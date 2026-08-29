@@ -15,6 +15,7 @@ from zhenxun.models.ban_console import BanConsole
 from zhenxun.services.log import logger
 from zhenxun.utils.enum import PluginType
 from zhenxun.utils.message import MessageUtils
+from zhenxun.utils.platform import PlatformUtils
 
 from .auth.context import resolve_actor_user_id, resolve_event_group_id
 
@@ -160,6 +161,8 @@ def _get_positive_config(key: str, cast_type: type[int] | type[float]) -> int | 
 async def _(
     matcher: Matcher, bot: Bot, session: EventSession, state: T_State, event: Event
 ):
+    if PlatformUtils.get_platform_scope(bot) == "qq_api":
+        return
     # 提前判断 notice 类型，直接跳过
     if matcher.type == "notice":
         return

@@ -66,6 +66,28 @@ def _skip_auth_for_plugin(matcher: Matcher) -> bool:
     return "chat_history" in module_name
 
 
+def _enforce_platform_contract(matcher: Matcher, event_context) -> None:
+    if matcher.plugin is None:
+        return
+    metadata = getattr(matcher.plugin, "metadata", None)
+    extra = getattr(metadata, "extra", None)
+    if not isinstance(extra, dict):
+        return
+    supported = extra.get("supported_platform_scopes")
+    if supported and event_context.platform_scope not in set(supported):
+        raise IgnoredException("plugin platform scope unsupported")
+    required = set(extra.get("required_platform_capabilities") or ())
+    if not required:
+        return
+    available = {"uni_message", "passive_reply"}
+    if event_context.group_id:
+        available.add("group")
+    else:
+        available.add("c2c")
+    if not required.issubset(available):
+        raise IgnoredException("plugin platform capability unavailable")
+
+
 @event_preprocessor
 async def _drop_message_before_cache_ready(event: Event):
     mark_activity()
@@ -103,6 +125,7 @@ async def _auth_preprocessor(
         state,
         message=message,
     )
+    _enforce_platform_contract(matcher, event_context)
 
     if not event_context.route_modules_loaded:
         route_modules = await _get_route_context(
@@ -147,9 +170,10 @@ async def _unblock_after_matcher(
 ):
     context = get_event_context(state)
     if context is not None:
-        user_id = context.user_id
-        group_id = context.group_id
-        channel_id = context.channel_id
+        limit_entity = context.limit_entity
+        user_id = limit_entity.user_id
+        group_id = limit_entity.group_id
+        channel_id = limit_entity.channel_id
     else:
         user_id = resolve_actor_user_id(event, session.user.id)
         group_id = resolve_event_group_id(event, None)

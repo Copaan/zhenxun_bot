@@ -51,6 +51,7 @@ __plugin_meta__ = PluginMetadata(
         version="0.2",
         plugin_type=PluginType.NORMAL,
         menu_type="数据统计",
+        supported_platform_scopes={"qq_client"},
         commands=[
             Command(command="消息统计"),
             Command(command="日消息统计"),

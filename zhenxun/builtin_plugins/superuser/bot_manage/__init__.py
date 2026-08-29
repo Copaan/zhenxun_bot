@@ -70,26 +70,32 @@ async def init_bot_console(bot: Bot):
     ]
     task_list = await TaskInfo.get_modules(status=True)
     platform = PlatformUtils.get_platform(bot)
+    storage_bot_id = PlatformUtils.get_storage_bot_id(bot)
     try:
         bot_data, created = await BotConsole.get_or_create(
-            bot_id=bot.self_id, platform=platform
+            bot_id=storage_bot_id, platform=platform
         )
     except (IntegrityError, TransactionManagementError):
         async with in_transaction() as connection:
             bot_data = (
-                await BotConsole.filter(bot_id=bot.self_id).using_db(connection).get()
+                await BotConsole.filter(bot_id=storage_bot_id)
+                .using_db(connection)
+                .get()
             )
         created = False
 
     if not created:
         task_list = await _filter_blocked_items(
-            task_list, await bot_data.get_tasks(bot.self_id, False)
+            task_list, await bot_data.get_tasks(storage_bot_id, False)
         )
         plugin_list = await _filter_blocked_items(
-            plugin_list, await bot_data.get_plugins(bot.self_id, False)
+            plugin_list, await bot_data.get_plugins(storage_bot_id, False)
         )
 
     bot_data.available_plugins = BotConsole.convert_module_format(plugin_list)
     bot_data.available_tasks = BotConsole.convert_module_format(task_list)
     await bot_data.save(update_fields=["available_plugins", "available_tasks"])
+    from zhenxun.services.cache.runtime_cache import BotMemoryCache
+
+    await BotMemoryCache.upsert_from_model(bot_data)
     logger.info("初始化Bot管理完成...")

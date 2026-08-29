@@ -23,6 +23,7 @@ STATE_PLAIN_TEXT = "_zx_plain_text"
 STATE_ROUTE_MODULES = "_zx_route_modules"
 STATE_IS_SUPERUSER = "_zx_is_superuser"
 STATE_PERMISSION_SIDE_EFFECTS = "_zx_permission_side_effects"
+STATE_OFFICIAL_CONTEXT = "_zx_official_context"
 EVENT_CACHE_PERMISSION_SIDE_EFFECTS = "permission_side_effects"
 
 EVENT_CACHE = (
@@ -43,11 +44,17 @@ class EventContext:
     event_type: str
     message_id: str | int | None
     entity: EntityIDs
+    adapter_bot_id: str | None = None
     plain_text: str = ""
     route_modules: set[str] = field(default_factory=set)
     route_modules_loaded: bool = False
     is_superuser: bool = False
     event_cache: dict[str, Any] | None = None
+    official_context: object | None = None
+    principal_id: str | None = None
+    storage_bot_id: str | None = None
+    storage_user_id: str | None = None
+    storage_group_id: str | None = None
 
     @property
     def user_id(self) -> str:
@@ -60,6 +67,16 @@ class EventContext:
     @property
     def channel_id(self) -> str | None:
         return self.entity.channel_id
+
+    @property
+    def limit_entity(self) -> EntityIDs:
+        if self.platform_scope != "qq_api":
+            return self.entity
+        return EntityIDs(
+            user_id=self.storage_user_id or self.entity.user_id,
+            group_id=self.storage_group_id,
+            channel_id=self.entity.channel_id,
+        )
 
 
 @dataclass
@@ -218,6 +235,8 @@ def _sync_context_state(state: dict[str, Any], context: EventContext) -> None:
     state[STATE_PLAIN_TEXT] = context.plain_text
     state[STATE_ROUTE_MODULES] = context.route_modules
     state[STATE_IS_SUPERUSER] = context.is_superuser
+    if context.official_context is not None:
+        state[STATE_OFFICIAL_CONTEXT] = context.official_context
     get_permission_side_effect_cache(state=state, event_cache=context.event_cache)
 
 
@@ -270,11 +289,16 @@ def get_or_create_event_context(
     platform = PlatformUtils.get_platform(session)
     platform_scope = PlatformUtils.get_platform_scope(session)
     bot_id = str(bot.self_id)
+    official_context = getattr(event, "_zhenxun_official_context", None)
+    principal_id = getattr(official_context, "principal_id", None)
+    storage_bot_id = getattr(official_context, "storage_bot_id", None)
+    storage_user_id = getattr(official_context, "storage_user_id", None)
+    storage_group_id = getattr(official_context, "storage_group_id", None)
     event_cache = state.get(STATE_EVENT_CACHE)
     if not isinstance(event_cache, dict):
         event_cache = get_event_cache(
             event,
-            bot_id=bot_id,
+            bot_id=storage_bot_id or bot_id,
             platform=platform,
             platform_scope=platform_scope,
             entity=entity,
@@ -305,7 +329,8 @@ def get_or_create_event_context(
         is_superuser = entity.user_id in bot.config.superusers
 
     context = EventContext(
-        bot_id=bot_id,
+        bot_id=storage_bot_id or bot_id,
+        adapter_bot_id=bot_id,
         platform=platform,
         platform_scope=platform_scope,
         event_type=event.get_type(),
@@ -316,6 +341,11 @@ def get_or_create_event_context(
         route_modules_loaded=route_modules_loaded,
         is_superuser=is_superuser,
         event_cache=event_cache,
+        official_context=official_context,
+        principal_id=str(principal_id) if principal_id else None,
+        storage_bot_id=storage_bot_id,
+        storage_user_id=storage_user_id,
+        storage_group_id=storage_group_id,
     )
     _sync_context_state(state, context)
     return context

@@ -1418,6 +1418,9 @@ async def _resolve_cost_gold(
     if prep.profile.cost_gold <= 0:
         hook_recorder.set("cost_gold", "skipped")
         return 0
+    if prep.snapshot.context.platform_scope == "qq_api":
+        hook_recorder.set("cost_gold", "qq_api_unadapted")
+        raise SkipPluginException("该状态型功能尚未适配 QQ 官方身份")
     if is_db_unhealthy():
         hook_recorder.set("cost_gold", "db_unhealthy")
         raise SkipPluginException("数据库繁忙，金币功能暂不可用...")
@@ -1553,6 +1556,7 @@ async def auth(
     """
     start_time = time.time()
     entity = context.entity
+    limit_entity = context.limit_entity
     event_cache = context.event_cache
     text = context.plain_text
     route_modules = context.route_modules if context.route_modules_loaded else None
@@ -1567,7 +1571,7 @@ async def auth(
         session=session,
         module=module,
         owner_matcher_id=id(matcher),
-        limit_entity=entity,
+        limit_entity=limit_entity,
     )
 
     # 仅在慢请求时记录 hook 明细，避免热路径高频构造字符串
@@ -1597,7 +1601,12 @@ async def auth(
         await _AUTH_PIPELINE.run(pipeline_context)
 
     except SkipPluginException as e:
-        LimitManager.unblock(module, entity.user_id, entity.group_id, entity.channel_id)
+        LimitManager.unblock(
+            module,
+            limit_entity.user_id,
+            limit_entity.group_id,
+            limit_entity.channel_id,
+        )
         await side_effect_commit.rollback_all("auth_skip")
         if e.tip_message:
             await side_effect_commit.send_permission_tip(

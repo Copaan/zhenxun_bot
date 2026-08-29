@@ -76,6 +76,14 @@ class UserData(BaseModel):
 
 class PlatformUtils:
     @classmethod
+    def get_storage_bot_id(cls, bot: Bot) -> str:
+        """Return a persistence-safe bot ID without changing adapter routing IDs."""
+        bot_id = str(bot.self_id)
+        if cls.get_platform_scope(bot) == "qq_api":
+            return f"qq_api:{bot_id}"
+        return bot_id
+
+    @classmethod
     def _resolve_unique_qq_client_bot(cls, log_cmd: str | None = None) -> Bot | None:
         bots = list(nonebot.get_bots().values())
         if not bots:
@@ -380,6 +388,7 @@ class PlatformUtils:
         user_id: str | None,
         group_id: str | None,
         message: str | UniMessage,
+        official_context: object | None = None,
     ) -> Receipt | None:
         """发送消息
 
@@ -392,12 +401,47 @@ class PlatformUtils:
         返回:
             Receipt | None: 是否发送成功
         """
-        if target := cls.get_target(user_id=user_id, group_id=group_id):
-            send_message = (
-                MessageUtils.build_message(message)
-                if isinstance(message, str)
-                else message
+        send_message = (
+            MessageUtils.build_message(message) if isinstance(message, str) else message
+        )
+        if cls.get_platform_scope(bot) == "qq_api":
+            from zhenxun.adapters.qq_official.context import (
+                OfficialQQEventContext,
+                OfficialReplyUnavailable,
+                allocate_reply_sequence,
+                finish_reply,
+                get_current_official_context,
             )
+
+            context = official_context or get_current_official_context()
+            if not isinstance(context, OfficialQQEventContext):
+                raise OfficialReplyUnavailable(
+                    "QQ official sends require a current reply context"
+                )
+            if context.app_id != str(bot.self_id):
+                raise OfficialReplyUnavailable("QQ official reply context bot mismatch")
+            state, sequence = await allocate_reply_sequence(context)
+            successful = False
+            try:
+                target = Target(
+                    id=(
+                        context.actor_openid
+                        if context.scene == "c2c"
+                        else context.group_openid
+                    ),
+                    private=context.scene == "c2c",
+                    source=context.source_id,
+                    self_id=str(bot.self_id),
+                    adapter="QQ",
+                    scope=SupportScope.qq_api,
+                    extra={"qq.reply_seq": sequence - 1},
+                )
+                receipt = await send_message.send(target=target, bot=bot)
+                successful = True
+                return receipt
+            finally:
+                await finish_reply(state, successful=successful)
+        if target := cls.get_target(user_id=user_id, group_id=group_id):
             return await send_message.send(target=target, bot=bot)
         return None
 

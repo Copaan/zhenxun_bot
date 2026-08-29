@@ -223,13 +223,18 @@ def _run_worker() -> None:
 
     if BotConfig.qq_adapter_load:
         try:
-            from nonebot.adapters.qq import Adapter as QQAdapter  # type: ignore
+            from zhenxun.adapters.qq_official.config import (
+                validate_qq_official_config,
+            )
+
+            validate_qq_official_config()
+            from zhenxun.adapters.qq_official.adapter import ZhenxunQQAdapter
         except ImportError as e:
             raise RuntimeError(
                 "QQ_ADAPTER_LOAD=True 但未安装 nonebot-adapter-qq，"
                 "请安装后再开启 QQ 官方适配器。"
             ) from e
-        driver.register_adapter(QQAdapter)
+        driver.register_adapter(ZhenxunQQAdapter)
         enabled_adapters.append("QQ")
 
     nonebot.logger.info(f"已启用适配器: {', '.join(enabled_adapters)}")

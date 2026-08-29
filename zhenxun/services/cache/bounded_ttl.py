@@ -30,6 +30,7 @@ class BoundedTTLCacheStats:
     misses: int
     sets: int
     evictions: int
+    expirations: int
 
     def to_dict(self) -> dict[str, int | str | None]:
         return {
@@ -42,6 +43,7 @@ class BoundedTTLCacheStats:
             "misses": self.misses,
             "sets": self.sets,
             "evictions": self.evictions,
+            "expirations": self.expirations,
         }
 
 
@@ -73,6 +75,7 @@ class BoundedTTLCache(Generic[K, V]):
         self._misses = 0
         self._sets = 0
         self._evictions = 0
+        self._expirations = 0
         self._lock = asyncio.Lock()
         self._last_sweep = 0.0
         self.__class__._instances.add(self)
@@ -126,7 +129,7 @@ class BoundedTTLCache(Generic[K, V]):
         ]
         for key in expired_keys:
             if self._remove_key_nolock(key):
-                self._evictions += 1
+                self._expirations += 1
 
     def _maybe_sweep_nolock(self, now: float) -> None:
         if now - self._last_sweep >= self._SWEEP_INTERVAL:
@@ -148,6 +151,7 @@ class BoundedTTLCache(Generic[K, V]):
             expire_at, value, _ = item
             if expire_at <= now:
                 self._remove_key_nolock(key)
+                self._expirations += 1
                 self._misses += 1
                 return None
             self._cache.move_to_end(key)
@@ -196,6 +200,7 @@ class BoundedTTLCache(Generic[K, V]):
                 misses=self._misses,
                 sets=self._sets,
                 evictions=self._evictions,
+                expirations=self._expirations,
             )
 
     @classmethod
@@ -226,6 +231,7 @@ class BoundedTTLCache(Generic[K, V]):
                 "misses",
                 "sets",
                 "evictions",
+                "expirations",
             ):
                 current[key] = int(current.get(key) or 0) + int(
                     getattr(stats, key) or 0

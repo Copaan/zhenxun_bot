@@ -269,6 +269,10 @@ class PluginExtraData(BaseModel):
     """BOT自我介绍时插件的自我介绍"""
     precautions: list[str] | None = None
     """BOT自我介绍时插件的注意事项"""
+    supported_platform_scopes: set[str] | None = None
+    """插件明确支持的平台作用域；未声明时沿用兼容行为"""
+    required_platform_capabilities: set[str] = Field(default_factory=set)
+    """插件运行所需的平台能力"""
 
     def to_dict(self, **kwargs):
         return model_dump(self, **kwargs)

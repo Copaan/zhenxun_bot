@@ -422,7 +422,7 @@ async def auth_limit(
         session: Uninfo
     """
     if context is not None:
-        entity = context.entity
+        entity = context.event.limit_entity
     if entity is None:
         entity = get_entity_ids(session)
     try:
@@ -444,7 +444,7 @@ async def reserve_auth_limit(
 ) -> LimitReservation:
     del session
     if context is not None:
-        entity = context.entity
+        entity = context.event.limit_entity
     if entity is None:
         raise RuntimeError("reserve_auth_limit requires entity or context")
     return await LimitManager.reserve(

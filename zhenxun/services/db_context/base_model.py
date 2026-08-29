@@ -10,15 +10,61 @@ from tortoise.exceptions import (
     MultipleObjectsReturned,
     TransactionManagementError,
 )
+from tortoise.manager import Manager
 from tortoise.models import Model as TortoiseModel
+from tortoise.queryset import QuerySet
 from tortoise.transactions import in_transaction
 
 from zhenxun.services.cache import CacheRoot
 from zhenxun.services.log import logger
+from zhenxun.services.platform_identity import guard_legacy_identity_write
 from zhenxun.utils.enum import DbLockType
 
 from .config import LOG_COMMAND, db_model
 from .utils import with_db_timeout
+
+
+class _PlatformGuardedQuerySet(QuerySet):
+    def _guard_platform_write(self) -> None:
+        guard_legacy_identity_write(self.model._meta.db_table)
+
+    def update(self, **kwargs: Any):
+        self._guard_platform_write()
+        return super().update(**kwargs)
+
+    def delete(self):
+        self._guard_platform_write()
+        return super().delete()
+
+    def bulk_create(
+        self,
+        objects,
+        batch_size=None,
+        ignore_conflicts=False,
+        update_fields=None,
+        on_conflict=None,
+    ):
+        self._guard_platform_write()
+        return super().bulk_create(
+            objects,
+            batch_size,
+            ignore_conflicts,
+            update_fields,
+            on_conflict,
+        )
+
+    def bulk_update(self, objects, fields, batch_size=None):
+        self._guard_platform_write()
+        return super().bulk_update(objects, fields, batch_size)
+
+    def raw(self, sql: str):
+        self._guard_platform_write()
+        return super().raw(sql)
+
+
+class _PlatformGuardedManager(Manager):
+    def get_queryset(self) -> _PlatformGuardedQuerySet:
+        return _PlatformGuardedQuerySet(self._model)
 
 
 class Model(TortoiseModel):
@@ -31,6 +77,8 @@ class Model(TortoiseModel):
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
+
+        cls._meta.manager = _PlatformGuardedManager(cls)
 
         is_abstract = (
             getattr(cls.Meta, "abstract", False) if hasattr(cls, "Meta") else False
@@ -118,10 +166,15 @@ class Model(TortoiseModel):
             yield
 
     @classmethod
+    def _guard_platform_write(cls) -> None:
+        guard_legacy_identity_write(cls._meta.db_table)
+
+    @classmethod
     async def create(
         cls, using_db: BaseDBAsyncClient | None = None, **kwargs: Any
     ) -> Self:
         """创建数据（使用CREATE锁）"""
+        cls._guard_platform_write()
         async with cls._lock_context(DbLockType.CREATE):
             # 直接调用父类的_create方法避免触发save的锁
             result = await super().create(using_db=using_db, **kwargs)
@@ -137,6 +190,7 @@ class Model(TortoiseModel):
         **kwargs: Any,
     ) -> tuple[Self, bool]:
         """获取或创建数据（无锁版本，依赖数据库约束）"""
+        cls._guard_platform_write()
         try:
             result = await super().get_or_create(
                 defaults=defaults, using_db=using_db, **kwargs
@@ -166,6 +220,7 @@ class Model(TortoiseModel):
         **kwargs: Any,
     ) -> tuple[Self, bool]:
         """更新或创建数据（使用UPSERT锁）"""
+        cls._guard_platform_write()
         async with cls._lock_context(DbLockType.UPSERT):
             try:
                 # 先尝试更新（带行锁）
@@ -196,6 +251,7 @@ class Model(TortoiseModel):
         force_update: bool = False,
     ):
         """保存数据（根据操作类型自动选择锁）"""
+        self._guard_platform_write()
         lock_type = (
             DbLockType.CREATE
             if getattr(self, "id", None) is None
@@ -214,6 +270,7 @@ class Model(TortoiseModel):
                 )
 
     async def delete(self, using_db: BaseDBAsyncClient | None = None):
+        self._guard_platform_write()
         cache_type = getattr(self, "cache_type", None)
         key = self.__class__.get_cache_key(self) if cache_type else None
         # 执行删除操作
@@ -222,6 +279,16 @@ class Model(TortoiseModel):
         # 清除缓存
         if cache_type:
             await CacheRoot.invalidate_cache(cache_type, key)
+
+    @classmethod
+    def bulk_create(cls, objects, *args, **kwargs):
+        cls._guard_platform_write()
+        return super().bulk_create(objects, *args, **kwargs)
+
+    @classmethod
+    def bulk_update(cls, objects, fields, *args, **kwargs):
+        cls._guard_platform_write()
+        return super().bulk_update(objects, fields, *args, **kwargs)
 
     @classmethod
     async def safe_get_or_none(

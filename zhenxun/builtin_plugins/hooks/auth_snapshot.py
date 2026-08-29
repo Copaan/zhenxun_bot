@@ -229,10 +229,11 @@ async def build_auth_snapshot(
     ):
         bot_data = event_cache.get("bot_data")
     else:
-        bot_data = provider.get_bot_if_ready(bot.self_id)
+        storage_bot_id = context.storage_bot_id or str(bot.self_id)
+        bot_data = provider.get_bot_if_ready(storage_bot_id)
         if bot_data is None:
             if can_load_cache:
-                bot_data = await provider.get_bot(bot.self_id)
+                bot_data = await provider.get_bot(storage_bot_id)
             elif db_unhealthy:
                 bot_data = _build_default_bot_snapshot(context)
             elif not provider.bot_cache_loaded():
@@ -246,8 +247,14 @@ async def build_auth_snapshot(
             event_cache["bot_data"] = bot_data
             event_cache["bot_cache_ready"] = True
 
-    group = None
-    if entity.group_id:
+    group = _build_runtime_group_snapshot(context)
+    if group is not None:
+        cache_misses.discard("group")
+        if event_cache is not None:
+            event_cache["group"] = group
+            event_cache["group_cache_ready"] = True
+            event_cache["group_runtime_virtual"] = True
+    elif entity.group_id:
         if (
             event_cache is not None
             and "group" in event_cache
@@ -292,8 +299,8 @@ async def build_auth_snapshot(
                 event_cache["group"] = group
                 event_cache["group_cache_ready"] = True
 
-    admin_levels = None
-    if profile.need_admin:
+    admin_levels = (None, None) if context.platform_scope == "qq_api" else None
+    if profile.need_admin and context.platform_scope != "qq_api":
         if (
             event_cache is not None
             and "admin_levels" in event_cache
@@ -327,8 +334,8 @@ async def build_auth_snapshot(
                 event_cache["admin_levels"] = admin_levels
                 event_cache["admin_cache_ready"] = True
 
-    ban_state = None
-    if not skip_ban:
+    ban_state = False if context.platform_scope == "qq_api" else None
+    if not skip_ban and context.platform_scope != "qq_api":
         if event_cache is not None and "ban_state" in event_cache:
             ban_state = event_cache.get("ban_state")
         elif provider.ban_cache_loaded():

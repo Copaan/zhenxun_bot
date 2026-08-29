@@ -29,13 +29,17 @@ driver: Driver = nonebot.get_driver()
 @driver.on_bot_connect
 async def _(bot: Bot):
     logger.debug(f"Bot: {bot.self_id} 建立连接...")
+    storage_bot_id = PlatformUtils.get_storage_bot_id(bot)
     await BotConnectLog.create(
-        bot_id=bot.self_id, platform=bot.adapter, connect_time=datetime.now(), type=1
+        bot_id=storage_bot_id,
+        platform=bot.adapter,
+        connect_time=datetime.now(),
+        type=1,
     )
-    if not await BotConsole.exists(bot_id=bot.self_id):
+    if not await BotConsole.exists(bot_id=storage_bot_id):
         try:
             await BotConsole.create(
-                bot_id=bot.self_id, platform=PlatformUtils.get_platform(bot)
+                bot_id=storage_bot_id, platform=PlatformUtils.get_platform(bot)
             )
         except IntegrityError as e:
             logger.warning(f"记录bot: {bot.self_id} 数据已存在...", e=e)
@@ -46,7 +50,7 @@ async def _(bot: Bot):
     logger.debug(f"Bot: {bot.self_id} 断开连接...")
     try:
         await BotConnectLog.create(
-            bot_id=bot.self_id,
+            bot_id=PlatformUtils.get_storage_bot_id(bot),
             platform=bot.adapter,
             connect_time=datetime.now(),
             type=0,

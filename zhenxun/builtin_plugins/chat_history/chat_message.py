@@ -25,6 +25,7 @@ __plugin_meta__ = PluginMetadata(
         author="HibiKier",
         version="0.1",
         plugin_type=PluginType.HIDDEN,
+        supported_platform_scopes={"qq_client"},
         configs=[
             RegisterConfig(
                 module="chat_history",
