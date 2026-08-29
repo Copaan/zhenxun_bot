@@ -16,6 +16,8 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 
 GRACEFUL_SHUTDOWN_TIMEOUT = 15
 WORKER_POLL_INTERVAL = 0.1
@@ -23,6 +25,8 @@ RESTART_POLL_INTERVAL = 0.5
 WORKER_SOFT_EXIT_TIMEOUT = 15.0
 WORKER_TERMINATE_TIMEOUT = 5.0
 WORKER_KILL_TIMEOUT = 5.0
+WORKER_READY_TIMEOUT = 120.0
+WORKER_READY_POLL_INTERVAL = 0.25
 ENV_EXAMPLE_FILE = ".env.example"
 ENV_DEV_FILE = ".env.dev"
 
@@ -227,7 +231,13 @@ def _run_worker() -> None:
                 validate_qq_official_config,
             )
 
-            validate_qq_official_config()
+            qq_config = validate_qq_official_config()
+            if qq_config.qq_webhook_mode == "builtin_https" and not os.environ.get(
+                "ZHENXUN_LAUNCHER_PID"
+            ):
+                raise RuntimeError(
+                    "QQ_WEBHOOK_MODE=builtin_https 必须通过 `zx run` 启动"
+                )
             from zhenxun.adapters.qq_official.adapter import ZhenxunQQAdapter
         except ImportError as e:
             raise RuntimeError(
@@ -253,6 +263,84 @@ def _run_worker() -> None:
 
 def _build_worker_command() -> list[str]:
     return [sys.executable, "-m", "zhenxun.cli", "run-worker"]
+
+
+def _build_ingress_command(settings) -> list[str]:
+    config = settings.config
+    upstream_host = (
+        f"[{settings.worker_host}]"
+        if ":" in settings.worker_host
+        else settings.worker_host
+    )
+    return [
+        sys.executable,
+        "-m",
+        "zhenxun.cli",
+        "run-ingress",
+        config.qq_webhook_listen_host,
+        str(config.qq_webhook_listen_port),
+        config.qq_webhook_tls_certfile,
+        config.qq_webhook_tls_keyfile,
+        f"http://{upstream_host}:{settings.worker_port}",
+    ]
+
+
+def _ingress_environment() -> dict[str, str]:
+    sensitive_markers = ("TOKEN", "SECRET", "PASSWORD", "API_KEY")
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key.upper() != "QQ_BOTS"
+        and not any(marker in key.upper() for marker in sensitive_markers)
+    }
+    environment["ZHENXUN_INGRESS_CHILD"] = "1"
+    return environment
+
+
+def _worker_health_url(settings) -> str:
+    host = (
+        f"[{settings.worker_host}]"
+        if ":" in settings.worker_host
+        else settings.worker_host
+    )
+    return f"http://{host}:{settings.worker_port}/qq/healthz"
+
+
+def _worker_is_ready(settings) -> bool:
+    try:
+        with urllib.request.urlopen(
+            _worker_health_url(settings), timeout=1.0
+        ) as response:
+            return response.status == 200 and b'"status":"ready"' in response.read(256)
+    except (OSError, urllib.error.URLError):
+        return False
+
+
+def _wait_worker_ready(worker: subprocess.Popen, settings) -> bool:
+    deadline = time.monotonic() + WORKER_READY_TIMEOUT
+    while time.monotonic() < deadline:
+        if worker.poll() is not None:
+            return False
+        if _worker_is_ready(settings):
+            return True
+        time.sleep(WORKER_READY_POLL_INTERVAL)
+    return False
+
+
+def _run_ingress(args: list[str]) -> None:
+    if len(args) != 5 or os.environ.get("ZHENXUN_INGRESS_CHILD") != "1":
+        raise RuntimeError("run-ingress 参数无效；该命令只能由 zx launcher 调用")
+    from zhenxun.adapters.qq_official.ingress import IngressSettings, run_ingress
+
+    run_ingress(
+        IngressSettings(
+            listen_host=args[0],
+            listen_port=int(args[1]),
+            certfile=args[2],
+            keyfile=args[3],
+            upstream_url=args[4],
+        )
+    )
 
 
 def _get_worker_creationflags() -> int:
@@ -313,8 +401,42 @@ def _terminate_worker(proc: subprocess.Popen) -> None:
     proc.wait(timeout=WORKER_KILL_TIMEOUT)
 
 
+def _terminate_named_process(proc: subprocess.Popen, name: str) -> None:
+    if proc.poll() is not None:
+        return
+    _launcher_log(f"stopping {name} pid={proc.pid}")
+    if os.name == "nt" and hasattr(signal, "CTRL_BREAK_EVENT"):
+        try:
+            proc.send_signal(signal.CTRL_BREAK_EVENT)
+        except OSError:
+            pass
+        else:
+            if _wait_worker_exit(proc, WORKER_SOFT_EXIT_TIMEOUT):
+                return
+    proc.terminate()
+    if _wait_worker_exit(proc, WORKER_TERMINATE_TIMEOUT):
+        return
+    proc.kill()
+    proc.wait(timeout=WORKER_KILL_TIMEOUT)
+
+
 def _run_launcher() -> None:
     cwd = _ensure_project_root()
+    _sync_env_missing_items(cwd)
+    from zhenxun.adapters.qq_official.config import (
+        load_qq_launcher_settings,
+        validate_builtin_ingress,
+        validate_qq_config_data,
+    )
+
+    qq_settings = load_qq_launcher_settings(cwd)
+    builtin_ingress = bool(
+        qq_settings.enabled and qq_settings.config.qq_webhook_mode == "builtin_https"
+    )
+    if qq_settings.enabled:
+        validate_qq_config_data(qq_settings.config)
+    if builtin_ingress:
+        validate_builtin_ingress(qq_settings)
     from zhenxun.utils.restart_state import (
         clear_launcher_restart_signal,
         consume_launcher_restart_signal,
@@ -322,10 +444,13 @@ def _run_launcher() -> None:
 
     clear_launcher_restart_signal()
     current_worker: subprocess.Popen | None = None
+    ingress: subprocess.Popen | None = None
     stop_requested = False
     stop_signal: int | None = None
 
     def _cleanup_current_worker() -> None:
+        if ingress is not None:
+            _terminate_named_process(ingress, "QQ HTTPS ingress")
         if current_worker is not None:
             _terminate_worker(current_worker)
 
@@ -363,6 +488,30 @@ def _run_launcher() -> None:
             env=worker_env,
         )
         current_worker = worker
+        if builtin_ingress and ingress is None:
+            _launcher_log(
+                "waiting for QQ worker readiness before opening HTTPS ingress"
+            )
+            if not _wait_worker_ready(worker, qq_settings):
+                _terminate_worker(worker)
+                raise RuntimeError("QQ worker 未在规定时间内就绪，HTTPS Ingress 未启动")
+            ingress = subprocess.Popen(
+                _build_ingress_command(qq_settings),
+                cwd=str(cwd),
+                creationflags=_get_worker_creationflags(),
+                env=_ingress_environment(),
+            )
+            time.sleep(0.25)
+            if ingress.poll() is not None:
+                code = ingress.returncode
+                ingress = None
+                _terminate_worker(worker)
+                raise SystemExit(code or 1)
+            _launcher_log(
+                "QQ HTTPS ingress ready on "
+                f"{qq_settings.config.qq_webhook_listen_host}:"
+                f"{qq_settings.config.qq_webhook_listen_port}"
+            )
         restart_requested = False
         return_code: int | None = None
         next_restart_check = 0.0
@@ -371,8 +520,17 @@ def _run_launcher() -> None:
                 return_code = worker.poll()
                 if return_code is not None:
                     break
+                if ingress is not None and ingress.poll() is not None:
+                    ingress_code = ingress.returncode
+                    ingress = None
+                    _launcher_log("QQ HTTPS ingress exited unexpectedly")
+                    _terminate_worker(worker)
+                    raise SystemExit(ingress_code or 1)
                 if stop_requested:
                     clear_launcher_restart_signal()
+                    if ingress is not None:
+                        _terminate_named_process(ingress, "QQ HTTPS ingress")
+                        ingress = None
                     _terminate_worker(worker)
                     raise SystemExit(128 + int(stop_signal or signal.SIGINT))
                 now = time.monotonic()
@@ -389,6 +547,9 @@ def _run_launcher() -> None:
                 time.sleep(WORKER_POLL_INTERVAL)
         except KeyboardInterrupt:
             clear_launcher_restart_signal()
+            if ingress is not None:
+                _terminate_named_process(ingress, "QQ HTTPS ingress")
+                ingress = None
             _terminate_worker(worker)
             return
         finally:
@@ -397,6 +558,9 @@ def _run_launcher() -> None:
 
         if restart_requested or consume_launcher_restart_signal():
             continue
+        if ingress is not None:
+            _terminate_named_process(ingress, "QQ HTTPS ingress")
+            ingress = None
         raise SystemExit(return_code if return_code is not None else 1)
 
 
@@ -407,6 +571,8 @@ def main() -> None:
         _run_launcher()
     elif args[0] == "run-worker":
         _run_worker()
+    elif args[0] == "run-ingress":
+        _run_ingress(args[1:])
     elif args[0] == "version":
         _print_version()
     elif args[0] in ("-h", "--help", "help"):

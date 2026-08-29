@@ -232,6 +232,12 @@ async def reserve_webhook_receipt(
     return True
 
 
+async def release_webhook_receipt(app_id: str, event_digest: str) -> None:
+    """Undo an unacknowledged reservation so the platform can safely retry."""
+    await QQWebhookReceipt.filter(app_id=app_id, event_id_digest=event_digest).delete()
+    await RECEIPT_CACHE.delete((app_id, event_digest))
+
+
 class OfficialReplyUnavailable(RuntimeError):
     pass
 
@@ -307,5 +313,6 @@ __all__ = [
     "invalidate_principal",
     "prepare_event_context",
     "receipt_seen",
+    "release_webhook_receipt",
     "reserve_webhook_receipt",
 ]

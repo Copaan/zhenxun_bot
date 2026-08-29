@@ -21,6 +21,31 @@ _database_ready = False
 _connection_lock: asyncio.Lock | None = None
 
 
+def database_ready() -> bool:
+    return _database_ready
+
+
+def runtime_ready() -> bool:
+    if not _database_ready or not _adapters:
+        return False
+    return all(
+        bool(getattr(adapter, "is_ready", lambda: False)()) for adapter in _adapters
+    )
+
+
+async def runtime_diagnostics() -> dict[str, object]:
+    adapters = []
+    for adapter in tuple(_adapters):
+        diagnostics = getattr(adapter, "diagnostics", None)
+        if callable(diagnostics):
+            adapters.append(await diagnostics())
+    return {
+        "database_ready": _database_ready,
+        "ready": runtime_ready(),
+        "adapters": adapters,
+    }
+
+
 def register_adapter_runtime(adapter: object) -> None:
     _adapters.add(adapter)
 
@@ -102,7 +127,10 @@ async def stop_qq_official_runtime() -> None:
 __all__ = [
     "cleanup_expired_receipts",
     "connect_prepared_adapter",
+    "database_ready",
     "register_adapter_runtime",
+    "runtime_diagnostics",
+    "runtime_ready",
     "start_qq_official_runtime",
     "stop_qq_official_runtime",
     "unregister_adapter_runtime",
