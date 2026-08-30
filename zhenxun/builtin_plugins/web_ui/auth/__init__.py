@@ -1,21 +1,31 @@
 import asyncio
 from datetime import timedelta
 import json
+import secrets
 
 import aiofiles
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.security import OAuth2PasswordRequestForm
 import nonebot
+from pydantic import BaseModel, Field
 
 from zhenxun.configs.config import Config
 from zhenxun.services.log import logger
 
 from ..api.configure.persistence import persist_webui_credentials
+from ..api.configure.setup_access import setup_access
 from ..base_model import Result
-from ..passwords import hash_password, is_password_hash, verify_password
-from ..security import login_attempt_limiter
+from ..console_access import console_access
+from ..passwords import (
+    hash_password,
+    is_password_hash,
+    validate_new_password,
+    verify_password,
+)
+from ..security import login_attempt_limiter, revoke_authenticated_websockets
 from ..utils import (
     ACCESS_TOKEN_EXPIRE_MINUTES,
+    authentication,
     create_token,
     get_user,
     token_data,
@@ -28,8 +38,25 @@ app = nonebot.get_app()
 router = APIRouter()
 
 
+class ConsoleConnectRequest(BaseModel):
+    code: str = Field(min_length=32, max_length=128)
+
+
+class PasswordResetRequest(BaseModel):
+    password: str = Field(min_length=8, max_length=1024)
+    confirm_password: str = Field(min_length=8, max_length=1024)
+
+
 def _client_key(request: Request) -> str:
     return request.client.host if request.client else "unknown"
+
+
+async def _remember_token(access_token: str) -> None:
+    token_data["token"].append(access_token)
+    if len(token_data["token"]) > 3:
+        token_data["token"] = token_data["token"][-3:]
+    async with aiofiles.open(token_file, "w", encoding="utf8") as stream:
+        await stream.write(json.dumps(token_data, ensure_ascii=False, indent=4))
 
 
 @router.post("/login")
@@ -66,11 +93,89 @@ async def login_get_token(
         user=user,
         expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
     )
-    token_data["token"].append(access_token)
-    if len(token_data["token"]) > 3:
-        token_data["token"] = token_data["token"][1:]
-    async with aiofiles.open(token_file, "w", encoding="utf8") as f:
-        await f.write(json.dumps(token_data, ensure_ascii=False, indent=4))
+    await _remember_token(access_token)
     return Result.ok(
         {"access_token": access_token, "token_type": "bearer"}, "欢迎回家, 欧尼酱!"
     )
+
+
+@router.post("/auth/console-connect", response_model=Result)
+async def console_connect(request: Request, payload: ConsoleConnectRequest) -> Result:
+    client_key = _client_key(request)
+    boot_id = await console_access.claim(payload.code, client_key)
+    state = setup_access.state()
+    if state in {"unconfigured", "partial"}:
+        setup_token, expires_in = await setup_access.create_session(client_key)
+        return Result.ok(
+            {
+                "mode": "setup",
+                "setup_token": setup_token,
+                "expires_in": expires_in,
+            },
+            "控制台连接已授权，请继续完成首次配置。",
+        )
+    if state == "restart_pending":
+        raise HTTPException(status_code=409, detail="配置正在等待重启。")
+
+    username = str(Config.get_config("web-ui", "username", ""))
+    user = get_user(username)
+    if user is None:
+        raise HTTPException(status_code=409, detail="WebUI 管理账户尚未完成配置。")
+    access_token = create_token(
+        user=user,
+        expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
+        extra_claims={"auth_source": "console", "boot_id": boot_id},
+    )
+    await _remember_token(access_token)
+    return Result.ok(
+        {
+            "mode": "login",
+            "access_token": access_token,
+            "token_type": "bearer",
+            "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        },
+        "已通过本次启动的控制台链接临时登录。",
+    )
+
+
+@router.post(
+    "/auth/password",
+    response_model=Result,
+    dependencies=[authentication()],
+)
+async def reset_password(payload: PasswordResetRequest) -> Result:
+    if payload.password != payload.confirm_password:
+        raise HTTPException(status_code=422, detail="两次输入的密码不一致。")
+    if password_error := validate_new_password(payload.password):
+        raise HTTPException(status_code=422, detail=password_error)
+    username = str(Config.get_config("web-ui", "username", ""))
+    if not username:
+        raise HTTPException(status_code=409, detail="WebUI 管理账户尚未完成配置。")
+
+    password_hash = await asyncio.to_thread(hash_password, payload.password)
+    new_secret = secrets.token_urlsafe(32)
+    try:
+        await asyncio.to_thread(
+            persist_webui_credentials,
+            username,
+            password_hash,
+            new_secret,
+        )
+    except Exception as error:
+        logger.error(
+            f"WebUI 管理密码重置失败（{error.__class__.__name__}）",
+            "WebUi",
+        )
+        raise HTTPException(status_code=500, detail="管理密码重置失败。") from error
+
+    token_data["token"].clear()
+    try:
+        async with aiofiles.open(token_file, "w", encoding="utf8") as stream:
+            await stream.write(json.dumps(token_data, ensure_ascii=False, indent=4))
+    except OSError as error:
+        logger.warning(
+            f"WebUI 旧登录记录清理失败（{error.__class__.__name__}）",
+            "WebUi",
+        )
+    await revoke_authenticated_websockets()
+    return Result.ok(info="管理密码已更新，请使用新密码重新登录。")

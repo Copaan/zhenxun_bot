@@ -28,6 +28,12 @@ default_menus = [
         router="/database",
         icon="database",
     ),
+    MenuItem(
+        name="协议端设置",
+        module="protocol",
+        router="/protocol",
+        icon="protocol",
+    ),
     MenuItem(name="系统信息", module="system", router="/system", icon="system"),
     MenuItem(name="关于我们", module="about", router="/about", icon="about"),
 ]
@@ -39,29 +45,21 @@ class MenuManager:
         self.menu = []
         if self.file.exists():
             try:
-                temp_menu = []
-                self.menu = json.load(self.file.open(encoding="utf8"))
-                self_menu_name = [menu["name"] for menu in self.menu]
-                for module in [m.module for m in default_menus]:
-                    if module in self_menu_name:
-                        temp_menu.append(
-                            MenuItem(
-                                **next(m for m in self.menu if m["module"] == module)
-                            )
-                        )
-                    else:
-                        temp_menu.append(self.__get_menu_model(module))
-                self.menu = temp_menu
+                stored_menu = json.load(self.file.open(encoding="utf8"))
+                stored_by_module = {
+                    item["module"]: item
+                    for item in stored_menu
+                    if isinstance(item, dict) and item.get("module")
+                }
+                self.menu = [
+                    MenuItem(**stored_by_module.get(item.module, item.to_dict()))
+                    for item in default_menus
+                ]
             except Exception as e:
                 logger.warning("菜单文件损坏，已重新生成...", "WebUi", e=e)
         if not self.menu:
             self.menu = default_menus
         self.save()
-
-    def __get_menu_model(self, module: str):
-        return default_menus[
-            next(i for i, m in enumerate(default_menus) if m.module == module)
-        ]
 
     def get_menus(self):
         return MenuData(menus=self.menu)

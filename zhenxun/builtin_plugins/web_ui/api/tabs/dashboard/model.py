@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel
 
@@ -80,3 +81,66 @@ class AllChatAndCallCount(BaseModel):
     """一月内调用次数"""
     call_year: int
     """一年内调用次数"""
+
+
+RuntimeLevel = Literal["ok", "warning", "critical"]
+
+
+class RuntimeServiceStatus(BaseModel):
+    status: RuntimeLevel
+    code: str
+    label: str
+    detail: str
+    latency_ms: int | None = None
+    mode: str | None = None
+
+
+class RuntimeIssue(BaseModel):
+    code: str
+    severity: Literal["warning", "critical"]
+    title: str
+    detail: str
+    action_label: str
+    action_route: str
+
+
+class RuntimeProcessStatus(BaseModel):
+    version: str
+    uptime_seconds: int
+    restart_pending: bool
+    listen_host: str
+    listen_port: int
+    log_level: str
+
+
+class RuntimeBotStatus(BaseModel):
+    self_id: str
+    platform: str
+    adapter: str
+    connect_seconds: int = 0
+
+
+class RuntimeProtocolStatus(BaseModel):
+    onebot_v11_connected: bool
+    qq_official_enabled: bool
+    qq_official_connected: bool
+    qq_webhook_mode: Literal["external", "builtin_https"]
+    connection_count: int
+
+
+class RuntimeWebSocketStatus(BaseModel):
+    status: RuntimeLevel
+    active_connections: int
+    connection_limit: int
+
+
+class RuntimeOverview(BaseModel):
+    generated_at: datetime
+    overall_status: RuntimeLevel
+    process: RuntimeProcessStatus
+    database: RuntimeServiceStatus
+    cache: RuntimeServiceStatus
+    websocket: RuntimeWebSocketStatus
+    protocols: RuntimeProtocolStatus
+    bots: list[RuntimeBotStatus]
+    issues: list[RuntimeIssue]

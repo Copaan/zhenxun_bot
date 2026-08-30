@@ -1,8 +1,11 @@
+import asyncio
+
 from fastapi import APIRouter
 from loguru import logger
 from nonebot.utils import escape_tag
 from starlette.websockets import WebSocket, WebSocketDisconnect, WebSocketState
 
+from ...security import authenticate_websocket, unregister_authenticated_websocket
 from .log_manager import LOG_STORAGE, ensure_log_sink_started, stop_log_sink_if_idle
 
 router = APIRouter()
@@ -10,15 +13,17 @@ router = APIRouter()
 
 @router.websocket("/logs")
 async def system_logs_realtime(websocket: WebSocket):
-    await websocket.accept()
+    if not await authenticate_websocket(websocket):
+        return
     await ensure_log_sink_started()
 
     async def log_listener(log: str):
-        await websocket.send_text(log)
+        await asyncio.wait_for(websocket.send_text(log), timeout=5)
 
     if not LOG_STORAGE.add_listener(log_listener):
         await websocket.send_text("日志连接数已达上限，请稍后再试。")
         await websocket.close()
+        unregister_authenticated_websocket(websocket)
         stop_log_sink_if_idle()
         return
     try:
@@ -31,5 +36,6 @@ async def system_logs_realtime(websocket: WebSocket):
     except WebSocketDisconnect:
         pass
     finally:
+        unregister_authenticated_websocket(websocket)
         LOG_STORAGE.remove_listener(log_listener)
         stop_log_sink_if_idle()

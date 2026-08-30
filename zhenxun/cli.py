@@ -20,6 +20,9 @@ import urllib.error
 import urllib.request
 
 GRACEFUL_SHUTDOWN_TIMEOUT = 15
+WORKER_CONNECTION_LIMIT = 512
+WORKER_BACKLOG = 2048
+WORKER_KEEP_ALIVE_TIMEOUT = 15
 WORKER_POLL_INTERVAL = 0.1
 RESTART_POLL_INTERVAL = 0.5
 WORKER_SOFT_EXIT_TIMEOUT = 15.0
@@ -258,7 +261,14 @@ def _run_worker() -> None:
             nonebot.logger.info(f"加载第三方插件目录: {ext}")
             nonebot.load_plugins(ext)
 
-    nonebot.run(timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_TIMEOUT)
+    nonebot.run(
+        workers=1,
+        access_log=False,
+        limit_concurrency=WORKER_CONNECTION_LIMIT,
+        backlog=WORKER_BACKLOG,
+        timeout_keep_alive=WORKER_KEEP_ALIVE_TIMEOUT,
+        timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_TIMEOUT,
+    )
 
 
 def _build_worker_command() -> list[str]:
@@ -267,11 +277,8 @@ def _build_worker_command() -> list[str]:
 
 def _build_ingress_command(settings) -> list[str]:
     config = settings.config
-    upstream_host = (
-        f"[{settings.worker_host}]"
-        if ":" in settings.worker_host
-        else settings.worker_host
-    )
+    connect_host = settings.worker_connect_host
+    upstream_host = f"[{connect_host}]" if ":" in connect_host else connect_host
     return [
         sys.executable,
         "-m",
@@ -298,11 +305,8 @@ def _ingress_environment() -> dict[str, str]:
 
 
 def _worker_health_url(settings) -> str:
-    host = (
-        f"[{settings.worker_host}]"
-        if ":" in settings.worker_host
-        else settings.worker_host
-    )
+    connect_host = settings.worker_connect_host
+    host = f"[{connect_host}]" if ":" in connect_host else connect_host
     return f"http://{host}:{settings.worker_port}/qq/healthz"
 
 

@@ -12,6 +12,7 @@ from zhenxun.models.group_member_info import GroupInfoUser
 from zhenxun.utils.depends import UserName
 
 from ....config import AVA_URL
+from ....security import authenticate_websocket, unregister_authenticated_websocket
 from .model import Message, MessageItem
 
 driver = nonebot.get_driver()
@@ -37,13 +38,21 @@ async def _():
 @ws_router.websocket("/chat")
 async def _(websocket: WebSocket):
     global ws_conn
-    await websocket.accept()
-    if not ws_conn or ws_conn.client_state != WebSocketState.CONNECTED:
-        ws_conn = websocket
-        try:
-            while websocket.client_state == WebSocketState.CONNECTED:
-                await websocket.receive()
-        except WebSocketDisconnect:
+    if not await authenticate_websocket(websocket):
+        return
+    if ws_conn and ws_conn.client_state == WebSocketState.CONNECTED:
+        await websocket.close(code=1013, reason="connection limit reached")
+        unregister_authenticated_websocket(websocket)
+        return
+    ws_conn = websocket
+    try:
+        while websocket.client_state == WebSocketState.CONNECTED:
+            await websocket.receive()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        unregister_authenticated_websocket(websocket)
+        if ws_conn is websocket:
             ws_conn = None
 
 

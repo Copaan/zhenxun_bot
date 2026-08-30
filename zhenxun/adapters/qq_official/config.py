@@ -13,6 +13,8 @@ from cryptography.hazmat.primitives import serialization
 from dotenv import dotenv_values
 from pydantic import BaseModel, Field, ValidationError, validator
 
+from zhenxun.utils.network import internal_connect_host
+
 QQWebhookMode = Literal["external", "builtin_https"]
 
 
@@ -69,6 +71,10 @@ class QQLauncherSettings:
     config: QQOfficialConfig
     worker_host: str
     worker_port: int
+
+    @property
+    def worker_connect_host(self) -> str:
+        return internal_connect_host(self.worker_host)
 
 
 class QQOfficialConfigError(RuntimeError):
@@ -192,14 +198,6 @@ def validate_builtin_ingress(
         return
     config = settings.config
     _validate_bind_host(config.qq_webhook_listen_host)
-    try:
-        worker_ip = ipaddress.ip_address(settings.worker_host)
-    except ValueError:
-        raise QQOfficialConfigError(
-            "builtin_https 模式要求 HOST 使用回环 IP 地址"
-        ) from None
-    if not worker_ip.is_loopback:
-        raise QQOfficialConfigError("builtin_https 模式要求 HOST 为 127.0.0.1 或 ::1")
     if config.qq_webhook_listen_port == settings.worker_port:
         raise QQOfficialConfigError("公网 HTTPS 端口不能与 Bot PORT 相同")
 

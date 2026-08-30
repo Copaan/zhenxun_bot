@@ -9,7 +9,6 @@ import nonebot
 
 from zhenxun.configs.config import Config
 from zhenxun.utils._restart_utils import issue_restart_ticket, request_restart
-from zhenxun.utils.manager.priority_manager import PriorityLifecycle
 from zhenxun.utils.network import local_access_urls, private_ipv4_addresses
 
 from ...base_model import Result
@@ -25,7 +24,6 @@ from .model import (
     ApplyRequest,
     CacheConfig,
     CacheProbeRequest,
-    ClaimRequest,
     DatabaseConfig,
     DatabaseProbeRequest,
     DatabaseTest,
@@ -45,6 +43,7 @@ from .persistence import (
     apply_configuration,
 )
 from .setup_access import (
+    SetupSession,
     client_ip,
     require_setup_token,
     setup_access,
@@ -58,20 +57,9 @@ def _current_listener() -> tuple[str, int]:
     return str(driver.config.host), int(driver.config.port)
 
 
-@PriorityLifecycle.on_startup(priority=1)
-async def _prepare_first_run_access() -> None:
-    await setup_access.prepare()
-
-
 @router.get("/status", response_model=Result, response_class=JSONResponse)
 async def configure_status() -> Result:
     return Result.ok({"state": setup_access.state()})
-
-
-@router.post("/claim", response_model=Result, response_class=JSONResponse)
-async def claim_setup(request: Request, claim: ClaimRequest) -> Result:
-    token, expires_in = await setup_access.claim(claim.code, client_ip(request))
-    return Result.ok({"token": token, "expires_in": expires_in})
 
 
 @router.get(
@@ -131,9 +119,15 @@ async def probe_network_route(payload: NetworkProbeRequest) -> Result:
     "/apply",
     response_model=Result,
     response_class=JSONResponse,
-    dependencies=[Depends(require_setup_token)],
 )
-async def apply_setup(payload: ApplyRequest) -> Result:
+async def apply_setup(
+    payload: ApplyRequest,
+    session: Annotated[SetupSession, Depends(require_setup_token)],
+) -> Result:
+    return await _apply_setup(payload, session)
+
+
+async def _apply_setup(payload: ApplyRequest, session: SetupSession) -> Result:
     if payload.password != payload.confirm_password:
         raise HTTPException(status_code=422, detail="两次输入的密码不一致。")
     if password_error := validate_new_password(payload.password):
@@ -168,7 +162,7 @@ async def apply_setup(payload: ApplyRequest) -> Result:
             detail=f"配置写入失败（{error.__class__.__name__}）。",
         ) from error
     issue_restart_ticket("webui.configure", ttl_seconds=10 * 60)
-    receipt = await setup_access.mark_applied()
+    receipt = await setup_access.mark_applied(session)
     access_urls = [
         item.url for item in local_access_urls(applied["host"], applied["port"])
     ]
@@ -189,8 +183,12 @@ async def restart_setup(
     payload: RestartRequest,
     x_setup_token: Annotated[str | None, Header(alias="X-Setup-Token")] = None,
 ) -> Result:
-    await setup_access.authorize(x_setup_token, client_ip(request), restart_only=True)
-    await setup_access.consume_restart_receipt(payload.receipt)
+    session = await setup_access.authorize(
+        x_setup_token,
+        client_ip(request),
+        restart_only=True,
+    )
+    await setup_access.consume_restart_receipt(session, payload.receipt)
     ok, message = await request_restart(
         "webui.configure", require_ticket="webui.configure"
     )
@@ -238,9 +236,11 @@ async def legacy_test_redis(payload: RedisTest) -> Result:
     "/set_configure",
     response_model=Result,
     response_class=JSONResponse,
-    dependencies=[Depends(require_setup_token)],
 )
-async def legacy_apply(payload: Setting) -> Result:
+async def legacy_apply(
+    payload: Setting,
+    session: Annotated[SetupSession, Depends(require_setup_token)],
+) -> Result:
     database = DatabaseConfig(mode="url", url=payload.db_url)
     cache = CacheConfig(
         mode=payload.cache_mode,
@@ -255,7 +255,7 @@ async def legacy_apply(payload: Setting) -> Result:
         if payload.host.strip() == "0.0.0.0"
         else "custom"
     )
-    return await apply_setup(
+    return await _apply_setup(
         ApplyRequest(
             username=payload.username,
             password=payload.password,
@@ -267,5 +267,6 @@ async def legacy_apply(payload: Setting) -> Result:
                 mode=network_mode, host=payload.host, port=payload.port
             ),
             accept_warnings=True,
-        )
+        ),
+        session,
     )

@@ -1,6 +1,6 @@
 import secrets
 
-from fastapi import APIRouter, FastAPI
+from fastapi import APIRouter, Depends, FastAPI
 import nonebot
 from nonebot.plugin import PluginMetadata
 
@@ -9,10 +9,13 @@ from zhenxun.configs.utils import PluginExtraData, RegisterConfig
 from zhenxun.services.log import logger
 from zhenxun.utils.enum import PluginType
 from zhenxun.utils.manager.priority_manager import PriorityLifecycle
+from zhenxun.utils.network import emit_webui_console_banner
 
 from .api.configure import router as configure_router
+from .api.configure.setup_access import setup_access
 from .api.logs import router as ws_log_routes
 from .api.menu import router as menu_router
+from .api.protocol import router as protocol_router
 from .api.tabs.dashboard import router as dashboard_router
 from .api.tabs.database import router as database_router
 from .api.tabs.main import router as main_router
@@ -23,7 +26,11 @@ from .api.tabs.plugin_manage import router as plugin_router
 from .api.tabs.plugin_manage.store import router as store_router
 from .api.tabs.system import router as system_router
 from .auth import router as auth_router
+from .config import install_cors_middleware
+from .console_access import console_access
 from .public import init_public
+from .ready_banner import webui_ready_banner
+from .security import require_private_request
 
 __plugin_meta__ = PluginMetadata(
     name="WebUi",
@@ -63,12 +70,15 @@ __plugin_meta__ = PluginMetadata(
 )
 
 driver = nonebot.get_driver()
+install_cors_middleware()
 
 
 gConfig.set_name("web-ui", "web-ui")
 
 
-BaseApiRouter = APIRouter(prefix="/zhenxun/api")
+BaseApiRouter = APIRouter(
+    prefix="/zhenxun/api", dependencies=[Depends(require_private_request)]
+)
 
 
 BaseApiRouter.include_router(auth_router)
@@ -81,6 +91,7 @@ BaseApiRouter.include_router(plugin_router)
 BaseApiRouter.include_router(system_router)
 BaseApiRouter.include_router(menu_router)
 BaseApiRouter.include_router(configure_router)
+BaseApiRouter.include_router(protocol_router)
 
 WsApiRouter = APIRouter(prefix="/zhenxun/socket")
 
@@ -95,7 +106,29 @@ async def _():
         app: FastAPI = nonebot.get_app()
         app.include_router(BaseApiRouter)
         app.include_router(WsApiRouter)
-        await init_public(app)
+        public_ready = await init_public(app)
         logger.info("<g>API启动成功</g>", "WebUi")
+        if public_ready and (connection_code := await console_access.prepare()):
+
+            def emit_ready_banner() -> None:
+                try:
+                    emit_webui_console_banner(
+                        str(driver.config.host),
+                        int(driver.config.port),
+                        connection_code=connection_code,
+                        state=setup_access.state(),
+                        username=str(gConfig.get_config("web-ui", "username", "")),
+                    )
+                except Exception as e:
+                    logger.error("WebUI 启动链接输出失败", "WebUi", e=e)
+
+            webui_ready_banner.arm(emit_ready_banner)
+        elif not public_ready:
+            logger.error("WebUI 静态资源未就绪，未输出访问链接", "WebUi")
     except Exception as e:
         logger.error("<g>API启动失败</g>", "WebUi", e=e)
+
+
+@PriorityLifecycle.on_shutdown(priority=1000)
+async def _cleanup_ready_banner():
+    webui_ready_banner.reset()

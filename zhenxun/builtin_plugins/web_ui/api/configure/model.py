@@ -3,10 +3,6 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 
-class ClaimRequest(BaseModel):
-    code: str = Field(min_length=8, max_length=8)
-
-
 class DatabaseConfig(BaseModel):
     mode: Literal["sqlite", "mysql", "postgres", "url"] = "sqlite"
     path: str = "data/db/zhenxun.db"

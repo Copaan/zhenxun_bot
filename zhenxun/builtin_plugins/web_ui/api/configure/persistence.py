@@ -55,18 +55,27 @@ def _dump_yaml(data: Any) -> bytes:
     return stream.getvalue().encode("utf-8")
 
 
-def _credential_documents(username: str, password_hash: str) -> tuple[bytes, bytes]:
+def _credential_documents(
+    username: str,
+    password_hash: str,
+    secret: str | None = None,
+) -> tuple[bytes, bytes]:
     simple = _load_yaml(_SIMPLE_CONFIG)
     simple_group = simple.setdefault("web-ui", {})
     simple_group["USERNAME"] = username
     simple_group["PASSWORD"] = password_hash
+    if secret is not None:
+        simple_group["SECRET"] = secret
 
     plugins = _load_yaml(_PLUGIN_CONFIG)
     plugin_group = plugins.setdefault("web-ui", {})
     username_entry = plugin_group.setdefault("USERNAME", {})
     password_entry = plugin_group.setdefault("PASSWORD", {})
+    secret_entry = plugin_group.setdefault("SECRET", {})
     username_entry["value"] = username
     password_entry["value"] = password_hash
+    if secret is not None:
+        secret_entry["value"] = secret
     return _dump_yaml(simple), _dump_yaml(plugins)
 
 
@@ -111,11 +120,21 @@ def _write_transaction(files: list[tuple[Path, bytes]]) -> None:
             temporary.unlink(missing_ok=True)
 
 
-def persist_webui_credentials(username: str, password_hash: str) -> None:
-    simple_bytes, plugin_bytes = _credential_documents(username, password_hash)
+def persist_webui_credentials(
+    username: str,
+    password_hash: str,
+    secret: str | None = None,
+) -> None:
+    simple_bytes, plugin_bytes = _credential_documents(
+        username,
+        password_hash,
+        secret,
+    )
     _write_transaction([(_PLUGIN_CONFIG, plugin_bytes), (_SIMPLE_CONFIG, simple_bytes)])
     Config.set_config("web-ui", "username", username)
     Config.set_config("web-ui", "password", password_hash)
+    if secret is not None:
+        Config.set_config("web-ui", "secret", secret)
 
 
 def apply_configuration(setting: ApplyRequest) -> dict[str, Any]:

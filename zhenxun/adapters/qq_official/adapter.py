@@ -53,7 +53,20 @@ class ZhenxunQQAdapter(QQAdapter):
                 prepared_bots: dict[str, ZhenxunQQBot] = {}
                 for bot_info in self.qq_config.qq_bots:
                     bot = ZhenxunQQBot(self, bot_info.id, bot_info)
-                    bot.self_info = await bot.me()
+                    try:
+                        bot.self_info = await bot.me()
+                    except Exception:
+                        logger.error(
+                            "QQ 官方 Bot 信息预热失败（API me）",
+                            "QQOfficial",
+                            target=bot_info.id,
+                        )
+                        raise
+                    logger.info(
+                        "QQ 官方 Bot 信息预热完成（API me）",
+                        "QQOfficial",
+                        target=bot_info.id,
+                    )
                     prepared_bots[bot_info.id] = bot
                 self._webhook_bots = prepared_bots
 

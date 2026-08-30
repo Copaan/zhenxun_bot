@@ -2,10 +2,11 @@ import contextlib
 from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
+from typing import Any
 
 from fastapi import Depends, HTTPException
 from fastapi.security import OAuth2PasswordBearer
-from jose import JWTError, jwt
+from jose import jwt
 from nonebot.utils import run_sync
 import psutil
 import ujson as json
@@ -16,6 +17,7 @@ from zhenxun.services.db_context import with_db_timeout
 from zhenxun.services.message_load import is_db_unhealthy
 
 from .base_model import SystemFolderSize, SystemStatus, User
+from .security import validate_access_token
 
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
@@ -116,7 +118,11 @@ def get_user(uname: str) -> User | None:
         return User(username=username, password=password)
 
 
-def create_token(user: User, expires_delta: timedelta | None = None):
+def create_token(
+    user: User,
+    expires_delta: timedelta | None = None,
+    extra_claims: dict[str, Any] | None = None,
+):
     """创建token
 
     参数:
@@ -124,8 +130,11 @@ def create_token(user: User, expires_delta: timedelta | None = None):
         expires_delta: 过期时间.
     """
     expire = datetime.now(timezone.utc) + (expires_delta or timedelta(minutes=15))
+    claims = {"sub": user.username, "exp": expire}
+    if extra_claims:
+        claims.update(extra_claims)
     return jwt.encode(
-        claims={"sub": user.username, "exp": expire},
+        claims=claims,
         key=Config.get_config("web-ui", "secret"),
         algorithm=ALGORITHM,
     )
@@ -141,15 +150,7 @@ def authentication():
 
     # if token not in token_data["token"]:
     def inner(token: str = Depends(oauth2_scheme)):
-        try:
-            payload = jwt.decode(
-                token, Config.get_config("web-ui", "secret"), algorithms=[ALGORITHM]
-            )
-            username, _ = payload.get("sub"), payload.get("exp")
-            user = get_user(username)  # type: ignore
-            if user is None:
-                raise JWTError
-        except JWTError:
+        if not validate_access_token(token):
             raise HTTPException(
                 status_code=400, detail="登录验证失败或已失效, 踢出房间!"
             )

@@ -16,6 +16,7 @@ from zhenxun.utils.platform import PlatformUtils
 
 from ....base_model import Result
 from ....config import QueryDateType
+from ....security import authenticate_websocket, unregister_authenticated_websocket
 from ....utils import DB_BUSY_MESSAGE, authentication, get_system_status
 from .data_source import ApiDataSource
 from .model import (
@@ -35,6 +36,7 @@ run_time = time.time()
 ws_router = APIRouter()
 router = APIRouter(prefix="/main")
 _SYSTEM_STATUS_CONNECTIONS: set[WebSocket] = set()
+_MAX_SYSTEM_STATUS_CONNECTIONS = 16
 _SYSTEM_STATUS_STOPPING = False
 
 
@@ -277,7 +279,12 @@ async def _(param: BotManageUpdateParam):
 
 @ws_router.websocket("/system_status")
 async def system_logs_realtime(websocket: WebSocket, sleep: int = 5):
-    await websocket.accept()
+    if not await authenticate_websocket(websocket):
+        return
+    if len(_SYSTEM_STATUS_CONNECTIONS) >= _MAX_SYSTEM_STATUS_CONNECTIONS:
+        await websocket.close(code=1013, reason="connection limit reached")
+        unregister_authenticated_websocket(websocket)
+        return
     _SYSTEM_STATUS_CONNECTIONS.add(websocket)
     logger.debug("ws system_status is connect")
 
@@ -315,6 +322,7 @@ async def system_logs_realtime(websocket: WebSocket, sleep: int = 5):
         pass
     finally:
         _SYSTEM_STATUS_CONNECTIONS.discard(websocket)
+        unregister_authenticated_websocket(websocket)
         receive_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await receive_task

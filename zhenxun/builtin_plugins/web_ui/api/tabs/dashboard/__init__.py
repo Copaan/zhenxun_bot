@@ -9,13 +9,31 @@ from zhenxun.services.log import logger
 from ....base_model import BaseResultModel, QueryModel, Result
 from ....utils import DB_BUSY_MESSAGE, authentication
 from .data_source import ApiDataSource
-from .model import AllChatAndCallCount, BotInfo, ChatCallMonthCount, QueryChatCallCount
+from .model import (
+    AllChatAndCallCount,
+    BotInfo,
+    ChatCallMonthCount,
+    QueryChatCallCount,
+    RuntimeOverview,
+)
+from .overview import build_runtime_overview
 
 require("plugin_store")
 
 router = APIRouter(prefix="/dashboard")
 
 driver = nonebot.get_driver()
+
+
+@router.get(
+    "/overview",
+    dependencies=[authentication()],
+    response_model=Result[RuntimeOverview],
+    response_class=JSONResponse,
+    description="获取WebUI运行概览",
+)
+async def _(force: bool = False) -> Result[RuntimeOverview]:
+    return Result.ok(await build_runtime_overview(force))
 
 
 @router.get(
@@ -27,12 +45,12 @@ driver = nonebot.get_driver()
 )
 async def _() -> Result[list[BotInfo]]:
     try:
-        return Result.ok(await ApiDataSource.get_bot_list(), "拿到信息啦!")
+        return Result.ok(await ApiDataSource.get_bot_list())
     except TimeoutError:
         return Result.fail(DB_BUSY_MESSAGE)
     except Exception as e:
         logger.error(f"{router.prefix}/get_bot_list 调用错误", "WebUi", e=e)
-        return Result.fail(f"发生了一点错误捏 {type(e)}: {e}")
+        return Result.fail("Bot列表读取失败，请稍后重试。")
 
 
 @router.get(
@@ -44,14 +62,12 @@ async def _() -> Result[list[BotInfo]]:
 )
 async def _(bot_id: str | None = None) -> Result[QueryChatCallCount]:
     try:
-        return Result.ok(
-            await ApiDataSource.get_chat_and_call_count(bot_id), "拿到信息啦!"
-        )
+        return Result.ok(await ApiDataSource.get_chat_and_call_count(bot_id))
     except TimeoutError:
         return Result.fail(DB_BUSY_MESSAGE)
     except Exception as e:
         logger.error(f"{router.prefix}/get_chat_and_call_count 调用错误", "WebUi", e=e)
-        return Result.fail(f"发生了一点错误捏 {type(e)}: {e}")
+        return Result.fail("消息统计读取失败，请稍后重试。")
 
 
 @router.get(
@@ -63,16 +79,14 @@ async def _(bot_id: str | None = None) -> Result[QueryChatCallCount]:
 )
 async def _(bot_id: str | None = None) -> Result[AllChatAndCallCount]:
     try:
-        return Result.ok(
-            await ApiDataSource.get_all_chat_and_call_count(bot_id), "拿到信息啦!"
-        )
+        return Result.ok(await ApiDataSource.get_all_chat_and_call_count(bot_id))
     except TimeoutError:
         return Result.fail(DB_BUSY_MESSAGE)
     except Exception as e:
         logger.error(
             f"{router.prefix}/get_all_chat_and_call_count 调用错误", "WebUi", e=e
         )
-        return Result.fail(f"发生了一点错误捏 {type(e)}: {e}")
+        return Result.fail("累计统计读取失败，请稍后重试。")
 
 
 @router.get(
@@ -84,14 +98,12 @@ async def _(bot_id: str | None = None) -> Result[AllChatAndCallCount]:
 )
 async def _(bot_id: str | None = None) -> Result[ChatCallMonthCount]:
     try:
-        return Result.ok(
-            await ApiDataSource.get_chat_and_call_month(bot_id), "拿到信息啦!"
-        )
+        return Result.ok(await ApiDataSource.get_chat_and_call_month(bot_id))
     except TimeoutError:
         return Result.fail(DB_BUSY_MESSAGE)
     except Exception as e:
         logger.error(f"{router.prefix}/get_chat_and_call_month 调用错误", "WebUi", e=e)
-        return Result.fail(f"发生了一点错误捏 {type(e)}: {e}")
+        return Result.fail("趋势统计读取失败，请稍后重试。")
 
 
 @router.post(
@@ -103,10 +115,10 @@ async def _(bot_id: str | None = None) -> Result[ChatCallMonthCount]:
 )
 async def _(query: QueryModel) -> Result[BaseResultModel]:
     try:
-        return Result.ok(await ApiDataSource.get_connect_log(query), "拿到信息啦!")
+        return Result.ok(await ApiDataSource.get_connect_log(query))
     except Exception as e:
         logger.error(f"{router.prefix}/get_connect_log 调用错误", "WebUi", e=e)
-        return Result.fail(f"发生了一点错误捏 {type(e)}: {e}")
+        return Result.fail("连接记录读取失败，请稍后重试。")
 
 
 @router.get(
