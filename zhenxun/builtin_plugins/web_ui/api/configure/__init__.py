@@ -1,105 +1,271 @@
-from pathlib import Path
-import re
+from __future__ import annotations
 
-from fastapi import APIRouter
+import asyncio
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 import nonebot
 
-from zhenxun.configs.config import BotConfig, Config
+from zhenxun.configs.config import Config
 from zhenxun.utils._restart_utils import issue_restart_ticket, request_restart
+from zhenxun.utils.manager.priority_manager import PriorityLifecycle
+from zhenxun.utils.network import local_access_urls, private_ipv4_addresses
 
 from ...base_model import Result
-from .data_source import test_db_connection
-from .model import Setting
+from ...passwords import validate_new_password
+from .data_source import (
+    probe_cache,
+    probe_database,
+    probe_network,
+    test_db_connection,
+    test_redis_connection,
+)
+from .model import (
+    ApplyRequest,
+    CacheConfig,
+    CacheProbeRequest,
+    ClaimRequest,
+    DatabaseConfig,
+    DatabaseProbeRequest,
+    DatabaseTest,
+    NetworkConfig,
+    NetworkProbeRequest,
+    RedisTest,
+    RestartRequest,
+    Setting,
+)
+from .persistence import (
+    _quote_env as _quote_env,
+)
+from .persistence import (
+    _set_env_value as _set_env_value,
+)
+from .persistence import (
+    apply_configuration,
+)
+from .setup_access import (
+    client_ip,
+    require_setup_token,
+    setup_access,
+)
 
 router = APIRouter(prefix="/configure")
-
 driver = nonebot.get_driver()
 
-port = driver.config.port
+
+def _current_listener() -> tuple[str, int]:
+    return str(driver.config.host), int(driver.config.port)
+
+
+@PriorityLifecycle.on_startup(priority=1)
+async def _prepare_first_run_access() -> None:
+    await setup_access.prepare()
+
+
+@router.get("/status", response_model=Result, response_class=JSONResponse)
+async def configure_status() -> Result:
+    return Result.ok({"state": setup_access.state()})
+
+
+@router.post("/claim", response_model=Result, response_class=JSONResponse)
+async def claim_setup(request: Request, claim: ClaimRequest) -> Result:
+    token, expires_in = await setup_access.claim(claim.code, client_ip(request))
+    return Result.ok({"token": token, "expires_in": expires_in})
+
+
+@router.get(
+    "/draft",
+    response_model=Result,
+    response_class=JSONResponse,
+    dependencies=[Depends(require_setup_token)],
+)
+async def configure_draft() -> Result:
+    current_host = str(getattr(driver.config, "host", "0.0.0.0"))
+    current_port = int(getattr(driver.config, "port", 8080))
+    username = str(Config.get_config("web-ui", "username", "admin"))
+    return Result.ok(
+        {
+            "username": username,
+            "database": {"mode": "sqlite", "path": "data/db/zhenxun.db"},
+            "cache": {"mode": "MEMORY", "host": "127.0.0.1", "port": 6379},
+            "network": {"mode": "lan", "host": current_host, "port": current_port},
+            "detected_addresses": private_ipv4_addresses(),
+        }
+    )
+
+
+@router.post(
+    "/probe/database",
+    response_model=Result,
+    response_class=JSONResponse,
+    dependencies=[Depends(require_setup_token)],
+)
+async def probe_database_route(payload: DatabaseProbeRequest) -> Result:
+    return Result.ok(await probe_database(payload.database))
+
+
+@router.post(
+    "/probe/cache",
+    response_model=Result,
+    response_class=JSONResponse,
+    dependencies=[Depends(require_setup_token)],
+)
+async def probe_cache_route(payload: CacheProbeRequest) -> Result:
+    return Result.ok(await probe_cache(payload.cache))
+
+
+@router.post(
+    "/probe/network",
+    response_model=Result,
+    response_class=JSONResponse,
+    dependencies=[Depends(require_setup_token)],
+)
+async def probe_network_route(payload: NetworkProbeRequest) -> Result:
+    return Result.ok(
+        await probe_network(payload.network, current_listener=_current_listener())
+    )
+
+
+@router.post(
+    "/apply",
+    response_model=Result,
+    response_class=JSONResponse,
+    dependencies=[Depends(require_setup_token)],
+)
+async def apply_setup(payload: ApplyRequest) -> Result:
+    if payload.password != payload.confirm_password:
+        raise HTTPException(status_code=422, detail="两次输入的密码不一致。")
+    if password_error := validate_new_password(payload.password):
+        raise HTTPException(status_code=422, detail=password_error)
+
+    database_result, cache_result, network_result = await asyncio.gather(
+        probe_database(payload.database),
+        probe_cache(payload.cache),
+        probe_network(payload.network, current_listener=_current_listener()),
+    )
+    results = {
+        "database": database_result,
+        "cache": cache_result,
+        "network": network_result,
+    }
+    errors = [result for result in results.values() if result.status == "error"]
+    warnings = [result for result in results.values() if result.status == "warning"]
+    if errors:
+        failure = Result.fail("配置检查未通过。", code=422)
+        failure.data = results
+        return failure
+    if warnings and not payload.accept_warnings:
+        failure = Result.fail("请确认警告后再保存。", code=409)
+        failure.data = results
+        return failure
+
+    try:
+        applied = await asyncio.to_thread(apply_configuration, payload)
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"配置写入失败（{error.__class__.__name__}）。",
+        ) from error
+    issue_restart_ticket("webui.configure", ttl_seconds=10 * 60)
+    receipt = await setup_access.mark_applied()
+    access_urls = [
+        item.url for item in local_access_urls(applied["host"], applied["port"])
+    ]
+    return Result.ok(
+        {
+            "state": "restart_pending",
+            "restart_receipt": receipt,
+            "access_urls": access_urls,
+            "checks": results,
+        },
+        info="配置已安全保存，可以重启真寻。",
+    )
+
+
+@router.post("/restart", response_model=Result, response_class=JSONResponse)
+async def restart_setup(
+    request: Request,
+    payload: RestartRequest,
+    x_setup_token: Annotated[str | None, Header(alias="X-Setup-Token")] = None,
+) -> Result:
+    await setup_access.authorize(x_setup_token, client_ip(request), restart_only=True)
+    await setup_access.consume_restart_receipt(payload.receipt)
+    ok, message = await request_restart(
+        "webui.configure", require_ticket="webui.configure"
+    )
+    if not ok:
+        return Result.fail(message)
+    return Result.ok(info=message)
+
+
+# Compatibility endpoints remain protected by the one-time setup session.
+@router.get(
+    "/test_db",
+    response_model=Result,
+    response_class=JSONResponse,
+    dependencies=[Depends(require_setup_token)],
+)
+async def legacy_test_db_get(db_url: str) -> Result:
+    result = await test_db_connection(db_url)
+    return Result.ok(info="数据库连接成功。") if result is True else Result.fail(result)
+
+
+@router.post(
+    "/test_db",
+    response_model=Result,
+    response_class=JSONResponse,
+    dependencies=[Depends(require_setup_token)],
+)
+async def legacy_test_db(payload: DatabaseTest) -> Result:
+    return await legacy_test_db_get(payload.db_url)
+
+
+@router.post(
+    "/test_redis",
+    response_model=Result,
+    response_class=JSONResponse,
+    dependencies=[Depends(require_setup_token)],
+)
+async def legacy_test_redis(payload: RedisTest) -> Result:
+    result = await test_redis_connection(
+        payload.redis_host, payload.redis_port, payload.redis_password
+    )
+    return Result.ok(info="Redis 连接成功。") if result is True else Result.fail(result)
 
 
 @router.post(
     "/set_configure",
     response_model=Result,
     response_class=JSONResponse,
-    description="设置基础配置",
+    dependencies=[Depends(require_setup_token)],
 )
-async def _(setting: Setting) -> Result:
-    global port
-    password = Config.get_config("web-ui", "password")
-    if password or BotConfig.db_url:
-        return Result.fail("配置已存在，请先删除DB_URL内容和前端密码再进行设置。")
-    env_file = Path() / ".env.example"
-    if not env_file.exists():
-        return Result.fail("基础配置文件.env.example不存在。")
-    env_text = env_file.read_text(encoding="utf-8")
-    to_env_file = Path() / ".env.dev"
-    if setting.db_url:
-        if setting.db_url.startswith("sqlite"):
-            base_dir = Path().resolve()
-            # 清理和验证数据库路径
-            db_path_str = setting.db_url.split(":")[-1].strip()
-            # 移除任何可能的路径遍历尝试
-            db_path_str = re.sub(r"[\\/]\.\.[\\/]", "", db_path_str)
-            # 规范化路径
-            db_path = Path(db_path_str).resolve()
-            parent_path = db_path.parent
-
-            # 验证路径是否在项目根目录内
-            try:
-                if not parent_path.absolute().is_relative_to(base_dir):
-                    return Result.fail("数据库路径不在项目根目录内。")
-            except ValueError:
-                return Result.fail("无效的数据库路径。")
-
-            # 创建目录
-            try:
-                parent_path.mkdir(parents=True, exist_ok=True)
-            except Exception as e:
-                return Result.fail(f"创建数据库目录失败: {e!s}")
-
-        env_text = env_text.replace('DB_URL = ""', f'DB_URL = "{setting.db_url}"')
-    if setting.superusers:
-        superusers = ", ".join([f'"{s}"' for s in setting.superusers])
-        env_text = re.sub(r"SUPERUSERS=\[.*?\]", f"SUPERUSERS=[{superusers}]", env_text)
-    if setting.host:
-        env_text = env_text.replace("HOST = 127.0.0.1", f"HOST = {setting.host}")
-    if setting.port:
-        env_text = env_text.replace("PORT = 8080", f"PORT = {setting.port}")
-        port = setting.port
-    if setting.username:
-        Config.set_config("web-ui", "username", setting.username)
-    Config.set_config("web-ui", "password", setting.password, True)
-    to_env_file.write_text(env_text, encoding="utf-8")
-    issue_restart_ticket("webui.configure", ttl_seconds=10 * 60)
-    return Result.ok(True, info="设置成功，请重启真寻以完成配置！")
-
-
-@router.get(
-    "/test_db",
-    response_model=Result,
-    response_class=JSONResponse,
-    description="设置基础配置",
-)
-async def _(db_url: str) -> Result:
-    result = await test_db_connection(db_url)
-    if isinstance(result, str):
-        return Result.fail(result)
-    return Result.ok(info="数据库连接成功!")
-
-
-@router.post(
-    "/restart",
-    response_model=Result,
-    response_class=JSONResponse,
-    description="重启",
-)
-async def _() -> Result:
-    ok, message = await request_restart(
-        "webui.configure",
-        require_ticket="webui.configure",
+async def legacy_apply(payload: Setting) -> Result:
+    database = DatabaseConfig(mode="url", url=payload.db_url)
+    cache = CacheConfig(
+        mode=payload.cache_mode,
+        host=payload.redis_host,
+        port=payload.redis_port,
+        password=payload.redis_password,
     )
-    if not ok:
-        return Result.fail(message)
-    return Result.ok(info=message)
+    network_mode = (
+        "local"
+        if payload.host.strip() == "127.0.0.1"
+        else "lan"
+        if payload.host.strip() == "0.0.0.0"
+        else "custom"
+    )
+    return await apply_setup(
+        ApplyRequest(
+            username=payload.username,
+            password=payload.password,
+            confirm_password=payload.password,
+            superusers=payload.superusers,
+            database=database,
+            cache=cache,
+            network=NetworkConfig(
+                mode=network_mode, host=payload.host, port=payload.port
+            ),
+            accept_warnings=True,
+        )
+    )
