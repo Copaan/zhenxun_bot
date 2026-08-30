@@ -185,7 +185,7 @@ async def init():
     MODELS = db_model.models
     SCRIPT_METHOD = db_model.script_method
     if not BotConfig.db_url:
-        error = prompt.format(host=driver.config.host, port=driver.config.port)
+        error = prompt
         raise DbUrlIsNode("\n" + error.strip())
     try:
         await Tortoise.init(

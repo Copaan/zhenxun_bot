@@ -127,11 +127,18 @@ def emit_webui_console_banner(
     urls = local_access_urls(bind_host, port)
     if not urls:
         urls = [AccessUrl("Local", f"http://{bind_host}:{port}")]
+    display_urls = list(urls)
+    if bind_host.strip().strip("[]") in {"0.0.0.0", "::"}:
+        display_urls.sort(key=lambda item: item.label != "Network")
     safe_username = " ".join(str(username or "").split())
     lines = ["", "WebUI is ready"]
-    for item in urls:
+    for item in display_urls:
         lines.append(f"  -> {item.label}: {item.url}/#/connect?code={connection_code}")
-    lines.append(f"  -> Normal login: {urls[0].url}")
+    preferred_login = next(
+        (item.url for item in display_urls if item.label == "Network"),
+        display_urls[0].url,
+    )
+    lines.append(f"  -> Normal login: {preferred_login}")
     if state == "configured":
         lines.append(f"  -> Account: {safe_username or 'configured administrator'}")
         lines.append("  -> Access: open a connection link for temporary admin login")

@@ -27,7 +27,12 @@ from zhenxun.utils.pydantic_compat import model_copy
 
 from ....base_model import Result
 from ....utils import authentication
-from ...configure.data_source import build_database_url, probe_cache, probe_database
+from ...configure.data_source import (
+    build_database_url,
+    log_probe_result,
+    probe_cache,
+    probe_database,
+)
 from ...configure.model import CacheConfig, DatabaseConfig
 from ...configure.persistence import _write_transaction
 from ..system.configuration import _read, _revision, _update_env, _validate_env
@@ -257,6 +262,8 @@ async def database_probe(payload: RuntimeProbeRequest) -> Result:
     database_result, cache_result = await asyncio.gather(
         probe_database(database), probe_cache(cache)
     )
+    log_probe_result("database", database.mode, database_result)
+    log_probe_result("cache", cache.mode, cache_result)
     return Result.ok({"database": database_result, "cache": cache_result})
 
 
@@ -285,6 +292,8 @@ async def update_database_configuration(
     database_result, cache_result = await asyncio.gather(
         probe_database(database), probe_cache(cache)
     )
+    log_probe_result("database", database.mode, database_result)
+    log_probe_result("cache", cache.mode, cache_result)
     if database_result.status == "error" or cache_result.status == "error":
         failure = Result.fail("数据库或缓存检查未通过。", code=422)
         failure.data = {"database": database_result, "cache": cache_result}

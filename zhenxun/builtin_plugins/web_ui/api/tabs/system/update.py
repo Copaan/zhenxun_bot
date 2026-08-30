@@ -26,8 +26,8 @@ class UpdateCheckRequest(BaseModel):
 class UpdateJobRequest(BaseModel):
     component: Literal["bot", "resource", "webui"]
     channel: Literal["main", "release"] = "main"
-    method: Literal["download", "git"] = "download"
-    source: Literal["github", "aliyun"] = "github"
+    method: Literal["download", "git"] = "git"
+    source: Literal["github", "aliyun"] = "aliyun"
     force: bool = False
 
 
@@ -37,6 +37,14 @@ def _service_error(error: UpdateServiceError) -> HTTPException:
         return HTTPException(status_code=404, detail="更新任务不存在。")
     if code in {"update_in_progress", "pending_update_exists"}:
         return HTTPException(status_code=409, detail="已有更新任务正在进行。")
+    if code == "release_blocked":
+        return HTTPException(
+            status_code=409,
+            detail={
+                "code": "release_blocked",
+                "message": "该版本存在已知兼容性问题，已禁止更新。",
+            },
+        )
     return HTTPException(status_code=422, detail=f"更新请求无效（{code}）。")
 
 

@@ -239,8 +239,10 @@ def _run_worker() -> None:
             )
 
             qq_config = validate_qq_official_config()
-            if qq_config.qq_webhook_mode == "builtin_https" and not os.environ.get(
-                "ZHENXUN_LAUNCHER_PID"
+            if (
+                qq_config.has_webhook_bots
+                and qq_config.qq_webhook_mode == "builtin_https"
+                and not os.environ.get("ZHENXUN_LAUNCHER_PID")
             ):
                 raise RuntimeError(
                     "QQ_WEBHOOK_MODE=builtin_https 必须通过 `zx run` 启动"
@@ -252,9 +254,9 @@ def _run_worker() -> None:
                 "请安装后再开启 QQ 官方适配器。"
             ) from e
         driver.register_adapter(ZhenxunQQAdapter)
-        enabled_adapters.append("QQ")
+        enabled_adapters.append("<c>QQ_Official</c>")
 
-    nonebot.logger.info(f"已启用适配器: {', '.join(enabled_adapters)}")
+    nonebot.logger.opt(colors=True).info(f"已启用适配器: {', '.join(enabled_adapters)}")
 
     nonebot.load_plugins("zhenxun/builtin_plugins")
     nonebot.load_plugins("zhenxun/plugins")
@@ -513,6 +515,7 @@ def _run_launcher() -> None:
         qq_settings = load_qq_launcher_settings(cwd)
         builtin_ingress = bool(
             qq_settings.enabled
+            and qq_settings.config.has_webhook_bots
             and qq_settings.config.qq_webhook_mode == "builtin_https"
         )
         desired_ingress_signature = (

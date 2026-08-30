@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import time
 from typing import Any
 
 _RESTART_STATE_FILE = Path() / "data" / ".restart_state.json"
 _LAUNCHER_ACTION_KEY = "launcher_action"
 _ACTION_RESTART = "restart"
+_LAUNCHER_NOT_BEFORE_KEY = "launcher_not_before"
 
 
 def _ensure_state_parent() -> None:
@@ -41,7 +43,10 @@ def consume_launcher_restart_signal() -> bool:
     state = read_restart_state()
     if state.get(_LAUNCHER_ACTION_KEY) != _ACTION_RESTART:
         return False
+    if time.time() < float(state.get(_LAUNCHER_NOT_BEFORE_KEY, 0)):
+        return False
     state.pop(_LAUNCHER_ACTION_KEY, None)
+    state.pop(_LAUNCHER_NOT_BEFORE_KEY, None)
     write_restart_state(state)
     return True
 
@@ -51,4 +56,5 @@ def clear_launcher_restart_signal() -> None:
     if _LAUNCHER_ACTION_KEY not in state:
         return
     state.pop(_LAUNCHER_ACTION_KEY, None)
+    state.pop(_LAUNCHER_NOT_BEFORE_KEY, None)
     write_restart_state(state)

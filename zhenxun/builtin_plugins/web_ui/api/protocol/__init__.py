@@ -9,9 +9,11 @@ from ...base_model import Result
 from ...utils import authentication
 from .configuration import router as configuration_router
 from .model import ProtocolConnection, ProtocolStatus
+from .qq_registration import router as qq_registration_router
 
 router = APIRouter(prefix="/protocol")
 router.include_router(configuration_router)
+router.include_router(qq_registration_router)
 
 
 def _platform(adapter_name: str) -> str:

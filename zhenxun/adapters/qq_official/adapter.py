@@ -8,6 +8,8 @@ from typing import Any, cast
 from typing_extensions import override
 
 from nonebot.adapters.qq.adapter import Adapter as QQAdapter
+from nonebot.adapters.qq.adapter import audit_result
+from nonebot.adapters.qq.event import MessageAuditEvent
 from nonebot.adapters.qq.models import Dispatch, WebhookVerify
 from nonebot.drivers import URL, ASGIMixin, HTTPServerSetup, Request, Response
 
@@ -34,6 +36,9 @@ class ZhenxunQQAdapter(QQAdapter):
 
     def __init__(self, driver, **kwargs: Any):
         self._webhook_bots: dict[str, ZhenxunQQBot] = {}
+        self._websocket_bot_infos: dict[str, Any] = {}
+        self._websocket_started = False
+        self._startup_prepared = False
         self._startup_lock = asyncio.Lock()
         self._prepared_bot_connect_lock = asyncio.Lock()
         self._webhook_route_registered = False
@@ -44,14 +49,45 @@ class ZhenxunQQAdapter(QQAdapter):
         _runtime.register_adapter_runtime(self)
 
     @override
+    def bot_connect(self, bot: ZhenxunQQBot) -> None:
+        try:
+            super().bot_connect(bot)
+        except RuntimeError as exc:
+            if "Duplicate bot connection" in str(exc):
+                logger.error(
+                    "QQ 官方 Bot连接失败：self_id与已连接适配器冲突",
+                    "QQOfficial",
+                    target=bot.self_id,
+                )
+            raise
+        logger.info("QQ 官方 Bot连接成功", "QQOfficial", target=bot.self_id)
+
+    @override
+    def bot_disconnect(self, bot: ZhenxunQQBot) -> None:
+        was_connected = bot.self_id in self.bots
+        super().bot_disconnect(bot)
+        if was_connected:
+            logger.info("QQ 官方 Bot已断开", "QQOfficial", target=bot.self_id)
+
+    @override
     async def startup(self) -> None:
         async with self._startup_lock:
-            if not isinstance(self.driver, ASGIMixin):
+            webhook_infos = [
+                bot_info
+                for bot_info in self.qq_config.qq_bots
+                if not getattr(bot_info, "use_websocket", False)
+            ]
+            websocket_infos = [
+                bot_info
+                for bot_info in self.qq_config.qq_bots
+                if getattr(bot_info, "use_websocket", False)
+            ]
+            if webhook_infos and not isinstance(self.driver, ASGIMixin):
                 raise RuntimeError("QQ Webhook requires an ASGI driver")
 
-            if not self._webhook_bots:
+            if webhook_infos and not self._webhook_bots:
                 prepared_bots: dict[str, ZhenxunQQBot] = {}
-                for bot_info in self.qq_config.qq_bots:
+                for bot_info in webhook_infos:
                     bot = ZhenxunQQBot(self, bot_info.id, bot_info)
                     try:
                         bot.self_info = await bot.me()
@@ -69,8 +105,11 @@ class ZhenxunQQAdapter(QQAdapter):
                     )
                     prepared_bots[bot_info.id] = bot
                 self._webhook_bots = prepared_bots
+            self._websocket_bot_infos = {
+                bot_info.id: bot_info for bot_info in websocket_infos
+            }
 
-            if not self._webhook_route_registered:
+            if webhook_infos and not self._webhook_route_registered:
                 self.setup_http_server(
                     HTTPServerSetup(
                         URL("/qq/webhook"),
@@ -80,7 +119,7 @@ class ZhenxunQQAdapter(QQAdapter):
                     )
                 )
                 self._webhook_route_registered = True
-            if not self._health_route_registered:
+            if webhook_infos and not self._health_route_registered:
                 self.setup_http_server(
                     HTTPServerSetup(
                         URL("/qq/healthz"),
@@ -90,7 +129,9 @@ class ZhenxunQQAdapter(QQAdapter):
                     )
                 )
                 self._health_route_registered = True
-            await self._dispatcher.start()
+            if webhook_infos:
+                await self._dispatcher.start()
+            self._startup_prepared = True
 
         await _runtime.connect_prepared_adapter(self)
 
@@ -100,19 +141,31 @@ class ZhenxunQQAdapter(QQAdapter):
         await super().shutdown()
         _runtime.unregister_adapter_runtime(self)
         self._webhook_bots.clear()
+        self._websocket_bot_infos.clear()
+        self._websocket_started = False
+        self._startup_prepared = False
         self._webhook_route_registered = False
         self._health_route_registered = False
 
     def is_ready(self) -> bool:
+        if not _runtime.database_ready() or not self._startup_prepared:
+            return False
+        configured_ids = set(self._webhook_bots) | set(self._websocket_bot_infos)
+        if not configured_ids or not configured_ids.issubset(self.bots):
+            return False
+        return not self._webhook_bots or self._dispatcher.accepting
+
+    def webhook_ready(self) -> bool:
         return bool(
             _runtime.database_ready()
-            and self._dispatcher.accepting
+            and self._startup_prepared
             and self._webhook_bots
+            and self._dispatcher.accepting
             and all(bot_id in self.bots for bot_id in self._webhook_bots)
         )
 
     async def _handle_health(self, _request: Request) -> Response:
-        status = 200 if self.is_ready() else 503
+        status = 200 if self.webhook_ready() else 503
         value = "ready" if status == 200 else "degraded"
         return Response(
             status,
@@ -131,6 +184,8 @@ class ZhenxunQQAdapter(QQAdapter):
         return {
             "ready": self.is_ready(),
             "configured_bots": len(self._webhook_bots),
+            "configured_webhook_bots": len(self._webhook_bots),
+            "configured_websocket_bots": len(self._websocket_bot_infos),
             "connected_bots": len(self.bots),
             "metrics": dict(getattr(self, "_metrics", {})),
             "dispatcher": await self._dispatcher.snapshot(),
@@ -153,6 +208,8 @@ class ZhenxunQQAdapter(QQAdapter):
         from zhenxun.services.cache.runtime_cache import BotMemoryCache
 
         async with self._prepared_bot_connect_lock:
+            if not getattr(self, "_startup_prepared", bool(self._webhook_bots)):
+                return
             for bot in self._webhook_bots.values():
                 if bot.self_id in self.bots:
                     continue
@@ -164,6 +221,101 @@ class ZhenxunQQAdapter(QQAdapter):
                 await BotMemoryCache.upsert_from_model(bot_data)
                 if bot.self_id not in self.bots:
                     self.bot_connect(bot)
+            websocket_infos = getattr(self, "_websocket_bot_infos", {})
+            if websocket_infos and not getattr(self, "_websocket_started", False):
+                self._websocket_started = True
+                for bot_info in websocket_infos.values():
+                    task = asyncio.create_task(
+                        self.run_bot_websocket(bot_info),
+                        name=f"qq-official-websocket-{bot_info.id}",
+                    )
+                    task.add_done_callback(self.tasks.discard)
+                    self.tasks.add(task)
+
+    @override
+    async def run_bot_websocket(self, bot_info: Any) -> None:
+        bot = ZhenxunQQBot(self, bot_info.id, bot_info)
+        try:
+            gateway_info = await bot.shard_url_get()
+            ws_url = URL(gateway_info.url)
+            if self.qq_config.qq_custom_gateway_url:
+                ws_url = self.qq_config.qq_custom_gateway_url
+            logger.info(
+                "QQ 官方 Bot WebSocket Gateway 获取成功",
+                "QQOfficial",
+                target=bot_info.id,
+            )
+        except Exception as exc:
+            logger.error(
+                "QQ 官方 Bot WebSocket Gateway 获取失败",
+                "QQOfficial",
+                target=bot_info.id,
+                e=exc,
+            )
+            return
+
+        if gateway_info.session_start_limit.remaining <= 0:
+            logger.error(
+                "QQ 官方 Bot WebSocket 会话启动额度不足",
+                "QQOfficial",
+                target=bot_info.id,
+            )
+            return
+
+        if bot_info.shard is not None:
+            task = asyncio.create_task(
+                self._forward_ws(bot, ws_url, bot_info.shard),
+                name=f"qq-official-shard-{bot_info.id}",
+            )
+            task.add_done_callback(self.tasks.discard)
+            self.tasks.add(task)
+            return
+
+        shards = gateway_info.shards or 1
+        logger.info(
+            f"QQ 官方 Bot WebSocket 开始连接 shards={shards}",
+            "QQOfficial",
+            target=bot_info.id,
+        )
+        for index in range(shards):
+            task = asyncio.create_task(
+                self._forward_ws(bot, ws_url, (index, shards)),
+                name=f"qq-official-shard-{bot_info.id}-{index}",
+            )
+            task.add_done_callback(self.tasks.discard)
+            self.tasks.add(task)
+            await asyncio.sleep(gateway_info.session_start_limit.max_concurrency or 1)
+
+    @override
+    def dispatch_event(self, bot: ZhenxunQQBot, payload: Dispatch) -> None:
+        try:
+            event = self.payload_to_event(payload)
+        except Exception as exc:
+            logger.warning(
+                "QQ 官方 Bot WebSocket 事件解析失败",
+                "QQOfficial",
+                target=bot.self_id,
+                e=exc,
+            )
+            return
+        if isinstance(event, MessageAuditEvent):
+            audit_result.add_result(event)
+
+        async def _handle() -> None:
+            try:
+                await prepare_event_context(bot.self_id, event)
+                await bot.handle_event(event)
+            except Exception as exc:
+                logger.error(
+                    "QQ 官方 Bot WebSocket 事件处理失败",
+                    "QQOfficial",
+                    target=bot.self_id,
+                    e=exc,
+                )
+
+        task = asyncio.create_task(_handle(), name=f"qq-official-event-{bot.self_id}")
+        task.add_done_callback(self.tasks.discard)
+        self.tasks.add(task)
 
     def _resolve_webhook_bot(self, app_id: str) -> ZhenxunQQBot | None:
         if app_id in self.bots:

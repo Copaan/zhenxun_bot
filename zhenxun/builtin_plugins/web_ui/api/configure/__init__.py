@@ -8,12 +8,18 @@ from fastapi.responses import JSONResponse
 import nonebot
 
 from zhenxun.configs.config import Config
-from zhenxun.utils._restart_utils import issue_restart_ticket, request_restart
-from zhenxun.utils.network import local_access_urls, private_ipv4_addresses
+from zhenxun.utils._restart_utils import issue_restart_ticket
+from zhenxun.utils.network import private_ipv4_addresses
 
 from ...base_model import Result
 from ...passwords import validate_new_password
+from ...restart_service import (
+    preferred_access_urls,
+    request_webui_restart,
+    restart_status_data,
+)
 from .data_source import (
+    log_probe_result,
     probe_cache,
     probe_database,
     probe_network,
@@ -59,7 +65,7 @@ def _current_listener() -> tuple[str, int]:
 
 @router.get("/status", response_model=Result, response_class=JSONResponse)
 async def configure_status() -> Result:
-    return Result.ok({"state": setup_access.state()})
+    return Result.ok({"state": setup_access.state(), **restart_status_data()})
 
 
 @router.get(
@@ -90,7 +96,9 @@ async def configure_draft() -> Result:
     dependencies=[Depends(require_setup_token)],
 )
 async def probe_database_route(payload: DatabaseProbeRequest) -> Result:
-    return Result.ok(await probe_database(payload.database))
+    result = await probe_database(payload.database)
+    log_probe_result("database", payload.database.mode, result)
+    return Result.ok(result)
 
 
 @router.post(
@@ -100,7 +108,9 @@ async def probe_database_route(payload: DatabaseProbeRequest) -> Result:
     dependencies=[Depends(require_setup_token)],
 )
 async def probe_cache_route(payload: CacheProbeRequest) -> Result:
-    return Result.ok(await probe_cache(payload.cache))
+    result = await probe_cache(payload.cache)
+    log_probe_result("cache", payload.cache.mode, result)
+    return Result.ok(result)
 
 
 @router.post(
@@ -143,6 +153,8 @@ async def _apply_setup(payload: ApplyRequest, session: SetupSession) -> Result:
         "cache": cache_result,
         "network": network_result,
     }
+    log_probe_result("database", payload.database.mode, database_result)
+    log_probe_result("cache", payload.cache.mode, cache_result)
     errors = [result for result in results.values() if result.status == "error"]
     warnings = [result for result in results.values() if result.status == "warning"]
     if errors:
@@ -163,9 +175,7 @@ async def _apply_setup(payload: ApplyRequest, session: SetupSession) -> Result:
         ) from error
     issue_restart_ticket("webui.configure", ttl_seconds=10 * 60)
     receipt = await setup_access.mark_applied(session)
-    access_urls = [
-        item.url for item in local_access_urls(applied["host"], applied["port"])
-    ]
+    access_urls = preferred_access_urls(applied["host"], applied["port"])
     return Result.ok(
         {
             "state": "restart_pending",
@@ -189,12 +199,12 @@ async def restart_setup(
         restart_only=True,
     )
     await setup_access.consume_restart_receipt(session, payload.receipt)
-    ok, message = await request_restart(
+    ok, message, data = await request_webui_restart(
         "webui.configure", require_ticket="webui.configure"
     )
     if not ok:
         return Result.fail(message)
-    return Result.ok(info=message)
+    return Result.ok(data, info=message)
 
 
 # Compatibility endpoints remain protected by the one-time setup session.

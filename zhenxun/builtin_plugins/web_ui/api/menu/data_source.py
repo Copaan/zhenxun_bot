@@ -29,7 +29,7 @@ default_menus = [
         icon="database",
     ),
     MenuItem(
-        name="协议端设置",
+        name="机器人接入",
         module="protocol",
         router="/protocol",
         icon="protocol",
@@ -57,6 +57,12 @@ class MenuManager:
                     and database_menu.get("name") == "数据库管理"
                 ):
                     database_menu["name"] = "数据与缓存"
+                protocol_menu = stored_by_module.get("protocol")
+                if (
+                    isinstance(protocol_menu, dict)
+                    and protocol_menu.get("name") == "协议端设置"
+                ):
+                    protocol_menu["name"] = "机器人接入"
                 self.menu = [
                     MenuItem(**stored_by_module.get(item.module, item.to_dict()))
                     for item in default_menus

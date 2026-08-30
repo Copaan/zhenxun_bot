@@ -51,14 +51,38 @@ class BotLive:
 bot_live = BotLive()
 
 
+def _bot_identity(bot: Bot) -> tuple[str, str, str, str, dict[str, bool]]:
+    runtime_bot_id = str(bot.self_id)
+    adapter = str(bot.adapter.get_name())
+    normalized = adapter.strip().lower()
+    platform = (
+        "onebot_v11"
+        if normalized == "onebot v11"
+        else "qq_official"
+        if normalized == "qq"
+        else "other"
+    )
+    storage_bot_id = PlatformUtils.get_storage_bot_id(bot)
+    bot_key = f"{platform}:{runtime_bot_id}"
+    onebot = platform == "onebot_v11"
+    capabilities = {
+        "dashboard": True,
+        "friend_list": onebot,
+        "group_list": onebot,
+        "chat": onebot,
+        "bot_manage": onebot,
+    }
+    return bot_key, runtime_bot_id, storage_bot_id, platform, capabilities
+
+
 @driver.on_bot_connect
 async def _(bot: Bot):
-    bot_live.add(bot.self_id)
+    bot_live.add(_bot_identity(bot)[0])
 
 
 @driver.on_bot_disconnect
 async def _(bot: Bot):
-    bot_live.remove(bot.self_id)
+    bot_live.remove(_bot_identity(bot)[0])
 
 
 class ApiDataSource:
@@ -72,16 +96,30 @@ class ApiDataSource:
         返回:
             TemplateBaseInfo: bot信息
         """
+        bot_key, runtime_id, storage_id, platform, capabilities = _bot_identity(bot)
         login_info = None
-        try:
-            login_info = await bot.get_login_info()
-        except Exception as e:
-            logger.warning("调用接口get_login_info失败", "WebUi", e=e)
+        if platform == "onebot_v11":
+            try:
+                login_info = await bot.get_login_info()
+            except Exception as e:
+                logger.warning("调用接口get_login_info失败", "WebUi", e=e)
+        self_info = getattr(bot, "self_info", None)
+        nickname = (
+            login_info.get("nickname")
+            if isinstance(login_info, dict) and login_info.get("nickname")
+            else getattr(self_info, "username", None) or runtime_id
+        )
         return TemplateBaseInfo(
             bot=bot,
-            self_id=bot.self_id,
-            nickname=login_info["nickname"] if login_info else bot.self_id,
-            ava_url=AVA_URL.format(bot.self_id),
+            self_id=runtime_id,
+            nickname=str(nickname),
+            ava_url=AVA_URL.format(runtime_id),
+            bot_key=bot_key,
+            runtime_bot_id=runtime_id,
+            storage_bot_id=storage_id,
+            adapter=str(bot.adapter.get_name()),
+            platform=platform,
+            capabilities=capabilities,
         )
 
     @classmethod
@@ -108,13 +146,15 @@ class ApiDataSource:
         # 今日累计接收消息
         select_bot.received_messages = await webui_db_call(
             ChatHistory.filter(
-                bot_id=select_bot.self_id,
+                bot_id=select_bot.storage_bot_id,
                 create_time__gte=now - timedelta(hours=now.hour),
             ).count(),
             "Main.received_messages",
         )
         # 群聊数量
         try:
+            if not select_bot.capabilities.get("group_list"):
+                raise NotImplementedError
             select_bot.group_count = len(
                 (await PlatformUtils.get_group_list(select_bot.bot, True))[0]
             )
@@ -122,13 +162,16 @@ class ApiDataSource:
             select_bot.friend_count = len(
                 (await PlatformUtils.get_friend_list(select_bot.bot))[0]
             )
+        except NotImplementedError:
+            select_bot.group_count = 0
+            select_bot.friend_count = 0
         except Exception as e:
             logger.warning("获取bot好友/群组数量失败...", "WebUi", e=e)
             select_bot.group_count = 0
             select_bot.friend_count = 0
-        select_bot.status = await BotConsole.get_bot_status(select_bot.self_id)
+        select_bot.status = await BotConsole.get_bot_status(select_bot.storage_bot_id)
         # 连接时间
-        select_bot.connect_time = bot_live.get(select_bot.self_id) or 0
+        select_bot.connect_time = bot_live.get(select_bot.bot_key) or 0
         if select_bot.connect_time:
             connect_date = datetime.fromtimestamp(select_bot.connect_time)
             select_bot.connect_date = connect_date.strftime("%Y-%m-%d %H:%M:%S")
@@ -139,7 +182,7 @@ class ApiDataSource:
         )
         select_bot.day_call = day_call
         select_bot.connect_count = await webui_db_call(
-            BotConnectLog.filter(bot_id=select_bot.self_id).count(),
+            BotConnectLog.filter(bot_id=select_bot.storage_bot_id).count(),
             "Main.connect_count",
         )
 
@@ -159,7 +202,9 @@ class ApiDataSource:
         select_bot: BaseInfo
         bot_list = [await cls.__build_bot_info(bot) for _, bot in bots.items()]
         # 获取指定qq号的bot信息，若无指定   则获取第一个
-        if _bl := [b for b in bot_list if b.self_id == bot_id]:
+        if _bl := [b for b in bot_list if b.bot_key == bot_id]:
+            select_bot = _bl[0]
+        elif _bl := [b for b in bot_list if b.self_id == bot_id]:
             select_bot = _bl[0]
         else:
             select_bot = bot_list[0]

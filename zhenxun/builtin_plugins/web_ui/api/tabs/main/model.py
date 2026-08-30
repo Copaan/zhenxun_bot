@@ -3,7 +3,7 @@ from typing import Any
 from nonebot.adapters import Bot
 from nonebot.compat import model_dump
 from nonebot.config import Config
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class BotManageUpdateParam(BaseModel):
@@ -83,6 +83,12 @@ class BaseInfo(BaseModel):
     """今日调用插件次数"""
     version: str = "unknown"
     """真寻版本"""
+    bot_key: str = ""
+    runtime_bot_id: str = ""
+    storage_bot_id: str = ""
+    adapter: str = ""
+    platform: str = "other"
+    capabilities: dict[str, bool] = Field(default_factory=dict)
 
     class Config:
         arbitrary_types_allowed = True

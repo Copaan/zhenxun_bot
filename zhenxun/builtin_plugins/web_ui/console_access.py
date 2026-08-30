@@ -66,6 +66,9 @@ class ConsoleAccessManager:
             and hmac.compare_digest(boot_id, self._boot_id)
         )
 
+    def current_boot_id(self) -> str | None:
+        return self._boot_id
+
     async def reset_for_tests(self) -> None:
         async with self._lock:
             self._code_digest = None

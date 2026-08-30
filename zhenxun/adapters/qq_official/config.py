@@ -39,17 +39,21 @@ class QQOfficialIntent(BaseModel):
 
 class QQOfficialBotConfig(BaseModel):
     id: str
-    token: str
+    token: str = ""
     secret: str
     use_websocket: bool = False
     intent: QQOfficialIntent = Field(default_factory=QQOfficialIntent)
 
-    @validator("id", "token", "secret")
+    @validator("id", "secret")
     def _not_blank(cls, value: str) -> str:
         value = value.strip()
         if not value:
             raise ValueError("must not be blank")
         return value
+
+    @validator("token")
+    def _strip_token(cls, value: str) -> str:
+        return value.strip()
 
     class Config:
         extra = "forbid"
@@ -64,6 +68,14 @@ class QQOfficialConfig(BaseModel):
     qq_webhook_tls_certfile: str = ""
     qq_webhook_tls_keyfile: str = ""
     qq_webhook_public_base_url: str = ""
+
+    @property
+    def has_webhook_bots(self) -> bool:
+        return any(not bot.use_websocket for bot in self.qq_bots)
+
+    @property
+    def has_websocket_bots(self) -> bool:
+        return any(bot.use_websocket for bot in self.qq_bots)
 
 
 @dataclass(frozen=True, slots=True)
@@ -199,7 +211,11 @@ def validate_builtin_ingress(
     settings: QQLauncherSettings, *, check_port: bool = True
 ) -> None:
     """Fail before process startup when built-in HTTPS cannot be started safely."""
-    if not settings.enabled or settings.config.qq_webhook_mode != "builtin_https":
+    if (
+        not settings.enabled
+        or not settings.config.has_webhook_bots
+        or settings.config.qq_webhook_mode != "builtin_https"
+    ):
         return
     config = settings.config
     _validate_bind_host(config.qq_webhook_listen_host)
@@ -272,7 +288,7 @@ def validate_qq_config_data(config: QQOfficialConfig) -> None:
     """Validate credentials and intents without importing adapter runtime code."""
     if not config.qq_bots:
         raise QQOfficialConfigError("QQ_ADAPTER_LOAD=True 时 QQ_BOTS 不能为空")
-    if not config.qq_verify_webhook:
+    if config.has_webhook_bots and not config.qq_verify_webhook:
         raise QQOfficialConfigError("QQ_VERIFY_WEBHOOK 必须保持开启")
 
     app_ids = [item.id for item in config.qq_bots]
@@ -281,10 +297,6 @@ def validate_qq_config_data(config: QQOfficialConfig) -> None:
         raise QQOfficialConfigError("QQ_BOTS 存在重复 AppID")
 
     for index, item in enumerate(config.qq_bots):
-        if item.use_websocket:
-            raise QQOfficialConfigError(
-                f"QQ_BOTS.{index}.use_websocket 首期 Webhook 模式必须为 false"
-            )
         if not item.intent.c2c_group_at_messages:
             raise QQOfficialConfigError(
                 f"QQ_BOTS.{index}.intent.c2c_group_at_messages 必须为 true"

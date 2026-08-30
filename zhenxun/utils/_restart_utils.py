@@ -1,7 +1,6 @@
-import _thread
-import asyncio
 import copy
 import json
+import os
 from pathlib import Path
 import time
 from typing import Any
@@ -19,6 +18,7 @@ _RESTART_TICKET_KEY = "restart_ticket"
 _PENDING_REQUEST_KEY = "pending_request"
 _LAUNCHER_ACTION_KEY = "launcher_action"
 _ACTION_RESTART = "restart"
+_LAUNCHER_NOT_BEFORE_KEY = "launcher_not_before"
 
 _restart_pending: bool = False
 
@@ -101,14 +101,7 @@ async def _schedule_restart() -> tuple[bool, str]:
         return False, "重启已在进行中，请稍后查看结果。"
     _restart_pending = True
     logger.info("已标记重启请求，等待 launcher 接管下一代 worker...", "重启")
-
-    async def _send_sigint() -> None:
-        await asyncio.sleep(0.3)
-        logger.info("发送重启信号...", "重启")
-        _thread.interrupt_main()
-
-    asyncio.create_task(_send_sigint())  # noqa: RUF006
-    return True, "执行重启命令成功"
+    return True, "重启请求已提交"
 
 
 async def request_restart(
@@ -118,6 +111,8 @@ async def request_restart(
     receipt_user_id: str | None = None,
     require_ticket: str | None = None,
 ) -> tuple[bool, str]:
+    if not os.getenv("ZHENXUN_LAUNCHER_PID"):
+        return False, "当前不是 launcher 托管模式，请手动重启真寻。"
     state = _read_restart_state()
     previous_state = copy.deepcopy(state)
     if require_ticket:
@@ -136,6 +131,8 @@ async def request_restart(
         }
     state[_PENDING_REQUEST_KEY] = pending_request
     state[_LAUNCHER_ACTION_KEY] = _ACTION_RESTART
+    # Give the ASGI server enough time to flush the successful HTTP response.
+    state[_LAUNCHER_NOT_BEFORE_KEY] = time.time() + 1.0
     if require_ticket:
         state.pop(_RESTART_TICKET_KEY, None)
 

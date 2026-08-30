@@ -17,6 +17,7 @@ import psutil
 from redis.asyncio import Redis
 from tortoise.backends.base.config_generator import expand_db_url
 
+from zhenxun.services.log import logger
 from zhenxun.utils.network import local_access_urls, private_ipv4_addresses
 
 from .model import CacheConfig, DatabaseConfig, NetworkConfig, ProbeResult
@@ -45,6 +46,17 @@ def _safe_failure(service: str, error: Exception, started_at: float) -> ProbeRes
         f"{service}连接失败（{error.__class__.__name__}）。",
         started_at,
     )
+
+
+def log_probe_result(service: str, mode: str, result: ProbeResult) -> None:
+    message = (
+        f"WebUI {service}测试完成 mode={mode} result={result.code} "
+        f"latency_ms={result.latency_ms}"
+    )
+    if result.status == "error":
+        logger.warning(message, "WebUIProbe")
+    else:
+        logger.info(message, "WebUIProbe")
 
 
 def resolve_sqlite_path(path_value: str, root: Path | None = None) -> Path:

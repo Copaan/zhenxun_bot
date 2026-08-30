@@ -50,9 +50,30 @@ _WRITER_NAME = "chat_history"
 _FLUSH_BATCH_SIZE = 200
 _FLUSH_MAX_PER_TICK = 1000
 _FLUSH_DB_TIMEOUT = 5.0
+_STRING_FIELDS = ("user_id", "group_id", "text", "plain_text", "bot_id", "platform")
+
+
+def _strip_nul(value: str) -> str:
+    return value.replace("\x00", "")
+
+
+def _sanitize_chat_history(record: ChatHistory) -> int:
+    changed = 0
+    for field in _STRING_FIELDS:
+        value = getattr(record, field, None)
+        if isinstance(value, str) and "\x00" in value:
+            setattr(record, field, _strip_nul(value))
+            changed += 1
+    return changed
 
 
 async def _write_chat_history_batch(batch: list[ChatHistory], reason: str) -> None:
+    sanitized = sum(_sanitize_chat_history(record) for record in batch)
+    if sanitized:
+        logger.warning(
+            f"聊天历史写库前清理了 {sanitized} 个含 NUL 的字符串字段",
+            "chat_history",
+        )
     await with_db_timeout(
         ChatHistory.bulk_create(batch, _FLUSH_BATCH_SIZE),
         timeout=_FLUSH_DB_TIMEOUT,
@@ -83,16 +104,27 @@ async def _(message: UniMsg, session: Uninfo):
     if is_overloaded():
         return
     try:
-        await append_low_priority_record(
-            _WRITER_NAME,
-            ChatHistory(
-                user_id=entity.user_id,
-                group_id=entity.group_id,
-                text=str(message),
-                plain_text=message.extract_plain_text(),
-                bot_id=session.self_id,
-                platform=session.platform,
+        from zhenxun.adapters.qq_official.context import get_current_official_context
+
+        official_context = get_current_official_context()
+        record = ChatHistory(
+            user_id=entity.user_id,
+            group_id=entity.group_id,
+            text=str(message),
+            plain_text=message.extract_plain_text(),
+            bot_id=(
+                official_context.storage_bot_id
+                if official_context is not None
+                else session.self_id
             ),
+            platform=session.platform,
         )
+        sanitized = _sanitize_chat_history(record)
+        if sanitized:
+            logger.warning(
+                f"聊天历史入队前清理了 {sanitized} 个含 NUL 的字符串字段",
+                "chat_history",
+            )
+        await append_low_priority_record(_WRITER_NAME, record)
     except Exception as e:
         logger.warning("存储聊天记录失败", "chat_history", e=e)

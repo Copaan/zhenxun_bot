@@ -5,6 +5,7 @@ from io import StringIO
 import json
 import os
 from pathlib import Path
+import time
 from typing import Any, Literal
 from urllib.parse import urlsplit, urlunsplit
 
@@ -24,10 +25,16 @@ from zhenxun.adapters.qq_official.config import (
     validate_builtin_ingress,
     validate_qq_config_data,
 )
+from zhenxun.services.log import logger
 from zhenxun.utils._restart_utils import issue_restart_ticket
 from zhenxun.utils.pydantic_compat import model_dump
 
 from ...base_model import Result
+from ...config_validation import (
+    ConfigurationValidationError,
+    validate_dotenv,
+    validation_detail,
+)
 from ...utils import authentication
 from ..configure.persistence import _write_transaction
 
@@ -50,6 +57,7 @@ class QQBotForm(BaseModel):
     id: str = Field(min_length=1, max_length=128)
     token: str | None = Field(default=None, max_length=512)
     secret: str | None = Field(default=None, max_length=512)
+    use_websocket: bool = False
 
 
 class ProtocolConfigurationUpdate(BaseModel):
@@ -79,16 +87,13 @@ def _revision(content: str) -> str:
 
 
 def _validate_env(content: str) -> None:
-    keys: set[str] = set()
-    for binding in parse_stream(StringIO(content)):
-        if binding.error:
-            raise HTTPException(status_code=422, detail="dotenv中存在无法解析的语句。")
-        if binding.key is None:
-            continue
-        key = binding.key.upper()
-        if key in keys:
-            raise HTTPException(status_code=422, detail="dotenv中存在重复配置键。")
-        keys.add(key)
+    try:
+        validate_dotenv(content)
+    except ConfigurationValidationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=validation_detail(exc, message="dotenv 配置校验失败。"),
+        ) from exc
 
 
 def _env_value(value: Any) -> str:
@@ -169,6 +174,11 @@ def _masked_configuration(content: str) -> dict[str, Any]:
                 "has_secret": bool(str(item.get("secret") or "").strip()),
             }
         )
+    bot_modes = {
+        str(item.get("id") or ""): bool(item.get("use_websocket", False))
+        for item in raw_bots
+        if isinstance(item, dict) and str(item.get("id") or "")
+    }
     base_url = str(values.get("QQ_WEBHOOK_PUBLIC_BASE_URL") or "").strip()
     return {
         "revision": _revision(content),
@@ -182,6 +192,7 @@ def _masked_configuration(content: str) -> dict[str, Any]:
             "enabled": str(values.get("QQ_ADAPTER_LOAD") or "").lower()
             in {"true", "1", "yes", "on"},
             "bots": bots,
+            "bot_modes": bot_modes,
             "webhook_mode": str(values.get("QQ_WEBHOOK_MODE") or "external"),
             "public_base_url": base_url,
             "callback_url": _callback_url(base_url),
@@ -209,17 +220,17 @@ def _resolve_bots(
         old = existing_by_id.get(app_id, {})
         token = (form.token or "").strip() or str(old.get("token") or "").strip()
         secret = (form.secret or "").strip() or str(old.get("secret") or "").strip()
-        if not token or not secret:
+        if not secret:
             raise HTTPException(
                 status_code=422,
-                detail=f"QQ Bot第{index + 1}项缺少Token或Secret。",
+                detail=f"QQ Bot第{index + 1}项缺少Secret。",
             )
         result.append(
             QQOfficialBotConfig(
                 id=app_id,
                 token=token,
                 secret=secret,
-                use_websocket=False,
+                use_websocket=form.use_websocket,
                 intent=QQOfficialIntent(c2c_group_at_messages=True),
             )
         )
@@ -227,6 +238,7 @@ def _resolve_bots(
 
 
 async def _probe_credential(app_id: str, secret: str) -> dict[str, str]:
+    started_at = time.perf_counter()
     try:
         async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=True) as client:
             auth = await client.post(
@@ -248,10 +260,21 @@ async def _probe_credential(app_id: str, secret: str) -> dict[str, str]:
             me.raise_for_status()
             data = me.json()
     except Exception as exc:
+        logger.warning(
+            "QQ Bot凭据测试失败 "
+            f"result={exc.__class__.__name__} "
+            f"latency_ms={round((time.perf_counter() - started_at) * 1000)}",
+            "QQOfficialProbe",
+        )
         raise HTTPException(
             status_code=422,
             detail=f"QQ Bot凭据验证失败（{exc.__class__.__name__}）。",
         ) from exc
+    logger.info(
+        "QQ Bot凭据测试成功 result=ready "
+        f"latency_ms={round((time.perf_counter() - started_at) * 1000)}",
+        "QQOfficialProbe",
+    )
     return {
         "app_id": app_id,
         "bot_id": str(data.get("id") or ""),
@@ -288,10 +311,9 @@ async def probe_qq_credential(payload: QQCredentialProbe) -> Result:
     }
     app_id = payload.id.strip()
     saved = existing.get(app_id, {})
-    token = (payload.token or "").strip() or str(saved.get("token") or "").strip()
     secret = (payload.secret or "").strip() or str(saved.get("secret") or "").strip()
-    if not token or not secret:
-        raise HTTPException(status_code=422, detail="QQ Bot缺少Token或Secret。")
+    if not secret:
+        raise HTTPException(status_code=422, detail="QQ Bot缺少Secret。")
     result = await _probe_credential(app_id, secret)
     return Result.ok(result, info="QQ Bot凭据验证成功。")
 
@@ -311,14 +333,9 @@ async def save_protocol_configuration(
         raise HTTPException(status_code=409, detail="配置已被外部修改，请重新加载。")
     values = dotenv_values(stream=StringIO(current))
     existing_bots = _parse_bots(values.get("QQ_BOTS"))
-    base_url = _public_base_url(
-        payload.qq_webhook_public_base_url, required=payload.qq_enabled
-    )
-
     changed: dict[str, Any] = {
         "QQ_ADAPTER_LOAD": payload.qq_enabled,
         "QQ_WEBHOOK_MODE": payload.qq_webhook_mode,
-        "QQ_WEBHOOK_PUBLIC_BASE_URL": base_url,
         "QQ_WEBHOOK_LISTEN_HOST": payload.qq_webhook_listen_host.strip(),
         "QQ_WEBHOOK_LISTEN_PORT": payload.qq_webhook_listen_port,
     }
@@ -328,8 +345,14 @@ async def save_protocol_configuration(
         changed["ONEBOT_ACCESS_TOKEN"] = payload.onebot_access_token
 
     bots: list[QQOfficialBotConfig] = []
+    base_url = ""
     if payload.qq_enabled:
         bots = _resolve_bots(payload.qq_bots, existing_bots)
+        has_webhook_bots = any(not bot.use_websocket for bot in bots)
+        base_url = _public_base_url(
+            payload.qq_webhook_public_base_url,
+            required=has_webhook_bots,
+        )
         config = QQOfficialConfig(
             qq_bots=bots,
             qq_verify_webhook=True,
@@ -369,6 +392,9 @@ async def save_protocol_configuration(
                 "QQ_WEBHOOK_TLS_KEYFILE": config.qq_webhook_tls_keyfile,
             }
         )
+    else:
+        base_url = str(values.get("QQ_WEBHOOK_PUBLIC_BASE_URL") or "").strip()
+    changed["QQ_WEBHOOK_PUBLIC_BASE_URL"] = base_url
 
     updated = _update_env(current, changed)
     _write_transaction([(_ENV_FILE, updated.encode("utf-8"))])

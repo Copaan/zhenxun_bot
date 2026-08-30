@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Any, Literal, get_args, get_origin
 
 from dotenv import dotenv_values
-from dotenv.parser import parse_stream
 from fastapi import APIRouter, HTTPException, Response
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
@@ -17,11 +16,17 @@ from ruamel.yaml import YAML
 
 from zhenxun.configs.config import Config
 from zhenxun.services.runtime_config_reload import reload_runtime_config
-from zhenxun.utils._restart_utils import issue_restart_ticket, request_restart
+from zhenxun.utils._restart_utils import issue_restart_ticket
 from zhenxun.utils.network import local_access_urls
-from zhenxun.utils.pydantic_compat import parse_as
 
 from ....base_model import Result
+from ....config_validation import (
+    ConfigurationValidationError,
+    validate_dotenv,
+    validate_simple_yaml,
+    validation_detail,
+)
+from ....restart_service import request_webui_restart
 from ....utils import authentication
 from ...configure.persistence import _write_transaction
 
@@ -57,6 +62,14 @@ class ConfigurationValidation(BaseModel):
     content: str
 
 
+def _validate_env(content: str) -> list[dict[str, Any]]:
+    return validate_dotenv(content)
+
+
+def _validate_simple(content: str) -> list[dict[str, Any]]:
+    return validate_simple_yaml(content)
+
+
 def _path(file: str) -> Path:
     if file == "env":
         return _ENV_FILE if _ENV_FILE.exists() else _ENV_TEMPLATE
@@ -73,48 +86,11 @@ def _revision(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
-def _validate_env(content: str) -> list[str]:
-    keys: set[str] = set()
-    for binding in parse_stream(StringIO(content)):
-        if binding.error:
-            raise ValueError("dotenv_invalid_statement")
-        if binding.key is None:
-            continue
-        normalized = binding.key.upper()
-        if normalized in keys:
-            raise ValueError("dotenv_duplicate_key")
-        keys.add(normalized)
-    return []
-
-
 def _yaml_parser() -> YAML:
     parser = YAML()
     parser.preserve_quotes = True
     parser.indent(mapping=2, sequence=4, offset=2)
     return parser
-
-
-def _validate_simple(content: str) -> list[str]:
-    data = _yaml_parser().load(StringIO(content)) or {}
-    if not isinstance(data, dict):
-        raise ValueError("yaml_top_level_mapping_required")
-    warnings: list[str] = []
-    registered = Config.get_data()
-    for module, values in data.items():
-        if module not in registered:
-            warnings.append(f"未知配置组将原样保留: {module}")
-            continue
-        if not isinstance(values, dict):
-            raise ValueError("yaml_group_mapping_required")
-        known = registered[module].configs
-        for key, value in values.items():
-            config = known.get(str(key).upper())
-            if config is None:
-                warnings.append(f"未知配置项将原样保留: {module}.{key}")
-                continue
-            if config.type is not None:
-                parse_as(config.type, value)
-    return warnings
 
 
 def _type_name(value_type: Any) -> tuple[str, list[str]]:
@@ -166,9 +142,11 @@ def _env_encode(value: Any) -> str:
 
 
 def _update_env(content: str, fields: dict[str, Any]) -> str:
-    _validate_env(content)
+    validate_dotenv(content)
     remaining = {key.upper(): value for key, value in fields.items()}
     output: list[str] = []
+    from dotenv.parser import parse_stream
+
     for binding in parse_stream(StringIO(content)):
         key = binding.key.upper() if binding.key else None
         if key in remaining:
@@ -203,6 +181,11 @@ def _update_simple(content: str, fields: dict[str, Any]) -> str:
 
 
 def _validation_error(file: str, error: Exception) -> HTTPException:
+    if isinstance(error, ConfigurationValidationError):
+        return HTTPException(
+            status_code=422,
+            detail=validation_detail(error, message=f"{file} 配置校验失败。"),
+        )
     code = str(error)
     messages = {
         "dotenv_invalid_statement": "dotenv 中存在无法解析的语句。",
@@ -270,9 +253,9 @@ async def get_configuration_file(file: str, response: Response) -> Result:
 async def validate_configuration(payload: ConfigurationValidation) -> Result:
     try:
         warnings = (
-            _validate_env(payload.content)
+            validate_dotenv(payload.content)
             if payload.file == "env"
-            else _validate_simple(payload.content)
+            else validate_simple_yaml(payload.content)
         )
     except Exception as error:
         raise _validation_error(payload.file, error) from error
@@ -308,7 +291,7 @@ async def update_configuration_file(
                 else _update_simple(current, payload.fields or {})
             )
         warnings = (
-            _validate_env(content) if file == "env" else _validate_simple(content)
+            validate_dotenv(content) if file == "env" else validate_simple_yaml(content)
         )
     except Exception as error:
         raise _validation_error(file, error) from error
@@ -369,10 +352,10 @@ async def update_configuration_file(
 async def restart_after_configuration() -> Result:
     if not os.getenv("ZHENXUN_LAUNCHER_PID"):
         return Result.fail("当前不是 launcher 托管模式，请手动重启真寻。", code=409)
-    ok, message = await request_restart(
+    ok, message, data = await request_webui_restart(
         "webui.settings", require_ticket="webui.settings"
     )
-    return Result.ok(info=message) if ok else Result.fail(message, code=409)
+    return Result.ok(data, info=message) if ok else Result.fail(message, code=409)
 
 
 __all__ = ["router"]

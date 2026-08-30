@@ -38,6 +38,7 @@ _STATUS_LOCK = asyncio.Lock()
 _JOB_LOCK = asyncio.Lock()
 _STATUS_CACHE: tuple[float, dict[str, Any]] | None = None
 _ACTIVE_TASK: asyncio.Task[None] | None = None
+_BLOCKED_BOT_RELEASES = {"0.2.4-fix"}
 
 _BOT_ROOT_FILES = (
     "pyproject.toml",
@@ -66,6 +67,23 @@ _ARCHIVES = {
 
 class UpdateServiceError(RuntimeError):
     pass
+
+
+def _normalized_release(value: object) -> str:
+    normalized = str(value or "").strip().lower()
+    return normalized[1:] if normalized.startswith("v") else normalized
+
+
+def _blocked_release_reason(
+    component: UpdateComponent, channel: UpdateChannel, value: object
+) -> str | None:
+    if (
+        component == "bot"
+        and channel == "release"
+        and _normalized_release(value) in _BLOCKED_BOT_RELEASES
+    ):
+        return "该版本存在已知兼容性问题，已禁止更新。"
+    return None
 
 
 def _now_iso() -> str:
@@ -178,6 +196,7 @@ def _component_status(
     current_version: str,
     current_commit: str | None,
     remote: dict[str, Any],
+    channel: UpdateChannel = "main",
 ) -> dict[str, Any]:
     latest_version = str(remote.get("version") or "unknown")
     latest_commit = str(remote.get("commit") or "").strip() or None
@@ -188,6 +207,7 @@ def _component_status(
         latest_commit if component == "webui" and latest_commit else latest_version
     )
     comparable = comparable_current != "unknown" and comparable_latest != "unknown"
+    block_reason = _blocked_release_reason(component, channel, latest_version)
     return {
         "component": component,
         "current_version": current_version,
@@ -199,7 +219,11 @@ def _component_status(
         "compatible": (
             component != "webui" or remote.get("api_version") == _WEBUI_API_VERSION
         ),
-        "update_available": comparable and comparable_current != comparable_latest,
+        "update_available": (
+            comparable and comparable_current != comparable_latest and not block_reason
+        ),
+        "blocked": bool(block_reason),
+        "block_reason": block_reason,
         "source": "official",
     }
 
@@ -240,12 +264,14 @@ async def check_updates(
             "cache_ttl_seconds": _STATUS_CACHE_SECONDS,
             "launcher_managed": bool(os.getenv("ZHENXUN_LAUNCHER_PID")),
             "components": {
-                "bot": _component_status("bot", bot_current, None, remote["bot"]),
+                "bot": _component_status(
+                    "bot", bot_current, None, remote["bot"], channel
+                ),
                 "resource": _component_status(
-                    "resource", resource_current, None, remote["resource"]
+                    "resource", resource_current, None, remote["resource"], channel
                 ),
                 "webui": _component_status(
-                    "webui", webui_current, webui_commit, remote["webui"]
+                    "webui", webui_current, webui_commit, remote["webui"], channel
                 ),
             },
             "errors": errors,
@@ -338,6 +364,8 @@ async def _latest_ref(component: UpdateComponent, channel: UpdateChannel) -> str
     ref = str(release.get("tag_name") or "").strip()
     if not ref:
         raise UpdateServiceError("release_not_found")
+    if _blocked_release_reason(component, channel, ref):
+        raise UpdateServiceError("release_blocked")
     return ref
 
 
@@ -436,7 +464,27 @@ def _clone_ref(
         check=False,
     )
     if result.returncode != 0:
-        raise UpdateServiceError("official_git_clone_failed")
+        stderr = (result.stderr or "").lower()
+        transport_markers = (
+            "could not resolve host",
+            "failed to connect",
+            "unable to access",
+            "connection reset",
+            "connection timed out",
+            "operation timed out",
+            "tls",
+            "rpc failed",
+            "early eof",
+            "http 502",
+            "http 503",
+            "http 504",
+        )
+        code = (
+            "git_transport_failed"
+            if any(marker in stderr for marker in transport_markers)
+            else "official_git_clone_failed"
+        )
+        raise UpdateServiceError(code)
     return destination
 
 
@@ -494,14 +542,35 @@ async def _prepare_job(job_id: str) -> None:
         if component == "bot" and _git_dirty() and not job["force"]:
             raise UpdateServiceError("working_tree_dirty")
         ref = await _latest_ref(component, job["channel"])
+        if _blocked_release_reason(component, job["channel"], ref):
+            raise UpdateServiceError("release_blocked")
         stage = _STAGING_ROOT / job_id
         if stage.exists():
             shutil.rmtree(stage)
         stage.mkdir(parents=True, exist_ok=True)
         checksum: str | None = None
         if job["method"] == "git":
-            root = await asyncio.to_thread(
-                _clone_ref, component, ref, stage / "source", job["source"]
+            attempted_sources = [job["source"]]
+            effective_source = job["source"]
+            try:
+                root = await asyncio.to_thread(
+                    _clone_ref, component, ref, stage / "source", job["source"]
+                )
+            except UpdateServiceError as exc:
+                if str(exc) != "git_transport_failed" or job["source"] != "aliyun":
+                    raise
+                attempted_sources.append("github")
+                effective_source = "github"
+                source_root = stage / "source"
+                if source_root.exists():
+                    shutil.rmtree(source_root)
+                root = await asyncio.to_thread(
+                    _clone_ref, component, ref, source_root, "github"
+                )
+            _update_job(
+                job_id,
+                attempted_sources=attempted_sources,
+                effective_source=effective_source,
             )
         else:
             archive = stage / "package.zip"
@@ -578,6 +647,10 @@ async def create_update_job(
             raise UpdateServiceError("pending_update_exists")
         if source == "aliyun" and method == "download":
             method = "git"
+        if component == "bot" and channel == "release":
+            ref = await _latest_ref(component, channel)
+            if _blocked_release_reason(component, channel, ref):
+                raise UpdateServiceError("release_blocked")
         job_id = uuid4().hex
         job = {
             "job_id": job_id,
@@ -585,6 +658,10 @@ async def create_update_job(
             "channel": channel,
             "method": method,
             "source": source,
+            "requested_method": method,
+            "requested_source": source,
+            "effective_source": None,
+            "attempted_sources": [],
             "force": force,
             "state": "queued",
             "progress": 0,
