@@ -10,9 +10,11 @@ from zhenxun.utils._build_image import BuildImage
 
 from ....base_model import Result, SystemFolderSize
 from ....utils import authentication, get_system_disk, validate_filename, validate_path
+from .configuration import router as configuration_router
 from .model import AddFile, DeleteFile, DirFile, RenameFile, SaveFile
 
 router = APIRouter(prefix="/system")
+router.include_router(configuration_router)
 
 IMAGE_TYPE = ["jpg", "jpeg", "png", "gif", "bmp", "webp", "svg"]
 

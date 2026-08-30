@@ -81,6 +81,8 @@ def build_database_url(config: DatabaseConfig, root: Path | None = None) -> str:
         raise ValueError("database_fields_incomplete")
     scheme = "mysql" if config.mode == "mysql" else "postgres"
     port = config.port or (3306 if scheme == "mysql" else 5432)
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
     username = quote(config.username, safe="")
     password = quote(config.password, safe="")
     database_name = quote(database, safe="")

@@ -23,7 +23,7 @@ default_menus = [
     MenuItem(name="插件商店", module="store", router="/store", icon="store"),
     MenuItem(name="好友/群组", module="manage", router="/manage", icon="user"),
     MenuItem(
-        name="数据库管理",
+        name="数据与缓存",
         module="database",
         router="/database",
         icon="database",
@@ -51,6 +51,12 @@ class MenuManager:
                     for item in stored_menu
                     if isinstance(item, dict) and item.get("module")
                 }
+                database_menu = stored_by_module.get("database")
+                if (
+                    isinstance(database_menu, dict)
+                    and database_menu.get("name") == "数据库管理"
+                ):
+                    database_menu["name"] = "数据与缓存"
                 self.menu = [
                     MenuItem(**stored_by_module.get(item.module, item.to_dict()))
                     for item in default_menus

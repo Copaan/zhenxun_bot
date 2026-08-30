@@ -1,5 +1,3 @@
-import contextlib
-
 from nonebot.permission import SUPERUSER
 from nonebot.plugin import PluginMetadata
 from nonebot.rule import to_me
@@ -9,9 +7,8 @@ from nonebot_plugin_session import EventSession
 
 from zhenxun.configs.config import Config
 from zhenxun.configs.utils import PluginExtraData, RegisterConfig
-from zhenxun.services.ai.config import get_llm_config
-from zhenxun.services.ai.llm.manager import clear_all_cache
 from zhenxun.services.log import logger
+from zhenxun.services.runtime_config_reload import reload_runtime_config
 from zhenxun.utils.enum import PluginType
 from zhenxun.utils.manager.priority_manager import PriorityLifecycle
 from zhenxun.utils.message import MessageUtils
@@ -96,22 +93,8 @@ def _reschedule_auto_reload_job() -> None:
     logger.debug(f"自动重载配置任务间隔已设置为 {seconds} 秒", "重载配置")
 
 
-async def _reload_plugin_limit_config() -> None:
-    from zhenxun.builtin_plugins.hooks.auth.auth_limit import LimitManager
-    from zhenxun.builtin_plugins.init.manager import manager
-
-    manager.init()
-    await manager.load_to_db()
-    await LimitManager.update_limits()
-
-
 async def _reload_runtime_config() -> None:
-    Config.reload()
-    get_llm_config.cache_clear()
-    clear_all_cache()
-    await _reload_plugin_limit_config()
-    with contextlib.suppress(Exception):
-        _reschedule_auto_reload_job()
+    await reload_runtime_config(_reschedule_auto_reload_job)
 
 
 @PriorityLifecycle.on_startup(priority=1)

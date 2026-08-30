@@ -24,13 +24,34 @@ async def _() -> Result[dict]:
         require("plugin_store")
         from zhenxun.builtin_plugins.plugin_store import StoreManager
 
-        plugin_list, extra_plugin_list = await StoreManager.get_data()
-        plugin_list = [
-            {**model_dump(plugin), "name": plugin.name, "id": idx}
-            for idx, plugin in enumerate(plugin_list + extra_plugin_list)
-        ]
-        modules = list((await StoreManager.get_installed_plugins()).keys())
-        return Result.ok({"install_module": modules, "plugin_list": plugin_list})
+        official_plugins, community_plugins = await StoreManager.get_data()
+        installed_plugins = await StoreManager.get_installed_plugins()
+        plugin_list = []
+        for idx, (plugin, source) in enumerate(
+            [(item, "official") for item in official_plugins]
+            + [(item, "community") for item in community_plugins]
+        ):
+            installed_version = installed_plugins.get(plugin.module)
+            plugin_list.append(
+                {
+                    **model_dump(plugin),
+                    "name": plugin.name,
+                    "id": idx,
+                    "source": source,
+                    "installed": installed_version is not None,
+                    "installed_version": installed_version,
+                    "update_available": bool(
+                        installed_version is not None
+                        and str(installed_version) != str(plugin.version)
+                    ),
+                }
+            )
+        return Result.ok(
+            {
+                "install_module": list(installed_plugins),
+                "plugin_list": plugin_list,
+            }
+        )
     except Exception as e:
         logger.error("获取插件商店插件信息失败", "WebUi", e=e)
         return Result.fail(f"获取插件商店插件信息失败: {type(e)}: {e}")

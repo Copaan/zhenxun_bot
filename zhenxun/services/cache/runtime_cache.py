@@ -2411,6 +2411,35 @@ def health_snapshot() -> dict[str, dict[str, Any]]:
     }
 
 
+async def refresh_all_runtime_caches() -> dict[str, bool]:
+    """Refresh authoritative runtime snapshots without clearing them first."""
+    caches = {
+        "plugin": PluginInfoMemoryCache,
+        "bot": BotMemoryCache,
+        "group": GroupMemoryCache,
+        "level": LevelUserMemoryCache,
+        "task": TaskInfoMemoryCache,
+        "plugin_limit": PluginLimitMemoryCache,
+        "ban": BanMemoryCache,
+    }
+
+    async def refresh(name: str, cache_cls: type) -> tuple[str, bool]:
+        try:
+            await cache_cls.refresh()
+            return name, True
+        except Exception as error:
+            RuntimeCacheMutation.mark_error(cache_cls, error)
+            logger.warning(
+                f"runtime cache refresh failed: {name}", LOG_COMMAND, e=error
+            )
+            return name, False
+
+    results = await asyncio.gather(
+        *(refresh(name, cache_cls) for name, cache_cls in caches.items())
+    )
+    return dict(results)
+
+
 def passive_status_snapshot(max_modules: int = 50) -> dict[str, Any]:
     """Return passive-task state from in-memory caches only.
 
