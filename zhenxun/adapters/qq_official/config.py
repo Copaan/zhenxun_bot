@@ -63,6 +63,7 @@ class QQOfficialConfig(BaseModel):
     qq_webhook_listen_port: int = 443
     qq_webhook_tls_certfile: str = ""
     qq_webhook_tls_keyfile: str = ""
+    qq_webhook_public_base_url: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,6 +121,7 @@ def load_qq_launcher_settings(project_root: Path) -> QQLauncherSettings:
         "QQ_WEBHOOK_LISTEN_PORT",
         "QQ_WEBHOOK_TLS_CERTFILE",
         "QQ_WEBHOOK_TLS_KEYFILE",
+        "QQ_WEBHOOK_PUBLIC_BASE_URL",
         "HOST",
         "PORT",
     ):
@@ -159,6 +161,9 @@ def load_qq_launcher_settings(project_root: Path) -> QQLauncherSettings:
             ),
             qq_webhook_tls_certfile=str(values.get("QQ_WEBHOOK_TLS_CERTFILE") or ""),
             qq_webhook_tls_keyfile=str(values.get("QQ_WEBHOOK_TLS_KEYFILE") or ""),
+            qq_webhook_public_base_url=str(
+                values.get("QQ_WEBHOOK_PUBLIC_BASE_URL") or ""
+            ),
         )
     except ValidationError as exc:
         raise QQOfficialConfigError(

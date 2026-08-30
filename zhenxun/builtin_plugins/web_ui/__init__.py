@@ -1,3 +1,4 @@
+import os
 import secrets
 
 from fastapi import APIRouter, Depends, FastAPI
@@ -112,6 +113,12 @@ async def _():
 
             def emit_ready_banner() -> None:
                 try:
+                    if not os.getenv("ZHENXUN_LAUNCHER_PID"):
+                        from zhenxun.update_service import (
+                            finalize_applied_update,
+                        )
+
+                        finalize_applied_update()
                     emit_webui_console_banner(
                         str(driver.config.host),
                         int(driver.config.port),

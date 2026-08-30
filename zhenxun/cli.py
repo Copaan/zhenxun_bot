@@ -176,6 +176,10 @@ def _ensure_project_root() -> Path:
 def _run_worker() -> None:
     """启动 Bot worker（必须在项目目录下执行）"""
     project_root = _ensure_project_root()
+    from zhenxun.update_service import apply_pending_update
+
+    if apply_pending_update(project_root):
+        os.execv(sys.executable, [sys.executable, "-m", "zhenxun.cli", "run-worker"])
     _sync_env_missing_items(project_root)
 
     import contextlib
@@ -310,6 +314,12 @@ def _worker_health_url(settings) -> str:
     return f"http://{host}:{settings.worker_port}/qq/healthz"
 
 
+def _worker_webui_health_url(settings) -> str:
+    connect_host = settings.worker_connect_host
+    host = f"[{connect_host}]" if ":" in connect_host else connect_host
+    return f"http://{host}:{settings.worker_port}/zhenxun/api/configure/status"
+
+
 def _worker_is_ready(settings) -> bool:
     try:
         with urllib.request.urlopen(
@@ -327,6 +337,23 @@ def _wait_worker_ready(worker: subprocess.Popen, settings) -> bool:
             return False
         if _worker_is_ready(settings):
             return True
+        time.sleep(WORKER_READY_POLL_INTERVAL)
+    return False
+
+
+def _wait_worker_webui_ready(worker: subprocess.Popen, settings) -> bool:
+    deadline = time.monotonic() + WORKER_READY_TIMEOUT
+    while time.monotonic() < deadline:
+        if worker.poll() is not None:
+            return False
+        try:
+            with urllib.request.urlopen(
+                _worker_webui_health_url(settings), timeout=1.0
+            ) as response:
+                if response.status == 200:
+                    return True
+        except (OSError, urllib.error.URLError):
+            pass
         time.sleep(WORKER_READY_POLL_INTERVAL)
     return False
 
@@ -426,21 +453,20 @@ def _terminate_named_process(proc: subprocess.Popen, name: str) -> None:
 
 def _run_launcher() -> None:
     cwd = _ensure_project_root()
+    from zhenxun.update_service import (
+        applied_update_pending,
+        apply_pending_update,
+        finalize_applied_update,
+        rollback_applied_update,
+    )
+
+    pending_bot_verification = apply_pending_update(cwd) or applied_update_pending()
     _sync_env_missing_items(cwd)
     from zhenxun.adapters.qq_official.config import (
         load_qq_launcher_settings,
         validate_builtin_ingress,
         validate_qq_config_data,
     )
-
-    qq_settings = load_qq_launcher_settings(cwd)
-    builtin_ingress = bool(
-        qq_settings.enabled and qq_settings.config.qq_webhook_mode == "builtin_https"
-    )
-    if qq_settings.enabled:
-        validate_qq_config_data(qq_settings.config)
-    if builtin_ingress:
-        validate_builtin_ingress(qq_settings)
     from zhenxun.utils.restart_state import (
         clear_launcher_restart_signal,
         consume_launcher_restart_signal,
@@ -449,6 +475,7 @@ def _run_launcher() -> None:
     clear_launcher_restart_signal()
     current_worker: subprocess.Popen | None = None
     ingress: subprocess.Popen | None = None
+    ingress_signature: tuple[str, int, str, str, str] | None = None
     stop_requested = False
     stop_signal: int | None = None
 
@@ -483,6 +510,30 @@ def _run_launcher() -> None:
     while True:
         if stop_requested:
             raise SystemExit(128 + int(stop_signal or signal.SIGINT))
+        qq_settings = load_qq_launcher_settings(cwd)
+        builtin_ingress = bool(
+            qq_settings.enabled
+            and qq_settings.config.qq_webhook_mode == "builtin_https"
+        )
+        desired_ingress_signature = (
+            (
+                qq_settings.config.qq_webhook_listen_host,
+                qq_settings.config.qq_webhook_listen_port,
+                qq_settings.config.qq_webhook_tls_certfile,
+                qq_settings.config.qq_webhook_tls_keyfile,
+                _worker_health_url(qq_settings),
+            )
+            if builtin_ingress
+            else None
+        )
+        if ingress is not None and ingress_signature != desired_ingress_signature:
+            _terminate_named_process(ingress, "QQ HTTPS ingress")
+            ingress = None
+            ingress_signature = None
+        if qq_settings.enabled:
+            validate_qq_config_data(qq_settings.config)
+        if builtin_ingress:
+            validate_builtin_ingress(qq_settings, check_port=ingress is None)
         worker_env = os.environ.copy()
         worker_env["ZHENXUN_LAUNCHER_PID"] = str(os.getpid())
         worker = subprocess.Popen(
@@ -492,6 +543,18 @@ def _run_launcher() -> None:
             env=worker_env,
         )
         current_worker = worker
+        if pending_bot_verification:
+            _launcher_log("waiting for updated worker health verification")
+            if not _wait_worker_webui_ready(worker, qq_settings):
+                _terminate_worker(worker)
+                current_worker = None
+                _launcher_log("updated worker failed health check, rolling back")
+                rollback_applied_update()
+                pending_bot_verification = False
+                continue
+            finalize_applied_update()
+            pending_bot_verification = False
+            _launcher_log("updated worker passed health verification")
         if builtin_ingress and ingress is None:
             _launcher_log(
                 "waiting for QQ worker readiness before opening HTTPS ingress"
@@ -505,6 +568,7 @@ def _run_launcher() -> None:
                 creationflags=_get_worker_creationflags(),
                 env=_ingress_environment(),
             )
+            ingress_signature = desired_ingress_signature
             time.sleep(0.25)
             if ingress.poll() is not None:
                 code = ingress.returncode
@@ -561,6 +625,7 @@ def _run_launcher() -> None:
                 current_worker = None
 
         if restart_requested or consume_launcher_restart_signal():
+            pending_bot_verification = apply_pending_update(cwd)
             continue
         if ingress is not None:
             _terminate_named_process(ingress, "QQ HTTPS ingress")

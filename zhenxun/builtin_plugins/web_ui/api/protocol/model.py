@@ -14,6 +14,7 @@ class ProtocolStatus(BaseModel):
     qq_official_enabled: bool
     qq_official_connected: bool
     qq_webhook_mode: Literal["external", "builtin_https"]
+    qq_webhook_callback_url: str | None = None
     connections: list[ProtocolConnection]
     onebot_v11_reverse_ws_path: str = "/onebot/v11/ws"
     qq_webhook_path: str = "/qq/webhook"

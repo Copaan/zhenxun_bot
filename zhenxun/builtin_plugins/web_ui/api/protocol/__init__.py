@@ -7,9 +7,11 @@ from zhenxun.configs.config import BotConfig
 
 from ...base_model import Result
 from ...utils import authentication
+from .configuration import router as configuration_router
 from .model import ProtocolConnection, ProtocolStatus
 
 router = APIRouter(prefix="/protocol")
+router.include_router(configuration_router)
 
 
 def _platform(adapter_name: str) -> str:
@@ -40,6 +42,11 @@ def build_protocol_status() -> ProtocolStatus:
         qq_official_enabled=BotConfig.qq_adapter_load,
         qq_official_connected="qq_official" in platforms,
         qq_webhook_mode=qq_config.qq_webhook_mode,
+        qq_webhook_callback_url=(
+            f"{qq_config.qq_webhook_public_base_url.rstrip('/')}/qq/webhook"
+            if qq_config.qq_webhook_public_base_url
+            else None
+        ),
         connections=connections,
     )
 
