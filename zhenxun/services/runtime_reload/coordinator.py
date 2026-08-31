@@ -24,8 +24,11 @@ class RuntimeChangeCoordinator:
         self._lock = asyncio.Lock()
 
     async def process(self, paths: set[Path]) -> RuntimeOperation | None:
-        changed = self.manager.claim_content_changes({path.resolve() for path in paths})
+        resolved = {path.resolve() for path in paths}
+        changed = self.manager.claim_content_changes(resolved)
         if not changed:
+            if _CONFIG_FILE in resolved:
+                logger.debug("配置文件事件已由当前运行时操作处理，跳过重复重载")
             return None
         async with self._lock:
             if changed & _ENV_FILES:
@@ -36,6 +39,7 @@ class RuntimeChangeCoordinator:
             ):
                 return await self.manager.request_dependency_restart(changed)
             if _CONFIG_FILE in changed:
+                logger.debug("检测到外部配置文件内容变化，开始运行时重载")
                 try:
                     await reload_runtime_config()
                 except Exception as e:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from io import StringIO
 import json
 import os
@@ -11,6 +12,7 @@ from typing import Any
 from ruamel.yaml import YAML
 
 from zhenxun.configs.config import Config
+from zhenxun.services.log import logger
 
 from ...passwords import hash_password
 from .data_source import build_database_url, resolve_network_host
@@ -114,10 +116,26 @@ def _write_transaction(files: list[tuple[Path, bytes]]) -> None:
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(rollback_name, path)
+        _mark_runtime_files_processed(path for path, _ in files)
         raise
+    else:
+        _mark_runtime_files_processed(path for path, _ in files)
     finally:
         for temporary in staged.values():
             temporary.unlink(missing_ok=True)
+
+
+def _mark_runtime_files_processed(paths: Iterable[Path]) -> None:
+    try:
+        from zhenxun.services.runtime_reload import plugin_runtime_manager
+
+        for path in paths:
+            plugin_runtime_manager.mark_content_processed(Path(path))
+    except Exception as error:
+        logger.warning(
+            f"WebUI内部配置写入摘要登记失败: {error.__class__.__name__}",
+            "WebUi",
+        )
 
 
 def persist_webui_credentials(

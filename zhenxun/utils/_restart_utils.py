@@ -99,8 +99,8 @@ def _validate_restart_ticket(
 async def _schedule_restart() -> tuple[bool, str]:
     global _restart_pending
     if _restart_pending:
-        logger.warning("重启已在进行中，忽略重复请求。", "重启")
-        return False, "重启已在进行中，请稍后查看结果。"
+        logger.info("重启已在进行中，复用当前重启请求。", "重启")
+        return True, "重启已在进行中，正在继续等待当前重启完成。"
     _restart_pending = True
     logger.info("已标记重启请求，等待 launcher 接管下一代 worker...", "重启")
     return True, "重启请求已提交"
@@ -115,6 +115,8 @@ async def request_restart(
 ) -> tuple[bool, str]:
     if not os.getenv("ZHENXUN_LAUNCHER_PID"):
         return False, "当前不是 launcher 托管模式，请手动重启真寻。"
+    if _restart_pending:
+        return await _schedule_restart()
     state = _read_restart_state()
     previous_state = copy.deepcopy(state)
     if require_ticket:
@@ -183,6 +185,8 @@ def _validated_dependency_paths(paths: set[Path]) -> list[str]:
 async def request_dependency_restart(source: str, paths: set[Path]) -> tuple[bool, str]:
     if not os.getenv("ZHENXUN_LAUNCHER_PID"):
         return False, "当前不是 launcher 托管模式，请手动同步依赖并重启真寻。"
+    if _restart_pending:
+        return await _schedule_restart()
     try:
         dependency_paths = _validated_dependency_paths(paths)
     except ValueError:

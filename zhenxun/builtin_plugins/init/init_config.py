@@ -1,4 +1,5 @@
 import hashlib
+from io import StringIO
 import json
 from pathlib import Path
 
@@ -57,7 +58,30 @@ def _handle_config(plugin: Plugin, exists_module: list[str]):
                 exists_module.append(f"{module}:{reg_config.key}".lower())
 
 
-def _generate_simple_config(exists_module: list[str]):
+def _normalize_config_keys(config_keys: list[str]) -> list[str]:
+    return sorted(set(config_keys) | set(Config.add_module))
+
+
+def _dump_yaml(data: CommentedMap) -> str:
+    stream = StringIO()
+    _yaml.dump(data, stream)
+    return stream.getvalue()
+
+
+def _write_simple_config_if_changed(data: CommentedMap) -> bool:
+    content = _dump_yaml(data)
+    current = (
+        SIMPLE_CONFIG_FILE.read_text(encoding="utf8")
+        if SIMPLE_CONFIG_FILE.exists()
+        else None
+    )
+    if current == content:
+        return False
+    SIMPLE_CONFIG_FILE.write_text(content, encoding="utf8")
+    return True
+
+
+def _generate_simple_config(exists_module: list[str]) -> bool:
     """
     生成简易配置
 
@@ -67,7 +91,6 @@ def _generate_simple_config(exists_module: list[str]):
     # 读取用户配置
     _data = {}
     _tmp_data = {}
-    exists_module += Config.add_module
     if SIMPLE_CONFIG_FILE.exists():
         _data = _yaml.load(SIMPLE_CONFIG_FILE.open(encoding="utf8"))
     # 将简易配置文件的数据填充到配置文件
@@ -101,16 +124,17 @@ def _generate_simple_config(exists_module: list[str]):
             for k in _data[module].keys():
                 help_text += f"{k}: {Config[module].configs[k].help}" + "\n"
             _data.yaml_set_comment_before_after_key(after=help_text[:-1], key=module)
-        with SIMPLE_CONFIG_FILE.open("w", encoding="utf8") as wf:
-            _yaml.dump(_data, wf)
+        return _write_simple_config_if_changed(_data)
     except Exception as e:
         logger.error("生成简易配置注释错误...", e=e)
-    if temp_file.exists():
-        temp_file.unlink()
+        return False
+    finally:
+        if temp_file.exists():
+            temp_file.unlink()
 
 
 @PriorityLifecycle.on_startup(priority=0)
-def reconcile_config_runtime():
+def reconcile_config_runtime() -> set[Path]:
     """
     初始化插件数据配置
     """
@@ -119,10 +143,11 @@ def reconcile_config_runtime():
     for plugin in get_loaded_plugins():
         if plugin.metadata:
             _handle_config(plugin, exists_module)
+    exists_module = _normalize_config_keys(exists_module)
     if Config.is_empty():
-        _generate_simple_config(exists_module)
+        changed = _generate_simple_config(exists_module)
         Config.reload()
-        return
+        return {SIMPLE_CONFIG_FILE.resolve()} if changed else set()
     # 计算当前插件配置指纹，未变化则跳过重写
     fingerprint = hashlib.md5(
         json.dumps(sorted(exists_module), ensure_ascii=False).encode()
@@ -134,9 +159,9 @@ def reconcile_config_runtime():
         and SIMPLE_CONFIG_FILE.exists()
     ):
         logger.debug("插件配置无变化，跳过配置文件重写", "初始化配置")
-        _generate_simple_config(exists_module)
+        changed = _generate_simple_config(exists_module)
         Config.reload()
-        return
+        return {SIMPLE_CONFIG_FILE.resolve()} if changed else set()
     Config.save()
     _data: CommentedMap = _yaml.load(plugins2config_file.open(encoding="utf8"))
     for module in _data.keys():
@@ -148,8 +173,9 @@ def reconcile_config_runtime():
     # 存完插件基本设置
     with plugins2config_file.open("w", encoding="utf8") as wf:
         _yaml.dump(_data, wf)
-    _generate_simple_config(exists_module)
+    changed = _generate_simple_config(exists_module)
     Config.reload()
     # 保存指纹
     _CONFIG_HASH_FILE.parent.mkdir(parents=True, exist_ok=True)
     _CONFIG_HASH_FILE.write_text(fingerprint, encoding="utf-8")
+    return {SIMPLE_CONFIG_FILE.resolve()} if changed else set()

@@ -1258,7 +1258,13 @@ class PluginRuntimeManager:
                 reconcile_task_runtime,
             )
 
-            reconcile_config_runtime()
+            managed_config_writes = reconcile_config_runtime() or set()
+            for path in managed_config_writes:
+                self.mark_content_processed(path)
+            if managed_config_writes:
+                logger.debug(
+                    "插件元数据产生的配置写入已纳入当前运行时操作，" "跳过后续重复重载"
+                )
             await reconcile_plugin_runtime()
             await reconcile_task_runtime()
         except Exception as e:
