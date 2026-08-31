@@ -15,6 +15,8 @@ class ProtocolQQError(BaseModel):
     code: str
     message: str
     provider_code: str | None = None
+    provider_explanation: str | None = None
+    suggestion: str | None = None
     http_status: int | None = None
     trace_id: str | None = None
     retryable: bool = False

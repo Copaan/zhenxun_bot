@@ -7,7 +7,7 @@ from nonebot.adapters import Bot
 from nonebot.drivers import Driver
 from tortoise.functions import Count
 
-from zhenxun.adapters.qq_official.diagnostics import safe_avatar_url
+from zhenxun.adapters.qq_official.diagnostics import public_identity, safe_avatar_url
 from zhenxun.models.bot_connect_log import BotConnectLog
 from zhenxun.models.bot_console import BotConsole
 from zhenxun.models.chat_history import ChatHistory
@@ -113,8 +113,15 @@ class ApiDataSource:
             if isinstance(login_info, dict) and login_info.get("nickname")
             else getattr(self_info, "username", None) or runtime_id
         )
+        cached_identity = (
+            public_identity(runtime_id) if platform == "qq_official" else None
+        )
+        if platform == "qq_official" and nickname == runtime_id and cached_identity:
+            nickname = cached_identity.username or runtime_id
         avatar_url = (
-            safe_avatar_url(getattr(self_info, "avatar", None)) or ""
+            safe_avatar_url(getattr(self_info, "avatar", None))
+            or (cached_identity.avatar_url if cached_identity else None)
+            or ""
             if platform == "qq_official"
             else AVA_URL.format(runtime_id)
         )

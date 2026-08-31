@@ -19,6 +19,7 @@ from ruamel.yaml import YAML
 from zhenxun.services.ai.config import get_llm_config
 from zhenxun.services.ai.config.models import LLMConfig, ProviderConfig
 from zhenxun.services.ai.llm.adapters.factory import LLMAdapterFactory
+from zhenxun.services.ai.llm.manager import get_default_api_base_for_type
 from zhenxun.services.ai.llm.system.capabilities import get_model_capabilities
 from zhenxun.services.log import logger
 from zhenxun.services.runtime_config_reload import reload_runtime_config
@@ -530,10 +531,16 @@ def _configuration_view(config: LLMConfig, revision: str) -> dict[str, Any]:
             return _safe_model_data(value)
         return jsonable_encoder(value) if value is not None else normalized
 
+    api_types = sorted(LLMAdapterFactory.list_supported_types())
     return {
         "revision": revision,
         "schema": model_json_schema(LLMConfig),
-        "api_types": sorted(LLMAdapterFactory.list_supported_types()),
+        "api_types": api_types,
+        "default_api_bases": {
+            api_type: default_base
+            for api_type in api_types
+            if (default_base := get_default_api_base_for_type(api_type))
+        },
         "discovery_api_types": sorted((*_OPENAI_DISCOVERY_TYPES, "gemini")),
         "providers": [
             _provider_view(provider, raw_provider(provider.name))
@@ -766,7 +773,54 @@ async def update_section(section: str, payload: SectionUpdate) -> Result:
                 if advanced_key in payload.value:
                     update_value(advanced_key, payload.value[advanced_key])
         elif section == "model_groups" and key:
-            _ai_set(ai, key, deepcopy(payload.value))
+            value = payload.value
+            if isinstance(value, list):
+                groups: dict[str, list[str]] = {}
+                for index, row in enumerate(value):
+                    if not isinstance(row, dict):
+                        raise _configuration_error(
+                            "model_group_invalid",
+                            "模型路由组格式无效。",
+                            f"AI.MODEL_GROUPS.{index}",
+                        )
+                    name = str(row.get("name") or "").strip()
+                    if not name:
+                        raise _configuration_error(
+                            "model_group_name_required",
+                            "请填写路由组名称。",
+                            f"AI.MODEL_GROUPS.{index}.name",
+                        )
+                    if name in groups:
+                        raise _configuration_error(
+                            "model_group_name_duplicate",
+                            f"路由组名称 {name} 重复。",
+                            f"AI.MODEL_GROUPS.{index}.name",
+                        )
+                    targets = row.get("targets", [])
+                    if not isinstance(targets, list) or not all(
+                        isinstance(target, str) for target in targets
+                    ):
+                        raise _configuration_error(
+                            "model_group_targets_invalid",
+                            "模型路由目标必须是字符串列表。",
+                            f"AI.MODEL_GROUPS.{index}.targets",
+                        )
+                    groups[name] = targets
+                value = groups
+            elif isinstance(value, dict):
+                if any(not str(name).strip() for name in value):
+                    raise _configuration_error(
+                        "model_group_name_required",
+                        "请填写路由组名称。",
+                        "AI.MODEL_GROUPS",
+                    )
+            else:
+                raise _configuration_error(
+                    "model_groups_invalid",
+                    "模型路由组必须是列表或映射。",
+                    "AI.MODEL_GROUPS",
+                )
+            _ai_set(ai, key, deepcopy(value))
         elif key:
             update_value(key, payload.value)
 
@@ -805,8 +859,15 @@ async def discover_models(payload: ProviderDiscoveryRequest) -> Result:
     temporary_key = (payload.api_key or "").strip()
     if provider is not None and not temporary_key:
         requested_type = payload.api_type or provider.api_type
-        requested_base = (payload.api_base or provider.api_base or "").rstrip("/")
-        saved_base = (provider.api_base or "").rstrip("/")
+        saved_base = (
+            provider.api_base or get_default_api_base_for_type(provider.api_type) or ""
+        ).rstrip("/")
+        requested_base = (
+            payload.api_base
+            or get_default_api_base_for_type(requested_type)
+            or provider.api_base
+            or ""
+        ).rstrip("/")
         if requested_type != provider.api_type or requested_base != saved_base:
             raise HTTPException(
                 status_code=422,
@@ -816,7 +877,11 @@ async def discover_models(payload: ProviderDiscoveryRequest) -> Result:
                 },
             )
     api_type = payload.api_type or (provider.api_type if provider else "")
-    api_base = payload.api_base or (provider.api_base if provider else None)
+    api_base = (
+        payload.api_base
+        or (provider.api_base if provider else None)
+        or get_default_api_base_for_type(api_type)
+    )
     saved_keys = (
         []
         if provider is None

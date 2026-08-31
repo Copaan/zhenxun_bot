@@ -32,6 +32,7 @@ from .diagnostics import (
     connection_diagnostic,
     public_error_from_exception,
     update_connection_diagnostic,
+    update_public_identity,
 )
 from .dispatcher import QQWebhookDispatcher, dispatch_routing_key
 
@@ -114,6 +115,12 @@ class ZhenxunQQAdapter(QQAdapter):
                     update_connection_diagnostic(bot_info.id, "webhook", "authorizing")
                     try:
                         bot.self_info = await bot.me()
+                        update_public_identity(
+                            bot_info.id,
+                            bot_id=getattr(bot.self_info, "id", None),
+                            username=getattr(bot.self_info, "username", None),
+                            avatar_url=getattr(bot.self_info, "avatar", None),
+                        )
                     except Exception as exc:
                         public_error = public_error_from_exception(
                             exc, stage="credential"
@@ -273,6 +280,33 @@ class ZhenxunQQAdapter(QQAdapter):
     @override
     async def run_bot_websocket(self, bot_info: Any) -> None:
         bot = ZhenxunQQBot(self, bot_info.id, bot_info)
+        update_connection_diagnostic(bot_info.id, "websocket", "authorizing")
+        try:
+            bot.self_info = await bot.me()
+            update_public_identity(
+                bot_info.id,
+                bot_id=getattr(bot.self_info, "id", None),
+                username=getattr(bot.self_info, "username", None),
+                avatar_url=getattr(bot.self_info, "avatar", None),
+            )
+        except Exception as exc:
+            public_error = public_error_from_exception(exc, stage="credential")
+            update_connection_diagnostic(
+                bot_info.id,
+                "websocket",
+                "failed",
+                error=public_error,
+            )
+            logger.error(
+                "QQ 官方 Bot 信息预热失败（API me） "
+                f"code={public_error.code} "
+                f"provider_code={public_error.provider_code or '-'} "
+                f"http_status={public_error.http_status or '-'} "
+                f"trace_id={public_error.trace_id or '-'}",
+                "QQOfficial",
+                target=bot_info.id,
+            )
+            return
         update_connection_diagnostic(bot_info.id, "websocket", "gateway")
         try:
             gateway_info = await bot.shard_url_get()

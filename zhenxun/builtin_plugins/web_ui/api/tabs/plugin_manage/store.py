@@ -8,6 +8,7 @@ from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 from nonebot import require
 from nonebot.compat import model_dump
+from nonebot.utils import path_to_module_name
 
 from zhenxun.services.log import logger
 from zhenxun.services.runtime_reload import plugin_runtime_manager
@@ -18,9 +19,35 @@ from .model import PluginIr, PluginReloadPayload
 
 router = APIRouter(prefix="/store")
 _STORE_OPERATION_LOCK = asyncio.Lock()
+_AI_CHAT_PLUGIN_MODULES = frozenset(
+    {
+        "ai",
+        "bym_ai",
+        "chat_toolkit",
+        "leekchat",
+        "multimodal_ai",
+        "zhenxun_plugin_chatinter",
+        "zhipu_toolkit",
+    }
+)
+
+
+def _plugin_capabilities(plugin) -> list[str]:
+    capabilities = {
+        str(item).strip()
+        for item in getattr(plugin, "capabilities", [])
+        if str(item).strip()
+    }
+    if plugin.module in _AI_CHAT_PLUGIN_MODULES:
+        capabilities.add("ai_chat")
+    return sorted(capabilities)
 
 
 class StoreOperationBusyError(RuntimeError):
+    pass
+
+
+class PluginRuntimeModuleError(ValueError):
     pass
 
 
@@ -65,6 +92,55 @@ def _changed_plugin_files(
     return changed
 
 
+def _resolve_runtime_module_name(path: Path) -> str:
+    """Resolve an installed store path using the same naming as NoneBot scanning."""
+    project_root = Path.cwd().resolve()
+    plugin_root = (project_root / "zhenxun" / "plugins").resolve()
+    resolved_path = path.resolve()
+    try:
+        resolved_path.relative_to(plugin_root)
+    except ValueError as e:
+        raise PluginRuntimeModuleError("plugin_runtime_module_invalid") from e
+
+    if resolved_path.is_file() and resolved_path.suffix == ".py":
+        entrypoint = resolved_path
+    elif resolved_path.is_dir() and (resolved_path / "__init__.py").is_file():
+        entrypoint = resolved_path / "__init__.py"
+    else:
+        raise PluginRuntimeModuleError("plugin_runtime_module_invalid")
+
+    try:
+        module_name = path_to_module_name(entrypoint)
+    except ValueError as e:
+        raise PluginRuntimeModuleError("plugin_runtime_module_invalid") from e
+    if not module_name or any(
+        not part.isidentifier() for part in module_name.split(".")
+    ):
+        raise PluginRuntimeModuleError("plugin_runtime_module_invalid")
+    return module_name
+
+
+def _store_operation_info(action: str, plugin_name: str, operation: dict) -> str:
+    mode = operation.get("apply_mode")
+    if mode == "hot_reloaded":
+        return f"插件 {plugin_name} 已{action}并热加载"
+    if mode == "restart_requested":
+        return f"插件 {plugin_name} 已{action}，已请求受控重启"
+    if mode == "restart_pending":
+        return f"插件 {plugin_name} 已{action}，等待重启后生效"
+    return f"插件 {plugin_name} 文件已{action}，但运行时应用失败"
+
+
+def _log_store_operation(action: str, plugin_name: str, operation: dict) -> str:
+    info = _store_operation_info(action, plugin_name, operation)
+    if operation.get("apply_mode") == "failed":
+        reason = operation.get("reason") or "plugin_runtime_apply_failed"
+        logger.error(f"{info} reason={reason}", "插件商店")
+    else:
+        logger.info(info, "插件商店")
+    return info
+
+
 async def _apply_store_change(
     store_manager,
     plugin_info,
@@ -83,8 +159,9 @@ async def _apply_store_change(
         include_requirements=include_requirements,
     )
     if newly_installed:
+        module_name = _resolve_runtime_module_name(path)
         operation = await plugin_runtime_manager.load_new_plugin(
-            plugin_info.module_path,
+            module_name,
             path,
             changed,
         )
@@ -133,6 +210,7 @@ async def _() -> Result[dict]:
                     "name": plugin.name,
                     "id": idx,
                     "source": source,
+                    "capabilities": _plugin_capabilities(plugin),
                     "installed": installed_version is not None,
                     "installed_version": installed_version,
                     "update_available": bool(
@@ -173,7 +251,7 @@ async def _(param: PluginIr) -> Result:
                 plugin_info, is_external=is_external
             )
             before = _snapshot_plugin_files(path)
-            result = await StoreManager.add_plugin(str(param.id))  # type: ignore
+            await StoreManager.add_plugin(str(param.id))  # type: ignore
             operation = await _apply_store_change(
                 StoreManager,
                 plugin_info,
@@ -181,10 +259,16 @@ async def _(param: PluginIr) -> Result:
                 before,
                 newly_installed=True,
             )
-        logger.info(result.replace("\n", "；"), "插件商店")
-        return Result.ok(operation, info=f"插件 {plugin_info.name} 安装完成")
+        info = _log_store_operation("安装", plugin_info.name, operation)
+        return Result.ok(operation, info=info)
     except StoreOperationBusyError:
         return Result.fail("plugin_operation_in_progress", code=409)
+    except PluginRuntimeModuleError:
+        logger.error(
+            "插件安装路径无法转换为有效运行时模块名",
+            "插件商店",
+        )
+        return Result.fail("plugin_runtime_module_invalid", code=400)
     except Exception as e:
         return Result.fail(f"安装插件失败: {type(e)}: {e}")
 
@@ -209,12 +293,12 @@ async def _(param: PluginIr) -> Result:
                 plugin_info, is_external=is_external
             )
             before = _snapshot_plugin_files(path)
-            result = await StoreManager.update_plugin(str(param.id))  # type: ignore
+            await StoreManager.update_plugin(str(param.id))  # type: ignore
             operation = await _apply_store_change(
                 StoreManager, plugin_info, is_external, before
             )
-        logger.info(result.replace("\n", "；"), "插件商店")
-        return Result.ok(operation, info=f"插件 {plugin_info.name} 更新完成")
+        info = _log_store_operation("更新", plugin_info.name, operation)
+        return Result.ok(operation, info=info)
     except StoreOperationBusyError:
         return Result.fail("plugin_operation_in_progress", code=409)
     except Exception as e:
@@ -241,7 +325,7 @@ async def _(param: PluginIr) -> Result:
                 plugin_info, is_external=is_external
             )
             before = _snapshot_plugin_files(path)
-            result = await StoreManager.remove_plugin(str(param.id))  # type: ignore
+            await StoreManager.remove_plugin(str(param.id))  # type: ignore
             operation = await _apply_store_change(
                 StoreManager,
                 plugin_info,
@@ -249,8 +333,8 @@ async def _(param: PluginIr) -> Result:
                 before,
                 include_requirements=False,
             )
-        logger.info(result.replace("\n", "；"), "插件商店")
-        return Result.ok(operation, info=f"插件 {plugin_info.name} 已卸载")
+        info = _log_store_operation("卸载", plugin_info.name, operation)
+        return Result.ok(operation, info=info)
     except StoreOperationBusyError:
         return Result.fail("plugin_operation_in_progress", code=409)
     except Exception as e:

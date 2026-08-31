@@ -5,6 +5,7 @@ import nonebot
 from zhenxun.adapters.qq_official.config import QQOfficialConfig
 from zhenxun.adapters.qq_official.diagnostics import (
     connection_diagnostic,
+    public_identity,
     safe_avatar_url,
 )
 from zhenxun.configs.config import BotConfig
@@ -70,6 +71,7 @@ def build_protocol_status() -> ProtocolStatus:
             except Exception:
                 self_info = None
             diagnostic = connection_diagnostic(app_id)
+            cached_identity = public_identity(app_id)
             connected = runtime_bot is not None
             error = (
                 ProtocolQQError(**diagnostic.error.to_dict())
@@ -79,9 +81,18 @@ def build_protocol_status() -> ProtocolStatus:
             qq_bots.append(
                 ProtocolQQBotStatus(
                     app_id=app_id,
-                    bot_id=(str(getattr(self_info, "id", "") or "") or None),
-                    username=(str(getattr(self_info, "username", "") or "") or None),
-                    avatar_url=safe_avatar_url(getattr(self_info, "avatar", None)),
+                    bot_id=(
+                        str(getattr(self_info, "id", "") or "")
+                        or (cached_identity.bot_id if cached_identity else None)
+                    ),
+                    username=(
+                        str(getattr(self_info, "username", "") or "")
+                        or (cached_identity.username if cached_identity else None)
+                    ),
+                    avatar_url=(
+                        safe_avatar_url(getattr(self_info, "avatar", None))
+                        or (cached_identity.avatar_url if cached_identity else None)
+                    ),
                     mode=("websocket" if configured_bot.use_websocket else "webhook"),
                     state=(
                         "connected"

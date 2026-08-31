@@ -28,6 +28,7 @@ from zhenxun.adapters.qq_official.config import (
 from zhenxun.adapters.qq_official.diagnostics import (
     public_error_from_exception,
     safe_avatar_url,
+    update_public_identity,
 )
 from zhenxun.services.log import logger
 from zhenxun.utils._restart_utils import issue_restart_ticket
@@ -287,6 +288,12 @@ async def _probe_credential(app_id: str, secret: str) -> dict[str, str]:
         "QQ Bot凭据测试成功 result=ready "
         f"latency_ms={round((time.perf_counter() - started_at) * 1000)}",
         "QQOfficialProbe",
+    )
+    update_public_identity(
+        app_id,
+        bot_id=data.get("id"),
+        username=data.get("username"),
+        avatar_url=data.get("avatar"),
     )
     return {
         "app_id": app_id,

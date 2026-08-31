@@ -1,7 +1,7 @@
 from typing import Any, Literal
 
 from nonebot.compat import model_dump
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from zhenxun.utils.enum import PluginType
 
@@ -59,6 +59,8 @@ class StorePluginInfo(BaseModel):
     """github链接"""
     ali_url: str | None = None
     """ali链接"""
+    capabilities: list[str] = Field(default_factory=list)
+    """WebUI 可发现的插件能力标签"""
 
     @property
     def plugin_type_name(self):
