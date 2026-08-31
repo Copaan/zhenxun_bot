@@ -41,7 +41,7 @@ class RuntimeChangeCoordinator:
             if _CONFIG_FILE in changed:
                 logger.debug("检测到外部配置文件内容变化，开始运行时重载")
                 try:
-                    await reload_runtime_config()
+                    operation = await reload_runtime_config()
                 except Exception as e:
                     logger.error("配置文件热加载失败，已保留上一代运行状态", e=e)
                     operation = RuntimeOperation(
@@ -53,12 +53,6 @@ class RuntimeChangeCoordinator:
                     )
                     self.manager.last_operation = operation
                     return operation
-                operation = RuntimeOperation(
-                    ApplyMode.CONFIG_RELOADED,
-                    "completed",
-                    ["config.yaml"],
-                    generation=self.manager.generation,
-                )
                 self.manager.last_operation = operation
                 return operation
             if any("data/web_ui/public" in path.as_posix() for path in changed):

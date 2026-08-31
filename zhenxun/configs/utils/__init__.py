@@ -72,6 +72,23 @@ class NoSuchConfig(Exception):
     pass
 
 
+class SimpleConfigValidationError(ValueError):
+    """Validation error for one registered config.yaml field."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        path: str | None = None,
+        line: int | None = None,
+        column: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.path = path
+        self.line = line
+        self.column = column
+
+
 class ConfigGroup(BaseModel):
     """
     配置组
@@ -150,36 +167,103 @@ class ConfigsManager:
             self._load_simple_data(raise_on_error=True)
             self._apply_simple_data(warn_unknown=False)
 
-    def _load_simple_data(self, *, raise_on_error: bool = False) -> None:
+    @staticmethod
+    def _mapping_location(mapping: Any, key: Any) -> tuple[int | None, int | None]:
+        try:
+            line, column = mapping.lc.key(key)
+            return int(line) + 1, int(column) + 1
+        except (AttributeError, KeyError, TypeError, ValueError):
+            return None, None
+
+    def _validate_simple_candidate(self, simple_data: dict) -> None:
+        for module, module_data in simple_data.items():
+            config_group = self._data.get(str(module))
+            if config_group is None:
+                continue
+            if not isinstance(module_data, dict):
+                line, column = self._mapping_location(simple_data, module)
+                raise SimpleConfigValidationError(
+                    f"配置组 {module} 必须是映射。",
+                    path=str(module),
+                    line=line,
+                    column=column,
+                )
+            for raw_key, value in module_data.items():
+                key = str(raw_key).upper()
+                config_key = self._find_mapping_key(config_group.configs, key)
+                if config_key is None:
+                    continue
+                config = config_group.configs[config_key]
+                if value is None:
+                    continue
+                try:
+                    if config.arg_parser:
+                        config.arg_parser(value)
+                    elif config.type:
+                        if _is_pydantic_type(config.type):
+                            parse_as(config.type, value)
+                        else:
+                            cattrs.structure(value, config.type)
+                except Exception as error:
+                    line, column = self._mapping_location(module_data, raw_key)
+                    raise SimpleConfigValidationError(
+                        f"配置项 {module}.{key} 的值不符合声明类型。",
+                        path=f"{module}.{key}",
+                        line=line,
+                        column=column,
+                    ) from error
+
+    def _load_simple_data(self, *, raise_on_error: bool = False) -> bool:
         if not self._simple_file.exists():
             self._simple_data = {}
-            return
+            return True
         try:
             with self._simple_file.open(encoding="utf8") as f:
                 simple_data = _yaml.load(f) or {}
         except ScannerError as e:
+            mark = getattr(e, "problem_mark", None)
+            line = int(mark.line) + 1 if mark is not None else None
+            column = int(mark.column) + 1 if mark is not None else None
             message = (
                 f"{e}\n**********************************************\n"
                 f"****** 可能为config.yaml配置文件填写不规范 ******\n"
                 f"**********************************************"
             )
             if raise_on_error:
-                raise ScannerError(message) from e
+                raise SimpleConfigValidationError(
+                    "config.yaml YAML 语法无效。",
+                    line=line,
+                    column=column,
+                ) from e
             logger.warning(f"读取config.yaml失败，已跳过本次重载: {message}", e=e)
-            return
+            return False
         except Exception as e:
             if raise_on_error:
+                mark = getattr(e, "problem_mark", None)
+                if mark is not None:
+                    raise SimpleConfigValidationError(
+                        "config.yaml YAML 语法无效。",
+                        line=int(mark.line) + 1,
+                        column=int(mark.column) + 1,
+                    ) from e
                 raise RuntimeError(f"读取config.yaml失败: {e}") from e
             logger.warning(f"读取config.yaml失败，已跳过本次重载: {e}", e=e)
-            return
+            return False
         if not isinstance(simple_data, dict):
             message = "config.yaml 顶层必须为字典，已忽略当前内容。"
             if raise_on_error:
                 raise ValueError(message)
             logger.warning(message)
-            self._simple_data = {}
-            return
+            return False
+        try:
+            self._validate_simple_candidate(simple_data)
+        except SimpleConfigValidationError as e:
+            if raise_on_error:
+                raise
+            logger.warning(f"读取config.yaml失败，已跳过本次重载: {e}", e=e)
+            return False
         self._simple_data = simple_data
+        return True
 
     @staticmethod
     def _find_mapping_key(data: dict, key: str) -> str | None:
@@ -473,9 +557,35 @@ class ConfigsManager:
         with open(path, "w", encoding="utf8") as f:
             _yaml.dump(save_data, f)
 
-    def reload(self):
+    def snapshot_runtime_values(self) -> tuple[dict, dict[str, dict[str, Any]]]:
+        """Capture mutable config values for transactional runtime reloads."""
+        values = {
+            module: {
+                key: copy.deepcopy(config.value)
+                for key, config in group.configs.items()
+            }
+            for module, group in self._data.items()
+        }
+        return copy.deepcopy(self._simple_data), values
+
+    def restore_runtime_values(
+        self, snapshot: tuple[dict, dict[str, dict[str, Any]]]
+    ) -> None:
+        """Restore a snapshot created by snapshot_runtime_values()."""
+        simple_data, values = snapshot
+        self._simple_data = copy.deepcopy(simple_data)
+        for module, module_values in values.items():
+            group = self._data.get(module)
+            if group is None:
+                continue
+            for key, value in module_values.items():
+                if config := group.configs.get(key):
+                    config.value = copy.deepcopy(value)
+
+    def reload(self, *, strict: bool = False) -> None:
         """重新加载配置文件"""
-        self._load_simple_data()
+        if not self._load_simple_data(raise_on_error=strict):
+            return
         self._apply_simple_data(warn_unknown=True)
         self.save()
 

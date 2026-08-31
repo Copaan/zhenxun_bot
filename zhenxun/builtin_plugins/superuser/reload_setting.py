@@ -5,9 +5,14 @@ from nonebot_plugin_alconna import Alconna, Arparma, on_alconna
 from nonebot_plugin_session import EventSession
 
 from zhenxun.configs.config import Config
-from zhenxun.configs.utils import PluginExtraData, RegisterConfig
+from zhenxun.configs.utils import (
+    PluginExtraData,
+    RegisterConfig,
+    SimpleConfigValidationError,
+)
 from zhenxun.services.log import logger
 from zhenxun.services.runtime_config_reload import reload_runtime_config
+from zhenxun.services.runtime_reload.models import ApplyMode, RuntimeOperation
 from zhenxun.utils.enum import PluginType
 from zhenxun.utils.manager.priority_manager import PriorityLifecycle
 from zhenxun.utils.message import MessageUtils
@@ -73,8 +78,31 @@ def _get_auto_reload_interval() -> int:
     return seconds
 
 
-async def _reload_runtime_config() -> None:
-    await reload_runtime_config()
+async def _reload_runtime_config() -> RuntimeOperation:
+    return await reload_runtime_config(submit_restart=False)
+
+
+def _validation_error_message(error: Exception) -> str:
+    if isinstance(error, SimpleConfigValidationError):
+        location = ""
+        if error.line is not None:
+            location = f"第 {error.line} 行"
+            if error.column is not None:
+                location += f"、第 {error.column} 列"
+        path = f"（{error.path}）" if error.path else ""
+        suffix = f"，{location}" if location else ""
+        return f"config.yaml 校验失败{path}{suffix}：{error}"
+    return f"config.yaml 重载失败（{error.__class__.__name__}）。"
+
+
+def _operation_message(operation: RuntimeOperation) -> str:
+    changed = "、".join(operation.config_keys)
+    changed_text = f"\n变更项：{changed}" if changed else "\n配置内容无语义变化。"
+    if operation.mode in {ApplyMode.RESTART_PENDING, ApplyMode.RESTART_REQUESTED}:
+        return f"配置已读取，但相关运行组件需要重启后生效。{changed_text}"
+    if operation.mode is ApplyMode.HOT_RELOADED:
+        return f"配置已热加载，相关插件已重新加载。{changed_text}"
+    return f"配置已热加载。{changed_text}"
 
 
 @PriorityLifecycle.on_startup(priority=1)
@@ -88,6 +116,13 @@ def _init_auto_reload_job() -> None:
 
 @_matcher.handle()
 async def _(session: EventSession, arparma: Arparma):
-    await _reload_runtime_config()
+    try:
+        operation = await _reload_runtime_config()
+    except Exception as error:
+        logger.warning("手动重载config.yaml失败", "重载配置", e=error)
+        await MessageUtils.build_message(_validation_error_message(error)).send(
+            reply_to=True
+        )
+        return
     logger.debug("自动重载配置文件", arparma.header_result, session=session)
-    await MessageUtils.build_message("重载完成!").send(reply_to=True)
+    await MessageUtils.build_message(_operation_message(operation)).send(reply_to=True)

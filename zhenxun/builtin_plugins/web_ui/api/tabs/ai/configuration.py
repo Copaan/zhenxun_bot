@@ -413,14 +413,14 @@ async def _persist_unlocked(
     original = _CONFIG_FILE.read_bytes() if _CONFIG_FILE.exists() else None
     try:
         _write_transaction([(_CONFIG_FILE, content.encode("utf-8"))])
-        await reload_runtime_config()
+        await reload_runtime_config(submit_restart=False)
     except Exception as error:
         if original is None:
             _CONFIG_FILE.unlink(missing_ok=True)
         else:
             _write_transaction([(_CONFIG_FILE, original)])
         try:
-            await reload_runtime_config()
+            await reload_runtime_config(submit_restart=False)
         except Exception:
             pass
         raise HTTPException(

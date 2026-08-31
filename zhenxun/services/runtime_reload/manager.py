@@ -1298,19 +1298,36 @@ class PluginRuntimeManager:
         except Exception as e:
             logger.warning(f"插件代际缓存刷新失败: {type(e).__name__}")
 
-    async def reload_config_consumers(self) -> RuntimeOperation | None:
+    async def reload_config_consumers(
+        self,
+        changed_dependencies: set[tuple[str, str]],
+        *,
+        submit_restart: bool = True,
+    ) -> RuntimeOperation | None:
         affected = {
-            unit.plugin_id for unit in self.units.values() if unit.config_dependencies
+            unit.plugin_id
+            for unit in self.units.values()
+            if any(
+                dependency in changed_dependencies
+                or (dependency[0], "*") in changed_dependencies
+                for dependency in unit.config_dependencies
+            )
         }
         if not affected:
             return None
+        logger.debug(
+            f"配置变更匹配到 {len(affected)} 个导入期消费者，"
+            f"处理方式: {'自动协调' if submit_restart else '等待用户确认'}"
+        )
         if any(
             self.units[plugin_id].classification
             is not ReloadClassification.HOT_RELOADABLE
             for plugin_id in affected
         ):
             return await self.request_restart(
-                affected, "import_time_config_consumer_requires_restart"
+                affected,
+                "import_time_config_consumer_requires_restart",
+                submit_launcher=submit_restart,
             )
         return await self._reload_units(affected)
 
@@ -1340,11 +1357,17 @@ class PluginRuntimeManager:
         self.claim_content_changes({path.resolve()})
 
     async def request_restart(
-        self, affected: set[str], reason: str
+        self,
+        affected: set[str],
+        reason: str,
+        *,
+        submit_launcher: bool = True,
     ) -> RuntimeOperation:
         self.pending_restart.add(reason)
         mode = ApplyMode.RESTART_PENDING
-        if bool(__import__("os").environ.get("ZHENXUN_LAUNCHER_PID")):
+        if submit_launcher and bool(
+            __import__("os").environ.get("ZHENXUN_LAUNCHER_PID")
+        ):
             try:
                 from zhenxun.utils._restart_utils import request_restart
 

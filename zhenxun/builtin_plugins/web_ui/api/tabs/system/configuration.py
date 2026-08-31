@@ -16,6 +16,7 @@ from ruamel.yaml import YAML
 
 from zhenxun.configs.config import Config
 from zhenxun.services.runtime_config_reload import reload_runtime_config
+from zhenxun.services.runtime_reload.models import ApplyMode, RuntimeOperation
 from zhenxun.utils._restart_utils import issue_restart_ticket
 from zhenxun.utils.network import local_access_urls
 from zhenxun.utils.pydantic_compat import (
@@ -331,10 +332,13 @@ async def update_configuration_file(
         raise _validation_error(file, error) from error
 
     original = target.read_bytes() if target.exists() else None
+    operation: RuntimeOperation | None = None
     try:
         _write_transaction([(target, content.encode("utf-8"))])
         if file == "simple":
-            await reload_runtime_config()
+            operation = await reload_runtime_config(submit_restart=False)
+            if operation.mode is ApplyMode.FAILED:
+                raise RuntimeError(operation.reason or "config_consumer_reload_failed")
     except Exception as error:
         if original is None:
             target.unlink(missing_ok=True)
@@ -342,7 +346,7 @@ async def update_configuration_file(
             _write_transaction([(target, original)])
         if file == "simple":
             try:
-                await reload_runtime_config()
+                await reload_runtime_config(submit_restart=False)
             except Exception:
                 pass
         raise HTTPException(
@@ -351,7 +355,11 @@ async def update_configuration_file(
         ) from error
 
     launcher_managed = bool(os.getenv("ZHENXUN_LAUNCHER_PID"))
-    if file == "env" and launcher_managed:
+    restart_required = file == "env" or bool(
+        operation
+        and operation.mode in {ApplyMode.RESTART_PENDING, ApplyMode.RESTART_REQUESTED}
+    )
+    if restart_required and launcher_managed:
         issue_restart_ticket("webui.settings", ttl_seconds=10 * 60)
     access_urls: list[str] = []
     access_targets: list[dict[str, str]] = []
@@ -371,15 +379,32 @@ async def update_configuration_file(
         {
             "file": file,
             "revision": _revision(content),
-            "changed_keys": sorted((payload.fields or {}).keys()),
+            "changed_keys": (
+                operation.config_keys
+                if operation is not None
+                else sorted((payload.fields or {}).keys())
+            ),
             "warnings": warnings,
-            "hot_reloaded": file == "simple",
-            "restart_required": file == "env",
-            "restart_available": file == "env" and launcher_managed,
+            "apply_mode": (
+                operation.mode.value if operation is not None else "restart_pending"
+            ),
+            "hot_reloaded": bool(
+                operation
+                and operation.mode
+                in {ApplyMode.CONFIG_RELOADED, ApplyMode.HOT_RELOADED}
+            ),
+            "restart_required": restart_required,
+            "restart_available": restart_required and launcher_managed,
+            "affected": operation.changed if operation is not None else [],
+            "reason": operation.reason if operation is not None else None,
             "access_urls": access_urls,
             "access_targets": access_targets,
         },
-        info="配置已保存并热加载。" if file == "simple" else "环境配置已保存。",
+        info=(
+            "配置已保存，需要重启后生效。"
+            if restart_required
+            else "配置已保存并热加载。"
+        ),
     )
 
 

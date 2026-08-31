@@ -60,6 +60,7 @@ class RuntimeOperation:
     changed: list[str]
     reason: str | None = None
     generation: int = 0
+    config_keys: list[str] = field(default_factory=list)
 
     def public_dict(self) -> dict[str, Any]:
         return {
@@ -68,4 +69,5 @@ class RuntimeOperation:
             "changed": self.changed,
             "reason": self.reason,
             "generation": self.generation,
+            "config_keys": self.config_keys,
         }

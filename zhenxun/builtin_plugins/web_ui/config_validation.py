@@ -92,6 +92,8 @@ def _location(mapping: Any, key: Any) -> tuple[int | None, int | None]:
 
 
 def _validate_registered_value(config: Any, value: Any) -> None:
+    if value is None:
+        return
     if config.arg_parser:
         config.arg_parser(value)
         return
