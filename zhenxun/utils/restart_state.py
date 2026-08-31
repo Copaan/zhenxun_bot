@@ -8,7 +8,9 @@ from typing import Any
 _RESTART_STATE_FILE = Path() / "data" / ".restart_state.json"
 _LAUNCHER_ACTION_KEY = "launcher_action"
 _ACTION_RESTART = "restart"
+_ACTION_SYNC_DEPENDENCIES = "sync_dependencies_restart"
 _LAUNCHER_NOT_BEFORE_KEY = "launcher_not_before"
+_DEPENDENCY_PATHS_KEY = "dependency_paths"
 
 
 def _ensure_state_parent() -> None:
@@ -40,15 +42,24 @@ def write_restart_state(state: dict[str, Any]) -> None:
 
 
 def consume_launcher_restart_signal() -> bool:
+    return consume_launcher_action() is not None
+
+
+def consume_launcher_action() -> tuple[str, list[str]] | None:
     state = read_restart_state()
-    if state.get(_LAUNCHER_ACTION_KEY) != _ACTION_RESTART:
-        return False
+    action = state.get(_LAUNCHER_ACTION_KEY)
+    if action not in {_ACTION_RESTART, _ACTION_SYNC_DEPENDENCIES}:
+        return None
     if time.time() < float(state.get(_LAUNCHER_NOT_BEFORE_KEY, 0)):
-        return False
+        return None
+    paths = state.get(_DEPENDENCY_PATHS_KEY, [])
+    if not isinstance(paths, list) or not all(isinstance(item, str) for item in paths):
+        paths = []
     state.pop(_LAUNCHER_ACTION_KEY, None)
     state.pop(_LAUNCHER_NOT_BEFORE_KEY, None)
+    state.pop(_DEPENDENCY_PATHS_KEY, None)
     write_restart_state(state)
-    return True
+    return str(action), paths
 
 
 def clear_launcher_restart_signal() -> None:
@@ -57,4 +68,5 @@ def clear_launcher_restart_signal() -> None:
         return
     state.pop(_LAUNCHER_ACTION_KEY, None)
     state.pop(_LAUNCHER_NOT_BEFORE_KEY, None)
+    state.pop(_DEPENDENCY_PATHS_KEY, None)
     write_restart_state(state)

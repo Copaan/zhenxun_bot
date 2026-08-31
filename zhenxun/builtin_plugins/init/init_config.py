@@ -110,7 +110,7 @@ def _generate_simple_config(exists_module: list[str]):
 
 
 @PriorityLifecycle.on_startup(priority=0)
-def _():
+def reconcile_config_runtime():
     """
     初始化插件数据配置
     """

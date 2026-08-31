@@ -13,7 +13,15 @@ router = APIRouter(dependencies=[Depends(require_private_request)])
 async def index():
     return FileResponse(
         ZhenxunRepoManager.config.WEBUI_PATH / "index.html",
-        headers={"Cache-Control": "no-cache"},
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@router.get("/version.json")
+async def version_manifest():
+    return FileResponse(
+        ZhenxunRepoManager.config.WEBUI_PATH / "version.json",
+        headers={"Cache-Control": "no-store"},
     )
 
 

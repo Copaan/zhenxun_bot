@@ -4667,6 +4667,7 @@ dependencies = [
     { name = "tortoise-orm" },
     { name = "ujson" },
     { name = "uvloop", marker = "sys_platform != 'win32'" },
+    { name = "watchfiles" },
 ]
 
 [package.dev-dependencies]
@@ -4727,6 +4728,7 @@ requires-dist = [
     { name = "tortoise-orm", specifier = ">=0.20.0,<0.21.0" },
     { name = "ujson", specifier = ">=5.9.0" },
     { name = "uvloop", marker = "sys_platform != 'win32'", specifier = ">=0.21.0" },
+    { name = "watchfiles", specifier = ">=1.1.1,<2.0.0" },
 ]
 
 [package.metadata.requires-dev]

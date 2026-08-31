@@ -2,7 +2,6 @@ from nonebot.permission import SUPERUSER
 from nonebot.plugin import PluginMetadata
 from nonebot.rule import to_me
 from nonebot_plugin_alconna import Alconna, Arparma, on_alconna
-from nonebot_plugin_apscheduler import scheduler
 from nonebot_plugin_session import EventSession
 
 from zhenxun.configs.config import Config
@@ -74,32 +73,17 @@ def _get_auto_reload_interval() -> int:
     return seconds
 
 
-def _reschedule_auto_reload_job() -> None:
-    seconds = _get_auto_reload_interval()
-    if scheduler.get_job(AUTO_RELOAD_JOB_ID):
-        scheduler.reschedule_job(
-            AUTO_RELOAD_JOB_ID,
-            trigger="interval",
-            seconds=seconds,
-        )
-    else:
-        scheduler.add_job(
-            _auto_reload_config,
-            "interval",
-            seconds=seconds,
-            id=AUTO_RELOAD_JOB_ID,
-            replace_existing=True,
-        )
-    logger.debug(f"自动重载配置任务间隔已设置为 {seconds} 秒", "重载配置")
-
-
 async def _reload_runtime_config() -> None:
-    await reload_runtime_config(_reschedule_auto_reload_job)
+    await reload_runtime_config()
 
 
 @PriorityLifecycle.on_startup(priority=1)
 def _init_auto_reload_job() -> None:
-    _reschedule_auto_reload_job()
+    if Config.get_config("reload_setting", "AUTO_RELOAD"):
+        logger.info(
+            "AUTO_RELOAD 已由文件监听接管，旧定时轮询配置不再生效",
+            "重载配置",
+        )
 
 
 @_matcher.handle()
@@ -107,9 +91,3 @@ async def _(session: EventSession, arparma: Arparma):
     await _reload_runtime_config()
     logger.debug("自动重载配置文件", arparma.header_result, session=session)
     await MessageUtils.build_message("重载完成!").send(reply_to=True)
-
-
-async def _auto_reload_config() -> None:
-    if Config.get_config("reload_setting", "AUTO_RELOAD"):
-        await _reload_runtime_config()
-        logger.debug("已自动重载配置文件...")

@@ -139,7 +139,7 @@ async def create_schedule(task: Task):
 
 
 @PriorityLifecycle.on_startup(priority=5)
-async def _():
+async def reconcile_task_runtime():
     """
     初始化插件数据配置
     """

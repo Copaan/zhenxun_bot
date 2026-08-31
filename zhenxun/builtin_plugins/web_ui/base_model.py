@@ -100,6 +100,8 @@ class SystemStatus(BaseModel):
     memory: float
     disk: float
     check_time: datetime
+    runtime_generation: int = 0
+    webui_revision: str = ""
 
 
 class SystemFolderSize(BaseModel):

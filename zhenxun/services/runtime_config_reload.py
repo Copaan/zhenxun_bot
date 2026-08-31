@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import contextlib
+from pathlib import Path
 
 from zhenxun.configs.config import Config
 from zhenxun.services.ai.config import get_llm_config
@@ -24,6 +25,10 @@ async def reload_runtime_config(
     if reschedule is not None:
         with contextlib.suppress(Exception):
             reschedule()
+    from zhenxun.services.runtime_reload import plugin_runtime_manager
+
+    plugin_runtime_manager.mark_content_processed(Path("data/config.yaml"))
+    await plugin_runtime_manager.reload_config_consumers()
 
 
 __all__ = ["reload_runtime_config"]

@@ -89,7 +89,7 @@ async def _handle_setting(
 
 
 @PriorityLifecycle.on_startup(priority=4)
-async def _():
+async def reconcile_plugin_runtime():
     """
     初始化插件数据配置
     """

@@ -13,12 +13,14 @@ from ....utils import authentication, get_system_disk, validate_filename, valida
 from .configuration import router as configuration_router
 from .model import AddFile, DeleteFile, DirFile, RenameFile, SaveFile
 from .restart import router as restart_router
+from .runtime import router as runtime_router
 from .update import router as update_router
 
 router = APIRouter(prefix="/system")
 router.include_router(configuration_router)
 router.include_router(update_router)
 router.include_router(restart_router)
+router.include_router(runtime_router)
 
 IMAGE_TYPE = ["jpg", "jpeg", "png", "gif", "bmp", "webp", "svg"]
 

@@ -151,6 +151,10 @@ class PluginIr(BaseModel):
     """插件id"""
 
 
+class PluginReloadPayload(BaseModel):
+    module: str = Field(..., min_length=1, max_length=200, description="插件模块名")
+
+
 class BatchUpdateResult(BaseModel):
     """
     批量更新插件结果

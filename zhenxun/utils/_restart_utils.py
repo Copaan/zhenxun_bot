@@ -18,7 +18,9 @@ _RESTART_TICKET_KEY = "restart_ticket"
 _PENDING_REQUEST_KEY = "pending_request"
 _LAUNCHER_ACTION_KEY = "launcher_action"
 _ACTION_RESTART = "restart"
+_ACTION_SYNC_DEPENDENCIES = "sync_dependencies_restart"
 _LAUNCHER_NOT_BEFORE_KEY = "launcher_not_before"
+_DEPENDENCY_PATHS_KEY = "dependency_paths"
 
 _restart_pending: bool = False
 
@@ -151,6 +153,62 @@ async def request_restart(
         return False, message
 
     logger.info(f"收到重启请求，来源: {source}", "重启")
+    return True, message
+
+
+def _validated_dependency_paths(paths: set[Path]) -> list[str]:
+    root = Path().resolve()
+    root_files = {
+        (root / "pyproject.toml").resolve(),
+        (root / "uv.lock").resolve(),
+    }
+    plugin_roots = [
+        (root / "zhenxun" / "plugins").resolve(),
+        (root / "zhenxun" / "builtin_plugins").resolve(),
+    ]
+    result: list[str] = []
+    for raw_path in paths:
+        path = raw_path.resolve()
+        if path in root_files:
+            result.append(path.relative_to(root).as_posix())
+            continue
+        if path.name not in {"requirement.txt", "requirements.txt"} or not any(
+            path.is_relative_to(base) for base in plugin_roots
+        ):
+            raise ValueError("dependency_path_not_allowed")
+        result.append(path.relative_to(root).as_posix())
+    return sorted(set(result))
+
+
+async def request_dependency_restart(source: str, paths: set[Path]) -> tuple[bool, str]:
+    if not os.getenv("ZHENXUN_LAUNCHER_PID"):
+        return False, "当前不是 launcher 托管模式，请手动同步依赖并重启真寻。"
+    try:
+        dependency_paths = _validated_dependency_paths(paths)
+    except ValueError:
+        return False, "依赖路径不在允许范围内。"
+    if not dependency_paths:
+        return await request_restart(source)
+
+    state = _read_restart_state()
+    previous_state = copy.deepcopy(state)
+    state[_PENDING_REQUEST_KEY] = {
+        "source": source,
+        "requested_at": time.time(),
+    }
+    state[_LAUNCHER_ACTION_KEY] = _ACTION_SYNC_DEPENDENCIES
+    state[_DEPENDENCY_PATHS_KEY] = dependency_paths
+    state[_LAUNCHER_NOT_BEFORE_KEY] = time.time() + 1.0
+    try:
+        _write_restart_state(state)
+    except Exception as e:
+        logger.error(f"写入依赖重启状态失败: {e}", "重启")
+        return False, "写入依赖重启状态失败。"
+    ok, message = await _schedule_restart()
+    if not ok:
+        _write_restart_state(previous_state)
+        return False, message
+    logger.info("收到同步依赖后重启请求", "重启")
     return True, message
 
 

@@ -224,6 +224,10 @@ def _run_worker() -> None:
         render_playwright={"channel": htmlrender_browser_channel},
     )
 
+    from zhenxun.services.runtime_reload import plugin_runtime_manager
+
+    plugin_runtime_manager.install()
+
     from nonebot.adapters.onebot.v11 import Adapter as OneBotV11Adapter
 
     from zhenxun.configs.config import BotConfig
@@ -471,7 +475,7 @@ def _run_launcher() -> None:
     )
     from zhenxun.utils.restart_state import (
         clear_launcher_restart_signal,
-        consume_launcher_restart_signal,
+        consume_launcher_action,
     )
 
     clear_launcher_restart_signal()
@@ -584,6 +588,7 @@ def _run_launcher() -> None:
                 f"{qq_settings.config.qq_webhook_listen_port}"
             )
         restart_requested = False
+        restart_action: tuple[str, list[str]] | None = None
         return_code: int | None = None
         next_restart_check = 0.0
         try:
@@ -607,8 +612,9 @@ def _run_launcher() -> None:
                 now = time.monotonic()
                 if now >= next_restart_check:
                     next_restart_check = now + RESTART_POLL_INTERVAL
-                    if consume_launcher_restart_signal():
+                    if action := consume_launcher_action():
                         restart_requested = True
+                        restart_action = action
                         _launcher_log(
                             "detected restart request, stopping current worker"
                         )
@@ -627,7 +633,26 @@ def _run_launcher() -> None:
             if current_worker is worker:
                 current_worker = None
 
-        if restart_requested or consume_launcher_restart_signal():
+        if restart_requested or (restart_action := consume_launcher_action()):
+            if restart_action and restart_action[0] == "sync_dependencies_restart":
+                dependency_paths = restart_action[1]
+                if any(
+                    path in {"pyproject.toml", "uv.lock"} for path in dependency_paths
+                ):
+                    from zhenxun.update_service import _sync_dependencies
+
+                    _sync_dependencies()
+                for dependency_path in dependency_paths:
+                    if Path(dependency_path).name not in {
+                        "requirement.txt",
+                        "requirements.txt",
+                    }:
+                        continue
+                    subprocess.run(
+                        ["uv", "pip", "install", "-r", dependency_path],
+                        cwd=str(cwd),
+                        check=True,
+                    )
             pending_bot_verification = apply_pending_update(cwd)
             continue
         if ingress is not None:
