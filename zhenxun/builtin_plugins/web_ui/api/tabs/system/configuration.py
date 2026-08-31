@@ -18,6 +18,11 @@ from zhenxun.configs.config import Config
 from zhenxun.services.runtime_config_reload import reload_runtime_config
 from zhenxun.utils._restart_utils import issue_restart_ticket
 from zhenxun.utils.network import local_access_urls
+from zhenxun.utils.pydantic_compat import (
+    _is_pydantic_type,
+    model_dump,
+    model_json_schema,
+)
 
 from ....base_model import Result
 from ....config_validation import (
@@ -103,13 +108,38 @@ def _type_name(value_type: Any) -> tuple[str, list[str]]:
     return getattr(value_type, "__name__", str(value_type)), []
 
 
+def _schema_for_type(value_type: Any) -> dict[str, Any]:
+    if value_type is None:
+        return {"type": "string"}
+    origin = get_origin(value_type)
+    if origin in (list, tuple, set):
+        args = get_args(value_type)
+        return {
+            "type": "array",
+            "items": _schema_for_type(args[0]) if args else {},
+        }
+    if origin is dict:
+        args = get_args(value_type)
+        return {
+            "type": "object",
+            "additionalProperties": _schema_for_type(args[1]) if len(args) > 1 else {},
+        }
+    if _is_pydantic_type(value_type) and isinstance(value_type, type):
+        return model_json_schema(value_type)
+    mapping = {str: "string", int: "integer", float: "number", bool: "boolean"}
+    return {"type": mapping.get(value_type, "string")}
+
+
 def _registered_groups() -> list[dict[str, Any]]:
     groups = []
     for module, group in Config.get_data().items():
         fields = []
         for key, config in group.configs.items():
             type_name, type_inner = _type_name(config.type)
-            sensitive = any(marker in key.upper() for marker in _SECRET_MARKERS)
+            ui = model_dump(config.ui, exclude_none=True) if config.ui else {}
+            sensitive = bool(ui.get("secret")) or any(
+                marker in key.upper() for marker in _SECRET_MARKERS
+            )
             fields.append(
                 {
                     "key": key,
@@ -121,8 +151,12 @@ def _registered_groups() -> list[dict[str, Any]]:
                         None if sensitive else jsonable_encoder(config.default_value)
                     ),
                     "sensitive": sensitive,
+                    "has_value": bool(config.value) if sensitive else None,
+                    "schema": _schema_for_type(config.type),
+                    "ui": ui,
                 }
             )
+        fields.sort(key=lambda item: (item["ui"].get("order", 0), item["key"]))
         groups.append(
             {
                 "module": module,
@@ -320,6 +354,7 @@ async def update_configuration_file(
     if file == "env" and launcher_managed:
         issue_restart_ticket("webui.settings", ttl_seconds=10 * 60)
     access_urls: list[str] = []
+    access_targets: list[dict[str, str]] = []
     if file == "env":
         values = dotenv_values(stream=StringIO(content))
         host = str(values.get("HOST") or "0.0.0.0")
@@ -327,7 +362,11 @@ async def update_configuration_file(
             port = int(values.get("PORT") or 8080)
         except (TypeError, ValueError):
             port = 8080
-        access_urls = [item.url for item in local_access_urls(host, port)]
+        local_urls = local_access_urls(host, port)
+        access_urls = [item.url for item in local_urls]
+        access_targets = [
+            {"kind": item.label.lower(), "url": item.url} for item in local_urls
+        ]
     return Result.ok(
         {
             "file": file,
@@ -338,6 +377,7 @@ async def update_configuration_file(
             "restart_required": file == "env",
             "restart_available": file == "env" and launcher_managed,
             "access_urls": access_urls,
+            "access_targets": access_targets,
         },
         info="配置已保存并热加载。" if file == "simple" else "环境配置已保存。",
     )

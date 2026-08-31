@@ -13,6 +13,12 @@ Config.add_plugin_config(
     help="是否开启文件备份",
     default_value=True,
     type=bool,
+    ui={
+        "label": "启用自动备份",
+        "section": "基本设置",
+        "component": "switch",
+        "order": 10,
+    },
 )
 
 Config.add_plugin_config(
@@ -22,6 +28,13 @@ Config.add_plugin_config(
     help="备份的文件夹或文件",
     default_value=[],
     type=list[str],
+    ui={
+        "label": "备份目录或文件",
+        "section": "基本设置",
+        "component": "tags",
+        "order": 20,
+        "visible_when": {"path": "BACKUP_FLAG", "operator": "eq", "value": True},
+    },
 )
 
 

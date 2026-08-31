@@ -26,6 +26,13 @@ from .context import (
     release_webhook_receipt,
     reserve_webhook_receipt,
 )
+from .diagnostics import (
+    QQPublicError,
+    clear_connection_diagnostics,
+    connection_diagnostic,
+    public_error_from_exception,
+    update_connection_diagnostic,
+)
 from .dispatcher import QQWebhookDispatcher, dispatch_routing_key
 
 ACK_BODY = '{"op":12}'
@@ -43,6 +50,7 @@ class ZhenxunQQAdapter(QQAdapter):
         self._prepared_bot_connect_lock = asyncio.Lock()
         self._webhook_route_registered = False
         self._health_route_registered = False
+        self._shutting_down = False
         self._dispatcher = QQWebhookDispatcher()
         self._metrics: Counter[str] = Counter()
         super().__init__(driver, **kwargs)
@@ -60,6 +68,10 @@ class ZhenxunQQAdapter(QQAdapter):
                     target=bot.self_id,
                 )
             raise
+        mode = (
+            "websocket" if getattr(bot.bot_info, "use_websocket", False) else "webhook"
+        )
+        update_connection_diagnostic(bot.self_id, mode, "connected")
         logger.info("QQ 官方 Bot连接成功", "QQOfficial", target=bot.self_id)
 
     @override
@@ -67,6 +79,16 @@ class ZhenxunQQAdapter(QQAdapter):
         was_connected = bot.self_id in self.bots
         super().bot_disconnect(bot)
         if was_connected:
+            if not self._shutting_down:
+                current = connection_diagnostic(bot.self_id)
+                update_connection_diagnostic(
+                    bot.self_id,
+                    "websocket"
+                    if getattr(bot.bot_info, "use_websocket", False)
+                    else "webhook",
+                    "reconnecting",
+                    error=current.error if current else None,
+                )
             logger.info("QQ 官方 Bot已断开", "QQOfficial", target=bot.self_id)
 
     @override
@@ -89,11 +111,25 @@ class ZhenxunQQAdapter(QQAdapter):
                 prepared_bots: dict[str, ZhenxunQQBot] = {}
                 for bot_info in webhook_infos:
                     bot = ZhenxunQQBot(self, bot_info.id, bot_info)
+                    update_connection_diagnostic(bot_info.id, "webhook", "authorizing")
                     try:
                         bot.self_info = await bot.me()
-                    except Exception:
+                    except Exception as exc:
+                        public_error = public_error_from_exception(
+                            exc, stage="credential"
+                        )
+                        update_connection_diagnostic(
+                            bot_info.id,
+                            "webhook",
+                            "failed",
+                            error=public_error,
+                        )
                         logger.error(
-                            "QQ 官方 Bot 信息预热失败（API me）",
+                            "QQ 官方 Bot 信息预热失败（API me） "
+                            f"code={public_error.code} "
+                            f"provider_code={public_error.provider_code or '-'} "
+                            f"http_status={public_error.http_status or '-'} "
+                            f"trace_id={public_error.trace_id or '-'}",
                             "QQOfficial",
                             target=bot_info.id,
                         )
@@ -137,6 +173,7 @@ class ZhenxunQQAdapter(QQAdapter):
 
     @override
     async def shutdown(self) -> None:
+        self._shutting_down = True
         await self._dispatcher.stop()
         await super().shutdown()
         _runtime.unregister_adapter_runtime(self)
@@ -146,6 +183,7 @@ class ZhenxunQQAdapter(QQAdapter):
         self._startup_prepared = False
         self._webhook_route_registered = False
         self._health_route_registered = False
+        clear_connection_diagnostics()
 
     def is_ready(self) -> bool:
         if not _runtime.database_ready() or not self._startup_prepared:
@@ -235,6 +273,7 @@ class ZhenxunQQAdapter(QQAdapter):
     @override
     async def run_bot_websocket(self, bot_info: Any) -> None:
         bot = ZhenxunQQBot(self, bot_info.id, bot_info)
+        update_connection_diagnostic(bot_info.id, "websocket", "gateway")
         try:
             gateway_info = await bot.shard_url_get()
             ws_url = URL(gateway_info.url)
@@ -246,21 +285,45 @@ class ZhenxunQQAdapter(QQAdapter):
                 target=bot_info.id,
             )
         except Exception as exc:
+            public_error = public_error_from_exception(exc, stage="gateway")
+            update_connection_diagnostic(
+                bot_info.id,
+                "websocket",
+                "failed",
+                error=public_error,
+            )
             logger.error(
-                "QQ 官方 Bot WebSocket Gateway 获取失败",
+                "QQ 官方 Bot WebSocket Gateway 获取失败 "
+                f"code={public_error.code} "
+                f"provider_code={public_error.provider_code or '-'} "
+                f"http_status={public_error.http_status or '-'} "
+                f"trace_id={public_error.trace_id or '-'}",
                 "QQOfficial",
                 target=bot_info.id,
-                e=exc,
             )
             return
 
         if gateway_info.session_start_limit.remaining <= 0:
+            public_error = QQPublicError(
+                code="qq_session_limit_exhausted",
+                message="QQ WebSocket会话启动额度不足。",
+                retryable=True,
+            )
+            update_connection_diagnostic(
+                bot_info.id,
+                "websocket",
+                "failed",
+                error=public_error,
+            )
             logger.error(
-                "QQ 官方 Bot WebSocket 会话启动额度不足",
+                "QQ 官方 Bot WebSocket 会话启动额度不足 "
+                "code=qq_session_limit_exhausted",
                 "QQOfficial",
                 target=bot_info.id,
             )
             return
+
+        update_connection_diagnostic(bot_info.id, "websocket", "connecting")
 
         if bot_info.shard is not None:
             task = asyncio.create_task(
@@ -285,6 +348,43 @@ class ZhenxunQQAdapter(QQAdapter):
             task.add_done_callback(self.tasks.discard)
             self.tasks.add(task)
             await asyncio.sleep(gateway_info.session_start_limit.max_concurrency or 1)
+
+    @override
+    async def _authenticate(self, bot, ws, shard):
+        update_connection_diagnostic(bot.self_id, "websocket", "authorizing")
+        try:
+            result = await super()._authenticate(bot, ws, shard)
+        except Exception as exc:
+            public_error = public_error_from_exception(exc, stage="websocket_auth")
+            update_connection_diagnostic(
+                bot.self_id,
+                "websocket",
+                "failed",
+                error=public_error,
+            )
+            logger.error(
+                "QQ 官方 Bot WebSocket 鉴权失败 "
+                f"code={public_error.code} "
+                f"provider_code={public_error.provider_code or '-'} "
+                f"http_status={public_error.http_status or '-'} "
+                f"trace_id={public_error.trace_id or '-'}",
+                "QQOfficial",
+                target=bot.self_id,
+            )
+            raise
+        if not result:
+            public_error = QQPublicError(
+                code="qq_websocket_auth_failed",
+                message="QQ WebSocket鉴权未完成。",
+                retryable=True,
+            )
+            update_connection_diagnostic(
+                bot.self_id,
+                "websocket",
+                "failed",
+                error=public_error,
+            )
+        return result
 
     @override
     def dispatch_event(self, bot: ZhenxunQQBot, payload: Dispatch) -> None:

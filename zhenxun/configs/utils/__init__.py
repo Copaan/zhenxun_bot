@@ -24,6 +24,7 @@ from .models import (
     BaseBlock,
     Command,
     ConfigModel,
+    ConfigUIModel,
     Example,
     PluginCdBlock,
     PluginCountBlock,
@@ -292,6 +293,7 @@ class ConfigsManager:
         default_value: Any = None,
         type: type | None = None,
         arg_parser: Callable | None = None,
+        ui: ConfigUIModel | dict[str, Any] | None = None,
         _override: bool = False,
     ):
         """为插件添加一个配置，不会被覆盖，只有第一个生效
@@ -304,6 +306,7 @@ class ConfigsManager:
             default_value: 默认值.
             type: 值类型.
             arg_parser: 值解析器，一般与webui配合使用.
+            ui: WebUI 展示元数据.
             _override: 强制覆盖值.
 
         异常:
@@ -330,6 +333,7 @@ class ConfigsManager:
             config.help = help
             config.arg_parser = arg_parser
             config.type = type
+            config.ui = ConfigUIModel(**ui) if isinstance(ui, dict) else ui
             if simple_value is not _MISSING or _override:
                 config.value = processed_value
                 config.default_value = processed_default_value
@@ -343,6 +347,7 @@ class ConfigsManager:
                 default_value=processed_default_value,
                 type=type,
                 arg_parser=arg_parser,
+                ui=ConfigUIModel(**ui) if isinstance(ui, dict) else ui,
             )
 
     def set_config(

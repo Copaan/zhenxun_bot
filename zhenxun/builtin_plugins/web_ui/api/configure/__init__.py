@@ -14,6 +14,7 @@ from zhenxun.utils.network import private_ipv4_addresses
 from ...base_model import Result
 from ...passwords import validate_new_password
 from ...restart_service import (
+    preferred_access_targets,
     preferred_access_urls,
     request_webui_restart,
     restart_status_data,
@@ -176,11 +177,16 @@ async def _apply_setup(payload: ApplyRequest, session: SetupSession) -> Result:
     issue_restart_ticket("webui.configure", ttl_seconds=10 * 60)
     receipt = await setup_access.mark_applied(session)
     access_urls = preferred_access_urls(applied["host"], applied["port"])
+    access_targets = [
+        {"kind": item.label.lower(), "url": item.url}
+        for item in preferred_access_targets(applied["host"], applied["port"])
+    ]
     return Result.ok(
         {
             "state": "restart_pending",
             "restart_receipt": receipt,
             "access_urls": access_urls,
+            "access_targets": access_targets,
             "checks": results,
         },
         info="配置已安全保存，可以重启真寻。",

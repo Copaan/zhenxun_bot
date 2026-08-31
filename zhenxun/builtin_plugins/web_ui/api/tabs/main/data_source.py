@@ -7,6 +7,7 @@ from nonebot.adapters import Bot
 from nonebot.drivers import Driver
 from tortoise.functions import Count
 
+from zhenxun.adapters.qq_official.diagnostics import safe_avatar_url
 from zhenxun.models.bot_connect_log import BotConnectLog
 from zhenxun.models.bot_console import BotConsole
 from zhenxun.models.chat_history import ChatHistory
@@ -103,17 +104,25 @@ class ApiDataSource:
                 login_info = await bot.get_login_info()
             except Exception as e:
                 logger.warning("调用接口get_login_info失败", "WebUi", e=e)
-        self_info = getattr(bot, "self_info", None)
+        try:
+            self_info = getattr(bot, "self_info", None)
+        except Exception:
+            self_info = None
         nickname = (
             login_info.get("nickname")
             if isinstance(login_info, dict) and login_info.get("nickname")
             else getattr(self_info, "username", None) or runtime_id
         )
+        avatar_url = (
+            safe_avatar_url(getattr(self_info, "avatar", None)) or ""
+            if platform == "qq_official"
+            else AVA_URL.format(runtime_id)
+        )
         return TemplateBaseInfo(
             bot=bot,
             self_id=runtime_id,
             nickname=str(nickname),
-            ava_url=AVA_URL.format(runtime_id),
+            ava_url=avatar_url,
             bot_key=bot_key,
             runtime_bot_id=runtime_id,
             storage_bot_id=storage_id,

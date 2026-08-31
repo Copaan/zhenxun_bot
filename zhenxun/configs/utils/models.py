@@ -14,6 +14,8 @@ __all__ = [
     "BaseBlock",
     "Command",
     "ConfigModel",
+    "ConfigUICondition",
+    "ConfigUIModel",
     "Example",
     "PluginCdBlock",
     "PluginCountBlock",
@@ -22,6 +24,34 @@ __all__ = [
     "RegisterConfig",
     "Task",
 ]
+
+
+class ConfigUICondition(BaseModel):
+    """Declarative visibility condition consumed by configuration clients."""
+
+    path: str
+    operator: Literal["eq", "neq", "in", "contains"] = "eq"
+    value: Any
+
+
+class ConfigUIModel(BaseModel):
+    """Optional presentation metadata for a registered configuration field."""
+
+    label: str | None = None
+    section: str | None = None
+    order: int = 0
+    component: str | None = None
+    placeholder: str | None = None
+    options: list[Any] = Field(default_factory=list)
+    minimum: float | None = None
+    maximum: float | None = None
+    step: float | None = None
+    unit: str | None = None
+    secret: bool = False
+    advanced: bool = False
+    effect: Literal["hot_reload", "new_session", "restart_required"] = "hot_reload"
+    visible_when: ConfigUICondition | None = None
+    item_schema: dict[str, Any] | None = None
 
 
 class Example(BaseModel):
@@ -69,6 +99,8 @@ class RegisterConfig(BaseModel):
     """参数类型"""
     arg_parser: Callable | None = None
     """参数解析"""
+    ui: ConfigUIModel | None = None
+    """WebUI 展示元数据"""
 
 
 class ConfigModel(BaseModel):
@@ -86,6 +118,8 @@ class ConfigModel(BaseModel):
     """参数类型"""
     arg_parser: Callable | None = None
     """参数解析"""
+    ui: ConfigUIModel | None = None
+    """WebUI 展示元数据"""
 
     def to_dict(self, **kwargs):
         return model_dump(self, **kwargs)

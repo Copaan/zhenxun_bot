@@ -17,6 +17,7 @@ from .api.configure.setup_access import setup_access
 from .api.logs import router as ws_log_routes
 from .api.menu import router as menu_router
 from .api.protocol import router as protocol_router
+from .api.tabs.ai import router as ai_router
 from .api.tabs.dashboard import router as dashboard_router
 from .api.tabs.database import router as database_router
 from .api.tabs.main import router as main_router
@@ -85,6 +86,7 @@ BaseApiRouter = APIRouter(
 BaseApiRouter.include_router(auth_router)
 BaseApiRouter.include_router(store_router)
 BaseApiRouter.include_router(dashboard_router)
+BaseApiRouter.include_router(ai_router)
 BaseApiRouter.include_router(main_router)
 BaseApiRouter.include_router(manage_router)
 BaseApiRouter.include_router(database_router)

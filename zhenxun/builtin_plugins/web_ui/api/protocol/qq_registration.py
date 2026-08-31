@@ -133,8 +133,16 @@ _sessions = _RegistrationStore()
 _configuration_write_lock = asyncio.Lock()
 
 
-def _registration_error(status: int, code: str, message: str) -> HTTPException:
-    return HTTPException(status_code=status, detail={"code": code, "message": message})
+def _registration_error(
+    status: int,
+    code: str,
+    message: str,
+    **details: Any,
+) -> HTTPException:
+    return HTTPException(
+        status_code=status,
+        detail={"code": code, "message": message, **details},
+    )
 
 
 def _owner(request: Request) -> str:
@@ -338,12 +346,23 @@ async def poll_qq_registration(registration_id: str, request: Request) -> Result
             identity = await _probe_credential(app_id, secret)
             saved = await _save_websocket_bot(app_id, secret)
         except HTTPException as exc:
+            public_detail = exc.detail if isinstance(exc.detail, dict) else {}
             logger.warning(
-                "QQ Bot扫码凭据验证失败 result=credential_invalid",
+                "QQ Bot扫码凭据验证失败 "
+                f"code={public_detail.get('code', 'credential_invalid')} "
+                f"provider_code={public_detail.get('provider_code') or '-'} "
+                f"http_status={public_detail.get('http_status') or '-'} "
+                f"trace_id={public_detail.get('trace_id') or '-'}",
                 "QQOfficialRegistration",
             )
             raise _registration_error(
-                422, "credential_invalid", "扫码已完成，但机器人凭据验证失败。"
+                422,
+                "credential_invalid",
+                "扫码已完成，但机器人凭据验证失败。",
+                provider_code=public_detail.get("provider_code"),
+                http_status=public_detail.get("http_status"),
+                trace_id=public_detail.get("trace_id"),
+                retryable=bool(public_detail.get("retryable", False)),
             ) from exc
         except Exception as exc:
             logger.warning(
@@ -361,12 +380,14 @@ async def poll_qq_registration(registration_id: str, request: Request) -> Result
                 "app_id": app_id,
                 "bot_id": identity.get("bot_id", ""),
                 "username": identity.get("username", ""),
+                "avatar_url": identity.get("avatar_url", ""),
             },
             "revision": saved["revision"],
             "updated_existing": saved["updated_existing"],
             "restart_required": True,
             "restart_available": restart["launcher_managed"],
             "access_urls": restart["access_urls"],
+            "access_targets": restart.get("access_targets", []),
         }
         session.completed = result
         session.key = b""

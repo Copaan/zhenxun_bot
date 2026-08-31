@@ -124,6 +124,12 @@ def register_llm_configs():
         model_dump(llm_config.default_models),
         help="不同任务类型的全局默认模型配置字典",
         type=dict,
+        ui={
+            "label": "默认模型",
+            "section": "default_models",
+            "component": "object",
+            "order": 10,
+        },
     )
     Config.add_plugin_config(
         "AI",
@@ -135,6 +141,13 @@ def register_llm_configs():
             "retry_delay(重试延迟), structured_retries(结构化生成重试)"
         ),
         type=dict,
+        ui={
+            "label": "客户端设置",
+            "section": "advanced",
+            "component": "object",
+            "order": 70,
+            "advanced": True,
+        },
     )
     Config.add_plugin_config(
         "AI",
@@ -145,6 +158,13 @@ def register_llm_configs():
             "'show_safety': False}"
         ),
         type=dict,
+        ui={
+            "label": "调试日志",
+            "section": "advanced",
+            "component": "object",
+            "order": 80,
+            "advanced": True,
+        },
     )
 
     Config.add_plugin_config(
@@ -169,6 +189,12 @@ def register_llm_configs():
             "    - keep_recent_turns: 修剪时强制原样保留的最新的工具消息轮数"
         ),
         type=dict,
+        ui={
+            "label": "上下文管理",
+            "section": "context",
+            "component": "object",
+            "order": 30,
+        },
     )
 
     Config.add_plugin_config(
@@ -181,6 +207,12 @@ def register_llm_configs():
             "使用 chat(model='cheap_models') 时系统将自动按列表顺序轮询和故障转移。"
         ),
         type=dict,
+        ui={
+            "label": "模型路由组",
+            "section": "model_groups",
+            "component": "key_value",
+            "order": 20,
+        },
     )
 
     Config.add_plugin_config(
@@ -196,6 +228,12 @@ def register_llm_configs():
             "mcp_cleanup_timeout(MCP 闲置回收时间)"
         ),
         type=dict,
+        ui={
+            "label": "Agent 设置",
+            "section": "agent",
+            "component": "object",
+            "order": 40,
+        },
     )
 
     Config.add_plugin_config(
@@ -209,6 +247,13 @@ def register_llm_configs():
             "cleanup_timeout(空闲清理超时秒数), enable_vfs_helper(开启VFS防逃逸探针)。"
         ),
         type=dict,
+        ui={
+            "label": "沙箱",
+            "section": "sandbox",
+            "component": "object",
+            "order": 50,
+            "effect": "new_session",
+        },
     )
 
     Config.add_plugin_config(
@@ -217,6 +262,13 @@ def register_llm_configs():
         model_dump(llm_config.provider_settings),
         help=("厂商专属高级设置。\n包含各厂商全局的特有策略开关"),
         type=dict,
+        ui={
+            "label": "厂商高级设置",
+            "section": "advanced",
+            "component": "object",
+            "order": 90,
+            "advanced": True,
+        },
     )
 
     Config.add_plugin_config(
@@ -239,6 +291,13 @@ def register_llm_configs():
         ),
         default_value=[],
         type=list[ProviderConfig],
+        ui={
+            "label": "服务商与模型",
+            "section": "providers",
+            "component": "object_list",
+            "order": 0,
+            "secret": True,
+        },
     )
 
 

@@ -6,12 +6,12 @@ import json
 import os
 from pathlib import Path
 import time
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit, urlunsplit
 
 from dotenv import dotenv_values
 from dotenv.parser import parse_stream
-from fastapi import APIRouter, HTTPException, Response
+from fastapi import APIRouter, HTTPException, Query, Response
 from fastapi.responses import JSONResponse
 import httpx
 from pydantic import BaseModel, Field
@@ -25,6 +25,10 @@ from zhenxun.adapters.qq_official.config import (
     validate_builtin_ingress,
     validate_qq_config_data,
 )
+from zhenxun.adapters.qq_official.diagnostics import (
+    public_error_from_exception,
+    safe_avatar_url,
+)
 from zhenxun.services.log import logger
 from zhenxun.utils._restart_utils import issue_restart_ticket
 from zhenxun.utils.pydantic_compat import model_dump
@@ -35,6 +39,7 @@ from ...config_validation import (
     validate_dotenv,
     validation_detail,
 )
+from ...restart_service import restart_status_data
 from ...utils import authentication
 from ..configure.persistence import _write_transaction
 
@@ -249,7 +254,11 @@ async def _probe_credential(app_id: str, secret: str) -> dict[str, str]:
             auth_data = auth.json()
             access_token = str(auth_data.get("access_token") or "")
             if not access_token:
-                raise ValueError("missing_access_token")
+                raise httpx.HTTPStatusError(
+                    "QQ authorization response did not include an access token",
+                    request=auth.request,
+                    response=auth,
+                )
             me = await client.get(
                 _ME_URL,
                 headers={
@@ -260,15 +269,19 @@ async def _probe_credential(app_id: str, secret: str) -> dict[str, str]:
             me.raise_for_status()
             data = me.json()
     except Exception as exc:
+        public_error = public_error_from_exception(exc, stage="credential")
         logger.warning(
             "QQ Bot凭据测试失败 "
-            f"result={exc.__class__.__name__} "
+            f"code={public_error.code} "
+            f"provider_code={public_error.provider_code or '-'} "
+            f"http_status={public_error.http_status or '-'} "
+            f"trace_id={public_error.trace_id or '-'} "
             f"latency_ms={round((time.perf_counter() - started_at) * 1000)}",
             "QQOfficialProbe",
         )
         raise HTTPException(
             status_code=422,
-            detail=f"QQ Bot凭据验证失败（{exc.__class__.__name__}）。",
+            detail=public_error.to_dict(),
         ) from exc
     logger.info(
         "QQ Bot凭据测试成功 result=ready "
@@ -279,6 +292,7 @@ async def _probe_credential(app_id: str, secret: str) -> dict[str, str]:
         "app_id": app_id,
         "bot_id": str(data.get("id") or ""),
         "username": str(data.get("username") or ""),
+        "avatar_url": safe_avatar_url(data.get("avatar")) or "",
     }
 
 
@@ -410,6 +424,97 @@ async def save_protocol_configuration(
             "restart_available": launcher_managed,
         },
         info="协议配置已保存。",
+    )
+
+
+@router.delete(
+    "/qq/bots/{app_id}",
+    dependencies=[authentication()],
+    response_model=Result,
+    response_class=JSONResponse,
+)
+async def delete_qq_bot(
+    app_id: str,
+    expected_revision: Annotated[
+        str,
+        Query(min_length=64, max_length=64),
+    ],
+) -> Result:
+    source = _source_path()
+    current = source.read_text(encoding="utf-8")
+    if _revision(current) != expected_revision:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "configuration_revision_conflict",
+                "message": "配置已被外部修改，请重新加载后再删除。",
+            },
+        )
+
+    values = dotenv_values(stream=StringIO(current))
+    bots = [
+        item for item in _parse_bots(values.get("QQ_BOTS")) if isinstance(item, dict)
+    ]
+    normalized_app_id = app_id.strip()
+    remaining = [
+        item for item in bots if str(item.get("id") or "").strip() != normalized_app_id
+    ]
+    if len(remaining) == len(bots):
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "qq_bot_not_found",
+                "message": "未找到要移除的QQ官方机器人。",
+            },
+        )
+
+    was_enabled = str(values.get("QQ_ADAPTER_LOAD") or "").strip().lower() in {
+        "true",
+        "1",
+        "yes",
+        "on",
+    }
+    updated = _update_env(
+        current,
+        {
+            "QQ_ADAPTER_LOAD": was_enabled and bool(remaining),
+            "QQ_BOTS": remaining,
+        },
+    )
+    try:
+        _write_transaction([(_ENV_FILE, updated.encode("utf-8"))])
+    except Exception as exc:
+        logger.error(
+            "QQ Bot本地配置移除失败 code=qq_bot_delete_failed",
+            "QQOfficialConfiguration",
+        )
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "qq_bot_delete_failed",
+                "message": "QQ机器人本地配置移除失败，请重试。",
+            },
+        ) from exc
+
+    launcher_managed = bool(os.getenv("ZHENXUN_LAUNCHER_PID"))
+    if launcher_managed:
+        issue_restart_ticket("webui.settings", ttl_seconds=10 * 60)
+    restart = restart_status_data()
+    logger.info(
+        f"QQ Bot已从本地配置移除 remaining={len(remaining)}",
+        "QQOfficialConfiguration",
+    )
+    return Result.ok(
+        {
+            "revision": _revision(updated),
+            "remaining": len(remaining),
+            "qq_enabled": was_enabled and bool(remaining),
+            "restart_required": True,
+            "restart_available": launcher_managed,
+            "access_urls": restart["access_urls"],
+            "access_targets": restart["access_targets"],
+        },
+        info="机器人已从真寻本地配置移除。",
     )
 
 

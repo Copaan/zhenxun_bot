@@ -23,16 +23,17 @@ default_menus = [
     MenuItem(name="插件商店", module="store", router="/store", icon="store"),
     MenuItem(name="好友/群组", module="manage", router="/manage", icon="user"),
     MenuItem(
-        name="数据与缓存",
-        module="database",
-        router="/database",
-        icon="database",
-    ),
-    MenuItem(
         name="机器人接入",
         module="protocol",
         router="/protocol",
         icon="protocol",
+    ),
+    MenuItem(name="AI 配置", module="ai", router="/ai", icon="magic"),
+    MenuItem(
+        name="数据与缓存",
+        module="database",
+        router="/database",
+        icon="database",
     ),
     MenuItem(name="系统信息", module="system", router="/system", icon="system"),
     MenuItem(name="关于我们", module="about", router="/about", icon="about"),

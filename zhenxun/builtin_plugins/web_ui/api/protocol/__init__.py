@@ -3,12 +3,21 @@ from fastapi.responses import JSONResponse
 import nonebot
 
 from zhenxun.adapters.qq_official.config import QQOfficialConfig
+from zhenxun.adapters.qq_official.diagnostics import (
+    connection_diagnostic,
+    safe_avatar_url,
+)
 from zhenxun.configs.config import BotConfig
 
 from ...base_model import Result
 from ...utils import authentication
 from .configuration import router as configuration_router
-from .model import ProtocolConnection, ProtocolStatus
+from .model import (
+    ProtocolConnection,
+    ProtocolQQBotStatus,
+    ProtocolQQError,
+    ProtocolStatus,
+)
 from .qq_registration import router as qq_registration_router
 
 router = APIRouter(prefix="/protocol")
@@ -27,18 +36,65 @@ def _platform(adapter_name: str) -> str:
 
 def build_protocol_status() -> ProtocolStatus:
     connections: list[ProtocolConnection] = []
+    qq_runtime_bots: dict[str, object] = {}
     for bot in nonebot.get_bots().values():
         adapter_name = str(bot.adapter.get_name())
+        platform = _platform(adapter_name)
+        try:
+            self_info = getattr(bot, "self_info", None)
+        except Exception:
+            self_info = None
+        nickname = getattr(self_info, "username", None)
+        avatar_url = safe_avatar_url(getattr(self_info, "avatar", None))
+        if platform == "qq_official":
+            qq_runtime_bots[str(bot.self_id)] = bot
         connections.append(
             ProtocolConnection(
                 self_id=str(bot.self_id),
                 adapter=adapter_name,
-                platform=_platform(adapter_name),
+                platform=platform,
+                nickname=str(nickname) if nickname else None,
+                avatar_url=avatar_url,
             )
         )
     connections.sort(key=lambda item: (item.platform, item.self_id))
     qq_config = nonebot.get_plugin_config(QQOfficialConfig)
     platforms = {item.platform for item in connections}
+    qq_bots: list[ProtocolQQBotStatus] = []
+    if BotConfig.qq_adapter_load:
+        for configured_bot in qq_config.qq_bots:
+            app_id = str(configured_bot.id)
+            runtime_bot = qq_runtime_bots.get(app_id)
+            try:
+                self_info = getattr(runtime_bot, "self_info", None)
+            except Exception:
+                self_info = None
+            diagnostic = connection_diagnostic(app_id)
+            connected = runtime_bot is not None
+            error = (
+                ProtocolQQError(**diagnostic.error.to_dict())
+                if diagnostic and diagnostic.error
+                else None
+            )
+            qq_bots.append(
+                ProtocolQQBotStatus(
+                    app_id=app_id,
+                    bot_id=(str(getattr(self_info, "id", "") or "") or None),
+                    username=(str(getattr(self_info, "username", "") or "") or None),
+                    avatar_url=safe_avatar_url(getattr(self_info, "avatar", None)),
+                    mode=("websocket" if configured_bot.use_websocket else "webhook"),
+                    state=(
+                        "connected"
+                        if connected
+                        else diagnostic.state
+                        if diagnostic
+                        else "connecting"
+                    ),
+                    connected=connected,
+                    updated_at=diagnostic.updated_at if diagnostic else None,
+                    error=error,
+                )
+            )
     return ProtocolStatus(
         onebot_v11_connected="onebot_v11" in platforms,
         qq_official_enabled=BotConfig.qq_adapter_load,
@@ -50,6 +106,7 @@ def build_protocol_status() -> ProtocolStatus:
             else None
         ),
         connections=connections,
+        qq_bots=qq_bots,
     )
 
 

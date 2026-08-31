@@ -131,20 +131,35 @@ def emit_webui_console_banner(
     if bind_host.strip().strip("[]") in {"0.0.0.0", "::"}:
         display_urls.sort(key=lambda item: item.label != "Network")
     safe_username = " ".join(str(username or "").split())
-    lines = ["", "WebUI is ready"]
+    lines = ["", "WebUI 已启动"]
+    if state == "configured":
+        lines.append("  临时管理：请打开下面带 code 的连接链接")
+    else:
+        lines.append("  首次配置：必须打开下面带 code 的连接链接")
     for item in display_urls:
-        lines.append(f"  -> {item.label}: {item.url}/#/connect?code={connection_code}")
+        label = "本机" if item.label == "Local" else "局域网"
+        lines.append(
+            f"  -> {label}连接链接（含 code）: "
+            f"{item.url}/#/connect?code={connection_code}"
+        )
     preferred_login = next(
         (item.url for item in display_urls if item.label == "Network"),
         display_urls[0].url,
     )
-    lines.append(f"  -> Normal login: {preferred_login}")
+    login_label = "普通登录" if state == "configured" else "普通登录（配置完成后）"
+    lines.append(f"  -> {login_label}: {preferred_login}")
     if state == "configured":
-        lines.append(f"  -> Account: {safe_username or 'configured administrator'}")
-        lines.append("  -> Access: open a connection link for temporary admin login")
+        lines.append(f"  -> 管理员账号: {safe_username or '已配置'}")
+        lines.append("  -> 提示: 带 code 的链接可在本次启动中临时登录")
     else:
-        lines.append("  -> Setup: open a connection link to finish initial setup")
-    lines.append("  -> Security: links are valid for this startup; do not share them")
+        lines.append("  -> 提示: 不带 code 的普通地址不能领取首次配置会话")
+    normalized_host = bind_host.strip().strip("[]")
+    has_network = any(item.label == "Network" for item in display_urls)
+    if normalized_host in {"0.0.0.0", "::"} and not has_network:
+        lines.append("  -> 网络: 未检测到可用的私网网卡地址，仅显示本机链接")
+    elif normalized_host in {"127.0.0.1", "::1", "localhost"}:
+        lines.append("  -> 网络: 当前仅监听本机，局域网设备无法访问")
+    lines.append("  -> 安全提示: 连接链接仅对本次启动有效，请勿分享")
     sys.stderr.write("\n".join(lines) + "\n")
     sys.stderr.flush()
 

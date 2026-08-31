@@ -2,20 +2,35 @@ from __future__ import annotations
 
 import os
 from typing import Any
+from urllib.parse import urlsplit
 
 import nonebot
 
 from zhenxun.utils._restart_utils import request_restart
-from zhenxun.utils.network import local_access_urls
+from zhenxun.utils.network import AccessUrl, local_access_urls
 
 from .console_access import console_access
 
 
-def preferred_access_urls(host: str, port: int) -> list[str]:
+def preferred_access_targets(host: str, port: int) -> list[AccessUrl]:
     urls = local_access_urls(host, port)
     if host.strip().strip("[]") in {"0.0.0.0", "::"}:
         urls.sort(key=lambda item: item.label != "Network")
-    return [item.url for item in urls]
+    return urls
+
+
+def preferred_access_urls(host: str, port: int) -> list[str]:
+    return [item.url for item in preferred_access_targets(host, port)]
+
+
+def _target_kind(url: str) -> str:
+    try:
+        hostname = (urlsplit(url).hostname or "").lower()
+    except ValueError:
+        return "custom"
+    if hostname in {"localhost", "127.0.0.1", "::1"}:
+        return "local"
+    return "network"
 
 
 def _current_access_urls() -> list[str]:
@@ -27,10 +42,13 @@ def _current_access_urls() -> list[str]:
 
 def restart_status_data(*, access_urls: list[str] | None = None) -> dict[str, Any]:
     urls = list(dict.fromkeys([*(access_urls or []), *_current_access_urls()]))
+    access_targets = [{"kind": _target_kind(url), "url": url} for url in urls]
     return {
         "launcher_managed": bool(os.getenv("ZHENXUN_LAUNCHER_PID")),
         "boot_id": console_access.current_boot_id(),
         "access_urls": urls,
+        "access_targets": access_targets,
+        "preferred_url": urls[0] if urls else None,
     }
 
 
@@ -48,6 +66,7 @@ async def request_webui_restart(
 
 
 __all__ = [
+    "preferred_access_targets",
     "preferred_access_urls",
     "request_webui_restart",
     "restart_status_data",

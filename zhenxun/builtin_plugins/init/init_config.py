@@ -51,6 +51,7 @@ def _handle_config(plugin: Plugin, exists_module: list[str]):
                     default_value=reg_config.default_value,
                     type=reg_config.type,  # type: ignore
                     arg_parser=reg_config.arg_parser,
+                    ui=reg_config.ui,
                     _override=False,
                 )
                 exists_module.append(f"{module}:{reg_config.key}".lower())
