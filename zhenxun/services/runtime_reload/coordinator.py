@@ -27,6 +27,7 @@ class RuntimeChangeCoordinator:
         self, paths: set[Path], *, submit_restart: bool = True
     ) -> RuntimeOperation | None:
         resolved = {path.resolve() for path in paths}
+        await self.manager.wait_for_content_change_holds(resolved)
         changed = self.manager.claim_content_changes(resolved)
         if not changed:
             if _CONFIG_FILE in resolved:

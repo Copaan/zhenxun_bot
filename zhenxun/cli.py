@@ -182,6 +182,10 @@ def _run_worker() -> None:
         os.execv(sys.executable, [sys.executable, "-m", "zhenxun.cli", "run-worker"])
     _sync_env_missing_items(project_root)
 
+    from zhenxun.nonebot_store.runtime import activate_current_generation
+
+    activate_current_generation()
+
     import contextlib
     import platform
 
@@ -270,6 +274,15 @@ def _run_worker() -> None:
         if ext:
             nonebot.logger.info(f"加载第三方插件目录: {ext}")
             nonebot.load_plugins(ext)
+
+    from zhenxun.nonebot_store.runtime import load_managed_plugins
+
+    managed_status = load_managed_plugins()
+    if managed_status["failed"]:
+        nonebot.logger.error(
+            "部分 WebUI 托管的 NoneBot 插件加载失败，已隔离: {}",
+            ", ".join(item["store_key"] for item in managed_status["failed"]),
+        )
 
     from zhenxun.configs.webui_tls import (
         load_webui_tls_settings,
@@ -651,6 +664,25 @@ def _run_launcher() -> None:
     while True:
         if stop_requested:
             raise SystemExit(128 + int(stop_signal or signal.SIGINT))
+        from zhenxun.nonebot_store.runtime import (
+            apply_pending_transaction as apply_pending_nonebot_transaction,
+        )
+        from zhenxun.nonebot_store.runtime import (
+            finalize_pending_transaction as finalize_nonebot_transaction,
+        )
+        from zhenxun.nonebot_store.runtime import (
+            rollback_pending_transaction as rollback_nonebot_transaction,
+        )
+        from zhenxun.nonebot_store.runtime import (
+            startup_verification as verify_nonebot_startup,
+        )
+        from zhenxun.nonebot_store.storage import load_manifest as load_nonebot_manifest
+
+        if apply_pending_nonebot_transaction():
+            _launcher_log("NoneBot 插件依赖层已构建，等待 worker 启动验证")
+        verify_nonebot_generation = bool(
+            load_nonebot_manifest().get("pending_verification")
+        )
         qq_settings = load_qq_launcher_settings(cwd)
         webui_tls = load_webui_tls_settings(cwd)
         builtin_ingress = bool(
@@ -703,6 +735,31 @@ def _run_launcher() -> None:
             env=worker_env,
         )
         current_worker = worker
+        if verify_nonebot_generation:
+            _launcher_log("waiting for managed NoneBot plugin verification")
+            if not _wait_worker_webui_ready(
+                worker, qq_settings, scheme=webui_tls.scheme
+            ):
+                _terminate_worker(worker)
+                current_worker = None
+                _launcher_log("managed plugin worker failed, rolling back generation")
+                rollback_nonebot_transaction()
+                continue
+            verified, verification = verify_nonebot_startup()
+            if not verified:
+                _terminate_worker(worker)
+                current_worker = None
+                failed = verification.get("failed") or []
+                _launcher_log(
+                    "managed plugin verification failed, rolling back generation: "
+                    + ", ".join(
+                        str(item.get("store_key", "unknown")) for item in failed
+                    )
+                )
+                rollback_nonebot_transaction()
+                continue
+            finalize_nonebot_transaction()
+            _launcher_log("managed NoneBot plugins passed startup verification")
         if pending_bot_verification:
             _launcher_log("waiting for updated worker health verification")
             if not _wait_worker_webui_ready(

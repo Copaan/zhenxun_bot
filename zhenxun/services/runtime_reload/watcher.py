@@ -15,16 +15,17 @@ if TYPE_CHECKING:
 
 def _watch_roots(manager: PluginRuntimeManager) -> list[Path]:
     project_root = Path.cwd().resolve()
+    runtime_root = (Path("data") / "runtime").resolve()
+    virtual_env_root = (Path(__file__).resolve().parents[3] / ".venv").resolve()
     roots = {Path("zhenxun"), Path("data/web_ui/public")}
     roots.update(
         unit.root
         for unit in manager.units.values()
         if unit.root
+        and not unit.root.resolve().is_relative_to(runtime_root)
         and (
-            unit.root.is_relative_to(project_root)
-            or not unit.root.is_relative_to(
-                Path(__file__).resolve().parents[3] / ".venv"
-            )
+            unit.root.resolve().is_relative_to(project_root)
+            or not unit.root.resolve().is_relative_to(virtual_env_root)
         )
     )
     roots.update(
@@ -48,6 +49,8 @@ def _watch_roots(manager: PluginRuntimeManager) -> list[Path]:
 
 def _interesting(change: Change, raw_path: str) -> bool:
     path = Path(raw_path)
+    if path.resolve().is_relative_to((Path("data") / "runtime").resolve()):
+        return False
     if any(part in {"__pycache__", ".git", ".pytest_cache"} for part in path.parts):
         return False
     return path.suffix in {

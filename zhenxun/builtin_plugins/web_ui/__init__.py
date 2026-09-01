@@ -26,6 +26,7 @@ from .api.tabs.main import ws_router as status_routes
 from .api.tabs.manage import router as manage_router
 from .api.tabs.manage.chat import ws_router as chat_routes
 from .api.tabs.plugin_manage import router as plugin_router
+from .api.tabs.plugin_manage.nonebot_store import router as nonebot_store_router
 from .api.tabs.plugin_manage.store import router as store_router
 from .api.tabs.system import router as system_router
 from .auth import router as auth_router
@@ -86,6 +87,7 @@ BaseApiRouter = APIRouter(
 
 BaseApiRouter.include_router(auth_router)
 BaseApiRouter.include_router(store_router)
+BaseApiRouter.include_router(nonebot_store_router)
 BaseApiRouter.include_router(dashboard_router)
 BaseApiRouter.include_router(ai_router)
 BaseApiRouter.include_router(main_router)

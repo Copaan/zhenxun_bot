@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 from copy import deepcopy
 import hashlib
+from importlib import import_module
 from io import StringIO
+import json
 from pathlib import Path
 import re
 import time
@@ -114,6 +116,16 @@ class ModelTestRequest(BaseModel):
     confirmed_paid_request: bool = False
 
 
+class PersonaUpdate(BaseModel):
+    expected_revision: str = Field(min_length=64, max_length=64)
+    name: str = Field(min_length=1, max_length=80)
+    prompt: str = Field(min_length=1, max_length=20000)
+    style: str = Field(default="", max_length=2000)
+    tone_examples: list[str] = Field(default_factory=list, max_length=12)
+    preset_dialogues: list[str] = Field(default_factory=list, max_length=12)
+    enabled: bool = True
+
+
 def _yaml() -> YAML:
     parser = YAML()
     parser.preserve_quotes = True
@@ -127,6 +139,38 @@ def _read() -> str:
 
 def _revision(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def _persona_revision(payload: dict[str, Any]) -> str:
+    content = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    return _revision(content)
+
+
+def _persona_state() -> tuple[Any, Any] | None:
+    try:
+        module = import_module("zhenxun.plugins.chatinter.persona")
+        personas = module.list_personas()
+    except (ImportError, RuntimeError):
+        return None
+    persona = next(
+        (item for item in personas if getattr(item, "persona_id", "") == "default"),
+        personas[0] if personas else None,
+    )
+    return (module, persona) if persona is not None else None
+
+
+def _persona_view(persona: Any) -> dict[str, Any]:
+    return {
+        "persona_id": str(persona.persona_id),
+        "name": str(persona.name),
+        "prompt": str(persona.prompt),
+        "style": str(persona.style),
+        "tone_examples": list(persona.tone_examples),
+        "preset_dialogues": list(persona.preset_dialogues),
+        "enabled": bool(persona.enabled),
+    }
 
 
 def _load(content: str) -> dict[str, Any]:
@@ -1337,6 +1381,107 @@ async def test_model(payload: ModelTestRequest) -> Result:
                 "message": "模型测试失败，请检查服务商配置和后台脱敏日志。",
             },
         ) from error
+
+
+@router.get(
+    "/personas/default",
+    dependencies=[authentication()],
+    response_model=Result,
+    response_class=JSONResponse,
+)
+async def get_default_persona() -> Result:
+    state = _persona_state()
+    if state is None:
+        return Result.ok(
+            {
+                "available": False,
+                "reason": "ai_chat_persona_not_available",
+            }
+        )
+    _, persona = state
+    view = _persona_view(persona)
+    return Result.ok(
+        {
+            "available": True,
+            "revision": _persona_revision(view),
+            "persona": view,
+        }
+    )
+
+
+@router.put(
+    "/personas/default",
+    dependencies=[authentication()],
+    response_model=Result,
+    response_class=JSONResponse,
+)
+async def update_default_persona(payload: PersonaUpdate) -> Result:
+    state = _persona_state()
+    if state is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "ai_chat_persona_not_available",
+                "message": "当前未安装支持人设管理的 AI 聊天插件。",
+            },
+        )
+    module, persona = state
+    current = _persona_view(persona)
+    if payload.expected_revision != _persona_revision(current):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "persona_revision_conflict",
+                "message": "AI 人设已被其他操作修改，请重新加载后再保存。",
+            },
+        )
+    updated_payload = {
+        **persona.to_payload(),
+        "name": payload.name.strip(),
+        "prompt": payload.prompt.strip(),
+        "style": payload.style.strip(),
+        "tone_examples": [
+            item.strip() for item in payload.tone_examples if item.strip()
+        ],
+        "preset_dialogues": [
+            item.strip() for item in payload.preset_dialogues if item.strip()
+        ],
+        "enabled": payload.enabled,
+        "source": "file",
+    }
+    updated = module.Persona.from_payload(updated_payload)
+    if updated is None:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "persona_invalid",
+                "message": "AI 人设内容无效。",
+            },
+        )
+    try:
+        saved = module.upsert_persona(updated)
+    except OSError as error:
+        logger.error("AI 人设保存失败", "WebUi", e=error)
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "persona_save_failed",
+                "message": "AI 人设保存失败，请检查数据目录写入权限。",
+            },
+        ) from error
+    view = _persona_view(saved)
+    return Result.ok(
+        {
+            "available": True,
+            "revision": _persona_revision(view),
+            "persona": view,
+            "apply_mode": "hot_reloaded",
+            "restart_required": False,
+            "restart_available": False,
+            "reason_codes": [],
+        },
+        info="AI 人设已保存，将从下一条消息开始生效。",
+    )
 
 
 __all__ = ["router"]

@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 import shutil
 import tempfile
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import ujson as json
 
@@ -53,6 +53,7 @@ def row_style(column: str, text: str) -> RowStyle:
 
 class StoreManager:
     _last_install_had_requirements: ClassVar[bool] = False
+    _last_dependency_plan: ClassVar[dict[str, Any] | None] = None
     _SOURCE_NAMES: ClassVar[dict[RepoType, str]] = {
         RepoType.ALIYUN: "阿里云",
         RepoType.GITHUB: "GitHub",
@@ -383,12 +384,12 @@ class StoreManager:
             is_external,
             source,
         )
-        return (
-            f"插件 {plugin_info.name} 安装完成\n"
-            "- 已下载插件文件\n"
-            "- 已处理依赖文件\n"
-            "- 重启后生效"
+        dependency_status = (
+            "依赖已更新，需由运行时决定生效方式"
+            if cls._last_install_had_requirements
+            else "依赖已满足"
         )
+        return f"插件 {plugin_info.name} 安装完成\n- {dependency_status}"
 
     @classmethod
     async def install_plugin_with_repo(
@@ -407,6 +408,7 @@ class StoreManager:
                 不指定时优先阿里云，失败后回退 GitHub
         """
         cls._last_install_had_requirements = False
+        cls._last_dependency_plan = None
         source_order = cls._get_source_order(source)
         errors: list[str] = []
 
@@ -446,14 +448,36 @@ class StoreManager:
                 )
 
             deploy_files, requirement_files = staged_result
-            cls._last_install_had_requirements = bool(requirement_files)
-            for requirement_file in requirement_files:
-                logger.info(
-                    f"开始安装插件 {plugin_info.module_path} "
-                    f"依赖文件: {requirement_file}",
-                    LOG_COMMAND,
+            if requirement_files:
+                from zhenxun.nonebot_store.dependencies import (
+                    DependencyAnalysisError,
+                    preflight_source_requirements,
                 )
-                await VirtualEnvPackageManager.install_requirement(requirement_file)
+
+                try:
+                    dependency_plan = await preflight_source_requirements(
+                        requirement_files
+                    )
+                except DependencyAnalysisError as error:
+                    raise PluginStoreException(error.code) from error
+                cls._last_dependency_plan = dependency_plan
+                changes = dependency_plan.get("package_changes", {})
+                cls._last_install_had_requirements = bool(
+                    changes.get("added") or changes.get("changed")
+                )
+                if not cls._last_install_had_requirements:
+                    logger.info(
+                        f"插件 {plugin_info.module_path} 的依赖已满足，跳过安装",
+                        LOG_COMMAND,
+                    )
+            if cls._last_install_had_requirements:
+                for requirement_file in requirement_files:
+                    logger.info(
+                        f"开始安装插件 {plugin_info.module_path} "
+                        f"依赖文件: {requirement_file}",
+                        LOG_COMMAND,
+                    )
+                    await VirtualEnvPackageManager.install_requirement(requirement_file)
 
             cls._deploy_staged_plugin(plugin_info, deploy_files)
 
@@ -481,18 +505,22 @@ class StoreManager:
                 temp_path.unlink(missing_ok=True)
             return
 
-        staged_deploy = Path(
-            tempfile.mkdtemp(prefix=f".{local_path.name}.new.", dir=local_path.parent)
+        transaction_root = (
+            BASE_PATH.parent / "data" / "runtime" / "plugin-store-staging"
         )
-        old_path = local_path.parent / f".{local_path.name}.old"
-        try:
+        transaction_root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix=f"{local_path.name}.", dir=transaction_root
+        ) as transaction_dir:
+            transaction_path = Path(transaction_dir)
+            staged_deploy = transaction_path / "new"
+            old_path = transaction_path / "old"
+            staged_deploy.mkdir()
             for staged_path, destination_path in deploy_files:
                 relative = destination_path.relative_to(local_path)
                 target = staged_deploy / relative
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(staged_path, target)
-            if old_path.exists():
-                shutil.rmtree(old_path, onerror=win_on_rm_error)
             if local_path.exists():
                 os.replace(local_path, old_path)
             try:
@@ -503,9 +531,6 @@ class StoreManager:
                 raise
             if old_path.exists():
                 shutil.rmtree(old_path, onerror=win_on_rm_error)
-        finally:
-            if staged_deploy.exists():
-                shutil.rmtree(staged_deploy, onerror=win_on_rm_error)
 
     @staticmethod
     def _get_source_order(source: str | None) -> tuple[RepoType, ...]:

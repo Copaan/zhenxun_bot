@@ -90,6 +90,9 @@ class PluginRuntimeManager:
         self._original_scheduler_add_job: Callable[..., Any] | None = None
         self._pending_dependencies: dict[str, set[str]] = defaultdict(set)
         self._content_digests: dict[Path, str] = {}
+        self._content_change_holds: dict[Path, int] = defaultdict(int)
+        self._content_changes_released = asyncio.Event()
+        self._content_changes_released.set()
         self._classification_cache = self._load_index_cache()
         self._original_thread_start: Callable[..., Any] | None = None
         self._original_popen_init: Callable[..., Any] | None = None
@@ -775,6 +778,20 @@ class PluginRuntimeManager:
                 return self._failed_operation(module, "plugin_not_hot_reloadable")
         return await self._reload_units(affected)
 
+    async def unload_plugin(self, module: str) -> RuntimeOperation:
+        """Unload one managed plugin without requiring its files to disappear first."""
+        unit = self._find_unit(module)
+        if unit is None:
+            return self._failed_operation(module, "plugin_not_loaded")
+        if not self.enabled:
+            return self._failed_operation(module, "nonebot_compatibility")
+        affected = self._dependent_closure({unit.plugin_id})
+        for plugin_id in affected:
+            candidate = self.units[plugin_id]
+            if candidate.classification is not ReloadClassification.HOT_RELOADABLE:
+                return self._failed_operation(module, "plugin_not_hot_reloadable")
+        return await self._unload_removed_units(affected, submit_restart=False)
+
     async def _request_restart_compat(
         self, affected: set[str], reason: str, *, submit_restart: bool
     ) -> RuntimeOperation:
@@ -905,7 +922,9 @@ class PluginRuntimeManager:
                     raise RuntimeError("plugin_runtime_unit_missing")
                 if unit.classification is not ReloadClassification.HOT_RELOADABLE:
                     reason = sorted(unit.reasons)[0]
-                    return await self.request_restart({plugin_id}, reason)
+                    return await self._request_restart_compat(
+                        {plugin_id}, reason, submit_restart=submit_restart
+                    )
 
                 await self._run_reload_startup_hooks({plugin_id})
                 self.discover_loaded_plugins()
@@ -915,7 +934,9 @@ class PluginRuntimeManager:
                     and unit.classification is not ReloadClassification.HOT_RELOADABLE
                 ):
                     reason = sorted(unit.reasons)[0]
-                    return await self.request_restart({plugin_id}, reason)
+                    return await self._request_restart_compat(
+                        {plugin_id}, reason, submit_restart=submit_restart
+                    )
 
                 self.generation += 1
                 await self._reconcile_runtime_metadata()
@@ -1118,6 +1139,31 @@ class PluginRuntimeManager:
         return {
             "reload_support": unit.classification.value,
             "reload_reasons": sorted(unit.reasons),
+        }
+
+    def classification_for_source(self, module: str, root: Path) -> dict[str, Any]:
+        """Classify an unimported plugin tree without registering runtime resources."""
+        root = root.resolve()
+        files = self._source_files(root)
+        if not files:
+            return {
+                "reload_support": ReloadClassification.FAILED.value,
+                "reload_reasons": ["plugin_source_missing"],
+            }
+        provisional = PluginUnit(
+            plugin_id=module,
+            module_name=module,
+            manager=None,
+            root=root,
+            files=files,
+        )
+        classify_unit(provisional)
+        if provisional.model_files:
+            provisional.reasons.add("orm_model_new_plugin")
+            provisional.classification = ReloadClassification.RESTART_REQUIRED
+        return {
+            "reload_support": provisional.classification.value,
+            "reload_reasons": sorted(provisional.reasons),
         }
 
     async def _reload_units(self, affected: set[str]) -> RuntimeOperation:
@@ -1480,6 +1526,37 @@ class PluginRuntimeManager:
             self._content_digests[path] = digest
             changed.add(path)
         return changed
+
+    def _content_changes_held(self, paths: set[Path]) -> bool:
+        return any(
+            path == root or path.is_relative_to(root)
+            for path in paths
+            for root, count in self._content_change_holds.items()
+            if count > 0
+        )
+
+    async def wait_for_content_change_holds(self, paths: set[Path]) -> None:
+        resolved = {path.resolve() for path in paths}
+        while self._content_changes_held(resolved):
+            await self._content_changes_released.wait()
+
+    @contextlib.asynccontextmanager
+    async def hold_content_changes(self, roots: set[Path]):
+        resolved = {root.resolve() for root in roots}
+        for root in resolved:
+            self._content_change_holds[root] += 1
+        self._content_changes_released.clear()
+        try:
+            yield
+        finally:
+            for root in resolved:
+                remaining = self._content_change_holds[root] - 1
+                if remaining > 0:
+                    self._content_change_holds[root] = remaining
+                else:
+                    self._content_change_holds.pop(root, None)
+            if not self._content_change_holds:
+                self._content_changes_released.set()
 
     async def process_changes(
         self, paths: set[Path], *, submit_restart: bool = True
