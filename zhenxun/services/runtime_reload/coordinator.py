@@ -23,7 +23,9 @@ class RuntimeChangeCoordinator:
         self.manager = manager
         self._lock = asyncio.Lock()
 
-    async def process(self, paths: set[Path]) -> RuntimeOperation | None:
+    async def process(
+        self, paths: set[Path], *, submit_restart: bool = True
+    ) -> RuntimeOperation | None:
         resolved = {path.resolve() for path in paths}
         changed = self.manager.claim_content_changes(resolved)
         if not changed:
@@ -32,12 +34,30 @@ class RuntimeChangeCoordinator:
             return None
         async with self._lock:
             if changed & _ENV_FILES:
-                return await self.manager.request_restart(set(), "environment_changed")
+                try:
+                    return await self.manager.request_restart(
+                        set(),
+                        "environment_changed",
+                        submit_launcher=submit_restart,
+                    )
+                except TypeError as error:
+                    if "submit_launcher" not in str(error):
+                        raise
+                    return await self.manager.request_restart(
+                        set(), "environment_changed"
+                    )
             if any(
                 path.name in _DEPENDENCY_NAMES or path.name == "requirements.txt"
                 for path in changed
             ):
-                return await self.manager.request_dependency_restart(changed)
+                try:
+                    return await self.manager.request_dependency_restart(
+                        changed, submit_launcher=submit_restart
+                    )
+                except TypeError as error:
+                    if "submit_launcher" not in str(error):
+                        raise
+                    return await self.manager.request_dependency_restart(changed)
             if _CONFIG_FILE in changed:
                 logger.debug("检测到外部配置文件内容变化，开始运行时重载")
                 try:
@@ -65,4 +85,6 @@ class RuntimeChangeCoordinator:
                 )
                 self.manager.last_operation = operation
                 return operation
-            return await self.manager.apply_plugin_changes(changed)
+            return await self.manager.apply_plugin_changes(
+                changed, submit_restart=submit_restart
+            )

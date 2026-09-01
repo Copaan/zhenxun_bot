@@ -52,6 +52,7 @@ def row_style(column: str, text: str) -> RowStyle:
 
 
 class StoreManager:
+    _last_install_had_requirements: ClassVar[bool] = False
     _SOURCE_NAMES: ClassVar[dict[RepoType, str]] = {
         RepoType.ALIYUN: "阿里云",
         RepoType.GITHUB: "GitHub",
@@ -109,7 +110,11 @@ class StoreManager:
         cls, plugin_info: StorePluginInfo, *, is_external: bool
     ) -> Path:
         """将商店插件信息映射到本地插件文件/目录路径。"""
-        plugin_name = plugin_info.module
+        module_parts = plugin_info.module_path.replace("/", ".").split(".")
+        plugin_name = next(
+            (part for part in reversed(module_parts) if part and part.isidentifier()),
+            plugin_info.module,
+        )
 
         if plugin_info.is_dir:
             return BASE_PATH / "plugins" / plugin_name
@@ -140,6 +145,10 @@ class StoreManager:
         )
         await _PLUGIN_STORE_DATA_CACHE.set(cache_key, result)
         return result
+
+    @classmethod
+    async def invalidate_cache(cls) -> None:
+        await _PLUGIN_STORE_DATA_CACHE.delete("plugins_json")
 
     @classmethod
     def version_check(cls, plugin_info: StorePluginInfo, suc_plugin: dict[str, str]):
@@ -292,6 +301,14 @@ class StoreManager:
 
         installed_modules = set((await cls.get_installed_plugins()).keys())
 
+        def is_installed(info: StorePluginInfo) -> bool:
+            return (
+                info.module in installed_modules
+                or cls._resolve_local_plugin_path(
+                    info, is_external=is_external
+                ).exists()
+            )
+
         if is_remove:
             # 商店列表中找不到时，从数据库构建最小插件信息
             if not plugin_info:
@@ -316,7 +333,7 @@ class StoreManager:
                     is_dir=_path.is_dir(),
                 )
                 is_external = True
-            if plugin_info.module not in installed_modules:
+            if not is_installed(plugin_info):
                 raise PluginStoreException(f"插件 {plugin_info.name} 未安装，无法移除")
             if plugin_obj := await PluginInfo.get_plugin(
                 module=plugin_info.module,
@@ -334,11 +351,11 @@ class StoreManager:
             raise PluginStoreException(f"插件不存在: {plugin_key}")
 
         if is_update:
-            if plugin_info.module not in installed_modules:
+            if not is_installed(plugin_info):
                 raise PluginStoreException(f"插件 {plugin_info.name} 未安装，无法更新")
             return plugin_info, is_external
 
-        if plugin_info.module in installed_modules:
+        if is_installed(plugin_info):
             raise PluginStoreException(f"插件 {plugin_info.name} 已安装，无需重复安装")
 
         return plugin_info, is_external
@@ -389,6 +406,7 @@ class StoreManager:
             source: 强制使用的源，ali 为阿里云，git 为 GitHub；
                 不指定时优先阿里云，失败后回退 GitHub
         """
+        cls._last_install_had_requirements = False
         source_order = cls._get_source_order(source)
         errors: list[str] = []
 
@@ -428,6 +446,7 @@ class StoreManager:
                 )
 
             deploy_files, requirement_files = staged_result
+            cls._last_install_had_requirements = bool(requirement_files)
             for requirement_file in requirement_files:
                 logger.info(
                     f"开始安装插件 {plugin_info.module_path} "
@@ -436,9 +455,57 @@ class StoreManager:
                 )
                 await VirtualEnvPackageManager.install_requirement(requirement_file)
 
+            cls._deploy_staged_plugin(plugin_info, deploy_files)
+
+    @classmethod
+    def _deploy_staged_plugin(
+        cls,
+        plugin_info: StorePluginInfo,
+        deploy_files: list[tuple[Path, Path]],
+    ) -> None:
+        local_path = cls._resolve_local_plugin_path(plugin_info, is_external=False)
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        if not plugin_info.is_dir:
+            if len(deploy_files) != 1:
+                raise PluginStoreException("单文件插件下载结果不唯一")
+            staged_path = deploy_files[0][0]
+            fd, temp_name = tempfile.mkstemp(
+                prefix=f".{local_path.name}.", dir=local_path.parent
+            )
+            os.close(fd)
+            temp_path = Path(temp_name)
+            try:
+                shutil.copy2(staged_path, temp_path)
+                os.replace(temp_path, local_path)
+            finally:
+                temp_path.unlink(missing_ok=True)
+            return
+
+        staged_deploy = Path(
+            tempfile.mkdtemp(prefix=f".{local_path.name}.new.", dir=local_path.parent)
+        )
+        old_path = local_path.parent / f".{local_path.name}.old"
+        try:
             for staged_path, destination_path in deploy_files:
-                destination_path.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(staged_path, destination_path)
+                relative = destination_path.relative_to(local_path)
+                target = staged_deploy / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(staged_path, target)
+            if old_path.exists():
+                shutil.rmtree(old_path, onerror=win_on_rm_error)
+            if local_path.exists():
+                os.replace(local_path, old_path)
+            try:
+                os.replace(staged_deploy, local_path)
+            except Exception:
+                if old_path.exists() and not local_path.exists():
+                    os.replace(old_path, local_path)
+                raise
+            if old_path.exists():
+                shutil.rmtree(old_path, onerror=win_on_rm_error)
+        finally:
+            if staged_deploy.exists():
+                shutil.rmtree(staged_deploy, onerror=win_on_rm_error)
 
     @staticmethod
     def _get_source_order(source: str | None) -> tuple[RepoType, ...]:
@@ -522,10 +589,11 @@ class StoreManager:
                 f"仓库中未找到插件目录: {plugin_info.module_path}"
             )
 
+        local_plugin_path = cls._resolve_local_plugin_path(
+            plugin_info, is_external=repo_type != RepoType.GITHUB
+        )
         target_root = (
-            BASE_PATH / "plugins" / plugin_info.module
-            if plugin_info.is_dir
-            else BASE_PATH / "plugins"
+            local_plugin_path if plugin_info.is_dir else local_plugin_path.parent
         )
         download_files: list[tuple[str, Path]] = []
         deploy_files: list[tuple[Path, Path]] = []
@@ -548,7 +616,7 @@ class StoreManager:
                     ) from e
                 destination_path = target_root / relative_path
             else:
-                destination_path = target_root / f"{plugin_info.module}.py"
+                destination_path = local_plugin_path
 
             download_files.append((file.path, staged_path))
             deploy_files.append((staged_path, destination_path))
@@ -682,8 +750,6 @@ class StoreManager:
         logger.info(f"尝试更新插件 {plugin_info.name}", LOG_COMMAND)
         suc_plugin = await cls.get_installed_plugins()
         logger.debug(f"当前插件列表: {suc_plugin}", LOG_COMMAND)
-        if cls.check_version_is_new(plugin_info, suc_plugin):
-            return f"插件 {plugin_info.name} 已是最新版本"
         if plugin_info.github_url is None:
             plugin_info.github_url = DEFAULT_GITHUB_URL
         await cls.install_plugin_with_repo(

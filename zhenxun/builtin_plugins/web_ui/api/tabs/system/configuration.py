@@ -17,6 +17,11 @@ from ruamel.yaml import YAML
 from zhenxun.configs.config import Config
 from zhenxun.services.runtime_config_reload import reload_runtime_config
 from zhenxun.services.runtime_reload.models import ApplyMode, RuntimeOperation
+from zhenxun.services.webui_tls import (
+    WebUITLSConfigError,
+    settings_from_values,
+    validate_webui_tls_settings,
+)
 from zhenxun.utils._restart_utils import issue_restart_ticket
 from zhenxun.utils.network import local_access_urls
 from zhenxun.utils.pydantic_compat import (
@@ -25,6 +30,13 @@ from zhenxun.utils.pydantic_compat import (
     model_json_schema,
 )
 
+from ....apply_result import (
+    APPLY_NO_CHANGE,
+    APPLY_RESTART_PENDING,
+    apply_result_data,
+    env_change_impact,
+    update_pending_restart,
+)
 from ....base_model import Result
 from ....config_validation import (
     ConfigurationValidationError,
@@ -44,6 +56,11 @@ _SIMPLE_FILE = Path("data/config.yaml")
 _ENV_FORM_KEYS = (
     "HOST",
     "PORT",
+    "WEBUI_HTTPS_ENABLED",
+    "WEBUI_TLS_CERTFILE",
+    "WEBUI_TLS_KEYFILE",
+    "WEBUI_HTTP_REDIRECT_ENABLED",
+    "WEBUI_HTTP_REDIRECT_PORT",
     "LOG_LEVEL",
     "SYSTEM_PROXY",
     "NICKNAME",
@@ -69,7 +86,35 @@ class ConfigurationValidation(BaseModel):
 
 
 def _validate_env(content: str) -> list[dict[str, Any]]:
-    return validate_dotenv(content)
+    warnings = validate_dotenv(content)
+    values = dict(dotenv_values(stream=StringIO(content)))
+    qq_enabled = str(values.get("QQ_ADAPTER_LOAD") or "").casefold() == "true"
+    qq_builtin = str(values.get("QQ_WEBHOOK_MODE") or "") == "builtin_https"
+    try:
+        qq_port = int(values.get("QQ_WEBHOOK_LISTEN_PORT") or 443)
+    except (TypeError, ValueError):
+        qq_port = 443
+    try:
+        validate_webui_tls_settings(
+            settings_from_values(values),
+            qq_https_port=qq_port if qq_enabled and qq_builtin else None,
+            launcher_managed=bool(os.getenv("ZHENXUN_LAUNCHER_PID")),
+        )
+    except WebUITLSConfigError as error:
+        raise ConfigurationValidationError(
+            [
+                {
+                    "code": "webui_tls_invalid",
+                    "file": ".env.dev",
+                    "path": "WEBUI_HTTPS_ENABLED",
+                    "line": None,
+                    "column": None,
+                    "severity": "error",
+                    "message": str(error),
+                }
+            ]
+        ) from error
+    return warnings
 
 
 def _validate_simple(content: str) -> list[dict[str, Any]]:
@@ -288,7 +333,7 @@ async def get_configuration_file(file: str, response: Response) -> Result:
 async def validate_configuration(payload: ConfigurationValidation) -> Result:
     try:
         warnings = (
-            validate_dotenv(payload.content)
+            _validate_env(payload.content)
             if payload.file == "env"
             else validate_simple_yaml(payload.content)
         )
@@ -326,7 +371,7 @@ async def update_configuration_file(
                 else _update_simple(current, payload.fields or {})
             )
         warnings = (
-            validate_dotenv(content) if file == "env" else validate_simple_yaml(content)
+            _validate_env(content) if file == "env" else validate_simple_yaml(content)
         )
     except Exception as error:
         raise _validation_error(file, error) from error
@@ -334,8 +379,11 @@ async def update_configuration_file(
     original = target.read_bytes() if target.exists() else None
     operation: RuntimeOperation | None = None
     try:
-        _write_transaction([(target, content.encode("utf-8"))])
-        if file == "simple":
+        content_bytes = content.encode("utf-8")
+        content_changed = original != content_bytes
+        if content_changed:
+            _write_transaction([(target, content_bytes)])
+        if file == "simple" and content_changed:
             operation = await reload_runtime_config(submit_restart=False)
             if operation.mode is ApplyMode.FAILED:
                 raise RuntimeError(operation.reason or "config_consumer_reload_failed")
@@ -354,11 +402,33 @@ async def update_configuration_file(
             detail=f"配置保存或重载失败（{error.__class__.__name__}）。",
         ) from error
 
-    launcher_managed = bool(os.getenv("ZHENXUN_LAUNCHER_PID"))
-    restart_required = file == "env" or bool(
-        operation
-        and operation.mode in {ApplyMode.RESTART_PENDING, ApplyMode.RESTART_REQUESTED}
-    )
+    if file == "env":
+        changed_keys, pending_keys = env_change_impact(
+            current,
+            content,
+            set(_ENV_FORM_KEYS) if payload.fields is not None else None,
+        )
+        restart_required = bool(set(changed_keys) & set(pending_keys))
+        apply_mode = APPLY_RESTART_PENDING if restart_required else APPLY_NO_CHANGE
+        reason_codes = [f"environment:{key}" for key in pending_keys]
+        launcher_managed = update_pending_restart(
+            "webui.env-form" if payload.fields is not None else "webui.env-raw",
+            reason_codes,
+            issue_ticket=False,
+        )
+    else:
+        apply_mode = operation.mode.value if operation is not None else APPLY_NO_CHANGE
+        restart_required = apply_mode in {
+            ApplyMode.RESTART_PENDING.value,
+            ApplyMode.RESTART_REQUESTED.value,
+        }
+        changed_keys = operation.config_keys if operation is not None else []
+        reason_codes = [operation.reason] if operation and operation.reason else []
+        launcher_managed = update_pending_restart(
+            "webui.config",
+            reason_codes if restart_required else [],
+            issue_ticket=False,
+        )
     if restart_required and launcher_managed:
         issue_restart_ticket("webui.settings", ttl_seconds=10 * 60)
     access_urls: list[str] = []
@@ -370,42 +440,32 @@ async def update_configuration_file(
             port = int(values.get("PORT") or 8080)
         except (TypeError, ValueError):
             port = 8080
-        local_urls = local_access_urls(host, port)
+        scheme = settings_from_values(dict(values)).scheme
+        local_urls = local_access_urls(host, port, scheme)
         access_urls = [item.url for item in local_urls]
         access_targets = [
             {"kind": item.label.lower(), "url": item.url} for item in local_urls
         ]
-    return Result.ok(
-        {
-            "file": file,
-            "revision": _revision(content),
-            "changed_keys": (
-                operation.config_keys
-                if operation is not None
-                else sorted((payload.fields or {}).keys())
-            ),
-            "warnings": warnings,
-            "apply_mode": (
-                operation.mode.value if operation is not None else "restart_pending"
-            ),
-            "hot_reloaded": bool(
-                operation
-                and operation.mode
-                in {ApplyMode.CONFIG_RELOADED, ApplyMode.HOT_RELOADED}
-            ),
-            "restart_required": restart_required,
-            "restart_available": restart_required and launcher_managed,
-            "affected": operation.changed if operation is not None else [],
-            "reason": operation.reason if operation is not None else None,
-            "access_urls": access_urls,
-            "access_targets": access_targets,
-        },
-        info=(
-            "配置已保存，需要重启后生效。"
-            if restart_required
-            else "配置已保存并热加载。"
-        ),
+    data = apply_result_data(
+        apply_mode=apply_mode,
+        changed_keys=changed_keys,
+        restart_required=restart_required,
+        reason_codes=reason_codes,
+        access_urls=access_urls,
+        access_targets=access_targets,
+        file=file,
+        revision=_revision(content),
+        warnings=warnings,
+        affected=operation.changed if operation is not None else [],
+        reason=operation.reason if operation is not None else None,
     )
+    if apply_mode == APPLY_NO_CHANGE:
+        info = "配置已保存，没有需要应用的运行时变化。"
+    elif restart_required:
+        info = "配置已保存，需要重启后生效。"
+    else:
+        info = "配置已保存并热加载。"
+    return Result.ok(data, info=info)
 
 
 @router.post(

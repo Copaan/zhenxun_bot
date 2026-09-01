@@ -13,6 +13,7 @@ from zhenxun.services.log import logger
 from zhenxun.services.runtime_reload.models import ApplyMode, RuntimeOperation
 
 ConfigDependency = tuple[str, str]
+_STARTUP_SIMPLE_DATA = deepcopy(Config._simple_data)
 
 
 class RuntimeConfigReloadError(RuntimeError):
@@ -50,6 +51,8 @@ async def reload_runtime_config(
     reschedule: Callable[[], None] | None = None,
     *,
     submit_restart: bool = True,
+    previous_simple_data: Any | None = None,
+    reload_consumers: bool = True,
 ) -> RuntimeOperation:
     """Reload config.yaml and the runtime state derived from it."""
     from zhenxun.builtin_plugins.hooks.auth.auth_limit import LimitManager
@@ -67,10 +70,15 @@ async def reload_runtime_config(
                 reschedule()
 
     snapshot = Config.snapshot_runtime_values()
-    before = deepcopy(Config._simple_data)
+    before = deepcopy(
+        Config._simple_data if previous_simple_data is None else previous_simple_data
+    )
     try:
         Config.reload(strict=True)
         changed_dependencies = changed_config_dependencies(before, Config._simple_data)
+        startup_changed_dependencies = changed_config_dependencies(
+            _STARTUP_SIMPLE_DATA, Config._simple_data
+        )
         changed_paths = sorted(
             f"{module}.{key}" for module, key in changed_dependencies
         )
@@ -79,10 +87,21 @@ async def reload_runtime_config(
         else:
             logger.debug("config.yaml 语义内容未变化，跳过配置消费者重载")
         await refresh_derived_state()
-        operation = await plugin_runtime_manager.reload_config_consumers(
-            changed_dependencies,
-            submit_restart=submit_restart,
-        )
+        operation = None
+        if reload_consumers:
+            try:
+                operation = await plugin_runtime_manager.reload_config_consumers(
+                    changed_dependencies,
+                    restart_dependencies=startup_changed_dependencies,
+                    submit_restart=submit_restart,
+                )
+            except TypeError as error:
+                if "restart_dependencies" not in str(error):
+                    raise
+                operation = await plugin_runtime_manager.reload_config_consumers(
+                    changed_dependencies,
+                    submit_restart=submit_restart,
+                )
         if operation is not None and operation.mode is ApplyMode.FAILED:
             raise RuntimeConfigReloadError(
                 operation.reason or "config_consumer_reload_failed"

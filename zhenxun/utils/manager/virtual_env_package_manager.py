@@ -197,7 +197,7 @@ class VirtualEnvPackageManager:
                 f"安装虚拟环境依赖文件指令执行失败: {stderr}.",
                 LOG_COMMAND,
             )
-            return stderr
+            raise RuntimeError("plugin_dependency_install_failed") from e
 
     @classmethod
     async def add_requirement(cls, requirement_file: Path):

@@ -775,11 +775,69 @@ class PluginRuntimeManager:
                 return self._failed_operation(module, "plugin_not_hot_reloadable")
         return await self._reload_units(affected)
 
+    async def _request_restart_compat(
+        self, affected: set[str], reason: str, *, submit_restart: bool
+    ) -> RuntimeOperation:
+        try:
+            return await self.request_restart(
+                affected, reason, submit_launcher=submit_restart
+            )
+        except TypeError as error:
+            if "submit_launcher" not in str(error):
+                raise
+            return await self.request_restart(affected, reason)
+
+    async def _request_dependency_restart_compat(
+        self, changed: set[Path], *, submit_restart: bool
+    ) -> RuntimeOperation:
+        try:
+            return await self.request_dependency_restart(
+                changed, submit_launcher=submit_restart
+            )
+        except TypeError as error:
+            if "submit_launcher" not in str(error):
+                raise
+            return await self.request_dependency_restart(changed)
+
+    async def recover_plugin(
+        self, module: str, *, submit_restart: bool = True
+    ) -> RuntimeOperation:
+        """Reload a plugin after its files were restored by a failed store update."""
+        unit = self._find_unit(module)
+        if unit is None:
+            root = Path.cwd() / Path(*module.split("."))
+            return await self.load_new_plugin(
+                module, root, submit_restart=submit_restart
+            )
+        unit.reasons.clear()
+        unit.last_error = None
+        classify_unit(unit)
+        if unit.classification is not ReloadClassification.HOT_RELOADABLE:
+            return await self._request_restart_compat(
+                {unit.plugin_id},
+                sorted(unit.reasons)[0],
+                submit_restart=submit_restart,
+            )
+        affected = self._dependent_closure({unit.plugin_id})
+        for plugin_id in affected:
+            candidate = self.units[plugin_id]
+            if candidate is unit:
+                continue
+            if candidate.classification is not ReloadClassification.HOT_RELOADABLE:
+                return await self._request_restart_compat(
+                    affected,
+                    sorted(candidate.reasons)[0],
+                    submit_restart=submit_restart,
+                )
+        return await self._reload_units(affected)
+
     async def load_new_plugin(
         self,
         module_name: str,
         root: Path,
         changed: set[Path] | None = None,
+        *,
+        submit_restart: bool = True,
     ) -> RuntimeOperation:
         """Load a newly installed plugin when its source has no hard boundaries."""
         root = root.resolve()
@@ -791,7 +849,11 @@ class PluginRuntimeManager:
         if unit := self._find_unit(module_name):
             return await self.reload_plugin(unit.plugin_id)
         if not self.enabled:
-            return await self.request_restart({module_name}, "nonebot_compatibility")
+            return await self._request_restart_compat(
+                {module_name},
+                "nonebot_compatibility",
+                submit_restart=submit_restart,
+            )
 
         dependency_files = {
             path
@@ -799,7 +861,9 @@ class PluginRuntimeManager:
             if path.name in {"requirements.txt", "requirement.txt", "pyproject.toml"}
         }
         if dependency_files:
-            return await self.request_dependency_restart(dependency_files)
+            return await self._request_dependency_restart_compat(
+                dependency_files, submit_restart=submit_restart
+            )
 
         provisional = PluginUnit(
             plugin_id=module_name,
@@ -814,7 +878,9 @@ class PluginRuntimeManager:
             provisional.classification = ReloadClassification.RESTART_REQUIRED
         if provisional.classification is not ReloadClassification.HOT_RELOADABLE:
             reason = sorted(provisional.reasons)[0]
-            return await self.request_restart({module_name}, reason)
+            return await self._request_restart_compat(
+                {module_name}, reason, submit_restart=submit_restart
+            )
 
         async with self._reload_lock:
             from nonebot.matcher import matchers
@@ -956,17 +1022,27 @@ class PluginRuntimeManager:
             sys.modules.pop(name, None)
         self.discover_loaded_plugins()
 
-    async def apply_plugin_changes(self, changed: set[Path]) -> RuntimeOperation:
+    async def apply_plugin_changes(
+        self, changed: set[Path], *, submit_restart: bool = True
+    ) -> RuntimeOperation:
         affected = self.affected_units(changed)
         if not affected:
-            return await self.request_restart(set(), "core_source_changed")
+            return await self._request_restart_compat(
+                set(), "core_source_changed", submit_restart=submit_restart
+            )
         if not self.enabled:
-            return await self.request_restart(affected, "nonebot_compatibility")
+            return await self._request_restart_compat(
+                affected, "nonebot_compatibility", submit_restart=submit_restart
+            )
         if any(
             path.name in {"requirements.txt", "requirement.txt", "pyproject.toml"}
             for path in changed
         ):
-            return await self.request_restart(affected, "plugin_dependencies_changed")
+            return await self._request_restart_compat(
+                affected,
+                "plugin_dependencies_changed",
+                submit_restart=submit_restart,
+            )
         removed = {
             plugin_id
             for plugin_id in affected
@@ -974,21 +1050,39 @@ class PluginRuntimeManager:
         }
         if removed:
             if removed != affected:
-                return await self.request_restart(affected, "plugin_dependency_removed")
+                return await self._request_restart_compat(
+                    affected,
+                    "plugin_dependency_removed",
+                    submit_restart=submit_restart,
+                )
             for plugin_id in removed:
                 unit = self.units[plugin_id]
                 if unit.classification is not ReloadClassification.HOT_RELOADABLE:
-                    return await self.request_restart(removed, sorted(unit.reasons)[0])
-            return await self._unload_removed_units(removed)
+                    return await self._request_restart_compat(
+                        removed,
+                        sorted(unit.reasons)[0],
+                        submit_restart=submit_restart,
+                    )
+            return await self._unload_removed_units(
+                removed, submit_restart=submit_restart
+            )
         for plugin_id in affected:
             unit = self.units[plugin_id]
             if unit.classification is not ReloadClassification.HOT_RELOADABLE:
-                return await self.request_restart(affected, sorted(unit.reasons)[0])
+                return await self._request_restart_compat(
+                    affected,
+                    sorted(unit.reasons)[0],
+                    submit_restart=submit_restart,
+                )
             if changed_model_file(unit, changed):
-                return await self.request_restart(affected, "orm_model_changed")
+                return await self._request_restart_compat(
+                    affected, "orm_model_changed", submit_restart=submit_restart
+                )
         return await self._reload_units(affected)
 
-    async def _unload_removed_units(self, affected: set[str]) -> RuntimeOperation:
+    async def _unload_removed_units(
+        self, affected: set[str], *, submit_restart: bool = True
+    ) -> RuntimeOperation:
         async with self._reload_lock:
             try:
                 for plugin_id in self._reload_order(affected):
@@ -1005,7 +1099,11 @@ class PluginRuntimeManager:
                 )
             except Exception as e:
                 logger.error("插件热卸载失败，已标记为需要重启", e=e)
-                operation = await self.request_restart(affected, "plugin_unload_failed")
+                operation = await self._request_restart_compat(
+                    affected,
+                    "plugin_unload_failed",
+                    submit_restart=submit_restart,
+                )
             self.last_operation = operation
             self._persist_index()
             return operation
@@ -1268,6 +1366,13 @@ class PluginRuntimeManager:
             await reconcile_plugin_runtime()
             await reconcile_task_runtime()
         except Exception as e:
+            if e.__class__.__name__ == "OperationalError" and (
+                "no such table" in str(e).lower() or "does not exist" in str(e).lower()
+            ):
+                logger.warning(
+                    "插件已完成运行时加载，数据库元数据表尚未就绪，跳过本次协调"
+                )
+                return
             logger.error("插件代际元数据协调失败", e=e)
             raise
 
@@ -1302,6 +1407,7 @@ class PluginRuntimeManager:
         self,
         changed_dependencies: set[tuple[str, str]],
         *,
+        restart_dependencies: set[tuple[str, str]] | None = None,
         submit_restart: bool = True,
     ) -> RuntimeOperation | None:
         affected = {
@@ -1319,17 +1425,46 @@ class PluginRuntimeManager:
             f"配置变更匹配到 {len(affected)} 个导入期消费者，"
             f"处理方式: {'自动协调' if submit_restart else '等待用户确认'}"
         )
-        if any(
-            self.units[plugin_id].classification
-            is not ReloadClassification.HOT_RELOADABLE
+        restart_dependencies = (
+            changed_dependencies
+            if restart_dependencies is None
+            else restart_dependencies
+        )
+        restart_affected = {
+            plugin_id
             for plugin_id in affected
-        ):
-            return await self.request_restart(
+            if self.units[plugin_id].classification
+            is not ReloadClassification.HOT_RELOADABLE
+            and any(
+                dependency in restart_dependencies
+                or (dependency[0], "*") in restart_dependencies
+                for dependency in self.units[plugin_id].config_dependencies
+            )
+        }
+        if restart_affected:
+            return await self._request_restart_compat(
                 affected,
                 "import_time_config_consumer_requires_restart",
-                submit_launcher=submit_restart,
+                submit_restart=submit_restart,
             )
-        return await self._reload_units(affected)
+        unsafe_pending = any(
+            unit.classification is not ReloadClassification.HOT_RELOADABLE
+            and any(
+                dependency in restart_dependencies
+                or (dependency[0], "*") in restart_dependencies
+                for dependency in unit.config_dependencies
+            )
+            for unit in self.units.values()
+        )
+        if not unsafe_pending:
+            self.clear_pending_restart("import_time_config_consumer_requires_restart")
+        hot_affected = {
+            plugin_id
+            for plugin_id in affected
+            if self.units[plugin_id].classification
+            is ReloadClassification.HOT_RELOADABLE
+        }
+        return await self._reload_units(hot_affected) if hot_affected else None
 
     def claim_content_changes(self, paths: set[Path]) -> set[Path]:
         from hashlib import sha256
@@ -1346,15 +1481,26 @@ class PluginRuntimeManager:
             changed.add(path)
         return changed
 
-    async def process_changes(self, paths: set[Path]) -> RuntimeOperation | None:
+    async def process_changes(
+        self, paths: set[Path], *, submit_restart: bool = True
+    ) -> RuntimeOperation | None:
         if self._change_coordinator is None:
             from .coordinator import RuntimeChangeCoordinator
 
             self._change_coordinator = RuntimeChangeCoordinator(self)
-        return await self._change_coordinator.process(paths)
+        return await self._change_coordinator.process(
+            paths, submit_restart=submit_restart
+        )
 
     def mark_content_processed(self, path: Path) -> None:
         self.claim_content_changes({path.resolve()})
+
+    def clear_pending_restart(self, reason: str | None = None) -> None:
+        if reason is None:
+            self.pending_restart.clear()
+        else:
+            self.pending_restart.discard(reason)
+        self._persist_index()
 
     async def request_restart(
         self,
@@ -1387,11 +1533,15 @@ class PluginRuntimeManager:
         self._persist_index()
         return operation
 
-    async def request_dependency_restart(self, changed: set[Path]) -> RuntimeOperation:
+    async def request_dependency_restart(
+        self, changed: set[Path], *, submit_launcher: bool = True
+    ) -> RuntimeOperation:
         reason = "dependencies_changed"
         self.pending_restart.add(reason)
         mode = ApplyMode.RESTART_PENDING
-        if bool(__import__("os").environ.get("ZHENXUN_LAUNCHER_PID")):
+        if submit_launcher and bool(
+            __import__("os").environ.get("ZHENXUN_LAUNCHER_PID")
+        ):
             try:
                 from zhenxun.utils._restart_utils import (
                     request_dependency_restart,

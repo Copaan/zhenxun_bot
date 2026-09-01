@@ -3,10 +3,18 @@ from fastapi.responses import JSONResponse
 
 from zhenxun.models.plugin_info import PluginInfo as DbPluginInfo
 from zhenxun.services.log import logger
+from zhenxun.services.runtime_reload.models import ApplyMode
+from zhenxun.utils._restart_utils import issue_restart_ticket
 from zhenxun.utils.enum import BlockType, PluginType
 from zhenxun.utils.manager.virtual_env_package_manager import VirtualEnvPackageManager
 
+from ....apply_result import (
+    APPLY_CONFIG_RELOADED,
+    apply_result_data,
+    update_pending_restart,
+)
 from ....base_model import Result
+from ....restart_service import restart_status_data
 from ....utils import authentication
 from .data_source import ApiDataSource
 from .model import (
@@ -81,8 +89,37 @@ async def _() -> Result[PluginCount]:
 )
 async def _(param: UpdatePlugin) -> Result:
     try:
-        await ApiDataSource.update_plugin(param)
-        return Result.ok(info="已经帮你写好啦!")
+        _, operation = await ApiDataSource.update_plugin(param)
+        apply_mode = (
+            operation.mode.value if operation is not None else APPLY_CONFIG_RELOADED
+        )
+        restart_required = apply_mode in {
+            ApplyMode.RESTART_PENDING.value,
+            ApplyMode.RESTART_REQUESTED.value,
+        }
+        reasons = [operation.reason] if operation and operation.reason else []
+        launcher_managed = update_pending_restart(
+            f"webui.plugin-config:{param.module}",
+            reasons if restart_required else [],
+            issue_ticket=False,
+        )
+        if restart_required and launcher_managed:
+            issue_restart_ticket("webui.settings", ttl_seconds=10 * 60)
+        status = restart_status_data()
+        data = apply_result_data(
+            apply_mode=apply_mode,
+            changed_keys=operation.config_keys if operation else [],
+            restart_required=restart_required,
+            reason_codes=reasons,
+            access_urls=status["access_urls"],
+            access_targets=status["access_targets"],
+        )
+        info = (
+            "插件设置已保存，需要重启后生效。"
+            if restart_required
+            else "插件设置已保存并生效。"
+        )
+        return Result.ok(data, info=info)
     except (ValueError, KeyError):
         return Result.fail("插件数据不存在...")
     except Exception as e:

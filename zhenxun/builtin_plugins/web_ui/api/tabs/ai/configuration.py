@@ -5,6 +5,7 @@ from copy import deepcopy
 import hashlib
 from io import StringIO
 from pathlib import Path
+import re
 import time
 from typing import Any, Literal
 from urllib.parse import urlparse
@@ -16,6 +17,7 @@ import httpx
 from pydantic import BaseModel, Field
 from ruamel.yaml import YAML
 
+from zhenxun.configs.config import Config
 from zhenxun.services.ai.config import get_llm_config
 from zhenxun.services.ai.config.models import LLMConfig, ProviderConfig
 from zhenxun.services.ai.llm.adapters.factory import LLMAdapterFactory
@@ -23,13 +25,24 @@ from zhenxun.services.ai.llm.manager import get_default_api_base_for_type
 from zhenxun.services.ai.llm.system.capabilities import get_model_capabilities
 from zhenxun.services.log import logger
 from zhenxun.services.runtime_config_reload import reload_runtime_config
+from zhenxun.services.runtime_reload.models import RuntimeOperation
+from zhenxun.utils._restart_utils import issue_restart_ticket
 from zhenxun.utils.pydantic_compat import (
     model_dump,
     model_json_schema,
     parse_as,
 )
 
+from ....apply_result import (
+    APPLY_CONFIG_RELOADED,
+    APPLY_NEW_SESSION,
+    APPLY_NO_CHANGE,
+    APPLY_RESTART_PENDING,
+    apply_result_data,
+    update_pending_restart,
+)
 from ....base_model import Result
+from ....restart_service import restart_status_data
 from ....utils import authentication
 from ...configure.persistence import _write_transaction
 
@@ -53,6 +66,8 @@ _OPENAI_DISCOVERY_TYPES = {
 }
 _DISCOVERY_TIMEOUT = 12.0
 _PERSIST_LOCK = asyncio.Lock()
+_SANDBOX_STARTUP_VALUES = model_dump(get_llm_config().sandbox)
+_SANDBOX_STARTUP_KEYS = {"enable_sandbox", "sandbox_type"}
 
 
 class SecretSlot(BaseModel):
@@ -79,6 +94,10 @@ class ProviderModelsUpdate(BaseModel):
 
 class SectionUpdate(BaseModel):
     expected_revision: str = Field(min_length=64, max_length=64)
+    value: Any
+
+
+class RoutingValidationRequest(BaseModel):
     value: Any
 
 
@@ -218,7 +237,8 @@ def _reference_issues(config: LLMConfig) -> list[dict[str, str]]:
                 f"模型路由组 {' -> '.join((*stack, group))} 存在循环引用。",
             )
             return
-        for target in config.model_groups.get(group, []):
+        targets = config.model_groups.get(group, [])
+        for target in targets:
             if target in group_names:
                 visit(target, (*stack, group))
             elif target not in available_models:
@@ -229,7 +249,34 @@ def _reference_issues(config: LLMConfig) -> list[dict[str, str]]:
                 )
 
     for group_name in group_names:
+        targets = config.model_groups.get(group_name, [])
+        if len(targets) != len(set(targets)):
+            add(
+                "model_group_target_duplicate",
+                f"AI.MODEL_GROUPS.{group_name}",
+                f"模型路由组 {group_name} 包含重复目标。",
+            )
         visit(group_name, ())
+
+    def model_supports(target: str, task: str) -> bool:
+        model = model_details.get(target)
+        if model is None:
+            return False
+        capabilities = get_model_capabilities(model.model_name)
+        declared_task = model.task_type or ""
+        if task == "image" and declared_task == "image_generation":
+            return True
+        return declared_task == task or capabilities.supports_task(task)
+
+    def target_supports(target: str, task: str, seen: set[str]) -> bool:
+        if target in model_details:
+            return model_supports(target, task)
+        if target not in group_names or target in seen:
+            return False
+        return any(
+            target_supports(child, task, {*seen, target})
+            for child in config.model_groups.get(target, [])
+        )
 
     for task, target in model_dump(config.default_models).items():
         if target and target not in available_models and target not in group_names:
@@ -238,20 +285,16 @@ def _reference_issues(config: LLMConfig) -> list[dict[str, str]]:
                 f"AI.default_models.{task}",
                 f"{task} 默认模型 {target} 不存在。",
             )
-        elif target and target in model_details:
-            model = model_details[target]
-            capabilities = get_model_capabilities(model.model_name)
-            declared_task = model.task_type or ""
-            supported = capabilities.supports_task(task)
-            if task == "image" and declared_task == "image_generation":
-                supported = True
-            elif declared_task == task:
-                supported = True
-            if not supported:
+        elif target and not target_supports(target, task, set()):
+            if target in model_details:
+                label = f"模型 {target}"
+            else:
+                label = f"路由组 {target}"
+            if target in available_models or target in group_names:
                 add(
                     "default_model_capability_mismatch",
                     f"AI.default_models.{task}",
-                    f"模型 {target} 不支持 {task} 任务。",
+                    f"{label}中没有支持 {task} 任务的可用模型。",
                 )
     return issues
 
@@ -328,8 +371,34 @@ def _find_provider(ai: dict[str, Any], name: str) -> tuple[int, dict[str, Any]]:
 def _keys(provider: dict[str, Any]) -> list[str]:
     value = provider.get("api_key", [])
     if isinstance(value, str):
-        return [value] if value else []
-    return [str(item) for item in value if str(item)] if isinstance(value, list) else []
+        candidates = [value]
+    elif isinstance(value, list):
+        candidates = [str(item) for item in value]
+    else:
+        candidates = []
+    return [item for item in candidates if not _is_placeholder_secret(item)]
+
+
+_PLACEHOLDER_SECRETS = {
+    "change_me",
+    "changeme",
+    "replace_me",
+    "your_api_key",
+    "your_key_here",
+}
+
+
+def _is_placeholder_secret(value: Any) -> bool:
+    normalized = str(value or "").strip()
+    if not normalized:
+        return True
+    folded = normalized.casefold()
+    return bool(
+        folded in _PLACEHOLDER_SECRETS
+        or folded.startswith("your_")
+        or re.fullmatch(r"\$\{[^{}]+\}", normalized)
+        or re.fullmatch(r"<[^<>]+>", normalized)
+    )
 
 
 def _rename_provider_references(ai: dict[str, Any], old: str, new: str) -> None:
@@ -365,6 +434,8 @@ def _apply_secret_slots(
     used: set[int] = set()
     for slot in slots:
         replacement = (slot.value or "").strip()
+        if replacement and _is_placeholder_secret(replacement):
+            replacement = ""
         if slot.existing_index is None:
             if replacement:
                 result.append(replacement)
@@ -381,8 +452,11 @@ def _apply_secret_slots(
 
 
 async def _persist_unlocked(
-    expected_revision: str, mutate: Any
-) -> tuple[str, LLMConfig]:
+    expected_revision: str,
+    mutate: Any,
+    *,
+    reload_consumers: bool = True,
+) -> tuple[str, LLMConfig, RuntimeOperation | None]:
     current = _read()
     if _revision(current) != expected_revision:
         raise HTTPException(
@@ -410,10 +484,23 @@ async def _persist_unlocked(
     if new_issues:
         _raise_reference_issue(new_issues[0])
     content = _dump(candidate)
+    if content == current:
+        return _revision(content), config, None
     original = _CONFIG_FILE.read_bytes() if _CONFIG_FILE.exists() else None
     try:
         _write_transaction([(_CONFIG_FILE, content.encode("utf-8"))])
-        await reload_runtime_config(submit_restart=False)
+        if reload_consumers:
+            operation = await reload_runtime_config(submit_restart=False)
+        else:
+            try:
+                operation = await reload_runtime_config(
+                    submit_restart=False,
+                    reload_consumers=False,
+                )
+            except TypeError as error:
+                if "reload_consumers" not in str(error):
+                    raise
+                operation = await reload_runtime_config(submit_restart=False)
     except Exception as error:
         if original is None:
             _CONFIG_FILE.unlink(missing_ok=True)
@@ -430,12 +517,92 @@ async def _persist_unlocked(
                 "message": "AI 配置保存或热加载失败，已恢复原配置。",
             },
         ) from error
-    return _revision(content), config
+    return _revision(content), config, operation
+
+
+async def _persist_with_operation(
+    expected_revision: str,
+    mutate: Any,
+    *,
+    reload_consumers: bool = True,
+) -> tuple[str, LLMConfig, RuntimeOperation | None]:
+    async with _PERSIST_LOCK:
+        return await _persist_unlocked(
+            expected_revision,
+            mutate,
+            reload_consumers=reload_consumers,
+        )
 
 
 async def _persist(expected_revision: str, mutate: Any) -> tuple[str, LLMConfig]:
-    async with _PERSIST_LOCK:
-        return await _persist_unlocked(expected_revision, mutate)
+    revision, config, _ = await _persist_with_operation(expected_revision, mutate)
+    return revision, config
+
+
+def _restore_sandbox_startup_runtime() -> None:
+    group = Config.get("AI")
+    config_model = group.configs.get("SANDBOX")
+    current = deepcopy(config_model.value) if config_model else {}
+    if not isinstance(current, dict):
+        current = {}
+    for key in _SANDBOX_STARTUP_KEYS:
+        current[key] = deepcopy(_SANDBOX_STARTUP_VALUES.get(key))
+    if config_model:
+        config_model.value = current
+    ai_data = Config._simple_data.get("AI")
+    if isinstance(ai_data, dict):
+        raw_key = next(
+            (key for key in ai_data if str(key).upper() == "SANDBOX"),
+            "sandbox",
+        )
+        ai_data[raw_key] = deepcopy(current)
+    get_llm_config.cache_clear()
+
+
+def _apply_response(
+    config: LLMConfig,
+    revision: str,
+    operation: RuntimeOperation | None,
+    *,
+    apply_mode: str | None = None,
+    changed_keys: list[str] | None = None,
+    restart_required: bool | None = None,
+    reason_codes: list[str] | None = None,
+    pending_source: str = "webui.ai",
+) -> dict[str, Any]:
+    status = restart_status_data()
+    mode = apply_mode or (
+        operation.mode.value if operation is not None else APPLY_NO_CHANGE
+    )
+    required = (
+        mode == APPLY_RESTART_PENDING if restart_required is None else restart_required
+    )
+    reasons = reason_codes or (
+        [operation.reason] if operation is not None and operation.reason else []
+    )
+    if required:
+        launcher_managed = update_pending_restart(
+            pending_source,
+            reasons or ["ai_runtime_restart_required"],
+            issue_ticket=False,
+        )
+        if launcher_managed:
+            issue_restart_ticket("webui.settings", ttl_seconds=10 * 60)
+    return apply_result_data(
+        apply_mode=mode,
+        changed_keys=(
+            changed_keys
+            if changed_keys is not None
+            else operation.config_keys
+            if operation is not None
+            else []
+        ),
+        restart_required=required,
+        reason_codes=reasons,
+        access_urls=status["access_urls"],
+        access_targets=status["access_targets"],
+        **_configuration_view(config, revision),
+    )
 
 
 def _safe_model_data(value: Any) -> dict[str, Any]:
@@ -479,7 +646,7 @@ def _provider_view(
     data["api_key_slots"] = [
         {"existing_index": index, "configured": True}
         for index, value in enumerate(keys)
-        if value
+        if not _is_placeholder_secret(value)
     ]
     raw_models = (
         raw_provider.get("models", []) if isinstance(raw_provider, dict) else []
@@ -505,6 +672,58 @@ def _provider_view(
         provider.api_type in _OPENAI_DISCOVERY_TYPES or provider.api_type == "gemini"
     )
     return data
+
+
+def _normalize_model_groups(value: Any) -> dict[str, list[str]]:
+    if isinstance(value, dict):
+        rows = [{"name": name, "targets": targets} for name, targets in value.items()]
+    elif isinstance(value, list):
+        rows = value
+    else:
+        raise _configuration_error(
+            "model_groups_invalid",
+            "模型路由组必须是列表或映射。",
+            "AI.MODEL_GROUPS",
+        )
+    groups: dict[str, list[str]] = {}
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise _configuration_error(
+                "model_group_invalid",
+                "模型路由组格式无效。",
+                f"AI.MODEL_GROUPS.{index}",
+            )
+        name = str(row.get("name") or "").strip()
+        if not name:
+            raise _configuration_error(
+                "model_group_name_required",
+                "请填写路由组名称。",
+                f"AI.MODEL_GROUPS.{index}.name",
+            )
+        if name in groups:
+            raise _configuration_error(
+                "model_group_name_duplicate",
+                f"路由组名称 {name} 重复。",
+                f"AI.MODEL_GROUPS.{index}.name",
+            )
+        targets = row.get("targets", [])
+        if not isinstance(targets, list) or not all(
+            isinstance(target, str) and target.strip() for target in targets
+        ):
+            raise _configuration_error(
+                "model_group_targets_invalid",
+                "模型路由目标必须是非空字符串列表。",
+                f"AI.MODEL_GROUPS.{index}.targets",
+            )
+        normalized_targets = [target.strip() for target in targets]
+        if len(normalized_targets) != len(set(normalized_targets)):
+            raise _configuration_error(
+                "model_group_target_duplicate",
+                f"路由组 {name} 不能重复引用同一目标。",
+                f"AI.MODEL_GROUPS.{index}.targets",
+            )
+        groups[name] = normalized_targets
+    return groups
 
 
 def _configuration_view(config: LLMConfig, revision: str) -> dict[str, Any]:
@@ -634,9 +853,12 @@ async def create_provider(payload: ProviderSettingsUpdate) -> Result:
             }
         )
 
-    revision, config = await _persist(payload.expected_revision, mutate)
+    revision, config, operation = await _persist_with_operation(
+        payload.expected_revision, mutate
+    )
     return Result.ok(
-        _configuration_view(config, revision), info="AI 服务商已保存并热加载。"
+        _apply_response(config, revision, operation),
+        info="AI 服务商已保存并热加载。",
     )
 
 
@@ -679,9 +901,12 @@ async def update_provider(
             }
         )
 
-    revision, config = await _persist(payload.expected_revision, mutate)
+    revision, config, operation = await _persist_with_operation(
+        payload.expected_revision, mutate
+    )
     return Result.ok(
-        _configuration_view(config, revision), info="AI 服务商已保存并热加载。"
+        _apply_response(config, revision, operation),
+        info="AI 服务商已保存并热加载。",
     )
 
 
@@ -696,9 +921,12 @@ async def delete_provider(provider_name: str, expected_revision: str) -> Result:
         index, _ = _find_provider(ai, provider_name)
         _ai_get(ai, "PROVIDERS", []).pop(index)
 
-    revision, config = await _persist(expected_revision, mutate)
+    revision, config, operation = await _persist_with_operation(
+        expected_revision, mutate
+    )
     return Result.ok(
-        _configuration_view(config, revision), info="AI 服务商已删除并热加载。"
+        _apply_response(config, revision, operation),
+        info="AI 服务商已删除并热加载。",
     )
 
 
@@ -724,9 +952,12 @@ async def update_models(provider_name: str, payload: ProviderModelsUpdate) -> Re
             for model in payload.models
         ]
 
-    revision, config = await _persist(payload.expected_revision, mutate)
+    revision, config, operation = await _persist_with_operation(
+        payload.expected_revision, mutate
+    )
     return Result.ok(
-        _configuration_view(config, revision), info="模型列表已保存并热加载。"
+        _apply_response(config, revision, operation),
+        info="模型列表已保存并热加载。",
     )
 
 
@@ -745,6 +976,8 @@ async def update_section(section: str, payload: SectionUpdate) -> Result:
                 "message": "不支持的 AI 配置分区。",
             },
         )
+
+    before_config = _validate_full(_load(_read())["AI"], strict_references=False)
 
     def mutate(ai: dict[str, Any]) -> None:
         def update_value(key: str, value: Any) -> None:
@@ -773,63 +1006,93 @@ async def update_section(section: str, payload: SectionUpdate) -> Result:
                 if advanced_key in payload.value:
                     update_value(advanced_key, payload.value[advanced_key])
         elif section == "model_groups" and key:
-            value = payload.value
-            if isinstance(value, list):
-                groups: dict[str, list[str]] = {}
-                for index, row in enumerate(value):
-                    if not isinstance(row, dict):
-                        raise _configuration_error(
-                            "model_group_invalid",
-                            "模型路由组格式无效。",
-                            f"AI.MODEL_GROUPS.{index}",
-                        )
-                    name = str(row.get("name") or "").strip()
-                    if not name:
-                        raise _configuration_error(
-                            "model_group_name_required",
-                            "请填写路由组名称。",
-                            f"AI.MODEL_GROUPS.{index}.name",
-                        )
-                    if name in groups:
-                        raise _configuration_error(
-                            "model_group_name_duplicate",
-                            f"路由组名称 {name} 重复。",
-                            f"AI.MODEL_GROUPS.{index}.name",
-                        )
-                    targets = row.get("targets", [])
-                    if not isinstance(targets, list) or not all(
-                        isinstance(target, str) for target in targets
-                    ):
-                        raise _configuration_error(
-                            "model_group_targets_invalid",
-                            "模型路由目标必须是字符串列表。",
-                            f"AI.MODEL_GROUPS.{index}.targets",
-                        )
-                    groups[name] = targets
-                value = groups
-            elif isinstance(value, dict):
-                if any(not str(name).strip() for name in value):
-                    raise _configuration_error(
-                        "model_group_name_required",
-                        "请填写路由组名称。",
-                        "AI.MODEL_GROUPS",
-                    )
-            else:
-                raise _configuration_error(
-                    "model_groups_invalid",
-                    "模型路由组必须是列表或映射。",
-                    "AI.MODEL_GROUPS",
-                )
-            _ai_set(ai, key, deepcopy(value))
+            _ai_set(ai, key, deepcopy(_normalize_model_groups(payload.value)))
         elif key:
             update_value(key, payload.value)
 
-    revision, config = await _persist(payload.expected_revision, mutate)
-    effect = "new_session" if section == "sandbox" else "hot_reload"
-    return Result.ok(
-        {**_configuration_view(config, revision), "effect": effect},
-        info="AI 配置已保存。",
+    revision, config, operation = await _persist_with_operation(
+        payload.expected_revision,
+        mutate,
+        reload_consumers=section != "sandbox",
     )
+    effect = "hot_reload"
+    apply_mode: str | None = None
+    restart_required: bool | None = None
+    changed_keys: list[str] | None = None
+    reason_codes: list[str] | None = None
+    pending_source = "webui.ai"
+    if section == "sandbox":
+        before_sandbox = model_dump(before_config.sandbox)
+        after_sandbox = model_dump(config.sandbox)
+        changed_fields = sorted(
+            key
+            for key in before_sandbox.keys() | after_sandbox.keys()
+            if before_sandbox.get(key) != after_sandbox.get(key)
+        )
+        deferred_fields = sorted(
+            key
+            for key in _SANDBOX_STARTUP_KEYS
+            if after_sandbox.get(key) != _SANDBOX_STARTUP_VALUES.get(key)
+        )
+        changed_startup_fields = sorted(set(changed_fields) & _SANDBOX_STARTUP_KEYS)
+        changed_new_session_fields = sorted(set(changed_fields) - _SANDBOX_STARTUP_KEYS)
+        if deferred_fields:
+            _restore_sandbox_startup_runtime()
+        pending_source = "webui.ai-sandbox"
+        reason_codes = [f"ai.sandbox.{key}" for key in deferred_fields]
+        update_pending_restart(pending_source, reason_codes, issue_ticket=False)
+        if changed_startup_fields and deferred_fields:
+            apply_mode = APPLY_RESTART_PENDING
+            restart_required = True
+            changed_keys = [f"AI.SANDBOX.{key}" for key in changed_fields]
+            effect = "restart_required"
+        elif changed_new_session_fields:
+            apply_mode = APPLY_NEW_SESSION
+            restart_required = False
+            changed_keys = [f"AI.SANDBOX.{key}" for key in changed_fields]
+            effect = "new_session"
+        elif changed_startup_fields:
+            apply_mode = APPLY_CONFIG_RELOADED
+            restart_required = False
+            changed_keys = [f"AI.SANDBOX.{key}" for key in changed_fields]
+            effect = "hot_reload"
+        else:
+            apply_mode = APPLY_NO_CHANGE
+            restart_required = False
+            changed_keys = []
+    return Result.ok(
+        {
+            **_apply_response(
+                config,
+                revision,
+                operation,
+                apply_mode=apply_mode,
+                changed_keys=changed_keys,
+                restart_required=restart_required,
+                reason_codes=reason_codes,
+                pending_source=pending_source,
+            ),
+            "effect": effect,
+        },
+        info=(
+            "AI 配置已保存，需要重启后生效。" if restart_required else "AI 配置已保存。"
+        ),
+    )
+
+
+@router.post(
+    "/configuration/validate-routing",
+    dependencies=[authentication()],
+    response_model=Result,
+    response_class=JSONResponse,
+)
+async def validate_routing(payload: RoutingValidationRequest) -> Result:
+    data = _load(_read())
+    candidate = deepcopy(data)
+    _ai_set(candidate["AI"], "MODEL_GROUPS", _normalize_model_groups(payload.value))
+    config = _validate_full(candidate["AI"], strict_references=False)
+    issues = _reference_issues(config)
+    return Result.ok({"valid": not issues, "issues": issues})
 
 
 def _discovery_url(api_type: str, api_base: str) -> str:
@@ -891,7 +1154,11 @@ async def discover_models(payload: ProviderDiscoveryRequest) -> Result:
             else [provider.api_key]
         )
     )
-    api_key = temporary_key or next((key for key in saved_keys if key), "")
+    api_key = temporary_key or next(
+        (key for key in saved_keys if not _is_placeholder_secret(key)), ""
+    )
+    if _is_placeholder_secret(api_key):
+        api_key = ""
     if api_type not in _OPENAI_DISCOVERY_TYPES and api_type != "gemini":
         raise HTTPException(
             status_code=422,
@@ -1006,6 +1273,32 @@ async def test_model(payload: ModelTestRequest) -> Result:
             detail={
                 "code": "model_name_invalid",
                 "message": "模型名称必须包含服务商前缀。",
+            },
+        )
+    provider_name = payload.model.split("/", 1)[0]
+    provider = next(
+        (
+            item
+            for item in get_llm_config().providers
+            if item.name.casefold() == provider_name.casefold()
+        ),
+        None,
+    )
+    provider_keys = (
+        []
+        if provider is None
+        else (
+            provider.api_key
+            if isinstance(provider.api_key, list)
+            else [provider.api_key]
+        )
+    )
+    if not any(not _is_placeholder_secret(key) for key in provider_keys):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "provider_credentials_incomplete",
+                "message": "该模型所属服务商尚未配置有效 API Key。",
             },
         )
     started = time.monotonic()

@@ -106,10 +106,10 @@ def local_access_urls(
     return list(dict.fromkeys(urls))
 
 
-def format_access_url_banner(bind_host: str, port: int) -> str:
-    urls = local_access_urls(bind_host, port)
+def format_access_url_banner(bind_host: str, port: int, *, scheme: str = "http") -> str:
+    urls = local_access_urls(bind_host, port, scheme)
     if not urls:
-        return f"WebUI listening on http://{bind_host}:{port}"
+        return f"WebUI listening on {scheme}://{bind_host}:{port}"
     lines = ["WebUI is ready"]
     lines.extend(f"  -> {item.label}: {item.url}" for item in urls)
     return "\n".join(lines)
@@ -122,11 +122,12 @@ def emit_webui_console_banner(
     connection_code: str,
     state: str,
     username: str | None = None,
+    scheme: str = "http",
 ) -> None:
     """Write the startup-only WebUI recovery links outside application logs."""
-    urls = local_access_urls(bind_host, port)
+    urls = local_access_urls(bind_host, port, scheme)
     if not urls:
-        urls = [AccessUrl("Local", f"http://{bind_host}:{port}")]
+        urls = [AccessUrl("Local", f"{scheme}://{bind_host}:{port}")]
     display_urls = list(urls)
     if bind_host.strip().strip("[]") in {"0.0.0.0", "::"}:
         display_urls.sort(key=lambda item: item.label != "Network")

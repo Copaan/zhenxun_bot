@@ -1,3 +1,5 @@
+from copy import deepcopy
+from pathlib import Path
 import re
 
 import cattrs
@@ -8,6 +10,9 @@ from zhenxun.configs.config import Config
 from zhenxun.configs.utils import ConfigGroup
 from zhenxun.models.plugin_info import PluginInfo as DbPluginInfo
 from zhenxun.services.cache.runtime_cache import PluginInfoMemoryCache
+from zhenxun.services.runtime_config_reload import reload_runtime_config
+from zhenxun.services.runtime_reload import plugin_runtime_manager
+from zhenxun.services.runtime_reload.models import ApplyMode, RuntimeOperation
 from zhenxun.utils.enum import BlockType, PluginType
 
 from .model import (
@@ -17,6 +22,7 @@ from .model import (
     PluginInfo,
     UpdatePlugin,
 )
+from .store_receipts import StoreReceiptStore
 
 
 class ApiDataSource:
@@ -44,9 +50,37 @@ class ApiDataSource:
             filter_parent=False,
             **filters,
         )
+        receipts = StoreReceiptStore.load()
         for plugin in plugins:
+            runtime_module = str(plugin.module_path or plugin.module)
+            store_key = next(
+                (
+                    key
+                    for key, receipt in receipts.items()
+                    if str(receipt.get("runtime_module") or "")
+                    in {runtime_module, plugin.module}
+                    or str(receipt.get("runtime_module") or "").endswith(
+                        f".{plugin.module}"
+                    )
+                ),
+                None,
+            )
+            is_builtin = (
+                "builtin_plugins" in str(plugin.module_path or "")
+                or plugin.plugin_type == PluginType.HIDDEN
+            )
             plugin_info = PluginInfo(
                 id=plugin.id,
+                store_key=store_key,
+                runtime_module=runtime_module,
+                uninstall_supported=bool(store_key) and not is_builtin,
+                uninstall_reason=(
+                    "系统内置插件不可卸载"
+                    if is_builtin
+                    else None
+                    if store_key
+                    else "该插件不由插件商店管理，请手动维护插件文件"
+                ),
                 module=plugin.module,
                 plugin_name=plugin.name,
                 default_status=plugin.default_status,
@@ -58,8 +92,7 @@ class ApiDataSource:
                 status=plugin.status,
                 author=plugin.author,
                 block_type=plugin.block_type,
-                is_builtin="builtin_plugins" in plugin.module_path
-                or plugin.plugin_type == PluginType.HIDDEN,
+                is_builtin=is_builtin,
                 allow_setting=plugin.plugin_type != PluginType.HIDDEN,
                 allow_switch=plugin.plugin_type != PluginType.HIDDEN,
             )
@@ -67,7 +100,9 @@ class ApiDataSource:
         return plugin_list
 
     @classmethod
-    async def update_plugin(cls, param: UpdatePlugin) -> DbPluginInfo:
+    async def update_plugin(
+        cls, param: UpdatePlugin
+    ) -> tuple[DbPluginInfo, RuntimeOperation | None]:
         """更新插件数据
 
         参数:
@@ -79,23 +114,56 @@ class ApiDataSource:
         db_plugin = await DbPluginInfo.get_plugin(module=param.module)
         if not db_plugin:
             raise ValueError("插件不存在")
-        db_plugin.default_status = param.default_status
-        db_plugin.limit_superuser = param.limit_superuser
-        db_plugin.cost_gold = param.cost_gold
-        db_plugin.level = param.level
-        db_plugin.menu_type = param.menu_type
-        db_plugin.block_type = param.block_type
-        db_plugin.status = param.block_type != BlockType.ALL
-        await db_plugin.save()
-        if param.configs and (configs := Config.get(param.module)):
-            for key in param.configs:
-                if c := configs.configs.get(key):
-                    value = param.configs[key]
-                    if c.type and value is not None:
-                        value = cattrs.structure(value, c.type)
-                    Config.set_config(param.module, key, value)
+        previous_db = {
+            key: getattr(db_plugin, key)
+            for key in (
+                "default_status",
+                "limit_superuser",
+                "cost_gold",
+                "level",
+                "menu_type",
+                "block_type",
+                "status",
+            )
+        }
+        runtime_snapshot = Config.snapshot_runtime_values()
+        previous_simple = deepcopy(Config._simple_data)
+        operation: RuntimeOperation | None = None
+        try:
+            db_plugin.default_status = param.default_status
+            db_plugin.limit_superuser = param.limit_superuser
+            db_plugin.cost_gold = param.cost_gold
+            db_plugin.level = param.level
+            db_plugin.menu_type = param.menu_type
+            db_plugin.block_type = param.block_type
+            db_plugin.status = param.block_type != BlockType.ALL
+            await db_plugin.save()
+            if param.configs and (configs := Config.get(param.module)):
+                for key in param.configs:
+                    if c := configs.configs.get(key):
+                        value = param.configs[key]
+                        if c.type and value is not None:
+                            value = cattrs.structure(value, c.type)
+                        Config.set_config(param.module, key, value)
+                Config.save(save_simple_data=True)
+                plugin_runtime_manager.mark_content_processed(Path("data/config.yaml"))
+                operation = await reload_runtime_config(
+                    submit_restart=False,
+                    previous_simple_data=previous_simple,
+                )
+                if operation.mode is ApplyMode.FAILED:
+                    raise RuntimeError(
+                        operation.reason or "config_consumer_reload_failed"
+                    )
+        except Exception:
+            for key, value in previous_db.items():
+                setattr(db_plugin, key, value)
+            await db_plugin.save()
+            Config.restore_runtime_values(runtime_snapshot)
             Config.save(save_simple_data=True)
-        return db_plugin
+            plugin_runtime_manager.mark_content_processed(Path("data/config.yaml"))
+            raise
+        return db_plugin, operation
 
     @classmethod
     async def batch_update_plugins(cls, params: BatchUpdatePlugins) -> dict:

@@ -11,9 +11,11 @@ from zhenxun.update_service import (
     check_updates,
     create_update_job,
     read_job,
+    request_update_apply,
 )
 
 from ....base_model import Result
+from ....restart_service import restart_status_data
 from ....utils import authentication
 
 router = APIRouter(prefix="/update")
@@ -44,6 +46,11 @@ def _service_error(error: UpdateServiceError) -> HTTPException:
                 "code": "release_blocked",
                 "message": "该版本存在已知兼容性问题，已禁止更新。",
             },
+        )
+    if code == "update_not_pending":
+        return HTTPException(
+            status_code=409,
+            detail="该更新任务不处于等待应用状态，请重新检查任务状态。",
         )
     return HTTPException(status_code=422, detail=f"更新请求无效（{code}）。")
 
@@ -99,6 +106,29 @@ async def update_job(job_id: str) -> Result:
         return Result.ok(read_job(job_id))
     except UpdateServiceError as error:
         raise _service_error(error) from error
+
+
+@router.post(
+    "/jobs/{job_id}/apply",
+    dependencies=[authentication()],
+    response_model=Result,
+    response_class=JSONResponse,
+)
+async def apply_update_job(job_id: str) -> Result:
+    try:
+        ok, message, job = await request_update_apply(job_id)
+    except UpdateServiceError as error:
+        raise _service_error(error) from error
+    restart = restart_status_data()
+    data = {
+        **job,
+        **restart,
+        "apply_mode": "restart_requested" if ok else "restart_pending",
+        "restart_required": True,
+        "restart_available": ok,
+        "reason_codes": [f"update:{job.get('component', 'unknown')}:{job_id}"],
+    }
+    return Result.ok(data, info=message) if ok else Result.fail(message, code=409)
 
 
 __all__ = ["router"]

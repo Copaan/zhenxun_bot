@@ -34,6 +34,13 @@ from zhenxun.services.log import logger
 from zhenxun.utils._restart_utils import issue_restart_ticket
 from zhenxun.utils.pydantic_compat import model_dump
 
+from ...apply_result import (
+    APPLY_NO_CHANGE,
+    APPLY_RESTART_PENDING,
+    apply_result_data,
+    env_change_impact,
+    update_pending_restart,
+)
 from ...base_model import Result
 from ...config_validation import (
     ConfigurationValidationError,
@@ -51,6 +58,18 @@ _ENV_TEMPLATE = Path(".env.example")
 _AUTH_URL = "https://bots.qq.com/app/getAppAccessToken"
 _ME_URL = "https://api.sgroup.qq.com/users/@me"
 _TIMEOUT = httpx.Timeout(10.0, connect=5.0)
+_PROTOCOL_ENV_KEYS = {
+    "ONEBOT_ACCESS_TOKEN",
+    "QQ_ADAPTER_LOAD",
+    "QQ_BOTS",
+    "QQ_VERIFY_WEBHOOK",
+    "QQ_WEBHOOK_MODE",
+    "QQ_WEBHOOK_PUBLIC_BASE_URL",
+    "QQ_WEBHOOK_LISTEN_HOST",
+    "QQ_WEBHOOK_LISTEN_PORT",
+    "QQ_WEBHOOK_TLS_CERTFILE",
+    "QQ_WEBHOOK_TLS_KEYFILE",
+}
 
 
 class QQCredentialProbe(BaseModel):
@@ -418,19 +437,33 @@ async def save_protocol_configuration(
     changed["QQ_WEBHOOK_PUBLIC_BASE_URL"] = base_url
 
     updated = _update_env(current, changed)
-    _write_transaction([(_ENV_FILE, updated.encode("utf-8"))])
-    launcher_managed = bool(os.getenv("ZHENXUN_LAUNCHER_PID"))
-    if launcher_managed:
+    if updated != current:
+        _write_transaction([(_ENV_FILE, updated.encode("utf-8"))])
+    changed_keys, pending_keys = env_change_impact(current, updated, _PROTOCOL_ENV_KEYS)
+    restart_required = bool(set(changed_keys) & set(pending_keys))
+    reasons = [f"environment:{key}" for key in pending_keys]
+    launcher_managed = update_pending_restart(
+        "webui.protocol", reasons, issue_ticket=False
+    )
+    if restart_required and launcher_managed:
         issue_restart_ticket("webui.settings", ttl_seconds=10 * 60)
+    status = restart_status_data()
     return Result.ok(
-        {
-            "revision": _revision(updated),
-            "changed_keys": sorted(changed),
-            "callback_url": _callback_url(base_url),
-            "restart_required": True,
-            "restart_available": launcher_managed,
-        },
-        info="协议配置已保存。",
+        apply_result_data(
+            apply_mode=(APPLY_RESTART_PENDING if restart_required else APPLY_NO_CHANGE),
+            changed_keys=changed_keys,
+            restart_required=restart_required,
+            reason_codes=reasons,
+            access_urls=status["access_urls"],
+            access_targets=status["access_targets"],
+            revision=_revision(updated),
+            callback_url=_callback_url(base_url),
+        ),
+        info=(
+            "协议配置已保存，需要重启后生效。"
+            if restart_required
+            else "协议配置没有需要应用的运行时变化。"
+        ),
     )
 
 
@@ -503,8 +536,13 @@ async def delete_qq_bot(
             },
         ) from exc
 
-    launcher_managed = bool(os.getenv("ZHENXUN_LAUNCHER_PID"))
-    if launcher_managed:
+    changed_keys, pending_keys = env_change_impact(current, updated, _PROTOCOL_ENV_KEYS)
+    restart_required = bool(set(changed_keys) & set(pending_keys))
+    reasons = [f"environment:{key}" for key in pending_keys]
+    launcher_managed = update_pending_restart(
+        "webui.protocol", reasons, issue_ticket=False
+    )
+    if restart_required and launcher_managed:
         issue_restart_ticket("webui.settings", ttl_seconds=10 * 60)
     restart = restart_status_data()
     logger.info(
@@ -512,15 +550,17 @@ async def delete_qq_bot(
         "QQOfficialConfiguration",
     )
     return Result.ok(
-        {
-            "revision": _revision(updated),
-            "remaining": len(remaining),
-            "qq_enabled": was_enabled and bool(remaining),
-            "restart_required": True,
-            "restart_available": launcher_managed,
-            "access_urls": restart["access_urls"],
-            "access_targets": restart["access_targets"],
-        },
+        apply_result_data(
+            apply_mode=(APPLY_RESTART_PENDING if restart_required else APPLY_NO_CHANGE),
+            changed_keys=changed_keys,
+            restart_required=restart_required,
+            reason_codes=reasons,
+            access_urls=restart["access_urls"],
+            access_targets=restart["access_targets"],
+            revision=_revision(updated),
+            remaining=len(remaining),
+            qq_enabled=was_enabled and bool(remaining),
+        ),
         info="机器人已从真寻本地配置移除。",
     )
 

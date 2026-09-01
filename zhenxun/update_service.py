@@ -611,18 +611,14 @@ async def _prepare_job(job_id: str) -> None:
             restart_required=True,
             restart_available=launcher_managed,
         )
-        if launcher_managed:
-            from zhenxun.utils._restart_utils import (
-                issue_restart_ticket,
-                request_restart,
-            )
+        from zhenxun.utils._restart_utils import (
+            issue_restart_ticket,
+            mark_restart_pending,
+        )
 
+        mark_restart_pending(f"webui.update:{job_id}", [f"update:{component}:{job_id}"])
+        if launcher_managed:
             issue_restart_ticket("webui.update", ttl_seconds=10 * 60)
-            ok, message = await request_restart(
-                "webui.update", require_ticket="webui.update"
-            )
-            if not ok:
-                raise UpdateServiceError(f"restart_request_failed:{message}")
     except Exception as exc:
         code = (
             str(exc) if isinstance(exc, UpdateServiceError) else exc.__class__.__name__
@@ -673,7 +669,28 @@ async def create_update_job(
         _ACTIVE_TASK = asyncio.create_task(
             _prepare_job(job_id), name=f"update-{component}-{job_id[:8]}"
         )
-        return job
+    return job
+
+
+async def request_update_apply(job_id: str) -> tuple[bool, str, dict[str, Any]]:
+    """Request the launcher to apply one validated staged update."""
+    job = read_job(job_id)
+    pending = pending_job()
+    if (
+        job.get("state") != "pending_restart"
+        or pending is None
+        or pending.get("job_id") != job_id
+    ):
+        raise UpdateServiceError("update_not_pending")
+    if not os.getenv("ZHENXUN_LAUNCHER_PID"):
+        return False, "当前不是 launcher 托管模式，请手动重启真寻。", job
+    from zhenxun.utils._restart_utils import issue_restart_ticket, request_restart
+
+    issue_restart_ticket("webui.update", ttl_seconds=10 * 60)
+    ok, message = await request_restart("webui.update", require_ticket="webui.update")
+    if ok:
+        job = _update_job(job_id, state="restart_requested", progress=85)
+    return ok, message, job
 
 
 def _restore_directory(backup: Path, destination: Path) -> None:
@@ -889,5 +906,6 @@ __all__ = [
     "finalize_applied_update",
     "pending_job",
     "read_job",
+    "request_update_apply",
     "rollback_applied_update",
 ]

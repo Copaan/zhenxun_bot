@@ -25,7 +25,15 @@ from zhenxun.services.data_access import DataAccess
 from zhenxun.utils._restart_utils import issue_restart_ticket
 from zhenxun.utils.pydantic_compat import model_copy
 
+from ....apply_result import (
+    APPLY_NO_CHANGE,
+    APPLY_RESTART_PENDING,
+    apply_result_data,
+    env_change_impact,
+    update_pending_restart,
+)
 from ....base_model import Result
+from ....restart_service import restart_status_data
 from ....utils import authentication
 from ...configure.data_source import (
     build_database_url,
@@ -313,23 +321,43 @@ async def update_database_configuration(
     try:
         updated = _update_env(current_text, fields)
         _validate_env(updated)
-        _write_transaction([(_ENV_FILE, updated.encode("utf-8"))])
+        if updated != current_text:
+            _write_transaction([(_ENV_FILE, updated.encode("utf-8"))])
     except Exception as error:
         raise HTTPException(
             status_code=500,
             detail=f"数据服务配置保存失败（{error.__class__.__name__}）。",
         ) from error
-    launcher_managed = bool(os.getenv("ZHENXUN_LAUNCHER_PID"))
+    changed_keys, pending_keys = env_change_impact(
+        current_text,
+        updated,
+        {"DB_URL", "CACHE_MODE", "REDIS_HOST", "REDIS_PORT", "REDIS_PASSWORD"},
+    )
+    restart_required = bool(set(changed_keys) & set(pending_keys))
+    reasons = [f"environment:{key}" for key in pending_keys]
+    launcher_managed = update_pending_restart(
+        "webui.database", reasons, issue_ticket=False
+    )
     if launcher_managed:
         issue_restart_ticket("webui.settings", ttl_seconds=10 * 60)
+    status = restart_status_data()
+    apply_mode = APPLY_RESTART_PENDING if restart_required else APPLY_NO_CHANGE
     return Result.ok(
-        {
-            "revision": _revision(updated),
-            "restart_required": True,
-            "restart_available": launcher_managed,
-            "checks": {"database": database_result, "cache": cache_result},
-        },
-        info="数据服务配置已保存。",
+        apply_result_data(
+            apply_mode=apply_mode,
+            changed_keys=changed_keys,
+            restart_required=restart_required,
+            reason_codes=reasons,
+            access_urls=status["access_urls"],
+            access_targets=status["access_targets"],
+            revision=_revision(updated),
+            checks={"database": database_result, "cache": cache_result},
+        ),
+        info=(
+            "数据服务配置已保存，需要重启后生效。"
+            if restart_required
+            else "数据服务配置没有需要应用的运行时变化。"
+        ),
     )
 
 

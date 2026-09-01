@@ -8,6 +8,7 @@ from nonebot.plugin import PluginMetadata
 from zhenxun.configs.config import Config as gConfig
 from zhenxun.configs.utils import PluginExtraData, RegisterConfig
 from zhenxun.services.log import logger
+from zhenxun.services.webui_tls import current_webui_scheme
 from zhenxun.utils.enum import PluginType
 from zhenxun.utils.manager.priority_manager import PriorityLifecycle
 from zhenxun.utils.network import emit_webui_console_banner
@@ -127,6 +128,7 @@ async def _():
                         connection_code=connection_code,
                         state=setup_access.state(),
                         username=str(gConfig.get_config("web-ui", "username", "")),
+                        scheme=current_webui_scheme(),
                     )
                 except Exception as e:
                     logger.error("WebUI 启动链接输出失败", "WebUi", e=e)

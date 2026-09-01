@@ -18,6 +18,7 @@ from redis.asyncio import Redis
 from tortoise.backends.base.config_generator import expand_db_url
 
 from zhenxun.services.log import logger
+from zhenxun.services.webui_tls import current_webui_scheme
 from zhenxun.utils.network import local_access_urls, private_ipv4_addresses
 
 from .model import CacheConfig, DatabaseConfig, NetworkConfig, ProbeResult
@@ -304,7 +305,10 @@ async def probe_network(
             )
 
     owner = _listener_owner(host, config.port)
-    urls = [item.url for item in local_access_urls(host, config.port)]
+    urls = [
+        item.url
+        for item in local_access_urls(host, config.port, current_webui_scheme())
+    ]
     if owner == os.getpid() or _same_listener(host, config.port, current_listener):
         return _result(
             "warning",

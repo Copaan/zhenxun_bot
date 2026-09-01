@@ -58,6 +58,10 @@ class PluginInfo(BaseModel):
     """
 
     id: int
+    store_key: str | None = None
+    runtime_module: str | None = None
+    uninstall_supported: bool = False
+    uninstall_reason: str | None = None
     """插件id"""
     module: str
     """模块"""
@@ -147,12 +151,15 @@ class RenameMenuTypePayload(BaseModel):
 
 
 class PluginIr(BaseModel):
-    id: int
+    id: int | None = None
     """插件id"""
+    store_key: str | None = Field(default=None, min_length=3, max_length=300)
+    """稳定商店键 source:module"""
 
 
 class PluginReloadPayload(BaseModel):
-    module: str = Field(..., min_length=1, max_length=200, description="插件模块名")
+    module: str | None = Field(default=None, min_length=1, max_length=200)
+    store_key: str | None = Field(default=None, min_length=3, max_length=300)
 
 
 class BatchUpdateResult(BaseModel):

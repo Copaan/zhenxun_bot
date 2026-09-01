@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import shutil
 import tempfile
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import psutil
 
@@ -16,6 +17,53 @@ from zhenxun.services.log import logger
 
 from .config import LOG_COMMAND, RepoConfig
 from .exceptions import GitUnavailableError
+
+_SENSITIVE_QUERY_KEYS = {
+    "access_token",
+    "api_key",
+    "apikey",
+    "auth",
+    "key",
+    "password",
+    "private_token",
+    "secret",
+    "token",
+}
+
+
+def redact_git_output(value: object) -> str:
+    text = str(value or "")
+
+    def redact_url(match: re.Match[str]) -> str:
+        raw = match.group(0)
+        try:
+            parsed = urlsplit(raw)
+            port = parsed.port
+        except ValueError:
+            return "[redacted-url]"
+        hostname = parsed.hostname or ""
+        if ":" in hostname:
+            hostname = f"[{hostname}]"
+        netloc = hostname
+        if port:
+            netloc += f":{port}"
+        if parsed.username is not None or parsed.password is not None:
+            netloc = f"[credentials]@{netloc}"
+        query = urlencode(
+            [
+                (key, "[redacted]" if key.casefold() in _SENSITIVE_QUERY_KEYS else val)
+                for key, val in parse_qsl(parsed.query, keep_blank_values=True)
+            ]
+        )
+        return urlunsplit((parsed.scheme, netloc, parsed.path, query, parsed.fragment))
+
+    text = re.sub(r"https?://[^\s'\"<>]+", redact_url, text)
+    text = re.sub(
+        r"(?i)(authorization\s*[:=]\s*)(?:bearer|basic)\s+[^\s,;]+",
+        r"\1[redacted]",
+        text,
+    )
+    return text
 
 
 async def check_git() -> bool:
@@ -85,7 +133,9 @@ async def run_git_command(
                 chunk = await process.stderr.read(256)
                 if not chunk:
                     if buf:
-                        text = buf.decode("utf-8", errors="replace").strip()
+                        text = redact_git_output(
+                            buf.decode("utf-8", errors="replace").strip()
+                        )
                         if text:
                             stderr_lines.append(text)
                             logger.debug(text, LOG_COMMAND)
@@ -105,7 +155,9 @@ async def run_git_command(
                         buf = buf[idx + 2 :]
                     else:
                         buf = buf[idx + 1 :]
-                    text = line_bytes.decode("utf-8", errors="replace").strip()
+                    text = redact_git_output(
+                        line_bytes.decode("utf-8", errors="replace").strip()
+                    )
                     if text:
                         stderr_lines.append(text)
                         logger.debug(text, LOG_COMMAND)
@@ -129,8 +181,10 @@ async def run_git_command(
 
         return process.returncode == 0, stdout, stderr
     except Exception as e:
-        logger.error(f"运行git命令失败: {command}, 错误: {e}")
-        return False, "", str(e)
+        safe_command = redact_git_output(command)
+        safe_error = redact_git_output(e)
+        logger.error(f"运行git命令失败: {safe_command}, 错误: {safe_error}")
+        return False, "", safe_error
 
 
 async def _kill_process_tree(process: asyncio.subprocess.Process) -> None:

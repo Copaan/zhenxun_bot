@@ -271,6 +271,24 @@ def _run_worker() -> None:
             nonebot.logger.info(f"加载第三方插件目录: {ext}")
             nonebot.load_plugins(ext)
 
+    from zhenxun.services.webui_tls import (
+        load_webui_tls_settings,
+        validate_webui_tls_settings,
+    )
+
+    webui_tls = load_webui_tls_settings(project_root)
+    validate_webui_tls_settings(
+        webui_tls,
+        launcher_managed=bool(os.environ.get("ZHENXUN_LAUNCHER_PID")),
+    )
+    tls_options = (
+        {
+            "ssl_certfile": webui_tls.certfile,
+            "ssl_keyfile": webui_tls.keyfile,
+        }
+        if webui_tls.enabled
+        else {}
+    )
     nonebot.run(
         workers=1,
         access_log=False,
@@ -278,6 +296,7 @@ def _run_worker() -> None:
         backlog=WORKER_BACKLOG,
         timeout_keep_alive=WORKER_KEEP_ALIVE_TIMEOUT,
         timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_TIMEOUT,
+        **tls_options,
     )
 
 
@@ -285,7 +304,7 @@ def _build_worker_command() -> list[str]:
     return [sys.executable, "-m", "zhenxun.cli", "run-worker"]
 
 
-def _build_ingress_command(settings) -> list[str]:
+def _build_ingress_command(settings, *, upstream_scheme: str = "http") -> list[str]:
     config = settings.config
     connect_host = settings.worker_connect_host
     upstream_host = f"[{connect_host}]" if ":" in connect_host else connect_host
@@ -298,8 +317,62 @@ def _build_ingress_command(settings) -> list[str]:
         str(config.qq_webhook_listen_port),
         config.qq_webhook_tls_certfile,
         config.qq_webhook_tls_keyfile,
-        f"http://{upstream_host}:{settings.worker_port}",
+        f"{upstream_scheme}://{upstream_host}:{settings.worker_port}",
     ]
+
+
+def _build_redirect_command(settings) -> list[str]:
+    return [
+        sys.executable,
+        "-m",
+        "zhenxun.cli",
+        "run-http-redirect",
+        settings.host,
+        str(settings.redirect_port),
+        str(settings.port),
+    ]
+
+
+def _safe_redirect_hostname(raw_host: str) -> str:
+    import ipaddress
+
+    value = raw_host.strip()
+    if not value or any(ord(char) > 127 for char in value):
+        return "localhost"
+    if value.startswith("["):
+        closing = value.find("]")
+        if closing < 0:
+            return "localhost"
+        hostname = value[1:closing]
+        suffix = value[closing + 1 :]
+        if suffix and (not suffix.startswith(":") or not suffix[1:].isdigit()):
+            return "localhost"
+        try:
+            ipaddress.IPv6Address(hostname)
+        except ValueError:
+            return "localhost"
+        return f"[{hostname}]"
+
+    hostname, separator, port = value.rpartition(":")
+    if separator and port.isdigit() and ":" not in hostname:
+        value = hostname
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        labels = value.rstrip(".").split(".")
+        if value != "localhost" and not all(
+            label
+            and len(label) <= 63
+            and label[0].isalnum()
+            and label[-1].isalnum()
+            and all(char.isalnum() or char == "-" for char in label)
+            for label in labels
+        ):
+            return "localhost"
+        return value.rstrip(".")
+    if address.version == 6:
+        return f"[{address.compressed}]"
+    return str(address)
 
 
 def _ingress_environment() -> dict[str, str]:
@@ -314,47 +387,61 @@ def _ingress_environment() -> dict[str, str]:
     return environment
 
 
-def _worker_health_url(settings) -> str:
+def _worker_health_url(settings, *, scheme: str = "http") -> str:
     connect_host = settings.worker_connect_host
     host = f"[{connect_host}]" if ":" in connect_host else connect_host
-    return f"http://{host}:{settings.worker_port}/qq/healthz"
+    return f"{scheme}://{host}:{settings.worker_port}/qq/healthz"
 
 
-def _worker_webui_health_url(settings) -> str:
+def _worker_webui_health_url(settings, *, scheme: str = "http") -> str:
     connect_host = settings.worker_connect_host
     host = f"[{connect_host}]" if ":" in connect_host else connect_host
-    return f"http://{host}:{settings.worker_port}/zhenxun/api/configure/status"
+    return f"{scheme}://{host}:{settings.worker_port}/zhenxun/api/configure/status"
 
 
-def _worker_is_ready(settings) -> bool:
+def _health_urlopen(url: str):
+    if url.startswith("https://"):
+        import ssl
+
+        return urllib.request.urlopen(
+            url,
+            timeout=1.0,
+            context=ssl._create_unverified_context(),
+        )
+    return urllib.request.urlopen(url, timeout=1.0)
+
+
+def _worker_is_ready(settings, *, scheme: str = "http") -> bool:
     try:
-        with urllib.request.urlopen(
-            _worker_health_url(settings), timeout=1.0
-        ) as response:
+        with _health_urlopen(_worker_health_url(settings, scheme=scheme)) as response:
             return response.status == 200 and b'"status":"ready"' in response.read(256)
     except (OSError, urllib.error.URLError):
         return False
 
 
-def _wait_worker_ready(worker: subprocess.Popen, settings) -> bool:
+def _wait_worker_ready(
+    worker: subprocess.Popen, settings, *, scheme: str = "http"
+) -> bool:
     deadline = time.monotonic() + WORKER_READY_TIMEOUT
     while time.monotonic() < deadline:
         if worker.poll() is not None:
             return False
-        if _worker_is_ready(settings):
+        if _worker_is_ready(settings, scheme=scheme):
             return True
         time.sleep(WORKER_READY_POLL_INTERVAL)
     return False
 
 
-def _wait_worker_webui_ready(worker: subprocess.Popen, settings) -> bool:
+def _wait_worker_webui_ready(
+    worker: subprocess.Popen, settings, *, scheme: str = "http"
+) -> bool:
     deadline = time.monotonic() + WORKER_READY_TIMEOUT
     while time.monotonic() < deadline:
         if worker.poll() is not None:
             return False
         try:
-            with urllib.request.urlopen(
-                _worker_webui_health_url(settings), timeout=1.0
+            with _health_urlopen(
+                _worker_webui_health_url(settings, scheme=scheme)
             ) as response:
                 if response.status == 200:
                     return True
@@ -378,6 +465,46 @@ def _run_ingress(args: list[str]) -> None:
             upstream_url=args[4],
         )
     )
+
+
+def _run_http_redirect(args: list[str]) -> None:
+    if len(args) != 3 or os.environ.get("ZHENXUN_REDIRECT_CHILD") != "1":
+        raise RuntimeError("run-http-redirect 参数无效；该命令只能由 zx launcher 调用")
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import socket
+
+    listen_host, redirect_port_text, https_port_text = args
+    redirect_port = int(redirect_port_text)
+    https_port = int(https_port_text)
+
+    class RedirectHandler(BaseHTTPRequestHandler):
+        def _redirect(self) -> None:
+            hostname = _safe_redirect_hostname(self.headers.get("Host", ""))
+            location = f"https://{hostname}:{https_port}{self.path}"
+            self.send_response(308)
+            self.send_header("Location", location)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        do_GET = _redirect
+        do_HEAD = _redirect
+        do_POST = _redirect
+        do_PUT = _redirect
+        do_DELETE = _redirect
+        do_OPTIONS = _redirect
+
+        def log_message(self, _format: str, *_args: object) -> None:
+            return
+
+    class RedirectServer(ThreadingHTTPServer):
+        address_family = socket.AF_INET6 if ":" in listen_host else socket.AF_INET
+
+    server = RedirectServer((listen_host, redirect_port), RedirectHandler)
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
 
 
 def _get_worker_creationflags() -> int:
@@ -473,6 +600,10 @@ def _run_launcher() -> None:
         validate_builtin_ingress,
         validate_qq_config_data,
     )
+    from zhenxun.services.webui_tls import (
+        load_webui_tls_settings,
+        validate_webui_tls_settings,
+    )
     from zhenxun.utils.restart_state import (
         clear_launcher_restart_signal,
         consume_launcher_action,
@@ -482,12 +613,16 @@ def _run_launcher() -> None:
     current_worker: subprocess.Popen | None = None
     ingress: subprocess.Popen | None = None
     ingress_signature: tuple[str, int, str, str, str] | None = None
+    redirect: subprocess.Popen | None = None
+    redirect_signature: tuple[str, int, int] | None = None
     stop_requested = False
     stop_signal: int | None = None
 
     def _cleanup_current_worker() -> None:
         if ingress is not None:
             _terminate_named_process(ingress, "QQ HTTPS ingress")
+        if redirect is not None:
+            _terminate_named_process(redirect, "WebUI HTTP redirect")
         if current_worker is not None:
             _terminate_worker(current_worker)
 
@@ -517,18 +652,36 @@ def _run_launcher() -> None:
         if stop_requested:
             raise SystemExit(128 + int(stop_signal or signal.SIGINT))
         qq_settings = load_qq_launcher_settings(cwd)
+        webui_tls = load_webui_tls_settings(cwd)
         builtin_ingress = bool(
             qq_settings.enabled
             and qq_settings.config.has_webhook_bots
             and qq_settings.config.qq_webhook_mode == "builtin_https"
         )
+        validate_webui_tls_settings(
+            webui_tls,
+            qq_https_port=(
+                qq_settings.config.qq_webhook_listen_port if builtin_ingress else None
+            ),
+            launcher_managed=True,
+            check_redirect_port=redirect is None,
+        )
+        desired_redirect_signature = (
+            (webui_tls.host, webui_tls.redirect_port, webui_tls.port)
+            if webui_tls.redirect_enabled
+            else None
+        )
+        if redirect is not None and redirect_signature != desired_redirect_signature:
+            _terminate_named_process(redirect, "WebUI HTTP redirect")
+            redirect = None
+            redirect_signature = None
         desired_ingress_signature = (
             (
                 qq_settings.config.qq_webhook_listen_host,
                 qq_settings.config.qq_webhook_listen_port,
                 qq_settings.config.qq_webhook_tls_certfile,
                 qq_settings.config.qq_webhook_tls_keyfile,
-                _worker_health_url(qq_settings),
+                _worker_health_url(qq_settings, scheme=webui_tls.scheme),
             )
             if builtin_ingress
             else None
@@ -552,7 +705,9 @@ def _run_launcher() -> None:
         current_worker = worker
         if pending_bot_verification:
             _launcher_log("waiting for updated worker health verification")
-            if not _wait_worker_webui_ready(worker, qq_settings):
+            if not _wait_worker_webui_ready(
+                worker, qq_settings, scheme=webui_tls.scheme
+            ):
                 _terminate_worker(worker)
                 current_worker = None
                 _launcher_log("updated worker failed health check, rolling back")
@@ -566,11 +721,11 @@ def _run_launcher() -> None:
             _launcher_log(
                 "waiting for QQ worker readiness before opening HTTPS ingress"
             )
-            if not _wait_worker_ready(worker, qq_settings):
+            if not _wait_worker_ready(worker, qq_settings, scheme=webui_tls.scheme):
                 _terminate_worker(worker)
                 raise RuntimeError("QQ worker 未在规定时间内就绪，HTTPS Ingress 未启动")
             ingress = subprocess.Popen(
-                _build_ingress_command(qq_settings),
+                _build_ingress_command(qq_settings, upstream_scheme=webui_tls.scheme),
                 cwd=str(cwd),
                 creationflags=_get_worker_creationflags(),
                 env=_ingress_environment(),
@@ -587,6 +742,29 @@ def _run_launcher() -> None:
                 f"{qq_settings.config.qq_webhook_listen_host}:"
                 f"{qq_settings.config.qq_webhook_listen_port}"
             )
+        if webui_tls.redirect_enabled and redirect is None:
+            if not _wait_worker_webui_ready(
+                worker, qq_settings, scheme=webui_tls.scheme
+            ):
+                _terminate_worker(worker)
+                raise RuntimeError("WebUI worker 未就绪，HTTP 重定向服务未启动")
+            redirect = subprocess.Popen(
+                _build_redirect_command(webui_tls),
+                cwd=str(cwd),
+                creationflags=_get_worker_creationflags(),
+                env={**os.environ, "ZHENXUN_REDIRECT_CHILD": "1"},
+            )
+            redirect_signature = desired_redirect_signature
+            time.sleep(0.25)
+            if redirect.poll() is not None:
+                code = redirect.returncode
+                redirect = None
+                _terminate_worker(worker)
+                raise SystemExit(code or 1)
+            _launcher_log(
+                "WebUI HTTP redirect ready on "
+                f"{webui_tls.host}:{webui_tls.redirect_port}"
+            )
         restart_requested = False
         restart_action: tuple[str, list[str]] | None = None
         return_code: int | None = None
@@ -602,11 +780,20 @@ def _run_launcher() -> None:
                     _launcher_log("QQ HTTPS ingress exited unexpectedly")
                     _terminate_worker(worker)
                     raise SystemExit(ingress_code or 1)
+                if redirect is not None and redirect.poll() is not None:
+                    redirect_code = redirect.returncode
+                    redirect = None
+                    _launcher_log("WebUI HTTP redirect exited unexpectedly")
+                    _terminate_worker(worker)
+                    raise SystemExit(redirect_code or 1)
                 if stop_requested:
                     clear_launcher_restart_signal()
                     if ingress is not None:
                         _terminate_named_process(ingress, "QQ HTTPS ingress")
                         ingress = None
+                    if redirect is not None:
+                        _terminate_named_process(redirect, "WebUI HTTP redirect")
+                        redirect = None
                     _terminate_worker(worker)
                     raise SystemExit(128 + int(stop_signal or signal.SIGINT))
                 now = time.monotonic()
@@ -627,6 +814,9 @@ def _run_launcher() -> None:
             if ingress is not None:
                 _terminate_named_process(ingress, "QQ HTTPS ingress")
                 ingress = None
+            if redirect is not None:
+                _terminate_named_process(redirect, "WebUI HTTP redirect")
+                redirect = None
             _terminate_worker(worker)
             return
         finally:
@@ -658,6 +848,9 @@ def _run_launcher() -> None:
         if ingress is not None:
             _terminate_named_process(ingress, "QQ HTTPS ingress")
             ingress = None
+        if redirect is not None:
+            _terminate_named_process(redirect, "WebUI HTTP redirect")
+            redirect = None
         raise SystemExit(return_code if return_code is not None else 1)
 
 
@@ -670,6 +863,8 @@ def main() -> None:
         _run_worker()
     elif args[0] == "run-ingress":
         _run_ingress(args[1:])
+    elif args[0] == "run-http-redirect":
+        _run_http_redirect(args[1:])
     elif args[0] == "version":
         _print_version()
     elif args[0] in ("-h", "--help", "help"):

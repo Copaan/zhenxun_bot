@@ -56,6 +56,10 @@ class QQWebhookIngress:
             timeout=httpx.Timeout(UPSTREAM_TIMEOUT_SECONDS),
             trust_env=False,
             follow_redirects=False,
+            # The upstream is always the loopback worker. Its public certificate
+            # commonly does not contain localhost, so hostname verification is
+            # intentionally limited to this private launcher hop.
+            verify=not self.upstream_url.startswith("https://"),
         )
         try:
             yield

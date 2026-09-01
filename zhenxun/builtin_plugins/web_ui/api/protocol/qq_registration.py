@@ -27,12 +27,20 @@ from zhenxun.services.log import logger
 from zhenxun.utils._restart_utils import issue_restart_ticket
 from zhenxun.utils.pydantic_compat import model_dump
 
+from ...apply_result import (
+    APPLY_NO_CHANGE,
+    APPLY_RESTART_PENDING,
+    apply_result_data,
+    env_change_impact,
+    update_pending_restart,
+)
 from ...base_model import Result
 from ...restart_service import restart_status_data
 from ...utils import authentication
 from ..configure.persistence import _write_transaction
 from .configuration import (
     _ENV_FILE,
+    _PROTOCOL_ENV_KEYS,
     _parse_bots,
     _probe_credential,
     _revision,
@@ -251,11 +259,24 @@ async def _save_websocket_bot(app_id: str, secret: str) -> dict[str, Any]:
                 "QQ_BOTS": [model_dump(bot) for bot in bots],
             },
         )
-        _write_transaction([(_ENV_FILE, updated.encode("utf-8"))])
-        issue_restart_ticket("webui.settings", ttl_seconds=10 * 60)
+        if updated != current:
+            _write_transaction([(_ENV_FILE, updated.encode("utf-8"))])
+        changed_keys, pending_keys = env_change_impact(
+            current, updated, _PROTOCOL_ENV_KEYS
+        )
+        restart_required = bool(set(changed_keys) & set(pending_keys))
+        reasons = [f"environment:{key}" for key in pending_keys]
+        launcher_managed = update_pending_restart(
+            "webui.protocol", reasons, issue_ticket=False
+        )
+        if restart_required and launcher_managed:
+            issue_restart_ticket("webui.settings", ttl_seconds=10 * 60)
         return {
             "revision": _revision(updated),
             "updated_existing": replaced,
+            "restart_required": restart_required,
+            "changed_keys": changed_keys,
+            "reason_codes": reasons,
         }
 
 
@@ -374,21 +395,28 @@ async def poll_qq_registration(registration_id: str, request: Request) -> Result
             ) from exc
 
         restart = restart_status_data()
-        result = {
-            "status": "completed",
-            "bot": {
+        restart_required = bool(saved.get("restart_required", True))
+        changed_keys = saved.get("changed_keys") or ["QQ_ADAPTER_LOAD", "QQ_BOTS"]
+        reason_codes = saved.get("reason_codes") or [
+            f"environment:{key}" for key in changed_keys
+        ]
+        result = apply_result_data(
+            apply_mode=(APPLY_RESTART_PENDING if restart_required else APPLY_NO_CHANGE),
+            changed_keys=changed_keys,
+            restart_required=restart_required,
+            reason_codes=reason_codes,
+            access_urls=restart["access_urls"],
+            access_targets=restart.get("access_targets", []),
+            status="completed",
+            bot={
                 "app_id": app_id,
                 "bot_id": identity.get("bot_id", ""),
                 "username": identity.get("username", ""),
                 "avatar_url": identity.get("avatar_url", ""),
             },
-            "revision": saved["revision"],
-            "updated_existing": saved["updated_existing"],
-            "restart_required": True,
-            "restart_available": restart["launcher_managed"],
-            "access_urls": restart["access_urls"],
-            "access_targets": restart.get("access_targets", []),
-        }
+            revision=saved["revision"],
+            updated_existing=saved["updated_existing"],
+        )
         session.completed = result
         session.key = b""
         session.task_id = ""
