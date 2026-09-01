@@ -6,7 +6,7 @@ from urllib.parse import urlsplit
 
 import nonebot
 
-from zhenxun.services.webui_tls import current_webui_scheme, load_webui_tls_settings
+from zhenxun.configs.webui_tls import current_webui_scheme, load_webui_tls_settings
 from zhenxun.utils._restart_utils import get_pending_restart_reasons, request_restart
 from zhenxun.utils.network import AccessUrl, local_access_urls
 

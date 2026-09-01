@@ -7,8 +7,8 @@ from nonebot.plugin import PluginMetadata
 
 from zhenxun.configs.config import Config as gConfig
 from zhenxun.configs.utils import PluginExtraData, RegisterConfig
+from zhenxun.configs.webui_tls import current_webui_scheme
 from zhenxun.services.log import logger
-from zhenxun.services.webui_tls import current_webui_scheme
 from zhenxun.utils.enum import PluginType
 from zhenxun.utils.manager.priority_manager import PriorityLifecycle
 from zhenxun.utils.network import emit_webui_console_banner

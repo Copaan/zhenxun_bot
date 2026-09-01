@@ -271,7 +271,7 @@ def _run_worker() -> None:
             nonebot.logger.info(f"加载第三方插件目录: {ext}")
             nonebot.load_plugins(ext)
 
-    from zhenxun.services.webui_tls import (
+    from zhenxun.configs.webui_tls import (
         load_webui_tls_settings,
         validate_webui_tls_settings,
     )
@@ -600,7 +600,7 @@ def _run_launcher() -> None:
         validate_builtin_ingress,
         validate_qq_config_data,
     )
-    from zhenxun.services.webui_tls import (
+    from zhenxun.configs.webui_tls import (
         load_webui_tls_settings,
         validate_webui_tls_settings,
     )

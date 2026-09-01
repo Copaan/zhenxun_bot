@@ -17,8 +17,8 @@ import psutil
 from redis.asyncio import Redis
 from tortoise.backends.base.config_generator import expand_db_url
 
+from zhenxun.configs.webui_tls import current_webui_scheme
 from zhenxun.services.log import logger
-from zhenxun.services.webui_tls import current_webui_scheme
 from zhenxun.utils.network import local_access_urls, private_ipv4_addresses
 
 from .model import CacheConfig, DatabaseConfig, NetworkConfig, ProbeResult
