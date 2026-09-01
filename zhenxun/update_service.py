@@ -744,7 +744,9 @@ def _restore_bot_update(backup: Path) -> None:
     _sync_dependencies(raise_on_error=False)
 
 
-def _sync_dependencies(*, raise_on_error: bool = True) -> None:
+def _sync_dependencies(
+    *, raise_on_error: bool = True, preserve_extras: bool = False
+) -> None:
     if not (_ROOT / "uv.lock").is_file():
         return
     uv_executable = shutil.which("uv")
@@ -752,8 +754,11 @@ def _sync_dependencies(*, raise_on_error: bool = True) -> None:
         if raise_on_error:
             raise UpdateServiceError("dependency_tool_unavailable")
         return
+    command = [uv_executable, "sync", "--locked"]
+    if preserve_extras:
+        command.append("--inexact")
     result = subprocess.run(
-        [uv_executable, "sync", "--locked"],
+        command,
         cwd=_ROOT,
         capture_output=True,
         timeout=900,

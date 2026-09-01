@@ -4,6 +4,8 @@ import asyncio
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 import importlib.metadata
+import os
+from pathlib import Path
 from typing import Any, Literal
 import uuid
 
@@ -16,9 +18,11 @@ from pydantic import BaseModel, Field
 from zhenxun.nonebot_store.dependencies import (
     DependencyAnalysisError,
     environment_fingerprint,
+    environment_report,
     fetch_pypi_metadata,
     installed_inventory,
     metadata_compatibility,
+    preflight_environment_repair,
     protected_core,
     safe_process_error,
     solve_install,
@@ -37,8 +41,10 @@ from zhenxun.nonebot_store.runtime import (
 )
 from zhenxun.nonebot_store.storage import (
     clear_pending_transaction,
+    dependency_sync_status,
     load_manifest,
     pending_transaction,
+    save_dependency_sync_status,
     save_pending_transaction,
     utc_now,
 )
@@ -67,6 +73,48 @@ class ApplyPayload(BaseModel):
     confirm_non_core_changes: bool = False
     confirm_source_build: bool = False
     confirm_third_party_code: bool = False
+    confirm_compatibility_overrides: bool = False
+
+
+class EnvironmentRepairPayload(BaseModel):
+    expected_fingerprint: str = Field(min_length=64, max_length=64)
+    confirmed: bool = False
+
+
+def _environment_view() -> dict[str, Any]:
+    try:
+        result = environment_report(check_lock=True)
+    except DependencyAnalysisError as error:
+        result = {
+            "status": (
+                "project_lock_stale"
+                if error.code in {"project_lock_missing", "project_metadata_missing"}
+                else "failed"
+            ),
+            "fingerprint": "",
+            "repairable": False,
+            "immutable_drift": [],
+            "compatible_shared_drift": [],
+            "incompatible_shared_drift": [],
+            "extra_packages": [],
+            "extra_count": 0,
+            "error_code": error.code,
+        }
+    except Exception as error:
+        result = {
+            "status": "failed",
+            "fingerprint": "",
+            "repairable": False,
+            "immutable_drift": [],
+            "compatible_shared_drift": [],
+            "incompatible_shared_drift": [],
+            "extra_packages": [],
+            "extra_count": 0,
+            "error_code": type(error).__name__,
+        }
+    result["sync"] = dependency_sync_status()
+    result["launcher_managed"] = bool(os.environ.get("ZHENXUN_LAUNCHER_PID"))
+    return result
 
 
 def _enabled_adapters() -> set[str]:
@@ -183,6 +231,16 @@ def _catalog_item(
         managed
         and _version_is_newer(str(managed.get("version", "0")), str(plugin["version"]))
     )
+    compatibility_overrides = (
+        deepcopy(managed.get("compatibility_overrides") or []) if managed else []
+    )
+    effective_inventory = inventory or installed_inventory()
+    compatibility_override_stale = any(
+        effective_inventory.get(canonicalize_name(str(item.get("name") or "")))
+        != str(item.get("effective_version") or "")
+        for item in compatibility_overrides
+        if isinstance(item, dict)
+    )
     if failure_reasons:
         install_state = "failed"
     elif reasons:
@@ -217,6 +275,9 @@ def _catalog_item(
         "failure_reasons": failure_reasons,
         "managed": bool(managed),
         "external": bool(external),
+        "compatibility_overrides": compatibility_overrides,
+        "compatibility_unverified": bool(compatibility_overrides),
+        "compatibility_override_stale": compatibility_override_stale,
         "apply_mode": (
             "restart_pending"
             if pending_action
@@ -308,17 +369,23 @@ async def _analyze(analysis_id: str) -> None:
                 "registry_cache": registry_meta,
                 "fingerprint": environment_fingerprint(plugin),
                 "plan": plan,
+                "environment": _environment_view(),
                 "plugin": _catalog_item(plugin, manifest=manifest, inventory=inventory),
             }
         )
     except DependencyAnalysisError as error:
+        reason: dict[str, Any] = {
+            "code": error.code,
+            "message": safe_process_error(str(error)),
+        }
+        if error.details is not None:
+            reason["details"] = error.details
         analysis.update(
             {
                 "status": "blocked",
                 "compatible": False,
-                "blocked_reasons": [
-                    {"code": error.code, "message": safe_process_error(str(error))}
-                ],
+                "blocked_reasons": [reason],
+                "environment": _environment_view(),
             }
         )
     except KeyError:
@@ -368,6 +435,10 @@ def _target_manifest(analysis: dict[str, Any]) -> dict[str, Any]:
             "state": "managed",
             "installed_at": utc_now(),
             "registry_time": plugin.get("time"),
+            "compatibility_overrides": deepcopy(
+                analysis["plan"].get("compatibility_overrides", [])
+            ),
+            "environment_fingerprint": analysis.get("fingerprint"),
         }
     core = protected_core()
     target["packages"] = {
@@ -448,6 +519,70 @@ async def _apply_hot(
         [],
         generation=build["generation"],
         previous_generation=old_generation,
+    )
+
+
+@router.get(
+    "/environment",
+    dependencies=[authentication()],
+    response_model=Result[dict],
+    response_class=JSONResponse,
+)
+async def dependency_environment() -> Result[dict]:
+    return Result.ok(_environment_view())
+
+
+@router.post(
+    "/environment/repair",
+    dependencies=[authentication()],
+    response_model=Result[dict],
+    response_class=JSONResponse,
+)
+async def repair_dependency_environment(
+    payload: EnvironmentRepairPayload,
+) -> Result[dict]:
+    view = _environment_view()
+    if not payload.confirmed:
+        return Result.fail("dependency_repair_confirmation_required", code=400)
+    if not view.get("launcher_managed"):
+        return Result.fail("dependency_repair_requires_launcher", code=409)
+    if payload.expected_fingerprint != view.get("fingerprint"):
+        return Result.fail("environment_analysis_stale", code=409)
+    if not view.get("repairable"):
+        return Result.fail("dependency_environment_not_repairable", code=409)
+    ok, detail = await preflight_environment_repair()
+    if not ok:
+        return Result.fail(f"dependency_repair_preflight_failed: {detail}", code=409)
+    from zhenxun.utils._restart_utils import request_dependency_restart
+
+    save_dependency_sync_status(
+        {
+            "status": "pending",
+            "fingerprint": payload.expected_fingerprint,
+            "mode": "locked_inexact",
+        }
+    )
+    accepted, message = await request_dependency_restart(
+        "webui.nonebot-store.environment-repair",
+        {Path("pyproject.toml"), Path("uv.lock")},
+    )
+    if not accepted:
+        save_dependency_sync_status(
+            {"status": "failed", "code": "dependency_restart_not_accepted"}
+        )
+        return Result.fail(message, code=409)
+    status = restart_status_data()
+    return Result.ok(
+        {
+            "apply_mode": "restart_requested",
+            "restart_required": True,
+            "restart_available": True,
+            "reason_codes": ["dependency_environment_repair"],
+            "boot_id": status.get("boot_id"),
+            "access_urls": status["access_urls"],
+            "access_targets": status["access_targets"],
+        },
+        info="依赖同步已提交，正在重启真寻",
     )
 
 
@@ -617,6 +752,11 @@ async def apply_analysis(payload: ApplyPayload) -> Result[dict]:
         return Result.fail("non_core_changes_confirmation_required", code=400)
     if plan["source_build_required"] and not payload.confirm_source_build:
         return Result.fail("source_build_confirmation_required", code=400)
+    if (
+        plan.get("compatibility_overrides")
+        and not payload.confirm_compatibility_overrides
+    ):
+        return Result.fail("compatibility_override_confirmation_required", code=400)
 
     try:
         async with _store_operation():
@@ -631,6 +771,7 @@ async def apply_analysis(payload: ApplyPayload) -> Result[dict]:
                 "module_name": plugin["module_name"],
                 "target_manifest": target,
                 "source_build_confirmed": payload.confirm_source_build,
+                "compatibility_overrides": plan.get("compatibility_overrides", []),
                 "state": "building",
                 "created_at": utc_now(),
             }
@@ -653,6 +794,8 @@ async def apply_analysis(payload: ApplyPayload) -> Result[dict]:
             hot_candidate = (
                 not plan["source_build_required"]
                 and not dependency_changes
+                and not plan.get("shared_changes")
+                and not plan.get("compatibility_overrides")
                 and plan["pure_python_candidate"]
                 and (
                     analysis["action"] == "install"
@@ -697,6 +840,10 @@ async def apply_analysis(payload: ApplyPayload) -> Result[dict]:
             reasons = []
             if dependency_changes:
                 reasons.append("non_core_dependencies_changed")
+            if plan.get("shared_changes"):
+                reasons.append("shared_dependencies_changed")
+            if plan.get("compatibility_overrides"):
+                reasons.append("compatibility_override_unverified")
             if native_changed:
                 reasons.append("native_extensions_changed")
             if source_runtime["reload_support"] != "hot_reloadable":

@@ -236,8 +236,6 @@ def _validated_dependency_paths(paths: set[Path]) -> list[str]:
 async def request_dependency_restart(source: str, paths: set[Path]) -> tuple[bool, str]:
     if not os.getenv("ZHENXUN_LAUNCHER_PID"):
         return False, "当前不是 launcher 托管模式，请手动同步依赖并重启真寻。"
-    if _restart_pending:
-        return await _schedule_restart()
     try:
         dependency_paths = _validated_dependency_paths(paths)
     except ValueError:

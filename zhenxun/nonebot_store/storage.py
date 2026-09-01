@@ -12,6 +12,7 @@ LAYER_ROOT = Path("data") / "runtime" / "nonebot-site-packages"
 MANIFEST_FILE = STORE_ROOT / "manifest-v1.json"
 PENDING_FILE = STORE_ROOT / "pending-transaction-v1.json"
 STARTUP_STATUS_FILE = STORE_ROOT / "startup-status-v1.json"
+DEPENDENCY_SYNC_STATUS_FILE = STORE_ROOT / "dependency-sync-status-v1.json"
 ROLLBACK_FILE = STORE_ROOT / "rollback-manifest-v1.json"
 REGISTRY_CACHE_FILE = STORE_ROOT / "registry-plugins-v1.json"
 REGISTRY_META_FILE = STORE_ROOT / "registry-meta-v1.json"
@@ -129,3 +130,15 @@ def public_manifest() -> dict[str, Any]:
         "pending_verification": bool(manifest.get("pending_verification")),
         "plugins": deepcopy(manifest.get("plugins", {})),
     }
+
+
+def dependency_sync_status() -> dict[str, Any]:
+    value = read_json(DEPENDENCY_SYNC_STATUS_FILE, {})
+    return value if isinstance(value, dict) else {}
+
+
+def save_dependency_sync_status(value: dict[str, Any]) -> None:
+    write_json(
+        DEPENDENCY_SYNC_STATUS_FILE,
+        {**value, "updated_at": utc_now()},
+    )

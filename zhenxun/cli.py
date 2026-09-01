@@ -883,22 +883,47 @@ def _run_launcher() -> None:
         if restart_requested or (restart_action := consume_launcher_action()):
             if restart_action and restart_action[0] == "sync_dependencies_restart":
                 dependency_paths = restart_action[1]
-                if any(
-                    path in {"pyproject.toml", "uv.lock"} for path in dependency_paths
-                ):
-                    from zhenxun.update_service import _sync_dependencies
+                from zhenxun.nonebot_store.storage import (
+                    save_dependency_sync_status,
+                )
 
-                    _sync_dependencies()
-                for dependency_path in dependency_paths:
-                    if Path(dependency_path).name not in {
-                        "requirement.txt",
-                        "requirements.txt",
-                    }:
-                        continue
-                    subprocess.run(
-                        ["uv", "pip", "install", "-r", dependency_path],
-                        cwd=str(cwd),
-                        check=True,
+                save_dependency_sync_status(
+                    {"status": "running", "paths": dependency_paths}
+                )
+                try:
+                    if any(
+                        path in {"pyproject.toml", "uv.lock"}
+                        for path in dependency_paths
+                    ):
+                        from zhenxun.update_service import _sync_dependencies
+
+                        _sync_dependencies(preserve_extras=True)
+                    for dependency_path in dependency_paths:
+                        if Path(dependency_path).name not in {
+                            "requirement.txt",
+                            "requirements.txt",
+                        }:
+                            continue
+                        subprocess.run(
+                            ["uv", "pip", "install", "-r", dependency_path],
+                            cwd=str(cwd),
+                            check=True,
+                        )
+                except Exception as error:
+                    _launcher_log(
+                        "dependency sync failed; restarting worker with the "
+                        f"current environment ({type(error).__name__})"
+                    )
+                    save_dependency_sync_status(
+                        {
+                            "status": "failed",
+                            "code": getattr(error, "code", "dependency_sync_failed"),
+                            "paths": dependency_paths,
+                        }
+                    )
+                else:
+                    save_dependency_sync_status(
+                        {"status": "succeeded", "paths": dependency_paths}
                     )
             pending_bot_verification = apply_pending_update(cwd)
             continue
