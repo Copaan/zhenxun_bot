@@ -494,7 +494,9 @@ def _health_urlopen(url: str):
     return urllib.request.urlopen(url, timeout=1.0)
 
 
-def _worker_is_ready(settings, *, scheme: str = "http") -> bool:
+def _worker_is_ready(
+    settings, *, scheme: str = "http", require_warmup: bool = False
+) -> bool:
     try:
         with _health_urlopen(
             _worker_runtime_status_url(settings, scheme=scheme)
@@ -502,20 +504,31 @@ def _worker_is_ready(settings, *, scheme: str = "http") -> bool:
             if response.status != 200:
                 return False
             payload = json.loads(response.read())
-            state = payload.get("data", {}).get("state")
+            data = payload.get("data", {})
+            state = data.get("state")
+            if require_warmup:
+                warmup_state = data.get("stages", {}).get("warmup", {}).get("state")
+                return state in {"warmup_ready", "degraded"} and warmup_state in {
+                    "completed",
+                    "failed",
+                }
             return state in {"runtime_ready", "warmup_ready", "degraded"}
     except (OSError, ValueError, TypeError, urllib.error.URLError):
         return False
 
 
 def _wait_worker_ready(
-    worker: subprocess.Popen, settings, *, scheme: str = "http"
+    worker: subprocess.Popen,
+    settings,
+    *,
+    scheme: str = "http",
+    require_warmup: bool = False,
 ) -> bool:
     deadline = time.monotonic() + WORKER_READY_TIMEOUT
     while time.monotonic() < deadline:
         if worker.poll() is not None:
             return False
-        if _worker_is_ready(settings, scheme=scheme):
+        if _worker_is_ready(settings, scheme=scheme, require_warmup=require_warmup):
             return True
         time.sleep(WORKER_READY_POLL_INTERVAL)
     return False
@@ -871,7 +884,12 @@ def _run_launcher() -> None:
         current_worker = worker
         if verify_nonebot_generation or verify_source_transaction:
             _launcher_log("waiting for managed plugin transaction verification")
-            if not _wait_worker_ready(worker, qq_settings, scheme=webui_tls.scheme):
+            if not _wait_worker_ready(
+                worker,
+                qq_settings,
+                scheme=webui_tls.scheme,
+                require_warmup=True,
+            ):
                 _terminate_worker(worker)
                 current_worker = None
                 _launcher_log("managed plugin worker failed, rolling back transaction")

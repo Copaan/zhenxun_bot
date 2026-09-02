@@ -160,6 +160,7 @@ class PluginIr(BaseModel):
     store_key: str | None = Field(default=None, min_length=3, max_length=300)
     """稳定商店键 source:module"""
     operation_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
+    confirm_source_build: bool = False
 
 
 class PluginReloadPayload(BaseModel):

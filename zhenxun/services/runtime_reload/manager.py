@@ -1551,6 +1551,11 @@ class PluginRuntimeManager:
             except TimeoutError as e:
                 raise RuntimeError(f"plugin_drain_timeout:{unit.plugin_id}") from e
 
+        # Give plugin lifecycle hooks the first chance to stop their workers.
+        # Cancelling owned tasks first can make a shutdown hook re-await an already
+        # cancelled task and propagate CancelledError out of the WebUI request.
+        await self._run_reload_shutdown_hooks(unit.module_names)
+
         tasks = [
             task
             for owner in self._owned_keys_for_unit(unit.plugin_id)
@@ -1561,8 +1566,6 @@ class PluginRuntimeManager:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-
-        await self._run_reload_shutdown_hooks(unit.module_names)
 
         plugins = [
             plugin

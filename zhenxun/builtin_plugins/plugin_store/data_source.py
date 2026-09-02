@@ -47,6 +47,10 @@ class StoreInstallResult:
         changes = self.dependency_plan.get("package_changes", {})
         return bool(changes.get("added") or changes.get("changed"))
 
+    @property
+    def source_build_required(self) -> bool:
+        return bool(self.dependency_plan.get("source_build_required"))
+
 
 def row_style(column: str, text: str) -> RowStyle:
     """被动技能文本风格
@@ -469,6 +473,7 @@ class StoreManager:
         source: str | None = None,
         *,
         install_dependencies: bool = True,
+        confirm_source_build: bool = False,
         return_result: bool = False,
     ) -> str | StoreInstallResult:
         """添加插件
@@ -492,6 +497,7 @@ class StoreManager:
             is_external,
             source,
             install_dependencies=install_dependencies,
+            confirm_source_build=confirm_source_build,
         )
         dependency_status = (
             "依赖已更新，需由运行时决定生效方式"
@@ -512,6 +518,7 @@ class StoreManager:
         branch: str = "main",
         *,
         install_dependencies: bool = True,
+        confirm_source_build: bool = False,
     ) -> StoreInstallResult:
         """安装插件
 
@@ -582,6 +589,12 @@ class StoreManager:
                 dependency_changes = bool(
                     changes.get("added") or changes.get("changed")
                 )
+                if (
+                    dependency_changes
+                    and dependency_plan.get("source_build_required")
+                    and not confirm_source_build
+                ):
+                    raise PluginStoreException("source_build_confirmation_required")
                 if not dependency_changes:
                     logger.info(
                         f"插件 {plugin_info.module_path} 的依赖已满足，跳过安装",
@@ -886,6 +899,7 @@ class StoreManager:
         index_or_module: str,
         *,
         install_dependencies: bool = True,
+        confirm_source_build: bool = False,
         return_result: bool = False,
     ) -> str | StoreInstallResult:
         """更新插件
@@ -906,6 +920,7 @@ class StoreManager:
             plugin_info,
             is_external,
             install_dependencies=install_dependencies,
+            confirm_source_build=confirm_source_build,
         )
         if return_result:
             return install_result

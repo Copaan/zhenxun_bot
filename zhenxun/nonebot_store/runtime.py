@@ -259,6 +259,12 @@ def apply_pending_transaction() -> bool:
     try:
         build = _staged_build(transaction) or build_generation(transaction)
         if transaction.get("database_migration_possible"):
+            transaction["generation"] = int(build["generation"])
+            transaction["generation_digest"] = str(build["digest"])
+            transaction["native_extensions"] = list(
+                build.get("native_extensions") or []
+            )
+            write_json(PENDING_FILE, transaction)
             migration_result = _run_orm_migration("apply")
             if migration_result:
                 transaction["state"] = (
@@ -421,6 +427,8 @@ def rollback_pending_transaction() -> None:
             transaction["failure_reasons"] = [
                 {
                     "code": str(item.get("code") or "plugin_import_failed"),
+                    "store_key": str(item.get("store_key") or ""),
+                    "module_name": str(item.get("module_name") or ""),
                     "paths": [
                         str(path)
                         for path in item.get("paths", [])

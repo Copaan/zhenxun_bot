@@ -2489,7 +2489,11 @@ def passive_status_snapshot(max_modules: int = 50) -> dict[str, Any]:
     }
 
 
-@PriorityLifecycle.on_startup(priority=6)
+@PriorityLifecycle.on_startup(
+    priority=6,
+    task_id="runtime:runtime_cache",
+    depends_on=("runtime:reconcile_tasks",),
+)
 async def _init_runtime_cache():
     await RuntimeCacheSync.start()
     # 并发刷新所有缓存，互不依赖

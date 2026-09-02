@@ -23,7 +23,7 @@ from zhenxun.utils.bytecode import precompile_path
 
 ROOT = Path("data/runtime/plugin-store-transaction")
 PENDING_FILE = ROOT / "pending-v1.json"
-LIFECYCLE_INDEX = Path("data/runtime/lifecycle-index-v1.json")
+LIFECYCLE_INDEX = Path("data/runtime/lifecycle-index-v2.json")
 _TRANSACTION_LOCK = ROOT / ".transaction.lock"
 
 
@@ -152,6 +152,7 @@ def stage_operation(
     reason: str,
     dependency_inputs: list[str] | None = None,
     dependency_packages: dict[str, str] | None = None,
+    source_build_confirmed: bool = False,
     operation_id: str | None = None,
 ) -> dict[str, Any]:
     if action not in {"install", "update", "uninstall"}:
@@ -241,6 +242,7 @@ def stage_operation(
                     "dependency_packages": dict(
                         sorted((dependency_packages or {}).items())
                     ),
+                    "source_build_confirmed": bool(source_build_confirmed),
                     "created_at": _now(),
                 }
             except Exception:
@@ -386,6 +388,13 @@ def prepare_dependency_transaction() -> bool:
     if current:
         transaction = deepcopy(current)
         transaction["target_manifest"] = target
+        transaction["source_build_confirmed"] = bool(
+            transaction.get("source_build_confirmed")
+            or any(
+                operation.get("source_build_confirmed")
+                for operation in source.get("operations", [])
+            )
+        )
         transaction["source_transaction_revision"] = source.get("revision")
         transaction["updated_at"] = utc_now()
     else:
@@ -395,7 +404,10 @@ def prepare_dependency_transaction() -> bool:
             "base_manifest": base,
             "operations": [],
             "target_manifest": target,
-            "source_build_confirmed": False,
+            "source_build_confirmed": any(
+                operation.get("source_build_confirmed")
+                for operation in source.get("operations", [])
+            ),
             "database_migration_confirmed": False,
             "database_migration_possible": False,
             "database_type": "none",

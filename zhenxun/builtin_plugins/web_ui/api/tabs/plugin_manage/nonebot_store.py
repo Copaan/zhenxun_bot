@@ -256,9 +256,14 @@ def _catalog_item(
         for failure in pending.get("failure_reasons") or []:
             if not isinstance(failure, dict):
                 continue
+            failure_store_key = str(failure.get("store_key") or "")
+            if failure_store_key and failure_store_key != f"nonebot:{project_link}":
+                continue
             failure_reasons.append(
                 {
                     "code": str(failure.get("code") or "plugin_import_failed"),
+                    "store_key": failure_store_key or None,
+                    "module_name": str(failure.get("module_name") or "") or None,
                     "paths": [
                         str(path)
                         for path in failure.get("paths") or []
@@ -885,6 +890,9 @@ async def apply_analysis(payload: ApplyPayload) -> Result[dict]:
                 "project_link": plugin["project_link"],
                 "module_name": plugin["module_name"],
                 "name": plugin.get("name") or plugin["project_link"],
+                "database_migration_possible": bool(
+                    plan.get("database_migration_possible")
+                ),
                 "created_at": utc_now(),
                 "target_manifest": deepcopy(target),
             }

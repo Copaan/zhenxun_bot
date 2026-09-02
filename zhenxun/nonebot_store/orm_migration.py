@@ -11,7 +11,6 @@ from typing import Any
 
 import click
 import nonebot
-from sqlalchemy.util import greenlet_spawn
 
 from .storage import (
     ORM_MIGRATION_STATUS_FILE,
@@ -41,12 +40,25 @@ def _activate_staged_generation(transaction: dict[str, Any]) -> Path:
 def _load_target_plugins(transaction: dict[str, Any]) -> None:
     from .runtime import _load_managed_plugin
 
+    operations = [
+        item for item in transaction.get("operations", []) if isinstance(item, dict)
+    ]
+    migration_modules = {
+        str(item.get("module_name") or "")
+        for item in operations
+        if item.get("database_migration_possible")
+    }
+    # Transactions created before migration ownership was recorded require the
+    # conservative legacy behavior.
+    restrict_modules = bool(operations) and any(
+        "database_migration_possible" in item for item in operations
+    )
     plugins = transaction.get("target_manifest", {}).get("plugins", {})
     for plugin in plugins.values():
         if not isinstance(plugin, dict) or plugin.get("state") != "managed":
             continue
         module_name = str(plugin.get("module_name") or "")
-        if module_name:
+        if module_name and (not restrict_modules or module_name in migration_modules):
             _load_managed_plugin(module_name)
 
 
@@ -125,6 +137,8 @@ async def apply() -> int:
     revision = str(transaction.get("revision") or "")
     try:
         _activate_staged_generation(transaction)
+        from sqlalchemy.util import greenlet_spawn
+
         nonebot.init()
         _load_target_plugins(transaction)
         import nonebot_plugin_orm as orm
@@ -169,6 +183,7 @@ async def apply() -> int:
         )
         return 0
     except Exception as error:
+        restore()
         write_json(
             ORM_MIGRATION_STATUS_FILE,
             {
@@ -178,7 +193,6 @@ async def apply() -> int:
                 "updated_at": utc_now(),
             },
         )
-        restore()
         return 2
     finally:
         with __import__("contextlib").suppress(Exception):

@@ -594,6 +594,7 @@ async def _(param: PluginIr) -> Result:
                 install_result = await StoreManager.add_plugin(
                     request_value,
                     install_dependencies=False,
+                    confirm_source_build=param.confirm_source_build,
                     return_result=True,
                 )
                 after = _snapshot_plugin_files(path)
@@ -640,6 +641,7 @@ async def _(param: PluginIr) -> Result:
                     reason=str(operation.get("reason") or "plugin_restart_required"),
                     dependency_inputs=_dependency_inputs(install_result),
                     dependency_packages=_dependency_packages(install_result),
+                    source_build_confirmed=param.confirm_source_build,
                     operation_id=journal_operation_id,
                 )
                 async with plugin_runtime_manager.hold_content_changes({path}):
@@ -679,6 +681,8 @@ async def _(param: PluginIr) -> Result:
             _remove_path(path)
         reason = _safe_store_error(e)
         _record_failed_operation(journal_operation_id, journal_store_key, reason)
+        if reason == "source_build_confirmation_required":
+            return Result.fail(reason, code=409)
         return Result.fail(f"安装插件失败: {reason}")
 
 
@@ -720,6 +724,7 @@ async def _(param: PluginIr) -> Result:
                         install_result = await StoreManager.update_plugin(
                             request_value,
                             install_dependencies=False,
+                            confirm_source_build=param.confirm_source_build,
                             return_result=True,
                         )
                         after = _snapshot_plugin_files(path)
@@ -774,6 +779,7 @@ async def _(param: PluginIr) -> Result:
                             ),
                             dependency_inputs=_dependency_inputs(install_result),
                             dependency_packages=_dependency_packages(install_result),
+                            source_build_confirmed=param.confirm_source_build,
                             operation_id=journal_operation_id,
                         )
                         async with plugin_runtime_manager.hold_content_changes({path}):
@@ -809,6 +815,8 @@ async def _(param: PluginIr) -> Result:
     except Exception as e:
         reason = _safe_store_error(e)
         _record_failed_operation(journal_operation_id, journal_store_key, reason)
+        if reason == "source_build_confirmation_required":
+            return Result.fail(reason, code=409)
         return Result.fail(f"更新插件失败: {reason}")
 
 

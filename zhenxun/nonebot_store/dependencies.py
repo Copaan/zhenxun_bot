@@ -1019,8 +1019,16 @@ async def preflight_source_requirements(files: list[Path]) -> dict[str, Any]:
     for name, version in resolved.items():
         if name in core and core[name] != version:
             raise DependencyAnalysisError("core_dependency_conflict")
+    wheel_resolved, wheel_error = await _compile(
+        requirements,
+        resolved,
+        wheels_only=True,
+    )
+    source_build_required = wheel_resolved is None
     return {
         "resolved_packages": resolved,
         "package_changes": _package_changes(resolved, current),
         "candidate_inputs": requirements,
+        "source_build_required": source_build_required,
+        "source_build_detail": wheel_error if source_build_required else None,
     }
