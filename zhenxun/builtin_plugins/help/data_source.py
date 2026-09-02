@@ -11,7 +11,6 @@ from zhenxun.models.plugin_info import PluginInfo
 from zhenxun.models.statistics import Statistics
 from zhenxun.services import avatar_service
 from zhenxun.services.ai.core.exceptions import LLMException
-from zhenxun.services.ai.llm.api import chat
 from zhenxun.services.db_context import with_db_timeout
 from zhenxun.services.log import logger
 from zhenxun.services.message_load import is_db_unhealthy
@@ -360,6 +359,8 @@ async def get_llm_help(question: str, user_id: str) -> str | bytes:
         full_instruction = (
             f"{system_prompt}\n\n=== 功能列表和说明 ===\n{knowledge_base}"
         )
+
+        from zhenxun.services.ai.llm.api import chat
 
         response = await chat(
             message=question,

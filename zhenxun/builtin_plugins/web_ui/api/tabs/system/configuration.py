@@ -5,6 +5,7 @@ from io import StringIO
 import json
 import os
 from pathlib import Path
+import re
 from typing import Any, Literal, get_args, get_origin
 
 from dotenv import dotenv_values
@@ -21,6 +22,12 @@ from zhenxun.configs.webui_tls import (
     validate_webui_tls_settings,
 )
 from zhenxun.services.runtime_config_reload import reload_runtime_config
+from zhenxun.services.runtime_environment import (
+    KNOWN_ENV_KEYS,
+    environment_effect,
+    is_sensitive_env_key,
+    runtime_environment_manager,
+)
 from zhenxun.services.runtime_reload.models import ApplyMode, RuntimeOperation
 from zhenxun.utils._restart_utils import issue_restart_ticket
 from zhenxun.utils.network import local_access_urls
@@ -32,9 +39,7 @@ from zhenxun.utils.pydantic_compat import (
 
 from ....apply_result import (
     APPLY_NO_CHANGE,
-    APPLY_RESTART_PENDING,
     apply_result_data,
-    env_change_impact,
     update_pending_restart,
 )
 from ....base_model import Result
@@ -66,18 +71,29 @@ _ENV_FORM_KEYS = (
     "NICKNAME",
     "SELF_NICKNAME",
     "COMMAND_START",
+    "COMMAND_SEP",
+    "ALCONNA_USE_COMMAND_START",
     "SUPERUSERS",
+    "PLATFORM_SUPERUSERS",
     "SESSION_EXPIRE_TIMEOUT",
     "IMAGE_TO_BYTES",
     "EXT_PATH",
 )
 _SECRET_MARKERS = ("TOKEN", "SECRET", "PASSWORD", "COOKIE", "API_KEY", "APIKEY")
+_ENV_KEY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+class CustomEnvOperation(BaseModel):
+    key: str = Field(min_length=1, max_length=128)
+    operation: Literal["set", "delete"]
+    value: str | None = Field(default=None, max_length=65536)
 
 
 class ConfigurationFileUpdate(BaseModel):
     expected_revision: str = Field(min_length=64, max_length=64)
     content: str | None = None
     fields: dict[str, Any] | None = None
+    custom_operations: list[CustomEnvOperation] | None = None
 
 
 class ConfigurationValidation(BaseModel):
@@ -242,6 +258,41 @@ def _update_env(content: str, fields: dict[str, Any]) -> str:
     return "".join(output)
 
 
+def _update_custom_env(content: str, operations: list[CustomEnvOperation]) -> str:
+    if not operations:
+        return content
+    changes: dict[str, CustomEnvOperation] = {}
+    for operation in operations:
+        key = operation.key.strip()
+        folded = key.casefold()
+        if not _ENV_KEY_PATTERN.fullmatch(key):
+            raise ValueError("custom_env_key_invalid")
+        if key.upper() in KNOWN_ENV_KEYS:
+            raise ValueError("custom_env_key_managed")
+        if folded in changes:
+            raise ValueError("custom_env_key_duplicate")
+        if operation.operation == "set" and operation.value is None:
+            raise ValueError("custom_env_value_required")
+        changes[folded] = operation.model_copy(update={"key": key})
+
+    output: list[str] = []
+    from dotenv.parser import parse_stream
+
+    for binding in parse_stream(StringIO(content)):
+        folded = binding.key.casefold() if binding.key else None
+        operation = changes.pop(folded, None) if folded else None
+        if operation is None:
+            output.append(binding.original.string)
+        elif operation.operation == "set":
+            output.append(f"{operation.key} = {_env_encode(operation.value)}\n")
+    additions = [item for item in changes.values() if item.operation == "set"]
+    if additions:
+        if output and not output[-1].endswith("\n"):
+            output.append("\n")
+        output.extend(f"{item.key} = {_env_encode(item.value)}\n" for item in additions)
+    return "".join(output)
+
+
 def _update_simple(content: str, fields: dict[str, Any]) -> str:
     parser = _yaml_parser()
     data = parser.load(StringIO(content)) or {}
@@ -271,6 +322,12 @@ def _validation_error(file: str, error: Exception) -> HTTPException:
         "dotenv_invalid_statement": "dotenv 中存在无法解析的语句。",
         "dotenv_duplicate_key": "dotenv 中存在重复配置键。",
         "env_field_not_editable": "提交中包含不允许在此页面修改的环境配置。",
+        "custom_env_key_invalid": "自定义环境变量名称不合法。",
+        "custom_env_key_managed": "该变量由系统配置表单管理，不能重复添加。",
+        "custom_env_key_duplicate": "自定义环境变量操作中存在重复名称。",
+        "custom_env_value_required": "新增或替换环境变量时必须填写值。",
+        "custom_env_raw_conflict": "高级原文与自定义变量操作不能同时提交。",
+        "custom_env_file_invalid": "自定义环境变量只能写入 .env.dev。",
         "yaml_top_level_mapping_required": "config.yaml 顶层必须是映射。",
         "yaml_group_mapping_required": "config.yaml 配置组必须是映射。",
     }
@@ -293,9 +350,30 @@ async def configuration_summary() -> Result:
     env_content = _read(env_path)
     values = dotenv_values(stream=StringIO(env_content))
     env_fields = {key: values.get(key) for key in _ENV_FORM_KEYS}
+    custom_env = []
+    for key, value in sorted(values.items(), key=lambda item: str(item[0]).casefold()):
+        if str(key).upper() in KNOWN_ENV_KEYS:
+            continue
+        sensitive = is_sensitive_env_key(str(key))
+        custom_env.append(
+            {
+                "key": str(key),
+                "value": None if sensitive else value,
+                "configured": value not in {None, ""},
+                "sensitive": sensitive,
+                "apply_effect": "restart_required",
+            }
+        )
     return Result.ok(
         {
-            "env": {"fields": env_fields, "revision": _revision(env_content)},
+            "env": {
+                "fields": env_fields,
+                "field_effects": {
+                    key: environment_effect(key) for key in _ENV_FORM_KEYS
+                },
+                "custom_env": custom_env,
+                "revision": _revision(env_content),
+            },
             "simple": {
                 "groups": _registered_groups(),
                 "revision": _revision(_read(_SIMPLE_FILE)),
@@ -358,10 +436,18 @@ async def update_configuration_file(
         raise HTTPException(
             status_code=409, detail="配置文件已被外部修改，请重新加载。"
         )
-    if payload.content is None and payload.fields is None:
+    if (
+        payload.content is None
+        and payload.fields is None
+        and not payload.custom_operations
+    ):
         raise HTTPException(status_code=422, detail="没有可保存的配置内容。")
     try:
         content = payload.content
+        if payload.content is not None and payload.custom_operations:
+            raise ValueError("custom_env_raw_conflict")
+        if file != "env" and payload.custom_operations:
+            raise ValueError("custom_env_file_invalid")
         if content is None:
             if file == "env" and set(payload.fields or {}) - set(_ENV_FORM_KEYS):
                 raise ValueError("env_field_not_editable")
@@ -370,6 +456,8 @@ async def update_configuration_file(
                 if file == "env"
                 else _update_simple(current, payload.fields or {})
             )
+            if file == "env":
+                content = _update_custom_env(content, payload.custom_operations or [])
         warnings = (
             _validate_env(content) if file == "env" else validate_simple_yaml(content)
         )
@@ -378,6 +466,7 @@ async def update_configuration_file(
 
     original = target.read_bytes() if target.exists() else None
     operation: RuntimeOperation | None = None
+    env_operation = None
     try:
         content_bytes = content.encode("utf-8")
         content_changed = original != content_bytes
@@ -387,6 +476,10 @@ async def update_configuration_file(
             operation = await reload_runtime_config(submit_restart=False)
             if operation.mode is ApplyMode.FAILED:
                 raise RuntimeError(operation.reason or "config_consumer_reload_failed")
+        elif file == "env" and content_changed:
+            env_operation = await runtime_environment_manager.apply(
+                current, content, submit_restart=False
+            )
     except Exception as error:
         if original is None:
             target.unlink(missing_ok=True)
@@ -403,19 +496,11 @@ async def update_configuration_file(
         ) from error
 
     if file == "env":
-        changed_keys, pending_keys = env_change_impact(
-            current,
-            content,
-            set(_ENV_FORM_KEYS) if payload.fields is not None else None,
-        )
-        restart_required = bool(set(changed_keys) & set(pending_keys))
-        apply_mode = APPLY_RESTART_PENDING if restart_required else APPLY_NO_CHANGE
-        reason_codes = [f"environment:{key}" for key in pending_keys]
-        launcher_managed = update_pending_restart(
-            "webui.env-form" if payload.fields is not None else "webui.env-raw",
-            reason_codes,
-            issue_ticket=False,
-        )
+        apply_mode = env_operation.apply_mode if env_operation else APPLY_NO_CHANGE
+        restart_required = bool(env_operation and env_operation.restart_required)
+        changed_keys = env_operation.changed_keys if env_operation else []
+        reason_codes = env_operation.reason_codes if env_operation else []
+        launcher_managed = bool(os.getenv("ZHENXUN_LAUNCHER_PID"))
     else:
         apply_mode = operation.mode.value if operation is not None else APPLY_NO_CHANGE
         restart_required = apply_mode in {
@@ -450,14 +535,25 @@ async def update_configuration_file(
         apply_mode=apply_mode,
         changed_keys=changed_keys,
         restart_required=restart_required,
+        hot_reloaded=(
+            env_operation.hot_reloaded if env_operation is not None else None
+        ),
         reason_codes=reason_codes,
         access_urls=access_urls,
         access_targets=access_targets,
         file=file,
         revision=_revision(content),
         warnings=warnings,
-        affected=operation.changed if operation is not None else [],
         reason=operation.reason if operation is not None else None,
+        field_effects=env_operation.field_effects if env_operation else {},
+        rolled_back=bool(env_operation and env_operation.rolled_back),
+        affected=(
+            env_operation.changed_plugins
+            if env_operation is not None
+            else operation.changed
+            if operation is not None
+            else []
+        ),
     )
     if apply_mode == APPLY_NO_CHANGE:
         info = "配置已保存，没有需要应用的运行时变化。"

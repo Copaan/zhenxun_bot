@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import datetime, timezone
-import json
 from pathlib import Path
 import shutil
 from typing import Any
+
+from zhenxun.utils.atomic_json import read_json_locked, write_json_locked
 
 STORE_ROOT = Path("data") / "runtime" / "nonebot-store"
 LAYER_ROOT = Path("data") / "runtime" / "nonebot-site-packages"
@@ -13,6 +14,7 @@ MANIFEST_FILE = STORE_ROOT / "manifest-v1.json"
 PENDING_FILE = STORE_ROOT / "pending-transaction-v1.json"
 STARTUP_STATUS_FILE = STORE_ROOT / "startup-status-v1.json"
 DEPENDENCY_SYNC_STATUS_FILE = STORE_ROOT / "dependency-sync-status-v1.json"
+ORM_MIGRATION_STATUS_FILE = STORE_ROOT / "orm-migration-status-v1.json"
 ROLLBACK_FILE = STORE_ROOT / "rollback-manifest-v1.json"
 REGISTRY_CACHE_FILE = STORE_ROOT / "registry-plugins-v1.json"
 REGISTRY_META_FILE = STORE_ROOT / "registry-meta-v1.json"
@@ -23,21 +25,11 @@ def utc_now() -> str:
 
 
 def read_json(path: Path, default: Any) -> Any:
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, TypeError):
-        return deepcopy(default)
-    return value
+    return read_json_locked(path, default)
 
 
 def write_json(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp")
-    temporary.write_text(
-        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True),
-        encoding="utf-8",
-    )
-    temporary.replace(path)
+    write_json_locked(path, value)
 
 
 def default_manifest() -> dict[str, Any]:
@@ -120,7 +112,7 @@ def save_pending_transaction(value: dict[str, Any]) -> None:
 
 
 def clear_pending_transaction() -> None:
-    PENDING_FILE.unlink(missing_ok=True)
+    write_json(PENDING_FILE, None)
 
 
 def public_manifest() -> dict[str, Any]:

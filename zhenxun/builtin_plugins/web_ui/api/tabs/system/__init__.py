@@ -1,11 +1,13 @@
 import os
 from pathlib import Path
 import shutil
+from typing import Any
 
 import aiofiles
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 
+from zhenxun.services.startup import startup_coordinator
 from zhenxun.utils._build_image import BuildImage
 
 from ....base_model import Result, SystemFolderSize
@@ -21,6 +23,17 @@ router.include_router(configuration_router)
 router.include_router(update_router)
 router.include_router(restart_router)
 router.include_router(runtime_router)
+
+
+@router.get(
+    "/startup/status",
+    response_model=Result[dict[str, Any]],
+    response_class=JSONResponse,
+    description="获取worker分级启动状态",
+)
+async def get_startup_status() -> Result[dict[str, Any]]:
+    return Result.ok(startup_coordinator.snapshot())
+
 
 IMAGE_TYPE = ["jpg", "jpeg", "png", "gif", "bmp", "webp", "svg"]
 

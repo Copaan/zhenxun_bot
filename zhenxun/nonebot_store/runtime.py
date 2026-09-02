@@ -199,17 +199,78 @@ def commit_generation(
     return target
 
 
+def stage_generation(transaction: dict[str, Any], build: dict[str, Any]) -> None:
+    """Persist a built generation without exposing it to the running worker."""
+    previous = transaction.get("generation")
+    if isinstance(previous, int) and previous != build["generation"]:
+        remove_generation(previous)
+    transaction["generation"] = int(build["generation"])
+    transaction["generation_digest"] = str(build["digest"])
+    transaction["native_extensions"] = list(build.get("native_extensions") or [])
+    transaction["state"] = "pending_restart"
+    write_json(PENDING_FILE, transaction)
+
+
+def _staged_build(transaction: dict[str, Any]) -> dict[str, Any] | None:
+    generation = transaction.get("generation")
+    if not isinstance(generation, int):
+        return None
+    path = generation_path(generation)
+    digest = str(transaction.get("generation_digest") or "")
+    if not path.is_dir() or not digest:
+        return None
+    return {
+        "generation": generation,
+        "path": path,
+        "digest": digest,
+        "native_extensions": list(transaction.get("native_extensions") or []),
+    }
+
+
+def _run_orm_migration(action: str) -> int:
+    completed = subprocess.run(
+        [sys.executable, "-m", "zhenxun.nonebot_store.orm_migration", action],
+        cwd=str(Path.cwd()),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=180,
+        check=False,
+    )
+    return int(completed.returncode)
+
+
+def finalize_orm_migration() -> None:
+    _run_orm_migration("finalize")
+
+
 def apply_pending_transaction() -> bool:
     """Build a queued layer after the launcher has stopped the old worker."""
     transaction = pending_transaction()
     if transaction is None:
         return False
-    if transaction.get("state") not in {"pending_restart", "building"}:
+    if transaction.get("state") not in {
+        "pending_restart",
+        "building",
+        "migration_blocked",
+    }:
         return False
     transaction["state"] = "building"
     write_json(PENDING_FILE, transaction)
     try:
-        build = build_generation(transaction)
+        build = _staged_build(transaction) or build_generation(transaction)
+        if transaction.get("database_migration_possible"):
+            migration_result = _run_orm_migration("apply")
+            if migration_result:
+                transaction["state"] = (
+                    "migration_blocked" if migration_result == 3 else "failed"
+                )
+                transaction["error_code"] = (
+                    "external_database_manual_migration_required"
+                    if migration_result == 3
+                    else "database_migration_failed"
+                )
+                write_json(PENDING_FILE, transaction)
+                return False
         commit_generation(transaction, build, verify_on_start=True)
     except Exception as error:
         transaction["state"] = "failed"
@@ -336,6 +397,7 @@ def finalize_pending_transaction() -> None:
     manifest["pending_verification"] = False
     manifest["previous_generation"] = None
     save_manifest(manifest)
+    finalize_orm_migration()
     clear_pending_transaction()
     ROLLBACK_FILE.unlink(missing_ok=True)
     active = manifest.get("active_generation")
@@ -346,6 +408,7 @@ def rollback_pending_transaction() -> None:
     current = load_manifest()
     failed_status = read_json(STARTUP_STATUS_FILE, {})
     rollback = read_json(ROLLBACK_FILE, None)
+    _run_orm_migration("restore")
     if isinstance(rollback, dict):
         save_manifest(rollback)
     remove_generation(current.get("active_generation"))

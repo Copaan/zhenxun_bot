@@ -1,13 +1,16 @@
+from dataclasses import dataclass, field
 import os
 from pathlib import Path
 import shutil
 import tempfile
+import time
 from typing import Any, ClassVar
 
 import ujson as json
 
 from zhenxun.builtin_plugins.plugin_store.models import StorePluginInfo
 from zhenxun.models.plugin_info import PluginInfo
+from zhenxun.plugin_store_coordinator import coordinated_store_operation
 from zhenxun.services.cache.bounded_ttl import BoundedTTLCache
 from zhenxun.services.log import logger
 from zhenxun.services.plugin_init import PluginInitManager
@@ -35,6 +38,16 @@ _PLUGIN_STORE_DATA_CACHE = BoundedTTLCache[
 )
 
 
+@dataclass(frozen=True, slots=True)
+class StoreInstallResult:
+    dependency_plan: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def dependency_changes(self) -> bool:
+        changes = self.dependency_plan.get("package_changes", {})
+        return bool(changes.get("added") or changes.get("changed"))
+
+
 def row_style(column: str, text: str) -> RowStyle:
     """被动技能文本风格
 
@@ -52,8 +65,9 @@ def row_style(column: str, text: str) -> RowStyle:
 
 
 class StoreManager:
-    _last_install_had_requirements: ClassVar[bool] = False
-    _last_dependency_plan: ClassVar[dict[str, Any] | None] = None
+    _catalog_warnings: ClassVar[list[dict[str, Any]]] = []
+    _catalog_health: ClassVar[dict[str, dict[str, Any]]] = {}
+    _catalog_health_checked_at: ClassVar[float] = 0.0
     _SOURCE_NAMES: ClassVar[dict[RepoType, str]] = {
         RepoType.ALIYUN: "阿里云",
         RepoType.GITHUB: "GitHub",
@@ -140,16 +154,103 @@ class StoreManager:
         extra_plugins = await RepoFileManager.get_text_content(
             EXTRA_GITHUB_URL, "plugins.json", "index"
         )
+        warnings: list[dict[str, Any]] = []
+
+        def parse_entries(content: str, source: str) -> list[StorePluginInfo]:
+            try:
+                raw_entries = json.loads(content)
+            except Exception as error:
+                raise PluginStoreException(f"{source}_catalog_invalid") from error
+            if not isinstance(raw_entries, list):
+                raise PluginStoreException(f"{source}_catalog_invalid")
+            entries: list[StorePluginInfo] = []
+            for index, raw in enumerate(raw_entries):
+                try:
+                    entries.append(StorePluginInfo(**raw))
+                except Exception as error:
+                    warnings.append(
+                        {
+                            "source": source,
+                            "index": index,
+                            "code": "catalog_entry_invalid",
+                            "error_type": type(error).__name__,
+                        }
+                    )
+            return entries
+
         result = (
-            [StorePluginInfo(**plugin) for plugin in json.loads(plugins)],
-            [StorePluginInfo(**plugin) for plugin in json.loads(extra_plugins)],
+            parse_entries(plugins, "official"),
+            parse_entries(extra_plugins, "community"),
         )
+        cls._catalog_warnings = warnings
         await _PLUGIN_STORE_DATA_CACHE.set(cache_key, result)
         return result
 
     @classmethod
     async def invalidate_cache(cls) -> None:
         await _PLUGIN_STORE_DATA_CACHE.delete("plugins_json")
+        cls._catalog_health = {}
+        cls._catalog_health_checked_at = 0.0
+
+    @classmethod
+    async def catalog_health(
+        cls, plugins: list[StorePluginInfo], *, refresh: bool = False
+    ) -> dict[str, dict[str, Any]]:
+        now = time.monotonic()
+        if (
+            not refresh
+            and cls._catalog_health
+            and now - cls._catalog_health_checked_at < 60
+        ):
+            return cls._catalog_health.copy()
+        source_files: list[set[str]] = []
+        source_errors: list[str] = []
+        for repo_type in (RepoType.ALIYUN, RepoType.GITHUB):
+            try:
+                files = await RepoFileManager.list_directory_files(
+                    DEFAULT_GITHUB_URL,
+                    "",
+                    "main",
+                    repo_type=repo_type,
+                )
+            except Exception as error:
+                source_errors.append(type(error).__name__)
+                continue
+            source_files.append(
+                {Path(file.path).as_posix() for file in files if not file.is_dir}
+            )
+        result = {}
+        for plugin in plugins:
+            if plugin.github_url not in {None, DEFAULT_GITHUB_URL} or plugin.ali_url:
+                result[plugin.module] = {"status": "unknown", "reason": None}
+                continue
+            module_path = plugin.module_path.replace(".", "/").strip("/")
+            expected = (
+                f"{module_path}/__init__.py" if plugin.is_dir else f"{module_path}.py"
+            )
+            available = any(expected in files for files in source_files)
+            all_sources_checked = len(source_files) == 2
+            result[plugin.module] = {
+                "status": (
+                    "available"
+                    if available
+                    else "missing"
+                    if all_sources_checked
+                    else "unknown"
+                ),
+                "reason": (
+                    None
+                    if available
+                    else "catalog_source_missing"
+                    if all_sources_checked
+                    else "catalog_health_unavailable"
+                ),
+                "expected_path": expected,
+                "failed_sources": source_errors,
+            }
+        cls._catalog_health = result
+        cls._catalog_health_checked_at = now
+        return result.copy()
 
     @classmethod
     def version_check(cls, plugin_info: StorePluginInfo, suc_plugin: dict[str, str]):
@@ -362,7 +463,14 @@ class StoreManager:
         return plugin_info, is_external
 
     @classmethod
-    async def add_plugin(cls, index_or_module: str, source: str | None = None) -> str:
+    async def add_plugin(
+        cls,
+        index_or_module: str,
+        source: str | None = None,
+        *,
+        install_dependencies: bool = True,
+        return_result: bool = False,
+    ) -> str | StoreInstallResult:
         """添加插件
 
         参数:
@@ -379,26 +487,32 @@ class StoreManager:
             github_url_split = plugin_info.github_url.split("/tree/")
             plugin_info.github_url = f"{github_url_split[0]}/tree/{version_split[1]}"
         logger.info(f"正在安装插件 {plugin_info.name}...", LOG_COMMAND)
-        await cls.install_plugin_with_repo(
+        install_result = await cls.install_plugin_with_repo(
             plugin_info,
             is_external,
             source,
+            install_dependencies=install_dependencies,
         )
         dependency_status = (
             "依赖已更新，需由运行时决定生效方式"
-            if cls._last_install_had_requirements
+            if install_result.dependency_changes
             else "依赖已满足"
         )
+        if return_result:
+            return install_result
         return f"插件 {plugin_info.name} 安装完成\n- {dependency_status}"
 
     @classmethod
+    @coordinated_store_operation
     async def install_plugin_with_repo(
         cls,
         plugin_info: StorePluginInfo,
         is_external: bool = False,
         source: str | None = None,
         branch: str = "main",
-    ):
+        *,
+        install_dependencies: bool = True,
+    ) -> StoreInstallResult:
         """安装插件
 
         参数:
@@ -407,8 +521,6 @@ class StoreManager:
             source: 强制使用的源，ali 为阿里云，git 为 GitHub；
                 不指定时优先阿里云，失败后回退 GitHub
         """
-        cls._last_install_had_requirements = False
-        cls._last_dependency_plan = None
         source_order = cls._get_source_order(source)
         errors: list[str] = []
 
@@ -448,6 +560,12 @@ class StoreManager:
                 )
 
             deploy_files, requirement_files = staged_result
+            dependency_plan: dict[str, Any] = {
+                "resolved_packages": {},
+                "package_changes": {"added": [], "changed": [], "removed": []},
+                "candidate_inputs": [],
+            }
+            dependency_changes = False
             if requirement_files:
                 from zhenxun.nonebot_store.dependencies import (
                     DependencyAnalysisError,
@@ -460,17 +578,16 @@ class StoreManager:
                     )
                 except DependencyAnalysisError as error:
                     raise PluginStoreException(error.code) from error
-                cls._last_dependency_plan = dependency_plan
                 changes = dependency_plan.get("package_changes", {})
-                cls._last_install_had_requirements = bool(
+                dependency_changes = bool(
                     changes.get("added") or changes.get("changed")
                 )
-                if not cls._last_install_had_requirements:
+                if not dependency_changes:
                     logger.info(
                         f"插件 {plugin_info.module_path} 的依赖已满足，跳过安装",
                         LOG_COMMAND,
                     )
-            if cls._last_install_had_requirements:
+            if dependency_changes and install_dependencies:
                 for requirement_file in requirement_files:
                     logger.info(
                         f"开始安装插件 {plugin_info.module_path} "
@@ -480,6 +597,7 @@ class StoreManager:
                     await VirtualEnvPackageManager.install_requirement(requirement_file)
 
             cls._deploy_staged_plugin(plugin_info, deploy_files)
+            return StoreInstallResult(dependency_plan=dependency_plan)
 
     @classmethod
     def _deploy_staged_plugin(
@@ -688,6 +806,7 @@ class StoreManager:
         return deploy_files, requirement_files
 
     @classmethod
+    @coordinated_store_operation
     async def remove_plugin(cls, index_or_module: str) -> str:
         """移除插件
 
@@ -762,7 +881,13 @@ class StoreManager:
         )
 
     @classmethod
-    async def update_plugin(cls, index_or_module: str) -> str:
+    async def update_plugin(
+        cls,
+        index_or_module: str,
+        *,
+        install_dependencies: bool = True,
+        return_result: bool = False,
+    ) -> str | StoreInstallResult:
         """更新插件
 
         参数:
@@ -777,10 +902,13 @@ class StoreManager:
         logger.debug(f"当前插件列表: {suc_plugin}", LOG_COMMAND)
         if plugin_info.github_url is None:
             plugin_info.github_url = DEFAULT_GITHUB_URL
-        await cls.install_plugin_with_repo(
+        install_result = await cls.install_plugin_with_repo(
             plugin_info,
             is_external,
+            install_dependencies=install_dependencies,
         )
+        if return_result:
+            return install_result
         return f"插件 {plugin_info.name} 更新成功! 重启后生效"
 
     @classmethod

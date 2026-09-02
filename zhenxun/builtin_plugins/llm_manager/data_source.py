@@ -4,7 +4,6 @@ from typing import Any
 
 from zhenxun.configs.path_config import DATA_PATH
 from zhenxun.services.ai.core.exceptions import LLMException
-from zhenxun.services.ai.llm.api import chat
 from zhenxun.services.ai.llm.manager import (
     get_model_instance,
     list_available_models,
@@ -39,6 +38,8 @@ class DataSource:
     @staticmethod
     async def test_model_connectivity(model_name_str: str) -> tuple[bool, str]:
         """测试模型连通性"""
+        from zhenxun.services.ai.llm.api import chat
+
         start_time = time.monotonic()
         try:
             await chat("你好", model=model_name_str)

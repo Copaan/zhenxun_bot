@@ -8,10 +8,12 @@ from datetime import datetime, timezone
 from functools import wraps
 import inspect
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
 import threading
+import time
 from types import MethodType, ModuleType
 from typing import Any
 
@@ -19,6 +21,8 @@ import nonebot
 from nonebot.plugin import get_loaded_plugins
 
 from zhenxun.services.log import logger
+from zhenxun.services.startup import startup_coordinator
+from zhenxun.utils.atomic_json import write_json_locked
 
 from .classifier import changed_model_file, classify_unit
 from .compat import (
@@ -35,7 +39,20 @@ from .compat import (
 from .models import ApplyMode, PluginUnit, ReloadClassification, RuntimeOperation
 from .ownership import current_owner, import_owner, owner_context
 
-_INDEX_FILE = Path("data/runtime/lifecycle-index-v1.json")
+_INDEX_FILE = Path("data/runtime/lifecycle-index-v2.json")
+
+
+def _static_env_dependencies(files: set[Path]) -> set[str]:
+    """Compatibility helper backed by the per-file classifier cache."""
+    unit = PluginUnit(
+        plugin_id="static-env-scan",
+        module_name="static-env-scan",
+        manager=None,
+        root=None,
+        files=files,
+    )
+    classify_unit(unit)
+    return unit.env_dependencies
 
 
 def _module_file(module: Any) -> Path | None:
@@ -68,16 +85,22 @@ class PluginRuntimeManager:
         self._owned_tasks: dict[str, set[asyncio.Task[Any]]] = defaultdict(set)
         self._owned_threads: dict[str, set[threading.Thread]] = defaultdict(set)
         self._owned_processes: dict[str, set[subprocess.Popen[Any]]] = defaultdict(set)
+        self._ownership_lock = threading.RLock()
         self._drained_events: dict[str, asyncio.Event] = {}
         self._original_task_factory: Callable[..., asyncio.Future[Any]] | None = None
         self._task_factory_installed = False
         self._watcher_task: asyncio.Task[Any] | None = None
+        self._watcher_refresh_task: asyncio.Task[Any] | None = None
+        self._watcher_refresh_requested = False
         self._change_coordinator: Any | None = None
         self._pending_config_dependencies: dict[str, set[tuple[str, str]]] = (
             defaultdict(set)
         )
+        self._pending_env_dependencies: dict[str, set[str]] = defaultdict(set)
         self._original_matcher_run: Callable[..., Any] | None = None
         self._original_get_config: Callable[..., Any] | None = None
+        self._original_get_plugin_config: Callable[..., Any] | None = None
+        self._original_os_getenv: Callable[..., Any] | None = None
         self._original_add_plugin_config: Callable[..., Any] | None = None
         self._original_priority_add: Callable[..., Any] | None = None
         self._original_plugin_init_install: Callable[..., Any] | None = None
@@ -97,6 +120,7 @@ class PluginRuntimeManager:
         self._original_thread_start: Callable[..., Any] | None = None
         self._original_popen_init: Callable[..., Any] | None = None
         self._installed = False
+        self._index_ready = asyncio.Event()
 
     def install(self) -> None:
         if self._installed:
@@ -125,10 +149,22 @@ class PluginRuntimeManager:
         self._install_require_tracking()
         self._install_thread_process_tracking()
 
-        @driver.on_startup
-        async def _start_runtime_manager() -> None:
-            self.discover_loaded_plugins()
+        from zhenxun.utils.manager.priority_manager import PriorityLifecycle
+
+        @PriorityLifecycle.on_startup(priority=-90, stage="management", timeout=5)
+        async def _start_runtime_tracking() -> None:
             self._install_task_factory()
+
+        @PriorityLifecycle.on_startup(
+            priority=10,
+            stage="warmup",
+            timeout=60,
+            parallel_safe=True,
+            failure_policy="degrade",
+        )
+        async def _start_runtime_manager() -> None:
+            await self.discover_loaded_plugins_async()
+            self._index_ready.set()
             from .watcher import watch_runtime_changes
 
             self._watcher_task = asyncio.create_task(
@@ -144,8 +180,12 @@ class PluginRuntimeManager:
                 self._watcher_task = None
             await self._cancel_all_owned_tasks()
             self._restore_task_factory()
+            self._restore_thread_process_tracking()
 
-    def discover_loaded_plugins(self) -> None:
+    def _build_loaded_plugin_index(
+        self,
+    ) -> tuple[dict[str, PluginUnit], dict[str, str]]:
+        build_started = time.monotonic()
         plugins = list(get_loaded_plugins())
         roots: dict[str, list[Any]] = defaultdict(list)
         for plugin in plugins:
@@ -154,17 +194,33 @@ class PluginRuntimeManager:
                 root = root.parent_plugin
             roots[root.id_].append(plugin)
 
+        module_owner: dict[str, str] = {}
+        module_names_by_root: dict[str, set[str]] = defaultdict(set)
+        for root_id, members in roots.items():
+            for plugin in members:
+                module_owner[plugin.module_name] = root_id
+                module_names_by_root[root_id].add(plugin.module_name)
+        for name in list(sys.modules):
+            candidate = name
+            while candidate:
+                if owner := module_owner.get(candidate):
+                    module_names_by_root[owner].add(name)
+                    break
+                candidate = candidate.rpartition(".")[0]
+
+        startup_coordinator.record_operation(
+            "runtime_index:module_ownership",
+            "warmup",
+            "completed",
+            (time.monotonic() - build_started) * 1000,
+        )
+
+        classification_started = time.monotonic()
         units: dict[str, PluginUnit] = {}
         module_to_unit: dict[str, str] = {}
         for root_id, members in roots.items():
             root_plugin = next(plugin for plugin in members if plugin.id_ == root_id)
-            module_names = {plugin.module_name for plugin in members}
-            for name in list(sys.modules):
-                if any(
-                    name == module or name.startswith(f"{module}.")
-                    for module in module_names
-                ):
-                    module_names.add(name)
+            module_names = module_names_by_root[root_id]
             files = {
                 path
                 for name in module_names
@@ -199,6 +255,13 @@ class PluginRuntimeManager:
             for owner, dependencies in self._pending_config_dependencies.items():
                 if owner == root_id or owner.startswith(f"{root_id}:"):
                     unit.config_dependencies.update(dependencies)
+            for owner, dependencies in self._pending_env_dependencies.items():
+                if owner == root_id or owner.startswith(f"{root_id}:"):
+                    unit.env_dependencies.update(dependencies)
+            if any(plugin.matcher for plugin in members):
+                unit.env_dependencies.update(
+                    {"COMMAND_START", "COMMAND_SEP", "ALCONNA_USE_COMMAND_START"}
+                )
             for owner, dependencies in self._pending_dependencies.items():
                 if owner == root_id or owner.startswith(f"{root_id}:"):
                     unit.dependencies.update(dependencies)
@@ -206,12 +269,45 @@ class PluginRuntimeManager:
             for name in module_names:
                 module_to_unit[name] = root_id
 
+        startup_coordinator.record_operation(
+            "runtime_index:file_classification",
+            "warmup",
+            "completed",
+            (time.monotonic() - classification_started) * 1000,
+        )
+
+        return units, module_to_unit
+
+    def _commit_loaded_plugin_index(
+        self, units: dict[str, PluginUnit], module_to_unit: dict[str, str]
+    ) -> None:
+        commit_started = time.monotonic()
         self.units = units
         self.module_to_unit = module_to_unit
         self._collect_dependencies()
         self._collect_runtime_boundaries()
         self.webui_revision = self._read_webui_revision()
+        startup_coordinator.record_operation(
+            "runtime_index:dependency_commit",
+            "warmup",
+            "completed",
+            (time.monotonic() - commit_started) * 1000,
+        )
+        persist_started = time.monotonic()
         self._persist_index()
+        startup_coordinator.record_operation(
+            "runtime_index:persist",
+            "warmup",
+            "completed",
+            (time.monotonic() - persist_started) * 1000,
+        )
+
+    def discover_loaded_plugins(self) -> None:
+        self._commit_loaded_plugin_index(*self._build_loaded_plugin_index())
+
+    async def discover_loaded_plugins_async(self) -> None:
+        index = await asyncio.to_thread(self._build_loaded_plugin_index)
+        self._commit_loaded_plugin_index(*index)
 
     def _collect_dependencies(self) -> None:
         for unit in self.units.values():
@@ -239,14 +335,12 @@ class PluginRuntimeManager:
                         unit.dependencies.add(dependency)
 
     def owner_for_module(self, module_name: str) -> str | None:
-        if module_name in self.module_to_unit:
-            return self.module_to_unit[module_name]
-        candidates = (
-            (name, owner)
-            for name, owner in self.module_to_unit.items()
-            if module_name.startswith(f"{name}.")
-        )
-        return next((owner for _, owner in sorted(candidates, reverse=True)), None)
+        candidate = module_name
+        while candidate:
+            if owner := self.module_to_unit.get(candidate):
+                return owner
+            candidate = candidate.rpartition(".")[0]
+        return None
 
     def track_config_access(self, module: str, key: str) -> None:
         owner = import_owner()
@@ -256,6 +350,15 @@ class PluginRuntimeManager:
         self._pending_config_dependencies[owner].add(dependency)
         if owner in self.units:
             self.units[owner].config_dependencies.add(dependency)
+
+    def track_env_access(self, key: str) -> None:
+        owner = import_owner()
+        if not owner:
+            return
+        normalized = key.upper()
+        self._pending_env_dependencies[owner].add(normalized)
+        if owner in self.units:
+            self.units[owner].env_dependencies.add(normalized)
 
     def _install_matcher_execution_wrapper(self) -> None:
         from nonebot.matcher import Matcher
@@ -315,6 +418,32 @@ class PluginRuntimeManager:
 
         Config.add_plugin_config = MethodType(tracked_add_plugin_config, Config)
 
+        original_plugin_config = nonebot.get_plugin_config
+        self._original_get_plugin_config = original_plugin_config
+
+        def tracked_get_plugin_config(config_model):
+            fields = getattr(config_model, "model_fields", None) or getattr(
+                config_model, "__fields__", {}
+            )
+            for name, field in fields.items():
+                manager.track_env_access(str(name))
+                alias = getattr(field, "alias", None)
+                if alias:
+                    manager.track_env_access(str(alias))
+            return original_plugin_config(config_model)
+
+        nonebot.get_plugin_config = tracked_get_plugin_config
+
+        original_getenv = os.getenv
+        self._original_os_getenv = original_getenv
+
+        def tracked_getenv(key, default=None):
+            if isinstance(key, str):
+                manager.track_env_access(key)
+            return original_getenv(key, default)
+
+        os.getenv = tracked_getenv
+
     def _install_priority_lifecycle_tracking(self) -> None:
         from zhenxun.utils.manager.priority_manager import PriorityLifecycle
 
@@ -324,7 +453,7 @@ class PluginRuntimeManager:
         self._original_priority_add = original
         manager = self
 
-        def tracked_add(cls, hook_type, func, priority):
+        def tracked_add(cls, hook_type, func, priority, **kwargs):
             owner = current_owner() or manager.owner_for_module(
                 getattr(func, "__module__", "")
             )
@@ -358,7 +487,7 @@ class PluginRuntimeManager:
                         return func(*args, **kwargs)
 
                 wrapped = sync_hook
-            return original(cls, hook_type, wrapped, priority)
+            return original(cls, hook_type, wrapped, priority, **kwargs)
 
         PriorityLifecycle.add = classmethod(tracked_add)
 
@@ -388,7 +517,7 @@ class PluginRuntimeManager:
                 return await original_remove(cls, module_path)
 
         async def tracked_install_all(cls):
-            for module_path in list(cls.plugins):
+            for module_path in cls.snapshot_modules():
                 await cls.install(module_path)
 
         PluginInitManager.install = classmethod(tracked_install)
@@ -576,10 +705,13 @@ class PluginRuntimeManager:
             @wraps(original_start)
             def tracked_start(thread, *args, **kwargs):
                 owner = current_owner()
+                result = original_start(thread, *args, **kwargs)
                 if owner:
-                    manager._owned_threads[owner].add(thread)
-                return original_start(thread, *args, **kwargs)
+                    with manager._ownership_lock:
+                        manager._owned_threads[owner].add(thread)
+                return result
 
+            tracked_start.__zhenxun_runtime_owner__ = self
             threading.Thread.start = tracked_start
 
         if not self._original_popen_init:
@@ -592,18 +724,58 @@ class PluginRuntimeManager:
                 owner = current_owner()
                 original_init(process, *args, **kwargs)
                 if owner:
-                    manager._owned_processes[owner].add(process)
+                    with manager._ownership_lock:
+                        manager._owned_processes[owner].add(process)
 
+            tracked_init.__zhenxun_runtime_owner__ = self
             subprocess.Popen.__init__ = tracked_init
 
+    def _restore_thread_process_tracking(self) -> None:
+        current_start = threading.Thread.start
+        if (
+            getattr(current_start, "__zhenxun_runtime_owner__", None) is self
+            and self._original_thread_start is not None
+        ):
+            threading.Thread.start = self._original_thread_start
+        current_popen_init = subprocess.Popen.__init__
+        if (
+            getattr(current_popen_init, "__zhenxun_runtime_owner__", None) is self
+            and self._original_popen_init is not None
+        ):
+            subprocess.Popen.__init__ = self._original_popen_init
+
     def _collect_runtime_boundaries(self) -> None:
-        for owner, threads in self._owned_threads.items():
+        with self._ownership_lock:
+            owned_threads = {
+                owner: set(threads) for owner, threads in self._owned_threads.items()
+            }
+            owned_processes = {
+                owner: set(processes)
+                for owner, processes in self._owned_processes.items()
+            }
+            self._owned_threads = defaultdict(
+                set,
+                {
+                    owner: {thread for thread in threads if thread.is_alive()}
+                    for owner, threads in self._owned_threads.items()
+                    if any(thread.is_alive() for thread in threads)
+                },
+            )
+            self._owned_processes = defaultdict(
+                set,
+                {
+                    owner: {process for process in processes if process.poll() is None}
+                    for owner, processes in self._owned_processes.items()
+                    if any(process.poll() is None for process in processes)
+                },
+            )
+        for owner, threads in owned_threads.items():
             root = self._root_owner(owner)
             if root and (unit := self.units.get(root)):
                 if any(thread.is_alive() for thread in threads):
                     unit.reasons.add("live_thread")
                     unit.classification = ReloadClassification.RESTART_REQUIRED
-        for owner, processes in self._owned_processes.items():
+        for owner, processes in owned_processes.items():
             root = self._root_owner(owner)
             if root and (unit := self.units.get(root)):
                 if any(process.poll() is None for process in processes):
@@ -639,11 +811,10 @@ class PluginRuntimeManager:
         return root if root in self.units else None
 
     def _owned_keys_for_unit(self, plugin_id: str) -> set[str]:
-        keys = (
-            self._owned_tasks.keys()
-            | self._owned_threads.keys()
-            | self._owned_processes.keys()
-        )
+        with self._ownership_lock:
+            thread_keys = set(self._owned_threads)
+            process_keys = set(self._owned_processes)
+        keys = set(self._owned_tasks) | thread_keys | process_keys
         return {owner for owner in keys if self._root_owner(owner) == plugin_id}
 
     def _install_task_factory(self) -> None:
@@ -761,8 +932,15 @@ class PluginRuntimeManager:
         self._persist_index()
         return operation
 
+    def _indexing_operation(self, module: str) -> RuntimeOperation | None:
+        if not self._installed or self._index_ready.is_set():
+            return None
+        return self._failed_operation(module, "runtime_indexing")
+
     async def reload_plugin(self, module: str) -> RuntimeOperation:
         """Reload one loaded plugin and all of its runtime dependents."""
+        if operation := self._indexing_operation(module):
+            return operation
         unit = self._find_unit(module)
         if unit is None:
             return self._failed_operation(module, "plugin_not_loaded")
@@ -780,6 +958,8 @@ class PluginRuntimeManager:
 
     async def unload_plugin(self, module: str) -> RuntimeOperation:
         """Unload one managed plugin without requiring its files to disappear first."""
+        if operation := self._indexing_operation(module):
+            return operation
         unit = self._find_unit(module)
         if unit is None:
             return self._failed_operation(module, "plugin_not_loaded")
@@ -790,6 +970,8 @@ class PluginRuntimeManager:
             candidate = self.units[plugin_id]
             if candidate.classification is not ReloadClassification.HOT_RELOADABLE:
                 return self._failed_operation(module, "plugin_not_hot_reloadable")
+        for plugin_id in self._reload_order(affected):
+            await self._run_plugin_remove(self.units[plugin_id].module_names)
         return await self._unload_removed_units(affected, submit_restart=False)
 
     async def _request_restart_compat(
@@ -820,6 +1002,8 @@ class PluginRuntimeManager:
         self, module: str, *, submit_restart: bool = True
     ) -> RuntimeOperation:
         """Reload a plugin after its files were restored by a failed store update."""
+        if operation := self._indexing_operation(module):
+            return operation
         unit = self._find_unit(module)
         if unit is None:
             root = Path.cwd() / Path(*module.split("."))
@@ -857,6 +1041,8 @@ class PluginRuntimeManager:
         submit_restart: bool = True,
     ) -> RuntimeOperation:
         """Load a newly installed plugin when its source has no hard boundaries."""
+        if operation := self._indexing_operation(module_name):
+            return operation
         root = root.resolve()
         changed = {path.resolve() for path in (changed or set())}
         files = self._source_files(root)
@@ -962,6 +1148,118 @@ class PluginRuntimeManager:
             self.last_operation = operation
             self._persist_index()
             return operation
+
+    async def apply_ext_paths(
+        self, previous: set[Path], current: set[Path]
+    ) -> RuntimeOperation | None:
+        added = {path.resolve() for path in current - previous}
+        removed = {path.resolve() for path in previous - current}
+        if not added and not removed:
+            return None
+        if added and removed:
+            return await self._request_restart_compat(
+                set(), "ext_path_replaced", submit_restart=False
+            )
+
+        if removed:
+            affected = {
+                unit.plugin_id
+                for unit in self.units.values()
+                if unit.root
+                and any(unit.root.resolve().is_relative_to(root) for root in removed)
+            }
+            closure = self._dependent_closure(affected) if affected else set()
+            if closure != affected or any(
+                self.units[plugin_id].classification
+                is not ReloadClassification.HOT_RELOADABLE
+                for plugin_id in affected
+            ):
+                return await self._request_restart_compat(
+                    closure or affected,
+                    "ext_path_remove_requires_restart",
+                    submit_restart=False,
+                )
+            operation = (
+                await self._unload_removed_units(affected, submit_restart=False)
+                if affected
+                else None
+            )
+            self.refresh_watcher()
+            return operation
+
+        candidates: list[tuple[str, Path]] = []
+        for root in sorted(added):
+            if not root.is_dir():
+                return self._failed_operation(str(root), "ext_path_missing")
+            if any(root.glob("requirement*.txt")):
+                return await self._request_restart_compat(
+                    set(), "ext_path_dependencies", submit_restart=False
+                )
+            for path in sorted(root.iterdir()):
+                if path.name.startswith("_"):
+                    continue
+                if path.is_file() and path.suffix == ".py":
+                    candidates.append((path.stem, path))
+                elif path.is_dir() and (path / "__init__.py").is_file():
+                    candidates.append((path.name, path))
+        for module, root in candidates:
+            classification = self.classification_for_source(module, root)
+            if classification["reload_support"] != ReloadClassification.HOT_RELOADABLE:
+                reasons = classification.get("reload_reasons") or [
+                    "ext_path_plugin_requires_restart"
+                ]
+                return await self._request_restart_compat(
+                    {module}, str(reasons[0]), submit_restart=False
+                )
+
+        from nonebot.matcher import matchers
+
+        before_plugins = {plugin.id_ for plugin in get_loaded_plugins()}
+        before_matchers = {
+            matcher
+            for priority_matchers in matchers.values()
+            for matcher in priority_matchers
+        }
+        try:
+            loaded = nonebot.load_plugins(*(str(path) for path in sorted(added)))
+            if candidates and not loaded:
+                raise RuntimeError("ext_path_plugin_import_failed")
+            self.discover_loaded_plugins()
+            new_ids = {
+                self._root_owner(plugin.id_) or plugin.id_
+                for plugin in loaded
+                if plugin.id_ not in before_plugins
+            }
+            for plugin in loaded:
+                await self._run_plugin_install(plugin.module_name)
+            await self._run_reload_startup_hooks(new_ids)
+            self.generation += 1
+            self.discover_loaded_plugins()
+            await self._reconcile_runtime_metadata()
+            await self._invalidate_generation_caches()
+            operation = RuntimeOperation(
+                ApplyMode.HOT_RELOADED,
+                "completed",
+                sorted(new_ids),
+                generation=self.generation,
+            )
+        except Exception as error:
+            for module, _ in candidates:
+                await self._cleanup_failed_new_plugin(
+                    module, before_plugins, before_matchers
+                )
+            operation = RuntimeOperation(
+                ApplyMode.FAILED,
+                "failed",
+                [str(path) for path in sorted(added)],
+                reason=f"ext_path_load_failed:{type(error).__name__}",
+                generation=self.generation,
+            )
+        self.last_operation = operation
+        self._persist_index()
+        if operation.mode is ApplyMode.HOT_RELOADED:
+            self.refresh_watcher()
+        return operation
 
     async def _cleanup_failed_new_plugin(
         self,
@@ -1338,6 +1636,13 @@ class PluginRuntimeManager:
             if registered == module_name or registered.startswith(f"{module_name}."):
                 await PluginInitManager.install(registered)
 
+    async def _run_plugin_remove(self, module_names: set[str]) -> None:
+        from zhenxun.services.plugin_init import PluginInitManager
+
+        for registered in list(PluginInitManager.plugins):
+            if registered in module_names:
+                await PluginInitManager.remove(registered)
+
     async def _run_reload_shutdown_hooks(self, module_names: set[str]) -> None:
         from zhenxun.utils.enum import PriorityLifecycleType
         from zhenxun.utils.manager.priority_manager import (
@@ -1456,6 +1761,8 @@ class PluginRuntimeManager:
         restart_dependencies: set[tuple[str, str]] | None = None,
         submit_restart: bool = True,
     ) -> RuntimeOperation | None:
+        if self._installed and not self._index_ready.is_set():
+            return self._failed_operation("config", "runtime_indexing")
         affected = {
             unit.plugin_id
             for unit in self.units.values()
@@ -1511,6 +1818,74 @@ class PluginRuntimeManager:
             is ReloadClassification.HOT_RELOADABLE
         }
         return await self._reload_units(hot_affected) if hot_affected else None
+
+    async def reload_env_consumers(
+        self,
+        changed_keys: set[str],
+        *,
+        submit_restart: bool = False,
+    ) -> RuntimeOperation | None:
+        if self._installed and not self._index_ready.is_set():
+            return self._failed_operation("environment", "runtime_indexing")
+        normalized = {key.upper() for key in changed_keys}
+        affected, unsafe = self.environment_consumers(normalized)
+        if not affected:
+            return None
+        if unsafe:
+            return await self._request_restart_compat(
+                affected,
+                "import_time_environment_consumer_requires_restart",
+                submit_restart=submit_restart,
+            )
+        return await self._reload_units(affected)
+
+    def environment_consumers(
+        self, changed_keys: set[str]
+    ) -> tuple[set[str], set[str]]:
+        normalized = {key.upper() for key in changed_keys}
+        affected = {
+            unit.plugin_id
+            for unit in self.units.values()
+            if unit.env_dependencies & normalized
+        }
+        if not affected:
+            return set(), set()
+        affected = self._dependent_closure(affected)
+        unsafe = {
+            plugin_id
+            for plugin_id in affected
+            if self.units[plugin_id].classification
+            is not ReloadClassification.HOT_RELOADABLE
+        }
+        return affected, unsafe
+
+    def refresh_watcher(self) -> None:
+        if not self._watcher_task or self._watcher_task.done():
+            return
+        if asyncio.current_task() is self._watcher_task:
+            self._watcher_refresh_requested = True
+            return
+
+        async def replace() -> None:
+            previous = self._watcher_task
+            if previous:
+                previous.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await previous
+            from .watcher import watch_runtime_changes
+
+            self._watcher_task = asyncio.create_task(
+                watch_runtime_changes(self), name="zhenxun-runtime-watcher"
+            )
+
+        self._watcher_refresh_task = asyncio.create_task(
+            replace(), name="zhenxun-runtime-watcher-refresh"
+        )
+
+    def consume_watcher_refresh(self) -> bool:
+        requested = self._watcher_refresh_requested
+        self._watcher_refresh_requested = False
+        return requested
 
     def claim_content_changes(self, paths: set[Path]) -> set[Path]:
         from hashlib import sha256
@@ -1647,6 +2022,7 @@ class PluginRuntimeManager:
         for unit in self.units.values():
             counts[unit.classification.value] += 1
         return {
+            "index_ready": self._index_ready.is_set(),
             "watching": self._watcher_task is not None
             and not self._watcher_task.done(),
             "hot_reload_enabled": self.enabled,
@@ -1667,19 +2043,17 @@ class PluginRuntimeManager:
 
     def _persist_index(self) -> None:
         data = {
-            "version": 1,
+            "version": 2,
             "updated_at": datetime.now(timezone.utc).isoformat(),
             "generation": self.generation,
-            "plugins": [unit.public_dict() for unit in self.units.values()],
+            "plugins": [
+                {**unit.public_dict(), "file_cache": unit.file_cache}
+                for unit in self.units.values()
+            ],
             "pending_restart_reasons": sorted(self.pending_restart),
         }
         try:
-            _INDEX_FILE.parent.mkdir(parents=True, exist_ok=True)
-            temp = _INDEX_FILE.with_suffix(".tmp")
-            temp.write_text(
-                json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
-            temp.replace(_INDEX_FILE)
+            write_json_locked(_INDEX_FILE, data)
         except OSError as e:
             logger.warning(f"运行时生命周期索引写入失败: {type(e).__name__}")
 
@@ -1689,7 +2063,7 @@ class PluginRuntimeManager:
             data = json.loads(_INDEX_FILE.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return {}
-        if data.get("version") != 1 or not isinstance(data.get("plugins"), list):
+        if data.get("version") != 2 or not isinstance(data.get("plugins"), list):
             return {}
         return {
             str(item["plugin_id"]): item

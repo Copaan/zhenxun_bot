@@ -30,22 +30,43 @@ class RuntimeChangeCoordinator:
         await self.manager.wait_for_content_change_holds(resolved)
         changed = self.manager.claim_content_changes(resolved)
         if not changed:
+            if resolved & _ENV_FILES:
+                from zhenxun.services.runtime_environment import (
+                    runtime_environment_manager,
+                )
+
+                for path in resolved & _ENV_FILES:
+                    runtime_environment_manager.observe_file(path)
             if _CONFIG_FILE in resolved:
                 logger.debug("配置文件事件已由当前运行时操作处理，跳过重复重载")
             return None
         async with self._lock:
             if changed & _ENV_FILES:
                 try:
-                    return await self.manager.request_restart(
-                        set(),
-                        "environment_changed",
-                        submit_launcher=submit_restart,
+                    from zhenxun.services.runtime_environment import (
+                        runtime_environment_manager,
                     )
-                except TypeError as error:
-                    if "submit_launcher" not in str(error):
-                        raise
-                    return await self.manager.request_restart(
-                        set(), "environment_changed"
+
+                    result = await runtime_environment_manager.apply_current_file(
+                        next(iter(changed & _ENV_FILES)), submit_restart=submit_restart
+                    )
+                    if result.apply_mode == "no_change":
+                        return None
+                    return RuntimeOperation(
+                        ApplyMode(result.apply_mode),
+                        "completed",
+                        result.changed_keys,
+                        result.reason_codes[0] if result.reason_codes else None,
+                        self.manager.generation,
+                    )
+                except Exception as error:
+                    logger.error("环境配置运行时协调失败", e=error)
+                    return RuntimeOperation(
+                        ApplyMode.FAILED,
+                        "failed",
+                        sorted(str(path) for path in changed & _ENV_FILES),
+                        f"environment_apply_failed:{type(error).__name__}",
+                        self.manager.generation,
                     )
             if any(
                 path.name in _DEPENDENCY_NAMES or path.name == "requirements.txt"

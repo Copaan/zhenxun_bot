@@ -687,6 +687,7 @@ def _provider_view(
     keys = (
         provider.api_key if isinstance(provider.api_key, list) else [provider.api_key]
     )
+    valid_keys = [value for value in keys if not _is_placeholder_secret(value)]
     data["api_key_slots"] = [
         {"existing_index": index, "configured": True}
         for index, value in enumerate(keys)
@@ -712,9 +713,28 @@ def _provider_view(
                 ),
             }
         )
-    data["discovery_supported"] = (
+    discovery_supported = (
         provider.api_type in _OPENAI_DISCOVERY_TYPES or provider.api_type == "gemini"
     )
+    effective_base = provider.api_base or get_default_api_base_for_type(
+        provider.api_type
+    )
+    if not discovery_supported:
+        discovery_status = "manual_only"
+        discovery_reason_code = "model_discovery_unsupported"
+    elif not effective_base:
+        discovery_status = "missing_base"
+        discovery_reason_code = "provider_api_base_incomplete"
+    elif not valid_keys:
+        discovery_status = "missing_credentials"
+        discovery_reason_code = "provider_credentials_incomplete"
+    else:
+        discovery_status = "ready"
+        discovery_reason_code = None
+    data["discovery_supported"] = discovery_supported
+    data["credential_status"] = "configured" if valid_keys else "missing"
+    data["discovery_status"] = discovery_status
+    data["discovery_reason_code"] = discovery_reason_code
     return data
 
 

@@ -16,6 +16,7 @@ import tempfile
 from typing import Any, Literal
 from urllib.parse import quote
 
+from dotenv import dotenv_values
 import httpx
 from packaging.markers import InvalidMarker, Marker, default_environment
 from packaging.requirements import InvalidRequirement, Requirement
@@ -30,6 +31,7 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10
 
 from .storage import LAYER_ROOT, generation_path, load_manifest
 
+SOLVER_POLICY_VERSION = 2
 LOCK_FILE = Path("uv.lock")
 _REQ_LINE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)==([^\s;]+)")
 _SENSITIVE = re.compile(r"(?i)(authorization|token|password|secret)=?[^\s]*")
@@ -446,7 +448,9 @@ async def preflight_environment_repair() -> tuple[bool, str]:
     return process.returncode == 0, detail
 
 
-def environment_fingerprint(registry_plugin: dict[str, Any]) -> str:
+def environment_fingerprint(
+    registry_plugin: dict[str, Any], *, pending_revision: str = ""
+) -> str:
     lock_digest = (
         sha256(LOCK_FILE.read_bytes()).hexdigest() if LOCK_FILE.exists() else "missing"
     )
@@ -460,6 +464,8 @@ def environment_fingerprint(registry_plugin: dict[str, Any]) -> str:
         "environment": report["fingerprint"],
         "project": registry_plugin.get("project_link"),
         "version": registry_plugin.get("version"),
+        "solver_policy": SOLVER_POLICY_VERSION,
+        "pending_revision": pending_revision,
     }
     return sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
@@ -673,7 +679,16 @@ def _compatibility_overrides(
             raise DependencyAnalysisError(
                 "core_dependency_conflict",
                 f"{requirement}; current={actual}",
-                details=[{**detail, "tier": "immutable_core"}],
+                details=[
+                    {
+                        **detail,
+                        "tier": "immutable_core",
+                        "kind": "constraint_conflict",
+                        "expected": str(requirement.specifier),
+                        "actual": actual,
+                        "requirement": str(requirement),
+                    }
+                ],
             )
         if (
             name not in shared
@@ -694,7 +709,10 @@ def _compatibility_overrides(
 
 
 async def solve_install(
-    plugin: dict[str, Any], metadata: dict[str, Any]
+    plugin: dict[str, Any],
+    metadata: dict[str, Any],
+    *,
+    manifest: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     report = environment_report()
     blocking_drift = [
@@ -722,14 +740,20 @@ async def solve_install(
             ),
             details=blocking_drift,
         )
-    manifest = load_manifest()
-    active_requirements = [
-        f"{item['project_link']}=={item['version']}"
-        for item in manifest.get("plugins", {}).values()
-        if isinstance(item, dict)
-        and item.get("state") == "managed"
-        and item.get("project_link") != plugin["project_link"]
-    ]
+    manifest = manifest or load_manifest()
+    active_requirements: list[str] = []
+    for item in manifest.get("plugins", {}).values():
+        if (
+            not isinstance(item, dict)
+            or item.get("state") != "managed"
+            or item.get("project_link") == plugin["project_link"]
+        ):
+            continue
+        resolution_inputs = item.get("resolution_inputs")
+        if isinstance(resolution_inputs, list) and resolution_inputs:
+            active_requirements.extend(str(value) for value in resolution_inputs)
+        else:
+            active_requirements.append(f"{item['project_link']}=={item['version']}")
     candidate = f"{plugin['project_link']}=={plugin['version']}"
     current = installed_inventory()
     base = base_installed_inventory()
@@ -781,7 +805,15 @@ async def solve_install(
             )
 
     core_changes = [
-        {"name": name, "from": immutable[name], "to": version}
+        {
+            "name": name,
+            "tier": "immutable_core",
+            "kind": "version_mismatch",
+            "expected": immutable[name],
+            "actual": version,
+            "from": immutable[name],
+            "to": version,
+        }
         for name, version in resolved.items()
         if name in immutable and immutable[name] != version
     ]
@@ -807,6 +839,15 @@ async def solve_install(
         plugin_resolved[canonicalize_name(str(plugin["project_link"]))] = str(
             plugin["version"]
         )
+    for managed_plugin in manifest.get("plugins", {}).values():
+        if (
+            isinstance(managed_plugin, dict)
+            and managed_plugin.get("state") == "managed"
+            and managed_plugin.get("resolution_inputs")
+        ):
+            plugin_resolved[canonicalize_name(str(managed_plugin["project_link"]))] = (
+                str(managed_plugin["version"])
+            )
     shared_changes = [
         {"name": name, "from": base.get(name), "to": version}
         for name, version in sorted(resolved.items())
@@ -841,6 +882,23 @@ async def solve_install(
         if isinstance(item, dict)
     )
     source_required = source_required or not root_wheel_available
+    candidate_requirement_names = {
+        canonicalize_name(requirement.name)
+        for requirement in _active_metadata_requirements(metadata)
+    }
+    database_migration_possible = (
+        canonicalize_name(str(plugin["project_link"])) == "nonebot-plugin-orm"
+        or "nonebot-plugin-orm" in candidate_requirement_names
+    )
+    database_type = "none"
+    if database_migration_possible:
+        env_file = Path(".env.dev") if Path(".env.dev").exists() else Path(".env")
+        raw_url = str(dotenv_values(env_file).get("SQLALCHEMY_DATABASE_URL") or "")
+        database_type = (
+            "sqlite"
+            if not raw_url or raw_url.casefold().startswith("sqlite")
+            else "external"
+        )
     return {
         "requirements": requirements,
         "resolved_packages": layer_packages,
@@ -867,11 +925,17 @@ async def solve_install(
         ),
         "used_relaxed_resolution": relaxed,
         "resolver_note": strict_error if relaxed else None,
+        "solver_policy_version": SOLVER_POLICY_VERSION,
+        "candidate_inputs": candidate_inputs,
+        "database_migration_possible": database_migration_possible,
+        "database_type": database_type,
     }
 
 
-def uninstall_plan(plugin: dict[str, Any]) -> dict[str, Any]:
-    manifest = load_manifest()
+def uninstall_plan(
+    plugin: dict[str, Any], *, manifest: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    manifest = manifest or load_manifest()
     packages = {
         canonicalize_name(name): str(info["version"])
         for name, info in manifest.get("packages", {}).items()
@@ -908,6 +972,10 @@ def uninstall_plan(plugin: dict[str, Any]) -> dict[str, Any]:
         "pure_python_candidate": True,
         "used_relaxed_resolution": False,
         "resolver_note": None,
+        "solver_policy_version": SOLVER_POLICY_VERSION,
+        "candidate_inputs": [],
+        "database_migration_possible": False,
+        "database_type": "none",
     }
 
 
@@ -936,6 +1004,7 @@ async def preflight_source_requirements(files: list[Path]) -> dict[str, Any]:
         return {
             "resolved_packages": {},
             "package_changes": {"added": [], "changed": [], "removed": []},
+            "candidate_inputs": [],
         }
     drift = environment_drift()
     if drift:
@@ -953,4 +1022,5 @@ async def preflight_source_requirements(files: list[Path]) -> dict[str, Any]:
     return {
         "resolved_packages": resolved,
         "package_changes": _package_changes(resolved, current),
+        "candidate_inputs": requirements,
     }

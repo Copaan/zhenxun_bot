@@ -12,6 +12,7 @@ from zhenxun.services.memory_governor import (
     stop_memory_governor,
 )
 from zhenxun.services.send_queue import start_send_queue, stop_send_queue
+from zhenxun.services.startup import startup_coordinator
 from zhenxun.services.uninfo_patch import apply_uninfo_onebot11_patch
 from zhenxun.utils.manager.priority_manager import PriorityLifecycle
 
@@ -32,13 +33,11 @@ def _clamp(value: int, minimum: int, maximum: int) -> int:
 
 def _get_executor_workers() -> int:
     cpu = os.cpu_count() or 4
-    return _clamp(cpu * 4, DEFAULT_EXECUTOR_MIN_WORKERS, DEFAULT_EXECUTOR_MAX_WORKERS)
+    return _clamp(cpu * 2, 8, 32)
 
 
 def _get_anyio_tokens(executor_workers: int) -> int:
-    return _clamp(
-        executor_workers * 2, DEFAULT_ANYIO_MIN_TOKENS, DEFAULT_ANYIO_MAX_TOKENS
-    )
+    return _clamp(executor_workers * 2, DEFAULT_ANYIO_MIN_TOKENS, 64)
 
 
 def _apply_alconna_conflict_patch() -> None:
@@ -118,7 +117,15 @@ def register_runtime_bootstrap(_driver) -> None:
         return
     _runtime_hooks_registered = True
 
-    @PriorityLifecycle.on_startup(priority=-100)
+    from nonebot.exception import IgnoredException
+    from nonebot.message import event_preprocessor
+
+    @event_preprocessor
+    async def _reject_events_until_runtime_ready() -> None:
+        if not startup_coordinator.runtime_ready:
+            raise IgnoredException("worker_runtime_starting")
+
+    @PriorityLifecycle.on_startup(priority=-100, stage="management", timeout=10)
     async def _setup_runtime_concurrency() -> None:
         global _thread_executor
         workers = _get_executor_workers()

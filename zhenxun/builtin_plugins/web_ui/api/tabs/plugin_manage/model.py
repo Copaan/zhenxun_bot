@@ -62,6 +62,10 @@ class PluginInfo(BaseModel):
     runtime_module: str | None = None
     uninstall_supported: bool = False
     uninstall_reason: str | None = None
+    usage: str = ""
+    homepage: str | None = None
+    management_source: str = "manual"
+    management_route: str | None = None
     """插件id"""
     module: str
     """模块"""
@@ -155,11 +159,13 @@ class PluginIr(BaseModel):
     """插件id"""
     store_key: str | None = Field(default=None, min_length=3, max_length=300)
     """稳定商店键 source:module"""
+    operation_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
 
 
 class PluginReloadPayload(BaseModel):
     module: str | None = Field(default=None, min_length=1, max_length=200)
     store_key: str | None = Field(default=None, min_length=3, max_length=300)
+    operation_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
 
 
 class BatchUpdateResult(BaseModel):

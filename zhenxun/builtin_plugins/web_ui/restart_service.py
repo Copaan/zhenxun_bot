@@ -7,7 +7,11 @@ from urllib.parse import urlsplit
 import nonebot
 
 from zhenxun.configs.webui_tls import current_webui_scheme, load_webui_tls_settings
-from zhenxun.utils._restart_utils import get_pending_restart_reasons, request_restart
+from zhenxun.utils._restart_utils import (
+    get_pending_restart_items,
+    get_pending_restart_reasons,
+    request_restart,
+)
 from zhenxun.utils.network import AccessUrl, local_access_urls
 
 from .console_access import console_access
@@ -46,10 +50,87 @@ def restart_status_data(*, access_urls: list[str] | None = None) -> dict[str, An
     access_targets = [{"kind": _target_kind(url), "url": url} for url in urls]
     tls = load_webui_tls_settings()
     pending_reasons = set(get_pending_restart_reasons())
+    pending_items = get_pending_restart_items()
+    try:
+        from zhenxun.nonebot_store.storage import pending_transaction as nonebot_pending
+
+        transaction = nonebot_pending() or {}
+        operations = transaction.get("operations", [])
+        if operations and transaction.get("state") in {
+            "pending_restart",
+            "building",
+            "migration_blocked",
+            "failed",
+        }:
+            aggregate = next(
+                (
+                    item
+                    for item in pending_items
+                    if item.get("source") == "webui.nonebot-store"
+                ),
+                None,
+            )
+            pending_items = [
+                item
+                for item in pending_items
+                if item.get("source") != "webui.nonebot-store"
+            ]
+            reasons = list((aggregate or {}).get("reasons", []))
+            for operation in operations:
+                if not isinstance(operation, dict):
+                    continue
+                pending_items.append(
+                    {
+                        "source": "webui.nonebot-store",
+                        "operation_id": operation.get("operation_id"),
+                        "store_key": f"nonebot:{operation.get('project_link', '')}",
+                        "action": operation.get("action"),
+                        "reasons": reasons,
+                        "updated_at": (aggregate or {}).get("updated_at", 0),
+                    }
+                )
+    except Exception:
+        pass
+    try:
+        from zhenxun.plugin_store_transaction import public_transaction
+
+        transaction = public_transaction() or {}
+        existing_sources = {str(item.get("source")) for item in pending_items}
+        for operation in transaction.get("operations", []):
+            source = f"webui.plugin:{operation.get('store_key', '')}"
+            if source in existing_sources:
+                continue
+            reason = str(operation.get("reason") or "plugin_change_requires_restart")
+            pending_reasons.add(reason)
+            pending_items.append(
+                {
+                    "source": source,
+                    "operation_id": operation.get("operation_id"),
+                    "store_key": operation.get("store_key"),
+                    "action": operation.get("action"),
+                    "reasons": [reason],
+                    "updated_at": 0,
+                }
+            )
+    except Exception:
+        pass
     try:
         from zhenxun.services.runtime_reload import plugin_runtime_manager
 
-        pending_reasons.update(plugin_runtime_manager.pending_restart)
+        runtime_reasons = set(plugin_runtime_manager.pending_restart)
+        pending_reasons.update(runtime_reasons)
+        persisted_reasons = {
+            str(reason) for item in pending_items for reason in item.get("reasons", [])
+        }
+        uncovered_runtime_reasons = runtime_reasons - persisted_reasons
+        if uncovered_runtime_reasons:
+            pending_items.append(
+                {
+                    "source": "runtime.plugins",
+                    "reasons": sorted(uncovered_runtime_reasons),
+                    "updated_at": 0,
+                }
+            )
     except Exception:
         pass
     return {
@@ -64,7 +145,8 @@ def restart_status_data(*, access_urls: list[str] | None = None) -> dict[str, An
         "http_redirect_port": tls.redirect_port if tls.redirect_enabled else None,
         "pending_restart": bool(pending_reasons),
         "pending_reasons": sorted(pending_reasons),
-        "pending_count": len(pending_reasons),
+        "pending_count": len(pending_items),
+        "pending_items": pending_items,
     }
 
 

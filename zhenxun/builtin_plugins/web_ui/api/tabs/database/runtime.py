@@ -22,15 +22,12 @@ from zhenxun.services.cache.runtime_cache import (
     refresh_all_runtime_caches,
 )
 from zhenxun.services.data_access import DataAccess
+from zhenxun.services.runtime_environment import runtime_environment_manager
 from zhenxun.utils._restart_utils import issue_restart_ticket
 from zhenxun.utils.pydantic_compat import model_copy
 
 from ....apply_result import (
-    APPLY_NO_CHANGE,
-    APPLY_RESTART_PENDING,
     apply_result_data,
-    env_change_impact,
-    update_pending_restart,
 )
 from ....base_model import Result
 from ....restart_service import restart_status_data
@@ -318,45 +315,53 @@ async def update_database_configuration(
                 "REDIS_PASSWORD": cache.password,
             }
         )
+    updated = current_text
     try:
         updated = _update_env(current_text, fields)
         _validate_env(updated)
         if updated != current_text:
             _write_transaction([(_ENV_FILE, updated.encode("utf-8"))])
+            operation = await runtime_environment_manager.apply(
+                current_text, updated, submit_restart=False
+            )
+        else:
+            operation = None
     except Exception as error:
+        if updated != current_text:
+            _write_transaction([(_ENV_FILE, current_text.encode("utf-8"))])
         raise HTTPException(
             status_code=500,
             detail=f"数据服务配置保存失败（{error.__class__.__name__}）。",
         ) from error
-    changed_keys, pending_keys = env_change_impact(
-        current_text,
-        updated,
-        {"DB_URL", "CACHE_MODE", "REDIS_HOST", "REDIS_PORT", "REDIS_PASSWORD"},
-    )
-    restart_required = bool(set(changed_keys) & set(pending_keys))
-    reasons = [f"environment:{key}" for key in pending_keys]
-    launcher_managed = update_pending_restart(
-        "webui.database", reasons, issue_ticket=False
-    )
-    if launcher_managed:
+    changed_keys = operation.changed_keys if operation else []
+    restart_required = bool(operation and operation.restart_required)
+    reasons = operation.reason_codes if operation else []
+    if restart_required and os.getenv("ZHENXUN_LAUNCHER_PID"):
         issue_restart_ticket("webui.settings", ttl_seconds=10 * 60)
     status = restart_status_data()
-    apply_mode = APPLY_RESTART_PENDING if restart_required else APPLY_NO_CHANGE
+    apply_mode = operation.apply_mode if operation else "no_change"
     return Result.ok(
         apply_result_data(
             apply_mode=apply_mode,
             changed_keys=changed_keys,
             restart_required=restart_required,
+            hot_reloaded=bool(operation and operation.hot_reloaded),
             reason_codes=reasons,
             access_urls=status["access_urls"],
             access_targets=status["access_targets"],
             revision=_revision(updated),
             checks={"database": database_result, "cache": cache_result},
+            field_effects=operation.field_effects if operation else {},
+            rolled_back=False,
         ),
         info=(
             "数据服务配置已保存，需要重启后生效。"
             if restart_required
-            else "数据服务配置没有需要应用的运行时变化。"
+            else (
+                "缓存服务已重新连接并立即生效。"
+                if apply_mode in {"config_reloaded", "hot_reloaded"}
+                else "数据服务配置没有需要应用的运行时变化。"
+            )
         ),
     )
 

@@ -190,6 +190,7 @@ class RendererService:
                 )
 
                 self._screenshot_engine = await engine_manager.get_engine()
+                await engine_manager.warmup()
 
                 current_theme_name = Config.get_config("UI", "THEME", "default")
                 await self._theme_manager.load_theme(current_theme_name)
@@ -211,6 +212,7 @@ class RendererService:
                 logger.error(
                     f"渲染服务初始化失败，UI功能将不可用: {e}", "RendererService"
                 )
+                raise
 
     async def _collect_dependencies_recursive(
         self, component: Renderable, context: "RenderContext"
@@ -476,6 +478,8 @@ class RendererService:
         return self._theme_manager.list_available_themes()
 
     def clear_runtime_caches(self) -> dict[str, int]:
+        from .template import TemplateFileRenderStrategy
+
         cleared: dict[str, int] = {}
         if self._theme_manager:
             cleared.update(self._theme_manager.clear_runtime_caches())
@@ -485,6 +489,10 @@ class RendererService:
             jinja_cache.clear()
             if cache_size:
                 cleared["jinja_env"] = cache_size
+        strategy_cache_size = len(TemplateFileRenderStrategy._env_cache)
+        TemplateFileRenderStrategy._env_cache.clear()
+        if strategy_cache_size:
+            cleared["template_file_env"] = strategy_cache_size
         return cleared
 
     async def switch_theme(self, theme_name: str) -> str:

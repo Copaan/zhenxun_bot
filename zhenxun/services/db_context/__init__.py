@@ -169,7 +169,7 @@ def get_config() -> dict:
     return config
 
 
-@PriorityLifecycle.on_startup(priority=1)
+@PriorityLifecycle.on_startup(priority=1, stage="management", timeout=60)
 async def init():
     global MODELS, SCRIPT_METHOD
 

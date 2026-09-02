@@ -89,6 +89,12 @@ async def watch_runtime_changes(manager: PluginRuntimeManager) -> None:
             }
             if paths:
                 await manager.process_changes(paths)
+                if manager.consume_watcher_refresh():
+                    manager._watcher_task = asyncio.create_task(
+                        watch_runtime_changes(manager),
+                        name="zhenxun-runtime-watcher",
+                    )
+                    return
             if time.monotonic() - last_reconcile >= 60:
                 current_manifest = _build_manifest(roots)
                 missed = {

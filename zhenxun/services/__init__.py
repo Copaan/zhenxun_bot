@@ -1,50 +1,47 @@
-"""
-Zhenxun Bot - 核心服务模块
+"""Public service facade with lazy imports.
 
-主要服务包括：
-- 数据库上下文 (db_context): 提供数据库模型基类和连接管理。
-- 日志服务 (log): 提供增强的、带上下文的日志记录器。
-- LLM服务 (llm): 提供与大语言模型交互的统一API。
-- 插件生命周期管理 (plugin_init): 支持插件安装和卸载时的钩子函数。
-- 定时任务调度器 (scheduler): 提供持久化的、可管理的定时任务服务。
+Importing a lightweight service such as ``logger`` must not initialize the AI,
+renderer, database, and scheduler stacks. Keep this module side-effect free;
+NoneBot library plugins are bootstrapped explicitly by the worker.
 """
 
-from nonebot import require
+from __future__ import annotations
 
-require("nonebot_plugin_apscheduler")
-require("nonebot_plugin_alconna")
-require("nonebot_plugin_session")
-require("nonebot_plugin_htmlrender")
-require("nonebot_plugin_uninfo")
-require("nonebot_plugin_waiter")
+from importlib import import_module
+from typing import Any
 
-from .ai import chat
-from .avatar_service import avatar_service
-from .db_context import Model, disconnect, with_db_timeout
-from .group_settings_service import group_settings_service
-from .log import logger
-from .plugin_init import PluginInit, PluginInitManager
-from .renderer import renderer_service
-from .scheduler import (
-    ExecutionPolicy,
-    ScheduleContext,
-    Trigger,
-    scheduler_manager,
-)
+_EXPORTS: dict[str, tuple[str, str]] = {
+    "ExecutionPolicy": ("zhenxun.services.scheduler", "ExecutionPolicy"),
+    "Model": ("zhenxun.services.db_context", "Model"),
+    "PluginInit": ("zhenxun.services.plugin_init", "PluginInit"),
+    "PluginInitManager": ("zhenxun.services.plugin_init", "PluginInitManager"),
+    "ScheduleContext": ("zhenxun.services.scheduler", "ScheduleContext"),
+    "Trigger": ("zhenxun.services.scheduler", "Trigger"),
+    "avatar_service": ("zhenxun.services.avatar_service", "avatar_service"),
+    "chat": ("zhenxun.services.ai.llm.api", "chat"),
+    "disconnect": ("zhenxun.services.db_context", "disconnect"),
+    "group_settings_service": (
+        "zhenxun.services.group_settings_service",
+        "group_settings_service",
+    ),
+    "logger": ("zhenxun.services.log", "logger"),
+    "renderer_service": ("zhenxun.services.renderer", "renderer_service"),
+    "scheduler_manager": ("zhenxun.services.scheduler", "scheduler_manager"),
+    "with_db_timeout": ("zhenxun.services.db_context", "with_db_timeout"),
+}
 
-__all__ = [
-    "ExecutionPolicy",
-    "Model",
-    "PluginInit",
-    "PluginInitManager",
-    "ScheduleContext",
-    "Trigger",
-    "avatar_service",
-    "chat",
-    "disconnect",
-    "group_settings_service",
-    "logger",
-    "renderer_service",
-    "scheduler_manager",
-    "with_db_timeout",
-]
+__all__ = list(_EXPORTS)
+
+
+def __getattr__(name: str) -> Any:
+    try:
+        module_name, attribute = _EXPORTS[name]
+    except KeyError as error:
+        raise AttributeError(name) from error
+    value = getattr(import_module(module_name), attribute)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted({*globals(), *__all__})

@@ -1,32 +1,30 @@
-import nonebot
+"""Lazy public facade for AI tools."""
 
-from .bridges.matcher_bridge import bind_matcher
-from .core.decorators import Rules, tool, toolkit
-from .core.toolkit import BaseToolkit
-from .engine.registry import tool_provider_manager
-from .models import (
-    ToolOptions,
-    ToolResult,
-)
-from .providers.builtin.native import Native
-from .providers.mcp.provider import mcp_provider
+from importlib import import_module
+from typing import Any
 
-tool_provider_manager.register(mcp_provider)
+_EXPORTS = {
+    "BaseToolkit": ("zhenxun.services.ai.tools.core.toolkit", "BaseToolkit"),
+    "Native": ("zhenxun.services.ai.tools.providers.builtin.native", "Native"),
+    "Rules": ("zhenxun.services.ai.tools.core.decorators", "Rules"),
+    "ToolOptions": ("zhenxun.services.ai.tools.models", "ToolOptions"),
+    "ToolResult": ("zhenxun.services.ai.tools.models", "ToolResult"),
+    "bind_matcher": (
+        "zhenxun.services.ai.tools.bridges.matcher_bridge",
+        "bind_matcher",
+    ),
+    "tool": ("zhenxun.services.ai.tools.core.decorators", "tool"),
+    "toolkit": ("zhenxun.services.ai.tools.core.decorators", "toolkit"),
+}
+
+__all__ = list(_EXPORTS)
 
 
-@nonebot.get_driver().on_shutdown
-async def _shutdown_mcp_provider():
-    """在服务关闭时停止所有 MCP 子进程服务器"""
-    await mcp_provider.shutdown()
-
-
-__all__ = [
-    "BaseToolkit",
-    "Native",
-    "Rules",
-    "ToolOptions",
-    "ToolResult",
-    "bind_matcher",
-    "tool",
-    "toolkit",
-]
+def __getattr__(name: str) -> Any:
+    try:
+        module_name, attribute = _EXPORTS[name]
+    except KeyError as error:
+        raise AttributeError(name) from error
+    value = getattr(import_module(module_name), attribute)
+    globals()[name] = value
+    return value

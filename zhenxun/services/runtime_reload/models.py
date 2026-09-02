@@ -34,9 +34,11 @@ class PluginUnit:
     model_files: set[Path] = field(default_factory=set)
     dependencies: set[str] = field(default_factory=set)
     config_dependencies: set[tuple[str, str]] = field(default_factory=set)
+    env_dependencies: set[str] = field(default_factory=set)
     reasons: set[str] = field(default_factory=set)
     classification: ReloadClassification = ReloadClassification.HOT_RELOADABLE
     fingerprint: str = ""
+    file_cache: dict[str, dict[str, Any]] = field(default_factory=dict)
     in_flight: int = 0
     draining: bool = False
     last_error: str | None = None
@@ -48,6 +50,7 @@ class PluginUnit:
             "classification": self.classification.value,
             "reasons": sorted(self.reasons),
             "dependencies": sorted(self.dependencies),
+            "env_dependencies": sorted(self.env_dependencies),
             "fingerprint": self.fingerprint[:12],
             "last_error": self.last_error,
         }

@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 import nonebot
 
 from zhenxun.configs.config import Config
+from zhenxun.services.startup import startup_coordinator
 from zhenxun.utils._restart_utils import issue_restart_ticket
 from zhenxun.utils.network import private_ipv4_addresses
 
@@ -66,7 +67,13 @@ def _current_listener() -> tuple[str, int]:
 
 @router.get("/status", response_model=Result, response_class=JSONResponse)
 async def configure_status() -> Result:
-    return Result.ok({"state": setup_access.state(), **restart_status_data()})
+    return Result.ok(
+        {
+            "state": setup_access.state(),
+            "startup": startup_coordinator.snapshot(),
+            **restart_status_data(),
+        }
+    )
 
 
 @router.get(

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import atexit
 import importlib.metadata
+import json
 import os
 from pathlib import Path
 import signal
@@ -32,6 +33,32 @@ WORKER_READY_TIMEOUT = 120.0
 WORKER_READY_POLL_INTERVAL = 0.25
 ENV_EXAMPLE_FILE = ".env.example"
 ENV_DEV_FILE = ".env.dev"
+
+
+def _source_tree_references(root: Path, package: bytes) -> bool:
+    if not root.is_dir():
+        return False
+    for path in root.rglob("*.py"):
+        try:
+            if package in path.read_bytes():
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _defer_htmlrender_for_source_plugins(
+    nonebot_module, driver, roots: list[Path]
+) -> bool:
+    package = b"nonebot_plugin_htmlrender"
+    if not any(_source_tree_references(root, package) for root in roots):
+        return False
+    nonebot_module.require("nonebot_plugin_htmlrender")
+    startup_funcs = driver._lifespan._startup_funcs
+    for func in list(startup_funcs):
+        if getattr(func, "__module__", "").startswith("nonebot_plugin_htmlrender"):
+            startup_funcs.remove(func)
+    return True
 
 
 def _env_assignment_key(line: str, *, include_commented: bool = False) -> str | None:
@@ -175,6 +202,7 @@ def _ensure_project_root() -> Path:
 
 def _run_worker() -> None:
     """启动 Bot worker（必须在项目目录下执行）"""
+    worker_started = time.monotonic()
     project_root = _ensure_project_root()
     from zhenxun.update_service import apply_pending_update
 
@@ -228,6 +256,26 @@ def _run_worker() -> None:
         render_playwright={"channel": htmlrender_browser_channel},
     )
 
+    # Core library plugins are process infrastructure, not side effects of
+    # importing zhenxun.services. HTMLRender is loaded lazily by the renderer.
+    for library_plugin in (
+        "nonebot_plugin_apscheduler",
+        "nonebot_plugin_alconna",
+        "nonebot_plugin_session",
+        "nonebot_plugin_uninfo",
+        "nonebot_plugin_waiter",
+    ):
+        nonebot.require(library_plugin)
+
+    from zhenxun.services.startup import startup_coordinator
+
+    startup_coordinator.record_operation(
+        "worker:bootstrap_imports",
+        "worker",
+        "completed",
+        (time.monotonic() - worker_started) * 1000,
+    )
+
     from zhenxun.services.runtime_reload import plugin_runtime_manager
 
     plugin_runtime_manager.install()
@@ -266,8 +314,32 @@ def _run_worker() -> None:
 
     nonebot.logger.opt(colors=True).info(f"已启用适配器: {', '.join(enabled_adapters)}")
 
+    source_roots = [Path("zhenxun/plugins")]
+    source_roots.extend(Path(ext.strip()) for ext in BotConfig.ext_path if ext.strip())
+    if _defer_htmlrender_for_source_plugins(nonebot, driver, source_roots):
+        startup_coordinator.record_operation(
+            "worker:register_htmlrender_dependency",
+            "worker",
+            "completed",
+            (time.monotonic() - worker_started) * 1000,
+        )
+
+    phase_started = time.monotonic()
     nonebot.load_plugins("zhenxun/builtin_plugins")
+    startup_coordinator.record_operation(
+        "worker:load_builtin_plugins",
+        "worker",
+        "completed",
+        (time.monotonic() - phase_started) * 1000,
+    )
+    phase_started = time.monotonic()
     nonebot.load_plugins("zhenxun/plugins")
+    startup_coordinator.record_operation(
+        "worker:load_source_plugins",
+        "worker",
+        "completed",
+        (time.monotonic() - phase_started) * 1000,
+    )
 
     for ext in BotConfig.ext_path:
         ext = ext.strip()
@@ -277,7 +349,14 @@ def _run_worker() -> None:
 
     from zhenxun.nonebot_store.runtime import load_managed_plugins
 
+    phase_started = time.monotonic()
     managed_status = load_managed_plugins()
+    startup_coordinator.record_operation(
+        "worker:load_managed_plugins",
+        "worker",
+        "completed",
+        (time.monotonic() - phase_started) * 1000,
+    )
     if managed_status["failed"]:
         nonebot.logger.error(
             "部分 WebUI 托管的 NoneBot 插件加载失败，已隔离: {}",
@@ -412,6 +491,14 @@ def _worker_webui_health_url(settings, *, scheme: str = "http") -> str:
     return f"{scheme}://{host}:{settings.worker_port}/zhenxun/api/configure/status"
 
 
+def _worker_runtime_status_url(settings, *, scheme: str = "http") -> str:
+    connect_host = settings.worker_connect_host
+    host = f"[{connect_host}]" if ":" in connect_host else connect_host
+    return (
+        f"{scheme}://{host}:{settings.worker_port}" "/zhenxun/api/system/startup/status"
+    )
+
+
 def _health_urlopen(url: str):
     if url.startswith("https://"):
         import ssl
@@ -426,9 +513,15 @@ def _health_urlopen(url: str):
 
 def _worker_is_ready(settings, *, scheme: str = "http") -> bool:
     try:
-        with _health_urlopen(_worker_health_url(settings, scheme=scheme)) as response:
-            return response.status == 200 and b'"status":"ready"' in response.read(256)
-    except (OSError, urllib.error.URLError):
+        with _health_urlopen(
+            _worker_runtime_status_url(settings, scheme=scheme)
+        ) as response:
+            if response.status != 200:
+                return False
+            payload = json.loads(response.read())
+            state = payload.get("data", {}).get("state")
+            return state in {"runtime_ready", "warmup_ready", "degraded"}
+    except (OSError, ValueError, TypeError, urllib.error.URLError):
         return False
 
 
@@ -598,6 +691,7 @@ def _terminate_named_process(proc: subprocess.Popen, name: str) -> None:
 
 
 def _run_launcher() -> None:
+    launcher_started_at = time.time()
     cwd = _ensure_project_root()
     from zhenxun.update_service import (
         applied_update_pending,
@@ -677,9 +771,64 @@ def _run_launcher() -> None:
             startup_verification as verify_nonebot_startup,
         )
         from zhenxun.nonebot_store.storage import load_manifest as load_nonebot_manifest
+        from zhenxun.nonebot_store.storage import (
+            pending_transaction as pending_nonebot_transaction,
+        )
+        from zhenxun.plugin_store_transaction import (
+            apply_pending_transaction as apply_pending_source_transaction,
+        )
+        from zhenxun.plugin_store_transaction import (
+            finalize_pending_transaction as finalize_source_transaction,
+        )
+        from zhenxun.plugin_store_transaction import (
+            pending_transaction as pending_source_transaction,
+        )
+        from zhenxun.plugin_store_transaction import prepare_dependency_transaction
+        from zhenxun.plugin_store_transaction import (
+            rollback_pending_transaction as rollback_source_transaction,
+        )
+        from zhenxun.plugin_store_transaction import (
+            startup_verification as verify_source_startup,
+        )
+        from zhenxun.utils.restart_state import clear_pending_restart_state
 
-        if apply_pending_nonebot_transaction():
+        source_before_apply = pending_source_transaction()
+        dependencies_ready = prepare_dependency_transaction()
+        nonebot_before_apply = pending_nonebot_transaction()
+        nonebot_applied = False
+        if dependencies_ready:
+            nonebot_applied = apply_pending_nonebot_transaction()
+        nonebot_after_apply = pending_nonebot_transaction()
+        nonebot_apply_failed = bool(
+            nonebot_before_apply
+            and nonebot_before_apply.get("state") == "pending_restart"
+            and nonebot_after_apply
+            and nonebot_after_apply.get("state") in {"failed", "migration_blocked"}
+        )
+        source_applied = (
+            apply_pending_source_transaction()
+            if dependencies_ready and not nonebot_apply_failed
+            else False
+        )
+        source_after_apply = pending_source_transaction()
+        source_apply_failed = bool(
+            source_before_apply
+            and source_before_apply.get("state") == "pending_restart"
+            and source_after_apply
+            and source_after_apply.get("state") == "failed"
+        )
+        if source_applied:
+            _launcher_log("真寻插件源码事务已应用，等待 worker 启动验证")
+        if source_apply_failed and nonebot_applied:
+            rollback_nonebot_transaction()
+            nonebot_applied = False
+            _launcher_log("真寻插件源码事务应用失败，已回滚依赖 generation")
+        if nonebot_applied:
             _launcher_log("NoneBot 插件依赖层已构建，等待 worker 启动验证")
+        source_pending = pending_source_transaction()
+        verify_source_transaction = bool(
+            source_pending and source_pending.get("state") == "verification_pending"
+        )
         verify_nonebot_generation = bool(
             load_nonebot_manifest().get("pending_verification")
         )
@@ -728,6 +877,8 @@ def _run_launcher() -> None:
             validate_builtin_ingress(qq_settings, check_port=ingress is None)
         worker_env = os.environ.copy()
         worker_env["ZHENXUN_LAUNCHER_PID"] = str(os.getpid())
+        worker_env["ZHENXUN_LAUNCHER_STARTED_AT"] = str(launcher_started_at)
+        worker_env["ZHENXUN_WORKER_SPAWNED_AT"] = str(time.time())
         worker = subprocess.Popen(
             _build_worker_command(),
             cwd=str(cwd),
@@ -735,36 +886,60 @@ def _run_launcher() -> None:
             env=worker_env,
         )
         current_worker = worker
-        if verify_nonebot_generation:
-            _launcher_log("waiting for managed NoneBot plugin verification")
-            if not _wait_worker_webui_ready(
-                worker, qq_settings, scheme=webui_tls.scheme
-            ):
+        if verify_nonebot_generation or verify_source_transaction:
+            _launcher_log("waiting for managed plugin transaction verification")
+            if not _wait_worker_ready(worker, qq_settings, scheme=webui_tls.scheme):
                 _terminate_worker(worker)
                 current_worker = None
-                _launcher_log("managed plugin worker failed, rolling back generation")
-                rollback_nonebot_transaction()
+                _launcher_log("managed plugin worker failed, rolling back transaction")
+                if verify_nonebot_generation:
+                    rollback_nonebot_transaction()
+                if verify_source_transaction:
+                    rollback_source_transaction(
+                        [{"code": "worker_health_check_failed"}]
+                    )
                 continue
-            verified, verification = verify_nonebot_startup()
-            if not verified:
+            nonebot_verified, nonebot_verification = (
+                verify_nonebot_startup()
+                if verify_nonebot_generation
+                else (True, {"failed": []})
+            )
+            source_verified, source_verification = (
+                verify_source_startup()
+                if verify_source_transaction
+                else (True, {"failed": []})
+            )
+            if not nonebot_verified or not source_verified:
                 _terminate_worker(worker)
                 current_worker = None
-                failed = verification.get("failed") or []
+                failed = [
+                    *(nonebot_verification.get("failed") or []),
+                    *(source_verification.get("failed") or []),
+                ]
                 _launcher_log(
-                    "managed plugin verification failed, rolling back generation: "
+                    "managed plugin verification failed, rolling back transaction: "
                     + ", ".join(
                         str(item.get("store_key", "unknown")) for item in failed
                     )
                 )
-                rollback_nonebot_transaction()
+                if verify_nonebot_generation:
+                    rollback_nonebot_transaction()
+                if verify_source_transaction:
+                    rollback_source_transaction(failed)
                 continue
-            finalize_nonebot_transaction()
-            _launcher_log("managed NoneBot plugins passed startup verification")
+            if verify_nonebot_generation:
+                finalize_nonebot_transaction()
+                clear_pending_restart_state("webui.nonebot-store")
+            if verify_source_transaction:
+                finalize_source_transaction()
+                for operation in (source_pending or {}).get("operations", []):
+                    clear_pending_restart_state(
+                        f"webui.plugin:{operation.get('store_key', '')}"
+                    )
+            _launcher_log("managed plugin transaction passed startup verification")
         if pending_bot_verification:
             _launcher_log("waiting for updated worker health verification")
-            if not _wait_worker_webui_ready(
-                worker, qq_settings, scheme=webui_tls.scheme
-            ):
+            if not _wait_worker_ready(worker, qq_settings, scheme=webui_tls.scheme):
                 _terminate_worker(worker)
                 current_worker = None
                 _launcher_log("updated worker failed health check, rolling back")

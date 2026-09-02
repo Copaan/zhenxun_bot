@@ -17,6 +17,8 @@ import zipfile
 
 import httpx
 
+from zhenxun.utils.atomic_json import write_json_locked
+
 logger = logging.getLogger(__name__)
 
 UpdateComponent = Literal["bot", "resource", "webui"]
@@ -39,6 +41,16 @@ _JOB_LOCK = asyncio.Lock()
 _STATUS_CACHE: tuple[float, dict[str, Any]] | None = None
 _ACTIVE_TASK: asyncio.Task[None] | None = None
 _BLOCKED_BOT_RELEASES = {"0.2.4-fix"}
+_RESOURCE_ENTRIES = (
+    "font",
+    "image",
+    "record",
+    "text",
+    "themes",
+    "__version__",
+    "README.md",
+)
+_RESOURCE_REQUIRED_DIRS = ("font", "image", "record", "text", "themes")
 
 _BOT_ROOT_FILES = (
     "pyproject.toml",
@@ -66,6 +78,10 @@ _ARCHIVES = {
 
 
 class UpdateServiceError(RuntimeError):
+    pass
+
+
+class ResourceHotSwapUnavailable(UpdateServiceError):
     pass
 
 
@@ -288,13 +304,7 @@ def _job_path(job_id: str) -> Path:
 
 
 def _write_json(path: Path, value: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    with temporary.open("w", encoding="utf-8") as stream:
-        json.dump(value, stream, ensure_ascii=False, indent=2)
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(temporary, path)
+    write_json_locked(path, value)
 
 
 def read_job(job_id: str) -> dict[str, Any]:
@@ -499,6 +509,110 @@ def _validate_staging(component: UpdateComponent, root: Path) -> None:
         raise UpdateServiceError("staged_package_incomplete")
     if component == "webui":
         _validate_webui_staging(root)
+    elif component == "resource":
+        if any(not (root / name).is_dir() for name in _RESOURCE_REQUIRED_DIRS):
+            raise UpdateServiceError("resource_directories_incomplete")
+        default_theme = root / "themes" / "default"
+        if not default_theme.is_dir() or not any(default_theme.iterdir()):
+            raise UpdateServiceError("resource_default_theme_invalid")
+
+
+def _remove_path(path: Path) -> None:
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    else:
+        path.unlink(missing_ok=True)
+
+
+def _prepare_resource_swap(job_id: str, staged: Path) -> tuple[Path, Path]:
+    swap_root = _STAGING_ROOT / job_id / "resource-hot-swap"
+    if swap_root.exists():
+        shutil.rmtree(swap_root)
+    next_root = swap_root / "next"
+    old_root = swap_root / "old"
+    next_root.mkdir(parents=True)
+    old_root.mkdir(parents=True)
+    for name in _RESOURCE_ENTRIES:
+        source = staged / name
+        if not source.exists():
+            continue
+        destination = next_root / name
+        if source.is_dir():
+            shutil.copytree(source, destination)
+        else:
+            shutil.copy2(source, destination)
+    return next_root, old_root
+
+
+def _swap_resource_entries(next_root: Path, old_root: Path) -> list[str]:
+    destination_root = _ROOT / "resources"
+    swapped: list[str] = []
+    try:
+        for name in _RESOURCE_ENTRIES:
+            replacement = next_root / name
+            if not replacement.exists():
+                continue
+            destination = destination_root / name
+            displaced = old_root / name
+            if destination.exists():
+                os.replace(destination, displaced)
+            try:
+                os.replace(replacement, destination)
+            except Exception:
+                if displaced.exists():
+                    os.replace(displaced, destination)
+                raise
+            swapped.append(name)
+    except OSError as error:
+        _rollback_resource_entries(swapped, old_root)
+        raise ResourceHotSwapUnavailable("resource_file_locked") from error
+    return swapped
+
+
+def _rollback_resource_entries(swapped: list[str], old_root: Path) -> None:
+    destination_root = _ROOT / "resources"
+    for name in reversed(swapped):
+        destination = destination_root / name
+        displaced = old_root / name
+        if destination.exists():
+            _remove_path(destination)
+        if displaced.exists():
+            os.replace(displaced, destination)
+
+
+async def _apply_resource_update_hot(job_id: str, staged: Path) -> dict[str, Any]:
+    from zhenxun.configs.path_config import UI_CACHE_PATH
+    from zhenxun.services.renderer import renderer_service
+    from zhenxun.services.renderer.engine import drain_rendering
+
+    next_root, old_root = await asyncio.to_thread(
+        _prepare_resource_swap, job_id, staged
+    )
+    swapped: list[str] = []
+    try:
+        async with drain_rendering("resource_update", timeout=15):
+            swapped = await asyncio.to_thread(
+                _swap_resource_entries, next_root, old_root
+            )
+            try:
+                renderer_service.clear_runtime_caches()
+                await renderer_service.reload_theme()
+                renderer_service.clear_runtime_caches()
+                await asyncio.to_thread(shutil.rmtree, UI_CACHE_PATH, True)
+                UI_CACHE_PATH.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                await asyncio.to_thread(_rollback_resource_entries, swapped, old_root)
+                renderer_service.clear_runtime_caches()
+                await renderer_service.reload_theme()
+                raise
+    except TimeoutError as error:
+        raise ResourceHotSwapUnavailable("resource_render_drain_timeout") from error
+
+    return {
+        "apply_mode": "hot_reloaded",
+        "resource_generation": _read_version_file(_ROOT / "resources" / "__version__"),
+        "fallback_reason": None,
+    }
 
 
 def _copy_visible(source: Path, destination: Path) -> None:
@@ -593,8 +707,31 @@ async def _prepare_job(job_id: str) -> None:
                 progress=100,
                 completed_at=_now_iso(),
                 restart_required=False,
+                apply_mode="webui_refresh",
             )
             return
+
+        fallback_reason: str | None = None
+        if component == "resource":
+            _update_job(job_id, state="applying", progress=82)
+            try:
+                result = await _apply_resource_update_hot(job_id, root)
+            except ResourceHotSwapUnavailable as error:
+                fallback_reason = str(error)
+                logger.info(
+                    "WebUIUpdate: 资源热更新不可用，已降级为待重启: %s",
+                    fallback_reason,
+                )
+            else:
+                _update_job(
+                    job_id,
+                    state="completed",
+                    progress=100,
+                    completed_at=_now_iso(),
+                    restart_required=False,
+                    **result,
+                )
+                return
 
         pending = {
             "job_id": job_id,
@@ -610,6 +747,8 @@ async def _prepare_job(job_id: str) -> None:
             progress=80,
             restart_required=True,
             restart_available=launcher_managed,
+            apply_mode="restart_pending",
+            fallback_reason=fallback_reason,
         )
         from zhenxun.utils._restart_utils import (
             issue_restart_ticket,
@@ -624,7 +763,9 @@ async def _prepare_job(job_id: str) -> None:
             str(exc) if isinstance(exc, UpdateServiceError) else exc.__class__.__name__
         )
         logger.error("WebUIUpdate: 更新任务失败 component=%s code=%s", component, code)
-        _update_job(job_id, state="failed", error=code, progress=100)
+        _update_job(
+            job_id, state="failed", error=code, progress=100, apply_mode="failed"
+        )
 
 
 async def create_update_job(
@@ -662,6 +803,8 @@ async def create_update_job(
             "state": "queued",
             "progress": 0,
             "error": None,
+            "apply_mode": None,
+            "fallback_reason": None,
             "created_at": _now_iso(),
             "updated_at": _now_iso(),
         }
@@ -689,7 +832,12 @@ async def request_update_apply(job_id: str) -> tuple[bool, str, dict[str, Any]]:
     issue_restart_ticket("webui.update", ttl_seconds=10 * 60)
     ok, message = await request_restart("webui.update", require_ticket="webui.update")
     if ok:
-        job = _update_job(job_id, state="restart_requested", progress=85)
+        job = _update_job(
+            job_id,
+            state="restart_requested",
+            progress=85,
+            apply_mode="restart_requested",
+        )
     return ok, message, job
 
 
@@ -770,29 +918,41 @@ def _sync_dependencies(
 
 def _apply_resource_update(staged: Path, backup: Path) -> None:
     destination = _ROOT / "resources"
-    destination_existed = destination.exists()
     if backup.exists():
         shutil.rmtree(backup)
     backup.parent.mkdir(parents=True, exist_ok=True)
-    if destination.exists():
-        shutil.copytree(destination, backup)
-    else:
-        backup.mkdir(parents=True)
+    backup.mkdir(parents=True)
+    destination.mkdir(parents=True, exist_ok=True)
+    replaced: list[str] = []
     try:
-        preserved_temp = backup / "temp"
-        if destination.exists():
-            shutil.rmtree(destination)
-        shutil.copytree(staged, destination)
-        if preserved_temp.exists():
-            target_temp = destination / "temp"
-            if target_temp.exists():
-                shutil.rmtree(target_temp)
-            shutil.copytree(preserved_temp, target_temp)
+        for name in _RESOURCE_ENTRIES:
+            source = staged / name
+            if not source.exists():
+                continue
+            target = destination / name
+            previous = backup / name
+            if target.exists():
+                if target.is_dir():
+                    shutil.copytree(target, previous)
+                else:
+                    shutil.copy2(target, previous)
+                _remove_path(target)
+            if source.is_dir():
+                shutil.copytree(source, target)
+            else:
+                shutil.copy2(source, target)
+            replaced.append(name)
     except Exception:
-        if destination_existed:
-            _restore_directory(backup, destination)
-        elif destination.exists():
-            shutil.rmtree(destination)
+        for name in reversed(replaced):
+            target = destination / name
+            previous = backup / name
+            if target.exists():
+                _remove_path(target)
+            if previous.exists():
+                if previous.is_dir():
+                    shutil.copytree(previous, target)
+                else:
+                    shutil.copy2(previous, target)
         raise
 
 
@@ -849,6 +1009,8 @@ def apply_pending_update(project_root: Path | None = None) -> bool:
         progress=100,
         completed_at=_now_iso(),
         restart_required=False,
+        apply_mode="restart_requested",
+        resource_generation=_read_version_file(_ROOT / "resources" / "__version__"),
     )
     _PENDING_FILE.unlink(missing_ok=True)
     return False

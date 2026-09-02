@@ -9,6 +9,7 @@ from zhenxun.configs.config import Config as gConfig
 from zhenxun.configs.utils import PluginExtraData, RegisterConfig
 from zhenxun.configs.webui_tls import current_webui_scheme
 from zhenxun.services.log import logger
+from zhenxun.services.startup import startup_coordinator
 from zhenxun.utils.enum import PluginType
 from zhenxun.utils.manager.priority_manager import PriorityLifecycle
 from zhenxun.utils.network import emit_webui_console_banner
@@ -106,7 +107,7 @@ WsApiRouter.include_router(status_routes)
 WsApiRouter.include_router(chat_routes)
 
 
-@PriorityLifecycle.on_startup(priority=0)
+@PriorityLifecycle.on_startup(priority=0, stage="management", timeout=20)
 async def _():
     try:
         app: FastAPI = nonebot.get_app()
@@ -114,9 +115,11 @@ async def _():
         app.include_router(WsApiRouter)
         public_ready = await init_public(app)
         logger.info("<g>API启动成功</g>", "WebUi")
-        if public_ready and (connection_code := await console_access.prepare()):
+        connection_code = await console_access.prepare() if public_ready else None
 
-            def emit_ready_banner() -> None:
+        def emit_ready_banner() -> None:
+            startup_coordinator.mark_server_bound()
+            if public_ready and connection_code:
                 try:
                     if not os.getenv("ZHENXUN_LAUNCHER_PID"):
                         from zhenxun.update_service import (
@@ -135,11 +138,12 @@ async def _():
                 except Exception as e:
                     logger.error("WebUI 启动链接输出失败", "WebUi", e=e)
 
-            webui_ready_banner.arm(emit_ready_banner)
-        elif not public_ready:
+        webui_ready_banner.arm(emit_ready_banner)
+        if not public_ready:
             logger.error("WebUI 静态资源未就绪，未输出访问链接", "WebUi")
     except Exception as e:
         logger.error("<g>API启动失败</g>", "WebUi", e=e)
+        raise
 
 
 @PriorityLifecycle.on_shutdown(priority=1000)

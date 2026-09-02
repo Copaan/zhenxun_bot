@@ -1,5 +1,3 @@
-import copy
-import json
 import os
 from pathlib import Path
 import time
@@ -8,51 +6,32 @@ from typing import Any
 from nonebot.adapters import Bot
 
 from zhenxun.services.log import logger
+from zhenxun.utils import restart_state as _restart_state_module
 from zhenxun.utils.manager.priority_manager import PriorityLifecycle
+from zhenxun.utils.restart_state import (
+    _ACTION_RESTART,
+    _ACTION_SYNC_DEPENDENCIES,
+    _DEPENDENCY_PATHS_KEY,
+    _LAUNCHER_ACTION_KEY,
+    _LAUNCHER_NOT_BEFORE_KEY,
+    _PENDING_RESTARTS_KEY,
+    clear_restart_tickets,
+    consume_restart_ticket,
+    mutate_restart_state,
+    read_restart_state,
+)
+from zhenxun.utils.restart_state import (
+    issue_restart_ticket as _issue_restart_ticket,
+)
 
-_RESTART_STATE_FILE = Path() / "data" / ".restart_state.json"
 _LEGACY_RESTART_MARK = Path() / "is_restart"
 _LEGACY_RESTART_SCRIPT = Path() / "restart.sh"
 _LEGACY_CONFIGURE_RESTART_PREFIX = ".configure_restart"
-_RESTART_TICKET_KEY = "restart_ticket"
 _PENDING_REQUEST_KEY = "pending_request"
-_LAUNCHER_ACTION_KEY = "launcher_action"
-_ACTION_RESTART = "restart"
-_ACTION_SYNC_DEPENDENCIES = "sync_dependencies_restart"
-_LAUNCHER_NOT_BEFORE_KEY = "launcher_not_before"
-_DEPENDENCY_PATHS_KEY = "dependency_paths"
-_PENDING_RESTARTS_KEY = "pending_restarts"
 
 _restart_pending: bool = False
-
-
-def _ensure_state_parent() -> None:
-    _RESTART_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-
-
-def _read_restart_state() -> dict[str, Any]:
-    if not _RESTART_STATE_FILE.exists():
-        return {}
-    try:
-        data = json.loads(_RESTART_STATE_FILE.read_text(encoding="utf-8"))
-    except Exception as e:
-        logger.warning(f"读取重启状态文件失败，已忽略旧状态: {e}", "重启")
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
-def _write_restart_state(state: dict[str, Any]) -> None:
-    if not state:
-        if _RESTART_STATE_FILE.exists():
-            _RESTART_STATE_FILE.unlink()
-        return
-    _ensure_state_parent()
-    temp_file = _RESTART_STATE_FILE.with_name(f"{_RESTART_STATE_FILE.name}.tmp")
-    temp_file.write_text(
-        json.dumps(state, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    temp_file.replace(_RESTART_STATE_FILE)
+# Compatibility for callers that patched both legacy modules in tests.
+_RESTART_STATE_FILE = _restart_state_module._RESTART_STATE_FILE
 
 
 def _cleanup_legacy_restart_artifacts() -> None:
@@ -69,14 +48,7 @@ def _cleanup_legacy_restart_artifacts() -> None:
 
 
 def issue_restart_ticket(source: str, *, ttl_seconds: int = 600) -> None:
-    now = time.time()
-    state = _read_restart_state()
-    state[_RESTART_TICKET_KEY] = {
-        "source": source,
-        "issued_at": now,
-        "expires_at": now + ttl_seconds,
-    }
-    _write_restart_state(state)
+    _issue_restart_ticket(source, ttl_seconds=ttl_seconds)
     logger.info(f"已记录重启授权，来源: {source}", "重启")
 
 
@@ -87,23 +59,25 @@ def mark_restart_pending(source: str, reasons: set[str] | list[str]) -> None:
     if not normalized:
         clear_restart_pending(source)
         return
-    state = _read_restart_state()
-    pending = state.get(_PENDING_RESTARTS_KEY)
-    if not isinstance(pending, dict):
-        pending = {}
-    pending[source] = {
-        "reasons": normalized,
-        "updated_at": time.time(),
-    }
-    state[_PENDING_RESTARTS_KEY] = pending
-    _write_restart_state(state)
+
+    def update(state: dict[str, Any]) -> None:
+        pending = state.get(_PENDING_RESTARTS_KEY)
+        if not isinstance(pending, dict):
+            pending = {}
+        pending[source] = {
+            "reasons": normalized,
+            "updated_at": time.time(),
+        }
+        state[_PENDING_RESTARTS_KEY] = pending
+
+    mutate_restart_state(update)
 
 
 def clear_restart_pending(source: str | None = None) -> None:
-    state = _read_restart_state()
-    if source is None:
-        state.pop(_PENDING_RESTARTS_KEY, None)
-    else:
+    def clear(state: dict[str, Any]) -> None:
+        if source is None:
+            state.pop(_PENDING_RESTARTS_KEY, None)
+            return
         pending = state.get(_PENDING_RESTARTS_KEY)
         if not isinstance(pending, dict):
             return
@@ -112,11 +86,22 @@ def clear_restart_pending(source: str | None = None) -> None:
             state[_PENDING_RESTARTS_KEY] = pending
         else:
             state.pop(_PENDING_RESTARTS_KEY, None)
-    _write_restart_state(state)
+
+    mutate_restart_state(clear)
+
+
+def clear_restart_ticket_if_idle() -> None:
+    def clear(state: dict[str, Any]) -> None:
+        pending = state.get(_PENDING_RESTARTS_KEY)
+        if isinstance(pending, dict) and pending:
+            return
+        clear_restart_tickets(state)
+
+    mutate_restart_state(clear)
 
 
 def get_pending_restart_reasons() -> list[str]:
-    state = _read_restart_state()
+    state = read_restart_state()
     pending = state.get(_PENDING_RESTARTS_KEY)
     if not isinstance(pending, dict):
         return []
@@ -130,21 +115,28 @@ def get_pending_restart_reasons() -> list[str]:
     return sorted(reasons)
 
 
-def _validate_restart_ticket(
-    state: dict[str, Any],
-    expected_source: str,
-) -> tuple[bool, str]:
-    ticket = state.get(_RESTART_TICKET_KEY)
-    if not isinstance(ticket, dict):
-        return False, "重启标志不存在..."
-    if ticket.get("source") != expected_source:
-        return False, "重启标志来源不匹配，请重新发起操作。"
-    expires_at = float(ticket.get("expires_at", 0))
-    if time.time() > expires_at:
-        state.pop(_RESTART_TICKET_KEY, None)
-        _write_restart_state(state)
-        return False, "重启标志已过期，请重新设置配置。"
-    return True, ""
+def get_pending_restart_items() -> list[dict[str, Any]]:
+    state = read_restart_state()
+    pending = state.get(_PENDING_RESTARTS_KEY)
+    if not isinstance(pending, dict):
+        return []
+    result: list[dict[str, Any]] = []
+    for source, item in sorted(pending.items()):
+        if not isinstance(item, dict):
+            continue
+        reasons = item.get("reasons")
+        if not isinstance(reasons, list):
+            reasons = []
+        result.append(
+            {
+                "source": str(source),
+                "reasons": sorted(
+                    {str(reason) for reason in reasons if str(reason).strip()}
+                ),
+                "updated_at": float(item.get("updated_at") or 0),
+            }
+        )
+    return result
 
 
 async def _schedule_restart() -> tuple[bool, str]:
@@ -168,43 +160,42 @@ async def request_restart(
         return False, "当前不是 launcher 托管模式，请手动重启真寻。"
     if _restart_pending:
         return await _schedule_restart()
-    state = _read_restart_state()
-    previous_state = copy.deepcopy(state)
-    if require_ticket:
-        ok, message = _validate_restart_ticket(state, require_ticket)
-        if not ok:
-            return False, message
-
-    pending_request: dict[str, Any] = {
-        "source": source,
-        "requested_at": time.time(),
-    }
-    if receipt_bot_id and receipt_user_id:
-        pending_request["receipt"] = {
-            "bot_id": receipt_bot_id,
-            "user_id": receipt_user_id,
-        }
-    state[_PENDING_REQUEST_KEY] = pending_request
-    state[_LAUNCHER_ACTION_KEY] = _ACTION_RESTART
-    # Give the ASGI server enough time to flush the successful HTTP response.
-    state[_LAUNCHER_NOT_BEFORE_KEY] = time.time() + 1.0
-    if require_ticket:
-        state.pop(_RESTART_TICKET_KEY, None)
-
     try:
-        _write_restart_state(state)
+
+        def update(state: dict[str, Any]) -> tuple[str, str]:
+            if state.get(_LAUNCHER_ACTION_KEY) in {
+                _ACTION_RESTART,
+                _ACTION_SYNC_DEPENDENCIES,
+            }:
+                return "duplicate", ""
+            if require_ticket:
+                ok, message = consume_restart_ticket(state, require_ticket)
+                if not ok:
+                    return "rejected", message
+            pending_request: dict[str, Any] = {
+                "source": source,
+                "requested_at": time.time(),
+            }
+            if receipt_bot_id and receipt_user_id:
+                pending_request["receipt"] = {
+                    "bot_id": receipt_bot_id,
+                    "user_id": receipt_user_id,
+                }
+            state[_PENDING_REQUEST_KEY] = pending_request
+            state[_LAUNCHER_ACTION_KEY] = _ACTION_RESTART
+            state[_LAUNCHER_NOT_BEFORE_KEY] = time.time() + 1.0
+            return "created", ""
+
+        result, detail = mutate_restart_state(update)
     except Exception as e:
         logger.error(f"写入重启状态失败: {e}", "重启")
         return False, "写入重启状态失败。"
+    if result == "rejected":
+        return False, detail
+    if result == "duplicate":
+        return await _schedule_restart()
 
     ok, message = await _schedule_restart()
-    if not ok:
-        try:
-            _write_restart_state(previous_state)
-        except Exception as e:
-            logger.warning(f"回滚重启状态失败: {e}", "重启")
-        return False, message
-
     logger.info(f"收到重启请求，来源: {source}", "重启")
     return True, message
 
@@ -243,30 +234,33 @@ async def request_dependency_restart(source: str, paths: set[Path]) -> tuple[boo
     if not dependency_paths:
         return await request_restart(source)
 
-    state = _read_restart_state()
-    previous_state = copy.deepcopy(state)
-    state[_PENDING_REQUEST_KEY] = {
-        "source": source,
-        "requested_at": time.time(),
-    }
-    state[_LAUNCHER_ACTION_KEY] = _ACTION_SYNC_DEPENDENCIES
-    state[_DEPENDENCY_PATHS_KEY] = dependency_paths
-    state[_LAUNCHER_NOT_BEFORE_KEY] = time.time() + 1.0
     try:
-        _write_restart_state(state)
+
+        def update(state: dict[str, Any]) -> None:
+            existing_paths = state.get(_DEPENDENCY_PATHS_KEY, [])
+            if not isinstance(existing_paths, list):
+                existing_paths = []
+            state.setdefault(
+                _PENDING_REQUEST_KEY,
+                {"source": source, "requested_at": time.time()},
+            )
+            state[_LAUNCHER_ACTION_KEY] = _ACTION_SYNC_DEPENDENCIES
+            state[_DEPENDENCY_PATHS_KEY] = sorted(
+                set(existing_paths) | set(dependency_paths)
+            )
+            state[_LAUNCHER_NOT_BEFORE_KEY] = time.time() + 1.0
+
+        mutate_restart_state(update)
     except Exception as e:
         logger.error(f"写入依赖重启状态失败: {e}", "重启")
         return False, "写入依赖重启状态失败。"
     ok, message = await _schedule_restart()
-    if not ok:
-        _write_restart_state(previous_state)
-        return False, message
     logger.info("收到同步依赖后重启请求", "重启")
     return True, message
 
 
 async def handle_restart_connect(bot: Bot) -> None:
-    state = _read_restart_state()
+    state = read_restart_state()
     pending_request = state.get(_PENDING_REQUEST_KEY)
     if not isinstance(pending_request, dict):
         return
@@ -275,8 +269,7 @@ async def handle_restart_connect(bot: Bot) -> None:
     receipt = pending_request.get("receipt")
     if not isinstance(receipt, dict):
         logger.info(f"检测到重启完成，来源: {source}", "重启")
-        state.pop(_PENDING_REQUEST_KEY, None)
-        _write_restart_state(state)
+        mutate_restart_state(lambda value: value.pop(_PENDING_REQUEST_KEY, None))
         return
 
     expected_bot_id = str(receipt.get("bot_id", ""))
@@ -304,32 +297,38 @@ async def handle_restart_connect(bot: Bot) -> None:
     else:
         logger.warning("未找到重启回执目标，已跳过发送。", "重启")
 
-    state.pop(_PENDING_REQUEST_KEY, None)
-    _write_restart_state(state)
+    def clear_request(value: dict[str, Any]) -> None:
+        current = value.get(_PENDING_REQUEST_KEY)
+        if isinstance(current, dict) and current.get("source") == source:
+            value.pop(_PENDING_REQUEST_KEY, None)
+
+    mutate_restart_state(clear_request)
 
 
 def _finalize_restart_state_on_startup() -> None:
-    state = _read_restart_state()
-    state.pop(_PENDING_RESTARTS_KEY, None)
-    state.pop(_RESTART_TICKET_KEY, None)
-    pending_request = state.get(_PENDING_REQUEST_KEY)
-    if not isinstance(pending_request, dict):
-        _write_restart_state(state)
-        return
+    result: dict[str, Any] = {}
 
-    source = str(pending_request.get("source", "unknown"))
-    receipt = pending_request.get("receipt")
-    if isinstance(receipt, dict):
+    def finalize(state: dict[str, Any]) -> None:
+        state.pop(_PENDING_RESTARTS_KEY, None)
+        clear_restart_tickets(state)
+        pending_request = state.get(_PENDING_REQUEST_KEY)
+        if not isinstance(pending_request, dict):
+            return
+        result.update(pending_request)
+        if not isinstance(pending_request.get("receipt"), dict):
+            state.pop(_PENDING_REQUEST_KEY, None)
+
+    mutate_restart_state(finalize)
+    if not result:
+        return
+    source = str(result.get("source", "unknown"))
+    if isinstance(result.get("receipt"), dict):
         logger.info(f"检测到待发送的重启回执，来源: {source}", "重启")
-        _write_restart_state(state)
-        return
-
-    logger.info(f"检测到重启完成，来源: {source}", "重启")
-    state.pop(_PENDING_REQUEST_KEY, None)
-    _write_restart_state(state)
+    else:
+        logger.info(f"检测到重启完成，来源: {source}", "重启")
 
 
-@PriorityLifecycle.on_startup(priority=0)
+@PriorityLifecycle.on_startup(priority=0, stage="management", timeout=10)
 async def _cleanup_restart_artifacts() -> None:
     _cleanup_legacy_restart_artifacts()
     _finalize_restart_state_on_startup()

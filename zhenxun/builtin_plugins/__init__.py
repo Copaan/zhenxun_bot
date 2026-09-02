@@ -90,7 +90,9 @@ from bag_users t1
 """
 
 
-@PriorityLifecycle.on_startup(priority=5)
+@PriorityLifecycle.on_startup(
+    priority=5, stage="warmup", timeout=300, failure_policy="degrade"
+)
 async def _():
     try:
         should_update = False

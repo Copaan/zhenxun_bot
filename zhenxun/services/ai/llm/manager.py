@@ -326,16 +326,32 @@ def clear_all_cache() -> None:
     logger.debug("已清空全局模型实例与路由组缓存")
 
 
-@PriorityLifecycle.on_startup(priority=10)
+@PriorityLifecycle.on_startup(
+    priority=10,
+    stage="warmup",
+    timeout=60,
+    parallel_safe=True,
+    failure_policy="degrade",
+)
 async def _init_llm_config_on_startup():
     """启动时初始化 LLM 配置、密钥状态并预热工具提供者管理器。"""
     logger.info("正在初始化 LLM 配置并加载遥测状态...")
     try:
         from zhenxun.services.ai.tools.engine.registry import tool_provider_manager
+        from zhenxun.services.ai.tools.providers.mcp.provider import mcp_provider
 
+        tool_provider_manager.register(mcp_provider)
         get_llm_config()
         await health_manager.initialize()
         await tool_provider_manager.initialize()
 
     except Exception as e:
         logger.error(f"LLM 配置或遥测状态初始化时发生错误: {e}", e=e)
+        raise
+
+
+@PriorityLifecycle.on_shutdown(priority=40, timeout=20)
+async def _shutdown_llm_tool_providers() -> None:
+    from zhenxun.services.ai.tools.providers.mcp.provider import mcp_provider
+
+    await mcp_provider.shutdown()

@@ -1,14 +1,17 @@
 from copy import deepcopy
 from pathlib import Path
 import re
+from urllib.parse import quote
 
 import cattrs
 from fastapi import Query
+import nonebot
 from tortoise.exceptions import DoesNotExist
 
 from zhenxun.configs.config import Config
 from zhenxun.configs.utils import ConfigGroup
 from zhenxun.models.plugin_info import PluginInfo as DbPluginInfo
+from zhenxun.nonebot_store.storage import load_manifest as load_nonebot_manifest
 from zhenxun.services.cache.runtime_cache import PluginInfoMemoryCache
 from zhenxun.services.runtime_config_reload import reload_runtime_config
 from zhenxun.services.runtime_reload import plugin_runtime_manager
@@ -23,6 +26,28 @@ from .model import (
     UpdatePlugin,
 )
 from .store_receipts import StoreReceiptStore
+
+
+def _loaded_metadata(runtime_module: str, module: str) -> tuple[str, str | None]:
+    candidates = []
+    for plugin in nonebot.get_loaded_plugins():
+        plugin_module = str(getattr(plugin, "module_name", "") or "")
+        score = 0
+        if plugin_module == runtime_module:
+            score = 3
+        elif plugin_module == module or plugin_module.endswith(f".{module}"):
+            score = 2
+        elif runtime_module.startswith(f"{plugin_module}."):
+            score = 1
+        if score:
+            candidates.append((score, plugin))
+    if not candidates:
+        return "", None
+    metadata = getattr(max(candidates, key=lambda item: item[0])[1], "metadata", None)
+    return (
+        str(getattr(metadata, "usage", "") or ""),
+        str(getattr(metadata, "homepage", "") or "") or None,
+    )
 
 
 class ApiDataSource:
@@ -51,6 +76,11 @@ class ApiDataSource:
             **filters,
         )
         receipts = StoreReceiptStore.load()
+        nonebot_plugins = {
+            str(item.get("module_name") or ""): (store_key, item)
+            for store_key, item in load_nonebot_manifest().get("plugins", {}).items()
+            if isinstance(item, dict) and item.get("state") == "managed"
+        }
         for plugin in plugins:
             runtime_module = str(plugin.module_path or plugin.module)
             store_key = next(
@@ -69,6 +99,34 @@ class ApiDataSource:
                 "builtin_plugins" in str(plugin.module_path or "")
                 or plugin.plugin_type == PluginType.HIDDEN
             )
+            nonebot_managed = next(
+                (
+                    value
+                    for managed_module, value in nonebot_plugins.items()
+                    if managed_module == runtime_module
+                    or managed_module == plugin.module
+                    or managed_module.endswith(f".{plugin.module}")
+                ),
+                None,
+            )
+            usage, homepage = _loaded_metadata(runtime_module, plugin.module)
+            if store_key:
+                management_source = "zhenxun_store"
+                management_route = "/store?source=zhenxun"
+            elif nonebot_managed:
+                management_source = "nonebot_store"
+                project_link = str(nonebot_managed[1].get("project_link") or "")
+                management_route = (
+                    f"/store?source=nonebot&search={quote(project_link)}"
+                    if project_link
+                    else "/store?source=nonebot"
+                )
+            elif is_builtin:
+                management_source = "builtin"
+                management_route = None
+            else:
+                management_source = "manual"
+                management_route = None
             plugin_info = PluginInfo(
                 id=plugin.id,
                 store_key=store_key,
@@ -77,10 +135,16 @@ class ApiDataSource:
                 uninstall_reason=(
                     "系统内置插件不可卸载"
                     if is_builtin
+                    else "请前往 NoneBot 商店管理或卸载该插件"
+                    if nonebot_managed
                     else None
                     if store_key
                     else "该插件不由插件商店管理，请手动维护插件文件"
                 ),
+                usage=usage,
+                homepage=homepage,
+                management_source=management_source,
+                management_route=management_route,
                 module=plugin.module,
                 plugin_name=plugin.name,
                 default_status=plugin.default_status,

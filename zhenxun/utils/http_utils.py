@@ -35,7 +35,7 @@ driver = nonebot.get_driver()
 _client: AsyncClient | None = None
 
 
-@PriorityLifecycle.on_startup(priority=0)
+@PriorityLifecycle.on_startup(priority=0, stage="management", timeout=15)
 async def _():
     """
     在Bot启动时初始化全局httpx客户端。
@@ -96,6 +96,28 @@ def get_client() -> AsyncClient:
             follow_redirects=True,
         )
     return _client
+
+
+async def reload_system_proxy(proxy: str | None) -> None:
+    """Replace the shared HTTP client after a runtime proxy change."""
+    global _client
+
+    normalized = proxy.strip() if proxy else None
+    kwargs: dict[str, str] = {}
+    if normalized:
+        kwargs["proxy"] = normalized
+    replacement = get_async_client(
+        headers=get_user_agent(),
+        follow_redirects=True,
+        **kwargs,
+    )
+    previous = _client
+    _client = replacement
+    AsyncHttpx.default_proxy = (
+        {"http://": normalized, "https://": normalized} if normalized else None
+    )
+    if previous:
+        await previous.aclose()
 
 
 def get_async_client(

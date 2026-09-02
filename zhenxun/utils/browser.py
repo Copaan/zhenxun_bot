@@ -3,8 +3,8 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Literal
 
+import nonebot
 from nonebot_plugin_alconna import UniMessage
-from nonebot_plugin_htmlrender.browser import get_browser
 from playwright.async_api import Page
 
 from zhenxun.utils.message import MessageUtils
@@ -25,6 +25,9 @@ class AsyncPlaywright:
         参数:
             cookies: cookies
         """
+        nonebot.require("nonebot_plugin_htmlrender")
+        from nonebot_plugin_htmlrender.browser import get_browser
+
         browser = await get_browser()
         ctx = await browser.new_context(**kwargs)
         if cookies:

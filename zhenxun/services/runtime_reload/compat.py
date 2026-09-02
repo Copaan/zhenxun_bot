@@ -73,11 +73,18 @@ def remove_priority_hooks(module_names: set[str]) -> None:
 
     for priority_map in PriorityLifecycle._data.values():
         for priority, funcs in list(priority_map.items()):
+            removed = {
+                func
+                for func in funcs
+                if getattr(func, "__module__", "") in module_names
+            }
             priority_map[priority] = [
                 func
                 for func in funcs
                 if getattr(func, "__module__", "") not in module_names
             ]
+            for func in removed:
+                PriorityLifecycle._metadata.pop(func, None)
             if not priority_map[priority]:
                 del priority_map[priority]
 
@@ -85,9 +92,7 @@ def remove_priority_hooks(module_names: set[str]) -> None:
 def remove_plugin_init(module_names: set[str]) -> None:
     from zhenxun.services.plugin_init import PluginInitManager
 
-    for module_name in list(PluginInitManager.plugins):
-        if module_name in module_names:
-            PluginInitManager.plugins.pop(module_name, None)
+    PluginInitManager.remove_registrations(module_names)
 
 
 def clean_matchers(matchers: Iterable[type]) -> None:

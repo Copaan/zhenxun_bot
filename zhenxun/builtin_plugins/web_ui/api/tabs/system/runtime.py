@@ -4,11 +4,22 @@ from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 
 from zhenxun.services.runtime_reload import plugin_runtime_manager
+from zhenxun.services.startup import startup_coordinator
 
 from ....base_model import Result
 from ....utils import authentication
 
 router = APIRouter(prefix="/runtime")
+
+
+@router.get(
+    "/startup/status",
+    response_model=Result[dict[str, Any]],
+    response_class=JSONResponse,
+    description="获取worker分级启动状态",
+)
+async def get_startup_status() -> Result[dict[str, Any]]:
+    return Result.ok(startup_coordinator.snapshot())
 
 
 @router.get(

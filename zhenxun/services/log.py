@@ -16,7 +16,7 @@ driver = nonebot.get_driver()
 
 log_level = driver.config.log_level or "INFO"
 
-logger_.add(
+_MAIN_LOG_SINK_ID = logger_.add(
     LOG_PATH / "{time:YYYY-MM-DD}.log",
     level=log_level,
     rotation="00:00",
@@ -25,7 +25,7 @@ logger_.add(
     retention=timedelta(days=30),
 )
 
-logger_.add(
+_ERROR_LOG_SINK_ID = logger_.add(
     LOG_PATH / "error_{time:YYYY-MM-DD}.log",
     level="ERROR",
     rotation="00:00",
@@ -33,6 +33,30 @@ logger_.add(
     filter=default_filter,
     retention=timedelta(days=30),
 )
+
+
+def reload_log_level(level: str | int) -> None:
+    """Apply a new runtime log level without replacing unrelated sinks."""
+    global _MAIN_LOG_SINK_ID, log_level
+
+    normalized: str | int = level or "INFO"
+    if isinstance(normalized, str):
+        normalized = normalized.upper()
+        if normalized.isdigit():
+            normalized = int(normalized)
+        else:
+            logger_.level(normalized)
+    logger_.remove(_MAIN_LOG_SINK_ID)
+    _MAIN_LOG_SINK_ID = logger_.add(
+        LOG_PATH / "{time:YYYY-MM-DD}.log",
+        level=normalized,
+        rotation="00:00",
+        format=default_format,
+        filter=default_filter,
+        retention=timedelta(days=30),
+    )
+    logger_.configure(extra={"nonebot_log_level": normalized})
+    log_level = normalized
 
 
 class logger:

@@ -96,6 +96,7 @@ def apply_result_data(
     apply_mode: str,
     changed_keys: list[str] | None = None,
     restart_required: bool = False,
+    hot_reloaded: bool | None = None,
     reason_codes: list[str] | None = None,
     access_urls: list[str] | None = None,
     access_targets: list[dict[str, str]] | None = None,
@@ -105,7 +106,11 @@ def apply_result_data(
         **extra,
         "apply_mode": apply_mode,
         "changed_keys": changed_keys or [],
-        "hot_reloaded": apply_mode in {APPLY_CONFIG_RELOADED, APPLY_HOT_RELOADED},
+        "hot_reloaded": (
+            apply_mode in {APPLY_CONFIG_RELOADED, APPLY_HOT_RELOADED}
+            if hot_reloaded is None
+            else hot_reloaded
+        ),
         "restart_required": restart_required,
         "restart_available": restart_required
         and bool(os.getenv("ZHENXUN_LAUNCHER_PID")),

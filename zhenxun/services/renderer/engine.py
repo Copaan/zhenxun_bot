@@ -4,14 +4,15 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
 import contextlib
 from dataclasses import dataclass, field
 import hashlib
+from importlib import import_module
 import inspect
 import json
 from pathlib import Path
+import sys
 import time
 from typing import Any, ClassVar, cast
 
-import nonebot_plugin_htmlrender as htmlrender_module
-import nonebot_plugin_htmlrender.browser as htmlrender_browser
+import nonebot
 import psutil
 
 from zhenxun.configs.config import Config
@@ -29,6 +30,19 @@ _PLAYWRIGHT_TARGET_CLOSED_ERROR_MARKERS = (
 _UNRETRIEVED_FUTURE_MESSAGE = "Future exception was never retrieved"
 _LOOP_EXCEPTION_FILTER_STATE_ATTR = "_zhenxun_playwright_exception_filter_state"
 _DISCONNECT_SUPPRESSION_WINDOW_SECONDS = 10.0
+
+htmlrender_module: Any | None = None
+htmlrender_browser: Any | None = None
+
+
+def _load_htmlrender_modules() -> tuple[Any, Any]:
+    global htmlrender_module, htmlrender_browser
+    if htmlrender_module is None or htmlrender_browser is None:
+        if "nonebot_plugin_htmlrender" not in sys.modules:
+            nonebot.require("nonebot_plugin_htmlrender")
+        htmlrender_module = import_module("nonebot_plugin_htmlrender")
+        htmlrender_browser = import_module("nonebot_plugin_htmlrender.browser")
+    return htmlrender_module, htmlrender_browser
 
 
 class HtmlrenderTaskTracker:
@@ -100,6 +114,16 @@ class HtmlrenderTaskTracker:
 _HTMLRENDER_TASK_TRACKER = HtmlrenderTaskTracker()
 
 
+@contextlib.asynccontextmanager
+async def drain_rendering(reason: str, *, timeout: float = 15.0):
+    await _HTMLRENDER_TASK_TRACKER.mark_draining(reason)
+    try:
+        await asyncio.wait_for(_HTMLRENDER_TASK_TRACKER.wait_for_idle(), timeout)
+        yield
+    finally:
+        await _HTMLRENDER_TASK_TRACKER.resume()
+
+
 @dataclass(slots=True)
 class ContextGeneration:
     generation_id: int
@@ -125,8 +149,9 @@ async def _await_if_needed(value: Any) -> Any:
 
 
 async def _get_browser_instance() -> Any:
+    _, browser_module = _load_htmlrender_modules()
     for attr_name in ("get_browser", "get_new_browser"):
-        browser_getter = getattr(htmlrender_browser, attr_name, None)
+        browser_getter = getattr(browser_module, attr_name, None)
         if callable(browser_getter):
             return await _await_if_needed(browser_getter())
     raise RuntimeError("nonebot_plugin_htmlrender.browser 未提供可用浏览器获取函数。")
@@ -197,6 +222,8 @@ def _arm_disconnect_exception_suppression(
 
 
 async def _shutdown_browser_instance() -> None:
+    if htmlrender_browser is None:
+        return
     loop = asyncio.get_running_loop()
     _arm_disconnect_exception_suppression(loop)
 
@@ -240,7 +267,8 @@ async def _shutdown_browser_instance() -> None:
 
 
 def _patch_htmlrender_task_tracking() -> None:
-    if getattr(htmlrender_browser, "_zhenxun_task_tracking_patched", False):
+    render_module, browser_module = _load_htmlrender_modules()
+    if getattr(browser_module, "_zhenxun_task_tracking_patched", False):
         return
 
     try:
@@ -249,7 +277,7 @@ def _patch_htmlrender_task_tracking() -> None:
         logger.warning("导入 htmlrender.data_source 失败，跳过任务追踪补丁。", e=e)
         return
 
-    original_get_new_page = getattr(htmlrender_browser, "get_new_page", None)
+    original_get_new_page = getattr(browser_module, "get_new_page", None)
     if not callable(original_get_new_page):
         logger.warning("htmlrender 未提供 get_new_page，跳过任务追踪补丁。")
         return
@@ -262,14 +290,15 @@ def _patch_htmlrender_task_tracking() -> None:
             async with page_context as page:
                 yield page
 
-    setattr(htmlrender_browser, "get_new_page", _tracked_get_new_page)
-    setattr(htmlrender_module, "get_new_page", _tracked_get_new_page)
+    setattr(browser_module, "get_new_page", _tracked_get_new_page)
+    setattr(render_module, "get_new_page", _tracked_get_new_page)
     setattr(htmlrender_data_source, "get_new_page", _tracked_get_new_page)
-    setattr(htmlrender_browser, "_zhenxun_task_tracking_patched", True)
+    setattr(browser_module, "_zhenxun_task_tracking_patched", True)
 
 
 def _patch_htmlrender_shutdown() -> None:
-    if getattr(htmlrender_browser, "_zhenxun_shutdown_patched", False):
+    render_module, browser_module = _load_htmlrender_modules()
+    if getattr(browser_module, "_zhenxun_shutdown_patched", False):
         return
 
     async def _patched_shutdown_browser() -> None:
@@ -277,21 +306,22 @@ def _patch_htmlrender_shutdown() -> None:
             await _HTMLRENDER_TASK_TRACKER.wait_for_idle()
         await _shutdown_browser_instance()
 
-    setattr(htmlrender_browser, "shutdown_browser", _patched_shutdown_browser)
-    setattr(htmlrender_module, "shutdown_browser", _patched_shutdown_browser)
-    setattr(htmlrender_browser, "_zhenxun_shutdown_patched", True)
+    setattr(browser_module, "shutdown_browser", _patched_shutdown_browser)
+    setattr(render_module, "shutdown_browser", _patched_shutdown_browser)
+    setattr(browser_module, "_zhenxun_shutdown_patched", True)
 
 
 def _patch_playwright_env_check_once() -> None:
+    _, browser_module = _load_htmlrender_modules()
     _patch_htmlrender_task_tracking()
     _patch_htmlrender_shutdown()
-    if getattr(htmlrender_browser, "_zhenxun_check_once_patched", False):
+    if getattr(browser_module, "_zhenxun_check_once_patched", False):
         return
 
     original_check: Callable[..., Awaitable[Any]] | None = None
     check_attr_name = ""
     for attr_name in ("check_playwright_env", "check_browser_env"):
-        candidate = getattr(htmlrender_browser, attr_name, None)
+        candidate = getattr(browser_module, attr_name, None)
         if callable(candidate):
             original_check = cast(Callable[..., Awaitable[Any]], candidate)
             check_attr_name = attr_name
@@ -302,7 +332,7 @@ def _patch_playwright_env_check_once() -> None:
             "未找到 htmlrender 环境检查函数，跳过 check_once 补丁。",
             "PlaywrightEngine",
         )
-        setattr(htmlrender_browser, "_zhenxun_check_once_patched", True)
+        setattr(browser_module, "_zhenxun_check_once_patched", True)
         return
 
     check_func = original_check
@@ -323,7 +353,7 @@ def _patch_playwright_env_check_once() -> None:
         current = state["result"]
         if _is_browser_usable(current):
             return current
-        fallback = getattr(htmlrender_browser, "_browser", None)
+        fallback = getattr(browser_module, "_browser", None)
         if _is_browser_usable(fallback):
             return fallback
         return None
@@ -356,8 +386,8 @@ def _patch_playwright_env_check_once() -> None:
                 return browser
             return result
 
-    setattr(htmlrender_browser, check_attr_name, _check_once)
-    setattr(htmlrender_browser, "_zhenxun_check_once_patched", True)
+    setattr(browser_module, check_attr_name, _check_once)
+    setattr(browser_module, "_zhenxun_check_once_patched", True)
 
 
 class PlaywrightEngine(BaseScreenshotEngine):
@@ -988,7 +1018,7 @@ class PlaywrightEngine(BaseScreenshotEngine):
         for generation in generations:
             await self._dispose_generation(generation)
 
-    async def _build_generation(self) -> ContextGeneration:
+    async def _build_generation(self, *, strict: bool = False) -> ContextGeneration:
         async with self._state_lock:
             generation = self._create_generation_nolock()
 
@@ -999,6 +1029,8 @@ class PlaywrightEngine(BaseScreenshotEngine):
             browser = await _get_browser_instance()
         except Exception as e:
             logger.warning("截图引擎浏览器预热失败。", "PlaywrightEngine", e=e)
+            if strict:
+                raise
             return generation
 
         for _ in range(self._PREWARM_CONTEXT_COUNT):
@@ -1032,8 +1064,8 @@ class PlaywrightEngine(BaseScreenshotEngine):
 
         return generation
 
-    async def _swap_generation(self, reason: str) -> None:
-        new_generation = await self._build_generation()
+    async def _swap_generation(self, reason: str, *, strict: bool = False) -> None:
+        new_generation = await self._build_generation(strict=strict)
         async with self._state_lock:
             old_generation = self._active_generation
             if old_generation is not None:
@@ -1047,6 +1079,14 @@ class PlaywrightEngine(BaseScreenshotEngine):
             "PlaywrightEngine",
         )
         await self._log_runtime_snapshot(f"swap_generation:{reason}")
+
+    async def warmup(self) -> None:
+        async with self._recycle_lock:
+            async with self._state_lock:
+                active = self._active_generation
+                if active is not None and active.all_contexts:
+                    return
+            await self._swap_generation("startup_warmup", strict=True)
 
     async def _acquire_context(self) -> tuple[ContextGeneration, Any]:
         generation: ContextGeneration | None = None
@@ -1332,6 +1372,11 @@ class EngineManager:
         if isinstance(engine, PlaywrightEngine):
             return await engine.get_runtime_snapshot()
         return {"engine": type(engine).__name__}
+
+    async def warmup(self) -> None:
+        engine = await self.get_engine()
+        if isinstance(engine, PlaywrightEngine):
+            await engine.warmup()
 
     async def close(self):
         if self._instance:
