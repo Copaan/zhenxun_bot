@@ -974,6 +974,9 @@ def apply_pending_update(project_root: Path | None = None) -> bool:
     try:
         if component == "bot":
             _apply_bot_update(staged, backup)
+            from zhenxun.utils.bytecode import precompile_path
+
+            precompile_path(_ROOT / "zhenxun")
         elif component == "resource":
             _apply_resource_update(staged, backup)
         else:

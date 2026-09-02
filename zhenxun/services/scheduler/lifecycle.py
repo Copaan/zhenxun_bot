@@ -15,11 +15,16 @@ from .repository import ScheduleRepository
 from .types import JobConfig, ScheduleContext
 
 
-@PriorityLifecycle.on_startup(priority=90)
+@PriorityLifecycle.on_startup(
+    priority=90,
+    task_id="runtime:restore_schedules",
+    depends_on=("runtime:runtime_cache",),
+)
 async def _load_schedules_from_db():
     """在服务启动时从数据库加载并调度所有任务。"""
     logger.info("正在从数据库加载并调度所有定时任务...")
-    schedules = await ScheduleRepository.get_all_enabled()
+    all_schedules = await ScheduleRepository.get_all()
+    schedules = [schedule for schedule in all_schedules if schedule.is_enabled]
     count = 0
     for schedule in schedules:
         if schedule.plugin_name in scheduler_registry.tasks:
@@ -31,19 +36,21 @@ async def _load_schedules_from_db():
 
     logger.info("正在检查并注册声明式默认任务...")
     declared_count = 0
+    existing_declarations = {
+        (
+            schedule.plugin_name,
+            schedule.target_identifier,
+            schedule.bot_id,
+        )
+        for schedule in all_schedules
+    }
     for task_info in scheduler_registry.persistent_declarations:
         plugin_name = task_info.plugin_name
         group_id = task_info.group_id
         bot_id = task_info.bot_id
 
-        query_kwargs = {
-            "plugin_name": plugin_name,
-            "target_identifier": group_id or "",
-            "bot_id": bot_id,
-        }
-        exists = await ScheduleRepository.exists(**query_kwargs)
-
-        if not exists:
+        declaration_key = (plugin_name, group_id or "", bot_id)
+        if declaration_key not in existing_declarations:
             logger.info(f"为插件 '{plugin_name}' 注册新的默认定时任务...")
 
             target_type = "GROUP" if group_id else "GLOBAL"
@@ -64,6 +71,7 @@ async def _load_schedules_from_db():
             )
             if schedule:
                 declared_count += 1
+                existing_declarations.add(declaration_key)
                 logger.debug(f"默认任务 '{plugin_name}' 注册成功 (ID: {schedule.id})")
             else:
                 logger.error(f"默认任务 '{plugin_name}' 注册失败")

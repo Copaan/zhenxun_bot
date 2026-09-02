@@ -35,32 +35,6 @@ ENV_EXAMPLE_FILE = ".env.example"
 ENV_DEV_FILE = ".env.dev"
 
 
-def _source_tree_references(root: Path, package: bytes) -> bool:
-    if not root.is_dir():
-        return False
-    for path in root.rglob("*.py"):
-        try:
-            if package in path.read_bytes():
-                return True
-        except OSError:
-            continue
-    return False
-
-
-def _defer_htmlrender_for_source_plugins(
-    nonebot_module, driver, roots: list[Path]
-) -> bool:
-    package = b"nonebot_plugin_htmlrender"
-    if not any(_source_tree_references(root, package) for root in roots):
-        return False
-    nonebot_module.require("nonebot_plugin_htmlrender")
-    startup_funcs = driver._lifespan._startup_funcs
-    for func in list(startup_funcs):
-        if getattr(func, "__module__", "").startswith("nonebot_plugin_htmlrender"):
-            startup_funcs.remove(func)
-    return True
-
-
 def _env_assignment_key(line: str, *, include_commented: bool = False) -> str | None:
     stripped = line.strip()
     if include_commented and stripped.startswith("#"):
@@ -314,38 +288,45 @@ def _run_worker() -> None:
 
     nonebot.logger.opt(colors=True).info(f"已启用适配器: {', '.join(enabled_adapters)}")
 
-    source_roots = [Path("zhenxun/plugins")]
-    source_roots.extend(Path(ext.strip()) for ext in BotConfig.ext_path if ext.strip())
-    if _defer_htmlrender_for_source_plugins(nonebot, driver, source_roots):
-        startup_coordinator.record_operation(
-            "worker:register_htmlrender_dependency",
-            "worker",
-            "completed",
-            (time.monotonic() - worker_started) * 1000,
-        )
+    from zhenxun.services.startup_load import startup_load_planner
 
     phase_started = time.monotonic()
-    nonebot.load_plugins("zhenxun/builtin_plugins")
+    for model_file in sorted(Path("zhenxun/models").glob("*.py")):
+        if model_file.name.startswith("_"):
+            continue
+        importlib.import_module(f"zhenxun.models.{model_file.stem}")
     startup_coordinator.record_operation(
-        "worker:load_builtin_plugins",
-        "worker",
-        "completed",
-        (time.monotonic() - phase_started) * 1000,
-    )
-    phase_started = time.monotonic()
-    nonebot.load_plugins("zhenxun/plugins")
-    startup_coordinator.record_operation(
-        "worker:load_source_plugins",
+        "worker:load_core_models",
         "worker",
         "completed",
         (time.monotonic() - phase_started) * 1000,
     )
 
-    for ext in BotConfig.ext_path:
-        ext = ext.strip()
-        if ext:
-            nonebot.logger.info(f"加载第三方插件目录: {ext}")
-            nonebot.load_plugins(ext)
+    source_roots: list[tuple[str, Path]] = [
+        ("builtin", Path("zhenxun/builtin_plugins")),
+        ("source", Path("zhenxun/plugins")),
+    ]
+    source_roots.extend(
+        ("external", Path(ext.strip())) for ext in BotConfig.ext_path if ext.strip()
+    )
+    phase_started = time.monotonic()
+    startup_load_planner.prepare(source_roots)
+    startup_coordinator.record_operation(
+        "worker:plan_plugin_load",
+        "worker",
+        "completed",
+        (time.monotonic() - phase_started) * 1000,
+        details=startup_load_planner.summary(),
+    )
+    startup_load_planner.prepare_library_plugins()
+    phase_started = time.monotonic()
+    startup_load_planner.load_critical()
+    startup_coordinator.record_operation(
+        "worker:load_critical_plugins",
+        "worker",
+        "completed",
+        (time.monotonic() - phase_started) * 1000,
+    )
 
     from zhenxun.nonebot_store.runtime import load_managed_plugins
 
@@ -362,6 +343,8 @@ def _run_worker() -> None:
             "部分 WebUI 托管的 NoneBot 插件加载失败，已隔离: {}",
             ", ".join(item["store_key"] for item in managed_status["failed"]),
         )
+
+    startup_load_planner.instrument_prebind_hooks(driver)
 
     from zhenxun.configs.webui_tls import (
         load_webui_tls_settings,

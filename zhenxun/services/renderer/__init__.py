@@ -13,6 +13,9 @@ renderer_service = RendererService()
     timeout=300,
     parallel_safe=True,
     failure_policy="degrade",
+    task_id="warmup:renderer",
+    depends_on=("warmup:resources",),
+    resource_group="renderer",
 )
 async def _init_renderer_service():
     """在Bot启动时初始化渲染服务及其依赖。"""

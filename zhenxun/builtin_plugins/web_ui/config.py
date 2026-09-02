@@ -1,8 +1,11 @@
 import sys
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 import nonebot
+
+from zhenxun.services.startup import startup_coordinator
 
 if sys.version_info >= (3, 11):
     from enum import StrEnum
@@ -31,6 +34,40 @@ def install_cors_middleware(app: FastAPI | None = None) -> bool:
         allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
         allow_headers=["Authorization", "Content-Type", "X-Setup-Token"],
     )
+    if not getattr(target.state, "zhenxun_startup_guard", False):
+
+        @target.middleware("http")
+        async def startup_mutation_guard(request: Request, call_next):
+            path = request.url.path
+            recovery_prefixes = (
+                "/zhenxun/api/auth",
+                "/zhenxun/api/configure",
+                "/zhenxun/api/system/restart",
+                "/zhenxun/api/system/update",
+            )
+            if (
+                request.method in {"POST", "PUT", "PATCH", "DELETE"}
+                and path.startswith("/zhenxun/api/")
+                and not path.startswith(recovery_prefixes)
+                and not startup_coordinator.runtime_ready
+            ):
+                snapshot = startup_coordinator.snapshot()
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "code": 409,
+                        "message": "startup_in_progress",
+                        "suc": False,
+                        "data": {
+                            "state": snapshot["state"],
+                            "current_operation": snapshot.get("current_operation"),
+                            "load_plan": snapshot.get("load_plan"),
+                        },
+                    },
+                )
+            return await call_next(request)
+
+        target.state.zhenxun_startup_guard = True
     return True
 
 

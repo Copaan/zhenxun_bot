@@ -161,6 +161,8 @@ class PluginRuntimeManager:
             timeout=60,
             parallel_safe=True,
             failure_policy="degrade",
+            task_id="warmup:runtime_index",
+            resource_group="runtime_index",
         )
         async def _start_runtime_manager() -> None:
             await self.discover_loaded_plugins_async()
@@ -373,6 +375,19 @@ class PluginRuntimeManager:
             source = getattr(matcher.__class__, "_source", None)
             plugin_id = getattr(source, "plugin_id", None)
             owner = plugin_id and manager._root_owner(plugin_id)
+            if plugin_id:
+                from zhenxun.services.startup_load import startup_load_planner
+
+                startup_owner = (
+                    startup_load_planner.owner_for_module(
+                        getattr(source, "module_name", "") or ""
+                    )
+                    or str(plugin_id).split(":", 1)[0]
+                )
+                if startup_owner in startup_load_planner.failed_plugins or (
+                    startup_owner in startup_load_planner.warming_plugins
+                ):
+                    return None
             unit = manager.units.get(owner or "")
             if unit and unit.draining:
                 return None

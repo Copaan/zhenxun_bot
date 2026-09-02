@@ -35,6 +35,17 @@ async def get_startup_status() -> Result[dict[str, Any]]:
     return Result.ok(startup_coordinator.snapshot())
 
 
+@router.get(
+    "/startup/report",
+    dependencies=[authentication()],
+    response_model=Result[dict[str, Any]],
+    response_class=JSONResponse,
+    description="获取worker完整启动事务报告",
+)
+async def get_startup_report() -> Result[dict[str, Any]]:
+    return Result.ok(startup_coordinator.report())
+
+
 IMAGE_TYPE = ["jpg", "jpeg", "png", "gif", "bmp", "webp", "svg"]
 
 

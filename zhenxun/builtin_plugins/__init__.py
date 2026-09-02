@@ -91,9 +91,15 @@ from bag_users t1
 
 
 @PriorityLifecycle.on_startup(
-    priority=5, stage="warmup", timeout=300, failure_policy="degrade"
+    priority=10,
+    stage="warmup",
+    timeout=300,
+    parallel_safe=True,
+    failure_policy="degrade",
+    task_id="warmup:resources",
+    resource_group="resources",
 )
-async def _():
+async def _prepare_resources():
     try:
         should_update = False
         resource_path = ZhenxunRepoManager.config.RESOURCE_PATH
@@ -150,6 +156,18 @@ async def _():
                 logger.info("资源文件下载/更新完成", "资源检查")
     except Exception as e:
         logger.error(f"资源检查或更新失败: {e}", "资源检查")
+
+
+@PriorityLifecycle.on_startup(
+    priority=10,
+    stage="warmup",
+    timeout=300,
+    parallel_safe=True,
+    failure_policy="degrade",
+    task_id="warmup:legacy_data",
+    resource_group="database",
+)
+async def _migrate_legacy_data():
     """签到与用户的数据迁移"""
     if goods_list := await GoodsInfo.filter(uuid__isnull=True).all():
         for goods in goods_list:

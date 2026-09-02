@@ -332,6 +332,8 @@ def clear_all_cache() -> None:
     timeout=60,
     parallel_safe=True,
     failure_policy="degrade",
+    task_id="warmup:ai",
+    resource_group="ai",
 )
 async def _init_llm_config_on_startup():
     """启动时初始化 LLM 配置、密钥状态并预热工具提供者管理器。"""

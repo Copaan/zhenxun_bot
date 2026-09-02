@@ -358,6 +358,14 @@ def _patch_playwright_env_check_once() -> None:
             return fallback
         return None
 
+    def _local_browser_executable_exists() -> bool:
+        playwright = getattr(browser_module, "_playwright", None)
+        plugin_config = getattr(browser_module, "plugin_config", None)
+        browser_name = str(getattr(plugin_config, "htmlrender_browser", "chromium"))
+        browser_type = getattr(playwright, browser_name, None)
+        executable_path = getattr(browser_type, "executable_path", None)
+        return bool(executable_path and Path(executable_path).is_file())
+
     async def _check_once(**kwargs: Any) -> Any:
         nonlocal check_lock
         if state["checked"]:
@@ -377,7 +385,13 @@ def _patch_playwright_env_check_once() -> None:
                 state["checked"] = False
                 state["result"] = None
 
-            result = await check_func(**kwargs)
+            # start_browser launches this same executable immediately afterwards.
+            # Avoid a redundant probe process when Playwright already resolved it.
+            result = (
+                True
+                if _local_browser_executable_exists()
+                else await check_func(**kwargs)
+            )
             state["checked"] = True
             state["result"] = result
 

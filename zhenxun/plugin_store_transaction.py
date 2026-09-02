@@ -19,6 +19,7 @@ from zhenxun.utils.atomic_json import (
     read_json_locked,
     write_json_locked,
 )
+from zhenxun.utils.bytecode import precompile_path
 
 ROOT = Path("data/runtime/plugin-store-transaction")
 PENDING_FILE = ROOT / "pending-v1.json"
@@ -438,6 +439,20 @@ def apply_pending_transaction() -> bool:
             _write_pending(transaction)
             return False
         transaction["state"] = "verification_pending"
+        compile_warnings = []
+        for operation in switched:
+            if operation.get("action") == "uninstall":
+                continue
+            live = Path(str(operation["live_path"]))
+            if not precompile_path(live):
+                compile_warnings.append(
+                    {
+                        "code": "bytecode_precompile_failed",
+                        "store_key": operation.get("store_key"),
+                    }
+                )
+        if compile_warnings:
+            transaction["warnings"] = compile_warnings
         transaction["updated_at"] = _now()
         _write_pending(transaction)
         return True

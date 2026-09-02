@@ -10,6 +10,15 @@ from zhenxun.models.group_console import GroupConsole
 from zhenxun.models.task_info import TaskInfo
 from zhenxun.services.cache.runtime_cache import GroupMemoryCache, TaskInfoMemoryCache
 from zhenxun.services.log import logger
+from zhenxun.services.startup_reconcile import (
+    commit as commit_reconcile,
+)
+from zhenxun.services.startup_reconcile import (
+    matches as reconcile_matches,
+)
+from zhenxun.services.startup_reconcile import (
+    payload_fingerprint,
+)
 from zhenxun.utils.common_utils import CommonUtils
 from zhenxun.utils.manager.priority_manager import PriorityLifecycle
 
@@ -138,7 +147,11 @@ async def create_schedule(task: Task):
         logger.error(f"动态创建定时任务 {task.name}({task.module}) 失败", e=e)
 
 
-@PriorityLifecycle.on_startup(priority=5)
+@PriorityLifecycle.on_startup(
+    priority=5,
+    task_id="runtime:reconcile_tasks",
+    depends_on=("runtime:reconcile_plugins",),
+)
 async def reconcile_task_runtime():
     """
     初始化插件数据配置
@@ -153,18 +166,58 @@ async def reconcile_task_runtime():
             "避免插件加载异常时误关闭全部被动技能。",
         )
         return
-    module_dict = {t[1]: t[0] for t in await TaskInfo.all().values_list("id", "module")}
+    payload = sorted(
+        (
+            {
+                "create_status": status,
+                "module": task.module,
+                "name": task.name,
+                "status": task.status,
+                "default_status": task.default_status,
+                "run_time": task.run_time,
+            }
+            for status, task in task_info_list
+        ),
+        key=lambda item: item["module"],
+    )
+    fingerprint = payload_fingerprint(payload)
+    if reconcile_matches("tasks", fingerprint):
+        database_tasks = await TaskInfo.all().values("module", "load_status")
+        loaded_modules = {
+            str(item["module"]) for item in database_tasks if item["load_status"]
+        }
+        known_modules = {str(item["module"]) for item in database_tasks}
+        desired_modules = {task.module for _, task in task_info_list}
+        if desired_modules <= known_modules and loaded_modules == desired_modules:
+            logger.debug("被动任务声明未变化，跳过启动期数据库写入")
+            return
+    existing_tasks = await TaskInfo.all()
+    module_dict = {task.module: task for task in existing_tasks}
     load_task = []
     create_list = []
     update_list = []
     for status, task in task_info_list:
-        if task.module not in module_dict:
+        existing = module_dict.get(task.module)
+        if existing is None:
             create_list.append((status, task))
         else:
-            task.id = module_dict[task.module]
-            update_list.append(task)
+            changed = False
+            for field in ("run_time", "name"):
+                value = getattr(task, field)
+                if getattr(existing, field) != value:
+                    setattr(existing, field, value)
+                    changed = True
+            if changed:
+                update_list.append(existing)
         load_task.append(task.module)
-    await to_db(load_task, create_list, update_list)
+    current_loaded = {task.module for task in existing_tasks if task.load_status}
+    desired_loaded = set(load_task)
+    await to_db(
+        load_task if current_loaded != desired_loaded else [],
+        create_list,
+        update_list,
+    )
+    commit_reconcile("tasks", fingerprint)
     # db_task = await TaskInfo.filter(load_status=True, status=True).values_list(
     #     "module", flat=True
     # )

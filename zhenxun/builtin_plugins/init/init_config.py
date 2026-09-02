@@ -133,7 +133,12 @@ def _generate_simple_config(exists_module: list[str]) -> bool:
             temp_file.unlink()
 
 
-@PriorityLifecycle.on_startup(priority=0, stage="management", timeout=15)
+@PriorityLifecycle.on_startup(
+    priority=0,
+    stage="runtime",
+    timeout=15,
+    task_id="runtime:reconcile_config",
+)
 def reconcile_config_runtime() -> set[Path]:
     """
     初始化插件数据配置

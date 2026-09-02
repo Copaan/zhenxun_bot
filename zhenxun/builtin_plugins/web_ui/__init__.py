@@ -115,30 +115,35 @@ async def _():
         app.include_router(WsApiRouter)
         public_ready = await init_public(app)
         logger.info("<g>API启动成功</g>", "WebUi")
-        connection_code = await console_access.prepare() if public_ready else None
 
-        def emit_ready_banner() -> None:
+        async def emit_ready_banner() -> None:
             startup_coordinator.mark_server_bound()
-            if public_ready and connection_code:
-                try:
-                    if not os.getenv("ZHENXUN_LAUNCHER_PID"):
-                        from zhenxun.update_service import (
-                            finalize_applied_update,
-                        )
+            if not public_ready or not await startup_coordinator.wait_final_available():
+                return
+            try:
+                connection_code = await console_access.prepare()
+                if not connection_code:
+                    return
+                if not os.getenv("ZHENXUN_LAUNCHER_PID"):
+                    from zhenxun.update_service import finalize_applied_update
 
-                        finalize_applied_update()
-                    emit_webui_console_banner(
-                        str(driver.config.host),
-                        int(driver.config.port),
-                        connection_code=connection_code,
-                        state=setup_access.state(),
-                        username=str(gConfig.get_config("web-ui", "username", "")),
-                        scheme=current_webui_scheme(),
-                    )
-                except Exception as e:
-                    logger.error("WebUI 启动链接输出失败", "WebUi", e=e)
+                    finalize_applied_update()
+                emit_webui_console_banner(
+                    str(driver.config.host),
+                    int(driver.config.port),
+                    connection_code=connection_code,
+                    state=setup_access.state(),
+                    username=str(gConfig.get_config("web-ui", "username", "")),
+                    scheme=current_webui_scheme(),
+                )
+            except Exception as e:
+                logger.error("WebUI 启动链接输出失败", "WebUi", e=e)
 
-        webui_ready_banner.arm(emit_ready_banner)
+        webui_ready_banner.arm(
+            emit_ready_banner,
+            host=str(driver.config.host),
+            port=int(driver.config.port),
+        )
         if not public_ready:
             logger.error("WebUI 静态资源未就绪，未输出访问链接", "WebUi")
     except Exception as e:

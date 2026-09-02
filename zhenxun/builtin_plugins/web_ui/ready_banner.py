@@ -1,82 +1,86 @@
 from __future__ import annotations
 
-from collections.abc import Callable
-import logging
-import os
-from threading import Lock
+import asyncio
+from collections.abc import Awaitable, Callable
+import contextlib
+import inspect
+import ipaddress
 
-_UVICORN_READY_PREFIX = "Uvicorn running on "
-_UVICORN_STARTUP_FAILURE_PREFIX = "Application startup failed"
+ReadyCallback = Callable[[], Awaitable[None] | None]
 
 
-class _ReadyLogHandler(logging.Handler):
-    def __init__(self, owner: UvicornReadyBanner) -> None:
-        super().__init__(logging.INFO)
-        self._owner = owner
-
-    def emit(self, record: logging.LogRecord) -> None:
-        self._owner.handle(self, record)
+def _connect_host(host: str) -> str:
+    value = host.strip().strip("[]")
+    if value in {"", "0.0.0.0", "::"}:
+        return "127.0.0.1"
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        return value
+    return "127.0.0.1" if address.is_unspecified else value
 
 
 class UvicornReadyBanner:
-    """Run one callback after Uvicorn has bound the worker's listening socket."""
+    """Run one callback after the worker's listening socket accepts TCP."""
 
-    def __init__(
-        self,
-        record_logger_name: str = "uvicorn.error",
-        handler_logger_name: str = "uvicorn",
-    ) -> None:
-        self._record_logger_name = record_logger_name
-        self._handler_logger_name = handler_logger_name
-        self._lock = Lock()
-        self._handler: _ReadyLogHandler | None = None
-        self._callback: Callable[[], None] | None = None
+    def __init__(self) -> None:
+        self._task: asyncio.Task[None] | None = None
         self._emitted = False
 
-    def arm(self, callback: Callable[[], None]) -> bool:
-        with self._lock:
-            if self._handler is not None or self._emitted:
-                return False
-            handler = _ReadyLogHandler(self)
-            self._handler = handler
-            self._callback = callback
-            logging.getLogger(self._handler_logger_name).addHandler(handler)
-            return True
+    def arm(
+        self,
+        callback: ReadyCallback,
+        *,
+        host: str,
+        port: int,
+        timeout: float = 120.0,
+    ) -> bool:
+        if self._task is not None or self._emitted:
+            return False
+        self._task = asyncio.create_task(
+            self._probe(callback, _connect_host(host), port, timeout),
+            name="zhenxun-webui-ready-probe",
+        )
+        return True
 
-    def handle(self, handler: _ReadyLogHandler, record: logging.LogRecord) -> None:
-        if record.process != os.getpid() or record.name != self._record_logger_name:
-            return
-        message = record.getMessage()
-        is_ready = message.startswith(_UVICORN_READY_PREFIX)
-        is_startup_failure = message.startswith(_UVICORN_STARTUP_FAILURE_PREFIX)
-        if not is_ready and not is_startup_failure:
-            return
-
-        with self._lock:
-            if handler is not self._handler or self._emitted:
+    async def _probe(
+        self,
+        callback: ReadyCallback,
+        host: str,
+        port: int,
+        timeout: float,
+    ) -> None:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        try:
+            while loop.time() < deadline:
+                try:
+                    attempt_timeout = max(0.01, min(0.25, deadline - loop.time()))
+                    _, writer = await asyncio.wait_for(
+                        asyncio.open_connection(host, port), timeout=attempt_timeout
+                    )
+                except (OSError, asyncio.TimeoutError):
+                    await asyncio.sleep(0.05)
+                    continue
+                writer.close()
+                with contextlib.suppress(Exception):
+                    await writer.wait_closed()
+                self._emitted = True
+                result = callback()
+                if inspect.isawaitable(result):
+                    await result
                 return
-            logging.getLogger(self._handler_logger_name).removeHandler(handler)
-            handler.close()
-            callback = self._callback
-            self._handler = None
-            self._callback = None
-            self._emitted = is_ready
-
-        if is_ready and callback is not None:
-            callback()
+        finally:
+            self._task = None
 
     def reset(self) -> None:
-        with self._lock:
-            handler = self._handler
-            self._handler = None
-            self._callback = None
-            self._emitted = False
-            if handler is not None:
-                logging.getLogger(self._handler_logger_name).removeHandler(handler)
-                handler.close()
+        task = self._task
+        self._task = None
+        self._emitted = False
+        if task is not None and not task.done():
+            task.cancel()
 
 
 webui_ready_banner = UvicornReadyBanner()
-
 
 __all__ = ["UvicornReadyBanner", "webui_ready_banner"]

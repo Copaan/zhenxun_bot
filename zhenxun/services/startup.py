@@ -5,6 +5,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import os
 from pathlib import Path
+import platform
 from threading import RLock
 import time
 from typing import Any, Literal
@@ -33,6 +34,7 @@ class OperationRecord:
     duration_ms: float
     priority: int | None = None
     error_code: str | None = None
+    details: dict[str, Any] | None = None
 
 
 class StartupCoordinator:
@@ -47,6 +49,11 @@ class StartupCoordinator:
         self._stages: dict[str, dict[str, Any]] = {}
         self._operations: list[OperationRecord] = []
         self._errors: list[dict[str, str]] = []
+        self._current_operation: dict[str, Any] | None = None
+        self._load_planner: Any | None = None
+        self._management_complete = False
+        self._server_bound = False
+        self._last_persist_monotonic = 0.0
         self._lock = RLock()
         self._server_bound_event: asyncio.Event | None = None
         self._runtime_event: asyncio.Event | None = None
@@ -77,7 +84,9 @@ class StartupCoordinator:
             }
             self._stage_completed_wall[stage] = time.time()
             if stage == "management":
-                self._state = "management_ready"
+                self._management_complete = True
+                if self._server_bound:
+                    self._state = "management_ready"
             elif stage == "runtime":
                 self._state = "runtime_ready"
                 self._set_event(self._runtime_event)
@@ -114,6 +123,7 @@ class StartupCoordinator:
         *,
         priority: int | None = None,
         error_code: str | None = None,
+        details: dict[str, Any] | None = None,
     ) -> None:
         record = OperationRecord(
             name=name,
@@ -122,10 +132,29 @@ class StartupCoordinator:
             duration_ms=round(duration_ms, 2),
             priority=priority,
             error_code=error_code,
+            details=details,
         )
         with self._lock:
             self._operations.append(record)
-            self._operations = self._operations[-300:]
+            self._operations = self._operations[-1000:]
+            if self._current_operation and self._current_operation.get("name") == name:
+                self._current_operation = None
+        self._persist_throttled(force=duration_ms >= 250 or state == "failed")
+
+    def begin_operation(self, name: str, stage: str, **details: Any) -> None:
+        with self._lock:
+            self._current_operation = {
+                "name": name,
+                "stage": stage,
+                "started_at": datetime.now(timezone.utc).isoformat(),
+                "details": details,
+            }
+        self._persist_throttled()
+
+    def set_load_plan(self, planner: Any) -> None:
+        with self._lock:
+            self._load_planner = planner
+        self._persist_throttled(force=True)
 
     def record_error(self, stage: str, error_code: str) -> None:
         with self._lock:
@@ -135,6 +164,9 @@ class StartupCoordinator:
 
     def mark_server_bound(self) -> None:
         with self._lock:
+            self._server_bound = True
+            if self._management_complete and self._state == "starting":
+                self._state = "management_ready"
             self._set_event(self._server_bound_event)
         self.persist()
 
@@ -144,19 +176,41 @@ class StartupCoordinator:
     async def wait_runtime_ready(self) -> None:
         await self._event("runtime").wait()
 
+    async def wait_final_available(self) -> bool:
+        """Wait until startup reaches its final user-facing usable state."""
+        await self.wait_runtime_ready()
+        with self._lock:
+            if self._stages.get("runtime", {}).get("state") != "completed":
+                return False
+        await self._event("warmup").wait()
+        with self._lock:
+            return self._state in {"warmup_ready", "degraded"}
+
     def _event(self, kind: str) -> asyncio.Event:
         with self._lock:
             self._loop = asyncio.get_running_loop()
             if kind == "server":
                 if self._server_bound_event is None:
                     self._server_bound_event = asyncio.Event()
+                    if self._server_bound:
+                        self._server_bound_event.set()
                 return self._server_bound_event
             if kind == "runtime":
                 if self._runtime_event is None:
                     self._runtime_event = asyncio.Event()
+                    if self._stages.get("runtime", {}).get("state") in {
+                        "completed",
+                        "failed",
+                    }:
+                        self._runtime_event.set()
                 return self._runtime_event
             if self._warmup_event is None:
                 self._warmup_event = asyncio.Event()
+                if self._stages.get("warmup", {}).get("state") in {
+                    "completed",
+                    "failed",
+                }:
+                    self._warmup_event.set()
             return self._warmup_event
 
     def _set_event(self, event: asyncio.Event | None) -> None:
@@ -188,7 +242,17 @@ class StartupCoordinator:
                 "stages": dict(self._stages),
                 "errors": list(self._errors),
                 "slow_operations": slow,
+                "current_operation": dict(self._current_operation)
+                if self._current_operation
+                else None,
+                "server_bound": self._server_bound,
+                "python": {
+                    "version": platform.python_version(),
+                    "implementation": platform.python_implementation(),
+                },
             }
+            if self._load_planner is not None:
+                result["load_plan"] = self._load_planner.summary()
             for stage, completed_at in self._stage_completed_wall.items():
                 for key, prefix in (
                     ("ZHENXUN_LAUNCHER_STARTED_AT", "launcher"),
@@ -202,6 +266,22 @@ class StartupCoordinator:
                         (completed_at - started_at) * 1000, 2
                     )
             return result
+
+    def report(self) -> dict[str, Any]:
+        result = self.snapshot()
+        with self._lock:
+            result["operations"] = [asdict(item) for item in self._operations]
+            if self._load_planner is not None:
+                result["load_plan"] = self._load_planner.summary(detail=True)
+        return result
+
+    def _persist_throttled(self, *, force: bool = False) -> None:
+        now = time.monotonic()
+        with self._lock:
+            if not force and now - self._last_persist_monotonic < 0.25:
+                return
+            self._last_persist_monotonic = now
+        self.persist()
 
     def persist(self) -> None:
         try:

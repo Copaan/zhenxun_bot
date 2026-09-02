@@ -152,6 +152,25 @@ def _inspect_file(path: Path, cached: dict[str, object] | None) -> dict[str, obj
     ):
         return dict(cached)
     try:
+        from zhenxun.services.startup_load import startup_load_planner
+
+        shared = startup_load_planner.runtime_file_record(path)
+    except ImportError:
+        shared = None
+    if (
+        shared
+        and shared.get("size") == stat.st_size
+        and shared.get("mtime_ns") == stat.st_mtime_ns
+    ):
+        return {
+            "size": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+            "digest": shared.get("digest", ""),
+            "reasons": list(shared.get("runtime_reasons", [])),
+            "defines_model": bool(shared.get("defines_model")),
+            "env_dependencies": list(shared.get("env_dependencies", [])),
+        }
+    try:
         data = path.read_bytes()
     except OSError:
         data = b""

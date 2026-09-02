@@ -25,6 +25,9 @@ class HookSpec:
     timeout: float | None = None
     parallel_safe: bool = False
     failure_policy: FailurePolicy = "fatal"
+    task_id: str | None = None
+    depends_on: tuple[str, ...] = ()
+    resource_group: str | None = None
 
 
 class PriorityLifecycle:
@@ -43,6 +46,9 @@ class PriorityLifecycle:
         timeout: float | None = None,
         parallel_safe: bool = False,
         failure_policy: FailurePolicy | None = None,
+        task_id: str | None = None,
+        depends_on: tuple[str, ...] = (),
+        resource_group: str | None = None,
     ):
         if hook_type not in cls._data:
             cls._data[hook_type] = {}
@@ -55,6 +61,9 @@ class PriorityLifecycle:
             parallel_safe=parallel_safe,
             failure_policy=failure_policy
             or ("degrade" if stage == "warmup" else "fatal"),
+            task_id=task_id,
+            depends_on=depends_on,
+            resource_group=resource_group,
         )
 
     @classmethod
@@ -66,6 +75,9 @@ class PriorityLifecycle:
         timeout: float | None = None,
         parallel_safe: bool = False,
         failure_policy: FailurePolicy | None = None,
+        task_id: str | None = None,
+        depends_on: tuple[str, ...] = (),
+        resource_group: str | None = None,
     ):
         def wrapper(func):
             cls.add(
@@ -76,6 +88,9 @@ class PriorityLifecycle:
                 timeout=timeout,
                 parallel_safe=parallel_safe,
                 failure_policy=failure_policy,
+                task_id=task_id,
+                depends_on=depends_on,
+                resource_group=resource_group,
             )
             return func
 
@@ -145,51 +160,119 @@ async def _run_hook(
 
 async def _run_stage(stage: StartupStage) -> None:
     priority_data = PriorityLifecycle._data.get(PriorityLifecycleType.STARTUP, {})
+    pending: dict[str, tuple[int, Callable, HookSpec]] = {}
     for priority in sorted(priority_data):
-        funcs = [
-            func
-            for func in list(priority_data[priority])
-            if PriorityLifecycle._metadata.get(func, HookSpec()).stage == stage
+        for func in list(priority_data[priority]):
+            spec = PriorityLifecycle._metadata.get(func, HookSpec())
+            if spec.stage != stage:
+                continue
+            base_id = spec.task_id or _hook_name(func)
+            task_id = base_id
+            suffix = 2
+            while task_id in pending:
+                task_id = f"{base_id}#{suffix}"
+                suffix += 1
+            pending[task_id] = (priority, func, spec)
+
+    completed: set[str] = set()
+
+    async def run_one(task_id: str, item: tuple[int, Callable, HookSpec]) -> None:
+        priority, func, spec = item
+        try:
+            await _run_hook(
+                func,
+                priority,
+                stage=stage,
+                timeout=spec.timeout,
+            )
+            if stage == "warmup":
+                from zhenxun.services.startup_load import startup_load_planner
+
+                startup_load_planner.finish_warmup_hook(
+                    str(getattr(func, "__module__", ""))
+                )
+        except (Exception, HookPriorityException) as error:
+            logger.error(
+                f"执行启动钩子失败: {_hook_name(func)} ({type(error).__name__})",
+                e=error if isinstance(error, Exception) else None,
+            )
+            from zhenxun.services.startup_load import startup_load_planner
+
+            owner = startup_load_planner.owner_for_module(
+                str(getattr(func, "__module__", ""))
+            )
+            if owner and not startup_load_planner.is_core_plugin(owner):
+                startup_load_planner.mark_failed(
+                    owner, f"plugin_lifecycle_failed:{type(error).__name__}"
+                )
+                if stage == "warmup":
+                    startup_load_planner.finish_warmup_hook(
+                        str(getattr(func, "__module__", ""))
+                    )
+                return
+            if spec.failure_policy == "fatal":
+                raise
+            startup_coordinator.record_error(stage, f"{task_id}:{type(error).__name__}")
+
+    running: dict[
+        asyncio.Task[None], tuple[str, tuple[int, Callable, HookSpec], str]
+    ] = {}
+    while pending or running:
+        ready = [
+            (task_id, item)
+            for task_id, item in pending.items()
+            if set(item[2].depends_on) <= completed
         ]
-        if not funcs:
+        if not ready and not running:
+            unresolved = ",".join(sorted(pending))
+            raise RuntimeError(f"startup_dependency_cycle:{unresolved}")
+        if ready:
+            # Keep priorities as barriers even when a parallel hook finishes first.
+            # Otherwise a higher-priority task could start while another task from
+            # the previous priority is still mutating shared startup state.
+            min_priority = (
+                min(item[0] for _, item, _ in running.values())
+                if running
+                else min(item[0] for _, item in ready)
+            )
+            ready = sorted(
+                (row for row in ready if row[1][0] == min_priority),
+                key=lambda row: row[0],
+            )
+            active_groups = {row[2] for row in running.values()}
+            running_is_parallel = all(
+                row[1][2].parallel_safe for row in running.values()
+            )
+            for task_id, item in ready:
+                spec = item[2]
+                group = spec.resource_group or task_id
+                if running and (not running_is_parallel or not spec.parallel_safe):
+                    continue
+                if not spec.parallel_safe and running:
+                    continue
+                if group in active_groups:
+                    continue
+                task = asyncio.create_task(
+                    run_one(task_id, item), name=f"startup:{stage}:{task_id}"
+                )
+                running[task] = (task_id, item, group)
+                pending.pop(task_id, None)
+                active_groups.add(group)
+                if not spec.parallel_safe:
+                    break
+        if not running:
             continue
-        run_parallel = len(funcs) > 1 and all(
-            PriorityLifecycle._metadata.get(func, HookSpec()).parallel_safe
-            for func in funcs
-        )
-
-        async def run_one(func: Callable) -> None:
-            spec = PriorityLifecycle._metadata.get(func, HookSpec(stage=stage))
+        done, _ = await asyncio.wait(running, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            task_id, _, _ = running.pop(task)
             try:
-                await _run_hook(
-                    func,
-                    priority,
-                    stage=stage,
-                    timeout=spec.timeout,
-                )
-            except (Exception, HookPriorityException) as error:
-                logger.error(
-                    f"执行启动钩子失败: {_hook_name(func)} ({type(error).__name__})",
-                    e=error if isinstance(error, Exception) else None,
-                )
-                if spec.failure_policy == "fatal":
-                    raise
-                startup_coordinator.record_error(
-                    stage, f"{_hook_name(func)}:{type(error).__name__}"
-                )
-
-        if run_parallel:
-            results = await asyncio.gather(
-                *(run_one(func) for func in funcs), return_exceptions=True
-            )
-            fatal = next(
-                (item for item in results if isinstance(item, BaseException)), None
-            )
-            if fatal is not None:
-                raise fatal
-        else:
-            for func in funcs:
-                await run_one(func)
+                task.result()
+            except BaseException:
+                for active in running:
+                    active.cancel()
+                await asyncio.gather(*running, return_exceptions=True)
+                raise
+            completed.add(task_id)
 
 
 _post_management_task: asyncio.Task[None] | None = None
@@ -199,6 +282,10 @@ async def _run_post_management() -> None:
     await startup_coordinator.wait_server_bound()
     startup_coordinator.begin_stage("runtime")
     try:
+        from zhenxun.services.startup_load import startup_load_planner
+
+        if startup_load_planner.prepared:
+            await startup_load_planner.load_runtime()
         await _run_stage("runtime")
     except asyncio.CancelledError:
         raise
@@ -207,6 +294,8 @@ async def _run_post_management() -> None:
             "runtime", f"runtime_stage_failed:{type(error).__name__}"
         )
         return
+    if startup_load_planner.prepared:
+        startup_load_planner.prepare_warmup_gates()
     startup_coordinator.finish_stage("runtime")
 
     startup_coordinator.begin_stage("warmup")
