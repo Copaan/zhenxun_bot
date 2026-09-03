@@ -3,6 +3,7 @@ LLM 模型管理器
 对外提供统一的配置查询、模型发现与实例化入口。
 """
 
+import asyncio
 from typing import Any
 
 from zhenxun.services.ai.config import (
@@ -14,6 +15,7 @@ from zhenxun.services.ai.core.exceptions import ConfigurationException
 from zhenxun.services.ai.core.models import ModelCapabilities, ModelDetail
 from zhenxun.services.ai.core.options import GenerationConfig
 from zhenxun.services.ai.utils.logger import log_llm as logger
+from zhenxun.services.lifecycle import ResourceReceipt, RuntimeHandle
 from zhenxun.utils.manager.priority_manager import PriorityLifecycle
 from zhenxun.utils.pydantic_compat import model_copy, model_dump
 
@@ -326,6 +328,114 @@ def clear_all_cache() -> None:
     logger.debug("已清空全局模型实例与路由组缓存")
 
 
+class AIRuntimeHandle:
+    async def quiesce(self) -> None:
+        return None
+
+    async def close(self) -> None:
+        from zhenxun.services.ai.tools.providers.mcp.provider import mcp_provider
+
+        await mcp_provider.shutdown()
+        await health_manager.shutdown()
+
+    def health(self) -> dict[str, object]:
+        persister = health_manager._persister
+        watchdog = getattr(persister, "_watchdog_task", None)
+        return {
+            "healthy": persister is None or watchdog is None or not watchdog.done(),
+            "provider_count": len(health_manager.state.providers),
+        }
+
+    def snapshot(self) -> dict[str, object]:
+        return {
+            "provider_count": len(health_manager.state.providers),
+            "route_count": len(health_manager.state.routes),
+            "resolved_group_cache": len(_RESOLVED_GROUP_CACHE),
+        }
+
+    def resource_snapshot(self) -> list[ResourceReceipt]:
+        persister = health_manager._persister
+        receipts = [
+            ResourceReceipt(
+                receipt_id="ai:health-persister",
+                provider="ai",
+                resource_type="health_persister",
+                owner_id="warmup:ai",
+                state="active" if persister is not None else "released",
+            )
+        ]
+        tasks = [getattr(persister, "_watchdog_task", None)]
+        from zhenxun.services.ai.tools.providers.mcp.provider import mcp_provider
+
+        for toolkit in mcp_provider._toolkits.values():
+            tasks.extend(
+                [
+                    getattr(toolkit, "_shared_task", None),
+                    getattr(
+                        getattr(toolkit, "lifespan_manager", None),
+                        "_watchdog_task",
+                        None,
+                    ),
+                ]
+            )
+        receipts.extend(
+            ResourceReceipt(
+                receipt_id=f"task:{id(task)}",
+                provider="ai",
+                resource_type="task",
+                owner_id="warmup:ai",
+                detail={"name": task.get_name()},
+            )
+            for task in tasks
+            if isinstance(task, asyncio.Task) and not task.done()
+        )
+        return receipts
+
+
+class AISandboxRuntimeHandle:
+    async def quiesce(self) -> None:
+        return None
+
+    async def close(self) -> None:
+        from zhenxun.services.ai.sandbox.manager import _shutdown_sandboxes
+
+        await _shutdown_sandboxes()
+
+    def health(self) -> dict[str, object]:
+        return {"healthy": True}
+
+    def snapshot(self) -> dict[str, object]:
+        from zhenxun.services.ai.sandbox.manager import sandbox_manager
+
+        return {"active_sessions": len(sandbox_manager._active_sessions)}
+
+    def resource_snapshot(self) -> list[ResourceReceipt]:
+        from zhenxun.services.ai.sandbox.manager import sandbox_manager
+
+        receipts = [
+            ResourceReceipt(
+                receipt_id=f"sandbox:{session_id}",
+                provider="sandbox",
+                resource_type="session",
+                owner_id="warmup:ai_sandbox",
+                reversible=False,
+            )
+            for session_id in sandbox_manager._active_sessions
+        ]
+        watchdog = sandbox_manager.lifespan_manager._watchdog_task
+        if isinstance(watchdog, asyncio.Task) and not watchdog.done():
+            receipts.append(
+                ResourceReceipt(
+                    receipt_id=f"task:{id(watchdog)}",
+                    provider="sandbox",
+                    resource_type="task",
+                    owner_id="warmup:ai_sandbox",
+                    detail={"name": watchdog.get_name()},
+                )
+            )
+        return receipts
+
+
 @PriorityLifecycle.on_startup(
     priority=10,
     stage="warmup",
@@ -333,9 +443,13 @@ def clear_all_cache() -> None:
     parallel_safe=True,
     failure_policy="degrade",
     task_id="warmup:ai",
+    component_id="warmup:ai",
     resource_group="ai",
+    restart_policy="component",
+    config_keys=("AI", "LLM", "AI_PROVIDER", "AI_TOOLS", "MCP"),
+    pass_context=True,
 )
-async def _init_llm_config_on_startup():
+async def _init_llm_config_on_startup(_context):
     """启动时初始化 LLM 配置、密钥状态并预热工具提供者管理器。"""
     logger.info("正在初始化 LLM 配置并加载遥测状态...")
     try:
@@ -346,14 +460,30 @@ async def _init_llm_config_on_startup():
         get_llm_config()
         await health_manager.initialize()
         await tool_provider_manager.initialize()
+        return RuntimeHandle(
+            controller=AIRuntimeHandle(),
+            metadata={"ownership": "composite"},
+        )
 
     except Exception as e:
         logger.error(f"LLM 配置或遥测状态初始化时发生错误: {e}", e=e)
         raise
 
 
-@PriorityLifecycle.on_shutdown(priority=40, timeout=20)
-async def _shutdown_llm_tool_providers() -> None:
-    from zhenxun.services.ai.tools.providers.mcp.provider import mcp_provider
+@PriorityLifecycle.on_startup(
+    priority=20,
+    stage="warmup",
+    component_id="warmup:ai_sandbox",
+    failure_policy="degrade",
+    restart_policy="worker",
+    config_keys=("ENABLE_SANDBOX", "SANDBOX_TYPE"),
+    pass_context=True,
+)
+async def _start_ai_sandbox(context) -> RuntimeHandle:
+    from zhenxun.services.ai.sandbox.manager import _startup_sandboxes
 
-    await mcp_provider.shutdown()
+    await _startup_sandboxes(context)
+    return RuntimeHandle(
+        controller=AISandboxRuntimeHandle(),
+        metadata={"ownership": "composite"},
+    )

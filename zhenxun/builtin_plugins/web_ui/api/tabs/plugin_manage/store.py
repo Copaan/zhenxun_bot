@@ -157,6 +157,21 @@ def _install_state(
     return "version_unknown", False, "installed_version_uncomparable"
 
 
+def _runtime_capability(
+    *,
+    available: bool,
+    runtime: dict[str, Any],
+    unavailable_reason: str,
+) -> dict[str, Any]:
+    if not available:
+        return {"mode": "blocked", "reason_codes": [unavailable_reason]}
+    hot = runtime.get("reload_support") == "hot_reloadable"
+    return {
+        "mode": "hot_reloadable" if hot else "restart_required",
+        "reason_codes": list(runtime.get("reload_reasons") or []),
+    }
+
+
 def _receipt_data(
     *,
     source: str,
@@ -219,8 +234,12 @@ def _dependency_packages(install_result: Any) -> dict[str, str]:
 
 
 @asynccontextmanager
-async def _store_operation() -> AsyncIterator[None]:
-    async with plugin_store_operation_coordinator.operation():
+async def _store_operation(
+    *, operation_id: str | None = None, owner: str | None = None
+) -> AsyncIterator[None]:
+    async with plugin_store_operation_coordinator.operation(
+        operation_id=operation_id, owner=owner
+    ):
         yield
 
 
@@ -291,6 +310,30 @@ def _resolve_runtime_module_name(path: Path) -> str:
     ):
         raise PluginRuntimeModuleError("plugin_runtime_module_invalid")
     return module_name
+
+
+def _resolve_uninstall_runtime_module_name(path: Path) -> str:
+    """Resolve a plugin module even when only runtime-created files remain."""
+    try:
+        return _resolve_runtime_module_name(path)
+    except PluginRuntimeModuleError:
+        project_root = Path.cwd().resolve()
+        plugin_root = (project_root / "zhenxun" / "plugins").resolve()
+        resolved_path = path.resolve()
+        try:
+            relative_path = resolved_path.relative_to(plugin_root)
+        except ValueError as e:
+            raise PluginRuntimeModuleError("plugin_runtime_module_invalid") from e
+        if (
+            not resolved_path.is_dir()
+            or not relative_path.parts
+            or any(not part.isidentifier() for part in relative_path.parts)
+        ):
+            raise PluginRuntimeModuleError("plugin_runtime_module_invalid")
+        module_name = ".".join(("zhenxun", "plugins", *relative_path.parts))
+        if any(not part.isidentifier() for part in module_name.split(".")):
+            raise PluginRuntimeModuleError("plugin_runtime_module_invalid")
+        return module_name
 
 
 def _store_operation_info(action: str, plugin_name: str, operation: dict) -> str:
@@ -504,6 +547,9 @@ async def _(refresh: bool = False) -> Result[dict]:
                 else []
             )
             pending_operation = pending_by_key.get(store_key)
+            runtime = plugin_runtime_manager.classification_for(
+                runtime_module or plugin.module
+            )
             plugin_list.append(
                 {
                     **model_dump(plugin),
@@ -535,9 +581,30 @@ async def _(refresh: bool = False) -> Result[dict]:
                     "catalog_status": health.get("status", "unknown"),
                     "blocked_reasons": blocked_reasons,
                     "update_available": update_available,
-                    **plugin_runtime_manager.classification_for(
-                        runtime_module or plugin.module
+                    "install_capability": _runtime_capability(
+                        available=not installed and not blocked_reasons,
+                        runtime=runtime,
+                        unavailable_reason=(
+                            "catalog_source_missing"
+                            if blocked_reasons
+                            else "plugin_already_installed"
+                        ),
                     ),
+                    "update_capability": _runtime_capability(
+                        available=installed and update_available,
+                        runtime=runtime,
+                        unavailable_reason=(
+                            "plugin_update_not_available"
+                            if installed
+                            else "plugin_not_installed"
+                        ),
+                    ),
+                    "uninstall_capability": _runtime_capability(
+                        available=installed,
+                        runtime=runtime,
+                        unavailable_reason="plugin_not_installed",
+                    ),
+                    **runtime,
                 }
             )
         return Result.ok(
@@ -566,7 +633,9 @@ async def _(param: PluginIr) -> Result:
     journal_operation_id: str | None = None
     journal_store_key: str | None = None
     try:
-        async with _store_operation():
+        async with _store_operation(
+            operation_id=param.operation_id, owner="webui.plugin_store"
+        ):
             require("plugin_store")
             from zhenxun.builtin_plugins.plugin_store import StoreManager
 
@@ -697,7 +766,9 @@ async def _(param: PluginIr) -> Result:
     journal_operation_id: str | None = None
     journal_store_key: str | None = None
     try:
-        async with _store_operation():
+        async with _store_operation(
+            operation_id=param.operation_id, owner="webui.plugin_store"
+        ):
             require("plugin_store")
             from zhenxun.builtin_plugins.plugin_store import StoreManager
 
@@ -831,7 +902,9 @@ async def _(param: PluginIr) -> Result:
     journal_operation_id: str | None = None
     journal_store_key: str | None = None
     try:
-        async with _store_operation():
+        async with _store_operation(
+            operation_id=param.operation_id, owner="webui.plugin_store"
+        ):
             require("plugin_store")
             from zhenxun.builtin_plugins.plugin_store import StoreManager
 
@@ -871,7 +944,7 @@ async def _(param: PluginIr) -> Result:
             path = StoreManager._resolve_local_plugin_path(
                 plugin_info, is_external=is_external
             )
-            runtime_module = _resolve_runtime_module_name(path)
+            runtime_module = _resolve_uninstall_runtime_module_name(path)
             runtime_classification = plugin_runtime_manager.classification_for(
                 runtime_module
             )
@@ -1001,7 +1074,9 @@ async def _(param: PluginReloadPayload) -> Result:
     journal_operation_id: str | None = None
     journal_store_key: str | None = None
     try:
-        async with _store_operation():
+        async with _store_operation(
+            operation_id=param.operation_id, owner="webui.plugin_store"
+        ):
             module = param.module
             if param.store_key:
                 receipt = StoreReceiptStore.load().get(param.store_key)

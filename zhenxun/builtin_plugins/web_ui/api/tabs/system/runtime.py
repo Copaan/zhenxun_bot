@@ -7,6 +7,7 @@ from zhenxun.services.runtime_reload import plugin_runtime_manager
 from zhenxun.services.startup import startup_coordinator
 
 from ....base_model import Result
+from ....restart_service import transaction_verification_status
 from ....utils import authentication
 
 router = APIRouter(prefix="/runtime")
@@ -19,7 +20,9 @@ router = APIRouter(prefix="/runtime")
     description="获取worker分级启动状态",
 )
 async def get_startup_status() -> Result[dict[str, Any]]:
-    return Result.ok(startup_coordinator.snapshot())
+    return Result.ok(
+        {**startup_coordinator.snapshot(), **transaction_verification_status()}
+    )
 
 
 @router.get(

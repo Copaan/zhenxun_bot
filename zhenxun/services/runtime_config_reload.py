@@ -69,6 +69,14 @@ async def reload_runtime_config(
             with contextlib.suppress(Exception):
                 reschedule()
 
+    async def apply_new_runtime() -> None:
+        Config.reload(strict=True)
+        await refresh_derived_state()
+
+    async def apply_previous_runtime() -> None:
+        Config.restore_runtime_values(snapshot)
+        await refresh_derived_state()
+
     snapshot = Config.snapshot_runtime_values()
     before = deepcopy(
         Config._simple_data if previous_simple_data is None else previous_simple_data
@@ -86,7 +94,35 @@ async def reload_runtime_config(
             logger.debug(f"运行时配置变更键: {', '.join(changed_paths)}")
         else:
             logger.debug("config.yaml 语义内容未变化，跳过配置消费者重载")
-        await refresh_derived_state()
+        Config.restore_runtime_values(snapshot)
+        lifecycle_keys = {
+            value
+            for module, key in changed_dependencies
+            for value in (module.upper(), f"{module}.{key}".upper())
+        }
+        from zhenxun.services.lifecycle import lifecycle_kernel
+
+        component_result = await lifecycle_kernel.restart_for_config(
+            lifecycle_keys,
+            apply_change=apply_new_runtime,
+            rollback_change=apply_previous_runtime,
+        )
+        if component_result.apply_effect == "no_change":
+            await apply_new_runtime()
+        elif component_result.apply_effect == "restart_pending":
+            operation = await plugin_runtime_manager.request_restart(
+                set(component_result.affected_components),
+                "component_not_restartable",
+                submit_launcher=submit_restart,
+            )
+            operation.config_keys = changed_paths
+            operation.component_effects = {
+                key: "worker_restart" for key in sorted(lifecycle_keys)
+            }
+            operation.affected_components = component_result.affected_components
+            return operation
+        elif component_result.apply_effect == "rolled_back":
+            raise RuntimeConfigReloadError("component_restart_rolled_back")
         operation = None
         if reload_consumers:
             try:
@@ -108,17 +144,38 @@ async def reload_runtime_config(
             )
         if operation is None:
             operation = RuntimeOperation(
-                ApplyMode.CONFIG_RELOADED,
+                ApplyMode.COMPONENT_RESTARTED
+                if component_result.apply_effect == "component_restarted"
+                else ApplyMode.CONFIG_RELOADED,
                 "completed",
                 changed_paths,
                 generation=plugin_runtime_manager.generation,
             )
             plugin_runtime_manager.last_operation = operation
         operation.config_keys = changed_paths
+        operation.component_effects = {
+            key: component_result.apply_effect for key in sorted(lifecycle_keys)
+        }
+        operation.affected_components = component_result.affected_components
+        operation.rollback_state = component_result.rollback_state
         plugin_runtime_manager.mark_content_processed(Path("data/config.yaml"))
         return operation
     except Exception:
-        Config.restore_runtime_values(snapshot)
+        try:
+            if "component_result" in locals() and (
+                component_result.apply_effect == "component_restarted"
+            ):
+                from zhenxun.services.lifecycle import lifecycle_kernel
+
+                await lifecycle_kernel.restart_for_config(
+                    lifecycle_keys,
+                    apply_change=apply_previous_runtime,
+                    rollback_change=apply_new_runtime,
+                )
+            else:
+                Config.restore_runtime_values(snapshot)
+        except Exception as component_rollback_error:
+            logger.error("配置组件回滚失败，需要重启worker", e=component_rollback_error)
         try:
             Config.save()
             await refresh_derived_state()

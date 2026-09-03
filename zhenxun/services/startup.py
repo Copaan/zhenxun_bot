@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import os
 from pathlib import Path
 import platform
+import sys
 from threading import RLock
 import time
 from typing import Any, Literal
@@ -43,12 +44,14 @@ class StartupCoordinator:
         self.pid = os.getpid()
         self.started_at = datetime.now(timezone.utc).isoformat()
         self._started_monotonic = time.monotonic()
+        self._finished_monotonic: float | None = None
         self._state: StartupState = "starting"
         self._stage_started: dict[str, float] = {}
         self._stage_completed_wall: dict[str, float] = {}
         self._stages: dict[str, dict[str, Any]] = {}
         self._operations: list[OperationRecord] = []
         self._errors: list[dict[str, str]] = []
+        self._degraded_reasons: list[dict[str, str]] = []
         self._current_operation: dict[str, Any] | None = None
         self._load_planner: Any | None = None
         self._management_complete = False
@@ -92,12 +95,22 @@ class StartupCoordinator:
                 self._set_event(self._runtime_event)
             else:
                 self._state = "warmup_ready" if not self._errors else "degraded"
+                if self._finished_monotonic is None:
+                    self._finished_monotonic = time.monotonic()
                 self._set_event(self._warmup_event)
         self.persist()
 
     def fail_stage(
-        self, stage: StartupStage, error_code: str, *, fatal: bool = True
+        self,
+        stage: StartupStage,
+        error_code: str,
+        *,
+        fatal: bool = True,
+        source_type: str = "stage",
+        source_id: str | None = None,
+        display_name: str | None = None,
     ) -> None:
+        added = False
         with self._lock:
             started = self._stage_started.get(stage, time.monotonic())
             self._stages[stage] = {
@@ -106,13 +119,27 @@ class StartupCoordinator:
                 "error_code": error_code,
             }
             self._stage_completed_wall[stage] = time.time()
-            self._errors.append({"stage": stage, "code": error_code})
+            error = {"stage": stage, "code": error_code}
+            if error not in self._errors:
+                self._errors.append(error)
+            added = self._append_degraded_reason_locked(
+                stage,
+                error_code,
+                source_type=source_type,
+                source_id=source_id,
+                display_name=display_name,
+            )
             self._state = "failed" if fatal else "degraded"
+            if self._finished_monotonic is None:
+                self._finished_monotonic = time.monotonic()
             if stage == "runtime":
                 self._set_event(self._runtime_event)
             if stage == "warmup":
                 self._set_event(self._warmup_event)
+        reason = dict(self._degraded_reasons[-1]) if added else None
         self.persist()
+        if added:
+            self._log_degraded_reason(reason or {})
 
     def record_operation(
         self,
@@ -156,11 +183,111 @@ class StartupCoordinator:
             self._load_planner = planner
         self._persist_throttled(force=True)
 
-    def record_error(self, stage: str, error_code: str) -> None:
+    def record_error(
+        self,
+        stage: str,
+        error_code: str,
+        *,
+        source_type: str = "operation",
+        source_id: str | None = None,
+        display_name: str | None = None,
+    ) -> None:
+        added = False
         with self._lock:
             item = {"stage": stage, "code": error_code}
             if item not in self._errors:
                 self._errors.append(item)
+            added = self._append_degraded_reason_locked(
+                stage,
+                error_code,
+                source_type=source_type,
+                source_id=source_id,
+                display_name=display_name,
+            )
+        reason = dict(self._degraded_reasons[-1]) if added else None
+        if added:
+            self._log_degraded_reason(reason or {})
+            self._persist_throttled(force=True)
+
+    def _append_degraded_reason_locked(
+        self,
+        stage: str,
+        error_code: str,
+        *,
+        source_type: str,
+        source_id: str | None,
+        display_name: str | None,
+    ) -> bool:
+        normalized_source_id = str(source_id or "").strip() or "unknown"
+        reason = {
+            "stage": str(stage),
+            "source_type": str(source_type or "operation"),
+            "source_id": normalized_source_id,
+            "code": str(error_code),
+            "display_name": str(display_name or normalized_source_id),
+        }
+        identity = (
+            reason["stage"],
+            reason["source_type"],
+            reason["source_id"],
+            reason["code"],
+        )
+        if any(
+            (
+                item["stage"],
+                item["source_type"],
+                item["source_id"],
+                item["code"],
+            )
+            == identity
+            for item in self._degraded_reasons
+        ):
+            return False
+        self._degraded_reasons.append(reason)
+        return True
+
+    @staticmethod
+    def _log_degraded_reason(reason: dict[str, str]) -> None:
+        try:
+            from zhenxun.services.log import logger
+
+            logger.warning(
+                "启动能力降级 | "
+                f"stage={reason['stage']} | source={reason['source_type']}:"
+                f"{reason['source_id']} | code={reason['code']}",
+                "Startup",
+            )
+        except Exception:
+            pass
+
+    def record_lifecycle_event(self, event: dict[str, Any]) -> None:
+        component = event.get("component") or {}
+        component_id = str(component.get("component_id") or "unknown")
+        state = str(component.get("state") or event.get("event") or "unknown")
+        with self._lock:
+            self._current_operation = (
+                {
+                    "name": component_id,
+                    "stage": str(component.get("stage") or "runtime"),
+                    "state": state,
+                }
+                if state in {"starting", "quiescing", "stopping"}
+                else None
+            )
+        if state in {"degraded", "failed"}:
+            error_code = str(
+                component.get("error_code")
+                or event.get("error_code")
+                or f"component_{state}"
+            )
+            self.record_error(
+                str(component.get("stage") or "runtime"),
+                error_code,
+                source_type="component",
+                source_id=component_id,
+                display_name=component_id,
+            )
+        self._persist_throttled(force=state in {"failed", "degraded"})
 
     def mark_server_bound(self) -> None:
         with self._lock:
@@ -237,15 +364,26 @@ class StartupCoordinator:
                 "state": self._state,
                 "started_at": self.started_at,
                 "elapsed_ms": round(
-                    (time.monotonic() - self._started_monotonic) * 1000, 2
+                    (
+                        (self._finished_monotonic or time.monotonic())
+                        - self._started_monotonic
+                    )
+                    * 1000,
+                    2,
                 ),
                 "stages": dict(self._stages),
                 "errors": list(self._errors),
+                "degraded_reasons": list(self._degraded_reasons),
                 "slow_operations": slow,
                 "current_operation": dict(self._current_operation)
                 if self._current_operation
                 else None,
                 "server_bound": self._server_bound,
+                "operating_mode": (
+                    "management_only" if self._state == "failed" else "normal"
+                ),
+                "accepts_bot_events": self.runtime_ready,
+                "failure_terminal": self._state == "failed",
                 "python": {
                     "version": platform.python_version(),
                     "implementation": platform.python_implementation(),
@@ -253,6 +391,43 @@ class StartupCoordinator:
             }
             if self._load_planner is not None:
                 result["load_plan"] = self._load_planner.summary()
+            try:
+                from zhenxun.services.lifecycle import lifecycle_kernel
+
+                lifecycle = lifecycle_kernel.status()
+                result["lifecycle"] = {
+                    key: value
+                    for key, value in lifecycle.items()
+                    if key != "components"
+                }
+            except Exception:
+                pass
+            try:
+                from zhenxun.services.message_load import (
+                    db_unhealthy_reason,
+                    is_db_unhealthy,
+                )
+
+                cache_module = sys.modules.get("zhenxun.services.cache.runtime_cache")
+                watchdog_module = sys.modules.get(
+                    "zhenxun.services.db_context.watchdog"
+                )
+                result["database_health"] = {
+                    "unhealthy": is_db_unhealthy(),
+                    "reason": db_unhealthy_reason(),
+                    "runtime_cache": (
+                        cache_module.refresh_coordinator_snapshot()
+                        if cache_module is not None
+                        else {"running": False, "state": "not_loaded"}
+                    ),
+                    "watchdog": (
+                        watchdog_module.watchdog_snapshot()
+                        if watchdog_module is not None
+                        else {"running": False, "state": "not_loaded"}
+                    ),
+                }
+            except Exception:
+                pass
             for stage, completed_at in self._stage_completed_wall.items():
                 for key, prefix in (
                     ("ZHENXUN_LAUNCHER_STARTED_AT", "launcher"),
@@ -273,6 +448,12 @@ class StartupCoordinator:
             result["operations"] = [asdict(item) for item in self._operations]
             if self._load_planner is not None:
                 result["load_plan"] = self._load_planner.summary(detail=True)
+        try:
+            from zhenxun.services.lifecycle import lifecycle_kernel
+
+            result["lifecycle"] = lifecycle_kernel.status()
+        except Exception:
+            pass
         return result
 
     def _persist_throttled(self, *, force: bool = False) -> None:
@@ -291,5 +472,12 @@ class StartupCoordinator:
 
 
 startup_coordinator = StartupCoordinator()
+
+try:
+    from zhenxun.services.lifecycle import lifecycle_kernel
+
+    lifecycle_kernel.add_observer(startup_coordinator.record_lifecycle_event)
+except Exception:
+    pass
 
 __all__ = ["StartupCoordinator", "startup_coordinator"]

@@ -2,6 +2,7 @@ import asyncio
 from datetime import timedelta
 import json
 import secrets
+import time
 
 import aiofiles
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -22,12 +23,19 @@ from ..passwords import (
     validate_new_password,
     verify_password,
 )
-from ..security import login_attempt_limiter, revoke_authenticated_websockets
+from ..security import (
+    decode_access_token_status,
+    login_attempt_limiter,
+    renew_authenticated_websockets,
+    revoke_authenticated_websockets,
+)
 from ..utils import (
+    ACCESS_TOKEN_ABSOLUTE_HOURS,
     ACCESS_TOKEN_EXPIRE_MINUTES,
     authentication,
     create_token,
     get_user,
+    oauth2_scheme,
     token_data,
     token_file,
 )
@@ -36,6 +44,7 @@ app = nonebot.get_app()
 
 
 router = APIRouter()
+_TOKEN_WRITE_LOCK = asyncio.Lock()
 
 
 class ConsoleConnectRequest(BaseModel):
@@ -47,16 +56,24 @@ class PasswordResetRequest(BaseModel):
     confirm_password: str = Field(min_length=8, max_length=1024)
 
 
+class SessionActivityResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    expires_in: int
+    absolute_expires_in: int
+
+
 def _client_key(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
 async def _remember_token(access_token: str) -> None:
-    token_data["token"].append(access_token)
-    if len(token_data["token"]) > 3:
-        token_data["token"] = token_data["token"][-3:]
-    async with aiofiles.open(token_file, "w", encoding="utf8") as stream:
-        await stream.write(json.dumps(token_data, ensure_ascii=False, indent=4))
+    async with _TOKEN_WRITE_LOCK:
+        token_data["token"].append(access_token)
+        if len(token_data["token"]) > 3:
+            token_data["token"] = token_data["token"][-3:]
+        async with aiofiles.open(token_file, "w", encoding="utf8") as stream:
+            await stream.write(json.dumps(token_data, ensure_ascii=False, indent=4))
 
 
 @router.post("/login")
@@ -135,6 +152,50 @@ async def console_connect(request: Request, payload: ConsoleConnectRequest) -> R
             "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,
         },
         "已通过本次启动的控制台链接临时登录。",
+    )
+
+
+@router.post("/auth/activity", response_model=Result[SessionActivityResponse])
+async def renew_session_activity(token: str = Depends(oauth2_scheme)) -> Result:
+    claims, status = decode_access_token_status(token)
+    if claims is None:
+        raise HTTPException(
+            status_code=401,
+            detail=("登录会话已过期。" if status == "expired" else "登录验证失败。"),
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    username = str(claims.get("sub") or "")
+    user = get_user(username)
+    if user is None:
+        raise HTTPException(status_code=401, detail="登录账户已失效。")
+    now = int(time.time())
+    absolute_exp = int(
+        claims.get("absolute_exp")
+        or claims.get("auth_time", now) + ACCESS_TOKEN_ABSOLUTE_HOURS * 3600
+    )
+    if now >= absolute_exp:
+        raise HTTPException(status_code=401, detail="登录会话已达到最长有效期。")
+    retained = {
+        key: claims[key]
+        for key in ("sid", "auth_time", "absolute_exp", "auth_source", "boot_id")
+        if key in claims
+    }
+    access_token = create_token(
+        user=user,
+        expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
+        extra_claims=retained,
+    )
+    refreshed, _ = decode_access_token_status(access_token)
+    expires_at = int((refreshed or {}).get("exp", now))
+    renew_authenticated_websockets(str((refreshed or {}).get("sid") or ""), expires_at)
+    await _remember_token(access_token)
+    return Result.ok(
+        {
+            "access_token": access_token,
+            "token_type": "bearer",
+            "expires_in": max(0, expires_at - now),
+            "absolute_expires_in": max(0, absolute_exp - now),
+        }
     )
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from datetime import datetime, timezone
 import hashlib
 from html.parser import HTMLParser
@@ -17,6 +18,8 @@ import zipfile
 
 import httpx
 
+from zhenxun.services.lifecycle.operations import operation_registry
+from zhenxun.services.runtime_mutation import runtime_mutation_coordinator
 from zhenxun.utils.atomic_json import write_json_locked
 
 logger = logging.getLogger(__name__)
@@ -325,6 +328,13 @@ def _update_job(job_id: str, **changes: Any) -> dict[str, Any]:
     job.update(changes)
     job["updated_at"] = _now_iso()
     _write_json(_job_path(job_id), job)
+    if operation_registry.get(job_id) is not None:
+        with contextlib.suppress(Exception):
+            operation_registry.update(
+                job_id,
+                phase=str(job.get("state") or "running"),
+                progress=int(job.get("progress") or 0),
+            )
     return job
 
 
@@ -700,7 +710,14 @@ async def _prepare_job(job_id: str) -> None:
             checksum=checksum,
         )
         if component == "webui":
-            await asyncio.to_thread(_apply_webui, job_id, root)
+            operation_registry.mark_commit_critical(job_id, "webui_hot_apply")
+            async with runtime_mutation_coordinator.operation(
+                "webui_update",
+                operation_id=job_id,
+                owner="webui.update",
+                phase="hot_apply",
+            ):
+                await asyncio.to_thread(_apply_webui, job_id, root)
             _update_job(
                 job_id,
                 state="completed",
@@ -715,7 +732,14 @@ async def _prepare_job(job_id: str) -> None:
         if component == "resource":
             _update_job(job_id, state="applying", progress=82)
             try:
-                result = await _apply_resource_update_hot(job_id, root)
+                operation_registry.mark_commit_critical(job_id, "resource_hot_apply")
+                async with runtime_mutation_coordinator.operation(
+                    "resource_update",
+                    operation_id=job_id,
+                    owner="webui.update",
+                    phase="hot_apply",
+                ):
+                    result = await _apply_resource_update_hot(job_id, root)
             except ResourceHotSwapUnavailable as error:
                 fallback_reason = str(error)
                 logger.info(
@@ -766,6 +790,36 @@ async def _prepare_job(job_id: str) -> None:
         _update_job(
             job_id, state="failed", error=code, progress=100, apply_mode="failed"
         )
+        raise
+
+
+def _update_checkpoint(job_id: str) -> dict[str, Any]:
+    try:
+        job = read_job(job_id)
+    except UpdateServiceError:
+        return {"job_state": "missing"}
+    return {
+        "job_state": job.get("state"),
+        "progress": job.get("progress"),
+        "ref": job.get("ref"),
+        "checksum": job.get("checksum"),
+    }
+
+
+def _recover_update(record: dict[str, Any]):
+    job_id = str(record.get("operation_id") or "")
+    if not job_id:
+        return None
+    try:
+        job = read_job(job_id)
+    except UpdateServiceError:
+        return None
+    if job.get("state") in {"completed", "failed", "pending_restart"}:
+        return None
+    return _prepare_job(job_id)
+
+
+operation_registry.register_recovery_handler("update_prepare", _recover_update)
 
 
 async def create_update_job(
@@ -809,8 +863,19 @@ async def create_update_job(
             "updated_at": _now_iso(),
         }
         _write_json(_job_path(job_id), job)
-        _ACTIVE_TASK = asyncio.create_task(
-            _prepare_job(job_id), name=f"update-{component}-{job_id[:8]}"
+        _, _ACTIVE_TASK = operation_registry.start(
+            "update_prepare",
+            _prepare_job(job_id),
+            operation_id=job_id,
+            public_input={
+                "component": component,
+                "channel": channel,
+                "method": method,
+                "source": source,
+            },
+            recovery_policy="restart",
+            checkpoint=lambda: _update_checkpoint(job_id),
+            name=f"update-{component}-{job_id[:8]}",
         )
     return job
 

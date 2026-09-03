@@ -45,6 +45,29 @@ def _current_access_urls() -> list[str]:
     return preferred_access_urls(host, port)
 
 
+def transaction_verification_status() -> dict[str, Any]:
+    sources: list[str] = []
+    try:
+        from zhenxun.nonebot_store.storage import load_manifest
+
+        if load_manifest().get("pending_verification"):
+            sources.append("nonebot_store")
+    except Exception:
+        pass
+    try:
+        from zhenxun.plugin_store_transaction import pending_transaction
+
+        transaction = pending_transaction() or {}
+        if transaction.get("state") == "verification_pending":
+            sources.append("zhenxun_store")
+    except Exception:
+        pass
+    return {
+        "transaction_verification_pending": bool(sources),
+        "transaction_verification_sources": sources,
+    }
+
+
 def restart_status_data(*, access_urls: list[str] | None = None) -> dict[str, Any]:
     urls = list(dict.fromkeys([*(access_urls or []), *_current_access_urls()]))
     access_targets = [{"kind": _target_kind(url), "url": url} for url in urls]
@@ -147,6 +170,7 @@ def restart_status_data(*, access_urls: list[str] | None = None) -> dict[str, An
         "pending_reasons": sorted(pending_reasons),
         "pending_count": len(pending_items),
         "pending_items": pending_items,
+        **transaction_verification_status(),
     }
 
 
@@ -168,4 +192,5 @@ __all__ = [
     "preferred_access_urls",
     "request_webui_restart",
     "restart_status_data",
+    "transaction_verification_status",
 ]

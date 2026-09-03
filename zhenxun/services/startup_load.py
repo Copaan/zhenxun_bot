@@ -26,19 +26,12 @@ _PREBIND_HOOK_PREFIXES = (
     "nonebot.drivers",
     "zhenxun.services.db_context",
 )
-_ROUTE_CALLS = {"add_api_route", "add_route", "include_router", "mount"}
-_ROUTE_DECORATORS = {
-    "api_route",
-    "delete",
-    "get",
-    "head",
-    "options",
-    "patch",
-    "post",
-    "put",
-    "trace",
-    "websocket",
-    "websocket_route",
+_ROUTE_CALLS = {
+    "add_exception_handler",
+    "add_middleware",
+    "lifespan",
+    "middleware",
+    "mount",
 }
 _PROCESS_CALLS = {"Popen", "Process", "Thread", "create_subprocess_exec"}
 _MODEL_MODULES = {
@@ -72,6 +65,7 @@ class _ImportBoundaryVisitor(ast.NodeVisitor):
         self.reasons: set[str] = set()
         self.imports: set[str] = set()
         self.requires: set[str] = set()
+        self.import_time_dependency_calls: set[str] = set()
         self.aliases: dict[str, str] = {}
         self.env_dependencies: set[str] = set()
 
@@ -124,15 +118,25 @@ class _ImportBoundaryVisitor(ast.NodeVisitor):
 
     def _inspect_function_decorators(self, decorators: list[ast.expr]) -> None:
         for decorator in decorators:
-            target = decorator.func if isinstance(decorator, ast.Call) else decorator
-            name = target.attr if isinstance(target, ast.Attribute) else ""
-            if name in _ROUTE_DECORATORS:
-                self.reasons.add("fastapi_route")
             if isinstance(decorator, ast.Call):
                 self.visit(decorator)
 
     def visit_Call(self, node: ast.Call) -> None:
         name = _call_name(node)
+        resolved = ""
+        if isinstance(node.func, ast.Name):
+            resolved = self.aliases.get(node.func.id, "")
+        elif isinstance(node.func, ast.Attribute):
+            parts = [node.func.attr]
+            owner = node.func.value
+            while isinstance(owner, ast.Attribute):
+                parts.append(owner.attr)
+                owner = owner.value
+            if isinstance(owner, ast.Name) and owner.id in self.aliases:
+                resolved = ".".join([self.aliases[owner.id], *reversed(parts)])
+        resolved_name = resolved.rsplit(".", 1)[-1]
+        if resolved and resolved_name[:1].islower():
+            self.import_time_dependency_calls.add(resolved)
         if name in _ROUTE_CALLS:
             self.reasons.add("fastapi_route")
         elif name == "register_adapter":
@@ -176,7 +180,7 @@ def _file_record(
         }
     if (
         cached
-        and cached.get("record_version") == 2
+        and cached.get("record_version") == 4
         and cached.get("size") == stat.st_size
         and cached.get("mtime_ns") == stat.st_mtime_ns
     ):
@@ -196,24 +200,15 @@ def _file_record(
     visitor = _ImportBoundaryVisitor(module_name)
     visitor.visit(tree)
     runtime_reasons = set(visitor.reasons)
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        name = _call_name(node)
-        if name in _ROUTE_CALLS:
-            runtime_reasons.add("fastapi_route")
-        elif name in _PROCESS_CALLS:
-            runtime_reasons.add("thread_or_process")
-        elif name in {"import_module", "__import__"}:
-            runtime_reasons.add("dynamic_import")
     return {
         "size": stat.st_size,
-        "record_version": 2,
+        "record_version": 4,
         "mtime_ns": stat.st_mtime_ns,
         "digest": hashlib.sha256(data).hexdigest(),
         "reasons": sorted(visitor.reasons),
         "imports": sorted(visitor.imports),
         "requires": sorted(visitor.requires),
+        "import_time_dependency_calls": sorted(visitor.import_time_dependency_calls),
         "runtime_reasons": sorted(runtime_reasons),
         "defines_model": "orm_model" in visitor.reasons,
         "env_dependencies": sorted(visitor.env_dependencies),
@@ -381,7 +376,7 @@ class StartupLoadPlanner:
                 stat = path.stat()
                 before_hit = bool(
                     isinstance(previous, dict)
-                    and previous.get("record_version") == 2
+                    and previous.get("record_version") == 4
                     and previous.get("size") == stat.st_size
                     and previous.get("mtime_ns") == stat.st_mtime_ns
                 )
@@ -611,10 +606,6 @@ class StartupLoadPlanner:
             classification_miss = None
             if set(db_model.models) - set(before_models):
                 classification_miss = "classification_miss:orm_model"
-            elif len(getattr(__import__("nonebot").get_app(), "routes", [])) > len(
-                before_routes
-            ):
-                classification_miss = "classification_miss:fastapi_route"
             elif dict(getattr(driver, "_adapters", {})) != before_adapters:
                 classification_miss = "classification_miss:adapter_registration"
             if classification_miss:
@@ -790,7 +781,13 @@ class StartupLoadPlanner:
         entry = self.entries.get(plugin_id)
         if entry is not None:
             entry.status = "failed"
-        startup_coordinator.record_error("runtime", f"{plugin_id}:{error_code}")
+        startup_coordinator.record_error(
+            "runtime",
+            error_code,
+            source_type="plugin",
+            source_id=plugin_id,
+            display_name=plugin_id,
+        )
 
     def prepare_warmup_gates(self) -> None:
         from zhenxun.utils.enum import PriorityLifecycleType

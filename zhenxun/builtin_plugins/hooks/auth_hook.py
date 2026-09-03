@@ -13,6 +13,7 @@ from zhenxun.services.cache.runtime_cache import is_cache_ready
 from zhenxun.services.log import logger
 from zhenxun.services.message_load import is_overloaded, mark_activity
 from zhenxun.services.runtime_bootstrap import register_runtime_bootstrap
+from zhenxun.utils.manager.priority_manager import PriorityLifecycle
 
 from .auth.config import LOGGER_COMMAND
 from .auth.context import (
@@ -46,12 +47,17 @@ async def _mark_bot_connected(bot: Bot):
     _BOT_CONNECT_TS = time.time()
 
 
-@driver.on_startup
-async def _start_auth_runtime_tasks():
-    await start_auth_runtime_tasks()
+@PriorityLifecycle.on_startup(
+    priority=7,
+    component_id="runtime:auth_tasks",
+    depends_on=("runtime:runtime_cache",),
+    pass_context=True,
+)
+async def _start_auth_runtime_tasks(context):
+    await start_auth_runtime_tasks(context)
 
 
-@driver.on_shutdown
+@PriorityLifecycle.on_shutdown(priority=7, component_id="runtime:auth_tasks")
 async def _stop_auth_runtime_tasks():
     await stop_auth_runtime_tasks()
 

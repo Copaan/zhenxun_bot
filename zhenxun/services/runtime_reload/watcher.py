@@ -13,6 +13,9 @@ if TYPE_CHECKING:
     from .manager import PluginRuntimeManager
 
 
+_RETRY_DELAYS = (1, 2, 5, 15, 30)
+
+
 def _watch_roots(manager: PluginRuntimeManager) -> list[Path]:
     project_root = Path.cwd().resolve()
     runtime_root = (Path("data") / "runtime").resolve()
@@ -53,13 +56,14 @@ def _interesting(change: Change, raw_path: str) -> bool:
         return False
     if any(part in {"__pycache__", ".git", ".pytest_cache"} for part in path.parts):
         return False
+    if path.suffix == ".json":
+        return path.name == "version.json" and "web_ui" in path.parts
     return path.suffix in {
         ".py",
         ".yaml",
         ".yml",
         ".toml",
         ".lock",
-        ".json",
         ".js",
         ".css",
         ".html",
@@ -67,52 +71,76 @@ def _interesting(change: Change, raw_path: str) -> bool:
 
 
 async def watch_runtime_changes(manager: PluginRuntimeManager) -> None:
-    roots = _watch_roots(manager)
-    if not roots:
-        logger.warning("未找到运行时监听目录，自动热加载未启动")
-        return
-    logger.info(f"运行时自动监听已启动，共 {len(roots)} 个目录")
-    manifest = _build_manifest(roots)
-    last_reconcile = time.monotonic()
-    try:
-        async for changes in awatch(
-            *roots,
-            debounce=750,
-            step=250,
-            rust_timeout=5000,
-            yield_on_timeout=True,
-        ):
-            paths = {
-                Path(raw_path)
-                for change, raw_path in changes
-                if _interesting(change, raw_path)
-            }
-            if paths:
-                await manager.process_changes(paths)
-                if manager.consume_watcher_refresh():
-                    manager._watcher_task = asyncio.create_task(
-                        watch_runtime_changes(manager),
-                        name="zhenxun-runtime-watcher",
-                    )
-                    return
-            if time.monotonic() - last_reconcile >= 60:
-                current_manifest = _build_manifest(roots)
-                missed = {
-                    path
-                    for path in manifest.keys() | current_manifest.keys()
-                    if manifest.get(path) != current_manifest.get(path)
+    retry_index = 0
+    while True:
+        try:
+            roots = _watch_roots(manager)
+            manager.watcher_roots = [str(path) for path in roots]
+            if not roots:
+                logger.warning("未找到运行时监听目录，自动热加载未启动")
+                manager.watcher_state = "idle"
+                return
+            manager.watcher_state = "watching"
+            logger.info(f"运行时自动监听已启动，共 {len(roots)} 个目录")
+            manifest = _build_manifest(roots)
+            last_reconcile = time.monotonic()
+            async for changes in awatch(
+                *roots,
+                debounce=750,
+                step=250,
+                rust_timeout=5000,
+                yield_on_timeout=True,
+            ):
+                retry_index = 0
+                manager.watcher_retry_count = 0
+                manager.watcher_last_error = None
+                paths = {
+                    Path(raw_path)
+                    for change, raw_path in changes
+                    if _interesting(change, raw_path)
                 }
-                if missed:
-                    await manager.process_changes(missed)
-                manifest = current_manifest
-                last_reconcile = time.monotonic()
-            await asyncio.sleep(0)
-    except asyncio.CancelledError:
-        raise
-    except Exception as e:
-        manager.enabled = False
-        manager.compatibility_error = "watcher_failed"
-        logger.error("运行时文件监听失败，插件热加载已降级", e=e)
+                if paths:
+                    await manager.process_changes(
+                        paths,
+                        submit_restart=manager.runtime_watch_mode() == "auto_restart",
+                    )
+                if manager.consume_watcher_refresh():
+                    break
+                if time.monotonic() - last_reconcile >= 60:
+                    current_manifest = _build_manifest(roots)
+                    missed = {
+                        path
+                        for path in manifest.keys() | current_manifest.keys()
+                        if manifest.get(path) != current_manifest.get(path)
+                    }
+                    if missed:
+                        await manager.process_changes(
+                            missed,
+                            submit_restart=manager.runtime_watch_mode()
+                            == "auto_restart",
+                        )
+                    manifest = current_manifest
+                    last_reconcile = time.monotonic()
+                await asyncio.sleep(0)
+            retry_index = 0
+            manager.watcher_retry_count = 0
+            if manager.runtime_watch_mode() == "disabled":
+                manager.watcher_state = "disabled"
+                return
+        except asyncio.CancelledError:
+            manager.watcher_state = "stopped"
+            raise
+        except Exception as e:
+            delay = _RETRY_DELAYS[min(retry_index, len(_RETRY_DELAYS) - 1)]
+            retry_index += 1
+            manager.watcher_state = "retrying"
+            manager.watcher_retry_count = retry_index
+            manager.watcher_last_error = f"watcher_failed:{type(e).__name__}"
+            logger.error(
+                f"运行时文件监听失败，将在 {delay} 秒后重试",
+                e=e,
+            )
+            await asyncio.sleep(delay)
 
 
 def _build_manifest(roots: list[Path]) -> dict[Path, tuple[int, int]]:

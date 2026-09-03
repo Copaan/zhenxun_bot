@@ -68,6 +68,20 @@ def remove_driver_hooks(driver: Any, module_names: set[str]) -> None:
                 registry.discard(item)
 
 
+def remove_bot_api_hooks(module_names: set[str]) -> None:
+    try:
+        from nonebot.internal.adapter import Bot
+    except ImportError:
+        return
+    for name in ("_calling_api_hook", "_called_api_hook"):
+        registry = getattr(Bot, name, None)
+        if registry is None:
+            continue
+        for item in list(registry):
+            if _dependent_module(item) in module_names:
+                registry.discard(item)
+
+
 def remove_priority_hooks(module_names: set[str]) -> None:
     from zhenxun.utils.manager.priority_manager import PriorityLifecycle
 

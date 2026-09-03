@@ -1,5 +1,7 @@
 import asyncio
+from collections.abc import AsyncIterator
 import contextlib
+from contextlib import asynccontextmanager
 import time
 
 from zhenxun.services.log import logger
@@ -13,6 +15,8 @@ from .config import (
 
 _SQLITE_STALL_UNTIL = 0.0
 _SQLITE_STALL_REASON = ""
+_SQLITE_OPERATION_LOCK = asyncio.Lock()
+_ACTIVE_MANAGED_DB_OPERATIONS = 0
 _DB_UNHEALTHY_TIMEOUT_SECONDS = 30.0
 _SQLITE_STALL_TIMEOUT_SECONDS = 60.0
 _SQLITE_LOCK_PATTERNS = (
@@ -59,15 +63,54 @@ def _is_sqlite_lock_error(exc: BaseException) -> bool:
     return any(pattern in message for pattern in _SQLITE_LOCK_PATTERNS)
 
 
-def _mark_sqlite_lock_unhealthy(exc: BaseException, operation: str | None) -> None:
-    reason = f"{operation or 'database_operation'} sqlite lock: {exc}"
+def _mark_sqlite_lock_unhealthy(
+    exc: BaseException, operation: str | None, source: str | None
+) -> None:
+    reason = f"{operation or 'database_operation'} sqlite_lock"
     _mark_sqlite_stall(reason, _SQLITE_STALL_TIMEOUT_SECONDS)
-    signal_db_unhealthy(_SQLITE_STALL_TIMEOUT_SECONDS, reason=reason)
+    if source != "runtime_cache":
+        signal_db_unhealthy(_SQLITE_STALL_TIMEOUT_SECONDS, reason=reason)
     logger.warning(
         "SQLite 数据库锁等待失败，已暂停低优先级数据库任务",
         LOG_COMMAND,
         e=exc if isinstance(exc, Exception) else None,
     )
+
+
+def managed_db_operation_count() -> int:
+    return _ACTIVE_MANAGED_DB_OPERATIONS
+
+
+def sqlite_operation_locked() -> bool:
+    return _SQLITE_OPERATION_LOCK.locked()
+
+
+@asynccontextmanager
+async def _managed_db_operation() -> AsyncIterator[None]:
+    global _ACTIVE_MANAGED_DB_OPERATIONS
+    lock = _SQLITE_OPERATION_LOCK if _is_sqlite_connection() else None
+    if lock is not None:
+        await lock.acquire()
+    _ACTIVE_MANAGED_DB_OPERATIONS += 1
+    try:
+        yield
+    finally:
+        _ACTIVE_MANAGED_DB_OPERATIONS = max(0, _ACTIVE_MANAGED_DB_OPERATIONS - 1)
+        if lock is not None:
+            lock.release()
+
+
+@asynccontextmanager
+async def sqlite_exclusive_access(timeout: float) -> AsyncIterator[None]:
+    """Block new managed SQLite operations while recovery inspects the connection."""
+    if not _is_sqlite_connection():
+        yield
+        return
+    await asyncio.wait_for(_SQLITE_OPERATION_LOCK.acquire(), timeout=timeout)
+    try:
+        yield
+    finally:
+        _SQLITE_OPERATION_LOCK.release()
 
 
 async def with_db_timeout(
@@ -79,7 +122,8 @@ async def with_db_timeout(
     """带超时控制的数据库操作"""
     start_time = time.time()
     try:
-        result = await asyncio.wait_for(coro, timeout=timeout)
+        async with _managed_db_operation():
+            result = await asyncio.wait_for(coro, timeout=timeout)
         elapsed = time.time() - start_time
         if elapsed > SLOW_QUERY_THRESHOLD and operation:
             logger.warning(f"慢查询: {operation} 耗时 {elapsed:.3f}s", LOG_COMMAND)
@@ -90,12 +134,20 @@ async def with_db_timeout(
         if _is_sqlite_connection():
             unhealthy_duration = _SQLITE_STALL_TIMEOUT_SECONDS
             _mark_sqlite_stall(timeout_reason, unhealthy_duration)
-            logger.warning(
-                "SQLite 数据库操作超时，疑似 aiosqlite worker/连接被锁等待卡住；"
-                "已暂停低优先级数据库任务",
-                LOG_COMMAND,
-            )
-        signal_db_unhealthy(unhealthy_duration, reason=timeout_reason)
+            if source == "runtime_cache":
+                logger.warning(
+                    "SQLite RuntimeCache 刷新超时；已对该缓存退避，"
+                    "数据库全局健康状态保持不变",
+                    LOG_COMMAND,
+                )
+            else:
+                logger.warning(
+                    "SQLite 数据库操作超时，疑似 aiosqlite worker/连接被锁等待"
+                    "卡住；已暂停低优先级数据库任务",
+                    LOG_COMMAND,
+                )
+        if source != "runtime_cache":
+            signal_db_unhealthy(unhealthy_duration, reason=timeout_reason)
         if operation:
             logger.error(
                 f"数据库操作超时: {operation} (>{timeout}s) 来源: {source}",
@@ -104,5 +156,5 @@ async def with_db_timeout(
         raise
     except Exception as exc:
         if _is_sqlite_lock_error(exc):
-            _mark_sqlite_lock_unhealthy(exc, operation)
+            _mark_sqlite_lock_unhealthy(exc, operation, source)
         raise

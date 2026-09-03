@@ -9,7 +9,6 @@ from typing import Any, ClassVar, cast
 import aiofiles
 import httpx
 from httpx import AsyncClient, AsyncHTTPTransport, HTTPStatusError, Proxy, Response
-import nonebot
 from rich.progress import (
     BarColumn,
     DownloadColumn,
@@ -31,12 +30,25 @@ from .browser import AsyncPlaywright, BrowserIsNone  # noqa: F401
 
 _SENTINEL = object()
 
-driver = nonebot.get_driver()
 _client: AsyncClient | None = None
 
 
-@PriorityLifecycle.on_startup(priority=0, stage="management", timeout=15)
-async def _():
+def _http_client_healthy(_value=None) -> bool:
+    return _client is not None and not _client.is_closed
+
+
+@PriorityLifecycle.on_startup(
+    priority=0,
+    stage="management",
+    timeout=15,
+    component_id="management:http_client",
+    depends_on=("management:runtime_concurrency",),
+    restart_policy="component",
+    config_keys=("SYSTEM_PROXY",),
+    pass_context=True,
+    health=_http_client_healthy,
+)
+async def _(context):
     """
     在Bot启动时初始化全局httpx客户端。
     """
@@ -67,17 +79,26 @@ async def _():
         follow_redirects=True,
         **client_kwargs,
     )
+    context.own_resource(
+        receipt_id=f"httpx:{id(_client)}",
+        provider="httpx",
+        resource_type="client",
+    )
 
     logger.info("全局 httpx.AsyncClient 已启动。", "HTTPClient")
 
 
-@driver.on_shutdown
+@PriorityLifecycle.on_shutdown(
+    priority=90, timeout=15, component_id="management:http_client"
+)
 async def _():
     """
     在Bot关闭时关闭全局httpx客户端。
     """
-    if _client:
-        await _client.aclose()
+    global _client
+    client, _client = _client, None
+    if client:
+        await client.aclose()
         logger.info("全局 httpx.AsyncClient 已关闭。", "HTTPClient")
 
 

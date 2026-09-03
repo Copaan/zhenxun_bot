@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import atexit
+import contextlib
 import importlib.metadata
 import json
 import os
@@ -180,7 +181,9 @@ def _run_worker() -> None:
     project_root = _ensure_project_root()
     from zhenxun.update_service import apply_pending_update
 
-    if apply_pending_update(project_root):
+    if not os.environ.get("ZHENXUN_LAUNCHER_PID") and apply_pending_update(
+        project_root
+    ):
         os.execv(sys.executable, [sys.executable, "-m", "zhenxun.cli", "run-worker"])
     _sync_env_missing_items(project_root)
 
@@ -230,6 +233,12 @@ def _run_worker() -> None:
         render_playwright={"channel": htmlrender_browser_channel},
     )
 
+    from zhenxun.services.lifecycle import hook_kernel
+    from zhenxun.services.runtime_bootstrap import register_runtime_bootstrap
+    from zhenxun.services.runtime_reload import plugin_runtime_manager
+
+    hook_kernel.install(plugin_runtime_manager)
+
     # Core library plugins are process infrastructure, not side effects of
     # importing zhenxun.services. HTMLRender is loaded lazily by the renderer.
     for library_plugin in (
@@ -240,6 +249,8 @@ def _run_worker() -> None:
         "nonebot_plugin_waiter",
     ):
         nonebot.require(library_plugin)
+    plugin_runtime_manager.activate_loaded_incarnations()
+    register_runtime_bootstrap(nonebot.get_driver())
 
     from zhenxun.services.startup import startup_coordinator
 
@@ -249,10 +260,6 @@ def _run_worker() -> None:
         "completed",
         (time.monotonic() - worker_started) * 1000,
     )
-
-    from zhenxun.services.runtime_reload import plugin_runtime_manager
-
-    plugin_runtime_manager.install()
 
     from nonebot.adapters.onebot.v11 import Adapter as OneBotV11Adapter
 
@@ -321,6 +328,7 @@ def _run_worker() -> None:
     startup_load_planner.prepare_library_plugins()
     phase_started = time.monotonic()
     startup_load_planner.load_critical()
+    plugin_runtime_manager.activate_loaded_incarnations()
     startup_coordinator.record_operation(
         "worker:load_critical_plugins",
         "worker",
@@ -332,6 +340,7 @@ def _run_worker() -> None:
 
     phase_started = time.monotonic()
     managed_status = load_managed_plugins()
+    plugin_runtime_manager.activate_loaded_incarnations()
     startup_coordinator.record_operation(
         "worker:load_managed_plugins",
         "worker",
@@ -364,15 +373,20 @@ def _run_worker() -> None:
         if webui_tls.enabled
         else {}
     )
-    nonebot.run(
-        workers=1,
-        access_log=False,
-        limit_concurrency=WORKER_CONNECTION_LIMIT,
-        backlog=WORKER_BACKLOG,
-        timeout_keep_alive=WORKER_KEEP_ALIVE_TIMEOUT,
-        timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_TIMEOUT,
-        **tls_options,
-    )
+    try:
+        nonebot.run(
+            workers=1,
+            access_log=False,
+            limit_concurrency=WORKER_CONNECTION_LIMIT,
+            backlog=WORKER_BACKLOG,
+            timeout_keep_alive=WORKER_KEEP_ALIVE_TIMEOUT,
+            timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_TIMEOUT,
+            **tls_options,
+        )
+    finally:
+        from zhenxun.services.runtime_bootstrap import finalize_runtime_executor
+
+        finalize_runtime_executor()
 
 
 def _build_worker_command() -> list[str]:
@@ -497,24 +511,52 @@ def _health_urlopen(url: str):
 def _worker_is_ready(
     settings, *, scheme: str = "http", require_warmup: bool = False
 ) -> bool:
+    data = _read_worker_runtime_status(settings, scheme=scheme)
+    return _runtime_status_is_ready(data, require_warmup=require_warmup)
+
+
+def _read_worker_runtime_status(
+    settings, *, scheme: str = "http"
+) -> dict[str, object] | None:
     try:
         with _health_urlopen(
             _worker_runtime_status_url(settings, scheme=scheme)
         ) as response:
             if response.status != 200:
-                return False
+                return None
             payload = json.loads(response.read())
             data = payload.get("data", {})
-            state = data.get("state")
-            if require_warmup:
-                warmup_state = data.get("stages", {}).get("warmup", {}).get("state")
-                return state in {"warmup_ready", "degraded"} and warmup_state in {
-                    "completed",
-                    "failed",
-                }
-            return state in {"runtime_ready", "warmup_ready", "degraded"}
+            return data if isinstance(data, dict) else None
     except (OSError, ValueError, TypeError, urllib.error.URLError):
+        return None
+
+
+def _runtime_status_is_ready(
+    data: dict[str, object] | None, *, require_warmup: bool = False
+) -> bool:
+    if not data:
         return False
+    state = data.get("state")
+    if require_warmup:
+        stages = data.get("stages")
+        warmup = stages.get("warmup", {}) if isinstance(stages, dict) else {}
+        warmup_state = warmup.get("state") if isinstance(warmup, dict) else None
+        return state in {"warmup_ready", "degraded"} and warmup_state in {
+            "completed",
+            "failed",
+        }
+    return state in {"runtime_ready", "warmup_ready", "degraded"}
+
+
+def _bind_worker_runtime_status(
+    worker: subprocess.Popen, status: dict[str, object] | None
+) -> None:
+    if status is None:
+        return
+    with contextlib.suppress(Exception):
+        from zhenxun.services.lifecycle.launcher import bind_launcher_worker_runtime
+
+        bind_launcher_worker_runtime(worker, status)
 
 
 def _wait_worker_ready(
@@ -528,8 +570,12 @@ def _wait_worker_ready(
     while time.monotonic() < deadline:
         if worker.poll() is not None:
             return False
-        if _worker_is_ready(settings, scheme=scheme, require_warmup=require_warmup):
+        status = _read_worker_runtime_status(settings, scheme=scheme)
+        _bind_worker_runtime_status(worker, status)
+        if _runtime_status_is_ready(status, require_warmup=require_warmup):
             return True
+        if status and status.get("operating_mode") == "management_only":
+            return False
         time.sleep(WORKER_READY_POLL_INTERVAL)
     return False
 
@@ -619,13 +665,32 @@ def _wait_worker_exit(proc: subprocess.Popen, timeout_seconds: float) -> bool:
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         if proc.poll() is not None:
+            _record_launcher_process_exit(proc, "process_exit")
             return True
         time.sleep(WORKER_POLL_INTERVAL)
-    return proc.poll() is not None
+    exited = proc.poll() is not None
+    if exited:
+        _record_launcher_process_exit(proc, "process_exit")
+    return exited
+
+
+def _record_launcher_process_start(role: str, proc: subprocess.Popen) -> None:
+    with contextlib.suppress(Exception):
+        from zhenxun.services.lifecycle.launcher import observe_launcher_process
+
+        observe_launcher_process(role, proc)
+
+
+def _record_launcher_process_exit(proc: subprocess.Popen, reason: str) -> None:
+    with contextlib.suppress(Exception):
+        from zhenxun.services.lifecycle.launcher import release_launcher_process
+
+        release_launcher_process(proc, reason)
 
 
 def _terminate_worker(proc: subprocess.Popen) -> None:
     if proc.poll() is not None:
+        _record_launcher_process_exit(proc, "already_exited")
         return
     _launcher_log(f"stopping worker pid={proc.pid}")
     if os.name == "nt":
@@ -665,10 +730,12 @@ def _terminate_worker(proc: subprocess.Popen) -> None:
     _launcher_log(f"killing worker pid={proc.pid}")
     proc.kill()
     proc.wait(timeout=WORKER_KILL_TIMEOUT)
+    _record_launcher_process_exit(proc, "killed")
 
 
 def _terminate_named_process(proc: subprocess.Popen, name: str) -> None:
     if proc.poll() is not None:
+        _record_launcher_process_exit(proc, "already_exited")
         return
     _launcher_log(f"stopping {name} pid={proc.pid}")
     if os.name == "nt" and hasattr(signal, "CTRL_BREAK_EVENT"):
@@ -684,11 +751,13 @@ def _terminate_named_process(proc: subprocess.Popen, name: str) -> None:
         return
     proc.kill()
     proc.wait(timeout=WORKER_KILL_TIMEOUT)
+    _record_launcher_process_exit(proc, "killed")
 
 
 def _run_launcher() -> None:
     launcher_started_at = time.time()
     cwd = _ensure_project_root()
+    from zhenxun.services.lifecycle.launcher import initialize_launcher_lifecycle
     from zhenxun.update_service import (
         applied_update_pending,
         apply_pending_update,
@@ -696,6 +765,7 @@ def _run_launcher() -> None:
         rollback_applied_update,
     )
 
+    launcher_boot_id = initialize_launcher_lifecycle()
     pending_bot_verification = apply_pending_update(cwd) or applied_update_pending()
     _sync_env_missing_items(cwd)
     from zhenxun.adapters.qq_official.config import (
@@ -706,6 +776,10 @@ def _run_launcher() -> None:
     from zhenxun.configs.webui_tls import (
         load_webui_tls_settings,
         validate_webui_tls_settings,
+    )
+    from zhenxun.services.lifecycle.launcher import (
+        begin_launcher_commit,
+        transition_launcher_commit,
     )
     from zhenxun.utils.restart_state import (
         clear_launcher_restart_signal,
@@ -789,8 +863,26 @@ def _run_launcher() -> None:
         from zhenxun.utils.restart_state import clear_pending_restart_state
 
         source_before_apply = pending_source_transaction()
-        dependencies_ready = prepare_dependency_transaction()
         nonebot_before_apply = pending_nonebot_transaction()
+        commit_targets = [
+            *(
+                ["source_plugins"]
+                if source_before_apply
+                and source_before_apply.get("state")
+                in {"pending_restart", "verification_pending"}
+                else []
+            ),
+            *(
+                ["nonebot_generation"]
+                if nonebot_before_apply
+                and nonebot_before_apply.get("state")
+                in {"pending_restart", "verification_pending"}
+                else []
+            ),
+        ]
+        if commit_targets:
+            begin_launcher_commit(commit_targets)
+        dependencies_ready = prepare_dependency_transaction()
         nonebot_applied = False
         if dependencies_ready:
             nonebot_applied = apply_pending_nonebot_transaction()
@@ -813,12 +905,23 @@ def _run_launcher() -> None:
             and source_after_apply
             and source_after_apply.get("state") == "failed"
         )
+        if nonebot_applied or source_applied:
+            with contextlib.suppress(Exception):
+                transition_launcher_commit("applied")
         if source_applied:
             _launcher_log("真寻插件源码事务已应用，等待 worker 启动验证")
         if source_apply_failed and nonebot_applied:
+            with contextlib.suppress(Exception):
+                transition_launcher_commit("rolling_back")
             rollback_nonebot_transaction()
             nonebot_applied = False
             _launcher_log("真寻插件源码事务应用失败，已回滚依赖 generation")
+            with contextlib.suppress(Exception):
+                transition_launcher_commit("rolled_back")
+        if nonebot_apply_failed or source_apply_failed:
+            with contextlib.suppress(Exception):
+                transition_launcher_commit("rolling_back")
+                transition_launcher_commit("rolled_back")
         if nonebot_applied:
             _launcher_log("NoneBot 插件依赖层已构建，等待 worker 启动验证")
         source_pending = pending_source_transaction()
@@ -875,14 +978,18 @@ def _run_launcher() -> None:
         worker_env["ZHENXUN_LAUNCHER_PID"] = str(os.getpid())
         worker_env["ZHENXUN_LAUNCHER_STARTED_AT"] = str(launcher_started_at)
         worker_env["ZHENXUN_WORKER_SPAWNED_AT"] = str(time.time())
+        worker_env["ZHENXUN_LAUNCHER_BOOT_ID"] = launcher_boot_id
         worker = subprocess.Popen(
             _build_worker_command(),
             cwd=str(cwd),
             creationflags=_get_worker_creationflags(),
             env=worker_env,
         )
+        _record_launcher_process_start("worker", worker)
         current_worker = worker
         if verify_nonebot_generation or verify_source_transaction:
+            with contextlib.suppress(Exception):
+                transition_launcher_commit("verifying")
             _launcher_log("waiting for managed plugin transaction verification")
             if not _wait_worker_ready(
                 worker,
@@ -893,12 +1000,16 @@ def _run_launcher() -> None:
                 _terminate_worker(worker)
                 current_worker = None
                 _launcher_log("managed plugin worker failed, rolling back transaction")
+                with contextlib.suppress(Exception):
+                    transition_launcher_commit("rolling_back")
                 if verify_nonebot_generation:
                     rollback_nonebot_transaction()
                 if verify_source_transaction:
                     rollback_source_transaction(
                         [{"code": "worker_health_check_failed"}]
                     )
+                with contextlib.suppress(Exception):
+                    transition_launcher_commit("rolled_back")
                 continue
             nonebot_verified, nonebot_verification = (
                 verify_nonebot_startup()
@@ -923,10 +1034,14 @@ def _run_launcher() -> None:
                         str(item.get("store_key", "unknown")) for item in failed
                     )
                 )
+                with contextlib.suppress(Exception):
+                    transition_launcher_commit("rolling_back")
                 if verify_nonebot_generation:
                     rollback_nonebot_transaction()
                 if verify_source_transaction:
                     rollback_source_transaction(failed)
+                with contextlib.suppress(Exception):
+                    transition_launcher_commit("rolled_back")
                 continue
             if verify_nonebot_generation:
                 finalize_nonebot_transaction()
@@ -938,6 +1053,8 @@ def _run_launcher() -> None:
                         f"webui.plugin:{operation.get('store_key', '')}"
                     )
             _launcher_log("managed plugin transaction passed startup verification")
+            with contextlib.suppress(Exception):
+                transition_launcher_commit("committed")
         if pending_bot_verification:
             _launcher_log("waiting for updated worker health verification")
             if not _wait_worker_ready(worker, qq_settings, scheme=webui_tls.scheme):
@@ -954,27 +1071,46 @@ def _run_launcher() -> None:
             _launcher_log(
                 "waiting for QQ worker readiness before opening HTTPS ingress"
             )
-            if not _wait_worker_ready(worker, qq_settings, scheme=webui_tls.scheme):
-                _terminate_worker(worker)
-                raise RuntimeError("QQ worker 未在规定时间内就绪，HTTPS Ingress 未启动")
-            ingress = subprocess.Popen(
-                _build_ingress_command(qq_settings, upstream_scheme=webui_tls.scheme),
-                cwd=str(cwd),
-                creationflags=_get_worker_creationflags(),
-                env=_ingress_environment(),
+            runtime_available = _wait_worker_ready(
+                worker, qq_settings, scheme=webui_tls.scheme
             )
-            ingress_signature = desired_ingress_signature
-            time.sleep(0.25)
-            if ingress.poll() is not None:
-                code = ingress.returncode
-                ingress = None
-                _terminate_worker(worker)
-                raise SystemExit(code or 1)
-            _launcher_log(
-                "QQ HTTPS ingress ready on "
-                f"{qq_settings.config.qq_webhook_listen_host}:"
-                f"{qq_settings.config.qq_webhook_listen_port}"
-            )
+            if not runtime_available:
+                status = _read_worker_runtime_status(
+                    qq_settings, scheme=webui_tls.scheme
+                )
+                _bind_worker_runtime_status(worker, status)
+                if status and status.get("operating_mode") == "management_only":
+                    _launcher_log(
+                        "worker entered management-only mode; QQ ingress remains closed"
+                    )
+                else:
+                    _terminate_worker(worker)
+                    raise RuntimeError(
+                        "QQ worker 未在规定时间内就绪，HTTPS Ingress 未启动"
+                    )
+            if runtime_available:
+                ingress = subprocess.Popen(
+                    _build_ingress_command(
+                        qq_settings, upstream_scheme=webui_tls.scheme
+                    ),
+                    cwd=str(cwd),
+                    creationflags=_get_worker_creationflags(),
+                    env=_ingress_environment(),
+                )
+                _record_launcher_process_start("qq_ingress", ingress)
+                ingress_signature = desired_ingress_signature
+                time.sleep(0.25)
+                if ingress.poll() is not None:
+                    code = ingress.returncode
+                    _record_launcher_process_exit(ingress, "unexpected_exit")
+                    ingress = None
+                    _terminate_worker(worker)
+                    raise SystemExit(code or 1)
+                _launcher_log(
+                    "QQ HTTPS ingress ready on "
+                    f"{qq_settings.config.qq_webhook_listen_host}:"
+                    f"{qq_settings.config.qq_webhook_listen_port}"
+                )
         if webui_tls.redirect_enabled and redirect is None:
             if not _wait_worker_webui_ready(
                 worker, qq_settings, scheme=webui_tls.scheme
@@ -987,10 +1123,12 @@ def _run_launcher() -> None:
                 creationflags=_get_worker_creationflags(),
                 env={**os.environ, "ZHENXUN_REDIRECT_CHILD": "1"},
             )
+            _record_launcher_process_start("http_redirect", redirect)
             redirect_signature = desired_redirect_signature
             time.sleep(0.25)
             if redirect.poll() is not None:
                 code = redirect.returncode
+                _record_launcher_process_exit(redirect, "unexpected_exit")
                 redirect = None
                 _terminate_worker(worker)
                 raise SystemExit(code or 1)
@@ -1009,12 +1147,14 @@ def _run_launcher() -> None:
                     break
                 if ingress is not None and ingress.poll() is not None:
                     ingress_code = ingress.returncode
+                    _record_launcher_process_exit(ingress, "unexpected_exit")
                     ingress = None
                     _launcher_log("QQ HTTPS ingress exited unexpectedly")
                     _terminate_worker(worker)
                     raise SystemExit(ingress_code or 1)
                 if redirect is not None and redirect.poll() is not None:
                     redirect_code = redirect.returncode
+                    _record_launcher_process_exit(redirect, "unexpected_exit")
                     redirect = None
                     _launcher_log("WebUI HTTP redirect exited unexpectedly")
                     _terminate_worker(worker)
@@ -1032,12 +1172,24 @@ def _run_launcher() -> None:
                 now = time.monotonic()
                 if now >= next_restart_check:
                     next_restart_check = now + RESTART_POLL_INTERVAL
+                    status = _read_worker_runtime_status(
+                        qq_settings, scheme=webui_tls.scheme
+                    )
+                    _bind_worker_runtime_status(worker, status)
                     if action := consume_launcher_action():
                         restart_requested = True
                         restart_action = action
                         _launcher_log(
                             "detected restart request, stopping current worker"
                         )
+                        if ingress is not None:
+                            _terminate_named_process(ingress, "QQ HTTPS ingress")
+                            ingress = None
+                            ingress_signature = None
+                        if redirect is not None:
+                            _terminate_named_process(redirect, "WebUI HTTP redirect")
+                            redirect = None
+                            redirect_signature = None
                         _terminate_worker(worker)
                         return_code = worker.poll()
                         break
@@ -1053,6 +1205,18 @@ def _run_launcher() -> None:
             _terminate_worker(worker)
             return
         finally:
+            if ingress is not None:
+                _terminate_named_process(ingress, "QQ HTTPS ingress")
+                ingress = None
+                ingress_signature = None
+            if redirect is not None:
+                _terminate_named_process(redirect, "WebUI HTTP redirect")
+                redirect = None
+                redirect_signature = None
+            _record_launcher_process_exit(
+                worker,
+                "restart" if restart_requested else "worker_exit",
+            )
             if current_worker is worker:
                 current_worker = None
 

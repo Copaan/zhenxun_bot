@@ -2,6 +2,7 @@ import contextlib
 from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
+import secrets
 from typing import Any
 
 from fastapi import Depends, HTTPException
@@ -20,7 +21,10 @@ from .base_model import SystemFolderSize, SystemStatus, User
 from .security import validate_access_token
 
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 30
+ACCESS_TOKEN_IDLE_MINUTES = 30
+ACCESS_TOKEN_ABSOLUTE_HOURS = 24
+# Compatibility alias for extensions importing the old constant.
+ACCESS_TOKEN_EXPIRE_MINUTES = ACCESS_TOKEN_IDLE_MINUTES
 DB_BUSY_MESSAGE = "数据库繁忙，请稍后再试"
 WEBUI_DB_TIMEOUT = 3.0
 
@@ -129,10 +133,31 @@ def create_token(
         user: 用户信息
         expires_delta: 过期时间.
     """
-    expire = datetime.now(timezone.utc) + (expires_delta or timedelta(minutes=15))
-    claims = {"sub": user.username, "exp": expire}
-    if extra_claims:
-        claims.update(extra_claims)
+    now = datetime.now(timezone.utc)
+    supplied = dict(extra_claims or {})
+    auth_time = int(supplied.pop("auth_time", int(now.timestamp())))
+    absolute_exp = int(
+        supplied.pop(
+            "absolute_exp",
+            auth_time
+            + int(timedelta(hours=ACCESS_TOKEN_ABSOLUTE_HOURS).total_seconds()),
+        )
+    )
+    idle_exp = int(
+        (
+            now + (expires_delta or timedelta(minutes=ACCESS_TOKEN_IDLE_MINUTES))
+        ).timestamp()
+    )
+    expire = min(idle_exp, absolute_exp)
+    claims = {
+        "sub": user.username,
+        "sid": supplied.pop("sid", secrets.token_urlsafe(18)),
+        "auth_time": auth_time,
+        "absolute_exp": absolute_exp,
+        "iat": int(now.timestamp()),
+        "exp": expire,
+    }
+    claims.update(supplied)
     return jwt.encode(
         claims=claims,
         key=Config.get_config("web-ui", "secret"),
@@ -152,7 +177,9 @@ def authentication():
     def inner(token: str = Depends(oauth2_scheme)):
         if not validate_access_token(token):
             raise HTTPException(
-                status_code=400, detail="登录验证失败或已失效, 踢出房间!"
+                status_code=401,
+                detail="登录验证失败或已失效, 踢出房间!",
+                headers={"WWW-Authenticate": "Bearer"},
             )
 
     return Depends(inner)

@@ -51,6 +51,7 @@ from zhenxun.nonebot_store.storage import (
     save_pending_transaction,
     utc_now,
 )
+from zhenxun.services.lifecycle.operations import operation_registry
 from zhenxun.services.log import logger
 from zhenxun.services.runtime_reload import plugin_runtime_manager
 
@@ -304,6 +305,18 @@ def _catalog_item(
         install_state = "external"
     else:
         install_state = "not_installed"
+    module_name = str(plugin.get("module_name") or "")
+    runtime = (
+        plugin_runtime_manager.classification_for(module_name)
+        if (managed or external) and module_name
+        else {"reload_support": "hot_reloadable", "reload_reasons": []}
+    )
+
+    def capability(available: bool, reason: str) -> dict[str, Any]:
+        if not available:
+            return {"mode": "blocked", "reason_codes": [reason]}
+        return {"mode": "analysis_required", "reason_codes": []}
+
     return {
         "store_key": f"nonebot:{project_link}",
         "project_link": project_link,
@@ -332,6 +345,19 @@ def _catalog_item(
         "compatibility_overrides": compatibility_overrides,
         "compatibility_unverified": bool(compatibility_overrides),
         "compatibility_override_stale": compatibility_override_stale,
+        "install_capability": capability(
+            not managed and not external and not reasons,
+            "plugin_incompatible" if reasons else "plugin_already_installed",
+        ),
+        "update_capability": capability(
+            bool(managed and update_available),
+            "plugin_update_not_available" if managed else "plugin_not_managed",
+        ),
+        "uninstall_capability": capability(
+            bool(managed),
+            "external_install_not_managed" if external else "plugin_not_managed",
+        ),
+        **runtime,
         "apply_mode": (
             "restart_pending"
             if pending_action
@@ -354,7 +380,10 @@ def _cleanup_analyses() -> None:
             created = datetime.fromisoformat(str(analysis["created_at"]))
         except (KeyError, TypeError, ValueError):
             created = threshold - timedelta(seconds=1)
-        if created < threshold:
+        task = analysis.get("task")
+        if created < threshold and not (
+            isinstance(task, asyncio.Task) and not task.done()
+        ):
             _ANALYSES.pop(analysis_id, None)
 
 
@@ -477,6 +506,40 @@ async def _analyze(analysis_id: str) -> None:
         )
     finally:
         analysis["completed_at"] = utc_now()
+        if operation_registry.get(analysis_id) is not None:
+            operation_registry.update(analysis_id, progress=100, phase="analyzed")
+
+
+def _recover_analysis(record: dict[str, Any]):
+    public_input = record.get("public_input") or {}
+    analysis_id = str(record.get("operation_id") or "")
+    project_link = str(public_input.get("project_link") or "")
+    action = str(public_input.get("action") or "")
+    if (
+        not analysis_id
+        or not project_link
+        or action
+        not in {
+            "install",
+            "update",
+            "uninstall",
+        }
+    ):
+        return None
+    _ANALYSES[analysis_id] = {
+        "analysis_id": analysis_id,
+        "project_link": project_link,
+        "action": action,
+        "status": "queued",
+        "created_at": utc_now(),
+        "recovered": True,
+    }
+    return _analyze(analysis_id)
+
+
+operation_registry.register_recovery_handler(
+    "nonebot_store_analysis", _recover_analysis
+)
 
 
 def _target_manifest(analysis: dict[str, Any]) -> dict[str, Any]:
@@ -785,7 +848,18 @@ async def analyze_plugin(payload: AnalyzePayload) -> Result[dict]:
         "created_at": utc_now(),
     }
     _ANALYSES[analysis_id] = analysis
-    analysis["task"] = asyncio.create_task(_analyze(analysis_id))
+    _, task = operation_registry.start(
+        "nonebot_store_analysis",
+        _analyze(analysis_id),
+        operation_id=analysis_id,
+        public_input={
+            "project_link": payload.project_link,
+            "action": payload.action,
+        },
+        recovery_policy="restart",
+        name=f"nonebot-analysis:{analysis_id[:8]}",
+    )
+    analysis["task"] = task
     return Result.ok(_public_analysis(analysis), info="依赖分析已开始")
 
 
@@ -875,7 +949,9 @@ async def apply_analysis(payload: ApplyPayload) -> Result[dict]:
     previous_pending = deepcopy(current_pending)
     new_generation: int | None = None
     try:
-        async with _store_operation():
+        async with _store_operation(
+            operation_id=operation_id, owner="webui.nonebot_store"
+        ):
             latest_pending = pending_transaction()
             if _pending_revision(latest_pending) != current_revision:
                 return Result.fail("analysis_stale", code=409)
@@ -1146,7 +1222,9 @@ async def pending_transaction_status() -> Result[dict]:
 )
 async def cancel_pending_operation(operation_id: str) -> Result[dict]:
     try:
-        async with _store_operation():
+        async with _store_operation(
+            operation_id=operation_id, owner="webui.nonebot_store"
+        ):
             transaction = pending_transaction()
             if transaction is None or transaction.get("state") not in {
                 "pending_restart",
@@ -1220,7 +1298,7 @@ async def cancel_pending_operation(operation_id: str) -> Result[dict]:
 )
 async def cancel_transaction() -> Result[dict]:
     try:
-        async with _store_operation():
+        async with _store_operation(owner="webui.nonebot_store"):
             transaction = pending_transaction()
             if transaction is None:
                 return Result.fail("nonebot_transaction_not_found", code=404)

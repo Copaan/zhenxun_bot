@@ -51,6 +51,8 @@ _WAKE_EVENT: asyncio.Event | None = None
 _FLUSH_LOCK = asyncio.Lock()
 _ACTIVE_FLUSHES = 0
 _STOPPING = False
+_LIFECYCLE_ACTIVE = False
+_LIFECYCLE_CONTEXT: Any | None = None
 
 
 def _wake() -> None:
@@ -60,6 +62,8 @@ def _wake() -> None:
 
 def _ensure_worker() -> None:
     global _STOPPING, _WAKE_EVENT, _WORKER_TASK
+    if not _LIFECYCLE_ACTIVE:
+        return
     if _STOPPING:
         _STOPPING = False
     try:
@@ -70,7 +74,11 @@ def _ensure_worker() -> None:
         _WAKE_EVENT = asyncio.Event()
     if _WORKER_TASK is not None and not _WORKER_TASK.done():
         return
-    _WORKER_TASK = loop.create_task(_worker_loop())
+    _WORKER_TASK = (
+        _LIFECYCLE_CONTEXT.spawn_task(_worker_loop(), name="low-priority-writer")
+        if _LIFECYCLE_CONTEXT is not None
+        else loop.create_task(_worker_loop(), name="low-priority-writer")
+    )
 
 
 def register_low_priority_writer(config: LowPriorityWriterConfig) -> None:
@@ -305,6 +313,10 @@ def low_priority_writer_backlog() -> dict[str, int]:
     return {name: len(state.buffer) for name, state in _WRITERS.items()}
 
 
+def low_priority_writer_healthy(_value=None) -> bool:
+    return not _WRITERS or (_WORKER_TASK is not None and not _WORKER_TASK.done())
+
+
 async def stop_low_priority_writer() -> int:
     global _STOPPING, _WORKER_TASK
     _STOPPING = True
@@ -319,11 +331,23 @@ async def stop_low_priority_writer() -> int:
     return await flush_all_low_priority_writers("关闭", force=True)
 
 
-@PriorityLifecycle.on_startup(priority=3)
-async def _start_low_priority_writer() -> None:
+@PriorityLifecycle.on_startup(
+    priority=3,
+    component_id="runtime:low_priority_writer",
+    depends_on=("management:database",),
+    pass_context=True,
+    health=low_priority_writer_healthy,
+)
+async def _start_low_priority_writer(context) -> None:
+    global _LIFECYCLE_ACTIVE, _LIFECYCLE_CONTEXT
+    _LIFECYCLE_ACTIVE = True
+    _LIFECYCLE_CONTEXT = context
     _ensure_worker()
 
 
-@PriorityLifecycle.on_shutdown(priority=95)
+@PriorityLifecycle.on_shutdown(priority=95, component_id="runtime:low_priority_writer")
 async def _stop_low_priority_writer() -> None:
+    global _LIFECYCLE_ACTIVE, _LIFECYCLE_CONTEXT
+    _LIFECYCLE_ACTIVE = False
     await stop_low_priority_writer()
+    _LIFECYCLE_CONTEXT = None

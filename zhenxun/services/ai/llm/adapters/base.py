@@ -60,6 +60,17 @@ if TYPE_CHECKING:
     )
 
 
+def join_api_url(api_base: str, endpoint: str) -> str:
+    """Join API paths without duplicating a version segment such as `/v1`."""
+    base = api_base.rstrip("/")
+    relative = endpoint.lstrip("/")
+    base_tail = base.rsplit("/", 1)[-1].casefold()
+    first_segment, separator, remainder = relative.partition("/")
+    if separator and first_segment.casefold() == base_tail:
+        relative = remainder
+    return f"{base}/{relative}" if relative else base
+
+
 class RequestData(BaseModel):
     """标准化的请求载体，用于向上层 HTTP 客户端传递请求参数。"""
 
@@ -529,8 +540,8 @@ class BaseAdapter(ABC):
         ep = endpoint.lstrip("/")
 
         if prefix:
-            return f"{base_url}/{prefix}/{ep}"
-        return f"{base_url}/{ep}"
+            return join_api_url(base_url, f"{prefix}/{ep}")
+        return join_api_url(base_url, ep)
 
     def get_base_headers(self, api_key: str) -> dict[str, str]:
         """构建默认请求头，包含 UA、JSON 类型与 Bearer 鉴权。"""

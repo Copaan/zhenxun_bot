@@ -108,9 +108,9 @@ class ConfigModel(BaseModel):
     配置项
     """
 
-    value: Any
+    value: Any = None
     """配置项值"""
-    help: str | None
+    help: str | None = None
     """配置注解"""
     default_value: Any | None = None
     """默认值"""

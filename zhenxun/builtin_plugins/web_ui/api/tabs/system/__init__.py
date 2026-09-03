@@ -7,13 +7,23 @@ import aiofiles
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 
+from zhenxun.services.lifecycle import lifecycle_kernel
 from zhenxun.services.startup import startup_coordinator
 from zhenxun.utils._build_image import BuildImage
 
 from ....base_model import Result, SystemFolderSize
+from ....restart_service import transaction_verification_status
 from ....utils import authentication, get_system_disk, validate_filename, validate_path
 from .configuration import router as configuration_router
-from .model import AddFile, DeleteFile, DirFile, RenameFile, SaveFile
+from .model import (
+    AddFile,
+    DeleteFile,
+    DirFile,
+    LifecycleComponentStatus,
+    LifecycleStatus,
+    RenameFile,
+    SaveFile,
+)
 from .restart import router as restart_router
 from .runtime import router as runtime_router
 from .update import router as update_router
@@ -32,7 +42,9 @@ router.include_router(runtime_router)
     description="获取worker分级启动状态",
 )
 async def get_startup_status() -> Result[dict[str, Any]]:
-    return Result.ok(startup_coordinator.snapshot())
+    return Result.ok(
+        {**startup_coordinator.snapshot(), **transaction_verification_status()}
+    )
 
 
 @router.get(
@@ -44,6 +56,73 @@ async def get_startup_status() -> Result[dict[str, Any]]:
 )
 async def get_startup_report() -> Result[dict[str, Any]]:
     return Result.ok(startup_coordinator.report())
+
+
+@router.get(
+    "/lifecycle/status",
+    dependencies=[authentication()],
+    response_model=Result[LifecycleStatus],
+    response_class=JSONResponse,
+    description="获取统一生命周期组件状态",
+)
+async def get_lifecycle_status() -> Result[LifecycleStatus]:
+    from zhenxun.services.lifecycle.launcher import launcher_lifecycle_snapshot
+    from zhenxun.services.lifecycle.operations import operation_registry
+    from zhenxun.services.runtime_reload import plugin_runtime_manager
+
+    return Result.ok(
+        {
+            **lifecycle_kernel.status(),
+            "launcher": launcher_lifecycle_snapshot(),
+            "operation_registry": operation_registry.status(),
+            "plugin_runtime": plugin_runtime_manager.status(),
+        }
+    )
+
+
+@router.get(
+    "/lifecycle/components/{component_id:path}",
+    dependencies=[authentication()],
+    response_model=Result[LifecycleComponentStatus],
+    response_class=JSONResponse,
+    description="获取生命周期组件详情",
+)
+async def get_lifecycle_component(
+    component_id: str,
+) -> Result[LifecycleComponentStatus]:
+    component = lifecycle_kernel.component_status(component_id)
+    if component is None:
+        return Result.fail("生命周期组件不存在。", code=404)
+    return Result.ok(component)
+
+
+@router.get(
+    "/lifecycle/operations",
+    dependencies=[authentication()],
+    response_model=Result[dict[str, Any]],
+    response_class=JSONResponse,
+    description="获取生命周期后台操作",
+)
+async def get_lifecycle_operations() -> Result[dict[str, Any]]:
+    from zhenxun.services.lifecycle.operations import operation_registry
+
+    return Result.ok(operation_registry.status())
+
+
+@router.get(
+    "/lifecycle/operations/{operation_id}",
+    dependencies=[authentication()],
+    response_model=Result[dict[str, Any]],
+    response_class=JSONResponse,
+    description="获取生命周期后台操作详情",
+)
+async def get_lifecycle_operation(operation_id: str) -> Result[dict[str, Any]]:
+    from zhenxun.services.lifecycle.operations import operation_registry
+
+    operation = operation_registry.get(operation_id)
+    if operation is None:
+        return Result.fail("lifecycle_operation_not_found", code=404)
+    return Result.ok(operation)
 
 
 IMAGE_TYPE = ["jpg", "jpeg", "png", "gif", "bmp", "webp", "svg"]

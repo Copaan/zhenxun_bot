@@ -13,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from jose import JWTError, jwt
 from jose.exceptions import ExpiredSignatureError
 from starlette.types import Receive, Scope, Send
-from starlette.websockets import WebSocket, WebSocketDisconnect
+from starlette.websockets import WebSocket, WebSocketDisconnect, WebSocketState
 
 from zhenxun.configs.config import Config
 from zhenxun.services.cache import BoundedTTLCache
@@ -30,6 +30,12 @@ _IPV4_PRIVATE_NETWORKS = (
     ipaddress.ip_network("192.168.0.0/16"),
 )
 _IPV6_PRIVATE_NETWORK = ipaddress.ip_network("fc00::/7")
+_LIFECYCLE_CONTEXT: Any | None = None
+
+
+def bind_lifecycle_context(context: Any | None) -> None:
+    global _LIFECYCLE_CONTEXT
+    _LIFECYCLE_CONTEXT = context
 
 
 class LoginAttemptLimiter:
@@ -52,8 +58,26 @@ class LoginAttemptLimiter:
 
 
 login_attempt_limiter = LoginAttemptLimiter()
-_AUTHENTICATED_WEBSOCKETS: set[WebSocket] = set()
-_WEBSOCKET_EXPIRY_TASKS: dict[WebSocket, asyncio.Task[None]] = {}
+
+
+class WebSocketAuthLease:
+    __slots__ = ("closing", "expires_at", "expiry_task", "send_lock", "sid")
+
+    def __init__(
+        self,
+        *,
+        sid: str,
+        expires_at: float | None,
+        send_lock: asyncio.Lock,
+    ) -> None:
+        self.sid = sid
+        self.expires_at = expires_at
+        self.send_lock = send_lock
+        self.closing = False
+        self.expiry_task: asyncio.Task[None] | None = None
+
+
+_AUTHENTICATED_WEBSOCKETS: dict[WebSocket, WebSocketAuthLease] = {}
 
 
 def is_private_client(host: str | None) -> bool:
@@ -76,7 +100,7 @@ def is_private_scope(scope: Scope) -> bool:
     return bool(client and is_private_client(str(client[0])))
 
 
-def _decode_access_token_status(
+def decode_access_token_status(
     token: str,
 ) -> tuple[dict[str, Any] | None, str]:
     token = token.strip()
@@ -105,7 +129,7 @@ def _decode_access_token_status(
 
 
 def _decode_access_token(token: str) -> dict[str, Any] | None:
-    payload, _ = _decode_access_token_status(token)
+    payload, _ = decode_access_token_status(token)
     return payload
 
 
@@ -113,13 +137,102 @@ def validate_access_token(token: str) -> bool:
     return _decode_access_token(token) is not None
 
 
+def _spawn_expiry_task(websocket: WebSocket, expires_at: float) -> asyncio.Task[None]:
+    coroutine = _expire_websocket(websocket, expires_at)
+    if _LIFECYCLE_CONTEXT is not None:
+        return _LIFECYCLE_CONTEXT.spawn_detached(
+            coroutine,
+            scope_id=f"websocket-auth-{id(websocket)}-{time.monotonic_ns()}",
+            scope="task",
+            name="webui-websocket-auth-expiry",
+        )
+    return asyncio.create_task(coroutine, name="webui-websocket-auth-expiry")
+
+
 async def _expire_websocket(websocket: WebSocket, expires_at: float) -> None:
     delay = max(0.0, expires_at - time.time())
     await asyncio.sleep(delay)
-    with contextlib.suppress(Exception):
-        await websocket.close(
-            code=WEBSOCKET_AUTH_EXPIRED, reason="authentication expired"
-        )
+    lease = _AUTHENTICATED_WEBSOCKETS.get(websocket)
+    if (
+        lease is None
+        or lease.closing
+        or lease.expires_at != expires_at
+        or time.time() < expires_at
+    ):
+        return
+    await close_authenticated_websocket(
+        websocket, code=WEBSOCKET_AUTH_EXPIRED, reason="authentication expired"
+    )
+
+
+async def close_authenticated_websocket(
+    websocket: WebSocket, *, code: int = 1000, reason: str = ""
+) -> bool:
+    lease = _AUTHENTICATED_WEBSOCKETS.get(websocket)
+    lock = lease.send_lock if lease is not None else asyncio.Lock()
+    async with lock:
+        if lease is not None:
+            lease.closing = True
+        if not _websocket_connected(websocket):
+            return False
+        try:
+            await websocket.close(code=code, reason=reason)
+        except (RuntimeError, WebSocketDisconnect):
+            return False
+        return True
+
+
+async def send_authenticated_text(websocket: WebSocket, text: str) -> bool:
+    lease = _AUTHENTICATED_WEBSOCKETS.get(websocket)
+    if lease is None:
+        return False
+    async with lease.send_lock:
+        if lease.closing or not _websocket_connected(websocket):
+            return False
+        try:
+            await websocket.send_text(text)
+        except (RuntimeError, WebSocketDisconnect):
+            lease.closing = True
+            return False
+        return True
+
+
+async def send_authenticated_json(websocket: WebSocket, data: Any) -> bool:
+    lease = _AUTHENTICATED_WEBSOCKETS.get(websocket)
+    if lease is None:
+        return False
+    async with lease.send_lock:
+        if lease.closing or not _websocket_connected(websocket):
+            return False
+        try:
+            await websocket.send_json(data)
+        except (RuntimeError, WebSocketDisconnect):
+            lease.closing = True
+            return False
+        return True
+
+
+def renew_authenticated_websockets(sid: str, expires_at: float) -> int:
+    renewed = 0
+    for websocket, lease in list(_AUTHENTICATED_WEBSOCKETS.items()):
+        if lease.sid != sid or lease.closing:
+            continue
+        task = lease.expiry_task
+        if task is not None and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+        lease.expires_at = expires_at
+        lease.expiry_task = _spawn_expiry_task(websocket, expires_at)
+        renewed += 1
+    return renewed
+
+
+def _websocket_connected(websocket: WebSocket) -> bool:
+    return (
+        getattr(websocket, "client_state", WebSocketState.CONNECTED)
+        == WebSocketState.CONNECTED
+        and getattr(websocket, "application_state", WebSocketState.CONNECTED)
+        == WebSocketState.CONNECTED
+    )
 
 
 async def require_private_request(request: Request) -> None:
@@ -165,7 +278,7 @@ async def authenticate_websocket(websocket: WebSocket) -> bool:
         token = None
 
     decoded, auth_status = (
-        _decode_access_token_status(token)
+        decode_access_token_status(token)
         if isinstance(token, str)
         else (None, "invalid")
     )
@@ -176,28 +289,34 @@ async def authenticate_websocket(websocket: WebSocket) -> bool:
     )
     if not valid:
         if auth_status == "expired":
-            await websocket.close(
-                code=WEBSOCKET_AUTH_EXPIRED, reason="authentication expired"
+            await close_authenticated_websocket(
+                websocket,
+                code=WEBSOCKET_AUTH_EXPIRED,
+                reason="authentication expired",
             )
         else:
-            await websocket.close(code=1008, reason="authentication required")
+            await close_authenticated_websocket(
+                websocket, code=1008, reason="authentication required"
+            )
         return False
     if decoded is None:
         decoded = {}
-    _AUTHENTICATED_WEBSOCKETS.add(websocket)
+    sid = str(decoded.get("sid") or "")
     expires_at = decoded.get("exp") if decoded is not None else None
+    lease = WebSocketAuthLease(
+        sid=sid,
+        expires_at=float(expires_at) if isinstance(expires_at, int | float) else None,
+        send_lock=asyncio.Lock(),
+    )
+    _AUTHENTICATED_WEBSOCKETS[websocket] = lease
     if isinstance(expires_at, int | float):
-        task = asyncio.create_task(
-            _expire_websocket(websocket, float(expires_at)),
-            name="webui-websocket-auth-expiry",
-        )
-        _WEBSOCKET_EXPIRY_TASKS[websocket] = task
+        lease.expiry_task = _spawn_expiry_task(websocket, float(expires_at))
     return True
 
 
 def unregister_authenticated_websocket(websocket: WebSocket) -> None:
-    _AUTHENTICATED_WEBSOCKETS.discard(websocket)
-    task = _WEBSOCKET_EXPIRY_TASKS.pop(websocket, None)
+    lease = _AUTHENTICATED_WEBSOCKETS.pop(websocket, None)
+    task = lease.expiry_task if lease is not None else None
     if task is not None and task is not asyncio.current_task() and not task.done():
         task.cancel()
 
@@ -208,11 +327,12 @@ def authenticated_websocket_count() -> int:
 
 async def revoke_authenticated_websockets() -> None:
     websockets = list(_AUTHENTICATED_WEBSOCKETS)
-    _AUTHENTICATED_WEBSOCKETS.clear()
     for websocket in websockets:
-        with contextlib.suppress(Exception):
+        with contextlib.suppress(Exception, asyncio.TimeoutError):
             await asyncio.wait_for(
-                websocket.close(code=1008, reason="credentials changed"),
+                close_authenticated_websocket(
+                    websocket, code=1008, reason="credentials changed"
+                ),
                 timeout=2,
             )
         unregister_authenticated_websocket(websocket)
@@ -224,11 +344,16 @@ __all__ = [
     "PrivateNetworkStaticFiles",
     "authenticate_websocket",
     "authenticated_websocket_count",
+    "close_authenticated_websocket",
+    "decode_access_token_status",
     "is_private_client",
     "is_private_scope",
     "login_attempt_limiter",
+    "renew_authenticated_websockets",
     "require_private_request",
     "revoke_authenticated_websockets",
+    "send_authenticated_json",
+    "send_authenticated_text",
     "unregister_authenticated_websocket",
     "validate_access_token",
 ]

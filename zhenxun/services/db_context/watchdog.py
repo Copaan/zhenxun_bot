@@ -15,6 +15,11 @@ from zhenxun.services.message_load import (
 from zhenxun.utils.manager.priority_manager import PriorityLifecycle
 
 from .config import LOG_COMMAND
+from .utils import (
+    managed_db_operation_count,
+    sqlite_exclusive_access,
+    sqlite_operation_locked,
+)
 
 _CHECK_INTERVAL_SECONDS = 15.0
 _CHECK_TIMEOUT_SECONDS = 2.0
@@ -26,6 +31,13 @@ _RECONNECT_WAIT_IDLE_SECONDS = 3.0
 _WATCHDOG_TASK: asyncio.Task[None] | None = None
 _RECONNECT_LOCK = asyncio.Lock()
 _LAST_RECONNECT_AT = 0.0
+_CONSECUTIVE_FAILURES = 0
+_RECOVERY_STATE = "idle"
+_LAST_FAILURE = ""
+
+
+def db_watchdog_healthy(_value=None) -> bool:
+    return _WATCHDOG_TASK is not None and not _WATCHDOG_TASK.done()
 
 
 def _is_sqlite_connection() -> bool:
@@ -42,31 +54,54 @@ async def _select_one() -> None:
     await connection.execute_query("SELECT 1")
 
 
+async def _select_one_when_idle() -> bool:
+    if low_priority_writer_active_count() > 0 or sqlite_operation_locked():
+        return False
+    acquired = False
+    try:
+        async with sqlite_exclusive_access(0.1):
+            acquired = True
+            await asyncio.wait_for(_select_one(), timeout=_CHECK_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        if not acquired:
+            return False
+        raise
+    return True
+
+
 async def _try_reconnect(reason: str) -> None:
-    global _LAST_RECONNECT_AT
+    global _LAST_RECONNECT_AT, _RECOVERY_STATE
     now = time.monotonic()
     if now - _LAST_RECONNECT_AT < _RECONNECT_COOLDOWN_SECONDS:
         return
     if low_priority_writer_active_count() > 0:
+        _RECOVERY_STATE = "recovery_required"
         return
     async with _RECONNECT_LOCK:
         now = time.monotonic()
         if now - _LAST_RECONNECT_AT < _RECONNECT_COOLDOWN_SECONDS:
             return
-        await asyncio.sleep(_RECONNECT_WAIT_IDLE_SECONDS)
-        if low_priority_writer_active_count() > 0:
-            return
         try:
-            await connections.close_all(discard=True)
-            # ConnectionHandler lazily recreates default connection from db_config.
-            Tortoise.get_connection("default")
+            async with sqlite_exclusive_access(_RECONNECT_WAIT_IDLE_SECONDS):
+                if (
+                    low_priority_writer_active_count() > 0
+                    or managed_db_operation_count() > 0
+                ):
+                    _RECOVERY_STATE = "recovery_required"
+                    return
+                _RECOVERY_STATE = "reconnecting"
+                await connections.close_all(discard=True)
+                # ConnectionHandler lazily recreates default connection from db_config.
+                Tortoise.get_connection("default")
             _LAST_RECONNECT_AT = time.monotonic()
+            _RECOVERY_STATE = "recovered"
             logger.warning(
                 f"SQLite watchdog rebuilt default connection: {reason}",
                 LOG_COMMAND,
             )
         except Exception as exc:
             _LAST_RECONNECT_AT = time.monotonic()
+            _RECOVERY_STATE = "recovery_required"
             signal_db_unhealthy(
                 _UNHEALTHY_SECONDS,
                 reason=f"watchdog reconnect:{reason}",
@@ -74,32 +109,59 @@ async def _try_reconnect(reason: str) -> None:
             logger.warning("SQLite watchdog reconnect failed", LOG_COMMAND, e=exc)
 
 
+async def _run_watchdog_probe() -> None:
+    global _CONSECUTIVE_FAILURES, _LAST_FAILURE, _RECOVERY_STATE
+    if not _is_sqlite_connection():
+        _CONSECUTIVE_FAILURES = 0
+        return
+    try:
+        if not await _select_one_when_idle():
+            return
+        _CONSECUTIVE_FAILURES = 0
+        _LAST_FAILURE = ""
+        if _RECOVERY_STATE != "reconnecting":
+            _RECOVERY_STATE = "idle"
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        _CONSECUTIVE_FAILURES += 1
+        reason = (
+            "sqlite watchdog SELECT 1 failed "
+            f"x{_CONSECUTIVE_FAILURES}: {type(exc).__name__}"
+        )
+        _LAST_FAILURE = reason
+        logger.warning(reason, LOG_COMMAND)
+        if _CONSECUTIVE_FAILURES >= _FAIL_THRESHOLD:
+            signal_db_unhealthy(_UNHEALTHY_SECONDS, reason=reason)
+            await _try_reconnect(reason)
+
+
 async def _watchdog_loop() -> None:
-    failures = 0
     while True:
         await asyncio.sleep(_CHECK_INTERVAL_SECONDS)
-        if not _is_sqlite_connection():
-            failures = 0
-            continue
-        try:
-            await asyncio.wait_for(_select_one(), timeout=_CHECK_TIMEOUT_SECONDS)
-            failures = 0
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            failures += 1
-            reason = f"sqlite watchdog SELECT 1 failed x{failures}: {exc}"
-            signal_db_unhealthy(_UNHEALTHY_SECONDS, reason=reason)
-            logger.warning(reason, LOG_COMMAND)
-            if failures >= _FAIL_THRESHOLD:
-                await _try_reconnect(reason)
+        await _run_watchdog_probe()
 
 
-def start_db_watchdog() -> None:
+def watchdog_snapshot() -> dict[str, object]:
+    return {
+        "running": db_watchdog_healthy(),
+        "consecutive_failures": _CONSECUTIVE_FAILURES,
+        "last_failure": _LAST_FAILURE,
+        "recovery_state": _RECOVERY_STATE,
+        "managed_operations": managed_db_operation_count(),
+        "sqlite_operation_locked": sqlite_operation_locked(),
+    }
+
+
+def start_db_watchdog(context=None) -> None:
     global _WATCHDOG_TASK
     if _WATCHDOG_TASK is not None and not _WATCHDOG_TASK.done():
         return
-    _WATCHDOG_TASK = asyncio.create_task(_watchdog_loop())
+    _WATCHDOG_TASK = (
+        context.spawn_task(_watchdog_loop(), name="database-watchdog")
+        if context is not None
+        else asyncio.create_task(_watchdog_loop(), name="database-watchdog")
+    )
 
 
 async def stop_db_watchdog() -> None:
@@ -113,11 +175,17 @@ async def stop_db_watchdog() -> None:
         await task
 
 
-@PriorityLifecycle.on_startup(priority=8)
-async def _start_db_watchdog() -> None:
-    start_db_watchdog()
+@PriorityLifecycle.on_startup(
+    priority=8,
+    component_id="runtime:database_watchdog",
+    depends_on=("management:database",),
+    pass_context=True,
+    health=db_watchdog_healthy,
+)
+async def _start_db_watchdog(context) -> None:
+    start_db_watchdog(context)
 
 
-@PriorityLifecycle.on_shutdown(priority=10)
+@PriorityLifecycle.on_shutdown(priority=10, component_id="runtime:database_watchdog")
 async def _stop_db_watchdog() -> None:
     await stop_db_watchdog()

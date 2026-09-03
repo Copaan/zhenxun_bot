@@ -3,12 +3,13 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
+import inspect
 import time
 from typing import ClassVar, Literal
 
 import nonebot
-from nonebot.utils import is_coroutine_callable
 
+from zhenxun.services.lifecycle import ComponentSpec, LifecycleError, lifecycle_kernel
 from zhenxun.services.log import logger
 from zhenxun.services.startup import StartupStage, startup_coordinator
 from zhenxun.utils.enum import PriorityLifecycleType
@@ -28,6 +29,12 @@ class HookSpec:
     task_id: str | None = None
     depends_on: tuple[str, ...] = ()
     resource_group: str | None = None
+    component_id: str | None = None
+    scope: str = "infrastructure"
+    restart_policy: str = "worker"
+    config_keys: tuple[str, ...] = ()
+    pass_context: bool = False
+    health: Callable | None = None
 
 
 class PriorityLifecycle:
@@ -49,6 +56,12 @@ class PriorityLifecycle:
         task_id: str | None = None,
         depends_on: tuple[str, ...] = (),
         resource_group: str | None = None,
+        component_id: str | None = None,
+        scope: str = "infrastructure",
+        restart_policy: str = "worker",
+        config_keys: tuple[str, ...] = (),
+        pass_context: bool = False,
+        health: Callable | None = None,
     ):
         if hook_type not in cls._data:
             cls._data[hook_type] = {}
@@ -64,6 +77,12 @@ class PriorityLifecycle:
             task_id=task_id,
             depends_on=depends_on,
             resource_group=resource_group,
+            component_id=component_id,
+            scope=scope,
+            restart_policy=restart_policy,
+            config_keys=config_keys,
+            pass_context=pass_context,
+            health=health,
         )
 
     @classmethod
@@ -78,6 +97,12 @@ class PriorityLifecycle:
         task_id: str | None = None,
         depends_on: tuple[str, ...] = (),
         resource_group: str | None = None,
+        component_id: str | None = None,
+        scope: str = "infrastructure",
+        restart_policy: str = "worker",
+        config_keys: tuple[str, ...] = (),
+        pass_context: bool = False,
+        health: Callable | None = None,
     ):
         def wrapper(func):
             cls.add(
@@ -91,13 +116,25 @@ class PriorityLifecycle:
                 task_id=task_id,
                 depends_on=depends_on,
                 resource_group=resource_group,
+                component_id=component_id,
+                scope=scope,
+                restart_policy=restart_policy,
+                config_keys=config_keys,
+                pass_context=pass_context,
+                health=health,
             )
             return func
 
         return wrapper
 
     @classmethod
-    def on_shutdown(cls, *, priority: int, timeout: float | None = None):
+    def on_shutdown(
+        cls,
+        *,
+        priority: int,
+        timeout: float | None = None,
+        component_id: str | None = None,
+    ):
         def wrapper(func):
             cls.add(
                 PriorityLifecycleType.SHUTDOWN,
@@ -105,6 +142,7 @@ class PriorityLifecycle:
                 priority,
                 timeout=timeout,
                 failure_policy="degrade",
+                component_id=component_id,
             )
             return func
 
@@ -122,21 +160,21 @@ async def _run_hook(
     *,
     stage: str = "runtime",
     timeout: float | None = None,
-) -> None:
+    context: object | None = None,
+) -> object | None:
     name = _hook_name(func)
     logger.debug(f"执行优先级 [{priority}] on_{hook_type} 方法: {func.__module__}")
     started = time.monotonic()
     state = "completed"
     error_code = None
     try:
-        if is_coroutine_callable(func):
-            awaitable = func()
+        result = func(context) if context is not None else func()
+        if inspect.isawaitable(result):
             if timeout is not None:
-                await asyncio.wait_for(awaitable, timeout=timeout)
+                result = await asyncio.wait_for(result, timeout=timeout)
             else:
-                await awaitable
-        else:
-            func()
+                result = await result
+        return result
     except BaseException as error:
         state = "failed"
         error_code = (
@@ -158,15 +196,17 @@ async def _run_hook(
         )
 
 
-async def _run_stage(stage: StartupStage) -> None:
+def _stage_hooks() -> dict[str, tuple[int, Callable, HookSpec]]:
     priority_data = PriorityLifecycle._data.get(PriorityLifecycleType.STARTUP, {})
     pending: dict[str, tuple[int, Callable, HookSpec]] = {}
     for priority in sorted(priority_data):
         for func in list(priority_data[priority]):
             spec = PriorityLifecycle._metadata.get(func, HookSpec())
-            if spec.stage != stage:
-                continue
-            base_id = spec.task_id or _hook_name(func)
+            base_id = (
+                spec.component_id
+                or spec.task_id
+                or f"legacy:{spec.stage}:{_hook_name(func)}"
+            )
             task_id = base_id
             suffix = 2
             while task_id in pending:
@@ -174,26 +214,67 @@ async def _run_stage(stage: StartupStage) -> None:
                 suffix += 1
             pending[task_id] = (priority, func, spec)
 
-    completed: set[str] = set()
+    return pending
 
-    async def run_one(task_id: str, item: tuple[int, Callable, HookSpec]) -> None:
-        priority, func, spec = item
+
+def _paired_shutdown_hooks() -> dict[str, tuple[int, Callable, HookSpec]]:
+    result: dict[str, tuple[int, Callable, HookSpec]] = {}
+    priority_data = PriorityLifecycle._data.get(PriorityLifecycleType.SHUTDOWN, {})
+    for priority in sorted(priority_data):
+        for func in list(priority_data[priority]):
+            spec = PriorityLifecycle._metadata.get(func, HookSpec())
+            if spec.component_id:
+                if spec.component_id in result:
+                    raise LifecycleError(
+                        f"component_shutdown_duplicate:{spec.component_id}"
+                    )
+                result[spec.component_id] = (priority, func, spec)
+    return result
+
+
+def _shutdown_only_hooks() -> dict[str, tuple[int, Callable, HookSpec]]:
+    result: dict[str, tuple[int, Callable, HookSpec]] = {}
+    priority_data = PriorityLifecycle._data.get(PriorityLifecycleType.SHUTDOWN, {})
+    for priority in sorted(priority_data):
+        for func in list(priority_data[priority]):
+            spec = PriorityLifecycle._metadata.get(func, HookSpec())
+            if spec.component_id:
+                continue
+            base_id = f"legacy:shutdown:{_hook_name(func)}"
+            component_id = base_id
+            suffix = 2
+            while component_id in result:
+                component_id = f"{base_id}#{suffix}"
+                suffix += 1
+            result[component_id] = (priority, func, spec)
+    return result
+
+
+def _build_start_component(
+    func: Callable,
+    priority: int,
+    spec: HookSpec,
+    component_id: str,
+) -> Callable:
+    async def start_component(context=None):
         try:
-            await _run_hook(
+            result = await _run_hook(
                 func,
                 priority,
-                stage=stage,
+                stage=spec.stage,
                 timeout=spec.timeout,
+                context=context if spec.pass_context else None,
             )
-            if stage == "warmup":
+            if spec.stage == "warmup":
                 from zhenxun.services.startup_load import startup_load_planner
 
                 startup_load_planner.finish_warmup_hook(
                     str(getattr(func, "__module__", ""))
                 )
+            return result
         except (Exception, HookPriorityException) as error:
             logger.error(
-                f"执行启动钩子失败: {_hook_name(func)} ({type(error).__name__})",
+                "执行启动钩子失败: " f"{_hook_name(func)} ({type(error).__name__})",
                 e=error if isinstance(error, Exception) else None,
             )
             from zhenxun.services.startup_load import startup_load_planner
@@ -205,74 +286,141 @@ async def _run_stage(stage: StartupStage) -> None:
                 startup_load_planner.mark_failed(
                     owner, f"plugin_lifecycle_failed:{type(error).__name__}"
                 )
-                if stage == "warmup":
+                if spec.stage == "warmup":
                     startup_load_planner.finish_warmup_hook(
                         str(getattr(func, "__module__", ""))
                     )
-                return
-            if spec.failure_policy == "fatal":
-                raise
-            startup_coordinator.record_error(stage, f"{task_id}:{type(error).__name__}")
-
-    running: dict[
-        asyncio.Task[None], tuple[str, tuple[int, Callable, HookSpec], str]
-    ] = {}
-    while pending or running:
-        ready = [
-            (task_id, item)
-            for task_id, item in pending.items()
-            if set(item[2].depends_on) <= completed
-        ]
-        if not ready and not running:
-            unresolved = ",".join(sorted(pending))
-            raise RuntimeError(f"startup_dependency_cycle:{unresolved}")
-        if ready:
-            # Keep priorities as barriers even when a parallel hook finishes first.
-            # Otherwise a higher-priority task could start while another task from
-            # the previous priority is still mutating shared startup state.
-            min_priority = (
-                min(item[0] for _, item, _ in running.values())
-                if running
-                else min(item[0] for _, item in ready)
-            )
-            ready = sorted(
-                (row for row in ready if row[1][0] == min_priority),
-                key=lambda row: row[0],
-            )
-            active_groups = {row[2] for row in running.values()}
-            running_is_parallel = all(
-                row[1][2].parallel_safe for row in running.values()
-            )
-            for task_id, item in ready:
-                spec = item[2]
-                group = spec.resource_group or task_id
-                if running and (not running_is_parallel or not spec.parallel_safe):
-                    continue
-                if not spec.parallel_safe and running:
-                    continue
-                if group in active_groups:
-                    continue
-                task = asyncio.create_task(
-                    run_one(task_id, item), name=f"startup:{stage}:{task_id}"
+            elif spec.failure_policy != "fatal":
+                startup_coordinator.record_error(
+                    spec.stage,
+                    f"{component_id}:{type(error).__name__}",
+                    source_type="component",
+                    source_id=component_id,
+                    display_name=component_id,
                 )
-                running[task] = (task_id, item, group)
-                pending.pop(task_id, None)
-                active_groups.add(group)
-                if not spec.parallel_safe:
-                    break
-        if not running:
+            raise
+
+    return start_component
+
+
+def _build_stop_component(
+    func: Callable,
+    priority: int,
+    spec: HookSpec,
+) -> Callable:
+    async def stop_component() -> None:
+        await _run_hook(
+            func,
+            priority,
+            "shutdown",
+            stage="shutdown",
+            timeout=spec.timeout,
+        )
+
+    return stop_component
+
+
+def _sync_kernel_declarations() -> set[Callable]:
+    hooks = _stage_hooks()
+    shutdowns = _paired_shutdown_hooks()
+    shutdown_only = _shutdown_only_hooks()
+    paired: set[Callable] = {
+        item[1] for item in [*shutdowns.values(), *shutdown_only.values()]
+    }
+
+    for component_id, (priority, func, spec) in hooks.items():
+        status = lifecycle_kernel.component_status(component_id)
+        if status and status["state"] not in {"declared", "stopped", "failed"}:
             continue
-        done, _ = await asyncio.wait(running, return_when=asyncio.FIRST_COMPLETED)
-        for task in done:
-            task_id, _, _ = running.pop(task)
-            try:
-                task.result()
-            except BaseException:
-                for active in running:
-                    active.cancel()
-                await asyncio.gather(*running, return_exceptions=True)
-                raise
-            completed.add(task_id)
+
+        start_component = _build_start_component(func, priority, spec, component_id)
+
+        stop_item = shutdowns.get(component_id)
+        stop_component = None
+        if stop_item:
+            stop_priority, stop_func, stop_spec = stop_item
+            stop_component = _build_stop_component(stop_func, stop_priority, stop_spec)
+
+        failure_policy = spec.failure_policy
+        try:
+            from zhenxun.services.startup_load import startup_load_planner
+
+            owner = startup_load_planner.owner_for_module(
+                str(getattr(func, "__module__", ""))
+            )
+            if owner and not startup_load_planner.is_core_plugin(owner):
+                failure_policy = "degrade"
+        except Exception:
+            pass
+        lifecycle_kernel.register(
+            ComponentSpec(
+                component_id=component_id,
+                scope=spec.scope,  # type: ignore[arg-type]
+                stage=spec.stage,
+                depends_on=spec.depends_on,
+                resource_group=spec.resource_group,
+                timeout=spec.timeout,
+                failure_policy=failure_policy,
+                restart_policy=spec.restart_policy,  # type: ignore[arg-type]
+                config_keys=spec.config_keys,
+                priority=priority,
+                stop_priority=stop_item[0] if stop_item else None,
+                parallel_safe=spec.parallel_safe,
+                source="priority_lifecycle",
+            ),
+            start_component,
+            stop=stop_component,
+            health=spec.health,
+            pass_context=spec.pass_context,
+            replace=status is not None,
+        )
+    for component_id, (priority, func, spec) in shutdown_only.items():
+        status = lifecycle_kernel.component_status(component_id)
+        if status and status["state"] not in {"declared", "stopped", "failed"}:
+            continue
+        lifecycle_kernel.register(
+            ComponentSpec(
+                component_id=component_id,
+                scope="infrastructure",
+                stage="runtime",
+                timeout=spec.timeout,
+                failure_policy="degrade",
+                priority=priority,
+                stop_priority=priority,
+                source="priority_lifecycle_shutdown_only",
+            ),
+            lambda: None,
+            stop=_build_stop_component(func, priority, spec),
+            replace=status is not None,
+        )
+    return paired
+
+
+def lifecycle_component_ids(module_names: set[str]) -> set[str]:
+    startup = {
+        component_id
+        for component_id, (_, func, _) in _stage_hooks().items()
+        if str(getattr(func, "__module__", "")) in module_names
+    }
+    shutdown = {
+        component_id
+        for component_id, (_, func, _) in _shutdown_only_hooks().items()
+        if str(getattr(func, "__module__", "")) in module_names
+    }
+    return startup | shutdown
+
+
+async def _run_stage(stage: StartupStage) -> None:
+    _sync_kernel_declarations()
+    component_ids = {
+        component_id
+        for component_id, (_, _, spec) in _stage_hooks().items()
+        if spec.stage == stage
+    }
+    component_ids.update(lifecycle_kernel.native_component_ids_for_stage(stage))
+    if stage == "runtime":
+        component_ids.update(_shutdown_only_hooks())
+    await lifecycle_kernel.start_components(component_ids)
 
 
 _post_management_task: asyncio.Task[None] | None = None
@@ -286,6 +434,9 @@ async def _run_post_management() -> None:
 
         if startup_load_planner.prepared:
             await startup_load_planner.load_runtime()
+            from zhenxun.services.runtime_reload import plugin_runtime_manager
+
+            plugin_runtime_manager.activate_loaded_incarnations()
         await _run_stage("runtime")
     except asyncio.CancelledError:
         raise
@@ -314,6 +465,9 @@ async def _run_post_management() -> None:
 @driver.on_startup
 async def _():
     global _post_management_task
+    from zhenxun.services.runtime_mutation import runtime_mutation_coordinator
+
+    runtime_mutation_coordinator.reopen()
     startup_coordinator.begin_stage("management")
     try:
         await _run_stage("management")
@@ -323,14 +477,25 @@ async def _():
         )
         raise
     startup_coordinator.finish_stage("management")
-    _post_management_task = asyncio.create_task(
-        _run_post_management(), name="zhenxun-startup-runtime"
+    startup_context = lifecycle_kernel.component_context(
+        "management:runtime_concurrency"
+    )
+    _post_management_task = startup_context.spawn_detached(
+        _run_post_management(),
+        scope_id="startup-runtime",
+        scope="operation",
+        name="zhenxun-startup-runtime",
     )
 
 
 @driver.on_shutdown
 async def _():
     global _post_management_task
+    from zhenxun.services.runtime_mutation import runtime_mutation_coordinator
+
+    mutation_drained = await runtime_mutation_coordinator.quiesce(timeout=10)
+    if not mutation_drained:
+        logger.error("运行时变更事务未能在关闭前排空，将要求 worker 恢复。")
     task = _post_management_task
     _post_management_task = None
     if task is not None and not task.done():
@@ -340,11 +505,16 @@ async def _():
         except asyncio.CancelledError:
             pass
 
+    paired = _sync_kernel_declarations()
+    await lifecycle_kernel.stop_all()
+    runtime_mutation_coordinator.close()
     priority_data = PriorityLifecycle._data.get(PriorityLifecycleType.SHUTDOWN)
     if not priority_data:
         return
     for priority in sorted(priority_data):
         for func in list(priority_data[priority]):
+            if func in paired:
+                continue
             spec = PriorityLifecycle._metadata.get(func, HookSpec())
             try:
                 await _run_hook(

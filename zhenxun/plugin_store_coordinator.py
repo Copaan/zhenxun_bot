@@ -1,11 +1,14 @@
 from __future__ import annotations
 
-import asyncio
 from collections.abc import AsyncIterator, Callable, Coroutine
 from contextlib import asynccontextmanager
-from contextvars import ContextVar
 from functools import wraps
 from typing import Any, ParamSpec, TypeVar
+
+from zhenxun.services.runtime_mutation import (
+    RuntimeMutationBusyError,
+    runtime_mutation_coordinator,
+)
 
 P = ParamSpec("P")
 R = TypeVar("R")
@@ -17,29 +20,25 @@ class StoreOperationBusyError(RuntimeError):
 
 class PluginStoreOperationCoordinator:
     def __init__(self) -> None:
-        self._lock = asyncio.Lock()
-        self._depth: ContextVar[int] = ContextVar(
-            "plugin_store_operation_depth", default=0
-        )
+        self._coordinator = runtime_mutation_coordinator
 
     @asynccontextmanager
-    async def operation(self) -> AsyncIterator[None]:
-        depth = self._depth.get()
-        if depth:
-            token = self._depth.set(depth + 1)
-            try:
+    async def operation(
+        self,
+        *,
+        operation_id: str | None = None,
+        owner: str | None = None,
+    ) -> AsyncIterator[None]:
+        try:
+            async with self._coordinator.operation(
+                "plugin_store",
+                fail_if_busy=True,
+                operation_id=operation_id,
+                owner=owner,
+            ):
                 yield
-            finally:
-                self._depth.reset(token)
-            return
-        if self._lock.locked():
-            raise StoreOperationBusyError("plugin_operation_in_progress")
-        async with self._lock:
-            token = self._depth.set(1)
-            try:
-                yield
-            finally:
-                self._depth.reset(token)
+        except RuntimeMutationBusyError as error:
+            raise StoreOperationBusyError("plugin_operation_in_progress") from error
 
 
 plugin_store_operation_coordinator = PluginStoreOperationCoordinator()

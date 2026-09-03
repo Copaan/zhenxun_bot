@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+import copy
 from io import StringIO
 import json
 import os
 from pathlib import Path
 import re
+import secrets
 import tempfile
 from typing import Any
 
@@ -22,6 +24,12 @@ _SIMPLE_CONFIG = Path("data/config.yaml")
 _PLUGIN_CONFIG = Path("data/configs/plugins2config.yaml")
 _ENV_CONFIG = Path(".env.dev")
 _ENV_TEMPLATE = Path(".env.example")
+
+_CREDENTIAL_HELP = {
+    "USERNAME": "前端管理用户名",
+    "PASSWORD": "前端管理密码",
+    "SECRET": "JWT密钥",
+}
 
 
 def _set_env_value(env_text: str, key: str, value: str | int) -> str:
@@ -57,6 +65,28 @@ def _dump_yaml(data: Any) -> bytes:
     return stream.getvalue().encode("utf-8")
 
 
+def _credential_entry(plugin_group: dict[str, Any], key: str) -> dict[str, Any]:
+    registered_group = Config.get_data().get("web-ui")
+    registered = registered_group.configs.get(key) if registered_group else None
+    template = (
+        registered.to_dict(exclude={"type", "arg_parser"})
+        if registered
+        else {
+            "value": None,
+            "help": _CREDENTIAL_HELP[key],
+            "default_value": None,
+            "ui": None,
+        }
+    )
+    current = plugin_group.get(key)
+    if not isinstance(current, dict):
+        current = {}
+        plugin_group[key] = current
+    for field, value in template.items():
+        current.setdefault(field, copy.deepcopy(value))
+    return current
+
+
 def _credential_documents(
     username: str,
     password_hash: str,
@@ -71,9 +101,9 @@ def _credential_documents(
 
     plugins = _load_yaml(_PLUGIN_CONFIG)
     plugin_group = plugins.setdefault("web-ui", {})
-    username_entry = plugin_group.setdefault("USERNAME", {})
-    password_entry = plugin_group.setdefault("PASSWORD", {})
-    secret_entry = plugin_group.setdefault("SECRET", {})
+    username_entry = _credential_entry(plugin_group, "USERNAME")
+    password_entry = _credential_entry(plugin_group, "PASSWORD")
+    secret_entry = _credential_entry(plugin_group, "SECRET")
     username_entry["value"] = username
     password_entry["value"] = password_hash
     if secret is not None:
@@ -155,6 +185,21 @@ def persist_webui_credentials(
         Config.set_config("web-ui", "secret", secret)
 
 
+def ensure_webui_secret() -> bool:
+    username = str(Config.get_config("web-ui", "username", "") or "").strip()
+    password_hash = str(Config.get_config("web-ui", "password", "") or "")
+    if not username or not password_hash:
+        return False
+    if Config.get_config("web-ui", "secret"):
+        return False
+    persist_webui_credentials(
+        username,
+        password_hash,
+        secrets.token_urlsafe(32),
+    )
+    return True
+
+
 def apply_configuration(setting: ApplyRequest) -> dict[str, Any]:
     password_hash = hash_password(setting.password)
     simple_bytes, plugin_bytes = _credential_documents(
@@ -204,4 +249,8 @@ def apply_configuration(setting: ApplyRequest) -> dict[str, Any]:
     }
 
 
-__all__ = ["apply_configuration", "persist_webui_credentials"]
+__all__ = [
+    "apply_configuration",
+    "ensure_webui_secret",
+    "persist_webui_credentials",
+]

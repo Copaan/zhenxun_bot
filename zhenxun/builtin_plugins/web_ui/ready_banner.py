@@ -5,6 +5,7 @@ from collections.abc import Awaitable, Callable
 import contextlib
 import inspect
 import ipaddress
+from typing import Any
 
 ReadyCallback = Callable[[], Awaitable[None] | None]
 
@@ -34,12 +35,20 @@ class UvicornReadyBanner:
         host: str,
         port: int,
         timeout: float = 120.0,
+        context: Any | None = None,
     ) -> bool:
         if self._task is not None or self._emitted:
             return False
-        self._task = asyncio.create_task(
-            self._probe(callback, _connect_host(host), port, timeout),
-            name="zhenxun-webui-ready-probe",
+        coroutine = self._probe(callback, _connect_host(host), port, timeout)
+        self._task = (
+            context.spawn_detached(
+                coroutine,
+                scope_id="webui-ready-probe",
+                scope="operation",
+                name="zhenxun-webui-ready-probe",
+            )
+            if context is not None
+            else asyncio.create_task(coroutine, name="zhenxun-webui-ready-probe")
         )
         return True
 

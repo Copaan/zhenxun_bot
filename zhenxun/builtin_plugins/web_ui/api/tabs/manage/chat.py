@@ -12,7 +12,12 @@ from zhenxun.models.group_member_info import GroupInfoUser
 from zhenxun.utils.depends import UserName
 
 from ....config import AVA_URL
-from ....security import authenticate_websocket, unregister_authenticated_websocket
+from ....security import (
+    authenticate_websocket,
+    close_authenticated_websocket,
+    send_authenticated_json,
+    unregister_authenticated_websocket,
+)
 from .model import Message, MessageItem
 
 driver = nonebot.get_driver()
@@ -32,7 +37,9 @@ matcher = on_message(block=False, priority=1, rule=lambda: bool(ws_conn))
 @driver.on_shutdown
 async def _():
     if ws_conn and ws_conn.client_state == WebSocketState.CONNECTED:
-        await ws_conn.close()
+        await close_authenticated_websocket(
+            ws_conn, code=1001, reason="server shutdown"
+        )
 
 
 @ws_router.websocket("/chat")
@@ -41,7 +48,9 @@ async def _(websocket: WebSocket):
     if not await authenticate_websocket(websocket):
         return
     if ws_conn and ws_conn.client_state == WebSocketState.CONNECTED:
-        await websocket.close(code=1013, reason="connection limit reached")
+        await close_authenticated_websocket(
+            websocket, code=1013, reason="connection limit reached"
+        )
         unregister_authenticated_websocket(websocket)
         return
     ws_conn = websocket
@@ -112,4 +121,7 @@ async def _(
             name=uname,
             ava_url=AVA_URL.format(session.user.id),
         )
-        await ws_conn.send_json(data.to_dict())
+        if not await send_authenticated_json(ws_conn, data.to_dict()):
+            if ws_conn:
+                unregister_authenticated_websocket(ws_conn)
+            ws_conn = None

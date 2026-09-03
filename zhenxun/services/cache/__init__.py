@@ -104,7 +104,6 @@ class Config(BaseModel):
 
 
 # 获取配置
-driver = nonebot.get_driver()
 cache_config = nonebot.get_plugin_config(Config)
 
 
@@ -803,13 +802,28 @@ class Cache(Generic[T]):
         return await CacheRoot.clear(self.cache_type)
 
 
-@driver.on_startup
+from zhenxun.utils.manager.priority_manager import PriorityLifecycle
+
+
+@PriorityLifecycle.on_startup(
+    priority=2,
+    stage="management",
+    component_id="management:cache_root",
+    restart_policy="component",
+    config_keys=(
+        "CACHE_MODE",
+        "REDIS_EXPIRE",
+        "REDIS_HOST",
+        "REDIS_PASSWORD",
+        "REDIS_PORT",
+    ),
+)
 async def _():
     CacheRoot.enabled = _redis_cache_enabled()
     if CacheRoot.enabled:
         logger.info("CacheRoot Redis 模型缓存已启用", LOG_COMMAND)
 
 
-@driver.on_shutdown
+@PriorityLifecycle.on_shutdown(priority=80, component_id="management:cache_root")
 async def _():
     await CacheRoot.close()

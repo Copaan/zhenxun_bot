@@ -1,20 +1,38 @@
+from __future__ import annotations
+
 from datetime import timedelta
-from typing import Any, overload
+from typing import TYPE_CHECKING, Any, overload
 
-import nonebot
-from nonebot import require
-
-require("nonebot_plugin_session")
 from loguru import logger as logger_
+import nonebot
 from nonebot.log import default_filter, default_format
-from nonebot_plugin_session import Session
-from nonebot_plugin_uninfo import Session as uninfoSession
+
+if TYPE_CHECKING:
+    from nonebot_plugin_session import Session
+    from nonebot_plugin_uninfo import Session as uninfoSession
+else:
+    Session = Any
+    uninfoSession = Any
 
 from zhenxun.configs.path_config import LOG_PATH
 
 driver = nonebot.get_driver()
 
 log_level = driver.config.log_level or "INFO"
+
+
+def _session_kind(value: Any) -> str | None:
+    module = type(value).__module__
+    if module.startswith("nonebot_plugin_session") and all(
+        hasattr(value, name) for name in ("id1", "id2", "bot_type")
+    ):
+        return "session"
+    if module.startswith("nonebot_plugin_uninfo") and all(
+        hasattr(value, name) for name in ("user", "adapter", "basic")
+    ):
+        return "uninfo"
+    return None
+
 
 _MAIN_LOG_SINK_ID = logger_.add(
     LOG_PATH / "{time:YYYY-MM-DD}.log",
@@ -121,12 +139,13 @@ class logger:
         """
         user_id: str | None = str(session) if isinstance(session, int | str) else None
 
-        if isinstance(session, Session):
+        session_kind = _session_kind(session)
+        if session_kind == "session":
             user_id = session.id1
             adapter = session.bot_type
             group_id = f"{session.id3}:{session.id2}" if session.id3 else session.id2
             platform = platform or session.platform
-        elif isinstance(session, uninfoSession):
+        elif session_kind == "uninfo":
             user_id = session.user.id
             adapter = session.adapter
             if session.group:

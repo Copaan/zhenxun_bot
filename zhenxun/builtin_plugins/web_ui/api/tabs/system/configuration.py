@@ -546,6 +546,10 @@ async def update_configuration_file(
         warnings=warnings,
         reason=operation.reason if operation is not None else None,
         field_effects=env_operation.field_effects if env_operation else {},
+        component_effects=env_operation.component_effects if env_operation else {},
+        affected_components=(
+            env_operation.affected_components if env_operation else []
+        ),
         rolled_back=bool(env_operation and env_operation.rolled_back),
         affected=(
             env_operation.changed_plugins
@@ -559,6 +563,8 @@ async def update_configuration_file(
         info = "配置已保存，没有需要应用的运行时变化。"
     elif restart_required:
         info = "配置已保存，需要重启后生效。"
+    elif apply_mode == "component_restarted":
+        info = "配置已保存，相关运行时组件已重建。"
     else:
         info = "配置已保存并热加载。"
     return Result.ok(data, info=info)

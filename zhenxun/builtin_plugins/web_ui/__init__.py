@@ -1,3 +1,4 @@
+import asyncio
 import os
 import secrets
 
@@ -15,6 +16,7 @@ from zhenxun.utils.manager.priority_manager import PriorityLifecycle
 from zhenxun.utils.network import emit_webui_console_banner
 
 from .api.configure import router as configure_router
+from .api.configure.persistence import ensure_webui_secret
 from .api.configure.setup_access import setup_access
 from .api.logs import router as ws_log_routes
 from .api.menu import router as menu_router
@@ -35,7 +37,7 @@ from .config import install_cors_middleware
 from .console_access import console_access
 from .public import init_public
 from .ready_banner import webui_ready_banner
-from .security import require_private_request
+from .security import bind_lifecycle_context, require_private_request
 
 __plugin_meta__ = PluginMetadata(
     name="WebUi",
@@ -107,9 +109,21 @@ WsApiRouter.include_router(status_routes)
 WsApiRouter.include_router(chat_routes)
 
 
-@PriorityLifecycle.on_startup(priority=0, stage="management", timeout=20)
-async def _():
+@PriorityLifecycle.on_startup(
+    priority=0,
+    stage="management",
+    timeout=20,
+    component_id="management:webui",
+    scope="worker",
+    depends_on=("management:runtime_concurrency",),
+    restart_policy="worker",
+    config_keys=("HOST", "PORT", "DRIVER", "WEBUI_TLS"),
+    pass_context=True,
+)
+async def _(context):
+    bind_lifecycle_context(context)
     try:
+        await asyncio.to_thread(ensure_webui_secret)
         app: FastAPI = nonebot.get_app()
         app.include_router(BaseApiRouter)
         app.include_router(WsApiRouter)
@@ -143,6 +157,7 @@ async def _():
             emit_ready_banner,
             host=str(driver.config.host),
             port=int(driver.config.port),
+            context=context,
         )
         if not public_ready:
             logger.error("WebUI 静态资源未就绪，未输出访问链接", "WebUi")
@@ -151,6 +166,7 @@ async def _():
         raise
 
 
-@PriorityLifecycle.on_shutdown(priority=1000)
+@PriorityLifecycle.on_shutdown(priority=1000, component_id="management:webui")
 async def _cleanup_ready_banner():
+    bind_lifecycle_context(None)
     webui_ready_banner.reset()

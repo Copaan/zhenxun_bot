@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Literal
 
 import nonebot
 from pydantic import BaseModel, Field
@@ -23,6 +24,8 @@ class BotSetting(BaseModel):
     """第三方插件路径"""
     qq_adapter_load: bool = False
     """是否加载 QQ 官方适配器"""
+    runtime_watch_mode: Literal["hot_only", "disabled", "auto_restart"] = "hot_only"
+    """运行时文件监听策略"""
 
     def get_qbot_uid(self, qbot_id: str) -> str | None:
         """获取官bot账号id

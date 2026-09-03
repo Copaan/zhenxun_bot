@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import uuid
 
 from zhenxun.services.cache.config import CacheMode
+from zhenxun.services.lifecycle import ResourceReceipt, RuntimeHandle
 from zhenxun.services.log import logger
 from zhenxun.services.message_load import is_db_unhealthy
 from zhenxun.utils.enum import (
@@ -63,6 +64,7 @@ RUNTIME_CACHE_DB_TIMEOUT_SECONDS = 3.0
 
 INSTANCE_ID = uuid.uuid4().hex
 _CACHE_READY_EVENT = asyncio.Event()
+_LIFECYCLE_CONTEXT: Any | None = None
 _APPLYING_REMOTE_CACHE_EVENT: ContextVar[bool] = ContextVar(
     "APPLYING_REMOTE_RUNTIME_CACHE_EVENT",
     default=False,
@@ -83,7 +85,26 @@ def _redis_enabled() -> bool:
     return bool(_env_get("REDIS_HOST"))
 
 
+def _spawn_runtime_task(
+    coroutine,
+    *,
+    name: str,
+    persistent: bool = True,
+) -> asyncio.Task[Any]:
+    if _LIFECYCLE_CONTEXT is not None:
+        return _LIFECYCLE_CONTEXT.spawn_task(
+            coroutine,
+            name=name,
+            persistent=persistent,
+        )
+    return asyncio.create_task(coroutine, name=name)
+
+
 def is_cache_ready() -> bool:
+    return _CACHE_READY_EVENT.is_set()
+
+
+def _runtime_cache_healthy(_value=None) -> bool:
     return _CACHE_READY_EVENT.is_set()
 
 
@@ -618,7 +639,9 @@ class RuntimeCacheSync:
             if cls._pubsub is None:
                 return
             await cls._pubsub.subscribe(cls._channel)
-            cls._task = asyncio.create_task(cls._listen_loop())
+            cls._task = _spawn_runtime_task(
+                cls._listen_loop(), name="runtime-cache-sync"
+            )
             cls._ready = True
             logger.info("runtime cache sync enabled", LOG_COMMAND)
         except Exception as exc:
@@ -667,7 +690,9 @@ class RuntimeCacheSync:
             "action": action,
             "data": data,
         }
-        task = asyncio.create_task(cls._publish(payload))
+        task = _spawn_runtime_task(
+            cls._publish(payload), name="runtime-cache-publish", persistent=False
+        )
         cls._publish_tasks.add(task)
         task.add_done_callback(cls._publish_tasks.discard)
 
@@ -770,13 +795,19 @@ class RuntimeCacheMutation:
             if cls._retry_after.get(label, 0.0) > now:
                 return
             try:
-                await cache_cls.refresh()
+                refreshed = await runtime_cache_refresh_coordinator.refresh_one(
+                    label, cache_cls
+                )
+                if refreshed:
+                    return
+                cls._retry_after[label] = (
+                    time.monotonic() + RUNTIME_CACHE_LOAD_RETRY_SECONDS
+                )
             except Exception as exc:
                 cls.mark_error(cache_cls, exc)
                 cls._retry_after[label] = (
                     time.monotonic() + RUNTIME_CACHE_LOAD_RETRY_SECONDS
                 )
-                return
 
     @staticmethod
     async def read_db(cache_cls: type, coro, *, operation: str):
@@ -999,7 +1030,9 @@ class PluginInfoMemoryCache:
             return
         if cls._refresh_task and not cls._refresh_task.done():
             return
-        cls._refresh_task = asyncio.create_task(cls._refresh_loop(interval))
+        cls._refresh_task = _spawn_runtime_task(
+            cls._refresh_loop(interval), name=f"{cls.__name__}-refresh"
+        )
 
     @classmethod
     def stop_tasks(cls) -> None:
@@ -1180,7 +1213,9 @@ class BotMemoryCache:
             return
         if cls._refresh_task and not cls._refresh_task.done():
             return
-        cls._refresh_task = asyncio.create_task(cls._refresh_loop(interval))
+        cls._refresh_task = _spawn_runtime_task(
+            cls._refresh_loop(interval), name=f"{cls.__name__}-refresh"
+        )
 
     @classmethod
     def stop_tasks(cls) -> None:
@@ -1361,7 +1396,9 @@ class GroupMemoryCache:
             return
         if cls._refresh_task and not cls._refresh_task.done():
             return
-        cls._refresh_task = asyncio.create_task(cls._refresh_loop(interval))
+        cls._refresh_task = _spawn_runtime_task(
+            cls._refresh_loop(interval), name=f"{cls.__name__}-refresh"
+        )
 
     @classmethod
     def stop_tasks(cls) -> None:
@@ -1607,7 +1644,9 @@ class LevelUserMemoryCache:
             return
         if cls._refresh_task and not cls._refresh_task.done():
             return
-        cls._refresh_task = asyncio.create_task(cls._refresh_loop(interval))
+        cls._refresh_task = _spawn_runtime_task(
+            cls._refresh_loop(interval), name=f"{cls.__name__}-refresh"
+        )
 
     @classmethod
     def stop_tasks(cls) -> None:
@@ -1796,7 +1835,9 @@ class TaskInfoMemoryCache:
             return
         if cls._refresh_task and not cls._refresh_task.done():
             return
-        cls._refresh_task = asyncio.create_task(cls._refresh_loop(interval))
+        cls._refresh_task = _spawn_runtime_task(
+            cls._refresh_loop(interval), name=f"{cls.__name__}-refresh"
+        )
 
     @classmethod
     def stop_tasks(cls) -> None:
@@ -1999,7 +2040,9 @@ class PluginLimitMemoryCache:
             return
         if cls._refresh_task and not cls._refresh_task.done():
             return
-        cls._refresh_task = asyncio.create_task(cls._refresh_loop(interval))
+        cls._refresh_task = _spawn_runtime_task(
+            cls._refresh_loop(interval), name=f"{cls.__name__}-refresh"
+        )
 
     @classmethod
     def stop_tasks(cls) -> None:
@@ -2189,7 +2232,11 @@ class BanMemoryCache:
             return False
         remaining = entry.remaining()
         if remaining == 0 and entry.duration != -1:
-            task = asyncio.create_task(cls.remove(entry.user_id, entry.group_id))
+            task = _spawn_runtime_task(
+                cls.remove(entry.user_id, entry.group_id),
+                name=f"{cls.__name__}-remove",
+                persistent=False,
+            )
             cls._remove_tasks.add(task)
             task.add_done_callback(cls._remove_tasks.discard)
             return False
@@ -2208,7 +2255,11 @@ class BanMemoryCache:
             return 0
         remaining = entry.remaining()
         if remaining == 0 and entry.duration != -1:
-            task = asyncio.create_task(cls.remove(entry.user_id, entry.group_id))
+            task = _spawn_runtime_task(
+                cls.remove(entry.user_id, entry.group_id),
+                name=f"{cls.__name__}-remove",
+                persistent=False,
+            )
             cls._remove_tasks.add(task)
             task.add_done_callback(cls._remove_tasks.discard)
             return 0
@@ -2229,7 +2280,11 @@ class BanMemoryCache:
             return False
         remaining = entry.remaining()
         if remaining == 0 and entry.duration != -1:
-            task = asyncio.create_task(cls.remove(entry.user_id, entry.group_id))
+            task = _spawn_runtime_task(
+                cls.remove(entry.user_id, entry.group_id),
+                name=f"{cls.__name__}-remove",
+                persistent=False,
+            )
             cls._remove_tasks.add(task)
             task.add_done_callback(cls._remove_tasks.discard)
             return False
@@ -2301,10 +2356,22 @@ class BanMemoryCache:
         cleanup_db = BAN_MEM_CLEANUP_DB
 
         if refresh_interval > 0 and (not cls._refresh_task or cls._refresh_task.done()):
-            cls._refresh_task = asyncio.create_task(cls._refresh_loop(refresh_interval))
+            cls._refresh_task = _spawn_runtime_task(
+                cls._refresh_loop(refresh_interval), name=f"{cls.__name__}-refresh"
+            )
         if clean_interval > 0 and (not cls._cleanup_task or cls._cleanup_task.done()):
-            cls._cleanup_task = asyncio.create_task(
-                cls._cleanup_loop(clean_interval, cleanup_db)
+            cls._cleanup_task = _spawn_runtime_task(
+                cls._cleanup_loop(clean_interval, cleanup_db),
+                name=f"{cls.__name__}-cleanup",
+            )
+
+    @classmethod
+    def start_cleanup_task(cls) -> None:
+        interval = BAN_MEM_CLEAN_INTERVAL
+        if interval > 0 and (not cls._cleanup_task or cls._cleanup_task.done()):
+            cls._cleanup_task = _spawn_runtime_task(
+                cls._cleanup_loop(interval, BAN_MEM_CLEANUP_DB),
+                name=f"{cls.__name__}-cleanup",
             )
 
     @classmethod
@@ -2338,18 +2405,205 @@ class BanMemoryCache:
             await cls.refresh()
 
 
-async def _safe_refresh(cache_cls: type, label: str) -> None:
-    """安全地刷新单个缓存，异常不影响其他缓存。"""
-    if getattr(cache_cls, "_loaded", False):
-        last_refresh = float(getattr(cache_cls, "_last_refresh", 0.0) or 0.0)
-        if time.time() - last_refresh <= RUNTIME_CACHE_STARTUP_REFRESH_SKIP_SECONDS:
-            logger.debug(f"{label} cache startup refresh skipped", LOG_COMMAND)
+class RuntimeCacheRefreshCoordinator:
+    """Own all full-table refreshes so SQLite never receives a refresh burst."""
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._task: asyncio.Task[Any] | None = None
+        self._wake = asyncio.Event()
+        self._next_due: dict[str, float] = {}
+        self._failure_counts: dict[str, int] = {}
+        self._last_failed_cache: str | None = None
+        self._last_error_code: str | None = None
+        self._current_cache: str | None = None
+        self._queue_depth = 0
+
+    @staticmethod
+    def _specs() -> dict[str, tuple[type, int]]:
+        return {
+            "plugin": (PluginInfoMemoryCache, PLUGININFO_MEM_REFRESH_INTERVAL),
+            "bot": (BotMemoryCache, BOT_MEM_REFRESH_INTERVAL),
+            "group": (GroupMemoryCache, GROUP_MEM_REFRESH_INTERVAL),
+            "level": (LevelUserMemoryCache, LEVEL_MEM_REFRESH_INTERVAL),
+            "task": (TaskInfoMemoryCache, TASK_MEM_REFRESH_INTERVAL),
+            "plugin_limit": (PluginLimitMemoryCache, LIMIT_MEM_REFRESH_INTERVAL),
+            "ban": (BanMemoryCache, BAN_MEM_REFRESH_INTERVAL),
+        }
+
+    @staticmethod
+    def _sqlite() -> bool:
+        try:
+            from tortoise import Tortoise
+
+            connection = Tortoise.get_connection("default")
+            dialect = str(
+                getattr(getattr(connection, "capabilities", None), "dialect", "") or ""
+            ).lower()
+            return dialect.startswith("sqlite")
+        except Exception:
+            return False
+
+    async def start(self) -> None:
+        if self._task is not None and not self._task.done():
             return
-    try:
-        await cache_cls.refresh()
-    except Exception as exc:
-        RuntimeCacheMutation.mark_error(cache_cls, exc)
-        logger.error(f"{label} cache init failed", LOG_COMMAND, e=exc)
+        now = time.monotonic()
+        self._next_due = {
+            name: now + interval + min(30.0, (index + 1) * 2.0)
+            for index, (name, (_, interval)) in enumerate(self._specs().items())
+            if interval > 0
+        }
+        self._wake.clear()
+        self._task = _spawn_runtime_task(
+            self._run(), name="runtime-cache-refresh-coordinator"
+        )
+
+    async def stop(self) -> None:
+        task, self._task = self._task, None
+        self._wake.set()
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    async def _refresh_entry(
+        self, name: str, cache_cls: type, *, startup: bool = False
+    ) -> tuple[str, bool]:
+        if startup and getattr(cache_cls, "_loaded", False):
+            last_refresh = float(getattr(cache_cls, "_last_refresh", 0.0) or 0.0)
+            if time.time() - last_refresh <= RUNTIME_CACHE_STARTUP_REFRESH_SKIP_SECONDS:
+                return name, True
+        self._current_cache = name
+        previous_refresh = float(getattr(cache_cls, "_last_refresh", 0.0) or 0.0)
+        try:
+            await cache_cls.refresh()
+            current_refresh = float(getattr(cache_cls, "_last_refresh", 0.0) or 0.0)
+            current_error = getattr(cache_cls, "_last_error", None)
+            if current_error and current_refresh <= previous_refresh:
+                failures = self._failure_counts.get(name, 0) + 1
+                self._failure_counts[name] = failures
+                self._last_failed_cache = name
+                self._last_error_code = str(current_error).split(":", 1)[0]
+                return name, False
+            self._failure_counts.pop(name, None)
+            return name, True
+        except Exception as error:
+            RuntimeCacheMutation.mark_error(cache_cls, error)
+            failures = self._failure_counts.get(name, 0) + 1
+            self._failure_counts[name] = failures
+            self._last_failed_cache = name
+            self._last_error_code = type(error).__name__
+            logger.warning(
+                f"runtime cache refresh failed: {name}", LOG_COMMAND, e=error
+            )
+            return name, False
+        finally:
+            self._current_cache = None
+
+    async def refresh_one(self, name: str, cache_cls: type) -> bool:
+        async with self._lock:
+            _, success = await self._refresh_entry(name, cache_cls)
+            return success
+
+    async def refresh_all(self, *, startup: bool = False) -> dict[str, bool]:
+        specs = self._specs()
+        async with self._lock:
+            self._queue_depth = len(specs)
+            try:
+                if self._sqlite():
+                    results = []
+                    for name, (cache_cls, _) in specs.items():
+                        results.append(
+                            await self._refresh_entry(name, cache_cls, startup=startup)
+                        )
+                        self._queue_depth -= 1
+                else:
+                    semaphore = asyncio.Semaphore(3)
+
+                    async def refresh(name: str, cache_cls: type):
+                        async with semaphore:
+                            try:
+                                return await self._refresh_entry(
+                                    name, cache_cls, startup=startup
+                                )
+                            finally:
+                                self._queue_depth -= 1
+
+                    results = await asyncio.gather(
+                        *(
+                            refresh(name, cache_cls)
+                            for name, (cache_cls, _) in specs.items()
+                        )
+                    )
+                return dict(results)
+            finally:
+                self._queue_depth = 0
+
+    async def _run(self) -> None:
+        while True:
+            specs = self._specs()
+            now = time.monotonic()
+            active_due = {
+                name: due
+                for name, due in self._next_due.items()
+                if name in specs and specs[name][1] > 0
+            }
+            delay = max(0.0, min(active_due.values(), default=now + 60.0) - now)
+            try:
+                await asyncio.wait_for(self._wake.wait(), timeout=delay)
+                self._wake.clear()
+                continue
+            except asyncio.TimeoutError:
+                pass
+            now = time.monotonic()
+            due_names = [name for name, due in active_due.items() if due <= now]
+            if not due_names:
+                continue
+            # Advance deadlines before work. A resumed process therefore runs each
+            # overdue cache once instead of replaying every missed interval.
+            for name in due_names:
+                interval = specs[name][1]
+                failures = self._failure_counts.get(name, 0)
+                self._next_due[name] = now + (
+                    min(interval, max(5, 2**failures * 5)) if failures else interval
+                )
+            async with self._lock:
+                self._queue_depth = len(due_names)
+                if self._sqlite():
+                    for name in due_names:
+                        await self._refresh_entry(name, specs[name][0])
+                        self._queue_depth -= 1
+                else:
+                    semaphore = asyncio.Semaphore(3)
+
+                    async def refresh(name: str) -> None:
+                        async with semaphore:
+                            try:
+                                await self._refresh_entry(name, specs[name][0])
+                            finally:
+                                self._queue_depth -= 1
+
+                    await asyncio.gather(*(refresh(name) for name in due_names))
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "running": self._task is not None and not self._task.done(),
+            "queue_depth": self._queue_depth,
+            "current_cache": self._current_cache,
+            "last_failed_cache": self._last_failed_cache,
+            "last_error_code": self._last_error_code,
+            "failure_counts": dict(self._failure_counts),
+            "sqlite_serial": self._sqlite(),
+        }
+
+
+runtime_cache_refresh_coordinator = RuntimeCacheRefreshCoordinator()
+
+
+def refresh_coordinator_snapshot() -> dict[str, Any]:
+    return runtime_cache_refresh_coordinator.snapshot()
 
 
 def _cache_health(
@@ -2413,31 +2667,7 @@ def health_snapshot() -> dict[str, dict[str, Any]]:
 
 async def refresh_all_runtime_caches() -> dict[str, bool]:
     """Refresh authoritative runtime snapshots without clearing them first."""
-    caches = {
-        "plugin": PluginInfoMemoryCache,
-        "bot": BotMemoryCache,
-        "group": GroupMemoryCache,
-        "level": LevelUserMemoryCache,
-        "task": TaskInfoMemoryCache,
-        "plugin_limit": PluginLimitMemoryCache,
-        "ban": BanMemoryCache,
-    }
-
-    async def refresh(name: str, cache_cls: type) -> tuple[str, bool]:
-        try:
-            await cache_cls.refresh()
-            return name, True
-        except Exception as error:
-            RuntimeCacheMutation.mark_error(cache_cls, error)
-            logger.warning(
-                f"runtime cache refresh failed: {name}", LOG_COMMAND, e=error
-            )
-            return name, False
-
-    results = await asyncio.gather(
-        *(refresh(name, cache_cls) for name, cache_cls in caches.items())
-    )
-    return dict(results)
+    return await runtime_cache_refresh_coordinator.refresh_all()
 
 
 def passive_status_snapshot(max_modules: int = 50) -> dict[str, Any]:
@@ -2489,35 +2719,78 @@ def passive_status_snapshot(max_modules: int = 50) -> dict[str, Any]:
     }
 
 
+class RuntimeCacheHandle:
+    async def quiesce(self) -> None:
+        _CACHE_READY_EVENT.clear()
+
+    async def close(self) -> None:
+        await _stop_runtime_cache()
+
+    def health(self) -> dict[str, object]:
+        snapshot = health_snapshot()
+        return {
+            "healthy": _CACHE_READY_EVENT.is_set(),
+            "loaded_caches": sum(item["loaded"] for item in snapshot.values()),
+            "refresh_coordinator": refresh_coordinator_snapshot(),
+        }
+
+    def snapshot(self) -> dict[str, object]:
+        return {
+            "ready": _CACHE_READY_EVENT.is_set(),
+            "redis_sync_ready": RuntimeCacheSync._ready,
+            "caches": health_snapshot(),
+            "refresh_coordinator": refresh_coordinator_snapshot(),
+        }
+
+    def resource_snapshot(self) -> list[ResourceReceipt]:
+        return [
+            ResourceReceipt(
+                receipt_id="runtime-cache:state",
+                provider="cache",
+                resource_type="runtime_cache",
+                owner_id="runtime:runtime_cache",
+                detail={
+                    "ready": _CACHE_READY_EVENT.is_set(),
+                    "redis_sync_ready": RuntimeCacheSync._ready,
+                },
+            )
+        ]
+
+
 @PriorityLifecycle.on_startup(
     priority=6,
     task_id="runtime:runtime_cache",
-    depends_on=("runtime:reconcile_tasks",),
+    depends_on=("management:cache_root", "runtime:reconcile_tasks"),
+    component_id="runtime:runtime_cache",
+    restart_policy="component",
+    config_keys=(
+        "CACHE_MODE",
+        "REDIS_EXPIRE",
+        "REDIS_HOST",
+        "REDIS_PASSWORD",
+        "REDIS_PORT",
+    ),
+    pass_context=True,
+    health=_runtime_cache_healthy,
 )
-async def _init_runtime_cache():
+async def _init_runtime_cache(context):
+    global _LIFECYCLE_CONTEXT
+    _LIFECYCLE_CONTEXT = context
     await RuntimeCacheSync.start()
-    # 并发刷新所有缓存，互不依赖
-    await asyncio.gather(
-        _safe_refresh(PluginInfoMemoryCache, "plugin"),
-        _safe_refresh(BotMemoryCache, "bot"),
-        _safe_refresh(GroupMemoryCache, "group"),
-        _safe_refresh(LevelUserMemoryCache, "level"),
-        _safe_refresh(TaskInfoMemoryCache, "task info"),
-        _safe_refresh(PluginLimitMemoryCache, "plugin limit"),
-        _safe_refresh(BanMemoryCache, "ban"),
-    )
-    PluginInfoMemoryCache.start_refresh_task()
-    BotMemoryCache.start_tasks()
-    GroupMemoryCache.start_tasks()
-    LevelUserMemoryCache.start_tasks()
-    TaskInfoMemoryCache.start_tasks()
-    PluginLimitMemoryCache.start_tasks()
-    BanMemoryCache.start_tasks()
+    await runtime_cache_refresh_coordinator.start()
+    await runtime_cache_refresh_coordinator.refresh_all(startup=True)
+    BanMemoryCache.start_cleanup_task()
     _CACHE_READY_EVENT.set()
+    return RuntimeHandle(
+        controller=RuntimeCacheHandle(),
+        metadata={"ownership": "composite"},
+    )
 
 
-@PriorityLifecycle.on_shutdown(priority=6)
 async def _stop_runtime_cache():
+    global _LIFECYCLE_CONTEXT
+    _CACHE_READY_EVENT.clear()
+    await runtime_cache_refresh_coordinator.stop()
     PluginInfoMemoryCache.stop_tasks()
     BotMemoryCache.stop_tasks()
     GroupMemoryCache.stop_tasks()
@@ -2526,3 +2799,4 @@ async def _stop_runtime_cache():
     PluginLimitMemoryCache.stop_tasks()
     BanMemoryCache.stop_tasks()
     await RuntimeCacheSync.stop()
+    _LIFECYCLE_CONTEXT = None

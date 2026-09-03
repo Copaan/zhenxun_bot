@@ -429,7 +429,9 @@ def apply_pending_transaction() -> bool:
         try:
             for operation in transaction.get("operations", []):
                 live = Path(str(operation["live_path"]))
-                if _digest(live) != operation.get("base_digest"):
+                if operation.get("action") != "uninstall" and _digest(
+                    live
+                ) != operation.get("base_digest"):
                     raise RuntimeError("plugin_transaction_stale")
             for operation in transaction.get("operations", []):
                 live = Path(str(operation["live_path"]))

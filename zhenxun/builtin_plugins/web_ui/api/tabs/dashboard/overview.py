@@ -18,6 +18,8 @@ from zhenxun.builtin_plugins.web_ui.security import authenticated_websocket_coun
 from zhenxun.services.cache import cache_config
 from zhenxun.services.cache.config import CacheMode
 from zhenxun.services.cache.runtime_cache import health_snapshot
+from zhenxun.services.lifecycle import LifecycleError
+from zhenxun.services.lifecycle.operations import operation_registry
 from zhenxun.services.log import logger
 from zhenxun.services.message_load import is_db_unhealthy
 
@@ -217,9 +219,20 @@ async def _get_probes(
         ):
             return _probe_results
         if _probe_task is None or _probe_task.done():
-            _probe_task = asyncio.create_task(_run_probes())
+            try:
+                _, _probe_task = operation_registry.start(
+                    "dashboard_probe",
+                    _run_probes(),
+                    owner_component_id="management:webui",
+                    recovery_policy="discard",
+                    name="webui-dashboard-probe",
+                )
+            except LifecycleError:
+                _probe_task = asyncio.create_task(
+                    _run_probes(), name="webui-dashboard-probe"
+                )
         task = _probe_task
-    results = await task
+    results = await asyncio.shield(task)
     async with _probe_lock:
         if _probe_task is task:
             _probe_results = results

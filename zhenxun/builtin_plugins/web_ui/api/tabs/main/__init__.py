@@ -16,7 +16,12 @@ from zhenxun.utils.platform import PlatformUtils
 
 from ....base_model import Result
 from ....config import QueryDateType
-from ....security import authenticate_websocket, unregister_authenticated_websocket
+from ....security import (
+    authenticate_websocket,
+    close_authenticated_websocket,
+    send_authenticated_text,
+    unregister_authenticated_websocket,
+)
 from ....utils import DB_BUSY_MESSAGE, authentication, get_system_status
 from .data_source import ApiDataSource
 from .model import (
@@ -42,11 +47,12 @@ _SYSTEM_STATUS_STOPPING = False
 
 async def _close_system_status_websocket(websocket: WebSocket) -> None:
     with contextlib.suppress(Exception):
-        if websocket.client_state == WebSocketState.CONNECTED:
-            await asyncio.wait_for(
-                websocket.close(code=1001, reason="server shutdown"),
-                timeout=2,
-            )
+        await asyncio.wait_for(
+            close_authenticated_websocket(
+                websocket, code=1001, reason="server shutdown"
+            ),
+            timeout=2,
+        )
 
 
 @driver.on_shutdown
@@ -282,7 +288,9 @@ async def system_logs_realtime(websocket: WebSocket, sleep: int = 5):
     if not await authenticate_websocket(websocket):
         return
     if len(_SYSTEM_STATUS_CONNECTIONS) >= _MAX_SYSTEM_STATUS_CONNECTIONS:
-        await websocket.close(code=1013, reason="connection limit reached")
+        await close_authenticated_websocket(
+            websocket, code=1013, reason="connection limit reached"
+        )
         unregister_authenticated_websocket(websocket)
         return
     _SYSTEM_STATUS_CONNECTIONS.add(websocket)
@@ -308,7 +316,11 @@ async def system_logs_realtime(websocket: WebSocket, sleep: int = 5):
             and not _SYSTEM_STATUS_STOPPING
         ):
             system_status = await get_system_status()
-            await asyncio.wait_for(websocket.send_text(system_status.json()), timeout=5)
+            sent = await asyncio.wait_for(
+                send_authenticated_text(websocket, system_status.json()), timeout=5
+            )
+            if not sent:
+                break
             try:
                 await asyncio.wait_for(disconnect_event.wait(), timeout=max(sleep, 1))
             except asyncio.TimeoutError:

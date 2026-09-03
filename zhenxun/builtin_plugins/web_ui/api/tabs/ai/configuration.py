@@ -22,9 +22,34 @@ from ruamel.yaml import YAML
 from zhenxun.configs.config import Config
 from zhenxun.services.ai.config import get_llm_config
 from zhenxun.services.ai.config.models import LLMConfig, ProviderConfig
-from zhenxun.services.ai.llm.adapters.factory import LLMAdapterFactory
+from zhenxun.services.ai.core.exceptions import (
+    AuthenticationException,
+    ConfigurationException,
+    InvalidRequestException,
+    LLMException,
+    QuotaExceededException,
+    RateLimitException,
+    ResponseParseException,
+)
+from zhenxun.services.ai.core.messages import (
+    ChatRequest,
+    EmbeddingRequest,
+    ImageRequest,
+    LLMMessage,
+    RerankRequest,
+    SpeechRequest,
+)
+from zhenxun.services.ai.core.messages.parts import EmbedBatch, EmbedPayload, TextPart
+from zhenxun.services.ai.core.models import ModelDetail, ModelIdentity
+from zhenxun.services.ai.core.options import GenerationConfig
+from zhenxun.services.ai.llm.adapters.base import join_api_url
+from zhenxun.services.ai.llm.adapters.factory import (
+    LLMAdapterFactory,
+    get_adapter_for_api_type,
+)
 from zhenxun.services.ai.llm.manager import get_default_api_base_for_type
 from zhenxun.services.ai.llm.system.capabilities import get_model_capabilities
+from zhenxun.services.ai.llm.system.network import health_manager, http_client_manager
 from zhenxun.services.log import logger
 from zhenxun.services.runtime_config_reload import reload_runtime_config
 from zhenxun.services.runtime_reload.models import RuntimeOperation
@@ -114,6 +139,13 @@ class ModelTestRequest(BaseModel):
     model: str
     task: Literal["chat", "embedding", "rerank", "image", "tts"] = "chat"
     confirmed_paid_request: bool = False
+    provider_name: str | None = Field(default=None, max_length=80)
+    saved_provider_name: str | None = Field(default=None, max_length=80)
+    api_type: str | None = Field(default=None, max_length=64)
+    api_base: str | None = Field(default=None, max_length=500)
+    api_key: str | None = None
+    timeout: int | None = Field(default=None, ge=1, le=1800)
+    model_settings: dict[str, Any] | None = Field(default=None, alias="model_config")
 
 
 class PersonaUpdate(BaseModel):
@@ -1160,10 +1192,198 @@ async def validate_routing(payload: RoutingValidationRequest) -> Result:
 
 
 def _discovery_url(api_type: str, api_base: str) -> str:
-    base = api_base.rstrip("/")
-    if api_type == "gemini":
-        return f"{base}/v1beta/models"
-    return f"{base}/models" if base.endswith("/v1") else f"{base}/v1/models"
+    endpoint = "v1beta/models" if api_type == "gemini" else "v1/models"
+    return join_api_url(api_base, endpoint)
+
+
+def _saved_provider(name: str | None) -> ProviderConfig | None:
+    if not name:
+        return None
+    return next(
+        (
+            item
+            for item in get_llm_config().providers
+            if item.name.casefold() == name.casefold()
+        ),
+        None,
+    )
+
+
+def _provider_keys(provider: ProviderConfig | None) -> list[str]:
+    if provider is None:
+        return []
+    keys = (
+        provider.api_key if isinstance(provider.api_key, list) else [provider.api_key]
+    )
+    return [str(key) for key in keys if not _is_placeholder_secret(key)]
+
+
+def _normalized_api_base(api_type: str, api_base: str | None) -> str:
+    return str(api_base or get_default_api_base_for_type(api_type) or "").rstrip("/")
+
+
+def _resolve_probe_provider(
+    *,
+    provider_name: str | None,
+    saved_provider_name: str | None = None,
+    api_type: str | None,
+    api_base: str | None,
+    api_key: str | None,
+    timeout: int | None = None,
+) -> tuple[ProviderConfig, str, bool, str | None]:
+    saved = _saved_provider(saved_provider_name or provider_name)
+    resolved_type = str(api_type or (saved.api_type if saved else "")).strip()
+    resolved_base = _normalized_api_base(
+        resolved_type,
+        api_base if api_base is not None else (saved.api_base if saved else None),
+    )
+    temporary_key = str(api_key or "").strip()
+    saved_base = (
+        _normalized_api_base(saved.api_type, saved.api_base)
+        if saved is not None
+        else ""
+    )
+    scope_matches = bool(
+        saved is not None
+        and resolved_type == saved.api_type
+        and resolved_base == saved_base
+    )
+    if saved is not None and not temporary_key and not scope_matches:
+        raise _probe_error(
+            422,
+            "credentials",
+            "provider_credentials_scope_mismatch",
+            "修改 API 类型或地址后，请填写临时 API Key 再测试。",
+        )
+    saved_keys = _provider_keys(saved) if scope_matches else []
+    selected_key = temporary_key or next(iter(saved_keys), "")
+    if not resolved_type or not resolved_base or not selected_key:
+        raise _probe_error(
+            422,
+            "configuration",
+            "provider_credentials_incomplete",
+            "请填写 API 类型、API 地址和有效 API Key。",
+        )
+    provider = ProviderConfig(
+        name=str(provider_name or (saved.name if saved else "draft-provider")),
+        api_key=selected_key,
+        api_base=resolved_base,
+        api_type=resolved_type,
+        timeout=int(timeout or (saved.timeout if saved else _DISCOVERY_TIMEOUT)),
+        temperature=saved.temperature if saved else None,
+        max_output_tokens=saved.max_output_tokens if saved else None,
+        models=[],
+    )
+    return (
+        provider,
+        selected_key,
+        selected_key in saved_keys,
+        (saved.name if saved is not None else None),
+    )
+
+
+def _probe_error(
+    status_code: int, phase: str, code: str, message: str
+) -> HTTPException:
+    return HTTPException(
+        status_code=status_code,
+        detail={"phase": phase, "code": code, "message": message},
+    )
+
+
+def _map_probe_error(error: Exception, phase: str) -> HTTPException:
+    if isinstance(error, AuthenticationException):
+        return _probe_error(
+            401, phase, "provider_credentials_invalid", "服务商拒绝了当前凭据。"
+        )
+    if isinstance(error, RateLimitException | QuotaExceededException):
+        return _probe_error(
+            429, phase, "provider_rate_limited", "服务商当前限流或额度不可用。"
+        )
+    if isinstance(error, asyncio.TimeoutError | httpx.TimeoutException):
+        return _probe_error(504, phase, "provider_timeout", "连接服务商超时。")
+    if isinstance(error, httpx.NetworkError):
+        return _probe_error(502, phase, "provider_unreachable", "无法连接到服务商。")
+    if isinstance(error, ResponseParseException):
+        return _probe_error(
+            502,
+            "response_parse",
+            "provider_response_parse_failed",
+            "服务商响应与所选 API 协议不匹配。",
+        )
+    if isinstance(error, ConfigurationException | InvalidRequestException):
+        return _probe_error(
+            422,
+            "request_build",
+            "provider_protocol_mismatch",
+            "所选 API 协议、地址或模型配置不匹配。",
+        )
+    return _probe_error(
+        502, phase, "provider_request_failed", "服务商请求失败，请查看后台脱敏日志。"
+    )
+
+
+def _minimal_model_request(task: str):
+    if task == "embedding":
+        return EmbeddingRequest(
+            batch=EmbedBatch(payloads=[EmbedPayload(parts=[TextPart(text="test")])]),
+            timeout=20,
+        )
+    if task == "rerank":
+        return RerankRequest(query="a", documents=["a", "b"], top_n=1, timeout=20)
+    if task == "image":
+        return ImageRequest(prompt="one dot", timeout=20)
+    if task == "tts":
+        return SpeechRequest(input_text="test", timeout=20)
+    config = GenerationConfig()
+    config.common.max_tokens = 1
+    return ChatRequest(
+        messages=[LLMMessage.user("Reply OK")], config=config, timeout=20
+    )
+
+
+async def _run_exact_model_probe(
+    provider: ProviderConfig,
+    model_name: str,
+    model_config: dict[str, Any] | None,
+    task: str,
+    api_key: str,
+) -> float:
+    detail_payload = dict(model_config or {})
+    detail_payload["model_name"] = model_name
+    model_detail = parse_as(ModelDetail, detail_payload)
+    api_type = model_detail.api_type or provider.api_type
+    adapter = get_adapter_for_api_type(api_type)
+    capabilities = get_model_capabilities(model_name)
+    identity = ModelIdentity(
+        provider_name=provider.name,
+        model_name=model_name,
+        api_type=api_type,
+        api_base=provider.api_base,
+        path_prefix=model_detail.path_prefix,
+        capabilities=capabilities,
+        generation_config=None,
+    )
+    request = _minimal_model_request(task)
+    request_data = await adapter.prepare_payload(identity, api_key, request)
+    client = await http_client_manager.get_client(provider)
+    started = time.monotonic()
+    kwargs: dict[str, Any] = {
+        "headers": request_data.headers,
+        "timeout": min(float(provider.timeout), 20.0),
+    }
+    if request_data.files:
+        kwargs["data"] = request_data.body
+        kwargs["files"] = request_data.files
+    else:
+        kwargs["content"] = json.dumps(request_data.body, ensure_ascii=False)
+    response = await client.request(request_data.method, request_data.url, **kwargs)
+    if response.status_code == 404:
+        raise _probe_error(404, "upstream", "model_not_found", "服务商未找到指定模型。")
+    if exception := adapter.handle_http_error(response):
+        raise exception
+    await adapter.parse_payload(identity, request, response)
+    return (time.monotonic() - started) * 1000
 
 
 @router.post(
@@ -1173,71 +1393,24 @@ def _discovery_url(api_type: str, api_base: str) -> str:
     response_class=JSONResponse,
 )
 async def discover_models(payload: ProviderDiscoveryRequest) -> Result:
-    provider: ProviderConfig | None = None
-    if payload.provider_name:
-        provider = next(
-            (
-                item
-                for item in get_llm_config().providers
-                if item.name.casefold() == payload.provider_name.casefold()
-            ),
-            None,
-        )
-    temporary_key = (payload.api_key or "").strip()
-    if provider is not None and not temporary_key:
-        requested_type = payload.api_type or provider.api_type
-        saved_base = (
-            provider.api_base or get_default_api_base_for_type(provider.api_type) or ""
-        ).rstrip("/")
-        requested_base = (
-            payload.api_base
-            or get_default_api_base_for_type(requested_type)
-            or provider.api_base
-            or ""
-        ).rstrip("/")
-        if requested_type != provider.api_type or requested_base != saved_base:
-            raise HTTPException(
-                status_code=422,
-                detail={
-                    "code": "provider_credentials_scope_mismatch",
-                    "message": "修改 API 类型或地址后，请填写临时 API Key 再测试。",
-                },
-            )
-    api_type = payload.api_type or (provider.api_type if provider else "")
-    api_base = (
-        payload.api_base
-        or (provider.api_base if provider else None)
-        or get_default_api_base_for_type(api_type)
+    provider, api_key, _, _ = _resolve_probe_provider(
+        provider_name=payload.provider_name,
+        api_type=payload.api_type,
+        api_base=payload.api_base,
+        api_key=payload.api_key,
     )
-    saved_keys = (
-        []
-        if provider is None
-        else (
-            provider.api_key
-            if isinstance(provider.api_key, list)
-            else [provider.api_key]
-        )
-    )
-    api_key = temporary_key or next(
-        (key for key in saved_keys if not _is_placeholder_secret(key)), ""
-    )
-    if _is_placeholder_secret(api_key):
-        api_key = ""
+    api_type = provider.api_type
+    api_base = provider.api_base or ""
+    try:
+        get_adapter_for_api_type(api_type)
+    except Exception as error:
+        raise _map_probe_error(error, "configuration") from error
     if api_type not in _OPENAI_DISCOVERY_TYPES and api_type != "gemini":
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "code": "model_discovery_unsupported",
-                "message": "该 API 类型不支持安全的模型自动发现，请手动添加模型。",
-            },
-        )
-    if not api_base or not api_key:
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "code": "provider_credentials_incomplete",
-                "message": "请先填写 API 地址和 API Key。",
-            },
+        raise _probe_error(
+            422,
+            "configuration",
+            "model_discovery_unsupported",
+            "该 API 类型不支持安全的模型自动发现，请手动添加模型。",
         )
     started = time.monotonic()
     try:
@@ -1246,37 +1419,37 @@ async def discover_models(payload: ProviderDiscoveryRequest) -> Result:
             if api_type == "gemini"
             else {"Authorization": f"Bearer {api_key}"}
         )
-        async with httpx.AsyncClient(
-            timeout=_DISCOVERY_TIMEOUT, follow_redirects=False
-        ) as client:
-            response = await client.get(
-                _discovery_url(api_type, api_base), headers=headers
-            )
+        client = await http_client_manager.get_client(provider)
+        response = await client.request(
+            "GET",
+            _discovery_url(api_type, api_base),
+            headers=headers,
+            timeout=min(float(provider.timeout), _DISCOVERY_TIMEOUT),
+        )
         if response.status_code in {401, 403}:
-            raise HTTPException(
-                status_code=401,
-                detail={
-                    "code": "provider_credentials_invalid",
-                    "message": "服务商拒绝了当前凭据。",
-                },
+            raise _probe_error(
+                401,
+                "authentication",
+                "provider_credentials_invalid",
+                "服务商拒绝了当前凭据。",
             )
         if response.status_code == 429:
-            raise HTTPException(
-                status_code=429,
-                detail={
-                    "code": "provider_rate_limited",
-                    "message": "服务商暂时限制了模型查询，请稍后重试。",
-                },
+            raise _probe_error(
+                429,
+                "upstream",
+                "provider_rate_limited",
+                "服务商暂时限制了模型查询，请稍后重试。",
             )
         if response.status_code >= 400:
-            raise HTTPException(
-                status_code=502,
-                detail={
-                    "code": "provider_discovery_failed",
-                    "message": f"服务商模型查询失败（HTTP {response.status_code}）。",
-                },
+            raise _probe_error(
+                502,
+                "upstream",
+                "provider_discovery_failed",
+                f"服务商模型查询失败（HTTP {response.status_code}）。",
             )
         body = response.json()
+        if not isinstance(body, dict):
+            raise ValueError("model discovery response is not an object")
         raw_models = (
             body.get("models", []) if api_type == "gemini" else body.get("data", [])
         )
@@ -1292,28 +1465,22 @@ async def discover_models(payload: ProviderDiscoveryRequest) -> Result:
             "WebUi",
         )
         return Result.ok(
-            {"models": sorted(set(names)), "latency_ms": latency, "authenticated": True}
+            {
+                "models": sorted(set(names)),
+                "latency_ms": latency,
+                "authenticated": True,
+                "phase": "completed",
+            }
         )
     except HTTPException:
         raise
-    except httpx.TimeoutException as error:
-        raise HTTPException(
-            status_code=504,
-            detail={"code": "provider_timeout", "message": "连接服务商超时。"},
-        ) from error
     except (httpx.HTTPError, ValueError) as error:
         logger.warning(
             "AI Provider 探测失败 | "
             f"api_type={api_type} | error={error.__class__.__name__}",
             "WebUi",
         )
-        raise HTTPException(
-            status_code=502,
-            detail={
-                "code": "provider_unreachable",
-                "message": "无法完成服务商连接测试。",
-            },
-        ) from error
+        raise _map_probe_error(error, "model_discovery") from error
 
 
 @router.post(
@@ -1339,68 +1506,56 @@ async def test_model(payload: ModelTestRequest) -> Result:
                 "message": "模型名称必须包含服务商前缀。",
             },
         )
-    provider_name = payload.model.split("/", 1)[0]
-    provider = next(
-        (
-            item
-            for item in get_llm_config().providers
-            if item.name.casefold() == provider_name.casefold()
-        ),
-        None,
+    model_provider_name, model_name = payload.model.split("/", 1)
+    provider_name = payload.provider_name or model_provider_name
+    provider, api_key, uses_saved_key, health_provider_name = _resolve_probe_provider(
+        provider_name=provider_name,
+        saved_provider_name=payload.saved_provider_name,
+        api_type=payload.api_type,
+        api_base=payload.api_base,
+        api_key=payload.api_key,
+        timeout=payload.timeout,
     )
-    provider_keys = (
-        []
-        if provider is None
-        else (
-            provider.api_key
-            if isinstance(provider.api_key, list)
-            else [provider.api_key]
-        )
-    )
-    if not any(not _is_placeholder_secret(key) for key in provider_keys):
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "code": "provider_credentials_incomplete",
-                "message": "该模型所属服务商尚未配置有效 API Key。",
-            },
-        )
-    started = time.monotonic()
     try:
-        from zhenxun.services.ai.llm.api import (
-            chat,
-            create_image,
-            create_speech,
-            embed,
-            rerank,
+        latency_ms = await _run_exact_model_probe(
+            provider,
+            model_name,
+            payload.model_settings,
+            payload.task,
+            api_key,
         )
-
-        if payload.task == "embedding":
-            await embed("test", model=payload.model)
-        elif payload.task == "rerank":
-            await rerank("a", ["a", "b"], top_n=1, model=payload.model)
-        elif payload.task == "image":
-            await create_image("one dot", model=payload.model)
-        elif payload.task == "tts":
-            await create_speech("test", model=payload.model)
-        else:
-            await chat("Reply OK", model=payload.model, timeout=20)
-        latency = round((time.monotonic() - started) * 1000)
-        return Result.ok({"ok": True, "latency_ms": latency, "task": payload.task})
+        if uses_saved_key:
+            health_name = health_provider_name or provider.name
+            await health_manager.record_key_success(health_name, api_key)
+            await health_manager.record_route_success(
+                f"{health_name}/{model_name}", latency_ms
+            )
+        return Result.ok(
+            {
+                "ok": True,
+                "latency_ms": round(latency_ms),
+                "task": payload.task,
+                "phase": "completed",
+            }
+        )
     except asyncio.CancelledError:
+        raise
+    except HTTPException:
         raise
     except Exception as error:
         logger.warning(
             f"AI 模型测试失败 | task={payload.task} | error={error.__class__.__name__}",
             "WebUi",
         )
-        raise HTTPException(
-            status_code=502,
-            detail={
-                "code": "model_test_failed",
-                "message": "模型测试失败，请检查服务商配置和后台脱敏日志。",
-            },
-        ) from error
+        mapped = _map_probe_error(error, "model_test")
+        if uses_saved_key and isinstance(error, LLMException | httpx.HTTPError):
+            health_name = health_provider_name or provider.name
+            await health_manager.record_route_failure(
+                f"{health_name}/{model_name}", error
+            )
+            if isinstance(error, LLMException):
+                await health_manager.record_key_failure(health_name, api_key, error)
+        raise mapped from error
 
 
 @router.get(

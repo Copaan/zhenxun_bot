@@ -1,4 +1,63 @@
-from pydantic import BaseModel
+from typing import Any
+
+from pydantic import BaseModel, Field
+
+
+class LifecycleComponentStatus(BaseModel):
+    component_id: str
+    scope: str
+    stage: str
+    depends_on: list[str]
+    provides: list[str]
+    resource_group: str | None = None
+    timeout: float | None = None
+    drain_timeout: float = 10.0
+    cancel_timeout: float = 5.0
+    finalizer_timeout: float = 10.0
+    failure_policy: str
+    restart_policy: str
+    config_keys: list[str]
+    priority: int
+    stop_priority: int | None = None
+    parallel_safe: bool
+    source: str
+    state: str
+    runtime_generation: int
+    observed_generation: int
+    started_at: str | None = None
+    stopped_at: str | None = None
+    duration_ms: float | None = None
+    health: str
+    error_code: str | None = None
+    last_health_checked_at: str | None = None
+    consecutive_health_failures: int = 0
+    active_activities: int = 0
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    resource_count: int
+    resource_counts: dict[str, int] = Field(default_factory=dict)
+    dynamic_scopes: list[dict[str, Any]] = Field(default_factory=list)
+    recovery_required: bool = False
+
+
+class LifecycleStatus(BaseModel):
+    version: int = 2
+    runtime_generation: int
+    component_count: int
+    scope_counts: dict[str, int]
+    state_counts: dict[str, int]
+    current_operation: dict[str, Any] | None = None
+    current_operations: list[dict[str, Any]]
+    process: dict[str, Any] = Field(default_factory=dict)
+    current_mutation: dict[str, Any] | None = None
+    dynamic_scope_count: int = 0
+    active_scope_count: int = 0
+    dynamic_scopes: list[dict[str, Any]] = Field(default_factory=list)
+    recovery_required: list[str] = Field(default_factory=list)
+    ownership: dict[str, Any] = Field(default_factory=dict)
+    operation_registry: dict[str, Any] = Field(default_factory=dict)
+    plugin_runtime: dict[str, Any] = Field(default_factory=dict)
+    launcher: dict[str, Any] = Field(default_factory=dict)
+    components: list[LifecycleComponentStatus]
 
 
 class DirFile(BaseModel):

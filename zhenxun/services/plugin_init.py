@@ -77,7 +77,7 @@ class PluginInitManager:
             await cls.install(module_path)
 
     @classmethod
-    async def install(cls, module_path: str):
+    async def install(cls, module_path: str, *, raise_on_error: bool = False):
         """运行指定插件安装方法"""
         async with cls._operation_lock:
             with cls._registry_lock:
@@ -93,9 +93,11 @@ class PluginInitManager:
                         logger.debug(f"执行: {module_path}:install 完成")
                 except Exception as e:
                     logger.error(f"执行: {module_path}:install 失败", e=e)
+                    if raise_on_error:
+                        raise
 
     @classmethod
-    async def remove(cls, module_path: str):
+    async def remove(cls, module_path: str, *, raise_on_error: bool = False):
         """运行指定插件移除方法"""
         async with cls._operation_lock:
             with cls._registry_lock:
@@ -111,6 +113,8 @@ class PluginInitManager:
                         logger.debug(f"执行: {module_path}:remove 完成")
                 except Exception as e:
                     logger.error(f"执行: {module_path}:remove 失败", e=e)
+                    if raise_on_error:
+                        raise
 
 
 @PriorityLifecycle.on_startup(priority=5)

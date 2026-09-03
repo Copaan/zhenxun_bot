@@ -1,8 +1,6 @@
 import asyncio
 from typing import Any, cast
 
-import nonebot
-
 from zhenxun.services.ai.config import get_llm_config
 from zhenxun.services.ai.utils.logger import log_sandbox as logger
 from zhenxun.utils.lifespan import LifespanManager
@@ -164,11 +162,7 @@ class SandboxManager:
 sandbox_manager = SandboxManager()
 
 
-driver = nonebot.get_driver()
-
-
-@driver.on_startup
-async def _startup_sandboxes():
+async def _startup_sandboxes(context=None):
     """异步初始化沙箱，触发后台自动清理孤儿容器"""
     if not get_llm_config().sandbox.enable_sandbox:
         return
@@ -183,12 +177,20 @@ async def _startup_sandboxes():
             except Exception:
                 pass
 
-        task = asyncio.create_task(_delayed_silent_cleanup())
+        coroutine = _delayed_silent_cleanup()
+        task = (
+            context.spawn_detached(
+                coroutine,
+                scope_id="sandbox-orphan-cleanup",
+                name="sandbox-orphan-cleanup",
+            )
+            if context is not None
+            else asyncio.create_task(coroutine)
+        )
         _startup_tasks.add(task)
         task.add_done_callback(_startup_tasks.discard)
 
 
-@driver.on_shutdown
 async def _shutdown_sandboxes():
     """在系统关闭时优雅关闭所有沙箱并清理 Docker 环境"""
     if not get_llm_config().sandbox.enable_sandbox:

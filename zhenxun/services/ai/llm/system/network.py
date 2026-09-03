@@ -13,7 +13,6 @@ from typing import Any
 
 import aiofiles
 import httpx
-import nonebot
 
 from zhenxun.configs.config import BotConfig
 from zhenxun.configs.path_config import DATA_PATH
@@ -38,8 +37,6 @@ from .models import (
     RouteHealthState,
     RouteHealthStatus,
 )
-
-driver = nonebot.get_driver()
 
 
 class LLMHttpClient:
@@ -587,8 +584,3 @@ class HealthManager:
 
 
 health_manager = HealthManager()
-
-
-@driver.on_shutdown
-async def _shutdown_health_manager():
-    await health_manager.shutdown()

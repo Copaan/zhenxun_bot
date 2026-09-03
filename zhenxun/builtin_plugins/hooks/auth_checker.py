@@ -875,12 +875,17 @@ async def _cache_sweep_loop() -> None:
                     _mc.clear()
 
 
-async def start_auth_runtime_tasks() -> None:
+async def start_auth_runtime_tasks(context=None) -> None:
     global _CACHE_SWEEP_TASK
     await _ensure_route_index()
     _install_handle_event_selector()
     if _CACHE_SWEEP_TASK is None or _CACHE_SWEEP_TASK.done():
-        _CACHE_SWEEP_TASK = asyncio.create_task(_cache_sweep_loop())
+        coroutine = _cache_sweep_loop()
+        _CACHE_SWEEP_TASK = (
+            context.spawn_task(coroutine, name="auth-cache-sweep")
+            if context is not None
+            else asyncio.create_task(coroutine, name="auth-cache-sweep")
+        )
 
 
 async def stop_auth_runtime_tasks() -> None:

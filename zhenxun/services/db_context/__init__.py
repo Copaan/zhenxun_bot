@@ -169,7 +169,15 @@ def get_config() -> dict:
     return config
 
 
-@PriorityLifecycle.on_startup(priority=1, stage="management", timeout=60)
+@PriorityLifecycle.on_startup(
+    priority=1,
+    stage="management",
+    timeout=60,
+    component_id="management:database",
+    scope="worker",
+    restart_policy="worker",
+    config_keys=("DB_URL", "DATABASE_MODELS", "DATABASE_SCHEMA"),
+)
 async def init():
     global MODELS, SCRIPT_METHOD
 
@@ -355,7 +363,7 @@ async def init():
         raise DbConnectError(f"数据库连接错误... e:{e}") from e
 
 
-@PriorityLifecycle.on_shutdown(priority=100)
+@PriorityLifecycle.on_shutdown(priority=100, component_id="management:database")
 async def disconnect():
     try:
         await connections.close_all()

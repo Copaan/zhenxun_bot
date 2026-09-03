@@ -28,19 +28,29 @@ _reclaim_lock = asyncio.Lock()
 _last_reclaim_at = 0.0
 
 
+def memory_governor_healthy(_value=None) -> bool:
+    if IDLE_CHECK_INTERVAL_SECONDS <= 0 or IDLE_RECLAIM_SECONDS <= 0:
+        return True
+    return _task is not None and not _task.done()
+
+
 def _cooldown_left(now: float | None = None) -> float:
     now = time.monotonic() if now is None else now
     return max(0.0, _last_reclaim_at + RECLAIM_COOLDOWN_SECONDS - now)
 
 
-async def start_memory_governor() -> None:
+async def start_memory_governor(context=None) -> None:
     global _task
     if _task is not None and not _task.done():
         return
     if IDLE_CHECK_INTERVAL_SECONDS <= 0 or IDLE_RECLAIM_SECONDS <= 0:
         logger.info("idle memory governor disabled", LOG_COMMAND)
         return
-    _task = asyncio.create_task(_idle_reclaim_loop())
+    _task = (
+        context.spawn_task(_idle_reclaim_loop(), name="memory-governor")
+        if context is not None
+        else asyncio.create_task(_idle_reclaim_loop(), name="memory-governor")
+    )
 
 
 async def stop_memory_governor() -> None:

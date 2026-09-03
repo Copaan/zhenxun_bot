@@ -67,6 +67,36 @@ def _is_layer_path(value: str, layer_root: Path) -> bool:
     return True
 
 
+def referenced_generations() -> set[int]:
+    """Return generations still referenced by modules loaded in this process."""
+    layer_root = LAYER_ROOT.resolve()
+    generations: set[int] = set()
+    for module in tuple(sys.modules.values()):
+        if module is None:
+            continue
+        candidates: list[Any] = [getattr(module, "__file__", None)]
+        module_path = getattr(module, "__path__", None)
+        if module_path is not None:
+            try:
+                candidates.extend(tuple(module_path))
+            except TypeError:
+                pass
+        for candidate in candidates:
+            if not isinstance(candidate, str | os.PathLike):
+                continue
+            try:
+                relative = Path(candidate).resolve().relative_to(layer_root)
+            except (OSError, ValueError):
+                continue
+            if not relative.parts or not relative.parts[0].startswith("generation-"):
+                continue
+            try:
+                generations.add(int(relative.parts[0].removeprefix("generation-")))
+            except ValueError:
+                continue
+    return generations
+
+
 def module_source_path(module_name: str, root: Path | None = None) -> Path | None:
     root = root or _active_path()
     if root is None:
@@ -407,7 +437,10 @@ def finalize_pending_transaction() -> None:
     clear_pending_transaction()
     ROLLBACK_FILE.unlink(missing_ok=True)
     active = manifest.get("active_generation")
-    prune_generations({active} if isinstance(active, int) else set())
+    retained = referenced_generations()
+    if isinstance(active, int):
+        retained.add(active)
+    prune_generations(retained)
 
 
 def rollback_pending_transaction() -> None:
@@ -442,6 +475,10 @@ def rollback_pending_transaction() -> None:
                     or item.get("module_name") == transaction.get("module_name")
                 )
             ][:10]
+            if not transaction["failure_reasons"]:
+                transaction["failure_reasons"] = [
+                    {"code": "plugin_startup_verification_failed"}
+                ]
         write_json(PENDING_FILE, transaction)
     ROLLBACK_FILE.unlink(missing_ok=True)
     restored = load_manifest().get("active_generation")

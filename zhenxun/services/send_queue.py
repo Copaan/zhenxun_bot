@@ -40,6 +40,13 @@ _MAX_OBSERVED_RECORDS_PER_TRACE = 12
 _MAX_OBSERVED_TEXT_LEN = 900
 
 
+def send_queue_healthy(_value=None) -> bool:
+    return (
+        _PATCHED
+        and len([task for task in _WORKER_TASKS if not task.done()]) == _WORKERS
+    )
+
+
 def _send_platform_scope(adapter: Any) -> str:
     if adapter is None:
         return "unknown"
@@ -275,15 +282,18 @@ def unpatch_send_queue() -> None:
     _PATCHED = False
 
 
-async def start_send_queue() -> None:
+async def start_send_queue(context=None) -> None:
     global _STOPPING
     patch_send_queue()
     _STOPPING = False
     _WORKER_TASKS[:] = [task for task in _WORKER_TASKS if not task.done()]
-    if _WORKER_TASKS:
-        return
-    for idx in range(_WORKERS):
-        _WORKER_TASKS.append(asyncio.create_task(_worker(idx)))
+    for idx in range(len(_WORKER_TASKS), _WORKERS):
+        task = (
+            context.spawn_task(_worker(idx), name=f"send-queue-{idx}")
+            if context is not None
+            else asyncio.create_task(_worker(idx), name=f"send-queue-{idx}")
+        )
+        _WORKER_TASKS.append(task)
 
 
 def _message_to_text(message: Any) -> str:

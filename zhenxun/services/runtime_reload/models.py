@@ -20,6 +20,8 @@ class ApplyMode(StrEnum):
     FAILED = "failed"
     CONFIG_RELOADED = "config_reloaded"
     WEBUI_REFRESH = "webui_refresh"
+    COMPONENT_RESTARTED = "component_restarted"
+    ROLLED_BACK = "rolled_back"
 
 
 @dataclass(slots=True)
@@ -35,6 +37,8 @@ class PluginUnit:
     dependencies: set[str] = field(default_factory=set)
     config_dependencies: set[tuple[str, str]] = field(default_factory=set)
     env_dependencies: set[str] = field(default_factory=set)
+    imported_modules: set[str] = field(default_factory=set)
+    import_time_dependency_calls: set[str] = field(default_factory=set)
     reasons: set[str] = field(default_factory=set)
     classification: ReloadClassification = ReloadClassification.HOT_RELOADABLE
     fingerprint: str = ""
@@ -42,6 +46,8 @@ class PluginUnit:
     in_flight: int = 0
     draining: bool = False
     last_error: str | None = None
+    incarnation_id: str | None = None
+    resource_receipts: list[Any] = field(default_factory=list)
 
     def public_dict(self) -> dict[str, Any]:
         return {
@@ -53,6 +59,11 @@ class PluginUnit:
             "env_dependencies": sorted(self.env_dependencies),
             "fingerprint": self.fingerprint[:12],
             "last_error": self.last_error,
+            "incarnation_id": self.incarnation_id,
+            "resource_count": len(self.resource_receipts),
+            "resource_providers": sorted(
+                {receipt.provider for receipt in self.resource_receipts}
+            ),
         }
 
 
@@ -64,6 +75,9 @@ class RuntimeOperation:
     reason: str | None = None
     generation: int = 0
     config_keys: list[str] = field(default_factory=list)
+    component_effects: dict[str, str] = field(default_factory=dict)
+    affected_components: list[str] = field(default_factory=list)
+    rollback_state: str = "none"
 
     def public_dict(self) -> dict[str, Any]:
         return {
@@ -73,4 +87,7 @@ class RuntimeOperation:
             "reason": self.reason,
             "generation": self.generation,
             "config_keys": self.config_keys,
+            "component_effects": dict(self.component_effects),
+            "affected_components": list(self.affected_components),
+            "rollback_state": self.rollback_state,
         }

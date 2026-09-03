@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from zhenxun.services.log import logger
 from zhenxun.services.runtime_config_reload import reload_runtime_config
+from zhenxun.services.runtime_mutation import runtime_mutation_coordinator
 
 from .models import ApplyMode, RuntimeOperation
 
@@ -21,7 +21,6 @@ _DEPENDENCY_NAMES = {"pyproject.toml", "uv.lock", "requirements.txt"}
 class RuntimeChangeCoordinator:
     def __init__(self, manager: PluginRuntimeManager) -> None:
         self.manager = manager
-        self._lock = asyncio.Lock()
 
     async def process(
         self, paths: set[Path], *, submit_restart: bool = True
@@ -40,7 +39,7 @@ class RuntimeChangeCoordinator:
             if _CONFIG_FILE in resolved:
                 logger.debug("配置文件事件已由当前运行时操作处理，跳过重复重载")
             return None
-        async with self._lock:
+        async with runtime_mutation_coordinator.operation("filesystem_watcher"):
             if changed & _ENV_FILES:
                 try:
                     from zhenxun.services.runtime_environment import (

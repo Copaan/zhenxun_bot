@@ -65,11 +65,82 @@ def test_repository_branch_is_resolved_per_source() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("source_entries", "failed_source", "expected"),
+    [
+        ({"github": ["demo/__init__.py"], "aliyun": []}, None, "available"),
+        ({"github": [], "aliyun": []}, None, "missing"),
+        ({"github": [], "aliyun": []}, "aliyun", "unknown"),
+    ],
+)
+async def test_catalog_health_requires_both_sources_before_marking_missing(
+    mocker: MockerFixture,
+    source_entries: dict[str, list[str]],
+    failed_source: str | None,
+    expected: str,
+) -> None:
+    from zhenxun.builtin_plugins.plugin_store.config import DEFAULT_GITHUB_URL
+    from zhenxun.builtin_plugins.plugin_store.data_source import StoreManager
+    from zhenxun.utils.repo_utils.models import RepoFileInfo, RepoType
+
+    plugin = _plugin_info()
+    plugin.github_url = DEFAULT_GITHUB_URL
+
+    async def list_directory_files(
+        repo_url: str,
+        directory_path: str,
+        branch: str,
+        repo_type: RepoType,
+    ) -> list[RepoFileInfo]:
+        del repo_url, directory_path, branch
+        if repo_type.value == failed_source:
+            raise RuntimeError("source unavailable")
+        return [
+            RepoFileInfo(path=path, is_dir=False)
+            for path in source_entries[repo_type.value]
+        ]
+
+    mocker.patch.object(
+        StoreManager,
+        "_catalog_health",
+        {},
+    )
+    mocker.patch.object(StoreManager, "_catalog_health_checked_at", 0.0)
+    mocker.patch(
+        "zhenxun.builtin_plugins.plugin_store.data_source."
+        "RepoFileManager.list_directory_files",
+        side_effect=list_directory_files,
+    )
+
+    health = await StoreManager.catalog_health([plugin], refresh=True)
+
+    assert health["demo"]["status"] == expected
+    assert (health["demo"]["reason"] == "catalog_source_missing") is (
+        expected == "missing"
+    )
+
+
 @pytest.mark.parametrize("is_external", [False, True])
+@pytest.mark.parametrize(
+    ("dependency_changes", "expected_install_count"),
+    [
+        (
+            {
+                "added": [{"name": "demo-dependency", "version": "1.0.0"}],
+                "changed": [],
+                "removed": [],
+            },
+            1,
+        ),
+        ({"added": [], "changed": [], "removed": []}, 0),
+    ],
+)
 async def test_default_source_falls_back_to_github_for_all_plugins(
     mocker: MockerFixture,
     tmp_path: Path,
     is_external: bool,
+    dependency_changes: dict[str, list[dict[str, str]]],
+    expected_install_count: int,
 ) -> None:
     from zhenxun.builtin_plugins.plugin_store.data_source import StoreManager
     from zhenxun.utils.repo_utils.models import (
@@ -137,6 +208,13 @@ async def test_default_source_falls_back_to_github_for_all_plugins(
         "zhenxun.builtin_plugins.plugin_store.data_source."
         "VirtualEnvPackageManager.install_requirement",
     )
+    mocker.patch(
+        "zhenxun.nonebot_store.dependencies.preflight_source_requirements",
+        return_value={
+            "resolved_packages": {"demo-dependency": "1.0.0"},
+            "package_changes": dependency_changes,
+        },
+    )
 
     await StoreManager.install_plugin_with_repo(
         _plugin_info(),
@@ -157,7 +235,15 @@ async def test_default_source_falls_back_to_github_for_all_plugins(
     assert (
         mock_base_path / "plugins" / "demo" / "assets" / "icon.png"
     ).read_bytes() == b"\x89PNG\r\n\x1a\n"
-    install_requirement.assert_awaited_once()
+    assert not [
+        path
+        for path in (mock_base_path / "plugins").iterdir()
+        if path.name.startswith(".demo")
+    ]
+    staging_root = tmp_path / "data" / "runtime" / "plugin-store-staging"
+    assert staging_root.is_dir()
+    assert not list(staging_root.iterdir())
+    assert install_requirement.await_count == expected_install_count
 
 
 async def test_zero_byte_aliyun_binary_falls_back_to_github(

@@ -4,6 +4,12 @@
 包含在机器人启动时加载和调度数据库中保存的任务的逻辑。
 """
 
+import asyncio
+import contextlib
+
+from nonebot_plugin_apscheduler import scheduler
+
+from zhenxun.services.lifecycle import ResourceReceipt, RuntimeHandle
 from zhenxun.services.log import logger
 from zhenxun.utils.manager.priority_manager import PriorityLifecycle
 from zhenxun.utils.pydantic_compat import model_dump
@@ -15,12 +21,70 @@ from .repository import ScheduleRepository
 from .types import JobConfig, ScheduleContext
 
 
+def _managed_jobs():
+    return [
+        job
+        for job in scheduler.get_jobs()
+        if str(job.id).startswith("zhenxun_schedule_")
+        or str(job.id).startswith("runtime::")
+    ]
+
+
+class SchedulerRuntimeHandle:
+    async def quiesce(self) -> None:
+        for job in _managed_jobs():
+            with contextlib.suppress(Exception):
+                job.pause()
+        deadline = asyncio.get_running_loop().time() + 10
+        while scheduler_registry.running_tasks:
+            if asyncio.get_running_loop().time() >= deadline:
+                raise TimeoutError("scheduler_drain_timeout")
+            await asyncio.sleep(0.05)
+
+    async def close(self) -> None:
+        for job in _managed_jobs():
+            with contextlib.suppress(Exception):
+                scheduler.remove_job(job.id)
+
+    def health(self) -> dict[str, object]:
+        return {
+            "healthy": bool(getattr(scheduler, "running", False)),
+            "running_tasks": len(scheduler_registry.running_tasks),
+        }
+
+    def snapshot(self) -> dict[str, object]:
+        return {
+            "managed_jobs": len(_managed_jobs()),
+            "running_tasks": len(scheduler_registry.running_tasks),
+        }
+
+    def resource_snapshot(self) -> list[ResourceReceipt]:
+        return [
+            ResourceReceipt(
+                receipt_id=f"apscheduler:{job.id}",
+                provider="apscheduler",
+                resource_type="job",
+                owner_id="runtime:scheduler",
+                detail={"next_run_time": str(job.next_run_time or "")},
+            )
+            for job in _managed_jobs()
+        ]
+
+
+def _scheduler_healthy(_value=None) -> bool:
+    return bool(getattr(scheduler, "running", False))
+
+
 @PriorityLifecycle.on_startup(
     priority=90,
     task_id="runtime:restore_schedules",
+    component_id="runtime:scheduler",
     depends_on=("runtime:runtime_cache",),
+    restart_policy="component",
+    pass_context=True,
+    health=_scheduler_healthy,
 )
-async def _load_schedules_from_db():
+async def _load_schedules_from_db(context):
     """在服务启动时从数据库加载并调度所有任务。"""
     logger.info("正在从数据库加载并调度所有定时任务...")
     all_schedules = await ScheduleRepository.get_all()
@@ -113,3 +177,7 @@ async def _load_schedules_from_db():
 
     if ephemeral_count > 0:
         logger.info(f"临时任务调度完成，共成功加载 {ephemeral_count} 个任务。")
+    return RuntimeHandle(
+        controller=SchedulerRuntimeHandle(),
+        metadata={"ownership": "composite"},
+    )
