@@ -461,7 +461,12 @@ class PluginRuntimeManager:
             incarnation.lease_state = LeaseState.ACTIVE
             self._incarnations[unit.plugin_id] = incarnation
             for module_name in unit.module_names:
-                self._incarnations[module_name] = incarnation
+                module_incarnation = self._incarnations.get(module_name)
+                if module_incarnation is None or module_incarnation.lease_state in {
+                    LeaseState.REVOKED,
+                    LeaseState.FAILED,
+                }:
+                    self._incarnations[module_name] = incarnation
             unit.incarnation_id = incarnation.incarnation_id
         self._collect_dependencies()
         self._collect_runtime_boundaries()
@@ -492,20 +497,16 @@ class PluginRuntimeManager:
 
     def activate_loaded_incarnations(self) -> None:
         for plugin in get_loaded_plugins():
-            root = plugin
-            while root.parent_plugin:
-                root = root.parent_plugin
-            incarnation = self._incarnations.get(root.id_)
-            if incarnation is None:
-                incarnation = self._incarnations.get(plugin.id_)
+            incarnation = self._incarnations.get(plugin.id_) or self._incarnations.get(
+                plugin.module_name
+            )
             if incarnation is None or incarnation.lease_state in {
                 LeaseState.REVOKED,
                 LeaseState.FAILED,
             }:
-                incarnation = self._new_incarnation(root.id_)
-            incarnation.plugin_id = root.id_
+                incarnation = self._new_incarnation(plugin.id_)
+            incarnation.plugin_id = plugin.id_
             incarnation.lease_state = LeaseState.ACTIVE
-            self._incarnations[root.id_] = incarnation
             self._incarnations[plugin.id_] = incarnation
             self._incarnations[plugin.module_name] = incarnation
 
@@ -1619,7 +1620,7 @@ class PluginRuntimeManager:
 
     def _lease_is_current(self, owner: str, incarnation_id: str) -> bool:
         root = self._root_owner(owner) or owner
-        incarnation = self._incarnations.get(root) or self._incarnations.get(owner)
+        incarnation = self._incarnations.get(owner) or self._incarnations.get(root)
         return bool(
             incarnation
             and incarnation.incarnation_id == incarnation_id
@@ -1628,11 +1629,16 @@ class PluginRuntimeManager:
 
     def _revoke_incarnation(self, owner: str, *, failed: bool = False) -> None:
         root = self._root_owner(owner) or owner
-        incarnation = self._incarnations.get(root) or self._incarnations.get(owner)
-        if incarnation is None:
-            return
-        incarnation.lease_state = LeaseState.REVOKING
-        incarnation.lease_state = LeaseState.FAILED if failed else LeaseState.REVOKED
+        incarnations = {
+            id(incarnation): incarnation
+            for alias, incarnation in self._incarnations.items()
+            if alias == root or self._root_owner(alias) == root
+        }.values()
+        for incarnation in incarnations:
+            incarnation.lease_state = LeaseState.REVOKING
+            incarnation.lease_state = (
+                LeaseState.FAILED if failed else LeaseState.REVOKED
+            )
 
     def _owned_keys_for_unit(self, plugin_id: str) -> set[str]:
         with self._ownership_lock:
@@ -2414,6 +2420,11 @@ class PluginRuntimeManager:
             from zhenxun.utils.manager.priority_manager import lifecycle_component_ids
 
             checkpoint = self._capture_reload_checkpoint(affected)
+            retired_managers = [
+                self.units[plugin_id].manager
+                for plugin_id in affected
+                if self.units[plugin_id].manager is not None
+            ]
             component_ids = {
                 component_id
                 for plugin_id in affected
@@ -2428,6 +2439,14 @@ class PluginRuntimeManager:
                 self.discover_loaded_plugins()
                 await self._reconcile_runtime_metadata()
                 await self._invalidate_generation_caches()
+                remaining_manager_ids = {
+                    id(plugin.manager) for plugin in get_loaded_plugins()
+                }
+                remove_nested_managers(
+                    manager
+                    for manager in retired_managers
+                    if id(manager) not in remaining_manager_ids
+                )
                 from zhenxun.services.lifecycle import lifecycle_kernel
 
                 for plugin_id in affected:

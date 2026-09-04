@@ -15,6 +15,7 @@ from tortoise.connection import connections
 from tortoise.exceptions import ConfigurationError, OperationalError
 
 from zhenxun.configs.config import BotConfig
+from zhenxun.configs.database import is_sqlite_memory_url, sqlite_path_from_url
 from zhenxun.services.log import logger
 from zhenxun.utils.manager.priority_manager import PriorityLifecycle
 
@@ -99,7 +100,11 @@ def _db_script_hash_file(script_fingerprint: str) -> Path:
     parsed = urlparse(BotConfig.db_url or "")
     dialect = parsed.scheme or "unknown"
     if dialect == "sqlite":
-        db_identity = str(Path(parsed.path).resolve())
+        db_identity = (
+            ":memory:"
+            if is_sqlite_memory_url(BotConfig.db_url)
+            else str(sqlite_path_from_url(BotConfig.db_url))
+        )
     else:
         db_identity = f"{parsed.hostname or ''}:{parsed.port or ''}{parsed.path}"
     db_hash = hashlib.md5(
@@ -158,11 +163,16 @@ def get_config() -> dict:
             **MYSQL_CONFIG,
         }
     elif parsed.scheme == "sqlite":
-        Path(parsed.path).parent.mkdir(parents=True, exist_ok=True)
+        if is_sqlite_memory_url(BotConfig.db_url):
+            sqlite_file_path = ":memory:"
+        else:
+            sqlite_path = sqlite_path_from_url(BotConfig.db_url)
+            sqlite_path.parent.mkdir(parents=True, exist_ok=True)
+            sqlite_file_path = str(sqlite_path)
         config["connections"]["default"] = {
             "engine": "tortoise.backends.sqlite",
             "credentials": {
-                "file_path": parsed.path,
+                "file_path": sqlite_file_path,
             },
             **SQLITE_CONFIG,
         }

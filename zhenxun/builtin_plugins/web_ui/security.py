@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Coroutine
 import contextlib
 import ipaddress
 import json
@@ -147,6 +148,19 @@ def _spawn_expiry_task(websocket: WebSocket, expires_at: float) -> asyncio.Task[
             name="webui-websocket-auth-expiry",
         )
     return asyncio.create_task(coroutine, name="webui-websocket-auth-expiry")
+
+
+def spawn_websocket_task(
+    coroutine: Coroutine[Any, Any, None], *, scope_id: str, name: str
+) -> asyncio.Task[None]:
+    if _LIFECYCLE_CONTEXT is not None:
+        return _LIFECYCLE_CONTEXT.spawn_detached(
+            coroutine,
+            scope_id=scope_id,
+            scope="task",
+            name=name,
+        )
+    return asyncio.create_task(coroutine, name=name)
 
 
 async def _expire_websocket(websocket: WebSocket, expires_at: float) -> None:
@@ -354,6 +368,7 @@ __all__ = [
     "revoke_authenticated_websockets",
     "send_authenticated_json",
     "send_authenticated_text",
+    "spawn_websocket_task",
     "unregister_authenticated_websocket",
     "validate_access_token",
 ]

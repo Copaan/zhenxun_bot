@@ -1294,7 +1294,7 @@ def _probe_error(
 def _map_probe_error(error: Exception, phase: str) -> HTTPException:
     if isinstance(error, AuthenticationException):
         return _probe_error(
-            401, phase, "provider_credentials_invalid", "服务商拒绝了当前凭据。"
+            422, phase, "provider_credentials_invalid", "服务商拒绝了当前凭据。"
         )
     if isinstance(error, RateLimitException | QuotaExceededException):
         return _probe_error(
@@ -1428,7 +1428,7 @@ async def discover_models(payload: ProviderDiscoveryRequest) -> Result:
         )
         if response.status_code in {401, 403}:
             raise _probe_error(
-                401,
+                422,
                 "authentication",
                 "provider_credentials_invalid",
                 "服务商拒绝了当前凭据。",

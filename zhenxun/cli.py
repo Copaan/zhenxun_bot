@@ -228,6 +228,7 @@ def _run_worker() -> None:
         )
 
     nonebot.init(
+        _env_file=ENV_DEV_FILE,
         htmlrender_browser_channel=htmlrender_browser_channel,
         render_backend="playwright",
         render_playwright={"channel": htmlrender_browser_channel},
@@ -574,7 +575,10 @@ def _wait_worker_ready(
         _bind_worker_runtime_status(worker, status)
         if _runtime_status_is_ready(status, require_warmup=require_warmup):
             return True
-        if status and status.get("operating_mode") == "management_only":
+        if status and status.get("operating_mode") in {
+            "management_only",
+            "setup_only",
+        }:
             return False
         time.sleep(WORKER_READY_POLL_INTERVAL)
     return False
@@ -1079,9 +1083,13 @@ def _run_launcher() -> None:
                     qq_settings, scheme=webui_tls.scheme
                 )
                 _bind_worker_runtime_status(worker, status)
-                if status and status.get("operating_mode") == "management_only":
+                if status and status.get("operating_mode") in {
+                    "management_only",
+                    "setup_only",
+                }:
                     _launcher_log(
-                        "worker entered management-only mode; QQ ingress remains closed"
+                        "worker entered management/setup-only mode; "
+                        "QQ ingress remains closed"
                     )
                 else:
                     _terminate_worker(worker)

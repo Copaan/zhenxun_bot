@@ -20,6 +20,7 @@ from ....security import (
     authenticate_websocket,
     close_authenticated_websocket,
     send_authenticated_text,
+    spawn_websocket_task,
     unregister_authenticated_websocket,
 )
 from ....utils import DB_BUSY_MESSAGE, authentication, get_system_status
@@ -309,7 +310,11 @@ async def system_logs_realtime(websocket: WebSocket, sleep: int = 5):
         finally:
             disconnect_event.set()
 
-    receive_task = asyncio.create_task(_watch_disconnect())
+    receive_task = spawn_websocket_task(
+        _watch_disconnect(),
+        scope_id=f"system-status-receive-{id(websocket)}",
+        name="webui-system-status-receive",
+    )
     try:
         while (
             websocket.client_state == WebSocketState.CONNECTED

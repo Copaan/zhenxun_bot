@@ -56,6 +56,7 @@ class StartupCoordinator:
         self._load_planner: Any | None = None
         self._management_complete = False
         self._server_bound = False
+        self._setup_required = False
         self._last_persist_monotonic = 0.0
         self._lock = RLock()
         self._server_bound_event: asyncio.Event | None = None
@@ -98,6 +99,23 @@ class StartupCoordinator:
                 if self._finished_monotonic is None:
                     self._finished_monotonic = time.monotonic()
                 self._set_event(self._warmup_event)
+        self.persist()
+
+    def enter_setup_mode(self) -> None:
+        """Keep the minimal management surface alive until first setup restarts."""
+        with self._lock:
+            self._setup_required = True
+            skipped = {
+                "state": "skipped",
+                "duration_ms": 0.0,
+                "reason_code": "initial_setup_required",
+            }
+            self._stages.setdefault("runtime", dict(skipped))
+            self._stages.setdefault("warmup", dict(skipped))
+            if self._management_complete and self._server_bound:
+                self._state = "management_ready"
+                if self._finished_monotonic is None:
+                    self._finished_monotonic = time.monotonic()
         self.persist()
 
     def fail_stage(
@@ -294,6 +312,8 @@ class StartupCoordinator:
             self._server_bound = True
             if self._management_complete and self._state == "starting":
                 self._state = "management_ready"
+                if self._setup_required and self._finished_monotonic is None:
+                    self._finished_monotonic = time.monotonic()
             self._set_event(self._server_bound_event)
         self.persist()
 
@@ -305,6 +325,16 @@ class StartupCoordinator:
 
     async def wait_final_available(self) -> bool:
         """Wait until startup reaches its final user-facing usable state."""
+        with self._lock:
+            setup_required = self._setup_required
+        if setup_required:
+            await self.wait_server_bound()
+            with self._lock:
+                return (
+                    self._management_complete
+                    and self._server_bound
+                    and self._state == "management_ready"
+                )
         await self.wait_runtime_ready()
         with self._lock:
             if self._stages.get("runtime", {}).get("state") != "completed":
@@ -380,10 +410,15 @@ class StartupCoordinator:
                 else None,
                 "server_bound": self._server_bound,
                 "operating_mode": (
-                    "management_only" if self._state == "failed" else "normal"
+                    "management_only"
+                    if self._state == "failed"
+                    else "setup_only"
+                    if self._setup_required
+                    else "normal"
                 ),
                 "accepts_bot_events": self.runtime_ready,
                 "failure_terminal": self._state == "failed",
+                "setup_required": self._setup_required,
                 "python": {
                     "version": platform.python_version(),
                     "implementation": platform.python_implementation(),

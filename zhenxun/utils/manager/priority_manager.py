@@ -410,7 +410,9 @@ def lifecycle_component_ids(module_names: set[str]) -> set[str]:
     return startup | shutdown
 
 
-async def _run_stage(stage: StartupStage) -> None:
+async def _run_stage(
+    stage: StartupStage, *, excluded_components: set[str] | None = None
+) -> None:
     _sync_kernel_declarations()
     component_ids = {
         component_id
@@ -420,6 +422,7 @@ async def _run_stage(stage: StartupStage) -> None:
     component_ids.update(lifecycle_kernel.native_component_ids_for_stage(stage))
     if stage == "runtime":
         component_ids.update(_shutdown_only_hooks())
+    component_ids.difference_update(excluded_components or set())
     await lifecycle_kernel.start_components(component_ids)
 
 
@@ -463,20 +466,35 @@ async def _run_post_management() -> None:
 
 
 @driver.on_startup
-async def _():
+async def _start_application_lifecycle() -> None:
     global _post_management_task
     from zhenxun.services.runtime_mutation import runtime_mutation_coordinator
 
     runtime_mutation_coordinator.reopen()
+    from zhenxun.builtin_plugins.web_ui.api.configure.setup_access import setup_access
+
+    setup_required = setup_access.state() in {"unconfigured", "partial"}
+    if setup_required:
+        startup_coordinator.enter_setup_mode()
     startup_coordinator.begin_stage("management")
     try:
-        await _run_stage("management")
+        await _run_stage(
+            "management",
+            excluded_components={"management:database"} if setup_required else None,
+        )
     except BaseException as error:
         startup_coordinator.fail_stage(
             "management", f"management_stage_failed:{type(error).__name__}"
         )
         raise
     startup_coordinator.finish_stage("management")
+    if setup_required:
+        logger.info(
+            "首次配置尚未完成，worker 已进入 setup_only 管理模式；"
+            "数据库、Bot 事件和运行时插件将在配置重启后启动。",
+            "Startup",
+        )
+        return
     startup_context = lifecycle_kernel.component_context(
         "management:runtime_concurrency"
     )

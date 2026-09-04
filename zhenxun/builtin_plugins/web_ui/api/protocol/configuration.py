@@ -70,6 +70,18 @@ _PROTOCOL_ENV_KEYS = {
     "QQ_WEBHOOK_TLS_CERTFILE",
     "QQ_WEBHOOK_TLS_KEYFILE",
 }
+_PROTOCOL_DEFAULTS: dict[str, Any] = {
+    "ONEBOT_ACCESS_TOKEN": "",
+    "QQ_ADAPTER_LOAD": False,
+    "QQ_BOTS": [],
+    "QQ_VERIFY_WEBHOOK": True,
+    "QQ_WEBHOOK_MODE": "external",
+    "QQ_WEBHOOK_PUBLIC_BASE_URL": "",
+    "QQ_WEBHOOK_LISTEN_HOST": "0.0.0.0",
+    "QQ_WEBHOOK_LISTEN_PORT": 443,
+    "QQ_WEBHOOK_TLS_CERTFILE": "",
+    "QQ_WEBHOOK_TLS_KEYFILE": "",
+}
 
 
 class QQCredentialProbe(BaseModel):
@@ -158,6 +170,31 @@ def _parse_bots(raw: object) -> list[dict[str, Any]]:
     except (TypeError, ValueError):
         return []
     return value if isinstance(value, list) else []
+
+
+def _normalized_protocol_value(key: str, value: Any) -> Any:
+    if key in {"QQ_ADAPTER_LOAD", "QQ_VERIFY_WEBHOOK"}:
+        if isinstance(value, bool):
+            return value
+        return str(value or "").strip().casefold() in {"1", "true", "yes", "on"}
+    if key == "QQ_WEBHOOK_LISTEN_PORT":
+        return int(value or _PROTOCOL_DEFAULTS[key])
+    if key == "QQ_BOTS":
+        return value if isinstance(value, list) else _parse_bots(value)
+    return str(value or "").strip()
+
+
+def _effective_protocol_changes(
+    current: dict[str, Any], candidate: dict[str, Any]
+) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in candidate.items()
+        if _normalized_protocol_value(
+            key, current.get(key, _PROTOCOL_DEFAULTS.get(key, ""))
+        )
+        != _normalized_protocol_value(key, value)
+    }
 
 
 def _public_base_url(value: str, *, required: bool) -> str:
@@ -436,6 +473,7 @@ async def save_protocol_configuration(
         base_url = str(values.get("QQ_WEBHOOK_PUBLIC_BASE_URL") or "").strip()
     changed["QQ_WEBHOOK_PUBLIC_BASE_URL"] = base_url
 
+    changed = _effective_protocol_changes(values, changed)
     updated = _update_env(current, changed)
     if updated != current:
         _write_transaction([(_ENV_FILE, updated.encode("utf-8"))])
