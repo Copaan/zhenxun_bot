@@ -18,7 +18,14 @@ from .models import (
     RepoType,
     RepoUpdateResult,
 )
-from .utils import check_git, filter_files, redact_git_output, run_git_command
+from .utils import (
+    canonicalize_git_url,
+    check_git,
+    filter_files,
+    git_auth_environment,
+    redact_git_output,
+    run_git_command,
+)
 
 
 class BaseRepoManager(ABC):
@@ -255,8 +262,11 @@ class BaseRepoManager(ABC):
                 )
 
             # 预处理仓库URL
+            authenticated_url = repo_url
             if prepare_repo_url:
-                repo_url = prepare_repo_url(repo_url)
+                authenticated_url = prepare_repo_url(repo_url)
+            repo_url = canonicalize_git_url(authenticated_url)
+            git_env = git_auth_environment(authenticated_url, repo_url)
 
             # 检查本地目录是否存在
             if not await AsyncPath(local_path).exists():
@@ -266,7 +276,8 @@ class BaseRepoManager(ABC):
                     LOG_COMMAND,
                 )
                 success, _stdout, stderr = await run_git_command(
-                    f"clone --progress -b {branch} {repo_url} {local_path}"
+                    ["clone", "--progress", "-b", branch, repo_url, str(local_path)],
+                    env=git_env,
                 )
                 if not success:
                     return RepoUpdateResult(
@@ -335,15 +346,20 @@ class BaseRepoManager(ABC):
 
             # 如果远程URL不匹配，则更新它
             remote_url = remote_url.strip()
-            if success and repo_url not in remote_url and remote_url not in repo_url:
-                logger.info(f"更新远程URL: {remote_url} -> {repo_url}", LOG_COMMAND)
+            canonical_remote_url = canonicalize_git_url(remote_url)
+            if success and (
+                canonical_remote_url != repo_url or remote_url != canonical_remote_url
+            ):
+                logger.info("已更新远程仓库地址并清理持久凭据", LOG_COMMAND)
                 await run_git_command(
-                    f"remote set-url origin {repo_url}", cwd=local_path
+                    ["remote", "set-url", "origin", repo_url], cwd=local_path
                 )
 
             # 获取远程更新
-            logger.info(f"获取远程更新: {repo_url}", LOG_COMMAND)
-            success, _, stderr = await run_git_command("fetch origin", cwd=local_path)
+            logger.info(f"获取远程更新: {redact_git_output(repo_url)}", LOG_COMMAND)
+            success, _, stderr = await run_git_command(
+                "fetch origin", cwd=local_path, env=git_env
+            )
             if not success:
                 return RepoUpdateResult(
                     repo_type=repo_type or RepoType.GITHUB,
@@ -377,12 +393,12 @@ class BaseRepoManager(ABC):
                     )
 
             # 拉取最新代码
-            logger.info(f"拉取最新代码: {repo_url}", LOG_COMMAND)
+            logger.info(f"拉取最新代码: {redact_git_output(repo_url)}", LOG_COMMAND)
             if force:
                 logger.info("使用强制拉取模式", LOG_COMMAND)
                 # 强制模式需要两步：先 fetch，再 reset，不能用 shell && 链式写法
                 success, _, stderr = await run_git_command(
-                    "fetch --all", cwd=local_path
+                    "fetch --all", cwd=local_path, env=git_env
                 )
                 if not success:
                     return RepoUpdateResult(
@@ -398,7 +414,7 @@ class BaseRepoManager(ABC):
                 )
             else:
                 success, _, stderr = await run_git_command(
-                    f"pull origin {branch}", cwd=local_path
+                    f"pull origin {branch}", cwd=local_path, env=git_env
                 )
             if not success:
                 return RepoUpdateResult(
@@ -419,7 +435,9 @@ class BaseRepoManager(ABC):
             # 如果版本相同，则无需更新
             if old_version.strip() == new_version.strip() and not force:
                 logger.info(
-                    f"仓库 {repo_url} 已是最新版本: {new_version.strip()}", LOG_COMMAND
+                    f"仓库 {redact_git_output(repo_url)} 已是最新版本: "
+                    f"{new_version.strip()}",
+                    LOG_COMMAND,
                 )
                 result.success = True
                 return result
@@ -442,12 +460,13 @@ class BaseRepoManager(ABC):
             return result
 
         except Exception as e:
-            logger.error("Git更新失败", LOG_COMMAND, e=e)
+            safe_error = redact_git_output(e)
+            logger.error(f"Git更新失败: {safe_error}", LOG_COMMAND)
             return RepoUpdateResult(
                 repo_type=repo_type or RepoType.GITHUB,
                 repo_name=repo_name,
                 owner=owner or "",
                 old_version="",
                 new_version="",
-                error_message=str(e),
+                error_message=safe_error,
             )

@@ -184,6 +184,10 @@ async def request_webui_restart(
     if not status["launcher_managed"]:
         return False, "当前不是 launcher 托管模式，请手动重启真寻。", status
     ok, message = await request_restart(source, require_ticket=require_ticket)
+    if ok:
+        from .security import quiesce_authenticated_websockets
+
+        await quiesce_authenticated_websockets(timeout=0.75)
     return ok, message, status
 
 

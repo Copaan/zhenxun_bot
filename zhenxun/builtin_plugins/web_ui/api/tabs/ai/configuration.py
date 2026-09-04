@@ -130,6 +130,7 @@ class RoutingValidationRequest(BaseModel):
 
 class ProviderDiscoveryRequest(BaseModel):
     provider_name: str | None = None
+    saved_provider_name: str | None = Field(default=None, max_length=80)
     api_type: str | None = None
     api_base: str | None = None
     api_key: str | None = None
@@ -996,6 +997,19 @@ async def update_provider(
                 "timeout": payload.timeout,
             }
         )
+        if payload.models is not None:
+            existing = {
+                str(item.get("model_name")): item
+                for item in provider.get("models", [])
+                if isinstance(item, dict) and item.get("model_name")
+            }
+            provider["models"] = [
+                {
+                    **deepcopy(existing.get(str(model.get("model_name", "")), {})),
+                    **model,
+                }
+                for model in payload.models
+            ]
 
     revision, config, operation = await _persist_with_operation(
         payload.expected_revision, mutate
@@ -1393,8 +1407,9 @@ async def _run_exact_model_probe(
     response_class=JSONResponse,
 )
 async def discover_models(payload: ProviderDiscoveryRequest) -> Result:
-    provider, api_key, _, _ = _resolve_probe_provider(
+    provider, api_key, uses_saved_key, health_provider_name = _resolve_probe_provider(
         provider_name=payload.provider_name,
+        saved_provider_name=payload.saved_provider_name,
         api_type=payload.api_type,
         api_base=payload.api_base,
         api_key=payload.api_key,
@@ -1412,20 +1427,48 @@ async def discover_models(payload: ProviderDiscoveryRequest) -> Result:
             "model_discovery_unsupported",
             "该 API 类型不支持安全的模型自动发现，请手动添加模型。",
         )
+    keys = [api_key]
+    saved_keys: list[str] = []
+    credential_slot: int | None = None
+    if uses_saved_key:
+        saved_provider = _saved_provider(
+            payload.saved_provider_name or payload.provider_name
+        )
+        saved_keys = _provider_keys(saved_provider)
+        selected = await health_manager.get_next_available_key(
+            health_provider_name or provider.name,
+            saved_keys,
+            strict_mode=False,
+        )
+        if selected:
+            keys = [selected, *(key for key in saved_keys if key != selected)]
     started = time.monotonic()
     try:
-        headers = (
-            {"x-goog-api-key": api_key}
-            if api_type == "gemini"
-            else {"Authorization": f"Bearer {api_key}"}
-        )
         client = await http_client_manager.get_client(provider)
-        response = await client.request(
-            "GET",
-            _discovery_url(api_type, api_base),
-            headers=headers,
-            timeout=min(float(provider.timeout), _DISCOVERY_TIMEOUT),
-        )
+        response = None
+        selected_key = api_key
+        for candidate_key in keys:
+            headers = (
+                {"x-goog-api-key": candidate_key}
+                if api_type == "gemini"
+                else {"Authorization": f"Bearer {candidate_key}"}
+            )
+            response = await client.request(
+                "GET",
+                _discovery_url(api_type, api_base),
+                headers=headers,
+                timeout=min(float(provider.timeout), _DISCOVERY_TIMEOUT),
+            )
+            selected_key = candidate_key
+            if response.status_code not in {401, 403}:
+                break
+            if uses_saved_key:
+                await health_manager.record_key_failure(
+                    health_provider_name or provider.name,
+                    candidate_key,
+                    AuthenticationException("provider rejected credential"),
+                )
+        assert response is not None
         if response.status_code in {401, 403}:
             raise _probe_error(
                 422,
@@ -1459,6 +1502,23 @@ async def discover_models(payload: ProviderDiscoveryRequest) -> Result:
             if raw_name:
                 names.append(str(raw_name).removeprefix("models/"))
         latency = round((time.monotonic() - started) * 1000)
+        if uses_saved_key:
+            await health_manager.record_key_success(
+                health_provider_name or provider.name, selected_key
+            )
+            raw_keys = (
+                saved_provider.api_key
+                if isinstance(saved_provider.api_key, list)
+                else [saved_provider.api_key]
+            )
+            credential_slot = next(
+                (
+                    index
+                    for index, value in enumerate(raw_keys)
+                    if str(value) == selected_key
+                ),
+                None,
+            )
         logger.info(
             "AI Provider 探测成功 | "
             f"api_type={api_type} | models={len(names)} | latency={latency}ms",
@@ -1470,6 +1530,8 @@ async def discover_models(payload: ProviderDiscoveryRequest) -> Result:
                 "latency_ms": latency,
                 "authenticated": True,
                 "phase": "completed",
+                "credential_source": "saved" if uses_saved_key else "temporary",
+                "credential_slot": credential_slot,
             }
         )
     except HTTPException:

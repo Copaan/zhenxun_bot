@@ -461,10 +461,18 @@ def _clone_ref(
     source: UpdateSource,
 ) -> Path:
     repo_url = _REPOSITORIES[component]
+    authenticated_url = repo_url
     if source == "aliyun":
         from zhenxun.utils.repo_utils.utils import prepare_aliyun_url
 
-        repo_url = prepare_aliyun_url(repo_url)
+        authenticated_url = prepare_aliyun_url(repo_url)
+    from zhenxun.utils.repo_utils.utils import (
+        canonicalize_git_url,
+        git_auth_environment,
+    )
+
+    repo_url = canonicalize_git_url(authenticated_url)
+    auth_env = git_auth_environment(authenticated_url, repo_url)
     result = subprocess.run(
         [
             "git",
@@ -482,6 +490,7 @@ def _clone_ref(
         text=True,
         timeout=300,
         check=False,
+        env={**os.environ, **auth_env} if auth_env else None,
     )
     if result.returncode != 0:
         stderr = (result.stderr or "").lower()

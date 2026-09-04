@@ -4,7 +4,9 @@
 
 import asyncio
 import base64
+from collections.abc import Mapping
 import contextlib
+import os
 from pathlib import Path
 import re
 import shutil
@@ -66,6 +68,43 @@ def redact_git_output(value: object) -> str:
     return text
 
 
+def canonicalize_git_url(value: str) -> str:
+    """Remove transport credentials while preserving a usable repository URL."""
+    try:
+        parsed = urlsplit(value)
+        if parsed.scheme not in {"http", "https"}:
+            return value
+        hostname = parsed.hostname or ""
+        if ":" in hostname:
+            hostname = f"[{hostname}]"
+        netloc = hostname
+        if parsed.port:
+            netloc += f":{parsed.port}"
+        query = urlencode(
+            [
+                (key, item)
+                for key, item in parse_qsl(parsed.query, keep_blank_values=True)
+                if key.casefold() not in _SENSITIVE_QUERY_KEYS
+            ]
+        )
+        return urlunsplit((parsed.scheme, netloc, parsed.path, query, parsed.fragment))
+    except ValueError:
+        return value
+
+
+def git_auth_environment(
+    authenticated_url: str, canonical_url: str
+) -> dict[str, str] | None:
+    """Build an ephemeral Git URL rewrite without persisting credentials."""
+    if authenticated_url == canonical_url:
+        return None
+    return {
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": f"url.{authenticated_url}.insteadOf",
+        "GIT_CONFIG_VALUE_0": canonical_url,
+    }
+
+
 async def check_git() -> bool:
     """
     检查环境变量中是否存在 git
@@ -102,6 +141,7 @@ async def run_git_command(
     command: str | list[str],
     cwd: Path | None = None,
     timeout_seconds: float | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> tuple[bool, str, str]:
     """
     运行git命令，实时输出 stderr 进度信息（如 git clone --progress）。
@@ -110,18 +150,23 @@ async def run_git_command(
         command: 命令字符串或参数列表
         cwd: 工作目录
         timeout_seconds: 硬超时时间，None 表示不限制
+        env: 仅传给 Git 子进程的临时环境
 
     返回:
         tuple[bool, str, str]: (是否成功, 标准输出, 标准错误)
     """
     try:
         args = command.split() if isinstance(command, str) else list(command)
+        process_env = None
+        if env:
+            process_env = {**os.environ, **env}
         process = await asyncio.create_subprocess_exec(
             "git",
             *args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=cwd,
+            env=process_env,
         )
 
         stderr_lines: list[str] = []
@@ -176,7 +221,9 @@ async def run_git_command(
             return False, "", f"命令执行超时（{timeout_seconds:g} 秒）"
 
         await process.wait()
-        stdout = (stdout_bytes or b"").decode("utf-8").strip()
+        stdout = redact_git_output(
+            (stdout_bytes or b"").decode("utf-8", errors="replace").strip()
+        )
         stderr = "\n".join(stderr_lines)
 
         return process.returncode == 0, stdout, stderr
@@ -294,6 +341,9 @@ async def sparse_checkout_clone(
     """
     target_dir.mkdir(parents=True, exist_ok=True)
     sparse_paths = [sparse_path] if isinstance(sparse_path, str) else list(sparse_path)
+    authenticated_url = repo_url
+    repo_url = canonicalize_git_url(repo_url)
+    git_env = git_auth_environment(authenticated_url, repo_url)
 
     if not await check_git():
         raise GitUnavailableError()
@@ -331,6 +381,7 @@ async def sparse_checkout_clone(
         # 防止一次下载永久占住插件商店任务。
         fetch_error = ""
         for attempt in range(3):
+            fetch_options = {"env": git_env} if git_env else {}
             success, out, err = await run_git_command(
                 [
                     "-c",
@@ -346,6 +397,7 @@ async def sparse_checkout_clone(
                 ],
                 temp_path,
                 timeout_seconds=60,
+                **fetch_options,
             )
             if success:
                 break
@@ -429,7 +481,7 @@ def prepare_aliyun_url(repo_url: str, group_name: str | None = None) -> str:
             ).decode()
             # 阿里云CodeUp使用oauth2:token的格式进行身份验证
             url = url.replace("https://", f"https://oauth2:{token}@")
-            logger.debug(f"使用RDC令牌构建阿里云URL: {url.split('@')[0]}@***")
+            logger.debug("已为阿里云仓库准备临时RDC认证")
         except Exception as e:
             logger.error(f"解码RDC令牌失败: {e}")
 

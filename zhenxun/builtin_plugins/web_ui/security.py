@@ -79,6 +79,16 @@ class WebSocketAuthLease:
 
 
 _AUTHENTICATED_WEBSOCKETS: dict[WebSocket, WebSocketAuthLease] = {}
+_WINDOWS_DISCONNECT_ERRORS = {10053, 10054}
+
+
+def is_websocket_disconnect_error(error: BaseException) -> bool:
+    """Return whether an exception is an expected socket disconnect at a WS boundary."""
+    if isinstance(error, WebSocketDisconnect | ConnectionResetError | BrokenPipeError):
+        return True
+    return isinstance(error, OSError) and getattr(error, "winerror", None) in (
+        _WINDOWS_DISCONNECT_ERRORS
+    )
 
 
 def is_private_client(host: str | None) -> bool:
@@ -191,8 +201,10 @@ async def close_authenticated_websocket(
             return False
         try:
             await websocket.close(code=code, reason=reason)
-        except (RuntimeError, WebSocketDisconnect):
-            return False
+        except Exception as error:
+            if isinstance(error, RuntimeError) or is_websocket_disconnect_error(error):
+                return False
+            raise
         return True
 
 
@@ -205,9 +217,11 @@ async def send_authenticated_text(websocket: WebSocket, text: str) -> bool:
             return False
         try:
             await websocket.send_text(text)
-        except (RuntimeError, WebSocketDisconnect):
-            lease.closing = True
-            return False
+        except Exception as error:
+            if isinstance(error, RuntimeError) or is_websocket_disconnect_error(error):
+                lease.closing = True
+                return False
+            raise
         return True
 
 
@@ -220,9 +234,11 @@ async def send_authenticated_json(websocket: WebSocket, data: Any) -> bool:
             return False
         try:
             await websocket.send_json(data)
-        except (RuntimeError, WebSocketDisconnect):
-            lease.closing = True
-            return False
+        except Exception as error:
+            if isinstance(error, RuntimeError) or is_websocket_disconnect_error(error):
+                lease.closing = True
+                return False
+            raise
         return True
 
 
@@ -290,6 +306,10 @@ async def authenticate_websocket(websocket: WebSocket) -> bool:
         token = payload.get("token") if isinstance(payload, dict) else None
     except (TimeoutError, ValueError, WebSocketDisconnect):
         token = None
+    except OSError as error:
+        if not is_websocket_disconnect_error(error):
+            raise
+        return False
 
     decoded, auth_status = (
         decode_access_token_status(token)
@@ -352,6 +372,30 @@ async def revoke_authenticated_websockets() -> None:
         unregister_authenticated_websocket(websocket)
 
 
+async def quiesce_authenticated_websockets(
+    *, code: int = 1012, reason: str = "service restart", timeout: float = 2.0
+) -> int:
+    entries = list(_AUTHENTICATED_WEBSOCKETS.items())
+    websockets = [websocket for websocket, _lease in entries]
+    if not websockets:
+        return 0
+    for _websocket, lease in entries:
+        lease.closing = True
+    await asyncio.gather(
+        *(
+            asyncio.wait_for(
+                close_authenticated_websocket(websocket, code=code, reason=reason),
+                timeout=timeout,
+            )
+            for websocket in websockets
+        ),
+        return_exceptions=True,
+    )
+    for websocket in websockets:
+        unregister_authenticated_websocket(websocket)
+    return len(websockets)
+
+
 __all__ = [
     "PRIVATE_ACCESS_DENIED",
     "WEBSOCKET_AUTH_EXPIRED",
@@ -362,7 +406,9 @@ __all__ = [
     "decode_access_token_status",
     "is_private_client",
     "is_private_scope",
+    "is_websocket_disconnect_error",
     "login_attempt_limiter",
+    "quiesce_authenticated_websockets",
     "renew_authenticated_websockets",
     "require_private_request",
     "revoke_authenticated_websockets",

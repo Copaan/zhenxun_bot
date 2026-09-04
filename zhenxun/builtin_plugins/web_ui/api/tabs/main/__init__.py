@@ -19,6 +19,7 @@ from ....config import QueryDateType
 from ....security import (
     authenticate_websocket,
     close_authenticated_websocket,
+    is_websocket_disconnect_error,
     send_authenticated_text,
     spawn_websocket_task,
     unregister_authenticated_websocket,
@@ -305,8 +306,13 @@ async def system_logs_realtime(websocket: WebSocket, sleep: int = 5):
                 await websocket.receive()
         except (WebSocketDisconnect, ConnectionClosedError, ConnectionClosedOK):
             pass
+        except OSError as error:
+            if not is_websocket_disconnect_error(error):
+                logger.warning(
+                    f"ws system_status receive failed: {type(error).__name__}"
+                )
         except Exception as e:
-            logger.debug(f"ws system_status receive stopped: {type(e).__name__}")
+            logger.warning(f"ws system_status receive failed: {type(e).__name__}")
         finally:
             disconnect_event.set()
 
