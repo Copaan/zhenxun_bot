@@ -15,7 +15,7 @@ from ....config import AVA_URL
 from ....security import (
     authenticate_websocket,
     close_authenticated_websocket,
-    is_websocket_disconnect_error,
+    record_websocket_disconnect,
     send_authenticated_json,
     unregister_authenticated_websocket,
 )
@@ -59,7 +59,7 @@ async def _(websocket: WebSocket):
         while websocket.client_state == WebSocketState.CONNECTED:
             await websocket.receive()
     except (WebSocketDisconnect, OSError) as error:
-        if not is_websocket_disconnect_error(error):
+        if not record_websocket_disconnect(error):
             raise
     finally:
         unregister_authenticated_websocket(websocket)

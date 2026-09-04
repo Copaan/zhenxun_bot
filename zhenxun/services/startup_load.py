@@ -13,6 +13,7 @@ import sys
 import time
 from typing import Any
 
+from nonebot.log import logger as nonebot_logger
 from nonebot.utils import is_coroutine_callable, run_sync
 
 from zhenxun.utils.atomic_json import read_json_locked, write_json_locked
@@ -40,6 +41,29 @@ _MODEL_MODULES = {
     "zhenxun.services.db_context",
     "zhenxun.services.db_context.base_model",
 }
+
+
+def _load_plugin_with_error(
+    manager: Any, plugin_id: str
+) -> tuple[Any, BaseException | None]:
+    """Capture the import error NoneBot logs and intentionally swallows."""
+    captured: list[BaseException] = []
+
+    def capture(message: Any) -> None:
+        record = message.record
+        exception = record.get("exception")
+        if "Failed to import" not in str(record.get("message") or ""):
+            return
+        value = getattr(exception, "value", None)
+        if isinstance(value, BaseException):
+            captured.append(value)
+
+    sink_id = nonebot_logger.add(capture, level="ERROR", catch=True)
+    try:
+        result = manager.load_plugin(plugin_id)
+    finally:
+        nonebot_logger.remove(sink_id)
+    return result, captured[-1] if captured else None
 
 
 def _call_name(node: ast.Call) -> str:
@@ -593,11 +617,13 @@ class StartupLoadPlanner:
             phase=entry.phase,
         )
         started = time.monotonic()
-        result = entry.manager.load_plugin(entry.plugin_id)
+        result, import_error = _load_plugin_with_error(entry.manager, entry.plugin_id)
         entry.duration_ms = round((time.monotonic() - started) * 1000, 2)
         entry.status = "loaded" if result is not None else "failed"
         if result is None:
-            self.mark_failed(entry.plugin_id, "plugin_import_failed")
+            self.mark_failed(
+                entry.plugin_id, "plugin_import_failed", error=import_error
+            )
             if self.is_core_plugin(entry.plugin_id):
                 raise RuntimeError(f"core_plugin_import_failed:{entry.plugin_id}")
         elif entry.phase == "runtime_load":
@@ -732,7 +758,7 @@ class StartupLoadPlanner:
             except Exception as error:
                 state = "failed"
                 error_code = f"plugin_startup_hook_failed:{type(error).__name__}"
-                self.mark_failed(hook.owner, error_code)
+                self.mark_failed(hook.owner, error_code, error=error)
             startup_coordinator.record_operation(
                 name,
                 "runtime",
@@ -776,7 +802,13 @@ class StartupLoadPlanner:
     def runtime_file_record(self, path: Path) -> dict[str, Any] | None:
         return self._file_lookup.get(str(path))
 
-    def mark_failed(self, plugin_id: str, error_code: str) -> None:
+    def mark_failed(
+        self,
+        plugin_id: str,
+        error_code: str,
+        *,
+        error: BaseException | None = None,
+    ) -> None:
         self.failed_plugins.add(plugin_id)
         entry = self.entries.get(plugin_id)
         if entry is not None:
@@ -787,6 +819,7 @@ class StartupLoadPlanner:
             source_type="plugin",
             source_id=plugin_id,
             display_name=plugin_id,
+            error=error,
         )
 
     def prepare_warmup_gates(self) -> None:

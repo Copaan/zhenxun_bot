@@ -18,6 +18,7 @@ from starlette.websockets import WebSocket, WebSocketDisconnect, WebSocketState
 
 from zhenxun.configs.config import Config
 from zhenxun.services.cache import BoundedTTLCache
+from zhenxun.services.webui_transport import transport_runtime
 
 from .console_access import console_access
 
@@ -89,6 +90,13 @@ def is_websocket_disconnect_error(error: BaseException) -> bool:
     return isinstance(error, OSError) and getattr(error, "winerror", None) in (
         _WINDOWS_DISCONNECT_ERRORS
     )
+
+
+def record_websocket_disconnect(error: BaseException) -> bool:
+    expected = is_websocket_disconnect_error(error)
+    if expected and isinstance(error, ConnectionResetError | BrokenPipeError | OSError):
+        transport_runtime.record("websocket_reset")
+    return expected
 
 
 def is_private_client(host: str | None) -> bool:
@@ -203,8 +211,11 @@ async def close_authenticated_websocket(
             await websocket.close(code=code, reason=reason)
         except Exception as error:
             if isinstance(error, RuntimeError) or is_websocket_disconnect_error(error):
+                record_websocket_disconnect(error)
                 return False
             raise
+        if code == 1012:
+            transport_runtime.record("cooperative_close")
         return True
 
 
@@ -220,6 +231,9 @@ async def send_authenticated_text(websocket: WebSocket, text: str) -> bool:
         except Exception as error:
             if isinstance(error, RuntimeError) or is_websocket_disconnect_error(error):
                 lease.closing = True
+                transport_runtime.record("websocket_send_failure")
+                record_websocket_disconnect(error)
+                unregister_authenticated_websocket(websocket)
                 return False
             raise
         return True
@@ -237,6 +251,9 @@ async def send_authenticated_json(websocket: WebSocket, data: Any) -> bool:
         except Exception as error:
             if isinstance(error, RuntimeError) or is_websocket_disconnect_error(error):
                 lease.closing = True
+                transport_runtime.record("websocket_send_failure")
+                record_websocket_disconnect(error)
+                unregister_authenticated_websocket(websocket)
                 return False
             raise
         return True
@@ -309,6 +326,7 @@ async def authenticate_websocket(websocket: WebSocket) -> bool:
     except OSError as error:
         if not is_websocket_disconnect_error(error):
             raise
+        record_websocket_disconnect(error)
         return False
 
     decoded, auth_status = (
@@ -409,6 +427,7 @@ __all__ = [
     "is_websocket_disconnect_error",
     "login_attempt_limiter",
     "quiesce_authenticated_websockets",
+    "record_websocket_disconnect",
     "renew_authenticated_websockets",
     "require_private_request",
     "revoke_authenticated_websockets",

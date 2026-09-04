@@ -20,6 +20,7 @@ from ....security import (
     authenticate_websocket,
     close_authenticated_websocket,
     is_websocket_disconnect_error,
+    record_websocket_disconnect,
     send_authenticated_text,
     spawn_websocket_task,
     unregister_authenticated_websocket,
@@ -311,6 +312,8 @@ async def system_logs_realtime(websocket: WebSocket, sleep: int = 5):
                 logger.warning(
                     f"ws system_status receive failed: {type(error).__name__}"
                 )
+            else:
+                record_websocket_disconnect(error)
         except Exception as e:
             logger.warning(f"ws system_status receive failed: {type(e).__name__}")
         finally:

@@ -8,7 +8,7 @@ from starlette.websockets import WebSocket, WebSocketDisconnect, WebSocketState
 from ...security import (
     authenticate_websocket,
     close_authenticated_websocket,
-    is_websocket_disconnect_error,
+    record_websocket_disconnect,
     send_authenticated_text,
     unregister_authenticated_websocket,
 )
@@ -45,7 +45,7 @@ async def system_logs_realtime(websocket: WebSocket):
                 f"<e>{escape_tag(repr(recv))}</e>"
             )
     except (WebSocketDisconnect, OSError) as error:
-        if not is_websocket_disconnect_error(error):
+        if not record_websocket_disconnect(error):
             raise
     finally:
         unregister_authenticated_websocket(websocket)

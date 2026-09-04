@@ -69,6 +69,7 @@ async def get_lifecycle_status() -> Result[LifecycleStatus]:
     from zhenxun.services.lifecycle.launcher import launcher_lifecycle_snapshot
     from zhenxun.services.lifecycle.operations import operation_registry
     from zhenxun.services.runtime_reload import plugin_runtime_manager
+    from zhenxun.services.webui_transport import transport_runtime
 
     return Result.ok(
         {
@@ -76,6 +77,7 @@ async def get_lifecycle_status() -> Result[LifecycleStatus]:
             "launcher": launcher_lifecycle_snapshot(),
             "operation_registry": operation_registry.status(),
             "plugin_runtime": plugin_runtime_manager.status(),
+            "transport": transport_runtime.snapshot(),
         }
     )
 

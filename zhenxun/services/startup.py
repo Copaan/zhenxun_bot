@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import os
 from pathlib import Path
 import platform
+import re
 import sys
 from threading import RLock
 import time
@@ -38,6 +39,77 @@ class OperationRecord:
     details: dict[str, Any] | None = None
 
 
+@dataclass(slots=True)
+class StartupDiagnostic:
+    diagnostic_id: str
+    occurred_at: str
+    stage: str
+    source_type: str
+    source_id: str
+    code: str
+    error_type: str
+    summary: str
+    details: dict[str, Any]
+
+
+_WINDOWS_PATH_PATTERN = re.compile(r"(?i)(?:[a-z]:[\\/]|\\\\)[^\r\n\t\"'<>|]+")
+_POSIX_PATH_PATTERN = re.compile(r"(?<![:\w])/(?:[^/\s]+/)+[^\s:]+")
+_SECRET_PATTERN = re.compile(
+    r"(?i)\b(token|api[_-]?key|secret|password|authorization)\b\s*[:=]\s*[^\s,;]+"
+)
+
+
+def _sanitize_diagnostic_text(value: object, *, limit: int = 240) -> str:
+    text = " ".join(str(value or "").split())
+    text = _WINDOWS_PATH_PATTERN.sub("[path]", text)
+    text = _POSIX_PATH_PATTERN.sub("[path]", text)
+    text = _SECRET_PATTERN.sub(lambda match: f"{match.group(1)}=[redacted]", text)
+    return text[:limit]
+
+
+def _diagnostic_payload(
+    error: BaseException | None, code: str
+) -> tuple[str, str, dict[str, Any]]:
+    if error is None:
+        return "StartupDegradation", f"启动能力降级：{code}", {}
+    error_type = type(error).__name__
+    if isinstance(error, ModuleNotFoundError):
+        module = _sanitize_diagnostic_text(error.name or "unknown", limit=120)
+        return error_type, f"缺少 Python 模块：{module}", {"missing_module": module}
+    if isinstance(error, SyntaxError):
+        filename = Path(str(error.filename or "")).name or None
+        details = {
+            key: value
+            for key, value in {
+                "filename": filename,
+                "line": error.lineno,
+                "column": error.offset,
+            }.items()
+            if value is not None
+        }
+        summary = _sanitize_diagnostic_text(error.msg or "Python 语法错误")
+        return error_type, summary, details
+    errors = getattr(error, "errors", None)
+    if callable(errors) and error_type == "ValidationError":
+        fields: list[str] = []
+        kinds: list[str] = []
+        try:
+            for item in errors(include_url=False, include_input=False)[:20]:
+                location = ".".join(str(part) for part in item.get("loc", ()))
+                if location:
+                    fields.append(_sanitize_diagnostic_text(location, limit=120))
+                if item.get("type"):
+                    kinds.append(_sanitize_diagnostic_text(item["type"], limit=80))
+        except (TypeError, ValueError):
+            pass
+        details = {"fields": fields, "validation_types": kinds}
+        summary = "配置校验失败"
+        if fields:
+            summary += f"：{', '.join(fields[:5])}"
+        return error_type, summary, details
+    return error_type, f"{error_type} 导致启动能力降级，请使用诊断ID查看本地日志", {}
+
+
 class StartupCoordinator:
     def __init__(self) -> None:
         self.boot_id = uuid.uuid4().hex
@@ -52,6 +124,7 @@ class StartupCoordinator:
         self._operations: list[OperationRecord] = []
         self._errors: list[dict[str, str]] = []
         self._degraded_reasons: list[dict[str, str]] = []
+        self._diagnostics: list[StartupDiagnostic] = []
         self._current_operation: dict[str, Any] | None = None
         self._load_planner: Any | None = None
         self._management_complete = False
@@ -127,6 +200,7 @@ class StartupCoordinator:
         source_type: str = "stage",
         source_id: str | None = None,
         display_name: str | None = None,
+        error: BaseException | None = None,
     ) -> None:
         added = False
         with self._lock:
@@ -146,6 +220,7 @@ class StartupCoordinator:
                 source_type=source_type,
                 source_id=source_id,
                 display_name=display_name,
+                error=error,
             )
             self._state = "failed" if fatal else "degraded"
             if self._finished_monotonic is None:
@@ -157,7 +232,7 @@ class StartupCoordinator:
         reason = dict(self._degraded_reasons[-1]) if added else None
         self.persist()
         if added:
-            self._log_degraded_reason(reason or {})
+            self._log_degraded_reason(reason or {}, error=error)
 
     def record_operation(
         self,
@@ -209,6 +284,7 @@ class StartupCoordinator:
         source_type: str = "operation",
         source_id: str | None = None,
         display_name: str | None = None,
+        error: BaseException | None = None,
     ) -> None:
         added = False
         with self._lock:
@@ -221,10 +297,11 @@ class StartupCoordinator:
                 source_type=source_type,
                 source_id=source_id,
                 display_name=display_name,
+                error=error,
             )
         reason = dict(self._degraded_reasons[-1]) if added else None
         if added:
-            self._log_degraded_reason(reason or {})
+            self._log_degraded_reason(reason or {}, error=error)
             self._persist_throttled(force=True)
 
     def _append_degraded_reason_locked(
@@ -235,6 +312,7 @@ class StartupCoordinator:
         source_type: str,
         source_id: str | None,
         display_name: str | None,
+        error: BaseException | None,
     ) -> bool:
         normalized_source_id = str(source_id or "").strip() or "unknown"
         reason = {
@@ -261,19 +339,42 @@ class StartupCoordinator:
             for item in self._degraded_reasons
         ):
             return False
+        occurred_at = datetime.now(timezone.utc).isoformat()
+        diagnostic_id = f"diag-{uuid.uuid4().hex[:12]}"
+        error_type, summary, details = _diagnostic_payload(error, str(error_code))
+        reason["diagnostic_id"] = diagnostic_id
+        reason["occurred_at"] = occurred_at
         self._degraded_reasons.append(reason)
+        self._diagnostics.append(
+            StartupDiagnostic(
+                diagnostic_id=diagnostic_id,
+                occurred_at=occurred_at,
+                stage=str(stage),
+                source_type=str(source_type or "operation"),
+                source_id=normalized_source_id,
+                code=str(error_code),
+                error_type=error_type,
+                summary=summary,
+                details=details,
+            )
+        )
+        self._diagnostics = self._diagnostics[-100:]
         return True
 
     @staticmethod
-    def _log_degraded_reason(reason: dict[str, str]) -> None:
+    def _log_degraded_reason(
+        reason: dict[str, str], *, error: BaseException | None = None
+    ) -> None:
         try:
             from zhenxun.services.log import logger
 
-            logger.warning(
+            logger.error(
                 "启动能力降级 | "
+                f"diagnostic_id={reason.get('diagnostic_id', 'unknown')} | "
                 f"stage={reason['stage']} | source={reason['source_type']}:"
                 f"{reason['source_id']} | code={reason['code']}",
                 "Startup",
+                e=error if isinstance(error, Exception) else None,
             )
         except Exception:
             pass
@@ -481,6 +582,7 @@ class StartupCoordinator:
         result = self.snapshot()
         with self._lock:
             result["operations"] = [asdict(item) for item in self._operations]
+            result["diagnostics"] = [asdict(item) for item in self._diagnostics]
             if self._load_planner is not None:
                 result["load_plan"] = self._load_planner.summary(detail=True)
         try:
@@ -515,4 +617,4 @@ try:
 except Exception:
     pass
 
-__all__ = ["StartupCoordinator", "startup_coordinator"]
+__all__ = ["StartupCoordinator", "StartupDiagnostic", "startup_coordinator"]

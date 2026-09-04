@@ -11,6 +11,7 @@ from zhenxun.configs.utils import PluginExtraData, RegisterConfig
 from zhenxun.configs.webui_tls import current_webui_scheme
 from zhenxun.services.log import logger
 from zhenxun.services.startup import startup_coordinator
+from zhenxun.services.webui_transport import transport_runtime
 from zhenxun.utils.enum import PluginType
 from zhenxun.utils.manager.priority_manager import PriorityLifecycle
 from zhenxun.utils.network import emit_webui_console_banner
@@ -110,12 +111,30 @@ WsApiRouter.include_router(chat_routes)
 
 
 @PriorityLifecycle.on_startup(
+    priority=-1,
+    stage="management",
+    timeout=5,
+    component_id="management:webui-transport",
+    scope="worker",
+    depends_on=("management:runtime_concurrency",),
+    restart_policy="worker",
+)
+async def _install_transport_runtime():
+    transport_runtime.install()
+
+
+@PriorityLifecycle.on_shutdown(priority=1001, component_id="management:webui-transport")
+async def _restore_transport_runtime():
+    transport_runtime.restore()
+
+
+@PriorityLifecycle.on_startup(
     priority=0,
     stage="management",
     timeout=20,
     component_id="management:webui",
     scope="worker",
-    depends_on=("management:runtime_concurrency",),
+    depends_on=("management:webui-transport",),
     restart_policy="worker",
     config_keys=("HOST", "PORT", "DRIVER", "WEBUI_TLS"),
     pass_context=True,

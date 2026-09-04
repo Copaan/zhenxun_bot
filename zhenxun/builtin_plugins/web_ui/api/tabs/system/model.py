@@ -57,6 +57,7 @@ class LifecycleStatus(BaseModel):
     operation_registry: dict[str, Any] = Field(default_factory=dict)
     plugin_runtime: dict[str, Any] = Field(default_factory=dict)
     launcher: dict[str, Any] = Field(default_factory=dict)
+    transport: dict[str, Any] = Field(default_factory=dict)
     components: list[LifecycleComponentStatus]
 
 
