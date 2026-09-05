@@ -999,6 +999,18 @@ class PluginRuntimeManager:
                                 return None
                             raise
 
+                # Resolve postponed annotations in the original function's namespace
+                # before NoneBot inspects the wrapper. Without an explicit signature,
+                # ForwardRefs such as ``Bot`` are evaluated against this module instead.
+                try:
+                    setattr(
+                        wrapped,
+                        "__signature__",
+                        inspect.signature(func, eval_str=True),
+                    )
+                except (NameError, TypeError, ValueError):
+                    pass
+
                 return _original(wrapped)
 
             tracked.__zhenxun_runtime_wrapped__ = True
