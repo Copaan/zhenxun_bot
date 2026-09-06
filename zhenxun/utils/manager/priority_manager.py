@@ -508,20 +508,35 @@ async def _start_application_lifecycle() -> None:
 
 @driver.on_shutdown
 async def _():
+    from zhenxun.services.lifecycle.deadline import (
+        received_shutdown_budget,
+        shutdown_budget,
+    )
+
+    with shutdown_budget(received_shutdown_budget(15.0)):
+        await _shutdown_with_budget()
+
+
+async def _shutdown_with_budget():
     global _post_management_task
+    from zhenxun.services.lifecycle.deadline import remaining_timeout
     from zhenxun.services.runtime_mutation import runtime_mutation_coordinator
 
-    mutation_drained = await runtime_mutation_coordinator.quiesce(timeout=10)
+    mutation_drained = await runtime_mutation_coordinator.quiesce(
+        timeout=remaining_timeout(10)
+    )
     if not mutation_drained:
         logger.error("运行时变更事务未能在关闭前排空，将要求 worker 恢复。")
     task = _post_management_task
     _post_management_task = None
     if task is not None and not task.done():
         task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+        done, pending = await asyncio.wait({task}, timeout=remaining_timeout(2.0))
+        if pending:
+            lifecycle_kernel._recovery_required.add("runtime_bootstrap")
+        for completed in done:
+            if not completed.cancelled():
+                completed.exception()
 
     paired = _sync_kernel_declarations()
     await lifecycle_kernel.stop_all()
@@ -540,7 +555,7 @@ async def _():
                     priority,
                     "shutdown",
                     stage="shutdown",
-                    timeout=spec.timeout,
+                    timeout=remaining_timeout(spec.timeout or 5.0),
                 )
             except Exception as error:
                 logger.error(

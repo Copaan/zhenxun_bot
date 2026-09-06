@@ -3,17 +3,33 @@ from __future__ import annotations
 import asyncio
 from collections import Counter
 from collections.abc import Callable
+from datetime import datetime, timezone
+import re
+import sys
 from threading import RLock
 import time
 from typing import Any
+import uuid
 
 _UVICORN_HTTP_PREFIX = "uvicorn.protocols.http."
 _UVICORN_WEBSOCKET_PREFIX = "uvicorn.protocols.websockets."
+_AIOHTTP_SERVER_PREFIX = "aiohttp.web_protocol"
 _DEBUG_INTERVAL_SECONDS = 30.0
+_MAX_CONTEXT_OBJECTS = 64
+_SAFE_SYMBOL = re.compile(r"^[A-Za-z0-9_.<>-]{1,160}$")
+_RELATED_ATTRIBUTES = (
+    "__self__",
+    "_protocol",
+    "protocol",
+    "_app_protocol",
+    "_app_transport",
+    "_ssl_protocol",
+    "_transport",
+)
 
 
 class TransportRuntime:
-    """Own the event-loop exception proxy and transport diagnostics."""
+    """Own event-loop reset handling and Uvicorn's outer transport lifetime."""
 
     def __init__(self) -> None:
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -21,6 +37,12 @@ class TransportRuntime:
         self._installed_handler: Callable[..., Any] | None = None
         self._counts: Counter[str] = Counter()
         self._last_debug: dict[str, float] = {}
+        self._last_unclassified_reset: dict[str, Any] | None = None
+        self._lifespan_stopped = False
+        self._uvicorn_server_type: type[Any] | None = None
+        self._uvicorn_original_handle_exit: Callable[..., Any] | None = None
+        self._uvicorn_wrapped_handle_exit: Callable[..., Any] | None = None
+        self._shutdown_task: asyncio.Task[None] | None = None
         self._lock = RLock()
 
     def install(self) -> None:
@@ -33,7 +55,13 @@ class TransportRuntime:
             self._loop = loop
             self._previous_handler = loop.get_exception_handler()
             self._installed_handler = self._handle_exception
+            self._lifespan_stopped = False
             loop.set_exception_handler(self._installed_handler)
+
+    def retain_until_loop_close(self) -> None:
+        """Keep the proxy installed while Uvicorn tears transports down."""
+        with self._lock:
+            self._lifespan_stopped = True
 
     def restore(self) -> None:
         with self._lock:
@@ -56,12 +84,28 @@ class TransportRuntime:
         with self._lock:
             counts = dict(self._counts)
             installed = self._installed_handler is not None
+            lifespan_stopped = self._lifespan_stopped
+            bridge_installed = self._uvicorn_wrapped_handle_exit is not None
+            last_unclassified = (
+                dict(self._last_unclassified_reset)
+                if self._last_unclassified_reset
+                else None
+            )
         return {
             "exception_proxy_installed": installed,
+            "lifespan_stopped": lifespan_stopped,
+            "signal_bridge_installed": bridge_installed,
             "http_reset_count": counts.get("http_reset", 0),
             "websocket_reset_count": counts.get("websocket_reset", 0),
+            "proactor_close_reset_count": counts.get("proactor_close_reset", 0),
+            "unclassified_windows_reset_count": counts.get(
+                "unclassified_windows_reset", 0
+            ),
             "websocket_send_failure_count": counts.get("websocket_send_failure", 0),
             "cooperative_close_count": counts.get("cooperative_close", 0),
+            "signal_shutdown_count": counts.get("signal_shutdown", 0),
+            "predrained_connection_count": counts.get("predrained_connection", 0),
+            "last_unclassified_reset": last_unclassified,
         }
 
     def _handle_exception(
@@ -74,7 +118,98 @@ class TransportRuntime:
             self.record(metric)
             self._debug_disconnect(metric)
             return
+        if self._is_windows_connection_reset(error):
+            if self._is_closing_proactor_cleanup(context):
+                self.record("proactor_close_reset")
+                self._debug_disconnect("proactor_close_reset")
+                return
+            self.record("unclassified_windows_reset")
+            self._record_unclassified_reset(context)
         self._delegate(loop, context)
+
+    def install_uvicorn_signal_bridge(self) -> bool:
+        """Start inbound connection drain before Uvicorn enters shutdown."""
+        try:
+            import uvicorn
+
+            server_type = uvicorn.Server
+            original = server_type.handle_exit
+        except (AttributeError, ImportError):
+            return False
+        with self._lock:
+            if self._uvicorn_wrapped_handle_exit is not None:
+                return self._uvicorn_server_type is server_type
+
+            def wrapped(server: Any, sig: int, frame: Any) -> Any:
+                self._begin_signal_shutdown(server)
+                return original(server, sig, frame)
+
+            wrapped.__name__ = getattr(original, "__name__", "handle_exit")
+            wrapped.__qualname__ = getattr(
+                original, "__qualname__", "Server.handle_exit"
+            )
+            setattr(wrapped, "__zhenxun_transport_bridge__", True)
+            server_type.handle_exit = wrapped
+            self._uvicorn_server_type = server_type
+            self._uvicorn_original_handle_exit = original
+            self._uvicorn_wrapped_handle_exit = wrapped
+        return True
+
+    def restore_uvicorn_signal_bridge(self) -> None:
+        with self._lock:
+            server_type = self._uvicorn_server_type
+            original = self._uvicorn_original_handle_exit
+            wrapped = self._uvicorn_wrapped_handle_exit
+            self._uvicorn_server_type = None
+            self._uvicorn_original_handle_exit = None
+            self._uvicorn_wrapped_handle_exit = None
+            self._shutdown_task = None
+        if (
+            server_type is not None
+            and original is not None
+            and wrapped is not None
+            and getattr(server_type, "handle_exit", None) is wrapped
+        ):
+            server_type.handle_exit = original
+
+    def _begin_signal_shutdown(self, server: Any) -> None:
+        self.record("signal_shutdown")
+        server_state = self._safe_getattr(server, "server_state")
+        connections = tuple(self._safe_getattr(server_state, "connections") or ())
+        drained = 0
+        for connection in connections:
+            shutdown = self._safe_getattr(connection, "shutdown")
+            if not callable(shutdown):
+                continue
+            try:
+                shutdown()
+            except Exception:
+                continue
+            drained += 1
+        if drained:
+            self.record("predrained_connection", drained)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        with self._lock:
+            task = self._shutdown_task
+            if task is not None and not task.done():
+                return
+            self._shutdown_task = loop.create_task(
+                self._quiesce_webui_connections(),
+                name="webui-transport-signal-quiesce",
+            )
+
+    @staticmethod
+    async def _quiesce_webui_connections() -> None:
+        try:
+            security = sys.modules.get("zhenxun.builtin_plugins.web_ui.security")
+            quiesce = getattr(security, "quiesce_authenticated_websockets", None)
+            if callable(quiesce):
+                await quiesce(timeout=0.75)
+        except Exception:
+            return
 
     def _delegate(
         self, loop: asyncio.AbstractEventLoop, context: dict[str, Any]
@@ -92,22 +227,44 @@ class TransportRuntime:
             isinstance(error, OSError) and getattr(error, "winerror", None) == 10054
         )
 
-    @staticmethod
-    def _uvicorn_channel(context: dict[str, Any]) -> str | None:
+    @classmethod
+    def _context_objects(cls, context: dict[str, Any]) -> list[Any]:
         objects: list[Any] = [
             context.get("protocol"),
             context.get("transport"),
             context.get("handle"),
             context.get("callback"),
         ]
-        handle = context.get("handle")
-        objects.append(getattr(handle, "_callback", None))
+        objects.append(cls._safe_getattr(context.get("handle"), "_callback"))
+        result: list[Any] = []
         visited: set[int] = set()
-        while objects:
+        while objects and len(result) < _MAX_CONTEXT_OBJECTS:
             current = objects.pop()
             if current is None or id(current) in visited:
                 continue
             visited.add(id(current))
+            result.append(current)
+            objects.extend(
+                cls._safe_getattr(current, attribute)
+                for attribute in _RELATED_ATTRIBUTES
+            )
+        return result
+
+    @staticmethod
+    def _safe_getattr(value: Any, attribute: str) -> Any:
+        try:
+            return getattr(value, attribute, None)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _safe_symbol(value: Any) -> str:
+        text = str(value or "unknown")
+        return text if _SAFE_SYMBOL.fullmatch(text) else "[redacted]"
+
+    @classmethod
+    def _uvicorn_channel(cls, context: dict[str, Any]) -> str | None:
+        for current in cls._context_objects(context):
             module = str(
                 getattr(current, "__module__", "")
                 or getattr(type(current), "__module__", "")
@@ -116,15 +273,82 @@ class TransportRuntime:
                 return "websocket"
             if module.startswith(_UVICORN_HTTP_PREFIX):
                 return "http"
-            objects.extend(
-                (
-                    getattr(current, "__self__", None),
-                    getattr(current, "_protocol", None),
-                    getattr(current, "protocol", None),
-                    getattr(current, "_transport", None),
-                )
-            )
+            if module.startswith(_AIOHTTP_SERVER_PREFIX):
+                return "http"
         return None
+
+    @classmethod
+    def _is_closing_proactor_cleanup(cls, context: dict[str, Any]) -> bool:
+        for current in cls._context_objects(context):
+            owner = cls._safe_getattr(current, "__self__")
+            if owner is None:
+                continue
+            owner_module = str(getattr(type(owner), "__module__", ""))
+            callback_name = str(getattr(current, "__name__", ""))
+            if not owner_module.startswith("asyncio.proactor_events"):
+                continue
+            if callback_name != "_call_connection_lost":
+                continue
+            is_closing = cls._safe_getattr(owner, "is_closing")
+            try:
+                if callable(is_closing):
+                    return bool(is_closing())
+                return bool(cls._safe_getattr(owner, "_closing"))
+            except Exception:
+                return False
+        return False
+
+    def _record_unclassified_reset(self, context: dict[str, Any]) -> None:
+        objects = self._context_objects(context)
+        modules = sorted(
+            {
+                self._safe_symbol(
+                    getattr(item, "__module__", "")
+                    or getattr(type(item), "__module__", "unknown")
+                )
+                for item in objects
+                if item is not None
+            }
+        )[:12]
+        callback = self._safe_getattr(
+            context.get("handle"), "_callback"
+        ) or context.get("callback")
+        diagnostic = {
+            "diagnostic_id": f"transport-{uuid.uuid4().hex[:12]}",
+            "occurred_at": datetime.now(timezone.utc).isoformat(),
+            "callback_module": self._safe_symbol(
+                getattr(callback, "__module__", "unknown")
+            ),
+            "callback_name": self._safe_symbol(
+                getattr(callback, "__qualname__", None)
+                or getattr(callback, "__name__", "unknown")
+            ),
+            "module_chain": modules,
+        }
+        with self._lock:
+            self._last_unclassified_reset = diagnostic
+        self._log_unclassified_reset(diagnostic)
+
+    def _log_unclassified_reset(self, diagnostic: dict[str, Any]) -> None:
+        now = time.monotonic()
+        metric = "unclassified_windows_reset"
+        with self._lock:
+            last = self._last_debug.get(metric, 0.0)
+            if now - last < _DEBUG_INTERVAL_SECONDS:
+                return
+            self._last_debug[metric] = now
+        try:
+            from zhenxun.services.log import logger
+
+            logger.warning(
+                "未分类Windows连接重置，将交给原异常处理器 | "
+                f"diagnostic_id={diagnostic['diagnostic_id']} | "
+                f"callback={diagnostic['callback_module']}:"
+                f"{diagnostic['callback_name']}",
+                "WebUi",
+            )
+        except Exception:
+            pass
 
     def _debug_disconnect(self, metric: str) -> None:
         now = time.monotonic()
@@ -137,8 +361,7 @@ class TransportRuntime:
             from zhenxun.services.log import logger
 
             logger.debug(
-                "已回收Uvicorn客户端重置连接 | "
-                f"channel={metric.removesuffix('_reset')}",
+                "已回收连接关闭阶段重置 | " f"category={metric.removesuffix('_reset')}",
                 "WebUi",
             )
         except Exception:

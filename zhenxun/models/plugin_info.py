@@ -179,9 +179,18 @@ class PluginInfo(Model):
 
         if cls._can_use_cached_filters(filters):
             plugins = await cls._get_cached_plugins()
-            return cls._filter_cached_plugins(plugins, filters)
+            plugins = cls._filter_cached_plugins(plugins, filters)
+        else:
+            plugins = await PluginInfo.filter(**filters).all()
+        if filters.get("load_status") is True:
+            from zhenxun.services.startup_load import startup_load_planner
 
-        return await PluginInfo.filter(**filters).all()
+            plugins = [
+                plugin
+                for plugin in plugins
+                if startup_load_planner.plugin_available(plugin.module_path)
+            ]
+        return plugins
 
     @classmethod
     async def get_plugins_values_list(

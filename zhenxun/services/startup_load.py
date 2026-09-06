@@ -739,7 +739,10 @@ class StartupLoadPlanner:
                 )
 
     async def _run_native_hooks(self) -> None:
-        for hook in self._native_hooks:
+        # NoneBot completes the startup phase before invoking ready callbacks.
+        for hook in sorted(
+            self._native_hooks, key=lambda hook: hook.hook_type != "startup"
+        ):
             if hook.owner in self.failed_plugins:
                 continue
             name = (
@@ -755,6 +758,9 @@ class StartupLoadPlanner:
                     await hook.func()
                 else:
                     await run_sync(hook.func)()
+                if hook.owner in self.failed_plugins:
+                    state = "failed"
+                    error_code = "plugin_lifecycle_failed"
             except Exception as error:
                 state = "failed"
                 error_code = f"plugin_startup_hook_failed:{type(error).__name__}"
@@ -770,13 +776,23 @@ class StartupLoadPlanner:
 
     def summary(self, *, detail: bool = False) -> dict[str, Any]:
         counts = defaultdict(int)
+        status_counts = {"loaded": 0, "failed": 0, "pending": 0}
         completed = 0
         for entry in self.entries.values():
             counts[entry.phase] += 1
             completed += int(entry.status in {"loaded", "failed"})
+            state = (
+                "failed"
+                if entry.plugin_id in self.failed_plugins or entry.status == "failed"
+                else "loaded"
+                if entry.status == "loaded"
+                else "pending"
+            )
+            status_counts[state] += 1
         result: dict[str, Any] = {
             "fingerprint": self.fingerprint,
             "counts": dict(counts),
+            "status_counts": status_counts,
             "total": len(self.entries),
             "completed": completed,
             "failed_plugins": sorted(self.failed_plugins),
@@ -801,6 +817,19 @@ class StartupLoadPlanner:
 
     def runtime_file_record(self, path: Path) -> dict[str, Any] | None:
         return self._file_lookup.get(str(path))
+
+    def plugin_available(self, module_name: str) -> bool:
+        owner = self.owner_for_module(module_name)
+        if owner in self.failed_plugins or module_name in self.failed_plugins:
+            return False
+        if owner is not None and self.entries[owner].status != "loaded":
+            return False
+        return not any(
+            module_name == entry.module_name
+            or module_name.startswith(f"{entry.module_name}.")
+            for plugin_id, entry in self.entries.items()
+            if plugin_id in self.failed_plugins
+        )
 
     def mark_failed(
         self,

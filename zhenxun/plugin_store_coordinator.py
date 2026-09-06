@@ -49,8 +49,12 @@ def coordinated_store_operation(
 ) -> Callable[P, Coroutine[Any, Any, R]]:
     @wraps(func)
     async def wrapped(*args: P.args, **kwargs: P.kwargs) -> R:
-        async with plugin_store_operation_coordinator.operation():
-            return await func(*args, **kwargs)
+        try:
+            return await runtime_mutation_coordinator.run_owned(
+                "plugin_store", lambda: func(*args, **kwargs), fail_if_busy=True
+            )
+        except RuntimeMutationBusyError as error:
+            raise StoreOperationBusyError("plugin_operation_in_progress") from error
 
     return wrapped
 

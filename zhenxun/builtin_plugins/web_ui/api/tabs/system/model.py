@@ -58,6 +58,7 @@ class LifecycleStatus(BaseModel):
     plugin_runtime: dict[str, Any] = Field(default_factory=dict)
     launcher: dict[str, Any] = Field(default_factory=dict)
     transport: dict[str, Any] = Field(default_factory=dict)
+    http_sidecar: dict[str, Any] = Field(default_factory=dict)
     components: list[LifecycleComponentStatus]
 
 

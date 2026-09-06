@@ -35,6 +35,22 @@ def _is_private_ipv4(address: ipaddress.IPv4Address) -> bool:
     return any(address in network for network in _IPV4_PRIVATE_NETWORKS)
 
 
+def is_private_client(host: str | None) -> bool:
+    """Return whether a client address belongs to the WebUI access boundary."""
+    if not host:
+        return False
+    normalized = host.split("%", 1)[0]
+    try:
+        address = ipaddress.ip_address(normalized)
+    except ValueError:
+        return normalized.casefold() == "localhost"
+    if address.is_loopback or address.is_link_local:
+        return True
+    if isinstance(address, ipaddress.IPv4Address):
+        return _is_private_ipv4(address)
+    return address in _IPV6_PRIVATE_NETWORK
+
+
 def private_ipv4_addresses() -> list[str]:
     """List active RFC1918 addresses without exposing wildcard or link-local IPs."""
     stats = psutil.net_if_stats()
@@ -123,9 +139,12 @@ def emit_webui_console_banner(
     state: str,
     username: str | None = None,
     scheme: str = "http",
+    http_compatibility_port: int | None = None,
 ) -> None:
     """Write the startup-only WebUI recovery links outside application logs."""
     urls = local_access_urls(bind_host, port, scheme)
+    if scheme == "https" and http_compatibility_port is not None:
+        urls.extend(local_access_urls(bind_host, http_compatibility_port, "http"))
     if not urls:
         urls = [AccessUrl("Local", f"{scheme}://{bind_host}:{port}")]
     display_urls = list(urls)
@@ -161,6 +180,8 @@ def emit_webui_console_banner(
     elif normalized_host in {"127.0.0.1", "::1", "localhost"}:
         lines.append("  -> 网络: 当前仅监听本机，局域网设备无法访问")
     lines.append("  -> 安全提示: 连接链接仅对本次启动有效，请勿分享")
+    if http_compatibility_port is not None:
+        lines.append("  -> HTTP 兼容入口为明文传输，请优先使用 HTTPS")
     sys.stderr.write("\n".join(lines) + "\n")
     sys.stderr.flush()
 
@@ -170,6 +191,7 @@ __all__ = [
     "emit_webui_console_banner",
     "format_access_url_banner",
     "internal_connect_host",
+    "is_private_client",
     "local_access_urls",
     "private_ipv4_addresses",
     "private_ipv6_addresses",

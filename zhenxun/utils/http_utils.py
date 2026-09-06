@@ -83,6 +83,7 @@ async def _(context):
         receipt_id=f"httpx:{id(_client)}",
         provider="httpx",
         resource_type="client",
+        release_check=lambda client=_client: client.is_closed,
     )
 
     logger.info("全局 httpx.AsyncClient 已启动。", "HTTPClient")

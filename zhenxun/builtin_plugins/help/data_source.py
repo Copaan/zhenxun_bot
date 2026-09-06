@@ -15,6 +15,7 @@ from zhenxun.services.db_context import with_db_timeout
 from zhenxun.services.log import logger
 from zhenxun.services.message_load import is_db_unhealthy
 from zhenxun.services.renderer.result_cache import RenderResultMemoryCache
+from zhenxun.services.startup_load import startup_load_planner
 from zhenxun.ui.models import PluginMenuCategory, PluginMenuData
 from zhenxun.utils.common_utils import format_usage_for_markdown
 from zhenxun.utils.enum import BlockType, PluginType
@@ -222,7 +223,11 @@ async def get_plugin_help(
     except _DbBusyError:
         return _DB_BUSY_MESSAGE
 
-    if plugin:
+    if (
+        plugin
+        and plugin.load_status
+        and startup_load_planner.plugin_available(plugin.module_path)
+    ):
         _plugin = nonebot.get_plugin_by_module_name(plugin.module_path)
         if _plugin and _plugin.metadata:
             extra_data = PluginExtraData(**_plugin.metadata.extra)
@@ -308,7 +313,7 @@ async def get_llm_help(question: str, user_id: str) -> str | bytes:
             allowed_types = await get_user_allow_help(user_id)
             plugins = await _read_db(
                 lambda: PluginInfo.get_plugins(
-                    load_status=None,
+                    load_status=True,
                     filter_parent=False,
                     is_show=True,
                     plugin_type__in=allowed_types,
@@ -320,6 +325,8 @@ async def get_llm_help(question: str, user_id: str) -> str | bytes:
 
         knowledge_base_parts = []
         for p in plugins:
+            if not startup_load_planner.plugin_available(p.module_path):
+                continue
             meta = nonebot.get_plugin_by_module_name(p.module_path)
             if not meta or not meta.metadata:
                 continue

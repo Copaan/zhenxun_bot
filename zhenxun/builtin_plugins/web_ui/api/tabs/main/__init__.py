@@ -11,7 +11,7 @@ from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 
 from zhenxun.models.bot_console import BotConsole
 from zhenxun.services.log import logger
-from zhenxun.utils.common_utils import CommonUtils
+from zhenxun.services.plugin_policy import plugin_policy_service
 from zhenxun.utils.platform import PlatformUtils
 
 from ....base_model import Result
@@ -274,13 +274,16 @@ async def _(bot_id: str) -> Result[BotBlockModule]:
 )
 async def _(param: BotManageUpdateParam):
     try:
-        bot_data = await BotConsole.get_or_none(bot_id=param.bot_id)
-        if not bot_data:
-            return Result.fail("Bot数据不存在...")
-        bot_data.block_plugins = CommonUtils.convert_module_format(param.block_plugins)
-        bot_data.block_tasks = CommonUtils.convert_module_format(param.block_tasks)
-        await bot_data.save(update_fields=["block_plugins", "block_tasks"])
-        return Result.ok()
+        result = await plugin_policy_service.update_account(
+            param.bot_id,
+            expected_revision=None,
+            block_plugins=param.block_plugins,
+            block_tasks=param.block_tasks,
+        )
+        return Result.ok(
+            result,
+            "账号插件设置已保存；若原账号绑定共享策略，现已转为独立设置。",
+        )
     except Exception as e:
         logger.error(f"{router.prefix}/update_bot_manage 调用错误", "WebUi", e=e)
         return Result.fail(f"发生了一点错误捏 {type(e)}: {e}")

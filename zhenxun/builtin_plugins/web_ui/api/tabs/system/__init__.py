@@ -35,6 +35,41 @@ router.include_router(restart_router)
 router.include_router(runtime_router)
 
 
+def _with_http_sidecar_degradation(value: dict[str, Any]) -> dict[str, Any]:
+    from zhenxun.services.webui_http_sidecar_state import read_http_sidecar_state
+
+    if not os.getenv("ZHENXUN_LAUNCHER_PID"):
+        return value
+    sidecar = read_http_sidecar_state()
+    if sidecar.get("state") != "degraded" or sidecar.get("mode") == "disabled":
+        return value
+    reason = {
+        "stage": "management",
+        "source_type": "component",
+        "source_id": "launcher:http_sidecar",
+        "display_name": "HTTP兼容入口",
+        "code": "http_sidecar_unavailable",
+        "occurred_at": sidecar.get("updated_at"),
+    }
+    reasons = list(value.get("degraded_reasons") or [])
+    if not any(
+        item.get("source_id") == reason["source_id"]
+        and item.get("code") == reason["code"]
+        for item in reasons
+        if isinstance(item, dict)
+    ):
+        reasons.append(reason)
+    return {
+        **value,
+        "state": (
+            "degraded"
+            if value.get("state") in {"runtime_ready", "warmup_ready"}
+            else value.get("state")
+        ),
+        "degraded_reasons": reasons,
+    }
+
+
 @router.get(
     "/startup/status",
     response_model=Result[dict[str, Any]],
@@ -43,7 +78,9 @@ router.include_router(runtime_router)
 )
 async def get_startup_status() -> Result[dict[str, Any]]:
     return Result.ok(
-        {**startup_coordinator.snapshot(), **transaction_verification_status()}
+        _with_http_sidecar_degradation(
+            {**startup_coordinator.snapshot(), **transaction_verification_status()}
+        )
     )
 
 
@@ -55,7 +92,7 @@ async def get_startup_status() -> Result[dict[str, Any]]:
     description="获取worker完整启动事务报告",
 )
 async def get_startup_report() -> Result[dict[str, Any]]:
-    return Result.ok(startup_coordinator.report())
+    return Result.ok(_with_http_sidecar_degradation(startup_coordinator.report()))
 
 
 @router.get(
@@ -69,6 +106,7 @@ async def get_lifecycle_status() -> Result[LifecycleStatus]:
     from zhenxun.services.lifecycle.launcher import launcher_lifecycle_snapshot
     from zhenxun.services.lifecycle.operations import operation_registry
     from zhenxun.services.runtime_reload import plugin_runtime_manager
+    from zhenxun.services.webui_http_sidecar_state import read_http_sidecar_state
     from zhenxun.services.webui_transport import transport_runtime
 
     return Result.ok(
@@ -78,6 +116,7 @@ async def get_lifecycle_status() -> Result[LifecycleStatus]:
             "operation_registry": operation_registry.status(),
             "plugin_runtime": plugin_runtime_manager.status(),
             "transport": transport_runtime.snapshot(),
+            "http_sidecar": read_http_sidecar_state(),
         }
     )
 

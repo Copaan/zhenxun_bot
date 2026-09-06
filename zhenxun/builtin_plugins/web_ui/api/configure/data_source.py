@@ -80,7 +80,7 @@ def build_database_url(config: DatabaseConfig, root: Path | None = None) -> str:
         path = resolve_sqlite_path(config.path, root)
         project_root = (root or Path.cwd()).resolve()
         relative = path.relative_to(project_root).as_posix()
-        return f"sqlite://{relative}"
+        return f"sqlite:{relative}"
     if config.mode == "url":
         value = config.url.strip()
         if not value:

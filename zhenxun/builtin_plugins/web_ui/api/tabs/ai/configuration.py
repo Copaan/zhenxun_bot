@@ -129,6 +129,7 @@ class RoutingValidationRequest(BaseModel):
 
 
 class ProviderDiscoveryRequest(BaseModel):
+    expected_revision: str | None = Field(default=None, min_length=64, max_length=64)
     provider_name: str | None = None
     saved_provider_name: str | None = Field(default=None, max_length=80)
     api_type: str | None = None
@@ -140,6 +141,7 @@ class ModelTestRequest(BaseModel):
     model: str
     task: Literal["chat", "embedding", "rerank", "image", "tts"] = "chat"
     confirmed_paid_request: bool = False
+    expected_revision: str | None = Field(default=None, min_length=64, max_length=64)
     provider_name: str | None = Field(default=None, max_length=80)
     saved_provider_name: str | None = Field(default=None, max_length=80)
     api_type: str | None = Field(default=None, max_length=64)
@@ -723,8 +725,7 @@ def _provider_view(
     valid_keys = [value for value in keys if not _is_placeholder_secret(value)]
     data["api_key_slots"] = [
         {"existing_index": index, "configured": True}
-        for index, value in enumerate(keys)
-        if not _is_placeholder_secret(value)
+        for index, _value in enumerate(valid_keys)
     ]
     raw_models = (
         raw_provider.get("models", []) if isinstance(raw_provider, dict) else []
@@ -1223,6 +1224,28 @@ def _saved_provider(name: str | None) -> ProviderConfig | None:
     )
 
 
+def _persisted_saved_provider(
+    name: str | None, expected_revision: str | None
+) -> ProviderConfig | None:
+    content = _read()
+    if expected_revision is not None and _revision(content) != expected_revision:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "configuration_revision_conflict",
+                "message": "AI 配置已变化，请重新加载后再测试。",
+            },
+        )
+    if not name:
+        return None
+    data = _load(content)
+    config = _validate_full(data["AI"], strict_references=False)
+    return next(
+        (item for item in config.providers if item.name.casefold() == name.casefold()),
+        None,
+    )
+
+
 def _provider_keys(provider: ProviderConfig | None) -> list[str]:
     if provider is None:
         return []
@@ -1230,6 +1253,17 @@ def _provider_keys(provider: ProviderConfig | None) -> list[str]:
         provider.api_key if isinstance(provider.api_key, list) else [provider.api_key]
     )
     return [str(key) for key in keys if not _is_placeholder_secret(key)]
+
+
+def _credential_slot(provider: ProviderConfig | None, selected_key: str) -> int | None:
+    return next(
+        (
+            index
+            for index, value in enumerate(_provider_keys(provider))
+            if value == selected_key
+        ),
+        None,
+    )
 
 
 def _normalized_api_base(api_type: str, api_base: str | None) -> str:
@@ -1244,8 +1278,14 @@ def _resolve_probe_provider(
     api_base: str | None,
     api_key: str | None,
     timeout: int | None = None,
+    saved_provider: ProviderConfig | None = None,
+    saved_provider_resolved: bool = False,
 ) -> tuple[ProviderConfig, str, bool, str | None]:
-    saved = _saved_provider(saved_provider_name or provider_name)
+    saved = (
+        saved_provider
+        if saved_provider_resolved
+        else _saved_provider(saved_provider_name or provider_name)
+    )
     resolved_type = str(api_type or (saved.api_type if saved else "")).strip()
     resolved_base = _normalized_api_base(
         resolved_type,
@@ -1407,13 +1447,26 @@ async def _run_exact_model_probe(
     response_class=JSONResponse,
 )
 async def discover_models(payload: ProviderDiscoveryRequest) -> Result:
+    saved_name = payload.saved_provider_name or payload.provider_name
+    saved_provider = None
+    saved_provider_resolved = False
+    if payload.expected_revision is not None:
+        async with _PERSIST_LOCK:
+            saved_provider = _persisted_saved_provider(
+                saved_name, payload.expected_revision
+            )
+        saved_provider_resolved = True
     provider, api_key, uses_saved_key, health_provider_name = _resolve_probe_provider(
         provider_name=payload.provider_name,
         saved_provider_name=payload.saved_provider_name,
         api_type=payload.api_type,
         api_base=payload.api_base,
         api_key=payload.api_key,
+        saved_provider=saved_provider,
+        saved_provider_resolved=saved_provider_resolved,
     )
+    if not saved_provider_resolved:
+        saved_provider = _saved_provider(saved_name)
     api_type = provider.api_type
     api_base = provider.api_base or ""
     try:
@@ -1431,9 +1484,6 @@ async def discover_models(payload: ProviderDiscoveryRequest) -> Result:
     saved_keys: list[str] = []
     credential_slot: int | None = None
     if uses_saved_key:
-        saved_provider = _saved_provider(
-            payload.saved_provider_name or payload.provider_name
-        )
         saved_keys = _provider_keys(saved_provider)
         selected = await health_manager.get_next_available_key(
             health_provider_name or provider.name,
@@ -1506,19 +1556,7 @@ async def discover_models(payload: ProviderDiscoveryRequest) -> Result:
             await health_manager.record_key_success(
                 health_provider_name or provider.name, selected_key
             )
-            raw_keys = (
-                saved_provider.api_key
-                if isinstance(saved_provider.api_key, list)
-                else [saved_provider.api_key]
-            )
-            credential_slot = next(
-                (
-                    index
-                    for index, value in enumerate(raw_keys)
-                    if str(value) == selected_key
-                ),
-                None,
-            )
+            credential_slot = _credential_slot(saved_provider, selected_key)
         logger.info(
             "AI Provider 探测成功 | "
             f"api_type={api_type} | models={len(names)} | latency={latency}ms",
@@ -1570,6 +1608,15 @@ async def test_model(payload: ModelTestRequest) -> Result:
         )
     model_provider_name, model_name = payload.model.split("/", 1)
     provider_name = payload.provider_name or model_provider_name
+    saved_name = payload.saved_provider_name or provider_name
+    saved_provider = None
+    saved_provider_resolved = False
+    if payload.expected_revision is not None:
+        async with _PERSIST_LOCK:
+            saved_provider = _persisted_saved_provider(
+                saved_name, payload.expected_revision
+            )
+        saved_provider_resolved = True
     provider, api_key, uses_saved_key, health_provider_name = _resolve_probe_provider(
         provider_name=provider_name,
         saved_provider_name=payload.saved_provider_name,
@@ -1577,27 +1624,64 @@ async def test_model(payload: ModelTestRequest) -> Result:
         api_base=payload.api_base,
         api_key=payload.api_key,
         timeout=payload.timeout,
+        saved_provider=saved_provider,
+        saved_provider_resolved=saved_provider_resolved,
     )
-    try:
-        latency_ms = await _run_exact_model_probe(
-            provider,
-            model_name,
-            payload.model_settings,
-            payload.task,
-            api_key,
+    if not saved_provider_resolved:
+        saved_provider = _saved_provider(saved_name)
+    keys = [api_key]
+    if uses_saved_key:
+        saved_keys = _provider_keys(saved_provider)
+        selected = await health_manager.get_next_available_key(
+            health_provider_name or provider.name,
+            saved_keys,
+            strict_mode=False,
         )
+        if selected:
+            keys = [selected, *(key for key in saved_keys if key != selected)]
+    selected_key = api_key
+    try:
+        last_authentication_error: AuthenticationException | None = None
+        latency_ms = 0.0
+        for candidate_key in keys:
+            selected_key = candidate_key
+            try:
+                latency_ms = await _run_exact_model_probe(
+                    provider,
+                    model_name,
+                    payload.model_settings,
+                    payload.task,
+                    candidate_key,
+                )
+                break
+            except AuthenticationException as error:
+                last_authentication_error = error
+                if uses_saved_key:
+                    await health_manager.record_key_failure(
+                        health_provider_name or provider.name,
+                        candidate_key,
+                        error,
+                    )
+        else:
+            assert last_authentication_error is not None
+            raise last_authentication_error
         if uses_saved_key:
             health_name = health_provider_name or provider.name
-            await health_manager.record_key_success(health_name, api_key)
+            await health_manager.record_key_success(health_name, selected_key)
             await health_manager.record_route_success(
                 f"{health_name}/{model_name}", latency_ms
             )
+        credential_slot = (
+            _credential_slot(saved_provider, selected_key) if uses_saved_key else None
+        )
         return Result.ok(
             {
                 "ok": True,
                 "latency_ms": round(latency_ms),
                 "task": payload.task,
                 "phase": "completed",
+                "credential_source": "saved" if uses_saved_key else "temporary",
+                "credential_slot": credential_slot,
             }
         )
     except asyncio.CancelledError:
@@ -1615,8 +1699,12 @@ async def test_model(payload: ModelTestRequest) -> Result:
             await health_manager.record_route_failure(
                 f"{health_name}/{model_name}", error
             )
-            if isinstance(error, LLMException):
-                await health_manager.record_key_failure(health_name, api_key, error)
+            if isinstance(error, LLMException) and not isinstance(
+                error, AuthenticationException
+            ):
+                await health_manager.record_key_failure(
+                    health_name, selected_key, error
+                )
         raise mapped from error
 
 

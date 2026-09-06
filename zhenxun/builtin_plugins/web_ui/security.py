@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Coroutine
 import contextlib
-import ipaddress
 import json
 import time
 from typing import Any
@@ -19,6 +18,7 @@ from starlette.websockets import WebSocket, WebSocketDisconnect, WebSocketState
 from zhenxun.configs.config import Config
 from zhenxun.services.cache import BoundedTTLCache
 from zhenxun.services.webui_transport import transport_runtime
+from zhenxun.utils.network import is_private_client
 
 from .console_access import console_access
 
@@ -26,12 +26,6 @@ PRIVATE_ACCESS_DENIED = "WebUI is available only from this host or a private net
 WEBSOCKET_AUTH_TIMEOUT = 5.0
 WEBSOCKET_AUTH_EXPIRED = 4401
 MAX_LOGIN_FAILURES = 5
-_IPV4_PRIVATE_NETWORKS = (
-    ipaddress.ip_network("10.0.0.0/8"),
-    ipaddress.ip_network("172.16.0.0/12"),
-    ipaddress.ip_network("192.168.0.0/16"),
-)
-_IPV6_PRIVATE_NETWORK = ipaddress.ip_network("fc00::/7")
 _LIFECYCLE_CONTEXT: Any | None = None
 
 
@@ -97,21 +91,6 @@ def record_websocket_disconnect(error: BaseException) -> bool:
     if expected and isinstance(error, ConnectionResetError | BrokenPipeError | OSError):
         transport_runtime.record("websocket_reset")
     return expected
-
-
-def is_private_client(host: str | None) -> bool:
-    if not host:
-        return False
-    normalized = host.split("%", 1)[0]
-    try:
-        address = ipaddress.ip_address(normalized)
-    except ValueError:
-        return normalized.lower() == "localhost"
-    if address.is_loopback or address.is_link_local:
-        return True
-    if isinstance(address, ipaddress.IPv4Address):
-        return any(address in network for network in _IPV4_PRIVATE_NETWORKS)
-    return address in _IPV6_PRIVATE_NETWORK
 
 
 def is_private_scope(scope: Scope) -> bool:

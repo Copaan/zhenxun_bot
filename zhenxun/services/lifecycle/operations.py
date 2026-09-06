@@ -16,6 +16,7 @@ from strenum import StrEnum
 
 from zhenxun.utils.atomic_json import read_json_locked, write_json_locked
 
+from .deadline import remaining_timeout, shutdown_budget
 from .kernel import LifecycleContext, LifecycleError, LifecycleKernel, lifecycle_kernel
 
 OperationRecoveryPolicy = Literal["resume", "restart", "rollback", "discard"]
@@ -120,6 +121,7 @@ class OperationRegistry:
         self._tasks: dict[str, asyncio.Task[Any]] = {}
         self._scopes: dict[str, LifecycleContext] = {}
         self._checkpoint_callbacks: dict[str, CheckpointCallback] = {}
+        self._cancel_callbacks: dict[str, Callable[[], None]] = {}
         self._recovery_handlers: dict[str, RecoveryCallback] = {}
         self._context: LifecycleContext | None = None
         self._accepting = True
@@ -146,6 +148,7 @@ class OperationRegistry:
         public_input: dict[str, Any] | None = None,
         recovery_policy: OperationRecoveryPolicy = "restart",
         checkpoint: CheckpointCallback | None = None,
+        cancel: Callable[[], None] | None = None,
         name: str | None = None,
         _resume: bool = False,
     ) -> tuple[OperationRecord, asyncio.Task[Any]]:
@@ -183,11 +186,14 @@ class OperationRegistry:
             self._scopes[operation_id] = scope
             if checkpoint is not None:
                 self._checkpoint_callbacks[operation_id] = checkpoint
+            if cancel is not None:
+                self._cancel_callbacks[operation_id] = cancel
             self._persist()
         task = scope.spawn_task(
             self._run(record, coroutine),
             name=name or f"operation:{kind}:{operation_id[:8]}",
             persistent=False,
+            cancel=cancel,
         )
         self._tasks[operation_id] = task
         task.add_done_callback(
@@ -216,13 +222,35 @@ class OperationRegistry:
                 )
             raise
         except BaseException as error:
+            if (
+                self._records[record.operation_id].state
+                is not OperationState.RECOVERY_REQUIRED
+            ):
+                self.update(
+                    record.operation_id,
+                    state=OperationState.FAILED,
+                    phase="failed",
+                    error_code=type(error).__name__,
+                )
+            raise
+        if self._records[record.operation_id].state is OperationState.RECOVERY_REQUIRED:
+            return result
+        if getattr(result, "rollback_state", None) == "worker_recovery_required":
+            self.update(
+                record.operation_id,
+                state=OperationState.RECOVERY_REQUIRED,
+                phase="recovery_required",
+                error_code=getattr(result, "reason", None),
+            )
+            return result
+        if getattr(result, "status", None) == "failed":
             self.update(
                 record.operation_id,
                 state=OperationState.FAILED,
                 phase="failed",
-                error_code=type(error).__name__,
+                error_code=getattr(result, "reason", None),
             )
-            raise
+            return result
         self.update(
             record.operation_id,
             state=OperationState.COMPLETED,
@@ -298,6 +326,12 @@ class OperationRegistry:
         checkpoint_timeout: float = 2.0,
         commit_timeout: float = 8.0,
     ) -> None:
+        with shutdown_budget(checkpoint_timeout + commit_timeout + 2.0):
+            await self._shutdown_with_budget(checkpoint_timeout, commit_timeout)
+
+    async def _shutdown_with_budget(
+        self, checkpoint_timeout: float, commit_timeout: float
+    ) -> None:
         self._accepting = False
         active_ids = [
             operation_id
@@ -328,6 +362,8 @@ class OperationRegistry:
                     value = await value
                 if isinstance(value, dict):
                     checkpoint_value = value
+            if self._records[operation_id].state is not OperationState.CHECKPOINTING:
+                return
             self.update(
                 operation_id,
                 state=OperationState.CHECKPOINTED,
@@ -337,12 +373,15 @@ class OperationRegistry:
 
         if checkpoint_ids:
             try:
-                checkpoint_results = await asyncio.wait_for(
+                checkpoint_results = await self._kernel._run_cleanup(
                     asyncio.gather(
                         *(checkpoint_one(item) for item in checkpoint_ids),
                         return_exceptions=True,
                     ),
+                    owner="management:operations",
+                    stage="checkpoint",
                     timeout=checkpoint_timeout,
+                    grace=0.05,
                 )
                 for operation_id, result in zip(checkpoint_ids, checkpoint_results):
                     if not isinstance(result, BaseException):
@@ -355,7 +394,7 @@ class OperationRegistry:
                             "operation_checkpoint_failed:" f"{type(result).__name__}"
                         ),
                     )
-            except TimeoutError:
+            except (asyncio.TimeoutError, LifecycleError):
                 for operation_id in checkpoint_ids:
                     if (
                         self._records[operation_id].state
@@ -368,11 +407,17 @@ class OperationRegistry:
                             error_code="operation_checkpoint_timeout",
                         )
             for operation_id in checkpoint_ids:
-                active_tasks[operation_id].cancel()
+                callback = self._cancel_callbacks.get(operation_id)
+                if callback is not None:
+                    callback()
+                else:
+                    active_tasks[operation_id].cancel()
 
         if commit_ids:
             pending = {active_tasks[item] for item in commit_ids}
-            _, still_pending = await asyncio.wait(pending, timeout=commit_timeout)
+            _, still_pending = await asyncio.wait(
+                pending, timeout=remaining_timeout(commit_timeout)
+            )
             if still_pending:
                 for operation_id in commit_ids:
                     task = active_tasks[operation_id]
@@ -384,15 +429,34 @@ class OperationRegistry:
                         phase="commit_timeout",
                         error_code="operation_commit_timeout",
                     )
-                    task.cancel()
+                    callback = self._cancel_callbacks.get(operation_id)
+                    if callback is not None:
+                        callback()
+                    else:
+                        task.cancel()
 
         remaining = [task for task in active_tasks.values() if not task.done()]
         if remaining:
-            await asyncio.gather(*remaining, return_exceptions=True)
-        scopes = list(self._scopes.values())
+            _, pending = await asyncio.wait(remaining, timeout=remaining_timeout(2.0))
+            for operation_id, task in active_tasks.items():
+                if task in pending:
+                    self.update(
+                        operation_id,
+                        state=OperationState.RECOVERY_REQUIRED,
+                        phase="shutdown_timeout",
+                        error_code="operation_shutdown_timeout",
+                    )
+        scopes = [
+            scope
+            for operation_id, scope in self._scopes.items()
+            if operation_id not in self._tasks or self._tasks[operation_id].done()
+        ]
         for scope in reversed(scopes):
             await scope.close()
-        await self._kernel.drain_scope_cleanups()
+        try:
+            await self._kernel.drain_scope_cleanups()
+        except LifecycleError:
+            self._kernel._recovery_required.add("management:operations")
         self._context = None
         self._persist()
 
@@ -424,6 +488,7 @@ class OperationRegistry:
     def _operation_done(self, operation_id: str) -> None:
         self._tasks.pop(operation_id, None)
         self._checkpoint_callbacks.pop(operation_id, None)
+        self._cancel_callbacks.pop(operation_id, None)
         scope = self._scopes.pop(operation_id, None)
         if scope is not None:
             self._kernel._schedule_scope_close(scope)

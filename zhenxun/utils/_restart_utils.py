@@ -1,3 +1,4 @@
+import asyncio
 import os
 from pathlib import Path
 import time
@@ -30,6 +31,7 @@ _LEGACY_CONFIGURE_RESTART_PREFIX = ".configure_restart"
 _PENDING_REQUEST_KEY = "pending_request"
 
 _restart_pending: bool = False
+_receipt_lock = asyncio.Lock()
 # Compatibility for callers that patched both legacy modules in tests.
 _RESTART_STATE_FILE = _restart_state_module._RESTART_STATE_FILE
 
@@ -260,6 +262,11 @@ async def request_dependency_restart(source: str, paths: set[Path]) -> tuple[boo
 
 
 async def handle_restart_connect(bot: Bot) -> None:
+    async with _receipt_lock:
+        await _handle_restart_receipt(bot)
+
+
+async def _handle_restart_receipt(bot: Bot) -> None:
     state = read_restart_state()
     pending_request = state.get(_PENDING_REQUEST_KEY)
     if not isinstance(pending_request, dict):
@@ -269,7 +276,12 @@ async def handle_restart_connect(bot: Bot) -> None:
     receipt = pending_request.get("receipt")
     if not isinstance(receipt, dict):
         logger.info(f"检测到重启完成，来源: {source}", "重启")
-        mutate_restart_state(lambda value: value.pop(_PENDING_REQUEST_KEY, None))
+
+        def clear_unaddressed(value):
+            if value.get(_PENDING_REQUEST_KEY) == pending_request:
+                value.pop(_PENDING_REQUEST_KEY, None)
+
+        mutate_restart_state(clear_unaddressed)
         return
 
     expected_bot_id = str(receipt.get("bot_id", ""))
@@ -293,13 +305,18 @@ async def handle_restart_connect(bot: Bot) -> None:
                 f"{BotConfig.self_nickname}已成功重启！"
             ).send(target, bot=bot)
         except Exception as e:
-            logger.warning(f"发送重启回执失败: {e}", "重启")
+            logger.warning(
+                f"重启已完成，但回执发送失败: {type(e).__name__}；"
+                "已保留回执，等待目标 Bot 重连后重试。",
+                "重启",
+            )
+            return
     else:
         logger.warning("未找到重启回执目标，已跳过发送。", "重启")
 
     def clear_request(value: dict[str, Any]) -> None:
         current = value.get(_PENDING_REQUEST_KEY)
-        if isinstance(current, dict) and current.get("source") == source:
+        if current == pending_request:
             value.pop(_PENDING_REQUEST_KEY, None)
 
     mutate_restart_state(clear_request)

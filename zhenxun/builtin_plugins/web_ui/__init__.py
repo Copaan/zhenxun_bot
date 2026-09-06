@@ -1,6 +1,7 @@
 import asyncio
 import os
 import secrets
+import sys
 
 from fastapi import APIRouter, Depends, FastAPI
 import nonebot
@@ -32,6 +33,7 @@ from .api.tabs.manage.chat import ws_router as chat_routes
 from .api.tabs.plugin_manage import router as plugin_router
 from .api.tabs.plugin_manage.nonebot_store import router as nonebot_store_router
 from .api.tabs.plugin_manage.store import router as store_router
+from .api.tabs.plugin_policy import router as plugin_policy_router
 from .api.tabs.system import router as system_router
 from .auth import router as auth_router
 from .config import install_cors_middleware
@@ -98,6 +100,7 @@ BaseApiRouter.include_router(main_router)
 BaseApiRouter.include_router(manage_router)
 BaseApiRouter.include_router(database_router)
 BaseApiRouter.include_router(plugin_router)
+BaseApiRouter.include_router(plugin_policy_router)
 BaseApiRouter.include_router(system_router)
 BaseApiRouter.include_router(menu_router)
 BaseApiRouter.include_router(configure_router)
@@ -124,8 +127,8 @@ async def _install_transport_runtime():
 
 
 @PriorityLifecycle.on_shutdown(priority=1001, component_id="management:webui-transport")
-async def _restore_transport_runtime():
-    transport_runtime.restore()
+async def _retain_transport_runtime_until_loop_close():
+    transport_runtime.retain_until_loop_close()
 
 
 @PriorityLifecycle.on_startup(
@@ -151,7 +154,14 @@ async def _(context):
 
         async def emit_ready_banner() -> None:
             startup_coordinator.mark_server_bound()
-            if not public_ready or not await startup_coordinator.wait_final_available():
+            if not public_ready:
+                return
+            available = await startup_coordinator.wait_final_available()
+            from zhenxun.startup_banner import ready_summary
+
+            sys.stderr.write(ready_summary(startup_coordinator.snapshot()))
+            sys.stderr.flush()
+            if not available:
                 return
             try:
                 connection_code = await console_access.prepare()
@@ -161,6 +171,9 @@ async def _(context):
                     from zhenxun.update_service import finalize_applied_update
 
                     finalize_applied_update()
+                from zhenxun.configs.webui_tls import load_webui_tls_settings
+
+                tls_settings = load_webui_tls_settings()
                 emit_webui_console_banner(
                     str(driver.config.host),
                     int(driver.config.port),
@@ -168,6 +181,12 @@ async def _(context):
                     state=setup_access.state(),
                     username=str(gConfig.get_config("web-ui", "username", "")),
                     scheme=current_webui_scheme(),
+                    http_compatibility_port=(
+                        tls_settings.redirect_port
+                        if tls_settings.http_sidecar_enabled
+                        and os.getenv("ZHENXUN_LAUNCHER_PID")
+                        else None
+                    ),
                 )
             except Exception as e:
                 logger.error("WebUI 启动链接输出失败", "WebUi", e=e)

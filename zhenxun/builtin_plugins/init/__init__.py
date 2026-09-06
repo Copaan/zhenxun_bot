@@ -1,3 +1,4 @@
+import asyncio
 from pathlib import Path
 
 import nonebot
@@ -35,21 +36,35 @@ async def _(bot: Bot):
 
     logger.debug(f"更新Bot: {bot.self_id} 的群认证...", "群认证同步")
 
-    try:
-        current_group_list, _ = await PlatformUtils.get_group_list(bot)
-    except NetworkError as e:
-        logger.debug(
-            f"Bot: {bot.self_id} 群认证同步被连接关闭打断，跳过本次同步: {e}",
-            "群认证同步",
-        )
-        return
+    current_group_list = []
+    last_error = None
+    for delay in (0, 1, 3):
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            current_group_list, _ = await asyncio.wait_for(
+                PlatformUtils.get_group_list(bot), timeout=5.0
+            )
+            last_error = None
+        except (NetworkError, asyncio.TimeoutError) as error:
+            last_error = type(error).__name__
+        if current_group_list:
+            break
 
     if not current_group_list:
-        logger.warning(
-            f"Bot: {bot.self_id} 未获取到任何群组，"
-            "本次不会创建群认证；后续群消息将尝试按事件自愈。",
-            "群认证同步",
-        )
+        if last_error:
+            logger.warning(
+                f"Bot: {bot.self_id} 群列表查询失败: {last_error}；"
+                "已有限重试，保留已有群认证，等待重连或群消息自愈。",
+                "群认证同步",
+            )
+        else:
+            logger.info(
+                f"Bot: {bot.self_id} 群列表仍为空；可能尚未就绪或账号没有群组，"
+                "本次不写入数据库，保留已有群认证。",
+                "群认证同步",
+            )
+        return
 
     db_group_list: list[str] = await GroupConsole.all().values_list(
         "group_id", flat=True

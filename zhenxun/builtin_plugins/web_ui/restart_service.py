@@ -6,7 +6,8 @@ from urllib.parse import urlsplit
 
 import nonebot
 
-from zhenxun.configs.webui_tls import current_webui_scheme, load_webui_tls_settings
+from zhenxun.configs.webui_tls import WebUITLSSettings, load_webui_tls_settings
+from zhenxun.services.webui_http_sidecar_state import read_http_sidecar_state
 from zhenxun.utils._restart_utils import (
     get_pending_restart_items,
     get_pending_restart_reasons,
@@ -17,15 +18,40 @@ from zhenxun.utils.network import AccessUrl, local_access_urls
 from .console_access import console_access
 
 
-def preferred_access_targets(host: str, port: int) -> list[AccessUrl]:
-    urls = local_access_urls(host, port, current_webui_scheme())
+def preferred_access_targets(
+    host: str,
+    port: int,
+    *,
+    settings: WebUITLSSettings | None = None,
+    sidecar_available: bool | None = None,
+) -> list[AccessUrl]:
+    tls = settings or load_webui_tls_settings()
+    urls = local_access_urls(host, port, tls.scheme)
+    if sidecar_available is None:
+        sidecar_available = bool(os.getenv("ZHENXUN_LAUNCHER_PID"))
+    if tls.enabled and tls.http_sidecar_enabled and sidecar_available:
+        urls.extend(local_access_urls(host, tls.redirect_port, "http"))
     if host.strip().strip("[]") in {"0.0.0.0", "::"}:
         urls.sort(key=lambda item: item.label != "Network")
-    return urls
+    return list(dict.fromkeys(urls))
 
 
-def preferred_access_urls(host: str, port: int) -> list[str]:
-    return [item.url for item in preferred_access_targets(host, port)]
+def preferred_access_urls(
+    host: str,
+    port: int,
+    *,
+    settings: WebUITLSSettings | None = None,
+    sidecar_available: bool | None = None,
+) -> list[str]:
+    return [
+        item.url
+        for item in preferred_access_targets(
+            host,
+            port,
+            settings=settings,
+            sidecar_available=sidecar_available,
+        )
+    ]
 
 
 def _target_kind(url: str) -> str:
@@ -70,8 +96,26 @@ def transaction_verification_status() -> dict[str, Any]:
 
 def restart_status_data(*, access_urls: list[str] | None = None) -> dict[str, Any]:
     urls = list(dict.fromkeys([*(access_urls or []), *_current_access_urls()]))
-    access_targets = [{"kind": _target_kind(url), "url": url} for url in urls]
     tls = load_webui_tls_settings()
+    access_targets = [
+        {
+            "kind": _target_kind(url),
+            "url": url,
+            "scheme": urlsplit(url).scheme,
+        }
+        for url in urls
+    ]
+    http_mode = getattr(tls, "effective_http_mode", None)
+    if not isinstance(http_mode, str):
+        http_mode = (
+            "redirect"
+            if tls.enabled and getattr(tls, "redirect_enabled", False)
+            else "disabled"
+        )
+    http_sidecar_enabled = bool(
+        getattr(tls, "http_sidecar_enabled", http_mode != "disabled")
+    )
+    http_sidecar = read_http_sidecar_state()
     pending_reasons = set(get_pending_restart_reasons())
     pending_items = get_pending_restart_items()
     try:
@@ -164,8 +208,11 @@ def restart_status_data(*, access_urls: list[str] | None = None) -> dict[str, An
         "preferred_url": urls[0] if urls else None,
         "scheme": tls.scheme,
         "https_enabled": tls.enabled,
-        "http_redirect_enabled": tls.redirect_enabled,
-        "http_redirect_port": tls.redirect_port if tls.redirect_enabled else None,
+        "http_mode": http_mode,
+        "http_port": tls.redirect_port if http_sidecar_enabled else None,
+        "http_sidecar": http_sidecar,
+        "http_redirect_enabled": http_mode == "redirect",
+        "http_redirect_port": tls.redirect_port if http_sidecar_enabled else None,
         "pending_restart": bool(pending_reasons),
         "pending_reasons": sorted(pending_reasons),
         "pending_count": len(pending_items),

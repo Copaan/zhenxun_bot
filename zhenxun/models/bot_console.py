@@ -248,22 +248,11 @@ class BotConsole(Model):
             bot_id (str | None): bot_id
             plugin_name (str): 插件名称
         """
-        if bot_id:
-            await cls._toggle_field(
-                bot_id,
-                "available_plugins",
-                "block_plugins",
-                plugin_name,
-            )
-        else:
-            bot_list = await cls.all()
-            for bot in bot_list:
-                await cls._toggle_field(
-                    bot.bot_id,
-                    "available_plugins",
-                    "block_plugins",
-                    plugin_name,
-                )
+        from zhenxun.services.plugin_policy import plugin_policy_service
+
+        await plugin_policy_service.set_feature_enabled(
+            bot_id, "plugins", plugin_name, False
+        )
 
     @classmethod
     async def enable_plugin(cls, bot_id: str | None, plugin_name: str) -> None:
@@ -274,22 +263,11 @@ class BotConsole(Model):
             bot_id (str | None): bot_id
             plugin_name (str): 插件名称
         """
-        if bot_id:
-            await cls._toggle_field(
-                bot_id,
-                "block_plugins",
-                "available_plugins",
-                plugin_name,
-            )
-        else:
-            bot_list = await cls.all()
-            for bot in bot_list:
-                await cls._toggle_field(
-                    bot.bot_id,
-                    "block_plugins",
-                    "available_plugins",
-                    plugin_name,
-                )
+        from zhenxun.services.plugin_policy import plugin_policy_service
+
+        await plugin_policy_service.set_feature_enabled(
+            bot_id, "plugins", plugin_name, True
+        )
 
     @classmethod
     async def disable_task(cls, bot_id: str | None, task_name: str) -> None:
@@ -300,22 +278,11 @@ class BotConsole(Model):
             bot_id (str | None): bot_id
             task_name (str): 被动技能名称
         """
-        if bot_id:
-            await cls._toggle_field(
-                bot_id,
-                "available_tasks",
-                "block_tasks",
-                task_name,
-            )
-        else:
-            bot_list = await cls.all()
-            for bot in bot_list:
-                await cls._toggle_field(
-                    bot.bot_id,
-                    "available_tasks",
-                    "block_tasks",
-                    task_name,
-                )
+        from zhenxun.services.plugin_policy import plugin_policy_service
+
+        await plugin_policy_service.set_feature_enabled(
+            bot_id, "tasks", task_name, False
+        )
 
     @classmethod
     async def enable_task(cls, bot_id: str | None, task_name: str) -> None:
@@ -326,22 +293,11 @@ class BotConsole(Model):
             bot_id (str | None): bot_id
             task_name (str): 被动技能名称
         """
-        if bot_id:
-            await cls._toggle_field(
-                bot_id,
-                "block_tasks",
-                "available_tasks",
-                task_name,
-            )
-        else:
-            bot_list = await cls.all()
-            for bot in bot_list:
-                await cls._toggle_field(
-                    bot.bot_id,
-                    "block_tasks",
-                    "available_tasks",
-                    task_name,
-                )
+        from zhenxun.services.plugin_policy import plugin_policy_service
+
+        await plugin_policy_service.set_feature_enabled(
+            bot_id, "tasks", task_name, True
+        )
 
     @classmethod
     async def disable_all(
@@ -356,29 +312,9 @@ class BotConsole(Model):
             bot_id (str): bot_id
             feat (Literal["plugins", "tasks"]): 插件或被动技能
         """
-        bot_data, _ = await cls.get_or_create(bot_id=bot_id)
-        if feat == "plugins":
-            available_plugins = cls.convert_module_format(bot_data.available_plugins)
-            block_plugins = cls.convert_module_format(bot_data.block_plugins)
-            bot_data.block_plugins = cls.convert_module_format(
-                available_plugins + block_plugins
-            )
-            bot_data.available_plugins = ""
-        elif feat == "tasks":
-            available_tasks = cls.convert_module_format(bot_data.available_tasks)
-            block_tasks = cls.convert_module_format(bot_data.block_tasks)
-            bot_data.block_tasks = cls.convert_module_format(
-                available_tasks + block_tasks
-            )
-            bot_data.available_tasks = ""
-        await bot_data.save(
-            update_fields=[
-                "available_tasks",
-                "block_tasks",
-                "available_plugins",
-                "block_plugins",
-            ]
-        )
+        from zhenxun.services.plugin_policy import plugin_policy_service
+
+        await plugin_policy_service.set_all_features_enabled(bot_id, feat, False)
 
     @classmethod
     async def enable_all(
@@ -393,29 +329,9 @@ class BotConsole(Model):
             bot_id (str): bot_id
             feat (Literal["plugins", "tasks"]): 插件或被动技能
         """
-        bot_data, _ = await cls.get_or_create(bot_id=bot_id)
-        if feat == "plugins":
-            available_plugins = cls.convert_module_format(bot_data.available_plugins)
-            block_plugins = cls.convert_module_format(bot_data.block_plugins)
-            bot_data.available_plugins = cls.convert_module_format(
-                available_plugins + block_plugins
-            )
-            bot_data.block_plugins = ""
-        elif feat == "tasks":
-            available_tasks = cls.convert_module_format(bot_data.available_tasks)
-            block_tasks = cls.convert_module_format(bot_data.block_tasks)
-            bot_data.available_tasks = cls.convert_module_format(
-                available_tasks + block_tasks
-            )
-            bot_data.block_tasks = ""
-        await bot_data.save(
-            update_fields=[
-                "available_tasks",
-                "block_tasks",
-                "available_plugins",
-                "block_plugins",
-            ]
-        )
+        from zhenxun.services.plugin_policy import plugin_policy_service
+
+        await plugin_policy_service.set_all_features_enabled(bot_id, feat, True)
 
     @classmethod
     async def is_block_plugin(cls, bot_id: str, plugin_name: str) -> bool:

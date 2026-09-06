@@ -7,7 +7,7 @@ import socket
 from typing import Any
 
 from cryptography import x509
-from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives import hashes, serialization
 from dotenv import dotenv_values
 
 
@@ -24,10 +24,23 @@ class WebUITLSSettings:
     keyfile: str = ""
     redirect_enabled: bool = False
     redirect_port: int = 80
+    http_mode: str | None = None
 
     @property
     def scheme(self) -> str:
         return "https" if self.enabled else "http"
+
+    @property
+    def effective_http_mode(self) -> str:
+        if not self.enabled:
+            return "disabled"
+        if self.http_mode is not None:
+            return self.http_mode
+        return "redirect" if self.redirect_enabled else "serve"
+
+    @property
+    def http_sidecar_enabled(self) -> bool:
+        return self.effective_http_mode != "disabled"
 
 
 def _bool(value: Any) -> bool:
@@ -44,6 +57,15 @@ def _port(value: Any, field: str, default: int) -> int:
     return port
 
 
+def _http_mode(values: dict[str, Any]) -> str | None:
+    if "WEBUI_HTTP_MODE" not in values:
+        return None
+    mode = str(values.get("WEBUI_HTTP_MODE") or "").strip().casefold()
+    if mode not in {"serve", "redirect", "disabled"}:
+        raise WebUITLSConfigError("WEBUI_HTTP_MODE 必须是 serve、redirect 或 disabled")
+    return mode
+
+
 def settings_from_values(values: dict[str, Any]) -> WebUITLSSettings:
     return WebUITLSSettings(
         host=str(values.get("HOST") or "0.0.0.0").strip(),
@@ -57,6 +79,7 @@ def settings_from_values(values: dict[str, Any]) -> WebUITLSSettings:
             "WEBUI_HTTP_REDIRECT_PORT",
             80,
         ),
+        http_mode=_http_mode(values),
     )
 
 
@@ -97,6 +120,15 @@ def _validate_certificate(certfile: str, keyfile: str) -> None:
         raise WebUITLSConfigError("WebUI TLS 证书与私钥不匹配")
 
 
+def certificate_sha256(certfile: str) -> str:
+    cert_path = Path(certfile).expanduser()
+    try:
+        certificate = x509.load_pem_x509_certificate(cert_path.read_bytes())
+    except (OSError, ValueError) as exc:
+        raise WebUITLSConfigError("WebUI TLS 证书不是有效 PEM") from exc
+    return certificate.fingerprint(hashes.SHA256()).hex()
+
+
 def validate_webui_tls_settings(
     settings: WebUITLSSettings,
     *,
@@ -104,26 +136,31 @@ def validate_webui_tls_settings(
     launcher_managed: bool = True,
     check_redirect_port: bool = False,
 ) -> None:
-    if settings.redirect_enabled and not settings.enabled:
+    if (
+        settings.http_mode is None
+        and settings.redirect_enabled
+        and not settings.enabled
+    ):
         raise WebUITLSConfigError("启用 HTTP 重定向前必须先启用 WebUI HTTPS")
-    if settings.redirect_enabled and not launcher_managed:
+    if (
+        settings.http_mode is None
+        and settings.redirect_enabled
+        and not launcher_managed
+    ):
         raise WebUITLSConfigError("HTTP 重定向仅在 launcher 托管模式下可用")
     if settings.enabled:
         _validate_certificate(settings.certfile, settings.keyfile)
-    if settings.redirect_enabled and settings.redirect_port == settings.port:
-        raise WebUITLSConfigError("HTTP 重定向端口不能与 WebUI HTTPS 端口相同")
     occupied = {port for port in (qq_https_port,) if port is not None}
     if settings.enabled and settings.port in occupied:
         raise WebUITLSConfigError("WebUI HTTPS 端口与 QQ Webhook HTTPS 端口冲突")
-    if settings.redirect_enabled and settings.redirect_port in occupied:
-        raise WebUITLSConfigError("HTTP 重定向端口与 QQ Webhook HTTPS 端口冲突")
-    if check_redirect_port and settings.redirect_enabled:
+    if check_redirect_port and settings.http_sidecar_enabled:
         family = socket.AF_INET6 if ":" in settings.host else socket.AF_INET
         probe = socket.socket(family, socket.SOCK_STREAM)
         try:
             probe.bind((settings.host, settings.redirect_port))
-        except OSError as exc:
-            raise WebUITLSConfigError("HTTP 重定向监听端口不可用") from exc
+        except OSError:
+            # The optional HTTP sidecar reports bind conflicts as a degradation.
+            pass
         finally:
             probe.close()
 
@@ -138,6 +175,7 @@ def current_webui_scheme() -> str:
 __all__ = [
     "WebUITLSConfigError",
     "WebUITLSSettings",
+    "certificate_sha256",
     "current_webui_scheme",
     "load_webui_tls_settings",
     "settings_from_values",

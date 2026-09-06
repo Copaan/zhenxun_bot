@@ -1,3 +1,5 @@
+import asyncio
+from copy import deepcopy
 from dataclasses import dataclass, field
 import os
 from pathlib import Path
@@ -33,9 +35,11 @@ _PLUGIN_STORE_DATA_CACHE = BoundedTTLCache[
     str, tuple[list[StorePluginInfo], list[StorePluginInfo]]
 ](
     "PLUGIN_STORE_DATA",
-    ttl_seconds=60,
+    ttl_seconds=5 * 60,
     max_items=1,
 )
+_PLUGIN_STORE_DATA_LOCK = asyncio.Lock()
+_PLUGIN_STORE_GENERATION = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,23 +145,19 @@ class StoreManager:
         return BASE_PATH / "plugins" / f"{plugin_name}.py"
 
     @classmethod
-    async def get_data(cls) -> tuple[list[StorePluginInfo], list[StorePluginInfo]]:
+    async def get_data(
+        cls, *, refresh: bool = False
+    ) -> tuple[list[StorePluginInfo], list[StorePluginInfo]]:
         """获取插件信息数据
 
         返回:
             tuple[list[StorePluginInfo], list[StorePluginInfo]]:
                 原生插件信息数据，第三方插件信息数据
         """
-        cache_key = "plugins_json"
-        if cached_data := await _PLUGIN_STORE_DATA_CACHE.get(cache_key):
-            return cached_data
+        global _PLUGIN_STORE_GENERATION
 
-        plugins = await RepoFileManager.get_text_content(
-            DEFAULT_GITHUB_URL, "plugins.json"
-        )
-        extra_plugins = await RepoFileManager.get_text_content(
-            EXTRA_GITHUB_URL, "plugins.json", "index"
-        )
+        cache_key = "plugins_json"
+        requested_generation = _PLUGIN_STORE_GENERATION
         warnings: list[dict[str, Any]] = []
 
         def parse_entries(content: str, source: str) -> list[StorePluginInfo]:
@@ -182,19 +182,42 @@ class StoreManager:
                     )
             return entries
 
-        result = (
-            parse_entries(plugins, "official"),
-            parse_entries(extra_plugins, "community"),
-        )
-        cls._catalog_warnings = warnings
-        await _PLUGIN_STORE_DATA_CACHE.set(cache_key, result)
-        return result
+        if not refresh:
+            cached_data = await _PLUGIN_STORE_DATA_CACHE.get(cache_key)
+            if cached_data is not None:
+                return deepcopy(cached_data)
+
+        async with _PLUGIN_STORE_DATA_LOCK:
+            cached_data = await _PLUGIN_STORE_DATA_CACHE.get(cache_key)
+            if cached_data is not None and (
+                not refresh or _PLUGIN_STORE_GENERATION != requested_generation
+            ):
+                return deepcopy(cached_data)
+
+            plugins = await RepoFileManager.get_text_content(
+                DEFAULT_GITHUB_URL, "plugins.json"
+            )
+            extra_plugins = await RepoFileManager.get_text_content(
+                EXTRA_GITHUB_URL, "plugins.json", "index"
+            )
+            result = (
+                parse_entries(plugins, "official"),
+                parse_entries(extra_plugins, "community"),
+            )
+            cls._catalog_warnings = warnings
+            await _PLUGIN_STORE_DATA_CACHE.set(cache_key, result)
+            _PLUGIN_STORE_GENERATION += 1
+            return deepcopy(result)
 
     @classmethod
     async def invalidate_cache(cls) -> None:
-        await _PLUGIN_STORE_DATA_CACHE.delete("plugins_json")
-        cls._catalog_health = {}
-        cls._catalog_health_checked_at = 0.0
+        global _PLUGIN_STORE_GENERATION
+
+        async with _PLUGIN_STORE_DATA_LOCK:
+            await _PLUGIN_STORE_DATA_CACHE.delete("plugins_json")
+            _PLUGIN_STORE_GENERATION += 1
+            cls._catalog_health = {}
+            cls._catalog_health_checked_at = 0.0
 
     @classmethod
     async def catalog_health(

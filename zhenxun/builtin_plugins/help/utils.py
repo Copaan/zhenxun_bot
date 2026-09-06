@@ -5,6 +5,7 @@ from nonebot_plugin_uninfo import Uninfo
 from zhenxun.models.bot_console import BotConsole
 from zhenxun.models.group_console import GroupConsole
 from zhenxun.models.plugin_info import PluginInfo
+from zhenxun.services.startup_load import startup_load_planner
 from zhenxun.utils.enum import PluginType
 
 
@@ -20,6 +21,8 @@ async def sort_type() -> dict[str, list[PluginInfo]]:
     )
     sort_data = {}
     for plugin in data:
+        if not startup_load_planner.plugin_available(plugin.module_path):
+            continue
         menu_type = plugin.menu_type or "normal"
         if menu_type == "normal":
             menu_type = "功能"

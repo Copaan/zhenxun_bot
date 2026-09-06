@@ -19,6 +19,12 @@ default_menus = [
         router="/command",
         icon="command",
     ),
+    MenuItem(
+        name="插件策略",
+        module="plugin-policy",
+        router="/plugin-policy",
+        icon="switch",
+    ),
     MenuItem(name="插件列表", module="plugin", router="/plugin", icon="plugin"),
     MenuItem(name="插件商店", module="store", router="/store", icon="store"),
     MenuItem(name="好友/群组", module="manage", router="/manage", icon="user"),

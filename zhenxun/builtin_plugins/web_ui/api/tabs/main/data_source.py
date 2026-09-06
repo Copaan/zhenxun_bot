@@ -14,10 +14,7 @@ from zhenxun.models.chat_history import ChatHistory
 from zhenxun.models.group_console import GroupConsole
 from zhenxun.models.plugin_info import PluginInfo
 from zhenxun.models.statistics import Statistics
-from zhenxun.models.task_info import TaskInfo
 from zhenxun.services.log import logger
-from zhenxun.utils.common_utils import CommonUtils
-from zhenxun.utils.enum import PluginType
 from zhenxun.utils.platform import PlatformUtils
 
 from ....config import AVA_URL, GROUP_AVA_URL, QueryDateType
@@ -480,31 +477,24 @@ class ApiDataSource:
         返回:
             BotBlockModule | None: 数据内容
         """
-        bot_data = await BotConsole.get_or_none(bot_id=bot_id)
-        if not bot_data:
-            return None
-        block_tasks = []
-        block_plugins = []
-        plugin_records = await PluginInfo.get_plugins(
-            load_status=True,
-            filter_parent=False,
-            plugin_type=PluginType.NORMAL,
-        )
+        from zhenxun.services.plugin_policy import plugin_policy_service
+
+        account = await plugin_policy_service.get_account(bot_id)
+        catalog = await plugin_policy_service.catalog()
         all_plugins = [
-            {"module": plugin.module, "name": plugin.name} for plugin in plugin_records
+            {"module": item["module"], "name": item["name"]}
+            for item in catalog["plugins"]
         ]
-        task_records = await TaskInfo.get_tasks(load_status=None)
-        all_task = [{"module": task.module, "name": task.name} for task in task_records]
-        if bot_data.block_tasks:
-            tasks = CommonUtils.convert_module_format(bot_data.block_tasks)
-            block_tasks = [t["module"] for t in all_task if t["module"] in tasks]
-        if bot_data.block_plugins:
-            plugins = CommonUtils.convert_module_format(bot_data.block_plugins)
-            block_plugins = [t["module"] for t in all_plugins if t["module"] in plugins]
+        all_task = [
+            {"module": item["module"], "name": item["name"]}
+            for item in catalog["tasks"]
+        ]
         return BotBlockModule(
-            bot_id=bot_id,
-            block_tasks=block_tasks,
-            block_plugins=block_plugins,
+            bot_id=account["bot_id"],
+            block_tasks=account["block_tasks"],
+            block_plugins=account["block_plugins"],
             all_plugins=all_plugins,
             all_tasks=all_task,
+            policy_mode=account["mode"],
+            policy_name=(account.get("policy") or {}).get("name"),
         )

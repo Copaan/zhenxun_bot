@@ -30,7 +30,6 @@ from zhenxun.services.runtime_environment import (
 )
 from zhenxun.services.runtime_reload.models import ApplyMode, RuntimeOperation
 from zhenxun.utils._restart_utils import issue_restart_ticket
-from zhenxun.utils.network import local_access_urls
 from zhenxun.utils.pydantic_compat import (
     _is_pydantic_type,
     model_dump,
@@ -49,7 +48,7 @@ from ....config_validation import (
     validate_simple_yaml,
     validation_detail,
 )
-from ....restart_service import request_webui_restart
+from ....restart_service import preferred_access_targets, request_webui_restart
 from ....utils import authentication
 from ...configure.persistence import _write_transaction
 
@@ -64,6 +63,7 @@ _ENV_FORM_KEYS = (
     "WEBUI_HTTPS_ENABLED",
     "WEBUI_TLS_CERTFILE",
     "WEBUI_TLS_KEYFILE",
+    "WEBUI_HTTP_MODE",
     "WEBUI_HTTP_REDIRECT_ENABLED",
     "WEBUI_HTTP_REDIRECT_PORT",
     "LOG_LEVEL",
@@ -525,11 +525,16 @@ async def update_configuration_file(
             port = int(values.get("PORT") or 8080)
         except (TypeError, ValueError):
             port = 8080
-        scheme = settings_from_values(dict(values)).scheme
-        local_urls = local_access_urls(host, port, scheme)
+        tls_settings = settings_from_values(dict(values))
+        local_urls = preferred_access_targets(host, port, settings=tls_settings)
         access_urls = [item.url for item in local_urls]
         access_targets = [
-            {"kind": item.label.lower(), "url": item.url} for item in local_urls
+            {
+                "kind": item.label.lower(),
+                "url": item.url,
+                "scheme": item.url.split(":", 1)[0],
+            }
+            for item in local_urls
         ]
     data = apply_result_data(
         apply_mode=apply_mode,

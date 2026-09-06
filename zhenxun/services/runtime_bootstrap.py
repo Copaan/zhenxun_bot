@@ -1,6 +1,7 @@
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import contextlib
+from datetime import datetime, timezone
 import os
 from pathlib import Path
 import signal
@@ -8,6 +9,7 @@ import threading
 
 import anyio.to_thread
 
+from zhenxun.services.lifecycle.diagnostics import DiagnosticWorker
 from zhenxun.services.log import logger
 from zhenxun.services.memory_governor import (
     memory_governor_healthy,
@@ -110,7 +112,7 @@ async def _launcher_watchdog_loop(launcher_pid: int) -> None:
                 signal.raise_signal(signal.SIGINT)
             else:
                 os.kill(current_pid, signal.SIGTERM)
-        return
+        await asyncio.Event().wait()
 
 
 def _start_launcher_watchdog(context=None) -> None:
@@ -159,25 +161,64 @@ def finalize_runtime_executor() -> None:
         executor.shutdown(wait=True, cancel_futures=True)
 
 
+def _sample_process() -> dict[str, object]:
+    import psutil
+
+    process = psutil.Process()
+    return {
+        "child_process_count": len(process.children(recursive=True)),
+        "rss_bytes": process.memory_info().rss,
+        "process_sampled_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+class _ProcessSampler:
+    def __init__(self) -> None:
+        self.worker = DiagnosticWorker("zhenxun-process-sampler")
+        self.future: asyncio.Future | None = None
+        self.latest: dict[str, object] = {
+            "child_process_count": 0,
+            "rss_bytes": 0,
+            "process_sampled_at": None,
+        }
+        self.error_code: str | None = None
+
+    def poll(self) -> dict[str, object]:
+        if self.future is not None and self.future.done():
+            try:
+                self.latest = self.future.result()
+                self.error_code = None
+            except Exception:
+                self.error_code = "process_sample_failed"
+            self.future = None
+        if self.future is None and not self.worker.closed:
+            self.future = self.worker.submit(_sample_process)
+        return {
+            **self.latest,
+            "process_sample_pending": self.future is not None,
+            "process_sample_error_code": self.error_code,
+        }
+
+    async def close(self) -> None:
+        if not await self.worker.close(2.0):
+            from zhenxun.services.lifecycle.kernel import LifecycleError
+
+            raise LifecycleError("process_sampler_shutdown_timeout")
+
+
 def _runtime_health_snapshot(
-    loop_lag_ms: float, lifecycle_kernel=None
+    loop_lag_ms: float, lifecycle_kernel=None, sampler: _ProcessSampler | None = None
 ) -> dict[str, object]:
     tasks = asyncio.all_tasks()
     threads = threading.enumerate()
-    child_processes = 0
-    rss_bytes = 0
-    with contextlib.suppress(Exception):
-        import psutil
-
-        process = psutil.Process()
-        child_processes = len(process.children(recursive=True))
-        rss_bytes = process.memory_info().rss
     tracked_task_ids = (
         lifecycle_kernel.owned_task_ids() if lifecycle_kernel is not None else set()
     )
     tracked_thread_ids = (
         lifecycle_kernel.owned_thread_ids() if lifecycle_kernel is not None else set()
     )
+    if sampler is not None:
+        tracked_thread_ids.update(id(thread) for thread in sampler.worker.threads)
     now = asyncio.get_running_loop().time()
     active_ids = {id(task) for task in tasks if not task.done()}
     for identity in set(_unowned_task_seen) - (active_ids - tracked_task_ids):
@@ -247,8 +288,7 @@ def _runtime_health_snapshot(
         "asyncio_task_count": len(tasks),
         "thread_count": len(threads),
         "thread_names": sorted({thread.name for thread in threads})[:32],
-        "child_process_count": child_processes,
-        "rss_bytes": rss_bytes,
+        **(sampler.poll() if sampler is not None else {}),
         "owned_asyncio_task_count": len(tracked_task_ids),
         "unowned_zhenxun_tasks": unowned[:32],
         "owned_thread_count": len(tracked_thread_ids),
@@ -256,23 +296,32 @@ def _runtime_health_snapshot(
     }
 
 
-async def _lifecycle_health_loop() -> None:
+async def _lifecycle_health_loop(sampler: _ProcessSampler) -> None:
     from zhenxun.services.lifecycle import lifecycle_kernel
 
     loop = asyncio.get_running_loop()
     while True:
         expected = loop.time() + _HEALTH_INTERVAL_SECONDS
         await asyncio.sleep(_HEALTH_INTERVAL_SECONDS)
-        with contextlib.suppress(Exception):
+        started = loop.time()
+        loop_lag_ms = max(0.0, (started - expected) * 1000)
+        inspection_error = None
+        try:
             from zhenxun.services.runtime_reload import plugin_runtime_manager
 
-            plugin_runtime_manager.refresh_lifecycle_scopes()
-        lifecycle_kernel.set_process_metadata(
-            **_runtime_health_snapshot(
-                max(0.0, (loop.time() - expected) * 1000), lifecycle_kernel
-            )
-        )
+            await plugin_runtime_manager.refresh_lifecycle_scopes_async()
+        except Exception:
+            inspection_error = "plugin_resource_inspection_failed"
+        snapshot = _runtime_health_snapshot(loop_lag_ms, lifecycle_kernel, sampler)
+        inspection_ms = (loop.time() - started) * 1000
+        health_started = loop.time()
         await lifecycle_kernel.check_health()
+        lifecycle_kernel.set_process_metadata(
+            **snapshot,
+            inspection_duration_ms=round(inspection_ms, 2),
+            inspection_error_code=inspection_error,
+            health_check_duration_ms=round((loop.time() - health_started) * 1000, 2),
+        )
 
 
 def register_runtime_bootstrap(_driver) -> None:
@@ -328,6 +377,8 @@ def register_runtime_bootstrap(_driver) -> None:
             receipt_id="operations:registry",
             provider="lifecycle",
             resource_type="operation_registry",
+            release_check=lambda: not operation_registry.accepting
+            and not operation_registry._tasks,
         )
         await operation_registry.recover_pending()
 
@@ -367,6 +418,7 @@ def register_runtime_bootstrap(_driver) -> None:
             receipt_id="plugin-host:scope-registry",
             provider="lifecycle",
             resource_type="plugin_scope_registry",
+            release_check=lambda: not context._children,
         )
 
     @PriorityLifecycle.on_startup(
@@ -377,10 +429,13 @@ def register_runtime_bootstrap(_driver) -> None:
         health=send_queue_healthy,
     )
     async def _setup_send_queue(context) -> None:
+        from zhenxun.services import send_queue
+
         context.own_resource(
             receipt_id="send-queue:adapter-patch",
             provider="nonebot",
             resource_type="adapter_patch",
+            release_check=lambda: not send_queue._PATCHED,
         )
         await start_send_queue(context)
 
@@ -412,10 +467,18 @@ def register_runtime_bootstrap(_driver) -> None:
     async def _setup_lifecycle_health(context) -> None:
         from zhenxun.services.lifecycle import lifecycle_kernel
 
-        lifecycle_kernel.set_process_metadata(
-            **_runtime_health_snapshot(0.0, lifecycle_kernel)
+        sampler = _ProcessSampler()
+        context.own_resource(
+            receipt_id="lifecycle-health:process-sampler",
+            provider="lifecycle",
+            resource_type="diagnostic_worker",
+            release_check=lambda: sampler.worker.released,
         )
-        context.spawn_task(_lifecycle_health_loop(), name="lifecycle-health")
+        context.add_finalizer(sampler.close)
+        lifecycle_kernel.set_process_metadata(
+            **_runtime_health_snapshot(0.0, lifecycle_kernel, sampler)
+        )
+        context.spawn_task(_lifecycle_health_loop(sampler), name="lifecycle-health")
 
     @PriorityLifecycle.on_shutdown(
         priority=50, component_id="management:runtime_concurrency"

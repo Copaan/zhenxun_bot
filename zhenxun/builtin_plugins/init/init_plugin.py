@@ -116,6 +116,19 @@ _PLUGIN_FIELDS = [
     "ignore_statistics",
 ]
 
+# Existing administrator settings are not plugin declaration defaults.
+_PLUGIN_REFRESH_FIELDS = [
+    "module",
+    "name",
+    "author",
+    "version",
+    "admin_level",
+    "parent",
+    "is_show",
+    "ignore_prompt",
+    "ignore_statistics",
+]
+
 
 def _value(value):
     return getattr(value, "value", value)
@@ -146,8 +159,11 @@ async def reconcile_plugin_runtime():
     plugin_list: list[PluginInfo] = []
     limit_list: list[PluginLimit] = []
     load_plugin = []
+    from zhenxun.services.startup_load import startup_load_planner
+
     for plugin in get_loaded_plugins():
-        load_plugin.append(plugin.module_name)
+        if startup_load_planner.plugin_available(plugin.module_name):
+            load_plugin.append(plugin.module_name)
         await _handle_setting(plugin, plugin_list, limit_list)
     manager.init()
     plugin_payload = {
@@ -202,13 +218,20 @@ async def reconcile_plugin_runtime():
     existing_by_path = {plugin.module_path: plugin for plugin in existing_plugins}
     create_list = []
     update_list = []
+    type_updates = []
     for plugin in plugin_list:
         existing = existing_by_path.get(plugin.module_path)
         if existing is None:
             create_list.append(plugin)
         else:
             changed = False
-            for field in _PLUGIN_FIELDS:
+            if (
+                existing.plugin_type is None
+                or plugin.plugin_type in {PluginType.HIDDEN, PluginType.PARENT}
+            ) and existing.plugin_type != plugin.plugin_type:
+                existing.plugin_type = plugin.plugin_type
+                type_updates.append(existing)
+            for field in _PLUGIN_REFRESH_FIELDS:
                 desired = getattr(plugin, field, None)
                 if _value(getattr(existing, field, None)) != _value(desired):
                     setattr(existing, field, desired)
@@ -221,13 +244,11 @@ async def reconcile_plugin_runtime():
         if update_list:
             await PluginInfo.bulk_update(
                 update_list,
-                [field for field in _PLUGIN_FIELDS if field != "plugin_type"],
+                _PLUGIN_REFRESH_FIELDS,
                 20,
             )
-            for plugin in update_list:
-                await PluginInfo.filter(id=plugin.id).update(
-                    plugin_type=plugin.plugin_type
-                )
+        for plugin in type_updates:
+            await PluginInfo.filter(id=plugin.id).update(plugin_type=plugin.plugin_type)
         current_loaded = {
             plugin.module_path for plugin in existing_plugins if plugin.load_status
         }

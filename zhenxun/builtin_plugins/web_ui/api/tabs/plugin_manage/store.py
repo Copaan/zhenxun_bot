@@ -1,3 +1,4 @@
+import ast
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -131,6 +132,82 @@ def _version_compare(installed: str | None, catalog: str) -> int | None:
     return (current > target) - (current < target)
 
 
+def _artifact_version(path: Path) -> str | None:
+    entrypoint = path / "__init__.py" if path.is_dir() else path
+    try:
+        tree = ast.parse(entrypoint.read_text(encoding="utf-8"))
+    except (OSError, SyntaxError, UnicodeError):
+        return None
+    metadata_values = []
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "__plugin_meta__"
+            for target in node.targets
+        ):
+            metadata_values.append(node.value)
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == "__plugin_meta__"
+            and node.value is not None
+        ):
+            metadata_values.append(node.value)
+    for metadata in metadata_values:
+        for node in ast.walk(metadata):
+            if not isinstance(node, ast.Call):
+                continue
+            name = (
+                node.func.id
+                if isinstance(node.func, ast.Name)
+                else node.func.attr
+                if isinstance(node.func, ast.Attribute)
+                else ""
+            )
+            if name != "PluginExtraData":
+                continue
+            keyword = next(
+                (item for item in node.keywords if item.arg == "version"), None
+            )
+            if keyword is None:
+                continue
+            try:
+                value = ast.literal_eval(keyword.value)
+            except (ValueError, TypeError):
+                continue
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
+def _installed_version_evidence(
+    *,
+    installed_version: str | None,
+    artifact_version: str | None,
+    digest: str | None,
+    receipt: dict[str, Any] | None,
+) -> tuple[str | None, str, str | None]:
+    requested_version = None
+    if receipt:
+        requested_version = (
+            str(
+                receipt.get("requested_version") or receipt.get("catalog_version") or ""
+            ).strip()
+            or None
+        )
+    if artifact_version:
+        return artifact_version, "artifact_metadata", requested_version
+    if installed_version:
+        return str(installed_version), "database", requested_version
+    if (
+        receipt
+        and digest
+        and digest == receipt.get("source_digest")
+        and receipt.get("installed_version")
+    ):
+        return str(receipt["installed_version"]), "receipt", requested_version
+    return None, "unknown", requested_version
+
+
 def _install_state(
     *,
     installed: bool,
@@ -138,11 +215,17 @@ def _install_state(
     catalog_version: str,
     digest: str | None,
     receipt: dict[str, Any] | None,
+    artifact_version: str | None = None,
 ) -> tuple[str, bool, str | None]:
     if not installed:
         return "not_installed", False, None
-    comparison_version = (
-        str(receipt.get("catalog_version")) if receipt else installed_version
+    comparison_version, _version_source, _requested_version = (
+        _installed_version_evidence(
+            installed_version=installed_version,
+            artifact_version=artifact_version,
+            digest=digest,
+            receipt=receipt,
+        )
     )
     comparison = _version_compare(comparison_version, catalog_version)
     update_available = comparison == -1
@@ -179,11 +262,15 @@ def _receipt_data(
     runtime_module: str,
     path: Path,
 ) -> dict[str, Any]:
+    installed_version = _artifact_version(path)
     return {
         "source": source,
         "module": plugin_info.module,
         "module_path": plugin_info.module_path,
         "runtime_module": runtime_module,
+        "requested_version": str(plugin_info.version),
+        "installed_version": installed_version,
+        "version_source": "artifact_metadata" if installed_version else "unknown",
         "catalog_version": str(plugin_info.version),
         "source_digest": source_digest(path),
         "installed_at": datetime.now(timezone.utc).isoformat(),
@@ -496,10 +583,9 @@ async def _(refresh: bool = False) -> Result[dict]:
         require("plugin_store")
         from zhenxun.builtin_plugins.plugin_store import StoreManager
 
-        if refresh:
-            await StoreManager.invalidate_cache()
-
-        official_plugins, community_plugins = await StoreManager.get_data()
+        official_plugins, community_plugins = await StoreManager.get_data(
+            refresh=refresh
+        )
         catalog_health = await StoreManager.catalog_health(
             official_plugins, refresh=refresh
         )
@@ -525,6 +611,15 @@ async def _(refresh: bool = False) -> Result[dict]:
             installed_version = installed_plugins.get(plugin.module)
             installed = path.exists() or installed_version is not None
             digest = source_digest(path) if installed else None
+            artifact_version = _artifact_version(path) if path.exists() else None
+            effective_version, version_source, requested_version = (
+                _installed_version_evidence(
+                    installed_version=installed_version,
+                    artifact_version=artifact_version,
+                    digest=digest,
+                    receipt=receipt,
+                )
+            )
             runtime_module = str((receipt or {}).get("runtime_module") or "")
             if installed and not runtime_module:
                 try:
@@ -537,6 +632,7 @@ async def _(refresh: bool = False) -> Result[dict]:
                 catalog_version=str(plugin.version),
                 digest=digest,
                 receipt=receipt,
+                artifact_version=artifact_version,
             )
             health = catalog_health.get(
                 plugin.module, {"status": "unknown", "reason": None}
@@ -560,6 +656,9 @@ async def _(refresh: bool = False) -> Result[dict]:
                     "capabilities": _plugin_capabilities(plugin),
                     "installed": installed,
                     "installed_version": installed_version,
+                    "installed_effective_version": effective_version,
+                    "requested_version": requested_version,
+                    "version_source": version_source,
                     "runtime_module": runtime_module or None,
                     "install_state": state,
                     "source_digest": digest,

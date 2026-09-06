@@ -39,6 +39,10 @@ class BotBlockModule(BaseModel):
     """所有插件"""
     all_tasks: list[dict[str, Any]]
     """所有被动"""
+    policy_mode: str = "independent"
+    """插件策略模式"""
+    policy_name: str | None = None
+    """绑定的共享策略名称"""
 
 
 class SystemStatus(BaseModel):

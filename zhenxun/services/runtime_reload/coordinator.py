@@ -5,7 +5,10 @@ from typing import TYPE_CHECKING
 
 from zhenxun.services.log import logger
 from zhenxun.services.runtime_config_reload import reload_runtime_config
-from zhenxun.services.runtime_mutation import runtime_mutation_coordinator
+from zhenxun.services.runtime_mutation import (
+    managed_mutation,
+    runtime_mutation_coordinator,
+)
 
 from .models import ApplyMode, RuntimeOperation
 
@@ -22,6 +25,7 @@ class RuntimeChangeCoordinator:
     def __init__(self, manager: PluginRuntimeManager) -> None:
         self.manager = manager
 
+    @managed_mutation("filesystem_watcher")
     async def process(
         self, paths: set[Path], *, submit_restart: bool = True
     ) -> RuntimeOperation | None:

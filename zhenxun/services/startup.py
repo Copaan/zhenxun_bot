@@ -125,6 +125,7 @@ class StartupCoordinator:
         self._errors: list[dict[str, str]] = []
         self._degraded_reasons: list[dict[str, str]] = []
         self._diagnostics: list[StartupDiagnostic] = []
+        self._lifecycle_diagnostics: list[dict[str, Any]] = []
         self._current_operation: dict[str, Any] | None = None
         self._load_planner: Any | None = None
         self._management_complete = False
@@ -383,6 +384,11 @@ class StartupCoordinator:
         component = event.get("component") or {}
         component_id = str(component.get("component_id") or "unknown")
         state = str(component.get("state") or event.get("event") or "unknown")
+        action = (event.get("operation") or {}).get("action")
+        if action in {"stop", "health_check", "rebuild"}:
+            if state in {"failed", "degraded"}:
+                self._record_lifecycle_diagnostic(event)
+            return
         with self._lock:
             self._current_operation = (
                 {
@@ -407,6 +413,58 @@ class StartupCoordinator:
                 display_name=component_id,
             )
         self._persist_throttled(force=state in {"failed", "degraded"})
+
+    def _record_lifecycle_diagnostic(self, event: dict[str, Any]) -> None:
+        component = event.get("component") or {}
+        operation = event.get("operation") or {}
+        diagnostic = (component.get("metadata") or {}).get("stop_diagnostic") or {}
+        source = _sanitize_diagnostic_text(
+            component.get("component_id", "unknown"), limit=120
+        )
+        code = _sanitize_diagnostic_text(
+            component.get("error_code", "component_failed"), limit=120
+        )
+        operation_id = operation.get("operation_id") or diagnostic.get("operation_id")
+        identity = (source, code, operation.get("action"), operation_id)
+        with self._lock:
+            if any(
+                tuple(item["identity"]) == identity
+                for item in self._lifecycle_diagnostics
+            ):
+                return
+            item = {
+                "identity": list(identity),
+                "diagnostic_id": diagnostic.get("diagnostic_id")
+                or f"diag-{uuid.uuid4().hex[:12]}",
+                "occurred_at": diagnostic.get("occurred_at")
+                or datetime.now(timezone.utc).isoformat(),
+                "action": operation.get("action"),
+                "component_id": source,
+                "code": code,
+                "failure_stage": _sanitize_diagnostic_text(
+                    event.get("failure_stage") or "unknown"
+                ),
+                "resources": {
+                    _sanitize_diagnostic_text(key, limit=100): value
+                    for key, value in (diagnostic.get("resources") or {}).items()
+                },
+            }
+            self._lifecycle_diagnostics.append(item)
+            self._lifecycle_diagnostics = self._lifecycle_diagnostics[-100:]
+        try:
+            from zhenxun.services.log import logger
+
+            label = (
+                "生命周期关闭异常" if item["action"] == "stop" else "生命周期运行异常"
+            )
+            logger.error(
+                f"{label} | diagnostic_id={item['diagnostic_id']} | "
+                f"component={source} | stage={item['failure_stage']} | "
+                f"code={code} | resources={item['resources']}",
+                "Lifecycle",
+            )
+        except Exception:
+            pass
 
     def mark_server_bound(self) -> None:
         with self._lock:
@@ -583,6 +641,9 @@ class StartupCoordinator:
         with self._lock:
             result["operations"] = [asdict(item) for item in self._operations]
             result["diagnostics"] = [asdict(item) for item in self._diagnostics]
+            result["lifecycle_diagnostics"] = [
+                dict(item) for item in self._lifecycle_diagnostics
+            ]
             if self._load_planner is not None:
                 result["load_plan"] = self._load_planner.summary(detail=True)
         try:
