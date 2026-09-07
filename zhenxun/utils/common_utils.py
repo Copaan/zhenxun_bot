@@ -47,6 +47,18 @@ class CommonUtils:
             return True
         if not group_id and isinstance(session, Session):
             group_id = session.group.id if session.group else None
+        from zhenxun.services.bot_group_policy import bot_group_policy_service
+        from zhenxun.utils.platform import PlatformUtils
+
+        scope = PlatformUtils.get_platform_scope(session)
+        bot_id = str(session.self_id)
+        if scope == "qq_api":
+            bot_id = f"qq_api:{bot_id}"
+        channel_id = getattr(getattr(session, "channel", None), "id", None)
+        if bot_group_policy_service.blocked(
+            bot_id, scope, group_id, module, task=True, channel_id=channel_id
+        ):
+            return True
         if await TaskInfoMemoryCache.is_runtime_disabled(module):
             """被动全局状态"""
             return True

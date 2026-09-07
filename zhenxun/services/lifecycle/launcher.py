@@ -9,12 +9,14 @@ from pathlib import Path
 import signal
 import subprocess
 from threading import RLock
+import time
 from typing import Any, ClassVar
 import uuid
 
 from zhenxun.utils.atomic_json import read_json_locked, write_json_locked
 
 from .deadline import ShutdownBudget, current_budget, shutdown_budget
+from .diagnostics import merge_terminal_receipt
 from .kernel import LifecycleKernel
 from .models import ComponentSpec, ResourceReceipt, RuntimeHandle
 
@@ -52,6 +54,9 @@ class ProcessHandle:
     shutdown_id: str | None = None
     identities: dict[int, float] = field(default_factory=dict)
     stop_stages: list[dict[str, Any]] = field(default_factory=list)
+    readiness: str = "spawned"
+    _next_tree_discovery: float = 0.0
+    _tree_scan_count: int = 0
 
     def __post_init__(self) -> None:
         import psutil
@@ -63,7 +68,7 @@ class ProcessHandle:
         except psutil.Error:
             pass
 
-    def _live_processes(self):
+    def _live_processes(self, *, discover: bool = False):
         import psutil
 
         if not self.identities and self.process.poll() is None:
@@ -79,23 +84,34 @@ class ProcessHandle:
                 ):
                     continue
                 live.append(process)
-                for child in process.children(recursive=True):
-                    self.identities[child.pid] = child.create_time()
             except psutil.Error:
                 continue
-        for pid, created in list(self.identities.items()):
-            if any(process.pid == pid for process in live):
-                continue
-            try:
-                process = psutil.Process(pid)
-                if (
-                    process.create_time() == created
-                    and process.is_running()
-                    and process.status() != psutil.STATUS_ZOMBIE
-                ):
-                    live.append(process)
-            except psutil.Error:
-                pass
+        now = time.monotonic()
+        if discover or not self.accepting or now >= self._next_tree_discovery:
+            self._next_tree_discovery = now + 0.5
+            known = {process.pid for process in live}
+            covered: set[int] = set()
+            # Visit each surviving root once; children of that root are already
+            # covered by its recursive discovery. Identity checks stay uncached;
+            # shutdown always discovers afresh to catch late child processes.
+            for process in tuple(live):
+                if process.pid in covered:
+                    continue
+                try:
+                    self._tree_scan_count += 1
+                    children = process.children(recursive=True)
+                    covered.update(child.pid for child in children)
+                    for child in children:
+                        created = child.create_time()
+                        previous = self.identities.get(child.pid)
+                        if previous is not None and previous != created:
+                            continue
+                        self.identities[child.pid] = created
+                        if child.pid not in known and child.is_running():
+                            live.append(child)
+                            known.add(child.pid)
+                except psutil.Error:
+                    continue
         return live
 
     @property
@@ -110,22 +126,24 @@ class ProcessHandle:
         operating_mode: str | None,
     ) -> bool:
         if runtime_pid is not None:
-            live = self._live_processes()
+            live = self._live_processes(discover=runtime_pid not in self.identities)
             if runtime_pid not in {process.pid for process in live}:
                 return False
         if self.worker_boot_id and worker_boot_id != self.worker_boot_id:
             return False
-        values = (runtime_pid, worker_boot_id, operating_mode)
-        previous = (self.runtime_pid, self.worker_boot_id, self.operating_mode)
-        self.runtime_pid, self.worker_boot_id, self.operating_mode = values
-        return values != previous
+        self.runtime_pid, self.worker_boot_id, self.operating_mode = (
+            runtime_pid,
+            worker_boot_id,
+            operating_mode,
+        )
+        return True
 
     async def quiesce(self) -> None:
         self.accepting = False
 
     async def close(self) -> None:
         self.accepting = False
-        if not self._live_processes():
+        if not self._live_processes(discover=True):
             return
         with shutdown_budget(15.0 if self.role == "worker" else 5.0) as budget:
             started = asyncio.get_running_loop().time()
@@ -133,7 +151,7 @@ class ProcessHandle:
             if state_path:
                 try:
                     state = read_json_locked(
-                        Path(state_path), {}, quarantine_corrupt=True
+                        Path(state_path), {}, timeout=0, quarantine_corrupt=True
                     )
                     if (
                         not isinstance(state, dict)
@@ -154,8 +172,8 @@ class ProcessHandle:
                             for pid, created in self.identities.items()
                         },
                     }
-                    write_json_locked(Path(state_path), state)
-                except OSError:
+                    write_json_locked(Path(state_path), state, timeout=0)
+                except (OSError, TimeoutError):
                     self.stop_stages.append(
                         {
                             "stage": "budget_handoff",
@@ -190,7 +208,7 @@ class ProcessHandle:
 
         for stage in ("terminate", "kill"):
             started = asyncio.get_running_loop().time()
-            for process in reversed(self._live_processes()):
+            for process in reversed(self._live_processes(discover=True)):
                 try:
                     getattr(process, stage)()
                 except psutil.Error:
@@ -230,14 +248,46 @@ class ProcessHandle:
             "worker_boot_id": self.worker_boot_id,
             "operating_mode": self.operating_mode,
             "running": bool(self._live_processes()),
+            "readiness": self.readiness,
             "return_code": self.process.poll(),
+            "spawn_return_code": self.process.poll(),
             "accepting": self.accepting,
             "exit_reason": self.exit_reason,
             "launcher_boot_id": self.launcher_boot_id,
             "startup_id": self.startup_id,
             "shutdown_id": self.shutdown_id,
             "stop_stages": list(self.stop_stages),
+            "tree_scan_count": self._tree_scan_count,
         }
+
+    def runtime_shutdown_receipt(self) -> dict[str, Any] | None:
+        if self.role != "worker" or not self.worker_boot_id:
+            return None
+        path = Path(
+            os.getenv(
+                "ZHENXUN_LIFECYCLE_STATE_PATH", "data/runtime/lifecycle-state-v2.json"
+            )
+        )
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(state, dict):
+            return None
+        receipt = merge_terminal_receipt(state, path).get("terminal_shutdown")
+        if not isinstance(receipt, dict):
+            return None
+        identity = receipt.get("identity", {})
+        if (
+            identity.get("boot_id") != self.worker_boot_id
+            or identity.get("startup_id") != self.startup_id
+            or identity.get("launcher_boot_id") != self.launcher_boot_id
+            or identity.get("pid") != self.runtime_pid
+            or identity.get("shutdown_correlation_id")
+            != (self.shutdown_id or self.startup_id)
+        ):
+            return None
+        return receipt
 
     def resource_snapshot(self) -> list[ResourceReceipt]:
         return [
@@ -313,6 +363,19 @@ class CommitSession:
         value = read_json_locked(self._path, {}, quarantine_corrupt=True)
         return value if isinstance(value, dict) else {}
 
+    def presentation(self, boot_id: str) -> dict[str, Any]:
+        value = self.status()
+        historical = bool(
+            value
+            and value.get("launcher_boot_id") != boot_id
+            and value.get("phase") in {"committed", "rolled_back"}
+        )
+        return {
+            "commit_session": value,
+            "current_commit_session": None if historical else value or None,
+            "historical_commit_session": value if historical else None,
+        }
+
 
 class LauncherSupervisor:
     def __init__(self, kernel: LifecycleKernel) -> None:
@@ -323,6 +386,7 @@ class LauncherSupervisor:
         self.commit_session = CommitSession(_COMMIT_PATH)
         self.shutdown_deadline: ShutdownBudget | None = None
         self.shutdown_id: str | None = None
+        self.shutdown_signal: int | None = None
         self._process_history: list[dict[str, Any]] = []
 
     async def run_recovery(self, callback):
@@ -343,22 +407,31 @@ class LauncherSupervisor:
             process_history=list(self._process_history),
         )
 
-    def begin_shutdown(self) -> None:
+    def begin_shutdown(
+        self, *, restarting: bool = False, signal_number: int | None = None
+    ) -> None:
+        if signal_number is not None and self.shutdown_signal is None:
+            self.shutdown_signal = int(signal_number)
+            self.kernel.set_process_metadata(exit_source=f"signal:{signal_number}")
+        if not restarting:
+            self.kernel.request_shutdown()
         if self.shutdown_deadline is None:
             self.shutdown_deadline = ShutdownBudget.start(15.0)
             self.shutdown_id = uuid.uuid4().hex
+            self.kernel.set_process_metadata(shutdown_id=self.shutdown_id)
             for handle in self._handles.values():
                 handle.shutdown_id = self.shutdown_id
 
     async def start_process(
-        self, role: str, factory, *, ready=None
+        self, role: str, factory, *, ready=None, startup_id: str | None = None
     ) -> subprocess.Popen:
+        if self.shutdown_deadline is not None:
+            raise OSError("launcher_startup_interrupted")
         previous = self._role_pids.get(role)
         if previous in self._handles:
             await self.stop_process(self._handles[previous].process)
-        if role == "worker":
-            self.shutdown_deadline = None
-            self.shutdown_id = None
+        if self.shutdown_deadline is not None:
+            raise OSError("launcher_startup_interrupted")
         recovery_id = "launcher:recovery"
         if self.kernel.component_status(recovery_id) is None:
             self.kernel.register(
@@ -368,8 +441,12 @@ class LauncherSupervisor:
         component_id = f"launcher:{role}"
 
         async def start():
+            if self.shutdown_deadline is not None:
+                raise OSError("launcher_startup_interrupted")
             process = factory()
             handle = ProcessHandle(role, process, self.boot_id)
+            if startup_id:
+                handle.startup_id = startup_id
             self._handles[process.pid] = handle
             self._role_pids[role] = process.pid
             self.kernel._registrations[component_id].runtime.metadata.update(
@@ -378,6 +455,8 @@ class LauncherSupervisor:
             self._publish_processes()
             if ready is not None:
                 await ready(process)
+                handle.readiness = "listening"
+                self._publish_processes()
             return RuntimeHandle(
                 value=process,
                 controller=handle,
@@ -465,7 +544,7 @@ class LauncherSupervisor:
             role="launcher",
             pid=os.getpid(),
             boot_id=self.boot_id,
-            commit_session=self.commit_session.status(),
+            **self.commit_session.presentation(self.boot_id),
         )
         return self.boot_id
 
@@ -508,7 +587,12 @@ class LauncherSupervisor:
             registration = self.kernel._registrations.get(f"launcher:{handle.role}")
             if registration is not None:
                 registration.runtime.metadata["handle"] = handle.snapshot()
-            self._process_history.append(handle.snapshot())
+            self._process_history.append(
+                {
+                    **handle.snapshot(),
+                    "runtime_shutdown": handle.runtime_shutdown_receipt(),
+                }
+            )
             self._process_history = self._process_history[-100:]
         self.kernel.release_external_process(
             process.pid,
@@ -519,22 +603,44 @@ class LauncherSupervisor:
 
     def bind_worker_runtime(
         self, process: subprocess.Popen[Any], status: dict[str, Any]
-    ) -> None:
+    ) -> bool:
         handle = self._handles.get(process.pid)
         if handle is None or handle.role != "worker":
-            return
+            return False
+        if (
+            status.get("launcher_boot_id") != self.boot_id
+            or status.get("startup_id") != handle.startup_id
+            or not status.get("boot_id")
+        ):
+            return False
         runtime_pid = status.get("pid")
         try:
             runtime_pid = int(runtime_pid) if runtime_pid is not None else None
         except (TypeError, ValueError):
             runtime_pid = None
+        if runtime_pid is None:
+            return False
+        previous = (
+            handle.runtime_pid,
+            handle.worker_boot_id,
+            handle.operating_mode,
+            handle.readiness,
+        )
         changed = handle.bind_runtime(
             runtime_pid=runtime_pid,
             worker_boot_id=str(status.get("boot_id") or "") or None,
             operating_mode=str(status.get("operating_mode") or "") or None,
         )
         if not changed:
-            return
+            return False
+        handle.readiness = str(status.get("state") or "starting")
+        if previous == (
+            handle.runtime_pid,
+            handle.worker_boot_id,
+            handle.operating_mode,
+            handle.readiness,
+        ):
+            return True
         registration = self.kernel._registrations.get("launcher:worker")
         if registration is not None and registration.context is not None:
             registration.runtime.metadata.update(
@@ -547,7 +653,7 @@ class LauncherSupervisor:
                 }
             )
             self._publish_processes()
-            return
+            return True
         self.kernel.observe_external_process(
             "launcher:worker",
             pid=handle.spawn_pid,
@@ -562,6 +668,7 @@ class LauncherSupervisor:
             },
             controller=handle,
         )
+        return True
 
     def begin_commit(self, targets: list[str]) -> dict[str, Any]:
         value = self.commit_session.begin(targets, self.boot_id)
@@ -576,7 +683,9 @@ class LauncherSupervisor:
         return value
 
     def _sync_commit(self, value: dict[str, Any]) -> None:
-        self.kernel.set_process_metadata(commit_session=value)
+        self.kernel.set_process_metadata(
+            **self.commit_session.presentation(self.boot_id)
+        )
 
     def update_metadata(self, **values: Any) -> None:
         self.kernel.set_process_metadata(**values)
@@ -587,7 +696,7 @@ class LauncherSupervisor:
             handle.snapshot()
             for handle in sorted(self._handles.values(), key=lambda item: item.role)
         ]
-        result["commit_session"] = self.commit_session.status()
+        result.update(self.commit_session.presentation(self.boot_id))
         return result
 
 
@@ -608,8 +717,8 @@ def release_launcher_process(process: subprocess.Popen[Any], reason: str) -> Non
 
 def bind_launcher_worker_runtime(
     process: subprocess.Popen[Any], status: dict[str, Any]
-) -> None:
-    launcher_supervisor.bind_worker_runtime(process, status)
+) -> bool:
+    return launcher_supervisor.bind_worker_runtime(process, status)
 
 
 def begin_launcher_commit(targets: list[str]) -> dict[str, Any]:
@@ -640,8 +749,12 @@ def launcher_lifecycle_snapshot() -> dict[str, Any]:
         return {}
     value["process_graph"] = value.get("process", {}).get("process_graph", [])
     value["process_history"] = value.get("process", {}).get("process_history", [])
-    value["commit_session"] = launcher_supervisor.commit_session.status()
-    return value
+    value.update(
+        launcher_supervisor.commit_session.presentation(
+            value.get("process", {}).get("boot_id", "")
+        )
+    )
+    return merge_terminal_receipt(value, path)
 
 
 __all__ = [

@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import signal
 import threading
+import time
 
 import anyio.to_thread
 
@@ -156,9 +157,122 @@ async def _stop_launcher_watchdog() -> None:
 def finalize_runtime_executor() -> None:
     """Close the worker-owned default executor after all lifespan hooks."""
     global _thread_executor
-    executor, _thread_executor = _thread_executor, None
+    from zhenxun.services.lifecycle.deadline import (
+        received_shutdown_budget,
+        remaining_timeout,
+    )
+
+    executor = _thread_executor
     if executor is not None:
-        executor.shutdown(wait=True, cancel_futures=True)
+        from zhenxun.services.lifecycle import lifecycle_kernel
+
+        deadline = time.monotonic() + min(
+            remaining_timeout(received_shutdown_budget(2.0)),
+            lifecycle_kernel.shutdown_remaining(2.0),
+        )
+        executor.shutdown(wait=False, cancel_futures=True)
+        for thread in tuple(executor._threads):
+            thread.join(max(0.0, deadline - time.monotonic()))
+        if any(thread.is_alive() for thread in executor._threads):
+            logger.error(
+                "共享执行器仍有活动工作项 | code=shared_executor_shutdown_timeout",
+                "Lifecycle",
+            )
+        else:
+            _thread_executor = None
+
+
+async def finish_runtime_workers() -> None:
+    """Run after native lifespan teardown, before asyncio's runner joins its pool."""
+    global _thread_executor
+    from anyio._backends._asyncio import WorkerThread
+
+    from zhenxun.services.lifecycle import lifecycle_kernel
+    from zhenxun.services.lifecycle.deadline import (
+        received_shutdown_budget,
+        received_shutdown_request,
+    )
+    from zhenxun.services.shared_workers import shared_worker_threads
+
+    lifecycle_kernel.request_shutdown()
+    shutdown_request = received_shutdown_request()
+    if shutdown_request.get("shutdown_id"):
+        lifecycle_kernel.set_process_metadata(
+            shutdown_id=shutdown_request["shutdown_id"]
+        )
+    remaining = min(
+        lifecycle_kernel.shutdown_remaining(15), received_shutdown_budget(15)
+    )
+    deadline = time.monotonic() + remaining
+    loop = asyncio.get_running_loop()
+    executor = _thread_executor
+    threads = set(shared_worker_threads())
+    if executor is not None:
+        executor.shutdown(wait=False, cancel_futures=True)
+        threads.update(executor._threads)
+        if getattr(loop, "_default_executor", None) is executor:
+            # Keep ownership here; the runner's unbounded join is not our contract.
+            loop._default_executor = None
+            loop._executor_shutdown_called = True
+    for thread in threads:
+        if isinstance(thread, WorkerThread):
+            thread.stop()
+    # These external threads expose no awaitable completion notification.
+    while any(thread.is_alive() for thread in threads) and time.monotonic() < deadline:  # noqa: ASYNC110
+        await asyncio.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+    remaining_threads = sum(thread.is_alive() for thread in threads)
+    lifecycle_kernel.set_process_metadata(
+        shared_worker_shutdown={
+            "unreleased_threads": remaining_threads,
+            "timed_out": bool(remaining_threads),
+        }
+    )
+    if remaining_threads:
+        lifecycle_kernel.require_recovery("infrastructure:shared_workers")
+        logger.error(
+            "共享工作线程尚未退出 | code=shared_worker_shutdown_timeout", "Lifecycle"
+        )
+    elif executor is not None:
+        _thread_executor = None
+
+
+def install_runtime_worker_teardown(app) -> None:
+    original = app.router.lifespan_context
+    if getattr(original, "__zhenxun_worker_teardown__", False):
+        return
+    from zhenxun.services.lifecycle import lifecycle_kernel
+
+    lifecycle_kernel.set_process_metadata(
+        role="worker",
+        pid=os.getpid(),
+        boot_id=startup_coordinator.boot_id,
+        startup_id=os.getenv("ZHENXUN_WORKER_STARTUP_ID") or None,
+        launcher_boot_id=os.getenv("ZHENXUN_LAUNCHER_BOOT_ID") or None,
+    )
+    lifecycle_kernel.defer_diagnostics_close()
+
+    @contextlib.asynccontextmanager
+    async def lifespan(application):
+        try:
+            async with original(application) as state:
+                yield state
+        finally:
+            try:
+                await finish_runtime_workers()
+            finally:
+                try:
+                    if not await startup_coordinator.finish_persistence(
+                        lifecycle_kernel.shutdown_remaining(15.0)
+                    ):
+                        lifecycle_kernel.require_recovery("startup:state_writer")
+                    lifecycle_kernel.set_process_metadata(
+                        startup_persistence=startup_coordinator.persistence_status()
+                    )
+                finally:
+                    await lifecycle_kernel.finish_diagnostics()
+
+    lifespan.__zhenxun_worker_teardown__ = True
+    app.router.lifespan_context = lifespan
 
 
 def _sample_process() -> dict[str, object]:
@@ -182,6 +296,7 @@ class _ProcessSampler:
             "process_sampled_at": None,
         }
         self.error_code: str | None = None
+        self.stopped = False
 
     def poll(self) -> dict[str, object]:
         if self.future is not None and self.future.done():
@@ -191,16 +306,27 @@ class _ProcessSampler:
             except Exception:
                 self.error_code = "process_sample_failed"
             self.future = None
-        if self.future is None and not self.worker.closed:
+        if self.future is None and not self.worker.closed and not self.stopped:
             self.future = self.worker.submit(_sample_process)
         return {
             **self.latest,
             "process_sample_pending": self.future is not None,
             "process_sample_error_code": self.error_code,
+            "process_sample_state": "stopped"
+            if self.stopped and self.worker.released
+            else "stopping"
+            if self.stopped
+            else "running",
+            "process_sample_is_current": not self.stopped,
         }
 
     async def close(self) -> None:
-        if not await self.worker.close(2.0):
+        self.stopped = True
+        released = await self.worker.close(2.0)
+        from zhenxun.services.lifecycle import lifecycle_kernel
+
+        lifecycle_kernel.set_process_metadata(**self.poll())
+        if not released:
             from zhenxun.services.lifecycle.kernel import LifecycleError
 
             raise LifecycleError("process_sampler_shutdown_timeout")
@@ -217,8 +343,20 @@ def _runtime_health_snapshot(
     tracked_thread_ids = (
         lifecycle_kernel.owned_thread_ids() if lifecycle_kernel is not None else set()
     )
+    startup_writer = startup_coordinator._state_writer
+    if startup_writer is not None:
+        if startup_writer.task is not None:
+            tracked_task_ids.add(id(startup_writer.task))
+        tracked_thread_ids.update(
+            id(thread) for thread in startup_writer.worker.threads
+        )
     if sampler is not None:
         tracked_thread_ids.update(id(thread) for thread in sampler.worker.threads)
+    from zhenxun.services.shared_workers import shared_worker_ids
+
+    tracked_thread_ids.update(shared_worker_ids())
+    if _thread_executor is not None:
+        tracked_thread_ids.update(id(thread) for thread in _thread_executor._threads)
     now = asyncio.get_running_loop().time()
     active_ids = {id(task) for task in tasks if not task.done()}
     for identity in set(_unowned_task_seen) - (active_ids - tracked_task_ids):
@@ -261,7 +399,6 @@ def _runtime_health_snapshot(
             thread is threading.current_thread()
             or not thread.is_alive()
             or id(thread) in tracked_thread_ids
-            or thread.name.startswith("zhenxun-worker")
         ):
             continue
         target = getattr(thread, "_target", None)
@@ -281,6 +418,9 @@ def _runtime_health_snapshot(
         )
     return {
         "role": "worker",
+        "boot_id": startup_coordinator.boot_id,
+        "startup_id": os.getenv("ZHENXUN_WORKER_STARTUP_ID") or None,
+        "runtime_sampled_at": datetime.now(timezone.utc).isoformat(),
         "pid": os.getpid(),
         "launcher_pid": os.getenv("ZHENXUN_LAUNCHER_PID") or None,
         "launcher_boot_id": os.getenv("ZHENXUN_LAUNCHER_BOOT_ID") or None,
@@ -292,6 +432,7 @@ def _runtime_health_snapshot(
         "owned_asyncio_task_count": len(tracked_task_ids),
         "unowned_zhenxun_tasks": unowned[:32],
         "owned_thread_count": len(tracked_thread_ids),
+        "startup_persistence": startup_coordinator.persistence_status(),
         "unowned_zhenxun_threads": unowned_threads[:32],
     }
 

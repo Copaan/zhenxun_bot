@@ -41,6 +41,13 @@ class LifecycleComponentStatus(BaseModel):
 
 class LifecycleStatus(BaseModel):
     version: int = 2
+    snapshot_at: str | None = None
+    snapshot_phase: str | None = None
+    snapshot_identity: dict[str, Any] = Field(default_factory=dict)
+    terminal_shutdown: dict[str, Any] | None = None
+    persistence: dict[str, Any] = Field(default_factory=dict)
+    cleanup_tasks: list[dict[str, Any]] = Field(default_factory=list)
+    unresolved_resources: list[dict[str, Any]] = Field(default_factory=list)
     runtime_generation: int
     component_count: int
     scope_counts: dict[str, int]
@@ -59,6 +66,7 @@ class LifecycleStatus(BaseModel):
     launcher: dict[str, Any] = Field(default_factory=dict)
     transport: dict[str, Any] = Field(default_factory=dict)
     http_sidecar: dict[str, Any] = Field(default_factory=dict)
+    network: dict[str, Any] = Field(default_factory=dict)
     components: list[LifecycleComponentStatus]
 
 

@@ -423,6 +423,13 @@ def prepare_dependency_transaction() -> bool:
 def apply_pending_transaction() -> bool:
     with _locked_transaction():
         transaction = _read_pending()
+        if transaction and transaction.get("state") == "applying":
+            _restore_operations(transaction)
+            transaction["state"] = "failed"
+            transaction["failure_reasons"] = [{"code": "plugin_apply_interrupted"}]
+            transaction["updated_at"] = _now()
+            _write_pending(transaction)
+            return False
         if not transaction or transaction.get("state") != "pending_restart":
             return False
         switched: list[dict[str, Any]] = []
@@ -433,14 +440,16 @@ def apply_pending_transaction() -> bool:
                     live
                 ) != operation.get("base_digest"):
                     raise RuntimeError("plugin_transaction_stale")
+            transaction["state"] = "applying"
+            _write_pending(transaction)
             for operation in transaction.get("operations", []):
                 live = Path(str(operation["live_path"]))
                 new_path = ROOT / str(operation["operation_id"]) / "new"
-                _remove(live)
                 switched.append(operation)
+                _remove(live)
                 if operation.get("action") != "uninstall":
                     _copy(new_path, live)
-        except Exception as error:
+        except BaseException as error:
             for operation in reversed(switched):
                 live = Path(str(operation["live_path"]))
                 old_path = ROOT / str(operation["operation_id"]) / "old"
@@ -451,6 +460,8 @@ def apply_pending_transaction() -> bool:
             transaction["failure_reasons"] = [{"code": str(error)}]
             transaction["updated_at"] = _now()
             _write_pending(transaction)
+            if not isinstance(error, Exception):
+                raise
             return False
         transaction["state"] = "verification_pending"
         compile_warnings = []
@@ -513,6 +524,15 @@ def finalize_pending_transaction() -> None:
         _write_pending(None)
 
 
+def _restore_operations(transaction: dict[str, Any]) -> None:
+    for operation in reversed(transaction.get("operations", [])):
+        live = Path(str(operation["live_path"]))
+        old_path = ROOT / str(operation["operation_id"]) / "old"
+        _remove(live)
+        if old_path.exists():
+            _copy(old_path, live)
+
+
 def rollback_pending_transaction(
     failures: list[dict[str, Any]] | None = None,
 ) -> None:
@@ -520,12 +540,7 @@ def rollback_pending_transaction(
         transaction = _read_pending()
         if not transaction or transaction.get("state") != "verification_pending":
             return
-        for operation in reversed(transaction.get("operations", [])):
-            live = Path(str(operation["live_path"]))
-            old_path = ROOT / str(operation["operation_id"]) / "old"
-            _remove(live)
-            if old_path.exists():
-                _copy(old_path, live)
+        _restore_operations(transaction)
         transaction["state"] = "failed"
         transaction["failure_reasons"] = failures or [
             {"code": "plugin_startup_verification_failed"}

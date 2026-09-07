@@ -5,6 +5,7 @@ from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextvars import Context
 from datetime import datetime, timezone
+import json
 import logging
 from pathlib import Path
 import threading
@@ -16,6 +17,26 @@ from zhenxun.utils.atomic_json import write_json_locked
 from .deadline import remaining_timeout
 
 _logger = logging.getLogger(__name__)
+
+
+def terminal_path(path: Path) -> Path:
+    return path.with_suffix(".terminal.json")
+
+
+def merge_terminal_receipt(state: dict[str, Any], path: Path) -> dict[str, Any]:
+    """Only a matching process incarnation can attest a snapshot's final state."""
+    try:
+        receipt = json.loads(terminal_path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return state
+    identity = state.get("snapshot_identity")
+    if (
+        not identity
+        or not isinstance(receipt, dict)
+        or receipt.get("identity") != identity
+    ):
+        return state
+    return {**state, "terminal_shutdown": receipt}
 
 
 def value_snapshot(value: Any) -> Any:

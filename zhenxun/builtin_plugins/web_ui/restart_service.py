@@ -4,9 +4,11 @@ import os
 from typing import Any
 from urllib.parse import urlsplit
 
-import nonebot
-
-from zhenxun.configs.webui_tls import WebUITLSSettings, load_webui_tls_settings
+from zhenxun.configs.webui_tls import (
+    WebUITLSSettings,
+    load_webui_tls_settings,
+    runtime_webui_settings,
+)
 from zhenxun.services.webui_http_sidecar_state import read_http_sidecar_state
 from zhenxun.utils._restart_utils import (
     get_pending_restart_items,
@@ -25,10 +27,16 @@ def preferred_access_targets(
     settings: WebUITLSSettings | None = None,
     sidecar_available: bool | None = None,
 ) -> list[AccessUrl]:
-    tls = settings or load_webui_tls_settings()
+    tls = settings or runtime_webui_settings()
     urls = local_access_urls(host, port, tls.scheme)
     if sidecar_available is None:
-        sidecar_available = bool(os.getenv("ZHENXUN_LAUNCHER_PID"))
+        sidecar = read_http_sidecar_state()
+        sidecar_available = bool(
+            os.getenv("ZHENXUN_LAUNCHER_PID")
+            and sidecar.get("state") == "ready"
+            and sidecar.get("port") == tls.redirect_port
+            and sidecar.get("mode") == tls.effective_http_mode
+        )
     if tls.enabled and tls.http_sidecar_enabled and sidecar_available:
         urls.extend(local_access_urls(host, tls.redirect_port, "http"))
     if host.strip().strip("[]") in {"0.0.0.0", "::"}:
@@ -65,10 +73,8 @@ def _target_kind(url: str) -> str:
 
 
 def _current_access_urls() -> list[str]:
-    driver = nonebot.get_driver()
-    host = str(getattr(driver.config, "host", "127.0.0.1"))
-    port = int(getattr(driver.config, "port", 8080))
-    return preferred_access_urls(host, port)
+    tls = runtime_webui_settings()
+    return preferred_access_urls(tls.host, tls.port)
 
 
 def transaction_verification_status() -> dict[str, Any]:
@@ -94,9 +100,56 @@ def transaction_verification_status() -> dict[str, Any]:
     }
 
 
+def network_configuration_status() -> dict[str, Any]:
+    tls = runtime_webui_settings()
+    desired = load_webui_tls_settings()
+    managed = bool(os.getenv("ZHENXUN_LAUNCHER_PID"))
+    sidecar = read_http_sidecar_state() if managed else {}
+    return {
+        "network_runtime": {
+            "scheme": tls.scheme,
+            "port": tls.port,
+            "http_mode": tls.effective_http_mode if managed else "disabled",
+            "http_port": tls.redirect_port
+            if managed and tls.http_sidecar_enabled
+            else None,
+            "http_state": sidecar.get("state", "unknown")
+            if managed and tls.http_sidecar_enabled
+            else "disabled",
+            "http_error": sidecar.get("last_error")
+            if managed and tls.http_sidecar_enabled
+            else None,
+        },
+        "network_configured": {
+            "scheme": desired.scheme,
+            "port": desired.port,
+            "http_mode": desired.effective_http_mode,
+            "http_port": desired.redirect_port
+            if desired.http_sidecar_enabled
+            else None,
+            "pending_restart": desired != tls,
+        },
+        "access_urls": _current_access_urls(),
+    }
+
+
 def restart_status_data(*, access_urls: list[str] | None = None) -> dict[str, Any]:
-    urls = list(dict.fromkeys([*(access_urls or []), *_current_access_urls()]))
-    tls = load_webui_tls_settings()
+    tls = runtime_webui_settings()
+    desired = load_webui_tls_settings()
+    urls = _current_access_urls()
+    target_urls = list(
+        dict.fromkeys(
+            [
+                *(access_urls or []),
+                *preferred_access_urls(
+                    desired.host,
+                    desired.port,
+                    settings=desired,
+                    sidecar_available=bool(os.getenv("ZHENXUN_LAUNCHER_PID")),
+                ),
+            ]
+        )
+    )
     access_targets = [
         {
             "kind": _target_kind(url),
@@ -211,6 +264,12 @@ def restart_status_data(*, access_urls: list[str] | None = None) -> dict[str, An
         "http_mode": http_mode,
         "http_port": tls.redirect_port if http_sidecar_enabled else None,
         "http_sidecar": http_sidecar,
+        **network_configuration_status(),
+        "target_access_urls": target_urls,
+        "target_access_targets": [
+            {"url": url, "scheme": urlsplit(url).scheme, "kind": _target_kind(url)}
+            for url in target_urls
+        ],
         "http_redirect_enabled": http_mode == "redirect",
         "http_redirect_port": tls.redirect_port if http_sidecar_enabled else None,
         "pending_restart": bool(pending_reasons),
@@ -228,6 +287,11 @@ async def request_webui_restart(
     access_urls: list[str] | None = None,
 ) -> tuple[bool, str, dict[str, Any]]:
     status = restart_status_data(access_urls=access_urls)
+    # A restart reply describes where the next worker will listen. Polling status
+    # continues to expose only the current worker's effective addresses.
+    status["access_urls"] = status["target_access_urls"]
+    status["access_targets"] = status["target_access_targets"]
+    status["preferred_url"] = next(iter(status["access_urls"]), None)
     if not status["launcher_managed"]:
         return False, "当前不是 launcher 托管模式，请手动重启真寻。", status
     ok, message = await request_restart(source, require_ticket=require_ticket)

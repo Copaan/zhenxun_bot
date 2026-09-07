@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime
 
 from fastapi import APIRouter
@@ -23,7 +24,8 @@ from .model import Message, MessageItem
 
 driver = nonebot.get_driver()
 
-ws_conn: WebSocket | None = None
+_CHAT_CONNECTIONS: set[WebSocket] = set()
+_MAX_CHAT_CONNECTIONS = 16
 
 ID2NAME = {}
 
@@ -32,29 +34,37 @@ ID_LIST = []
 ws_router = APIRouter()
 
 
-matcher = on_message(block=False, priority=1, rule=lambda: bool(ws_conn))
+matcher = on_message(block=False, priority=1, rule=lambda: bool(_CHAT_CONNECTIONS))
 
 
 @driver.on_shutdown
 async def _():
-    if ws_conn and ws_conn.client_state == WebSocketState.CONNECTED:
-        await close_authenticated_websocket(
-            ws_conn, code=1001, reason="server shutdown"
-        )
+    from zhenxun.services.lifecycle import lifecycle_kernel
+
+    timeout = lifecycle_kernel.shutdown_remaining(1.0)
+    await asyncio.gather(
+        *(
+            asyncio.wait_for(
+                close_authenticated_websocket(ws, code=1001, reason="server shutdown"),
+                timeout=timeout,
+            )
+            for ws in tuple(_CHAT_CONNECTIONS)
+        ),
+        return_exceptions=True,
+    )
 
 
 @ws_router.websocket("/chat")
 async def _(websocket: WebSocket):
-    global ws_conn
     if not await authenticate_websocket(websocket):
         return
-    if ws_conn and ws_conn.client_state == WebSocketState.CONNECTED:
+    if len(_CHAT_CONNECTIONS) >= _MAX_CHAT_CONNECTIONS:
         await close_authenticated_websocket(
             websocket, code=1013, reason="connection limit reached"
         )
         unregister_authenticated_websocket(websocket)
         return
-    ws_conn = websocket
+    _CHAT_CONNECTIONS.add(websocket)
     try:
         while websocket.client_state == WebSocketState.CONNECTED:
             await websocket.receive()
@@ -63,8 +73,7 @@ async def _(websocket: WebSocket):
             raise
     finally:
         unregister_authenticated_websocket(websocket)
-        if ws_conn is websocket:
-            ws_conn = None
+        _CHAT_CONNECTIONS.discard(websocket)
 
 
 async def message_handle(
@@ -105,8 +114,8 @@ async def message_handle(
 async def _(
     message: UniMsg, event: MessageEvent, session: Uninfo, uname: str = UserName()
 ):
-    global ws_conn, ID2NAME, ID_LIST
-    if ws_conn and ws_conn.client_state == WebSocketState.CONNECTED:
+    global ID2NAME, ID_LIST
+    if _CHAT_CONNECTIONS:
         msg_id = event.message_id
         if msg_id in ID_LIST:
             return
@@ -123,7 +132,19 @@ async def _(
             name=uname,
             ava_url=AVA_URL.format(session.user.id),
         )
-        if not await send_authenticated_json(ws_conn, data.to_dict()):
-            if ws_conn:
-                unregister_authenticated_websocket(ws_conn)
-            ws_conn = None
+
+        async def deliver(websocket):
+            try:
+                if await asyncio.wait_for(
+                    send_authenticated_json(websocket, data.to_dict()), timeout=2
+                ):
+                    return
+            except (TimeoutError, WebSocketDisconnect, OSError):
+                pass
+            unregister_authenticated_websocket(websocket)
+            _CHAT_CONNECTIONS.discard(websocket)
+            await close_authenticated_websocket(
+                websocket, code=1013, reason="slow consumer"
+            )
+
+        await asyncio.gather(*(deliver(ws) for ws in tuple(_CHAT_CONNECTIONS)))

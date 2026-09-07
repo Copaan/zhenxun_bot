@@ -117,6 +117,17 @@ class PolicyDecisionPoint:
         if not bot_data.status and not context.allow_sleep_bypass:
             return PolicyDecision("deny", "bot_sleeping")
         module = snapshot.profile.module
+        from zhenxun.services.bot_group_policy import bot_group_policy_service
+
+        event = snapshot.context
+        if bot_group_policy_service.blocked(
+            event.bot_id,
+            event.platform_scope,
+            event.group_id,
+            module,
+            channel_id=event.channel_id,
+        ):
+            return PolicyDecision("deny", "bot_group_plugin_blocked")
         if module:
             value = bot_data.block_plugins or ""
             # 缓存解析后的 frozenset,避免每次 bot 检查重复 split(B8-3);

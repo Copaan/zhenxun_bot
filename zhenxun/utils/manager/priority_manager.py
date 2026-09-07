@@ -277,7 +277,13 @@ def _build_start_component(
                 "执行启动钩子失败: " f"{_hook_name(func)} ({type(error).__name__})",
                 e=error if isinstance(error, Exception) else None,
             )
+            from zhenxun.services.lifecycle.provider_undo import active_undo
             from zhenxun.services.startup_load import startup_load_planner
+
+            # A failed candidate belongs to the transaction, not the boot report.
+            # The caller validates component state and rolls back before admission.
+            if active_undo.get() is not None:
+                raise
 
             owner = startup_load_planner.owner_for_module(
                 str(getattr(func, "__module__", ""))
@@ -396,18 +402,21 @@ def _sync_kernel_declarations() -> set[Callable]:
     return paired
 
 
-def lifecycle_component_ids(module_names: set[str]) -> set[str]:
-    startup = {
-        component_id
-        for component_id, (_, func, _) in _stage_hooks().items()
-        if str(getattr(func, "__module__", "")) in module_names
-    }
-    shutdown = {
-        component_id
-        for component_id, (_, func, _) in _shutdown_only_hooks().items()
-        if str(getattr(func, "__module__", "")) in module_names
-    }
-    return startup | shutdown
+def lifecycle_component_index() -> dict[str, set[str]]:
+    result: dict[str, set[str]] = {}
+    for hooks in (_stage_hooks(), _shutdown_only_hooks()):
+        for component_id, (_, func, _) in hooks.items():
+            module = str(getattr(func, "__module__", ""))
+            result.setdefault(module, set()).add(component_id)
+    return result
+
+
+def lifecycle_component_ids(
+    module_names: set[str], *, index: dict[str, set[str]] | None = None
+) -> set[str]:
+    if index is None:
+        index = lifecycle_component_index()
+    return {item for module in module_names for item in index.get(module, ())}
 
 
 async def _run_stage(

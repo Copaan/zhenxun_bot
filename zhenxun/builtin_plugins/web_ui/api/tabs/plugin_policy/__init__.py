@@ -23,6 +23,61 @@ from .model import (
 router = APIRouter(prefix="/plugin-policy")
 
 
+@router.get("/accounts/{bot_id}/groups", dependencies=[authentication()])
+async def get_account_groups(bot_id: str):
+    from zhenxun.services.bot_group_policy import bot_group_policy_service
+    from zhenxun.services.bot_group_sync import bot_group_sync
+
+    try:
+        groups = await bot_group_policy_service.list_groups(bot_id)
+        return Result.ok({"groups": groups, "sync": bot_group_sync.status.get(bot_id)})
+    except PluginPolicyError as error:
+        _raise_api_error(error)
+
+
+@router.get("/accounts/{bot_id}/groups/{group_id}", dependencies=[authentication()])
+async def get_account_group(
+    bot_id: str, group_id: str, platform_scope: str, channel_id: str = ""
+):
+    from zhenxun.services.bot_group_policy import bot_group_policy_service
+
+    try:
+        return Result.ok(
+            await bot_group_policy_service.get_group(
+                bot_id, platform_scope, group_id, channel_id
+            )
+        )
+    except PluginPolicyError as error:
+        _raise_api_error(error)
+
+
+@router.put("/accounts/{bot_id}/groups/{group_id}", dependencies=[authentication()])
+async def update_account_group(
+    bot_id: str,
+    group_id: str,
+    payload: AccountPolicyUpdate,
+    platform_scope: str,
+    channel_id: str = "",
+):
+    from zhenxun.services.bot_group_policy import bot_group_policy_service
+
+    try:
+        return Result.ok(
+            await bot_group_policy_service.update_group(
+                bot_id,
+                platform_scope,
+                group_id,
+                channel_id,
+                expected_revision=payload.expected_revision,
+                block_plugins=payload.block_plugins,
+                block_tasks=payload.block_tasks,
+            ),
+            "单群设置已保存并生效",
+        )
+    except (PluginPolicyError, RuntimeMutationBusyError) as error:
+        _raise_api_error(error)
+
+
 def _raise_api_error(error: Exception) -> None:
     if isinstance(error, PluginPolicyNotFound):
         status_code = 404

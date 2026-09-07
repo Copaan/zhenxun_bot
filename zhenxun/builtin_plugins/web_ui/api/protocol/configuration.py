@@ -11,7 +11,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from dotenv import dotenv_values
 from dotenv.parser import parse_stream
-from fastapi import APIRouter, HTTPException, Query, Response
+from fastapi import APIRouter, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
 import httpx
 from pydantic import BaseModel, Field
@@ -59,6 +59,7 @@ _AUTH_URL = "https://bots.qq.com/app/getAppAccessToken"
 _ME_URL = "https://api.sgroup.qq.com/users/@me"
 _TIMEOUT = httpx.Timeout(10.0, connect=5.0)
 _PROTOCOL_ENV_KEYS = {
+    "ONEBOT_REVERSE_WS_HOST",
     "ONEBOT_ACCESS_TOKEN",
     "QQ_ADAPTER_LOAD",
     "QQ_BOTS",
@@ -71,6 +72,7 @@ _PROTOCOL_ENV_KEYS = {
     "QQ_WEBHOOK_TLS_KEYFILE",
 }
 _PROTOCOL_DEFAULTS: dict[str, Any] = {
+    "ONEBOT_REVERSE_WS_HOST": "",
     "ONEBOT_ACCESS_TOKEN": "",
     "QQ_ADAPTER_LOAD": False,
     "QQ_BOTS": [],
@@ -100,6 +102,7 @@ class QQBotForm(BaseModel):
 class ProtocolConfigurationUpdate(BaseModel):
     expected_revision: str = Field(min_length=64, max_length=64)
     onebot_access_token: str | None = Field(default=None, max_length=1024)
+    onebot_reverse_ws_host: str | None = Field(default=None, max_length=253)
     clear_onebot_access_token: bool = False
     qq_enabled: bool
     qq_bots: list[QQBotForm] = Field(default_factory=list)
@@ -246,9 +249,10 @@ def _masked_configuration(content: str) -> dict[str, Any]:
         "revision": _revision(content),
         "launcher_managed": bool(os.getenv("ZHENXUN_LAUNCHER_PID")),
         "onebot": {
+            "reverse_ws_host": str(values.get("ONEBOT_REVERSE_WS_HOST") or ""),
             "has_access_token": bool(
                 str(values.get("ONEBOT_ACCESS_TOKEN") or "").strip()
-            )
+            ),
         },
         "qq": {
             "enabled": str(values.get("QQ_ADAPTER_LOAD") or "").lower()
@@ -365,11 +369,17 @@ async def _probe_credential(app_id: str, secret: str) -> dict[str, str]:
     response_model=Result,
     response_class=JSONResponse,
 )
-async def protocol_configuration(response: Response) -> Result:
+async def protocol_configuration(response: Response, request: Request) -> Result:
     content = _source_path().read_text(encoding="utf-8")
     _validate_env(content)
     response.headers["Cache-Control"] = "no-store"
-    return Result.ok(_masked_configuration(content))
+    from zhenxun.services.onebot_endpoint import current_reverse_ws_diagnostic
+
+    result = _masked_configuration(content)
+    result["onebot"]["endpoint"] = current_reverse_ws_diagnostic(
+        request.url.hostname or ""
+    )
+    return Result.ok(result)
 
 
 @router.post(
@@ -416,6 +426,15 @@ async def save_protocol_configuration(
         "QQ_WEBHOOK_LISTEN_HOST": payload.qq_webhook_listen_host.strip(),
         "QQ_WEBHOOK_LISTEN_PORT": payload.qq_webhook_listen_port,
     }
+    if payload.onebot_reverse_ws_host is not None:
+        from zhenxun.services.onebot_endpoint import normalize_reverse_ws_host
+
+        try:
+            changed["ONEBOT_REVERSE_WS_HOST"] = normalize_reverse_ws_host(
+                payload.onebot_reverse_ws_host
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
     if payload.clear_onebot_access_token:
         changed["ONEBOT_ACCESS_TOKEN"] = ""
     elif payload.onebot_access_token is not None and payload.onebot_access_token:

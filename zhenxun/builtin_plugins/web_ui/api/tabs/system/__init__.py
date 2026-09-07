@@ -12,7 +12,10 @@ from zhenxun.services.startup import startup_coordinator
 from zhenxun.utils._build_image import BuildImage
 
 from ....base_model import Result, SystemFolderSize
-from ....restart_service import transaction_verification_status
+from ....restart_service import (
+    network_configuration_status,
+    transaction_verification_status,
+)
 from ....utils import authentication, get_system_disk, validate_filename, validate_path
 from .configuration import router as configuration_router
 from .model import (
@@ -117,6 +120,7 @@ async def get_lifecycle_status() -> Result[LifecycleStatus]:
             "plugin_runtime": plugin_runtime_manager.status(),
             "transport": transport_runtime.snapshot(),
             "http_sidecar": read_http_sidecar_state(),
+            "network": network_configuration_status(),
         }
     )
 

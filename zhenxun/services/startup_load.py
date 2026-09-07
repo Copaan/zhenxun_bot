@@ -4,6 +4,8 @@ import ast
 import asyncio
 from collections import defaultdict
 from collections.abc import Callable, Iterable
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from functools import wraps
 import hashlib
@@ -304,6 +306,7 @@ class StartupLoadPlanner:
         self._file_lookup: dict[str, dict[str, Any]] = {}
         self.warming_plugins: set[str] = set()
         self._warmup_hook_counts: dict[str, int] = {}
+        self._recovery_preview = ContextVar("plugin_recovery_preview", default=None)
 
     def reset(self) -> None:
         self.entries.clear()
@@ -819,6 +822,13 @@ class StartupLoadPlanner:
         return self._file_lookup.get(str(path))
 
     def plugin_available(self, module_name: str) -> bool:
+        preview = self._recovery_preview.get()
+        if preview is not None and module_name in preview[1]:
+            try:
+                if asyncio.current_task() is preview[0]:
+                    return True
+            except RuntimeError:
+                pass
         owner = self.owner_for_module(module_name)
         if owner in self.failed_plugins or module_name in self.failed_plugins:
             return False
@@ -850,6 +860,37 @@ class StartupLoadPlanner:
             display_name=plugin_id,
             error=error,
         )
+
+    @contextmanager
+    def preview_runtime_recovery(self, module_names: set[str]):
+        token = self._recovery_preview.set(
+            (asyncio.current_task(), frozenset(module_names))
+        )
+        try:
+            yield
+        finally:
+            self._recovery_preview.reset(token)
+
+    def commit_runtime_recovery(
+        self,
+        module_names: set[str],
+        generation: int,
+        *,
+        plugin_ids: set[str] | None = None,
+    ) -> None:
+        # Historical startup diagnostics stay intact; only current admission is
+        # changed after the replacement generation has fully initialized.
+        owners = {
+            owner for name in module_names if (owner := self.owner_for_module(name))
+        } | (plugin_ids or set())
+        for owner in owners:
+            self.failed_plugins.discard(owner)
+            self.warming_plugins.discard(owner)
+            self._warmup_hook_counts.pop(owner, None)
+            if entry := self.entries.get(owner):
+                entry.status = "loaded"
+        self.failed_plugins.difference_update(module_names)
+        startup_coordinator.mark_plugins_recovered(owners, generation)
 
     def prepare_warmup_gates(self) -> None:
         from zhenxun.utils.enum import PriorityLifecycleType

@@ -137,6 +137,7 @@ class StartupCoordinator:
         self._runtime_event: asyncio.Event | None = None
         self._warmup_event: asyncio.Event | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._state_writer = None
 
     @property
     def state(self) -> StartupState:
@@ -276,6 +277,23 @@ class StartupCoordinator:
         with self._lock:
             self._load_planner = planner
         self._persist_throttled(force=True)
+
+    def mark_plugins_recovered(self, owners: set[str], generation: int) -> None:
+        with self._lock:
+            for diagnostic in self._diagnostics:
+                if (
+                    diagnostic.source_type == "plugin"
+                    and diagnostic.source_id in owners
+                ):
+                    diagnostic.details.update(
+                        recovered=True, recovered_generation=generation
+                    )
+            for reason in self._degraded_reasons:
+                if (
+                    reason.get("source_type") == "plugin"
+                    and reason.get("source_id") in owners
+                ):
+                    reason.update(recovered=True, recovered_generation=generation)
 
     def record_error(
         self,
@@ -549,6 +567,8 @@ class StartupCoordinator:
             )[:20]
             result = {
                 "boot_id": self.boot_id,
+                "launcher_boot_id": os.getenv("ZHENXUN_LAUNCHER_BOOT_ID", ""),
+                "startup_id": os.getenv("ZHENXUN_WORKER_STARTUP_ID", ""),
                 "pid": self.pid,
                 "state": self._state,
                 "started_at": self.started_at,
@@ -567,6 +587,7 @@ class StartupCoordinator:
                 "current_operation": dict(self._current_operation)
                 if self._current_operation
                 else None,
+                "persistence": self.persistence_status(),
                 "server_bound": self._server_bound,
                 "operating_mode": (
                     "management_only"
@@ -663,10 +684,33 @@ class StartupCoordinator:
         self.persist()
 
     def persist(self) -> None:
+        if self._state_writer is not None:
+            self._state_writer.mark_dirty()
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            from zhenxun.services.lifecycle.diagnostics import LifecycleStateWriter
+
+            self._state_writer = LifecycleStateWriter(_REPORT_PATH, self.snapshot)
+            self._state_writer.mark_dirty()
+            return
         try:
             write_json_locked(_REPORT_PATH, self.snapshot())
         except OSError:
             pass
+
+    def persistence_status(self) -> dict[str, Any]:
+        if self._state_writer is None:
+            return {"mode": "synchronous", "pending": False}
+        return {"mode": "managed", **self._state_writer.status()}
+
+    async def finish_persistence(self, timeout: float) -> bool:
+        if self._state_writer is None:
+            return True
+        return await self._state_writer.close(timeout)
 
 
 startup_coordinator = StartupCoordinator()

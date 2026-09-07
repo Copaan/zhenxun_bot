@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 import inspect
 from pathlib import Path
 import random
+import time
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from jinja2 import (
@@ -333,9 +334,10 @@ class AssetResolutionService:
                 if not hot_reload:
                     self.theme_manager._set_asset_resolution_cache(cache_key, uri)
                 return uri
-        logger.warning(
-            f"资源文件未找到: '{asset_path}' (在 '{current_template_name}' 中)"
-        )
+        now = time.monotonic()
+        if now - self.theme_manager._asset_miss_logged_at >= 30:
+            self.theme_manager._asset_miss_logged_at = now
+            logger.warning("渲染资源缺失 | code=render_asset_missing", "Renderer")
         return ""
 
 
@@ -352,6 +354,7 @@ class ThemeManager:
         - 加载和管理UI主题，包括 `palette.json` (调色板) 和 `theme.css.jinja`(主题样式)
         """
         self.current_theme: Theme | None = None
+        self._asset_miss_logged_at = float("-inf")
         self.jinja_env: Environment | None = None
         self.manifest_registry: ManifestRegistry | None = None
         self.asset_service = AssetResolutionService(self)
@@ -509,9 +512,11 @@ class ThemeManager:
                 local_base_path / "assets" / clean_path,
             ]
             for full_path in candidate_paths:
-                if full_path.exists():
+                if full_path.is_file():
                     return full_path.absolute().as_uri()
-            return ""
+            return self.asset_service.resolve_asset_uri(
+                asset_path, "standalone/main.html"
+            )
 
         return asset_loader
 

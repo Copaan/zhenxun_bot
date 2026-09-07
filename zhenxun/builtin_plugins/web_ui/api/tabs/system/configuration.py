@@ -346,6 +346,8 @@ def _validation_error(file: str, error: Exception) -> HTTPException:
     response_class=JSONResponse,
 )
 async def configuration_summary() -> Result:
+    from ....restart_service import network_configuration_status
+
     env_path = _path("env")
     env_content = _read(env_path)
     values = dotenv_values(stream=StringIO(env_content))
@@ -379,6 +381,7 @@ async def configuration_summary() -> Result:
                 "revision": _revision(_read(_SIMPLE_FILE)),
             },
             "launcher_managed": bool(os.getenv("ZHENXUN_LAUNCHER_PID")),
+            "network": network_configuration_status(),
         }
     )
 
@@ -526,7 +529,9 @@ async def update_configuration_file(
         except (TypeError, ValueError):
             port = 8080
         tls_settings = settings_from_values(dict(values))
-        local_urls = preferred_access_targets(host, port, settings=tls_settings)
+        local_urls = preferred_access_targets(
+            host, port, settings=tls_settings, sidecar_available=launcher_managed
+        )
         access_urls = [item.url for item in local_urls]
         access_targets = [
             {

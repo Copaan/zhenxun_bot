@@ -42,6 +42,8 @@ class ProtocolQQBotStatus(BaseModel):
 
 
 class ProtocolStatus(BaseModel):
+    onebot_endpoint: dict = Field(default_factory=dict)
+    qq_webhook_ingress: dict = Field(default_factory=dict)
     onebot_v11_connected: bool
     qq_official_enabled: bool
     qq_official_connected: bool

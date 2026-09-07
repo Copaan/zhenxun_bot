@@ -25,6 +25,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import uuid
 
 GRACEFUL_SHUTDOWN_TIMEOUT = 15
 WORKER_CONNECTION_LIMIT = 512
@@ -32,6 +33,7 @@ WORKER_BACKLOG = 2048
 WORKER_KEEP_ALIVE_TIMEOUT = 15
 WORKER_POLL_INTERVAL = 0.1
 RESTART_POLL_INTERVAL = 0.5
+WORKER_STATUS_POLL_INTERVAL = 2.0
 WORKER_SOFT_EXIT_TIMEOUT = 15.0
 WORKER_TERMINATE_TIMEOUT = 5.0
 WORKER_KILL_TIMEOUT = 5.0
@@ -41,6 +43,7 @@ HTTP_SIDECAR_RETRY_DELAYS = (1.0, 2.0, 5.0, 15.0, 30.0)
 HTTP_SIDECAR_START_TIMEOUT = 7.0
 ENV_EXAMPLE_FILE = ".env.example"
 ENV_DEV_FILE = ".env.dev"
+_worker_certificate_pin: str | None = None
 
 
 def _env_assignment_key(line: str, *, include_commented: bool = False) -> str | None:
@@ -120,51 +123,38 @@ def _sync_env_missing_items(project_root: Path) -> None:
         _launcher_log("已根据 .env.example 生成 .env.dev")
         return
 
-    example_lines = example_path.read_text(encoding="utf-8").splitlines(keepends=True)
-    env_lines = env_path.read_text(encoding="utf-8").splitlines(keepends=True)
-    example_blocks = _split_env_blocks(example_lines)
-    existing_keys = {key for line in env_lines if (key := _env_key(line))}
-    existing_values = {
-        key: line.split("=", 1)[1].strip()
-        for line in env_lines
-        if (key := _env_key(line)) and "=" in line
-    }
-    missing_blocks: list[tuple[int, list[str]]] = []
+    from io import StringIO
 
-    for block_index, (_, block) in enumerate(example_blocks):
-        key = _env_block_key(block)
-        if key and key not in existing_keys:
-            if key == "WEBUI_HTTP_MODE" and str(
+    from dotenv.parser import parse_stream
+
+    content = env_path.read_text(encoding="utf-8")
+    existing_values = {
+        item.key: item.value for item in parse_stream(StringIO(content)) if item.key
+    }
+    additions: list[str] = []
+    added_keys: list[str] = []
+    comments: list[str] = []
+    for item in parse_stream(StringIO(example_path.read_text(encoding="utf-8"))):
+        if item.error:
+            raise ValueError("env_example_parse_failed")
+        if item.key is None:
+            comments.append(item.original.string)
+            continue
+        if item.key not in existing_values:
+            text = item.original.string
+            if item.key == "WEBUI_HTTP_MODE" and str(
                 existing_values.get("WEBUI_HTTP_REDIRECT_ENABLED", "")
             ).casefold() in {"1", "true", "yes", "on"}:
-                block = [
-                    "# 已从旧 HTTP 重定向配置迁移\n",
-                    "WEBUI_HTTP_MODE=redirect\n",
-                ]
-            missing_blocks.append((block_index, block))
-
-    if not missing_blocks:
+                text = "WEBUI_HTTP_MODE=redirect\n"
+            additions.append("".join(comments) + text)
+            existing_values[item.key] = item.value
+            added_keys.append(item.key)
+        comments.clear()
+    if not additions:
         return
-
-    updated_lines = env_lines
-    added_keys: list[str] = []
-    for block_index, block in missing_blocks:
-        key = _env_block_key(block)
-        if not key:
-            continue
-        anchor_index = len(updated_lines)
-        for _, next_block in example_blocks[block_index + 1 :]:
-            next_key = _env_block_anchor_key(next_block)
-            if not next_key:
-                continue
-            if (found := _find_env_block_start(updated_lines, next_key)) is not None:
-                anchor_index = found
-                break
-        updated_lines = _insert_env_block_before(updated_lines, anchor_index, block)
-        existing_keys.add(key)
-        added_keys.append(key)
-
-    env_path.write_text("".join(updated_lines), encoding="utf-8")
+    env_path.write_text(
+        content.rstrip("\r\n") + "\n\n" + "".join(additions), encoding="utf-8"
+    )
     _launcher_log(f"已补齐 .env.dev 缺失配置: {', '.join(added_keys)}")
 
 
@@ -253,6 +243,31 @@ def _run_worker() -> None:
         render_playwright={"channel": htmlrender_browser_channel},
     )
 
+    from nonebot.adapters.onebot.v11 import Adapter as OneBotV11Adapter
+
+    from zhenxun.configs.config import BotConfig
+
+    driver = nonebot.get_driver()
+    driver.register_adapter(OneBotV11Adapter)
+    from zhenxun.services.onebot_endpoint import OneBotHandshakeDiagnostics
+
+    nonebot.get_app().add_middleware(OneBotHandshakeDiagnostics)
+    enabled_adapters = ["OneBot V11"]
+    if BotConfig.qq_adapter_load:
+        from zhenxun.adapters.qq_official.config import validate_qq_official_config
+
+        qq_config = validate_qq_official_config()
+        if (
+            qq_config.has_webhook_bots
+            and qq_config.qq_webhook_mode == "builtin_https"
+            and not os.environ.get("ZHENXUN_LAUNCHER_PID")
+        ):
+            raise RuntimeError("QQ_WEBHOOK_MODE=builtin_https 必须通过 `zx run` 启动")
+        from zhenxun.adapters.qq_official.adapter import ZhenxunQQAdapter
+
+        driver.register_adapter(ZhenxunQQAdapter)
+        enabled_adapters.append("<c>QQ_Official</c>")
+
     from zhenxun.services.lifecycle import hook_kernel
     from zhenxun.services.runtime_bootstrap import register_runtime_bootstrap
     from zhenxun.services.runtime_reload import plugin_runtime_manager
@@ -269,6 +284,15 @@ def _run_worker() -> None:
         "nonebot_plugin_waiter",
     ):
         nonebot.require(library_plugin)
+    from nonebot_plugin_uninfo.adapters import alter_get_fetcher
+
+    for adapter in nonebot.get_adapters().values():
+        # An embedding application may have imported Uninfo before its adapters.
+        from nonebot_plugin_uninfo.adapters import INFO_FETCHER_MAPPING
+
+        name = adapter.get_name()
+        if name not in INFO_FETCHER_MAPPING:
+            alter_get_fetcher(name)
     plugin_runtime_manager.activate_loaded_incarnations()
     register_runtime_bootstrap(nonebot.get_driver())
 
@@ -280,38 +304,6 @@ def _run_worker() -> None:
         "completed",
         (time.monotonic() - worker_started) * 1000,
     )
-
-    from nonebot.adapters.onebot.v11 import Adapter as OneBotV11Adapter
-
-    from zhenxun.configs.config import BotConfig
-
-    driver = nonebot.get_driver()
-    driver.register_adapter(OneBotV11Adapter)
-    enabled_adapters = ["OneBot V11"]
-
-    if BotConfig.qq_adapter_load:
-        try:
-            from zhenxun.adapters.qq_official.config import (
-                validate_qq_official_config,
-            )
-
-            qq_config = validate_qq_official_config()
-            if (
-                qq_config.has_webhook_bots
-                and qq_config.qq_webhook_mode == "builtin_https"
-                and not os.environ.get("ZHENXUN_LAUNCHER_PID")
-            ):
-                raise RuntimeError(
-                    "QQ_WEBHOOK_MODE=builtin_https 必须通过 `zx run` 启动"
-                )
-            from zhenxun.adapters.qq_official.adapter import ZhenxunQQAdapter
-        except ImportError as e:
-            raise RuntimeError(
-                "QQ_ADAPTER_LOAD=True 但未安装 nonebot-adapter-qq，"
-                "请安装后再开启 QQ 官方适配器。"
-            ) from e
-        driver.register_adapter(ZhenxunQQAdapter)
-        enabled_adapters.append("<c>QQ_Official</c>")
 
     nonebot.logger.opt(colors=True).info(f"已启用适配器: {', '.join(enabled_adapters)}")
 
@@ -376,6 +368,7 @@ def _run_worker() -> None:
     startup_load_planner.instrument_prebind_hooks(driver)
 
     from zhenxun.configs.webui_tls import (
+        bind_runtime_webui_settings,
         load_webui_tls_settings,
         validate_webui_tls_settings,
     )
@@ -385,6 +378,12 @@ def _run_worker() -> None:
         webui_tls,
         launcher_managed=bool(os.environ.get("ZHENXUN_LAUNCHER_PID")),
     )
+    from dataclasses import replace
+
+    webui_tls = replace(
+        webui_tls, host=str(driver.config.host), port=int(driver.config.port)
+    )
+    bind_runtime_webui_settings(webui_tls)
     tls_options = (
         {
             "ssl_certfile": webui_tls.certfile,
@@ -410,7 +409,27 @@ def _run_worker() -> None:
             "proxy_headers": True,
             "forwarded_allow_ips": ",".join(dict.fromkeys(trusted_proxy_ips)),
         }
+    from zhenxun.services.lifecycle import lifecycle_kernel
+
+    exit_signals: list[int] = []
+
+    def after_server_signal(signum, frame):
+        # Uvicorn replays captured signals after lifespan shutdown. SIG_DFL on
+        # Windows SIGBREAK exits in the C runtime, bypassing Python finally.
+        exit_signals.append(signum)
+        if not lifecycle_kernel._shutdown_requested:
+            signal.default_int_handler(signum, frame)
+
+    worker_signals = [signal.SIGINT, signal.SIGTERM]
+    if hasattr(signal, "SIGBREAK"):
+        worker_signals.append(signal.SIGBREAK)
+    original_signals = {
+        sig: signal.signal(sig, after_server_signal) for sig in worker_signals
+    }
     try:
+        from zhenxun.services.runtime_bootstrap import install_runtime_worker_teardown
+
+        install_runtime_worker_teardown(nonebot.get_app())
         nonebot.run(
             workers=1,
             access_log=False,
@@ -427,6 +446,13 @@ def _run_worker() -> None:
         from zhenxun.services.runtime_bootstrap import finalize_runtime_executor
 
         finalize_runtime_executor()
+        from zhenxun.services.lifecycle import lifecycle_kernel
+
+        try:
+            lifecycle_kernel.finalize_terminal_receipt(exit_signals=exit_signals)
+        finally:
+            for sig, handler in original_signals.items():
+                signal.signal(sig, handler)
 
 
 def _build_worker_command() -> list[str]:
@@ -549,21 +575,13 @@ def _worker_webui_health_url(settings, *, scheme: str = "http") -> str:
 def _worker_runtime_status_url(settings, *, scheme: str = "http") -> str:
     connect_host = settings.worker_connect_host
     host = f"[{connect_host}]" if ":" in connect_host else connect_host
-    return (
-        f"{scheme}://{host}:{settings.worker_port}" "/zhenxun/api/system/startup/status"
-    )
+    return f"{scheme}://{host}:{settings.worker_port}/zhenxun/api/system/startup/status"
 
 
 def _health_urlopen(url: str):
-    if url.startswith("https://"):
-        import ssl
+    from zhenxun.services.listener_health import health_response
 
-        return urllib.request.urlopen(
-            url,
-            timeout=1.0,
-            context=ssl._create_unverified_context(),
-        )
-    return urllib.request.urlopen(url, timeout=1.0)
+    return health_response(url, fingerprint=_worker_certificate_pin)
 
 
 def _worker_is_ready(
@@ -608,13 +626,14 @@ def _runtime_status_is_ready(
 
 def _bind_worker_runtime_status(
     worker: subprocess.Popen, status: dict[str, object] | None
-) -> None:
+) -> bool:
     if status is None:
-        return
+        return False
     with contextlib.suppress(Exception):
         from zhenxun.services.lifecycle.launcher import bind_launcher_worker_runtime
 
-        bind_launcher_worker_runtime(worker, status)
+        return bind_launcher_worker_runtime(worker, status)
+    return False
 
 
 async def _wait_worker_ready_async(
@@ -635,7 +654,9 @@ async def _wait_worker_ready_async(
         status = await asyncio.to_thread(
             _read_worker_runtime_status, settings, scheme=scheme
         )
-        _bind_worker_runtime_status(worker, status)
+        if not _bind_worker_runtime_status(worker, status):
+            await asyncio.sleep(WORKER_READY_POLL_INTERVAL)
+            continue
         if _runtime_status_is_ready(status, require_warmup=require_warmup):
             return True
         if status and status.get("operating_mode") in {
@@ -659,22 +680,33 @@ async def _wait_worker_webui_ready_async(
             or launcher_supervisor.shutdown_deadline is not None
         ):
             return False
-        if await asyncio.to_thread(
-            _worker_webui_is_ready_once, settings, scheme=scheme
-        ):
+        if await _worker_webui_is_ready_once(settings, scheme=scheme, worker=worker):
             return True
         await asyncio.sleep(WORKER_READY_POLL_INTERVAL)
     return False
 
 
-def _worker_webui_is_ready_once(settings, *, scheme: str = "http") -> bool:
-    try:
-        with _health_urlopen(
-            _worker_webui_health_url(settings, scheme=scheme)
-        ) as response:
-            return response.status == 200
-    except (OSError, urllib.error.URLError):
+async def _worker_webui_is_ready_once(
+    settings, *, scheme: str = "http", worker: subprocess.Popen | None = None
+) -> bool:
+    status = await asyncio.to_thread(
+        _read_worker_runtime_status, settings, scheme=scheme
+    )
+    if worker is None or not _bind_worker_runtime_status(worker, status):
         return False
+    if not status.get("server_bound"):
+        return False
+
+    def probe():
+        try:
+            with _health_urlopen(
+                _worker_webui_health_url(settings, scheme=scheme)
+            ) as response:
+                return response.status == 200
+        except (OSError, urllib.error.URLError):
+            return False
+
+    return await asyncio.to_thread(probe)
 
 
 def _run_ingress(args: list[str]) -> None:
@@ -796,7 +828,9 @@ def _publish_http_sidecar_state(**changes: object) -> dict[str, object]:
     )
 
     if changes:
-        write_http_sidecar_state(**changes)
+        write_http_sidecar_state(
+            **{**changes, "launcher_boot_id": os.getenv("ZHENXUN_LAUNCHER_BOOT_ID", "")}
+        )
     state = read_http_sidecar_state()
     update_launcher_metadata(http_sidecar=state)
     return state
@@ -871,6 +905,7 @@ async def _start_http_sidecar_async(settings, cwd: Path) -> subprocess.Popen | N
                 },
             ),
             ready=wait_ready,
+            startup_id=startup_id,
         )
     except OSError as error:
         _publish_http_sidecar_state(
@@ -887,6 +922,43 @@ async def _start_http_sidecar_async(settings, cwd: Path) -> subprocess.Popen | N
         f"(mode={settings.effective_http_mode})"
     )
     return process
+
+
+async def _start_qq_ingress_async(settings, tls, cwd: Path):
+    from zhenxun.services.lifecycle.launcher import launcher_supervisor
+    from zhenxun.services.qq_ingress_state import read_ingress_state
+
+    startup_id = uuid.uuid4().hex
+
+    async def wait_ready(process):
+        deadline = time.monotonic() + HTTP_SIDECAR_START_TIMEOUT
+        while process.poll() is None and time.monotonic() < deadline:
+            if launcher_supervisor.shutdown_deadline is not None:
+                raise OSError("ingress_startup_interrupted")
+            state = read_ingress_state()
+            if state.get("state") == "ready" and _http_sidecar_process_matches(
+                state, process, startup_id
+            ):
+                return
+            await asyncio.sleep(0.05)
+        raise OSError("ingress_startup_failed")
+
+    return await _spawn_launcher_process(
+        "qq_ingress",
+        partial(
+            subprocess.Popen,
+            _build_ingress_command(settings, upstream_scheme=tls.scheme),
+            cwd=str(cwd),
+            creationflags=_get_worker_creationflags(),
+            env={
+                **_ingress_environment(),
+                "ZHENXUN_QQ_INGRESS_STARTUP_ID": startup_id,
+                "ZHENXUN_QQ_UPSTREAM_CERT_SHA256": _worker_certificate_pin or "",
+            },
+        ),
+        ready=wait_ready,
+        startup_id=startup_id,
+    )
 
 
 def _terminate_worker(proc: subprocess.Popen) -> None:
@@ -909,11 +981,13 @@ async def _terminate_named_process_async(proc: subprocess.Popen, name: str) -> N
 
 
 async def _spawn_launcher_process(
-    role: str, factory, *, ready=None
+    role: str, factory, *, ready=None, startup_id: str | None = None
 ) -> subprocess.Popen:
     from zhenxun.services.lifecycle.launcher import launcher_supervisor
 
-    return await launcher_supervisor.start_process(role, factory, ready=ready)
+    return await launcher_supervisor.start_process(
+        role, factory, ready=ready, startup_id=startup_id
+    )
 
 
 async def _run_launcher_command(command, *, cwd):
@@ -952,7 +1026,40 @@ def _wait_worker_webui_ready(*args, **kwargs) -> bool:
 
 
 def _run_launcher() -> None:
-    asyncio.run(_launcher_entry())
+    from zhenxun.services.lifecycle.launcher import launcher_supervisor
+
+    try:
+        asyncio.run(_launcher_entry())
+    except asyncio.CancelledError:
+        if launcher_supervisor.shutdown_signal is None:
+            raise
+        _launcher_log(
+            "launcher_startup_outcome | phase=startup | code=launcher_startup_cancelled"
+        )
+        raise SystemExit(128 + launcher_supervisor.shutdown_signal) from None
+    except OSError as error:
+        import logging
+
+        if launcher_supervisor.shutdown_signal is not None:
+            _launcher_log(
+                "launcher_startup_outcome | phase=startup | "
+                "code=launcher_startup_cancelled"
+            )
+            raise SystemExit(128 + launcher_supervisor.shutdown_signal) from None
+        code = (
+            str(error)
+            if str(error)
+            in {"launcher_startup_interrupted", "launcher_process_start_failed"}
+            else "launcher_startup_failed"
+        )
+        logging.getLogger(__name__).error(
+            "launcher_startup_outcome | phase=startup | code=%s", code, exc_info=True
+        )
+        raise SystemExit(1) from None
+    finally:
+        from zhenxun.services.lifecycle.launcher import launcher_supervisor
+
+        launcher_supervisor.kernel.finalize_terminal_receipt()
 
 
 async def _launcher_entry() -> None:
@@ -962,6 +1069,13 @@ async def _launcher_entry() -> None:
     if hasattr(signal, "SIGBREAK"):
         signals.append(signal.SIGBREAK)
     original = {sig: signal.getsignal(sig) for sig in signals}
+    for sig in signals:
+        signal.signal(
+            sig,
+            lambda signum, _frame: launcher_supervisor.begin_shutdown(
+                signal_number=signum
+            ),
+        )
     try:
         await _run_launcher_async()
     finally:
@@ -973,22 +1087,27 @@ async def _launcher_entry() -> None:
 
 
 async def _run_launcher_async() -> None:
+    global _worker_certificate_pin
     launcher_started_at = time.time()
     cwd = _ensure_project_root()
     from zhenxun.services.lifecycle.launcher import initialize_launcher_lifecycle
     from zhenxun.update_service import (
         applied_update_pending,
-        apply_pending_update,
         finalize_applied_update,
+        pending_job,
         rollback_applied_update,
     )
 
     launcher_boot_id = initialize_launcher_lifecycle()
+    from zhenxun.services.launcher_maintenance import run as run_maintenance
     from zhenxun.services.lifecycle.launcher import launcher_supervisor
 
-    pending_bot_verification = await launcher_supervisor.run_recovery(
-        lambda: apply_pending_update(cwd) or applied_update_pending()
-    )
+    await launcher_supervisor.run_recovery(lambda: None)
+    pending_bot_verification = applied_update_pending()
+    if pending_job():
+        pending_bot_verification = (
+            await run_maintenance("update-apply") or pending_bot_verification
+        )
     _sync_env_missing_items(cwd)
     from zhenxun.adapters.qq_official.config import (
         load_qq_launcher_settings,
@@ -1026,7 +1145,7 @@ async def _run_launcher_async() -> None:
             return
         from zhenxun.services.lifecycle.launcher import launcher_supervisor
 
-        launcher_supervisor.begin_shutdown()
+        launcher_supervisor.begin_shutdown(signal_number=signum)
         stop_requested = True
         stop_signal = int(signum)
         _launcher_log(f"received signal {signum}, scheduling worker shutdown")
@@ -1043,11 +1162,12 @@ async def _run_launcher_async() -> None:
             pass
 
     while True:
-        if stop_requested:
+        if stop_requested or launcher_supervisor.shutdown_deadline is not None:
             raise SystemExit(128 + int(stop_signal or signal.SIGINT))
-        from zhenxun.nonebot_store.runtime import (
-            apply_pending_transaction as apply_pending_nonebot_transaction,
-        )
+        if current_worker is None and http_sidecar is not None:
+            await _terminate_named_process_async(http_sidecar, "WebUI HTTP sidecar")
+            http_sidecar = None
+            http_sidecar_signature = None
         from zhenxun.nonebot_store.runtime import (
             finalize_pending_transaction as finalize_nonebot_transaction,
         )
@@ -1060,9 +1180,6 @@ async def _run_launcher_async() -> None:
         from zhenxun.nonebot_store.storage import load_manifest as load_nonebot_manifest
         from zhenxun.nonebot_store.storage import (
             pending_transaction as pending_nonebot_transaction,
-        )
-        from zhenxun.plugin_store_transaction import (
-            apply_pending_transaction as apply_pending_source_transaction,
         )
         from zhenxun.plugin_store_transaction import (
             finalize_pending_transaction as finalize_source_transaction,
@@ -1101,8 +1218,8 @@ async def _run_launcher_async() -> None:
             begin_launcher_commit(commit_targets)
         dependencies_ready = prepare_dependency_transaction()
         nonebot_applied = False
-        if dependencies_ready:
-            nonebot_applied = apply_pending_nonebot_transaction()
+        if dependencies_ready and pending_nonebot_transaction():
+            nonebot_applied = await run_maintenance("nonebot-apply")
         nonebot_after_apply = pending_nonebot_transaction()
         nonebot_apply_failed = bool(
             nonebot_before_apply
@@ -1111,8 +1228,8 @@ async def _run_launcher_async() -> None:
             and nonebot_after_apply.get("state") in {"failed", "migration_blocked"}
         )
         source_applied = (
-            apply_pending_source_transaction()
-            if dependencies_ready and not nonebot_apply_failed
+            await run_maintenance("source-apply")
+            if dependencies_ready and not nonebot_apply_failed and source_before_apply
             else False
         )
         source_after_apply = pending_source_transaction()
@@ -1150,6 +1267,9 @@ async def _run_launcher_async() -> None:
         )
         qq_settings = load_qq_launcher_settings(cwd)
         webui_tls = load_webui_tls_settings(cwd)
+        _worker_certificate_pin = (
+            certificate_sha256(webui_tls.certfile) if webui_tls.enabled else None
+        )
         builtin_ingress = bool(
             qq_settings.enabled
             and qq_settings.config.has_webhook_bots
@@ -1214,6 +1334,10 @@ async def _run_launcher_async() -> None:
         worker_env["ZHENXUN_LAUNCHER_STARTED_AT"] = str(launcher_started_at)
         worker_env["ZHENXUN_WORKER_SPAWNED_AT"] = str(time.time())
         worker_env["ZHENXUN_LAUNCHER_BOOT_ID"] = launcher_boot_id
+        worker_startup_id = uuid.uuid4().hex
+        worker_env["ZHENXUN_WORKER_STARTUP_ID"] = worker_startup_id
+        if stop_requested:
+            raise SystemExit(128 + int(stop_signal or signal.SIGINT))
         worker = await _spawn_launcher_process(
             "worker",
             partial(
@@ -1223,9 +1347,34 @@ async def _run_launcher_async() -> None:
                 creationflags=_get_worker_creationflags(),
                 env=worker_env,
             ),
+            startup_id=worker_startup_id,
         )
         _record_launcher_process_start("worker", worker)
         current_worker = worker
+        # Management HTTP does not depend on plugin verification or QQ runtime.
+        if webui_tls.http_sidecar_enabled and http_sidecar is None:
+            if not await _wait_worker_webui_ready_async(
+                worker, qq_settings, scheme=webui_tls.scheme
+            ):
+                _publish_http_sidecar_state(
+                    mode=webui_tls.effective_http_mode,
+                    port=webui_tls.redirect_port,
+                    pid=None,
+                    state="degraded",
+                    active_connections=0,
+                    last_error="https_worker_not_ready",
+                )
+                next_http_sidecar_retry = time.monotonic() + 1.0
+                _launcher_log(
+                    "WebUI HTTP sidecar is degraded: HTTPS worker is not ready"
+                )
+            else:
+                http_sidecar = await _start_http_sidecar_async(webui_tls, cwd)
+                if http_sidecar is not None:
+                    http_sidecar_signature = desired_http_sidecar_signature
+                    http_sidecar_retry_index = 0
+                else:
+                    next_http_sidecar_retry = time.monotonic() + 1.0
         if verify_nonebot_generation or verify_source_transaction:
             with contextlib.suppress(Exception):
                 transition_launcher_commit("verifying")
@@ -1334,59 +1483,19 @@ async def _run_launcher_async() -> None:
                         "QQ worker 未在规定时间内就绪，HTTPS Ingress 未启动"
                     )
             if runtime_available:
-                ingress = await _spawn_launcher_process(
-                    "qq_ingress",
-                    partial(
-                        subprocess.Popen,
-                        _build_ingress_command(
-                            qq_settings, upstream_scheme=webui_tls.scheme
-                        ),
-                        cwd=str(cwd),
-                        creationflags=_get_worker_creationflags(),
-                        env=_ingress_environment(),
-                    ),
-                )
+                ingress = await _start_qq_ingress_async(qq_settings, webui_tls, cwd)
                 _record_launcher_process_start("qq_ingress", ingress)
                 ingress_signature = desired_ingress_signature
-                await asyncio.sleep(0.25)
-                if ingress.poll() is not None:
-                    code = ingress.returncode
-                    _record_launcher_process_exit(ingress, "unexpected_exit")
-                    ingress = None
-                    await _terminate_worker_async(worker)
-                    raise SystemExit(code or 1)
                 _launcher_log(
                     "QQ HTTPS ingress ready on "
                     f"{qq_settings.config.qq_webhook_listen_host}:"
                     f"{qq_settings.config.qq_webhook_listen_port}"
                 )
-        if webui_tls.http_sidecar_enabled and http_sidecar is None:
-            if not await _wait_worker_webui_ready_async(
-                worker, qq_settings, scheme=webui_tls.scheme
-            ):
-                _publish_http_sidecar_state(
-                    mode=webui_tls.effective_http_mode,
-                    port=webui_tls.redirect_port,
-                    pid=None,
-                    state="degraded",
-                    active_connections=0,
-                    last_error="https_worker_not_ready",
-                )
-                next_http_sidecar_retry = time.monotonic() + 1.0
-                _launcher_log(
-                    "WebUI HTTP sidecar is degraded: HTTPS worker is not ready"
-                )
-            else:
-                http_sidecar = await _start_http_sidecar_async(webui_tls, cwd)
-                if http_sidecar is not None:
-                    http_sidecar_signature = desired_http_sidecar_signature
-                    http_sidecar_retry_index = 0
-                else:
-                    next_http_sidecar_retry = time.monotonic() + 1.0
         restart_requested = False
         restart_action: tuple[str, list[str]] | None = None
         return_code: int | None = None
         next_restart_check = 0.0
+        next_status_check = 0.0
         try:
             while True:
                 return_code = worker.poll()
@@ -1437,15 +1546,43 @@ async def _run_launcher_async() -> None:
                     await _terminate_worker_async(worker)
                     raise SystemExit(128 + int(stop_signal or signal.SIGINT))
                 now = time.monotonic()
+                if now >= next_restart_check:
+                    next_restart_check = now + RESTART_POLL_INTERVAL
+                    if action := consume_launcher_action():
+                        from zhenxun.services.lifecycle.launcher import (
+                            launcher_supervisor,
+                        )
+
+                        launcher_supervisor.begin_shutdown(restarting=True)
+                        restart_requested = True
+                        restart_action = action
+                        _launcher_log(
+                            "detected restart request, stopping current worker"
+                        )
+                        if ingress is not None:
+                            await _terminate_named_process_async(
+                                ingress, "QQ HTTPS ingress"
+                            )
+                            ingress = None
+                            ingress_signature = None
+                        if http_sidecar is not None:
+                            await _terminate_named_process_async(
+                                http_sidecar, "WebUI HTTP sidecar"
+                            )
+                            http_sidecar = None
+                            http_sidecar_signature = None
+                        await _terminate_worker_async(worker)
+                        return_code = worker.poll()
+                        break
                 if (
                     webui_tls.http_sidecar_enabled
                     and http_sidecar is None
                     and now >= next_http_sidecar_retry
                 ):
-                    if await asyncio.to_thread(
-                        _worker_webui_is_ready_once,
+                    if await _worker_webui_is_ready_once(
                         qq_settings,
                         scheme=webui_tls.scheme,
+                        worker=worker,
                     ):
                         http_sidecar = await _start_http_sidecar_async(webui_tls, cwd)
                     if http_sidecar is not None:
@@ -1467,40 +1604,14 @@ async def _run_launcher_async() -> None:
                             active_connections=0,
                             retry_in_seconds=delay,
                         )
-                if now >= next_restart_check:
-                    next_restart_check = now + RESTART_POLL_INTERVAL
+                if now >= next_status_check:
+                    next_status_check = now + WORKER_STATUS_POLL_INTERVAL
                     status = await asyncio.to_thread(
                         _read_worker_runtime_status,
                         qq_settings,
                         scheme=webui_tls.scheme,
                     )
                     _bind_worker_runtime_status(worker, status)
-                    if action := consume_launcher_action():
-                        from zhenxun.services.lifecycle.launcher import (
-                            launcher_supervisor,
-                        )
-
-                        launcher_supervisor.begin_shutdown()
-                        restart_requested = True
-                        restart_action = action
-                        _launcher_log(
-                            "detected restart request, stopping current worker"
-                        )
-                        if ingress is not None:
-                            await _terminate_named_process_async(
-                                ingress, "QQ HTTPS ingress"
-                            )
-                            ingress = None
-                            ingress_signature = None
-                        if http_sidecar is not None:
-                            await _terminate_named_process_async(
-                                http_sidecar, "WebUI HTTP sidecar"
-                            )
-                            http_sidecar = None
-                            http_sidecar_signature = None
-                        await _terminate_worker_async(worker)
-                        return_code = worker.poll()
-                        break
                 await asyncio.sleep(WORKER_POLL_INTERVAL)
         except KeyboardInterrupt:
             clear_launcher_restart_signal()
@@ -1536,6 +1647,10 @@ async def _run_launcher_async() -> None:
                 current_worker = None
 
         if restart_requested or (restart_action := consume_launcher_action()):
+            if stop_requested:
+                raise SystemExit(128 + int(stop_signal or signal.SIGINT))
+            launcher_supervisor.shutdown_deadline = None
+            launcher_supervisor.shutdown_id = None
             if restart_action and restart_action[0] == "sync_dependencies_restart":
                 dependency_paths = restart_action[1]
                 from zhenxun.nonebot_store.storage import (
@@ -1550,9 +1665,7 @@ async def _run_launcher_async() -> None:
                         path in {"pyproject.toml", "uv.lock"}
                         for path in dependency_paths
                     ):
-                        from zhenxun.update_service import _sync_dependencies
-
-                        _sync_dependencies(preserve_extras=True)
+                        await run_maintenance("sync-core")
                     for dependency_path in dependency_paths:
                         if Path(dependency_path).name not in {
                             "requirement.txt",
@@ -1579,8 +1692,8 @@ async def _run_launcher_async() -> None:
                     save_dependency_sync_status(
                         {"status": "succeeded", "paths": dependency_paths}
                     )
-            pending_bot_verification = await launcher_supervisor.run_recovery(
-                lambda: apply_pending_update(cwd)
+            pending_bot_verification = (
+                await run_maintenance("update-apply") if pending_job() else False
             )
             continue
         if ingress is not None:
@@ -1612,6 +1725,10 @@ def main() -> None:
         _run_http_redirect(args[1:])
     elif args[0] == "run-http-sidecar":
         _run_http_sidecar(args[1:])
+    elif args[0] == "run-maintenance" and len(args) == 2:
+        from zhenxun.services.launcher_maintenance import execute
+
+        execute(args[1])
     elif args[0] == "version":
         _print_version()
     elif args[0] in ("-h", "--help", "help"):

@@ -6,9 +6,10 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 import json
+import os
 import ssl
 
-import httpx
+import aiohttp
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
@@ -45,21 +46,25 @@ class QQWebhookIngress:
 
     def __init__(self, upstream_url: str) -> None:
         self.upstream_url = upstream_url.rstrip("/")
-        self._client: httpx.AsyncClient | None = None
+        self._client: aiohttp.ClientSession | None = None
         self._in_flight = 0
         self._in_flight_lock = asyncio.Lock()
         self._counts: Counter[str] = Counter()
 
     @asynccontextmanager
     async def lifespan(self, _app: Starlette) -> AsyncIterator[None]:
-        self._client = httpx.AsyncClient(
-            timeout=httpx.Timeout(UPSTREAM_TIMEOUT_SECONDS),
+        fingerprint = os.getenv("ZHENXUN_QQ_UPSTREAM_CERT_SHA256", "")
+        if self.upstream_url.startswith("https://") and not fingerprint:
+            raise RuntimeError("qq_upstream_certificate_pin_missing")
+        connector = aiohttp.TCPConnector(
+            ssl=aiohttp.Fingerprint(bytes.fromhex(fingerprint)) if fingerprint else True
+        )
+        self._client = aiohttp.ClientSession(
+            connector=connector,
+            timeout=aiohttp.ClientTimeout(total=UPSTREAM_TIMEOUT_SECONDS),
             trust_env=False,
-            follow_redirects=False,
-            # The upstream is always the loopback worker. Its public certificate
-            # commonly does not contain localhost, so hostname verification is
-            # intentionally limited to this private launcher hop.
-            verify=not self.upstream_url.startswith("https://"),
+            auto_decompress=False,
+            cookie_jar=aiohttp.DummyCookieJar(),
         )
         try:
             yield
@@ -67,7 +72,7 @@ class QQWebhookIngress:
             client = self._client
             self._client = None
             if client is not None:
-                await client.aclose()
+                await client.close()
 
     def create_app(self) -> Starlette:
         return Starlette(
@@ -102,11 +107,14 @@ class QQWebhookIngress:
         if client is None:
             return JSONResponse({"status": "degraded"}, status_code=503)
         try:
-            response = await client.get(f"{self.upstream_url}/qq/healthz")
-            ready = (
-                response.status_code == 200 and response.json().get("status") == "ready"
-            )
-        except (httpx.HTTPError, json.JSONDecodeError, ValueError):
+            async with client.get(
+                f"{self.upstream_url}/qq/healthz", allow_redirects=False
+            ) as response:
+                ready = (
+                    response.status == 200
+                    and (await response.json()).get("status") == "ready"
+                )
+        except (aiohttp.ClientError, TimeoutError, json.JSONDecodeError, ValueError):
             ready = False
         return JSONResponse(
             {"status": "ready" if ready else "degraded"},
@@ -156,21 +164,26 @@ class QQWebhookIngress:
                 if name in request.headers
             }
             try:
-                upstream = await client.post(
+                async with client.post(
                     f"{self.upstream_url}/qq/webhook",
-                    content=body,
+                    data=body,
                     headers=headers,
-                )
-            except httpx.TransportError:
+                    allow_redirects=False,
+                ) as upstream:
+                    response_body = await upstream.read()
+                    status = upstream.status
+                    response_headers = {
+                        name: upstream.headers[name]
+                        for name in ("Content-Type", "Content-Encoding")
+                        if name in upstream.headers
+                    }
+            except (aiohttp.ClientError, TimeoutError):
                 self._counts["worker_unavailable"] += 1
                 return Response("Webhook worker unavailable", status_code=503)
-            self._counts[f"upstream_{upstream.status_code}"] += 1
-            response_headers = {}
-            if content_type := upstream.headers.get("content-type"):
-                response_headers["Content-Type"] = content_type
+            self._counts[f"upstream_{status}"] += 1
             return Response(
-                upstream.content,
-                status_code=upstream.status_code,
+                response_body,
+                status_code=status,
                 headers=response_headers,
             )
         finally:
@@ -224,8 +237,20 @@ def build_ingress_config(settings: IngressSettings, app: Starlette) -> uvicorn.C
 
 
 def run_ingress(settings: IngressSettings) -> None:
+    from zhenxun.services.qq_ingress_state import publish_ingress_state
+
+    class IngressServer(uvicorn.Server):
+        async def startup(self, sockets=None):
+            await super().startup(sockets=sockets)
+            if self.started and not self.should_exit:
+                publish_ingress_state("ready", port=settings.listen_port)
+
     proxy = QQWebhookIngress(settings.upstream_url)
-    uvicorn.Server(build_ingress_config(settings, proxy.create_app())).run()
+    publish_ingress_state("starting", port=settings.listen_port)
+    try:
+        IngressServer(build_ingress_config(settings, proxy.create_app())).run()
+    finally:
+        publish_ingress_state("stopped", port=settings.listen_port)
 
 
 __all__ = [

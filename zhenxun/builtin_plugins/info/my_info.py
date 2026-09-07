@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta
 import random
+import time
 
 from nonebot_plugin_uninfo import Uninfo
 from tortoise.expressions import RawSQL
@@ -13,6 +14,7 @@ from zhenxun.models.statistics import Statistics
 from zhenxun.models.user_console import UserConsole
 from zhenxun.services import avatar_service
 from zhenxun.services.db_context import with_db_timeout
+from zhenxun.services.log import logger
 from zhenxun.services.message_load import is_db_unhealthy
 from zhenxun.utils.platform import PlatformUtils
 
@@ -84,20 +86,33 @@ lik2level = {
     0: 0,
 }
 _INFO_DB_TIMEOUT = 3.0
+_last_db_error_log = 0.0
+
+
+class InfoDataUnavailable(RuntimeError):
+    pass
 
 
 async def _read_db(factory, operation: str, default):
-    if is_db_unhealthy():
-        return default
+    del default
+    global _last_db_error_log
     try:
+        if is_db_unhealthy():
+            raise InfoDataUnavailable("my_info_database_unavailable")
         return await with_db_timeout(
             factory(),
             timeout=_INFO_DB_TIMEOUT,
             operation=operation,
             source="my_info",
         )
-    except Exception:
-        return default
+    except Exception as error:
+        now = time.monotonic()
+        if now - _last_db_error_log >= 30:
+            _last_db_error_log = now
+            logger.warning(
+                "个人信息数据暂不可用 | code=my_info_database_unavailable", "MyInfo"
+            )
+        raise InfoDataUnavailable("my_info_database_unavailable") from error
 
 
 def get_level(impression: float) -> int:

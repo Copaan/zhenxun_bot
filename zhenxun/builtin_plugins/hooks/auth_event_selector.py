@@ -264,6 +264,17 @@ async def patched_handle_event(
                 else:
                     selected_matchers = priority_matchers
 
+                async def dispatch_one(coro, matcher, lane):
+                    # Catch inside each child: TaskGroup must not cancel peers
+                    # when one matcher blocks the next priority or fails a Rule.
+                    with catch(
+                        {
+                            stop_propagation: _handle_stop_propagation,
+                            Exception: handle_exception("Error when checking Matcher."),
+                        }
+                    ):
+                        await _run_matcher_with_deadline(anyio_mod, coro, matcher, lane)
+
                 async with anyio_mod.create_task_group() as tg:
                     for matcher in selected_matchers:
                         lane = deps.dispatch_lane_for_matcher(matcher, dispatch_context)
@@ -291,8 +302,7 @@ async def patched_handle_event(
                                         continue
                         matcher_state = deps.build_matcher_state(state)
                         tg.start_soon(
-                            _run_matcher_with_deadline,
-                            anyio_mod,
+                            dispatch_one,
                             deps.run_selected_matcher(
                                 matcher,
                                 bot,

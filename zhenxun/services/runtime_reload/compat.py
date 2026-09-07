@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 import contextlib
+import inspect
 from typing import Any
 
 
@@ -11,6 +12,11 @@ class NoneBotCompatibilityError(RuntimeError):
 
 def verify_nonebot_compatibility() -> None:
     try:
+        from dataclasses import fields
+
+        import nonebot
+        from nonebot.dependencies import Dependent
+        from nonebot.dependencies.utils import get_typed_annotation
         from nonebot.matcher import matchers
         import nonebot.message as message
         import nonebot.plugin as plugin
@@ -25,11 +31,40 @@ def verify_nonebot_compatibility() -> None:
             message._event_postprocessors,
             message._run_preprocessors,
             message._run_postprocessors,
+            get_typed_annotation,
         )
-    except (AttributeError, ImportError) as e:
+        if not {"call", "params", "parameterless"}.issubset(
+            {field.name for field in fields(Dependent)}
+        ):
+            raise NoneBotCompatibilityError("nonebot_dependent_incompatible")
+        if not inspect.iscoroutinefunction(Dependent.__call__) or not callable(
+            get_typed_annotation
+        ):
+            raise NoneBotCompatibilityError("nonebot_dependent_incompatible")
+        for name in (
+            "_event_preprocessors",
+            "_event_postprocessors",
+            "_run_preprocessors",
+            "_run_postprocessors",
+        ):
+            if not isinstance(getattr(message, name, None), set):
+                raise NoneBotCompatibilityError("nonebot_hook_registry_incompatible")
+        driver = nonebot.get_driver()
+        for name in ("_bot_connection_hook", "_bot_disconnection_hook"):
+            if not isinstance(getattr(driver, name, None), set):
+                raise NoneBotCompatibilityError("nonebot_hook_registry_incompatible")
+        for name in ("_startup_funcs", "_ready_funcs", "_shutdown_funcs"):
+            if not isinstance(getattr(driver._lifespan, name, None), list):
+                raise NoneBotCompatibilityError("nonebot_lifespan_incompatible")
+    except (AttributeError, ImportError, TypeError, ValueError) as e:
         raise NoneBotCompatibilityError("nonebot_private_api_missing") from e
     if not all(container is not None for container in required):
         raise NoneBotCompatibilityError("nonebot_private_api_invalid")
+    dispatch = getattr(message, "check_and_run_matcher", None)
+    if not callable(dispatch) or not {"Matcher", "bot", "event", "state"}.issubset(
+        inspect.signature(dispatch).parameters
+    ):
+        raise NoneBotCompatibilityError("nonebot_matcher_dispatch_incompatible")
 
 
 def _dependent_module(item: Any) -> str:

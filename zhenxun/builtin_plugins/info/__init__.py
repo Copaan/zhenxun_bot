@@ -10,7 +10,7 @@ from zhenxun.services.log import logger
 from zhenxun.utils.depends import UserName
 from zhenxun.utils.message import MessageUtils
 
-from .my_info import get_user_info
+from .my_info import InfoDataUnavailable, get_user_info
 
 __plugin_meta__ = PluginMetadata(
     name="查看信息",
@@ -52,6 +52,10 @@ async def _(
         )
         await MessageUtils.build_message(result).send(at_sender=True)
         logger.info("获取用户信息", arparma.header_result, session=session)
+    except InfoDataUnavailable:
+        await MessageUtils.build_message(
+            "个人信息数据暂不可用，请稍后重试。发言趋势未按零数据展示。"
+        ).finish(reply_to=True)
     except TimeoutError as e:
         logger.error("获取用户信息超时", arparma.header_result, session=session, e=e)
         await MessageUtils.build_message("获取用户信息超时...").finish(reply_to=True)

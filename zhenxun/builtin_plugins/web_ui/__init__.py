@@ -171,9 +171,13 @@ async def _(context):
                     from zhenxun.update_service import finalize_applied_update
 
                     finalize_applied_update()
-                from zhenxun.configs.webui_tls import load_webui_tls_settings
+                from zhenxun.configs.webui_tls import runtime_webui_settings
+                from zhenxun.services.webui_http_sidecar_state import (
+                    read_http_sidecar_state,
+                )
 
-                tls_settings = load_webui_tls_settings()
+                tls_settings = runtime_webui_settings()
+                http_state = read_http_sidecar_state()
                 emit_webui_console_banner(
                     str(driver.config.host),
                     int(driver.config.port),
@@ -184,7 +188,9 @@ async def _(context):
                     http_compatibility_port=(
                         tls_settings.redirect_port
                         if tls_settings.http_sidecar_enabled
-                        and os.getenv("ZHENXUN_LAUNCHER_PID")
+                        and http_state.get("state") == "ready"
+                        and http_state.get("mode") == tls_settings.http_mode
+                        and http_state.get("port") == tls_settings.redirect_port
                         else None
                     ),
                 )

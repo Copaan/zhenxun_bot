@@ -53,19 +53,47 @@ def write_http_sidecar_state(**changes: Any) -> dict[str, Any]:
 
 
 def read_http_sidecar_state() -> dict[str, Any]:
+    expected_boot = os.getenv("ZHENXUN_LAUNCHER_BOOT_ID", "")
+    if not expected_boot:
+        return {"state": "disabled", "mode": "disabled"}
     value = read_json_locked(_state_path(), {}, quarantine_corrupt=True)
     if not isinstance(value, dict):
         return {}
-    pid = value.get("pid")
-    if value.get("state") in {"starting", "ready"} and isinstance(pid, int):
-        if not psutil.pid_exists(pid):
+    if value.get("launcher_boot_id") != expected_boot:
+        return {"state": "unknown", "last_error": "listener_identity_unverified"}
+    if value.get("state") in {"starting", "ready"}:
+        if not listener_identity_matches(value):
             value = {
                 **value,
                 "state": "degraded",
                 "active_connections": 0,
-                "last_error": value.get("last_error") or "process_not_running",
+                "last_error": "listener_identity_unverified",
             }
     return value
+
+
+def listener_identity() -> dict[str, Any]:
+    return {
+        "pid": os.getpid(),
+        "process_created_at": psutil.Process().create_time(),
+        "launcher_boot_id": os.getenv("ZHENXUN_LAUNCHER_BOOT_ID", ""),
+    }
+
+
+def listener_identity_matches(value: dict[str, Any]) -> bool:
+    expected_boot = os.getenv("ZHENXUN_LAUNCHER_BOOT_ID", "")
+    if (
+        not expected_boot
+        or value.get("launcher_boot_id") != expected_boot
+        or not value.get("startup_id")
+    ):
+        return False
+    try:
+        pid = int(value["pid"])
+        created = float(value["process_created_at"])
+        return pid > 0 and abs(psutil.Process(pid).create_time() - created) < 0.01
+    except (psutil.Error, KeyError, ValueError, TypeError):
+        return False
 
 
 def reset_http_sidecar_state(*, mode: str, port: int | None) -> None:

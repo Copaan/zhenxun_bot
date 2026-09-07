@@ -165,9 +165,29 @@ def validate_webui_tls_settings(
             probe.close()
 
 
+_runtime_settings: WebUITLSSettings | None = None
+_runtime_certificate: bytes | None = None
+
+
+def bind_runtime_webui_settings(settings: WebUITLSSettings) -> None:
+    global _runtime_settings, _runtime_certificate
+    _runtime_settings = settings
+    _runtime_certificate = (
+        Path(settings.certfile).read_bytes() if settings.enabled else None
+    )
+
+
+def runtime_webui_settings() -> WebUITLSSettings:
+    return _runtime_settings or load_webui_tls_settings()
+
+
+def runtime_webui_certificate() -> bytes | None:
+    return _runtime_certificate
+
+
 def current_webui_scheme() -> str:
     try:
-        return load_webui_tls_settings().scheme
+        return runtime_webui_settings().scheme
     except (OSError, WebUITLSConfigError):
         return "http"
 

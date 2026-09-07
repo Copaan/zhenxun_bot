@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Callable, Coroutine
 from concurrent.futures import Future as ConcurrentFuture
 import contextlib
+from contextvars import Context, ContextVar
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -32,6 +33,7 @@ from zhenxun.services.lifecycle import (
 )
 from zhenxun.services.lifecycle.deadline import (
     check_budget,
+    current_budget,
     remaining_timeout,
     shutdown_budget,
 )
@@ -63,7 +65,17 @@ from .compat import (
     verify_nonebot_compatibility,
 )
 from .models import ApplyMode, PluginUnit, ReloadClassification, RuntimeOperation
-from .ownership import current_owner, import_owner, owner_context, resource_context
+from .ownership import (
+    LifecycleWork,
+    current_owner,
+    import_owner,
+    initialization_retainer,
+    lifecycle_work_context,
+    lifecycle_work_phase,
+    owner_context,
+    resource_context,
+)
+from .signatures import async_callable, typed_wraps
 
 _INDEX_FILE = Path("data/runtime/lifecycle-index-v2.json")
 _TASK_CANCEL_TIMEOUT = 2.0
@@ -120,6 +132,7 @@ class PluginReloadCheckpoint:
     modules: dict[str, ModuleType]
     incarnations: dict[str, PluginIncarnation]
     incarnation_history: list[PluginIncarnation]
+    incarnation_states: dict[str, LeaseState]
     unit_state: dict[str, dict[str, Any]]
     priority_entries: list[tuple[Any, int, int, Callable, Any]]
     plugin_init_entries: dict[str, Any]
@@ -147,6 +160,8 @@ class PluginRuntimeManager:
         self.last_operation: RuntimeOperation | None = None
         self.webui_revision = ""
         self._owned_tasks: dict[str, set[asyncio.Task[Any]]] = defaultdict(set)
+        self._entry_tasks: dict[str, dict[asyncio.Task, int]] = defaultdict(dict)
+        self._entry_calls: dict[tuple, int] = {}
         self._owned_threads: dict[str, set[threading.Thread]] = defaultdict(set)
         self._owned_processes: dict[str, set[subprocess.Popen[Any]]] = defaultdict(set)
         self._owned_handles: dict[str, weakref.WeakSet[asyncio.Handle]] = defaultdict(
@@ -174,6 +189,10 @@ class PluginRuntimeManager:
         )
         self._pending_env_dependencies: dict[str, set[str]] = defaultdict(set)
         self._original_matcher_run: Callable[..., Any] | None = None
+        self._original_matcher_dispatch: Callable[..., Any] | None = None
+        self._matcher_execution: ContextVar[Any] = ContextVar(
+            "plugin_matcher_execution", default=None
+        )
         self._original_matcher_new: Callable[..., Any] | None = None
         self._original_bot_api_hooks: dict[str, Callable[..., Any]] = {}
         self._original_asgi_methods: dict[str, Callable[..., Any]] = {}
@@ -202,12 +221,18 @@ class PluginRuntimeManager:
         self._content_changes_released.set()
         self._classification_cache = self._load_index_cache()
         self._original_thread_start: Callable[..., Any] | None = None
+        self._original_anyio_worker = None
+        self._wrapped_anyio_worker = None
         self._original_popen_init: Callable[..., Any] | None = None
         self._internal_lifecycle_hooks: list[Callable[..., Any]] = []
         self._installed = False
         self._index_ready = asyncio.Event()
         self._incarnations: dict[str, PluginIncarnation] = {}
         self._incarnation_history: list[PluginIncarnation] = []
+        self._candidate_roots: set[str] = set()
+        self._initialization_work: dict[str, list[LifecycleWork]] = defaultdict(list)
+        self._hook_failures: deque[dict[str, Any]] = deque(maxlen=64)
+        self._entry_diagnostics: dict[str, int] = defaultdict(int)
         self._shared_dependency_evidence: dict[str, list[str]] = {}
         self._integrity_failures: set[str] = set()
 
@@ -467,11 +492,18 @@ class PluginRuntimeManager:
         return units, module_to_unit
 
     def _commit_loaded_plugin_index(
-        self, units: dict[str, PluginUnit], module_to_unit: dict[str, str]
+        self,
+        units: dict[str, PluginUnit],
+        module_to_unit: dict[str, str],
+        *,
+        activate: bool = True,
     ) -> None:
         commit_started = time.monotonic()
         self.units = units
         self.module_to_unit = module_to_unit
+        self._candidate_roots = {
+            self._root_owner(root) or root for root in self._candidate_roots
+        }
         for unit in self.units.values():
             incarnation = self._incarnation_for_unit(unit)
             if incarnation is None or incarnation.lease_state in {
@@ -481,7 +513,8 @@ class PluginRuntimeManager:
                 incarnation = self._new_incarnation(unit.plugin_id)
             incarnation.plugin_id = unit.plugin_id
             incarnation.source_digest = unit.fingerprint
-            incarnation.lease_state = LeaseState.ACTIVE
+            if activate:
+                incarnation.lease_state = LeaseState.ACTIVE
             self._incarnations[unit.plugin_id] = incarnation
             for module_name in unit.module_names:
                 module_incarnation = self._incarnations.get(module_name)
@@ -491,10 +524,26 @@ class PluginRuntimeManager:
                 }:
                     self._incarnations[module_name] = incarnation
             unit.incarnation_id = incarnation.incarnation_id
+        for plugin in get_loaded_plugins():
+            incarnation = self._incarnations.get(plugin.id_) or self._incarnations.get(
+                plugin.module_name
+            )
+            if incarnation is None:
+                incarnation = self._ensure_incarnation(plugin.id_)
+            self._incarnations[plugin.id_] = incarnation
+            self._incarnations[plugin.module_name] = incarnation
+            if activate and incarnation.lease_state is LeaseState.PREPARED:
+                incarnation.lease_state = LeaseState.ACTIVE
+            for matcher in plugin.matcher:
+                if not getattr(matcher, "__zhenxun_incarnation_id__", None):
+                    matcher.__zhenxun_registration_owner__ = plugin.id_
+                    matcher.__zhenxun_incarnation_id__ = incarnation.incarnation_id
         self._collect_dependencies()
         self._collect_runtime_boundaries()
+        observation = self._lifecycle_observation_index()
         for unit in self.units.values():
-            self._observe_plugin_scope(unit)
+            if unit.plugin_id not in self._candidate_roots:
+                self._observe_plugin_scope(unit, observation=observation)
         self.webui_revision = self._read_webui_revision()
         startup_coordinator.record_operation(
             "runtime_index:dependency_commit",
@@ -511,8 +560,10 @@ class PluginRuntimeManager:
             (time.monotonic() - persist_started) * 1000,
         )
 
-    def discover_loaded_plugins(self) -> None:
-        self._commit_loaded_plugin_index(*self._build_loaded_plugin_index())
+    def discover_loaded_plugins(self, *, activate: bool = True) -> None:
+        self._commit_loaded_plugin_index(
+            *self._build_loaded_plugin_index(), activate=activate
+        )
 
     async def discover_loaded_plugins_async(self) -> None:
         index = await asyncio.to_thread(self._build_loaded_plugin_index)
@@ -586,6 +637,7 @@ class PluginRuntimeManager:
 
     def _install_matcher_execution_wrapper(self) -> None:
         from nonebot.matcher import Matcher
+        import nonebot.message as message
 
         if self._original_matcher_run:
             return
@@ -593,47 +645,123 @@ class PluginRuntimeManager:
         self._original_matcher_run = original
         manager = self
 
-        async def run_with_owner(matcher, *args, **kwargs):
-            source = getattr(matcher.__class__, "_source", None)
-            plugin_id = getattr(source, "plugin_id", None)
-            owner = plugin_id and manager._root_owner(plugin_id)
-            incarnation_id = getattr(
-                matcher.__class__, "__zhenxun_incarnation_id__", None
-            )
-            if incarnation_id and not manager._lease_is_current(
-                owner or str(plugin_id), incarnation_id
-            ):
-                return None
-            if plugin_id:
-                from zhenxun.services.startup_load import startup_load_planner
-
-                startup_owner = (
-                    startup_load_planner.owner_for_module(
-                        getattr(source, "module_name", "") or ""
+        @wraps(message.check_and_run_matcher)
+        async def dispatch_with_owner(Matcher, *args, **kwargs):
+            with manager._matcher_admission(Matcher) as admitted:
+                if admitted:
+                    return await manager._original_matcher_dispatch(
+                        Matcher, *args, **kwargs
                     )
-                    or str(plugin_id).split(":", 1)[0]
-                )
-                if startup_owner in startup_load_planner.failed_plugins or (
-                    startup_owner in startup_load_planner.warming_plugins
-                ):
-                    return None
-            unit = manager.units.get(owner or "")
-            if unit and unit.draining:
-                return None
-            if unit:
-                unit.in_flight += 1
-                manager._drained_event(unit.plugin_id).clear()
-            try:
-                with owner_context(owner):
+            return None
+
+        self._original_matcher_dispatch = message.check_and_run_matcher
+        dispatch_with_owner.__zhenxun_runtime_owner__ = self
+        message.check_and_run_matcher = dispatch_with_owner
+
+        @wraps(original)
+        async def run_with_owner(matcher, *args, **kwargs):
+            with manager._matcher_admission(type(matcher)) as admitted:
+                if admitted:
                     return await original(matcher, *args, **kwargs)
-            finally:
-                if unit:
-                    unit.in_flight = max(0, unit.in_flight - 1)
-                    if not unit.in_flight:
-                        manager._drained_event(unit.plugin_id).set()
+            return None
 
         run_with_owner.__zhenxun_runtime_owner__ = self
         Matcher.run = run_with_owner
+
+    @contextlib.contextmanager
+    def _entry_admission(self, owner, incarnation_id):
+        if not owner:
+            yield True
+            return
+        task = asyncio.current_task()
+        key = (owner, incarnation_id, task)
+        nested = key in self._entry_calls
+        root = self._root_owner(owner) or owner
+        unit = self.units.get(root)
+        if not nested and (
+            (incarnation_id and not self._lease_is_current(owner, incarnation_id))
+            or (unit and unit.draining)
+        ):
+            self._entry_diagnostics["plugin_entry_not_admitted"] += 1
+            yield False
+            return
+        self._entry_calls[key] = self._entry_calls.get(key, 0) + 1
+        release = self._retain_activity(owner) if not nested else lambda: None
+        tasks = self._entry_tasks[owner]
+        tasks[task] = tasks.get(task, 0) + 1
+        try:
+            with owner_context(owner):
+                yield True
+        finally:
+            self._entry_calls[key] -= 1
+            if not self._entry_calls[key]:
+                del self._entry_calls[key]
+            tasks[task] -= 1
+            if not tasks[task]:
+                del tasks[task]
+            if not tasks:
+                self._entry_tasks.pop(owner, None)
+            release()
+
+    def _retain_activity(self, owner):
+        unit = self.units.get(self._root_owner(owner) or owner)
+        if unit:
+            unit.in_flight += 1
+            self._drained_event(unit.plugin_id).clear()
+        released = False
+
+        def release():
+            nonlocal released
+            if released:
+                return
+            released = True
+            if unit:
+                unit.in_flight -= 1
+                if not unit.in_flight:
+                    self._drained_event(unit.plugin_id).set()
+
+        return release
+
+    @contextlib.contextmanager
+    def _matcher_admission(self, matcher):
+        execution = self._matcher_execution.get()
+        task = asyncio.current_task()
+        if execution is not None and execution[:2] == (matcher, task):
+            yield True
+            return
+        source = getattr(matcher, "_source", None)
+        owner = getattr(matcher, "__zhenxun_registration_owner__", None) or getattr(
+            source, "plugin_id", None
+        )
+        incarnation_id = getattr(matcher, "__zhenxun_incarnation_id__", None)
+        root = self._root_owner(owner) or owner if owner else None
+        unit = self.units.get(root or "")
+        if owner:
+            from zhenxun.services.startup_load import startup_load_planner
+
+            startup_owner = (
+                startup_load_planner.owner_for_module(
+                    getattr(source, "module_name", "") or ""
+                )
+                or str(owner).split(":", 1)[0]
+            )
+            if (
+                (incarnation_id and not self._lease_is_current(owner, incarnation_id))
+                or startup_owner in startup_load_planner.failed_plugins
+                or startup_owner in startup_load_planner.warming_plugins
+                or (unit and unit.draining)
+            ):
+                self._entry_diagnostics["plugin_entry_not_admitted"] += 1
+                yield False
+                return
+        if incarnation_id is None:
+            self._entry_diagnostics["plugin_entry_ownership_unobserved"] += 1
+        token = self._matcher_execution.set((matcher, task, owner, incarnation_id))
+        try:
+            with self._entry_admission(owner, incarnation_id) as admitted:
+                yield admitted
+        finally:
+            self._matcher_execution.reset(token)
 
     def _install_matcher_registration_tracking(self) -> None:
         from nonebot.matcher import Matcher
@@ -645,9 +773,20 @@ class PluginRuntimeManager:
         manager = self
 
         def tracked_new(cls, *args, **kwargs):
-            if owner := current_owner():
+            execution = manager._matcher_execution.get()
+            task = None
+            with contextlib.suppress(RuntimeError):
+                task = asyncio.current_task()
+            if execution and execution[1] is task:
+                owner, inherited_id = execution[2:]
+            else:
+                owner, inherited_id = current_owner(), None
+            if owner:
                 incarnation = manager._ensure_incarnation(owner)
-                if incarnation.lease_state in {LeaseState.REVOKED, LeaseState.FAILED}:
+                if incarnation.lease_state in {
+                    LeaseState.REVOKED,
+                    LeaseState.FAILED,
+                } or (inherited_id and incarnation.incarnation_id != inherited_id):
                     raise RuntimeError("plugin_incarnation_revoked")
             else:
                 incarnation = None
@@ -657,6 +796,7 @@ class PluginRuntimeManager:
             ):
                 matcher = original(cls, *args, **kwargs)
             if incarnation is not None:
+                setattr(matcher, "__zhenxun_registration_owner__", owner)
                 setattr(
                     matcher,
                     "__zhenxun_incarnation_id__",
@@ -742,18 +882,18 @@ class PluginRuntimeManager:
             )
             wrapped = func
             incarnation = manager._ensure_incarnation(owner) if owner else None
-            if owner and inspect.iscoroutinefunction(func):
+            if owner and async_callable(func):
 
                 @wraps(func)
                 async def async_hook(*args, **kwargs):
                     if (
                         hook_type is not PriorityLifecycleType.SHUTDOWN
                         and incarnation
-                        and not manager._lease_is_current(
-                            owner, incarnation.incarnation_id
+                        and not manager._hook_lease_is_current(
+                            owner, incarnation.incarnation_id, "on_startup"
                         )
                     ):
-                        return None
+                        raise RuntimeError("plugin_initialization_not_admitted")
                     manager._install_task_factory()
                     runtime_owner = manager._root_owner(owner) or owner
                     unit = manager.units.get(runtime_owner)
@@ -761,7 +901,16 @@ class PluginRuntimeManager:
                         unit.in_flight += 1
                         manager._drained_event(unit.plugin_id).clear()
                     try:
-                        with owner_context(runtime_owner):
+                        with (
+                            owner_context(owner),
+                            lifecycle_work_context(
+                                owner,
+                                incarnation.incarnation_id,
+                                "on_shutdown"
+                                if hook_type is PriorityLifecycleType.SHUTDOWN
+                                else "on_startup",
+                            ),
+                        ):
                             return await func(*args, **kwargs)
                     finally:
                         if unit:
@@ -777,13 +926,22 @@ class PluginRuntimeManager:
                     if (
                         hook_type is not PriorityLifecycleType.SHUTDOWN
                         and incarnation
-                        and not manager._lease_is_current(
-                            owner, incarnation.incarnation_id
+                        and not manager._hook_lease_is_current(
+                            owner, incarnation.incarnation_id, "on_startup"
                         )
                     ):
-                        return None
+                        raise RuntimeError("plugin_initialization_not_admitted")
                     manager._install_task_factory()
-                    with owner_context(manager._root_owner(owner) or owner):
+                    with (
+                        owner_context(owner),
+                        lifecycle_work_context(
+                            owner,
+                            incarnation.incarnation_id,
+                            "on_shutdown"
+                            if hook_type is PriorityLifecycleType.SHUTDOWN
+                            else "on_startup",
+                        ),
+                    ):
                         return func(*args, **kwargs)
 
                 wrapped = sync_hook
@@ -808,13 +966,23 @@ class PluginRuntimeManager:
         async def tracked_install(cls, module_path: str, **kwargs):
             manager._install_task_factory()
             owner = manager.owner_for_module(module_path) or module_path
-            with owner_context(manager._root_owner(owner) or owner):
+            incarnation = manager._ensure_incarnation(owner)
+            with (
+                owner_context(owner),
+                lifecycle_work_context(owner, incarnation.incarnation_id, "on_startup"),
+            ):
                 return await original_install(cls, module_path, **kwargs)
 
         async def tracked_remove(cls, module_path: str, **kwargs):
             manager._install_task_factory()
             owner = manager.owner_for_module(module_path) or module_path
-            with owner_context(manager._root_owner(owner) or owner):
+            incarnation = manager._ensure_incarnation(owner)
+            with (
+                owner_context(owner),
+                lifecycle_work_context(
+                    owner, incarnation.incarnation_id, "on_shutdown"
+                ),
+            ):
                 return await original_remove(cls, module_path, **kwargs)
 
         async def tracked_install_all(cls):
@@ -868,7 +1036,7 @@ class PluginRuntimeManager:
             wrapped = func
             incarnation = manager._ensure_incarnation(owner) if owner else None
             if owner:
-                if inspect.iscoroutinefunction(func):
+                if async_callable(func):
 
                     @wraps(func)
                     async def async_job(*job_args, **job_kwargs):
@@ -916,6 +1084,8 @@ class PluginRuntimeManager:
     def _install_processor_tracking(self) -> None:
         import nonebot.message as message
 
+        from .entries import manage_registration
+
         manager = self
         for name in (
             "event_preprocessor",
@@ -927,45 +1097,41 @@ class PluginRuntimeManager:
             if getattr(original, "__zhenxun_runtime_wrapped__", False):
                 continue
 
-            def make_decorator(decorator):
+            def make_decorator(decorator, registry_name):
                 @wraps(decorator)
                 def tracked(func):
                     owner = current_owner()
                     if not owner:
                         return decorator(func)
                     incarnation = manager._ensure_incarnation(owner)
-                    if inspect.iscoroutinefunction(func):
+                    if async_callable(func):
 
-                        @wraps(func)
+                        @typed_wraps(func)
                         async def wrapped(*args, **kwargs):
-                            if not manager._lease_is_current(
-                                owner, incarnation.incarnation_id
-                            ):
-                                return None
-                            with owner_context(manager._root_owner(owner) or owner):
-                                return await func(*args, **kwargs)
+                            return await func(*args, **kwargs)
 
                     else:
 
-                        @wraps(func)
+                        @typed_wraps(func)
                         def wrapped(*args, **kwargs):
-                            if not manager._lease_is_current(
-                                owner, incarnation.incarnation_id
-                            ):
-                                return None
-                            with owner_context(manager._root_owner(owner) or owner):
-                                return func(*args, **kwargs)
+                            return func(*args, **kwargs)
 
                     with provider_capture(
                         manager._root_owner(owner) or owner, incarnation.incarnation_id
                     ):
-                        return decorator(wrapped)
+                        registry = getattr(message, registry_name)
+                        before = {id(item) for item in registry}
+                        result = decorator(wrapped)
+                        manage_registration(
+                            registry, before, manager, owner, incarnation.incarnation_id
+                        )
+                        return result
 
                 tracked.__zhenxun_runtime_wrapped__ = True
                 return tracked
 
             nonebot_original = getattr(nonebot, name, None)
-            tracked_decorator = make_decorator(original)
+            tracked_decorator = make_decorator(original, f"_{name}s")
             tracked_decorator.__zhenxun_runtime_owner__ = self
             self._original_processor_hooks[name] = (original, nonebot_original)
             setattr(message, name, tracked_decorator)
@@ -973,6 +1139,8 @@ class PluginRuntimeManager:
                 setattr(nonebot, name, tracked_decorator)
 
     def _install_driver_hook_tracking(self, driver: Any) -> None:
+        from .entries import manage_registration
+
         manager = self
         for name in (
             "on_startup",
@@ -991,9 +1159,9 @@ class PluginRuntimeManager:
                 if not owner:
                     return _original(func)
                 incarnation = manager._ensure_incarnation(owner)
-                if inspect.iscoroutinefunction(func):
+                if async_callable(func):
 
-                    @wraps(func)
+                    @typed_wraps(func)
                     async def wrapped(*args, **kwargs):
                         if (
                             _hook_name != "on_shutdown"
@@ -1001,21 +1169,31 @@ class PluginRuntimeManager:
                                 owner, incarnation.incarnation_id, _hook_name
                             )
                         ):
+                            if _hook_name in {"on_startup", "on_ready"}:
+                                raise RuntimeError("plugin_initialization_not_admitted")
                             return None
                         root_owner = manager._root_owner(owner) or owner
                         try:
-                            with owner_context(root_owner):
+                            with (
+                                owner_context(owner),
+                                lifecycle_work_context(
+                                    owner, incarnation.incarnation_id, _hook_name
+                                ),
+                            ):
                                 return await func(*args, **kwargs)
                         except Exception as error:
                             if manager._isolate_plugin_hook_error(
-                                root_owner, _hook_name, error
+                                root_owner,
+                                _hook_name,
+                                error,
+                                bot=kwargs.get("bot") or (args[0] if args else None),
                             ):
                                 return None
                             raise
 
                 else:
 
-                    @wraps(func)
+                    @typed_wraps(func)
                     def wrapped(*args, **kwargs):
                         if (
                             _hook_name != "on_shutdown"
@@ -1023,14 +1201,24 @@ class PluginRuntimeManager:
                                 owner, incarnation.incarnation_id, _hook_name
                             )
                         ):
+                            if _hook_name in {"on_startup", "on_ready"}:
+                                raise RuntimeError("plugin_initialization_not_admitted")
                             return None
                         root_owner = manager._root_owner(owner) or owner
                         try:
-                            with owner_context(root_owner):
+                            with (
+                                owner_context(owner),
+                                lifecycle_work_context(
+                                    owner, incarnation.incarnation_id, _hook_name
+                                ),
+                            ):
                                 return func(*args, **kwargs)
                         except Exception as error:
                             if manager._isolate_plugin_hook_error(
-                                root_owner, _hook_name, error
+                                root_owner,
+                                _hook_name,
+                                error,
+                                bot=kwargs.get("bot") or (args[0] if args else None),
                             ):
                                 return None
                             raise
@@ -1038,7 +1226,24 @@ class PluginRuntimeManager:
                 with provider_capture(
                     manager._root_owner(owner) or owner, incarnation.incarnation_id
                 ):
-                    return _original(wrapped)
+                    registry = (
+                        getattr(driver, "_bot_connection_hook")
+                        if _hook_name == "on_bot_connect"
+                        else getattr(driver, "_bot_disconnection_hook")
+                        if _hook_name == "on_bot_disconnect"
+                        else None
+                    )
+                    before = (
+                        {id(item) for item in registry}
+                        if registry is not None
+                        else set()
+                    )
+                    result = _original(wrapped)
+                    if registry is not None:
+                        manage_registration(
+                            registry, before, manager, owner, incarnation.incarnation_id
+                        )
+                    return result
 
             tracked.__zhenxun_runtime_wrapped__ = True
             tracked.__zhenxun_runtime_owner__ = self
@@ -1046,8 +1251,38 @@ class PluginRuntimeManager:
             setattr(driver, name, tracked)
 
     def _isolate_plugin_hook_error(
-        self, owner: str, hook_name: str, error: Exception
+        self, owner: str, hook_name: str, error: Exception, *, bot=None
     ) -> bool:
+        record = {
+            "plugin_id": owner,
+            "phase": hook_name,
+            "code": "plugin_hook_invocation_failed",
+            "error_type": type(error).__name__,
+            "occurred_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if bot is not None and hasattr(bot, "self_id"):
+            from zhenxun.services.message_admission import connection_epochs
+            from zhenxun.utils.platform import PlatformUtils
+
+            scope = PlatformUtils.get_platform_scope(bot)
+            epoch = connection_epochs.get(bot, scope)
+            record.update(
+                {
+                    "bot_id": str(bot.self_id),
+                    "platform_scope": scope,
+                    "connection_id": epoch.connection_id if epoch else None,
+                }
+            )
+        self._hook_failures.append(record)
+        if (
+            hook_name not in {"on_startup", "on_ready"}
+            or runtime_mutation_coordinator.reentrant
+            or active_undo.get() is not None
+            or owner in self._candidate_roots
+        ):
+            # NoneBot reports connection errors for that invocation; shutdown and
+            # transactional initialization must propagate to their supervisors.
+            return False
         try:
             from zhenxun.services.startup_load import startup_load_planner
 
@@ -1093,9 +1328,9 @@ class PluginRuntimeManager:
                 if not owner:
                     return _original(cls, func)
                 incarnation = manager._ensure_incarnation(owner)
-                if inspect.iscoroutinefunction(func):
+                if async_callable(func):
 
-                    @wraps(func)
+                    @typed_wraps(func)
                     async def wrapped(*args, **kwargs):
                         if not manager._lease_is_current(
                             owner, incarnation.incarnation_id
@@ -1106,7 +1341,7 @@ class PluginRuntimeManager:
 
                 else:
 
-                    @wraps(func)
+                    @typed_wraps(func)
                     def wrapped(*args, **kwargs):
                         if not manager._lease_is_current(
                             owner, incarnation.incarnation_id
@@ -1154,9 +1389,9 @@ class PluginRuntimeManager:
                         # include_router() registers the endpoint again. Reuse the
                         # existing lease proxy instead of nesting another proxy.
                         pass
-                    elif inspect.iscoroutinefunction(endpoint):
+                    elif async_callable(endpoint):
 
-                        @wraps(endpoint)
+                        @typed_wraps(endpoint, asgi=True)
                         async def wrapped_endpoint(
                             *call_args, _endpoint=endpoint, **call_kwargs
                         ):
@@ -1239,6 +1474,53 @@ class PluginRuntimeManager:
             target.require = tracked_require
 
     def _install_thread_process_tracking(self) -> None:
+        if self._original_anyio_worker is None:
+            from anyio._backends._asyncio import AsyncIOBackend
+
+            original_worker = AsyncIOBackend.run_sync_in_worker_thread
+            self._original_anyio_worker = AsyncIOBackend.__dict__[
+                "run_sync_in_worker_thread"
+            ]
+            manager = self
+
+            async def tracked_worker(cls, func, args, *options, **kwargs):
+                owner = current_owner()
+                if not owner:
+                    return await original_worker(func, args, *options, **kwargs)
+                incarnation = manager._ensure_incarnation(owner)
+                phase = lifecycle_work_phase(owner, incarnation.incarnation_id)
+                completion = ConcurrentFuture()
+                owned = manager._owned_executor_futures[owner]
+                owned.add(completion)
+                loop = asyncio.get_running_loop()
+
+                def execute():
+                    if not completion.set_running_or_notify_cancel():
+                        return None
+                    try:
+                        check_budget()
+                        if not manager._work_lease_is_current(
+                            owner, incarnation.incarnation_id, phase
+                        ):
+                            return None
+                        with resource_context(owner):
+                            return func(*args)
+                    finally:
+                        completion.set_result(None)
+
+                def completed(_):
+                    with contextlib.suppress(RuntimeError):
+                        loop.call_soon_threadsafe(owned.discard, completion)
+
+                completion.add_done_callback(completed)
+                try:
+                    return await original_worker(execute, (), *options, **kwargs)
+                finally:
+                    # Cancels queued work only; running work remains owned until exit.
+                    completion.cancel()
+
+            self._wrapped_anyio_worker = classmethod(tracked_worker)
+            AsyncIOBackend.run_sync_in_worker_thread = self._wrapped_anyio_worker
         if not self._original_thread_start:
             original_start = threading.Thread.start
             self._original_thread_start = original_start
@@ -1247,6 +1529,26 @@ class PluginRuntimeManager:
             @wraps(original_start)
             def tracked_start(thread, *args, **kwargs):
                 owner = current_owner()
+                from concurrent.futures.thread import _worker
+
+                from anyio._backends._asyncio import WorkerThread
+
+                shared_worker = isinstance(thread, WorkerThread)
+                if getattr(thread, "_target", None) is _worker:
+                    pool_ref = getattr(thread, "_args", (None,))[0]
+                    pool = pool_ref() if callable(pool_ref) else None
+                    try:
+                        shared_worker = (
+                            pool is asyncio.get_running_loop()._default_executor
+                        )
+                    except RuntimeError:
+                        pass
+                if shared_worker:
+                    from zhenxun.services.shared_workers import register_shared_worker
+
+                    register_shared_worker(thread)
+                    # Ownership belongs to each submission, not the pool's first caller.
+                    return Context().run(original_start, thread, *args, **kwargs)
                 incarnation = (
                     manager._incarnations.get(manager._root_owner(owner) or owner)
                     if owner
@@ -1305,6 +1607,16 @@ class PluginRuntimeManager:
             subprocess.Popen.__init__ = tracked_init
 
     def _restore_thread_process_tracking(self) -> None:
+        if self._original_anyio_worker is not None:
+            from anyio._backends._asyncio import AsyncIOBackend
+
+            if (
+                AsyncIOBackend.__dict__["run_sync_in_worker_thread"]
+                is self._wrapped_anyio_worker
+            ):
+                AsyncIOBackend.run_sync_in_worker_thread = self._original_anyio_worker
+            self._original_anyio_worker = None
+            self._wrapped_anyio_worker = None
         current_start = threading.Thread.start
         if (
             getattr(current_start, "__zhenxun_runtime_owner__", None) is self
@@ -1337,6 +1649,10 @@ class PluginRuntimeManager:
 
         if self._original_matcher_run is not None and owned(Matcher.run):
             Matcher.run = self._original_matcher_run
+        if self._original_matcher_dispatch is not None and owned(
+            message.check_and_run_matcher
+        ):
+            message.check_and_run_matcher = self._original_matcher_dispatch
         if self._original_matcher_new is not None and owned(Matcher.new):
             Matcher.new = classmethod(self._original_matcher_new)
         if self._original_get_config is not None and owned(Config.get_config):
@@ -1404,6 +1720,7 @@ class PluginRuntimeManager:
                 setattr(target, name, original)
 
         self._original_matcher_run = None
+        self._original_matcher_dispatch = None
         self._original_matcher_new = None
         self._original_get_config = None
         self._original_add_plugin_config = None
@@ -1710,6 +2027,68 @@ class PluginRuntimeManager:
             incarnation = self._new_incarnation(owner)
         return incarnation
 
+    def _prepare_candidate(self, owner: str) -> PluginIncarnation:
+        # Checkpoints retain the old objects; new imports must not inherit their
+        # revoked aliases, including child plugin IDs and full module paths.
+        root = self._root_owner(owner) or owner
+        self._candidate_roots.add(root)
+        for alias in list(self._incarnations):
+            if (
+                alias == owner
+                or self._root_owner(alias) == root
+                or alias.startswith(f"{owner}:")
+                or alias.startswith(f"{owner}.")
+            ):
+                self._incarnations.pop(alias)
+        return self._new_incarnation(owner)
+
+    def _publish_candidates(self, roots: set[str]) -> None:
+        self._check_initialization_work(roots)
+        for alias, incarnation in self._incarnations.items():
+            if (self._root_owner(alias) or alias) in roots:
+                if incarnation.lease_state is LeaseState.PREPARED:
+                    incarnation.lease_state = LeaseState.ACTIVE
+        self._candidate_roots.difference_update(roots)
+        for root in roots:
+            if unit := self.units.get(root):
+                self._observe_plugin_scope(unit)
+        self._finish_initialization_work(roots)
+        from zhenxun.services.startup_load import startup_load_planner
+
+        startup_load_planner.commit_runtime_recovery(
+            {
+                module
+                for root in roots
+                if (unit := self.units.get(root))
+                for module in unit.module_names
+            },
+            self.generation,
+            plugin_ids=roots,
+        )
+
+    def _check_initialization_work(self, roots):
+        for owner, works in self._initialization_work.items():
+            if (self._root_owner(owner) or owner) in roots:
+                for work in works:
+                    if work.expired or work.budget.remaining() <= 0:
+                        raise TimeoutError("plugin_initialization_budget_exhausted")
+
+    def _finish_initialization_work(self, roots, *, cancel=False):
+        for owner in list(self._initialization_work):
+            if (self._root_owner(owner) or owner) not in roots and not any(
+                owner == root or owner.startswith((f"{root}:", f"{root}."))
+                for root in roots
+            ):
+                continue
+            for work in self._initialization_work.pop(owner):
+                work.active = False
+                if work.deadline_handle is not None:
+                    work.deadline_handle.cancel()
+                if cancel:
+                    for task in list(work.children):
+                        if not task.done():
+                            task.cancel()
+
     def _incarnation_for_unit(self, unit: PluginUnit) -> PluginIncarnation | None:
         if incarnation := self._incarnations.get(unit.plugin_id):
             return incarnation
@@ -1725,6 +2104,33 @@ class PluginRuntimeManager:
             incarnation
             and incarnation.incarnation_id == incarnation_id
             and incarnation.accepts_work
+            and root not in self._candidate_roots
+        )
+
+    def _work_lease_is_current(
+        self, owner: str, incarnation_id: str, phase: LifecycleWork | None
+    ) -> bool:
+        root = self._root_owner(owner) or owner
+        incarnation = self._incarnations.get(owner) or self._incarnations.get(root)
+        return bool(
+            incarnation
+            and incarnation.incarnation_id == incarnation_id
+            and (
+                (incarnation.accepts_work and root not in self._candidate_roots)
+                or (
+                    phase is not None
+                    and (phase.owner, phase.incarnation_id) == (owner, incarnation_id)
+                    and phase.valid()
+                    and (
+                        phase.phase == "on_shutdown"
+                        or (
+                            incarnation.lease_state
+                            in {LeaseState.PREPARED, LeaseState.ACTIVE}
+                            and phase.phase in {"on_startup", "on_ready"}
+                        )
+                    )
+                )
+            )
         )
 
     def _hook_lease_is_current(
@@ -1742,6 +2148,7 @@ class PluginRuntimeManager:
 
     def _revoke_incarnation(self, owner: str, *, failed: bool = False) -> None:
         root = self._root_owner(owner) or owner
+        self._finish_initialization_work({root}, cancel=failed)
         incarnations = {
             id(incarnation): incarnation
             for alias, incarnation in self._incarnations.items()
@@ -1759,6 +2166,7 @@ class PluginRuntimeManager:
             process_keys = set(self._owned_processes)
         keys = (
             set(self._owned_tasks)
+            | set(self._entry_tasks)
             | set(self._owned_handles)
             | set(self._owned_io_watchers)
             | set(self._owned_executor_futures)
@@ -1780,15 +2188,30 @@ class PluginRuntimeManager:
                 task = self._original_task_factory(loop, coro, **kwargs)
             else:
                 task = asyncio.Task(coro, loop=loop, **kwargs)
-            owner = current_owner()
+            context = kwargs.get("context")
+            owner = (
+                context.run(current_owner) if context is not None else current_owner()
+            )
             if owner:
-                incarnation = self._incarnations.get(self._root_owner(owner) or owner)
-                if incarnation and incarnation.lease_state in {
-                    LeaseState.REVOKED,
-                    LeaseState.FAILED,
-                }:
+                incarnation = self._incarnations.get(owner) or self._incarnations.get(
+                    self._root_owner(owner) or owner
+                )
+                phase = None
+                if incarnation:
+                    phase = (
+                        context.run(
+                            lifecycle_work_phase, owner, incarnation.incarnation_id
+                        )
+                        if context is not None
+                        else lifecycle_work_phase(owner, incarnation.incarnation_id)
+                    )
+                if incarnation and not self._work_lease_is_current(
+                    owner, incarnation.incarnation_id, phase
+                ):
                     task.cancel()
                 else:
+                    if phase:
+                        phase.children.add(task)
                     self._owned_tasks[owner].add(task)
                     task.add_done_callback(self._owned_tasks[owner].discard)
             return task
@@ -1812,6 +2235,7 @@ class PluginRuntimeManager:
                 callback_index = 1
                 callback = args[callback_index]
                 incarnation = manager._ensure_incarnation(owner)
+                phase = lifecycle_work_phase(owner, incarnation.incarnation_id)
                 holder: list[weakref.ReferenceType[asyncio.Handle]] = []
 
                 @wraps(callback)
@@ -1819,9 +2243,11 @@ class PluginRuntimeManager:
                     handle = holder[0]() if holder else None
                     if handle is not None:
                         manager._owned_handles[owner].discard(handle)
-                    if not manager._lease_is_current(owner, incarnation.incarnation_id):
+                    if not manager._work_lease_is_current(
+                        owner, incarnation.incarnation_id, phase
+                    ):
                         return None
-                    with owner_context(manager._root_owner(owner) or owner):
+                    with owner_context(owner):
                         return callback(*callback_args)
 
                 replaced = list(args)
@@ -1850,12 +2276,15 @@ class PluginRuntimeManager:
                 if not owner:
                     return _original(fd, callback, *args)
                 incarnation = manager._ensure_incarnation(owner)
+                phase = lifecycle_work_phase(owner, incarnation.incarnation_id)
 
                 @wraps(callback)
                 def wrapped(*callback_args):
-                    if not manager._lease_is_current(owner, incarnation.incarnation_id):
+                    if not manager._work_lease_is_current(
+                        owner, incarnation.incarnation_id, phase
+                    ):
                         return None
-                    with owner_context(manager._root_owner(owner) or owner):
+                    with owner_context(owner):
                         return callback(*callback_args)
 
                 result = _original(fd, wrapped, *args)
@@ -1873,6 +2302,8 @@ class PluginRuntimeManager:
             if not owner:
                 return original_run_in_executor(executor, func, *args)
             incarnation = manager._ensure_incarnation(owner)
+            budget = current_budget.get()
+            phase = lifecycle_work_phase(owner, incarnation.incarnation_id)
             completion: ConcurrentFuture[None] = ConcurrentFuture()
 
             @wraps(func)
@@ -1880,14 +2311,23 @@ class PluginRuntimeManager:
                 if not completion.set_running_or_notify_cancel():
                     return None
                 try:
-                    if not manager._lease_is_current(owner, incarnation.incarnation_id):
+                    if budget is not None:
+                        budget.check()
+                    check_budget()
+                    if not manager._work_lease_is_current(
+                        owner, incarnation.incarnation_id, phase
+                    ):
                         return None
                     with resource_context(owner):
                         return func(*args)
                 finally:
                     completion.set_result(None)
 
-            future = original_run_in_executor(executor, run_with_owner)
+            future = (
+                Context().run(original_run_in_executor, executor, run_with_owner)
+                if executor is None or executor is loop._default_executor
+                else original_run_in_executor(executor, run_with_owner)
+            )
             owned = manager._owned_executor_futures[owner]
             owned.add(completion)
 
@@ -1919,6 +2359,7 @@ class PluginRuntimeManager:
     async def _cancel_all_owned_tasks(self) -> None:
         owners = (
             set(self._owned_tasks)
+            | set(self._entry_tasks)
             | set(self._owned_handles)
             | set(self._owned_executor_futures)
             | set(self._owned_io_watchers)
@@ -2211,7 +2652,7 @@ class PluginRuntimeManager:
             previous_generation = self.generation
             runtime_mutation_coordinator.checkpoint()
             provider_snapshot = active_undo.get()
-            incarnation = self._new_incarnation(module_name)
+            incarnation = self._prepare_candidate(module_name)
             before_plugins = {plugin.id_ for plugin in get_loaded_plugins()}
             before_matchers = {
                 matcher
@@ -2227,9 +2668,11 @@ class PluginRuntimeManager:
                 if plugin is None:
                     raise RuntimeError("plugin_import_failed")
 
+                self._candidate_roots.discard(module_name)
+                self._candidate_roots.add(plugin.id_.split(":", 1)[0])
                 await self._run_plugin_install(plugin.module_name)
                 runtime_mutation_coordinator.checkpoint()
-                self.discover_loaded_plugins()
+                self.discover_loaded_plugins(activate=False)
                 plugin_id = self._root_owner(plugin.id_) or plugin.id_
                 unit = self.units.get(plugin_id)
                 if unit is None:
@@ -2249,7 +2692,7 @@ class PluginRuntimeManager:
 
                 await self._run_reload_startup_hooks({plugin_id})
                 runtime_mutation_coordinator.checkpoint()
-                self.discover_loaded_plugins()
+                self.discover_loaded_plugins(activate=False)
                 unit = self.units.get(plugin_id)
                 if (
                     unit
@@ -2273,8 +2716,8 @@ class PluginRuntimeManager:
                     plugin_id, active_incarnation.incarnation_id
                 )
                 self._observe_plugin_scope(unit)
-                await self._reconcile_runtime_metadata()
-                await self._invalidate_generation_caches()
+                await self._reconcile_candidate_metadata({plugin_id})
+                self._publish_candidates({plugin_id})
                 operation = RuntimeOperation(
                     ApplyMode.HOT_RELOADED,
                     "completed",
@@ -2575,6 +3018,8 @@ class PluginRuntimeManager:
         ):
             sys.modules.pop(name, None)
         self.discover_loaded_plugins()
+        self._candidate_roots.difference_update({plugin_id, module_name})
+        self._finish_initialization_work({plugin_id, module_name})
 
     async def apply_plugin_changes(
         self, changed: set[Path], *, submit_restart: bool = True
@@ -2821,6 +3266,14 @@ class PluginRuntimeManager:
     def _resource_summary(self, unit: PluginUnit) -> dict[str, int]:
         owners = self._owned_keys_for_unit(unit.plugin_id)
         counts = {
+            "entry_tasks": len(
+                {
+                    task
+                    for owner in owners
+                    for task in self._entry_tasks.get(owner, {})
+                    if not task.done()
+                }
+            ),
             "provider_registrations": sum(
                 1
                 for receipt in unit.resource_receipts
@@ -3020,6 +3473,10 @@ class PluginRuntimeManager:
             },
             incarnations=dict(self._incarnations),
             incarnation_history=list(self._incarnation_history),
+            incarnation_states={
+                alias: incarnation.lease_state
+                for alias, incarnation in self._incarnations.items()
+            },
             unit_state=unit_state,
             priority_entries=priority_entries,
             plugin_init_entries=plugin_init_entries,
@@ -3048,6 +3505,7 @@ class PluginRuntimeManager:
             for owner in self._owned_keys_for_unit(plugin_id)
         }
         await self._cancel_plugin_tasks(owners)
+        self._finish_initialization_work(checkpoint.affected)
         for owner in owners:
             for future in self._owned_executor_futures.pop(owner, set()):
                 future.cancel()
@@ -3134,6 +3592,9 @@ class PluginRuntimeManager:
         self.generation = checkpoint.generation
         self._incarnations = checkpoint.incarnations
         self._incarnation_history = checkpoint.incarnation_history
+        for alias, incarnation in self._incarnations.items():
+            if self._root_owner(alias) in checkpoint.affected:
+                incarnation.lease_state = checkpoint.incarnation_states[alias]
         for plugin_id, values in checkpoint.unit_state.items():
             unit = self.units[plugin_id]
             unit.draining = bool(values["draining"])
@@ -3236,6 +3697,8 @@ class PluginRuntimeManager:
         check_budget()
         await self._invalidate_generation_caches()
         self._validate_reload_checkpoint(checkpoint)
+        self._candidate_roots.difference_update(checkpoint.affected)
+        self._finish_initialization_work(checkpoint.affected)
 
     def _validate_reload_checkpoint(self, checkpoint: PluginReloadCheckpoint) -> None:
         from zhenxun.configs.config import Config
@@ -3335,7 +3798,7 @@ class PluginRuntimeManager:
                 for plugin_id in reversed(order):
                     runtime_mutation_coordinator.checkpoint()
                     unit = self.units[plugin_id]
-                    incarnations[plugin_id] = self._new_incarnation(plugin_id)
+                    incarnations[plugin_id] = self._prepare_candidate(plugin_id)
                     with (
                         owner_context(plugin_id),
                         provider_capture(
@@ -3367,7 +3830,7 @@ class PluginRuntimeManager:
                     )
                 runtime_mutation_coordinator.set_phase("committing")
                 self.generation += 1
-                self.discover_loaded_plugins()
+                self.discover_loaded_plugins(activate=False)
                 classification_misses = {
                     plugin_id: sorted(self.units[plugin_id].reasons)
                     for plugin_id in affected
@@ -3386,8 +3849,8 @@ class PluginRuntimeManager:
                             plugin_id, incarnation.incarnation_id
                         )
                         self._observe_plugin_scope(unit)
-                await self._reconcile_runtime_metadata()
-                await self._invalidate_generation_caches()
+                await self._reconcile_candidate_metadata(affected)
+                self._publish_candidates(affected)
                 operation = RuntimeOperation(
                     ApplyMode.HOT_RELOADED,
                     "completed",
@@ -3564,6 +4027,12 @@ class PluginRuntimeManager:
             for task in self._owned_tasks.get(owner, set())
             if id(task) not in cleanup_tasks
         }
+        tasks.update(
+            task
+            for owner in owners
+            for task in self._entry_tasks.get(owner, {})
+            if id(task) not in cleanup_tasks
+        )
         if asyncio.current_task() in tasks:
             raise PluginRecoveryRequired("plugin_cleanup_owns_current_task")
         for task in tasks:
@@ -3634,7 +4103,6 @@ class PluginRuntimeManager:
         ]
         if running_executor_work:
             raise RuntimeError(f"plugin_executor_in_flight:{unit.plugin_id}")
-        self._revoke_incarnation(unit.plugin_id)
         unit.draining = True
         if unit.in_flight:
             try:
@@ -3644,6 +4112,8 @@ class PluginRuntimeManager:
                 )
             except asyncio.TimeoutError as e:
                 raise PluginRecoveryRequired("plugin_drain_timeout") from e
+
+        self._revoke_incarnation(unit.plugin_id)
 
         # Give plugin lifecycle hooks the first chance to stop their workers.
         # Cancelling owned tasks first can make a shutdown hook re-await an already
@@ -3691,15 +4161,42 @@ class PluginRuntimeManager:
                 continue
             sys.modules.pop(module_name, None)
 
-    def _observe_plugin_scope(self, unit: PluginUnit) -> None:
+    def _lifecycle_observation_index(self):
+        from zhenxun.utils.manager.priority_manager import lifecycle_component_index
+
+        with self._ownership_lock:
+            keys = (
+                set(self._owned_tasks)
+                | set(self._owned_handles)
+                | set(self._owned_io_watchers)
+                | set(self._owned_executor_futures)
+                | set(self._owned_threads)
+                | set(self._owned_processes)
+            )
+        owners: dict[str, set[str]] = {}
+        for key in keys:
+            root = self._root_owner(key)
+            if root is not None:
+                owners.setdefault(root, set()).add(key)
+        return owners, lifecycle_component_index()
+
+    def _observe_plugin_scope(self, unit: PluginUnit, *, observation=None) -> None:
         if not unit.incarnation_id:
             return
         from zhenxun.services.lifecycle import lifecycle_kernel
         from zhenxun.utils.manager.priority_manager import lifecycle_component_ids
 
         incarnation_id = unit.incarnation_id
-        receipts = [*unit.resource_receipts, *self._scope_resource_receipts(unit)]
-        checks = self._scope_release_checks(unit, receipts)
+        owners = (
+            observation[0].get(unit.plugin_id, set())
+            if observation is not None
+            else self._owned_keys_for_unit(unit.plugin_id)
+        )
+        receipts = [
+            *unit.resource_receipts,
+            *self._scope_resource_receipts(unit, owners=owners),
+        ]
+        checks = self._scope_release_checks(unit, receipts, owners=owners)
 
         async def stop() -> None:
             if (
@@ -3707,7 +4204,6 @@ class PluginRuntimeManager:
                 or unit.incarnation_id != incarnation_id
             ):
                 raise PluginRecoveryRequired("plugin_stop_incarnation_changed")
-            self._revoke_incarnation(unit.plugin_id)
             unit.draining = True
             owners = self._owned_keys_for_unit(unit.plugin_id)
             try:
@@ -3718,6 +4214,7 @@ class PluginRuntimeManager:
                     await asyncio.wait_for(
                         self._drained_event(unit.plugin_id).wait(), timeout=timeout
                     )
+                self._revoke_incarnation(unit.plugin_id)
                 await self._cancel_plugin_tasks(owners)
             finally:
                 self._stop_owned_callbacks(owners)
@@ -3730,11 +4227,18 @@ class PluginRuntimeManager:
             classification=unit.classification.value,
             stop=stop,
             release_checks=checks,
-            stop_after=lifecycle_component_ids(unit.module_names),
+            stop_after=lifecycle_component_ids(
+                unit.module_names,
+                index=observation[1] if observation is not None else None,
+            ),
         )
 
     def _scope_release_checks(
-        self, unit: PluginUnit, receipts: list[ResourceReceipt]
+        self,
+        unit: PluginUnit,
+        receipts: list[ResourceReceipt],
+        *,
+        owners: set[str] | None = None,
     ) -> dict[str, Callable[[], bool]]:
         checks: dict[str, Callable[[], bool]] = {}
         incarnation = self._incarnations.get(unit.plugin_id)
@@ -3768,7 +4272,9 @@ class PluginRuntimeManager:
                     and inc.lease_state in {LeaseState.REVOKED, LeaseState.FAILED}
                     and observed.in_flight == 0
                 )
-        for owner in self._owned_keys_for_unit(unit.plugin_id):
+        for owner in (
+            self._owned_keys_for_unit(unit.plugin_id) if owners is None else owners
+        ):
             for task in self._owned_tasks.get(owner, set()):
                 checks[f"task:{id(task)}"] = task.done
             for handle in self._owned_handles.get(owner, set()):
@@ -3793,8 +4299,11 @@ class PluginRuntimeManager:
         observed_ids = {receipt.receipt_id for receipt in receipts}
         return {key: check for key, check in checks.items() if key in observed_ids}
 
-    def _scope_resource_receipts(self, unit: PluginUnit) -> list[ResourceReceipt]:
-        owners = self._owned_keys_for_unit(unit.plugin_id)
+    def _scope_resource_receipts(
+        self, unit: PluginUnit, *, owners: set[str] | None = None
+    ) -> list[ResourceReceipt]:
+        if owners is None:
+            owners = self._owned_keys_for_unit(unit.plugin_id)
         incarnation_id = unit.incarnation_id
         receipts: list[ResourceReceipt] = []
         for owner in owners:
@@ -3870,8 +4379,9 @@ class PluginRuntimeManager:
 
     def refresh_lifecycle_scopes(self) -> None:
         self._collect_runtime_boundaries()
+        observation = self._lifecycle_observation_index()
         for unit in self.units.values():
-            self._observe_plugin_scope(unit)
+            self._observe_plugin_scope(unit, observation=observation)
 
     async def refresh_lifecycle_scopes_async(self) -> None:
         from zhenxun.services.runtime_mutation import runtime_mutation_coordinator
@@ -3893,13 +4403,14 @@ class PluginRuntimeManager:
                 await asyncio.sleep(0)
                 if interrupted():
                     return
+        observation = self._lifecycle_observation_index()
         for index, (unit, incarnation) in enumerate(units, 1):
             if (
                 self.units.get(unit.plugin_id) is unit
                 and unit.incarnation_id == incarnation
                 and not unit.draining
             ):
-                self._observe_plugin_scope(unit)
+                self._observe_plugin_scope(unit, observation=observation)
             if index % 8 == 0:
                 await asyncio.sleep(0)
                 if interrupted():
@@ -4030,13 +4541,52 @@ class PluginRuntimeManager:
             if getattr(func, "__module__", "") in module_names
         ]
         if funcs:
-            await driver._lifespan._run_lifespan_func(funcs)
+            await driver._lifespan._run_lifespan_func(reversed(funcs))
 
     async def _run_reload_startup_hooks(
         self,
         affected: set[str],
         *,
         component_ids: set[str] | None = None,
+    ) -> None:
+        supervisor = asyncio.current_task()
+
+        def retain(work):
+            root = self._root_owner(work.owner) or work.owner
+            if root in affected and root in self._candidate_roots:
+                work.retained = True
+                work.supervisor = weakref.ref(supervisor)
+                work.loop = supervisor.get_loop()
+
+                def register():
+                    if root in self._candidate_roots:
+                        self._initialization_work[work.owner].append(work)
+                    else:
+                        work.active = False
+
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    loop = None
+                if loop is work.loop:
+                    register()
+                else:
+                    Context().run(work.loop.call_soon_threadsafe, register)
+
+        token = initialization_retainer.set(retain)
+        try:
+            await self._run_reload_startup_hooks_impl(
+                affected, component_ids=component_ids
+            )
+            self._check_initialization_work(affected)
+        except asyncio.CancelledError:
+            self._check_initialization_work(affected)
+            raise
+        finally:
+            initialization_retainer.reset(token)
+
+    async def _run_reload_startup_hooks_impl(
+        self, affected: set[str], *, component_ids: set[str] | None = None
     ) -> None:
         from zhenxun.utils.manager.priority_manager import (
             _sync_kernel_declarations,
@@ -4059,14 +4609,35 @@ class PluginRuntimeManager:
             from zhenxun.services.lifecycle import lifecycle_kernel
 
             await lifecycle_kernel.start_components(selected_component_ids)
+            for component_id in selected_component_ids:
+                status = lifecycle_kernel.component_status(component_id)
+                if not status or status["state"] != "ready":
+                    raise RuntimeError(f"plugin_initialization_failed:{component_id}")
         driver = nonebot.get_driver()
-        funcs = [
-            func
-            for func in driver._lifespan._startup_funcs
-            if getattr(func, "__module__", "") in module_names
-        ]
-        if funcs:
-            await driver._lifespan._run_lifespan_func(funcs)
+        for registry in (
+            driver._lifespan._startup_funcs,
+            driver._lifespan._ready_funcs,
+        ):
+            funcs = [
+                func
+                for func in registry
+                if getattr(func, "__module__", "") in module_names
+            ]
+            if funcs:
+                await driver._lifespan._run_lifespan_func(funcs)
+
+    async def _reconcile_candidate_metadata(self, roots: set[str]) -> None:
+        from zhenxun.services.startup_load import startup_load_planner
+
+        modules = {
+            module
+            for root in roots
+            if (unit := self.units.get(root))
+            for module in unit.module_names
+        }
+        with startup_load_planner.preview_runtime_recovery(modules):
+            await self._reconcile_runtime_metadata()
+            await self._invalidate_generation_caches()
 
     async def _reconcile_runtime_metadata(self) -> None:
         from tortoise import Tortoise
@@ -4089,7 +4660,7 @@ class PluginRuntimeManager:
                 self.mark_content_processed(path)
             if managed_config_writes:
                 logger.debug(
-                    "插件元数据产生的配置写入已纳入当前运行时操作，" "跳过后续重复重载"
+                    "插件元数据产生的配置写入已纳入当前运行时操作，跳过后续重复重载"
                 )
             await reconcile_plugin_runtime()
             await reconcile_task_runtime()
@@ -4393,6 +4964,8 @@ class PluginRuntimeManager:
             "hot_reload_enabled": self.enabled and not self._integrity_failures,
             "integrity_recovery_required": sorted(self._integrity_failures),
             "compatibility_error": self.compatibility_error,
+            "hook_failures": list(self._hook_failures),
+            "entry_diagnostics": dict(self._entry_diagnostics),
             "plugin_runtime_generation": self.generation,
             "webui_revision": self.webui_revision,
             "pending_restart": bool(self.pending_restart),

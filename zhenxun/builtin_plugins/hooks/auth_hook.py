@@ -11,6 +11,7 @@ from nonebot_plugin_uninfo import Uninfo
 
 from zhenxun.services.cache.runtime_cache import is_cache_ready
 from zhenxun.services.log import logger
+from zhenxun.services.message_admission import connection_epochs
 from zhenxun.services.message_load import is_overloaded, mark_activity
 from zhenxun.services.runtime_bootstrap import register_runtime_bootstrap
 from zhenxun.utils.manager.priority_manager import PriorityLifecycle
@@ -34,7 +35,6 @@ from .auth_checker import (
 )
 
 _SKIP_AUTH_PLUGINS = {"chat_history", "chat_message"}
-_BOT_CONNECT_TS: float | None = None
 
 driver = get_driver()
 register_runtime_bootstrap(driver)
@@ -42,9 +42,16 @@ register_runtime_bootstrap(driver)
 
 @driver.on_bot_connect
 async def _mark_bot_connected(bot: Bot):
-    del bot
-    global _BOT_CONNECT_TS
-    _BOT_CONNECT_TS = time.time()
+    from zhenxun.utils.platform import PlatformUtils
+
+    connection_epochs.connect(bot, PlatformUtils.get_platform_scope(bot))
+
+
+@driver.on_bot_disconnect
+async def _mark_bot_disconnected(bot: Bot):
+    from zhenxun.utils.platform import PlatformUtils
+
+    connection_epochs.disconnect(bot, PlatformUtils.get_platform_scope(bot))
 
 
 @PriorityLifecycle.on_startup(
@@ -59,7 +66,10 @@ async def _start_auth_runtime_tasks(context):
 
 @PriorityLifecycle.on_shutdown(priority=7, component_id="runtime:auth_tasks")
 async def _stop_auth_runtime_tasks():
-    await stop_auth_runtime_tasks()
+    try:
+        await stop_auth_runtime_tasks()
+    finally:
+        connection_epochs.clear()
 
 
 def _skip_auth_for_plugin(matcher: Matcher) -> bool:
@@ -95,16 +105,32 @@ def _enforce_platform_contract(matcher: Matcher, event_context) -> None:
 
 
 @event_preprocessor
-async def _drop_message_before_cache_ready(event: Event):
+async def _drop_message_before_cache_ready(event: Event, bot: Bot):
     mark_activity()
+    if is_cache_ready():
+        from zhenxun.services.bot_group_policy import bot_group_policy_service
+        from zhenxun.utils.platform import PlatformUtils
+
+        group_id = resolve_event_group_id(
+            event,
+            getattr(event, "group_openid", None) or getattr(event, "guild_id", None),
+        )
+        bot_group_policy_service.observe(
+            PlatformUtils.get_storage_bot_id(bot),
+            PlatformUtils.get_platform_scope(bot),
+            group_id,
+            resolve_event_channel_id(event, None),
+        )
     if event.get_type() != "message":
         return
     if not is_cache_ready():
         raise IgnoredException("cache not ready ignore")
-    if _BOT_CONNECT_TS is not None:
-        event_ts = getattr(event, "time", None)
-        if event_ts is not None and event_ts < _BOT_CONNECT_TS:
-            raise IgnoredException("drop backlog message")
+    from zhenxun.utils.platform import PlatformUtils
+
+    if connection_epochs.is_backlog(
+        bot, PlatformUtils.get_platform_scope(bot), getattr(event, "time", None)
+    ):
+        raise IgnoredException("drop backlog message")
 
 
 @run_preprocessor
@@ -132,6 +158,14 @@ async def _auth_preprocessor(
         message=message,
     )
     _enforce_platform_contract(matcher, event_context)
+    from zhenxun.services.bot_group_policy import bot_group_policy_service
+
+    bot_group_policy_service.observe(
+        event_context.bot_id,
+        event_context.platform_scope,
+        event_context.group_id,
+        event_context.channel_id,
+    )
 
     if not event_context.route_modules_loaded:
         route_modules = await _get_route_context(

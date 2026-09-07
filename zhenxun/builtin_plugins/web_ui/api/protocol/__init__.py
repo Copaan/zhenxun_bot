@@ -1,4 +1,4 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 import nonebot
 
@@ -128,5 +128,16 @@ def build_protocol_status() -> ProtocolStatus:
     response_class=JSONResponse,
     description="获取协议端连接状态",
 )
-async def _() -> Result[ProtocolStatus]:
-    return Result.ok(build_protocol_status())
+async def _(request: Request) -> Result[ProtocolStatus]:
+    from zhenxun.services.onebot_endpoint import current_reverse_ws_diagnostic
+
+    status = build_protocol_status()
+    status.onebot_endpoint = current_reverse_ws_diagnostic(request.url.hostname or "")
+    from zhenxun.services.qq_ingress_state import read_ingress_state
+
+    status.qq_webhook_ingress = (
+        read_ingress_state()
+        if status.qq_webhook_mode == "builtin_https" and status.qq_official_enabled
+        else {"state": "unknown" if status.qq_official_enabled else "disabled"}
+    )
+    return Result.ok(status)

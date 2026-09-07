@@ -33,6 +33,15 @@ _DISCONNECT_SUPPRESSION_WINDOW_SECONDS = 10.0
 
 htmlrender_module: Any | None = None
 htmlrender_browser: Any | None = None
+_render_diagnostic_times: dict[str, float] = {}
+
+
+def _render_diagnostic(code: str) -> None:
+    now = time.monotonic()
+    if now - _render_diagnostic_times.get(code, float("-inf")) < 30:
+        return
+    _render_diagnostic_times[code] = now
+    logger.warning(f"渲染页面异常 | code={code}", "Renderer")
 
 
 def _load_htmlrender_modules() -> tuple[Any, Any]:
@@ -739,6 +748,24 @@ class PlaywrightEngine(BaseScreenshotEngine):
         template_path: str,
         render_options: dict[str, Any],
     ) -> bytes:
+        def script_error(_error):
+            _render_diagnostic("render_page_script_error")
+
+        def request_failed(request):
+            if request.resource_type in {"script", "stylesheet"}:
+                _render_diagnostic("render_page_resource_failed")
+
+        page.on("pageerror", script_error)
+        page.on("requestfailed", request_failed)
+        try:
+            return await self._capture_rendered_page(
+                page, html, template_path, render_options
+            )
+        finally:
+            page.remove_listener("pageerror", script_error)
+            page.remove_listener("requestfailed", request_failed)
+
+    async def _capture_rendered_page(self, page, html, template_path, render_options):
         if self._debug_console_log:
             page.on("console", lambda msg: logger.debug(f"浏览器控制台: {msg.text}"))
         await page.goto(template_path, wait_until="commit")

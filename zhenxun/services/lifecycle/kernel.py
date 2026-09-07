@@ -17,7 +17,7 @@ import uuid
 from zhenxun.utils.atomic_json import write_json_locked
 
 from .deadline import check_budget, remaining_timeout, shutdown_budget
-from .diagnostics import LifecycleStateWriter
+from .diagnostics import LifecycleStateWriter, terminal_path, value_snapshot
 from .models import (
     SCOPE_DEPTH,
     ComponentRuntime,
@@ -396,6 +396,9 @@ class LifecycleKernel:
         self._observers: list[LifecycleObserver] = []
         self._state_path = state_path
         self._process_metadata: dict[str, Any] = {}
+        self._instance_id = uuid.uuid4().hex
+        self._shutdown_id: str | None = None
+        self._terminal_shutdown: dict[str, Any] | None = None
         self._scopes: dict[str, ScopeRecord] = {}
         self._scope_contexts: dict[str, LifecycleContext] = {}
         self._scope_sequence = 0
@@ -404,7 +407,11 @@ class LifecycleKernel:
         self._recovery_required: set[str] = set()
         self._plugin_scope_contexts: dict[str, LifecycleContext] = {}
         self._state_writer: LifecycleStateWriter | None = None
+        self._defer_state_writer_close = False
         self._rebuilding: set[str] = set()
+        self._shutdown_requested = False
+        self._shutdown_deadline: float | None = None
+        self._starting_tasks: set[asyncio.Task[Any]] = set()
 
     async def _run_cleanup(
         self,
@@ -495,6 +502,10 @@ class LifecycleKernel:
     def set_process_metadata(self, **metadata: Any) -> None:
         with self._metadata_lock:
             self._process_metadata.update(metadata)
+        self._persist()
+
+    def require_recovery(self, owner: str) -> None:
+        self._recovery_required.add(owner)
         self._persist()
 
     def _create_scope_context(
@@ -1026,6 +1037,8 @@ class LifecycleKernel:
 
     async def _start_subset(self, pending: set[str], started: list[str]) -> None:
         while pending:
+            if self._shutdown_requested:
+                raise asyncio.CancelledError
             blocked = [
                 component_id
                 for component_id in pending
@@ -1109,6 +1122,8 @@ class LifecycleKernel:
                 raise fatal
 
     async def _start_one(self, component_id: str) -> None:
+        if self._shutdown_requested:
+            raise asyncio.CancelledError
         registration = self._registrations[component_id]
         runtime = registration.runtime
         runtime.state = ComponentState.STARTING
@@ -1125,6 +1140,8 @@ class LifecycleKernel:
         }
         self._emit("starting", component_id)
         self._persist()
+        starting_task = asyncio.current_task()
+        self._starting_tasks.add(starting_task)
         try:
             result = (
                 registration.start(context)
@@ -1183,6 +1200,8 @@ class LifecycleKernel:
                         }
                     )
                     raise LifecycleError("component_health_failed")
+            if self._shutdown_requested:
+                raise asyncio.CancelledError
             self._generation += 1
             runtime.state = ComponentState.READY
             runtime.health = "healthy"
@@ -1197,6 +1216,7 @@ class LifecycleKernel:
                 self._start_order.append(component_id)
             self._emit("ready", component_id)
         except BaseException as error:
+            cancelled = isinstance(error, asyncio.CancelledError)
             runtime.state = (
                 ComponentState.DEGRADED
                 if registration.spec.failure_policy == "degrade"
@@ -1206,36 +1226,152 @@ class LifecycleKernel:
                 "degraded" if runtime.state is ComponentState.DEGRADED else "failed"
             )
             runtime.error_code = f"component_start_failed:{type(error).__name__}"
+            if cancelled:
+                runtime.state = ComponentState.STOPPED
+                runtime.health = "cancelled"
+                runtime.error_code = "component_start_cancelled"
+                self._current_operations[component_id]["action"] = "stop"
             try:
                 await context.close()
             except BaseException as cleanup_error:
                 runtime.metadata["cleanup_error_code"] = (
                     f"component_start_cleanup_failed:{type(cleanup_error).__name__}"
                 )
+                runtime.state = ComponentState.FAILED
+                runtime.health = "failed"
+                self._recovery_required.add(component_id)
             runtime.resources = context.resources
             self._release_capabilities(component_id)
-            registration.context = None
+            if context.closed and not runtime.metadata.get("cleanup_error_code"):
+                registration.context = None
+            elif component_id not in self._start_order:
+                self._start_order.append(component_id)
             registration.value = None
             registration.controller = None
             self._emit(runtime.state.value, component_id)
-            if registration.spec.failure_policy == "fatal":
+            if cancelled or registration.spec.failure_policy == "fatal":
                 raise
         finally:
+            self._starting_tasks.discard(starting_task)
             runtime.duration_ms = round((time.monotonic() - started_at) * 1000, 2)
             self._current_operations.pop(component_id, None)
             self._persist()
 
     async def stop_all(self, timeout: float = 15.0) -> None:
+        self.request_shutdown()
+        timeout = min(timeout, max(0.0, self._shutdown_deadline - time.monotonic()))
         with shutdown_budget(timeout):
             try:
                 await self._stop_all_with_budget()
             finally:
-                if self._state_writer is not None:
+                if (
+                    self._state_writer is not None
+                    and not self._defer_state_writer_close
+                ):
                     if not await self._state_writer.close(remaining_timeout(timeout)):
                         self._recovery_required.add("lifecycle:state_writer")
 
+    def defer_diagnostics_close(self) -> None:
+        self._defer_state_writer_close = True
+
+    async def finish_diagnostics(self) -> None:
+        self._defer_state_writer_close = False
+        if self._state_writer is not None:
+            if not await self._state_writer.close(self.shutdown_remaining(15.0)):
+                self._recovery_required.add("lifecycle:state_writer")
+
+    def request_shutdown(self) -> None:
+        first_request = not self._shutdown_requested
+        self._shutdown_requested = True
+        if self._shutdown_deadline is None:
+            self._shutdown_deadline = time.monotonic() + 15.0
+            self._shutdown_id = uuid.uuid4().hex
+        current = None
+        with contextlib.suppress(RuntimeError):
+            current = asyncio.current_task()
+        for task in self._starting_tasks:
+            if first_request and task is not current and not task.done():
+                task.cancel()
+
+    def shutdown_remaining(self, maximum: float) -> float:
+        if self._shutdown_deadline is None:
+            return maximum
+        return min(maximum, max(0.0, self._shutdown_deadline - time.monotonic()))
+
+    def finalize_terminal_receipt(
+        self, *, exit_signals: list[int] | None = None
+    ) -> None:
+        """Called by the CLI after the event loop has actually stopped."""
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            raise RuntimeError("terminal_receipt_loop_still_running")
+        if self._state_path is None or self._terminal_shutdown is not None:
+            return
+        state = self.status()
+        persistence = state["persistence"]
+        confirmed = bool(
+            self._shutdown_requested
+            and self._state_writer is not None
+            and not persistence["pending"]
+            and persistence["worker_released"]
+            and not persistence["writer_task_active"]
+            and not persistence["shutdown_timed_out"]
+            and not state["recovery_required"]
+            and not state["unresolved_resources"]
+            and not state["cleanup_tasks"]
+            and not state["active_scope_count"]
+            and not state["ownership"]["tracked_resource_count"]
+            and all(
+                item["state"] in {"stopped", "declared"} for item in state["components"]
+            )
+        )
+        receipt = value_snapshot(
+            {
+                "identity": state["snapshot_identity"],
+                "recorded_at": datetime.now(timezone.utc).isoformat(),
+                "phase": "event_loop_closed",
+                "exit_signals": list(exit_signals or []),
+                "exit_source": self._process_metadata.get("exit_source"),
+                "result": "confirmed" if confirmed else "unconfirmed",
+                "persistence": persistence,
+                "budget_remaining_ms": round(self.shutdown_remaining(15.0) * 1000, 2),
+                "budget_exhausted": self.shutdown_remaining(15.0) <= 0,
+                "recovery_required": state["recovery_required"],
+                "component_state_counts": state["state_counts"],
+                "unresolved_resources": state["unresolved_resources"],
+            }
+        )
+        try:
+            write_json_locked(terminal_path(self._state_path), receipt, timeout=0)
+        except (OSError, TimeoutError):
+            import logging
+
+            logging.getLogger(__name__).error("lifecycle_terminal_receipt_write_failed")
+        else:
+            self._terminal_shutdown = receipt
+
+    @asynccontextmanager
+    async def _shutdown_operation_lock(self):
+        if self._operation_lock.locked():
+            try:
+                await asyncio.wait_for(
+                    self._operation_lock.acquire(), remaining_timeout(15)
+                )
+            except asyncio.TimeoutError:
+                self._recovery_required.add("lifecycle:startup_shutdown_timeout")
+                raise LifecycleError("startup_shutdown_timeout") from None
+        else:
+            await self._operation_lock.acquire()
+        try:
+            yield
+        finally:
+            self._operation_lock.release()
+
     async def _stop_all_with_budget(self) -> None:
-        async with self._operation_lock:
+        async with self._shutdown_operation_lock():
             ordered = self._component_stop_order(set(self._start_order))
             for component_id in ordered:
                 context = self._registrations[component_id].context
@@ -1693,6 +1829,18 @@ class LifecycleKernel:
             mutation = None
         return {
             "version": 2,
+            "snapshot_at": datetime.now(timezone.utc).isoformat(),
+            "snapshot_phase": "shutdown" if self._shutdown_requested else "runtime",
+            "snapshot_identity": {
+                "instance_id": self._instance_id,
+                "pid": os.getpid(),
+                "boot_id": self._process_metadata.get("boot_id"),
+                "launcher_boot_id": self._process_metadata.get("launcher_boot_id"),
+                "startup_id": self._process_metadata.get("startup_id"),
+                "shutdown_id": self._shutdown_id,
+                "shutdown_correlation_id": self._process_metadata.get("shutdown_id"),
+            },
+            "terminal_shutdown": self._terminal_shutdown,
             "persistence": self._state_writer.status()
             if self._state_writer is not None
             else {"pending": False, "enabled": self._state_path is not None},

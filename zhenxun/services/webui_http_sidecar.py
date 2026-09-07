@@ -166,9 +166,12 @@ class HttpSidecar:
         self._write_state("stopped", active_connections=0)
 
     def _write_state(self, state: str, **changes: Any) -> None:
+        from zhenxun.services.webui_http_sidecar_state import listener_identity
+
         self._state = state
         values = {
             **changes,
+            **listener_identity(),
             "mode": self.settings.mode,
             "port": self.settings.listen_port,
             "pid": os.getpid(),
@@ -569,10 +572,12 @@ async def _serve_http_sidecar(settings: HttpSidecarSettings) -> None:
 
 
 def run_http_sidecar(settings: HttpSidecarSettings) -> None:
+    from zhenxun.services.webui_http_sidecar_state import listener_identity
+
     write_http_sidecar_state(
+        **listener_identity(),
         mode=settings.mode,
         port=settings.listen_port,
-        pid=os.getpid(),
         state="starting",
         active_connections=0,
         proxy_failures=0,

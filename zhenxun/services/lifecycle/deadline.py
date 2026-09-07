@@ -65,25 +65,25 @@ def check_budget() -> None:
         budget.check()
 
 
-def received_shutdown_budget(default: float) -> float:
+def received_shutdown_request() -> dict:
     path = os.getenv("ZHENXUN_SHUTDOWN_BUDGET_PATH")
     boot = os.getenv("ZHENXUN_LAUNCHER_BOOT_ID")
     if not path or not boot:
-        return default
+        return {}
     import psutil
 
     from zhenxun.utils.atomic_json import read_json_locked
 
     try:
-        state = read_json_locked(Path(path), {}, quarantine_corrupt=False)
+        state = read_json_locked(Path(path), {}, timeout=0, quarantine_corrupt=False)
         identity = psutil.Process(os.getpid()).create_time()
-    except (OSError, ValueError, psutil.Error):
-        return default
+    except (OSError, ValueError, TimeoutError, psutil.Error):
+        return {}
     if not isinstance(state, dict) or state.get("launcher_boot_id") != boot:
-        return default
+        return {}
     requests = state.get("requests")
     if not isinstance(requests, dict):
-        return default
+        return {}
     for request in requests.values():
         if not isinstance(request, dict):
             continue
@@ -101,8 +101,15 @@ def received_shutdown_budget(default: float) -> float:
             for value in (timestamp, milliseconds)
         ):
             continue
-        age = time.time() - timestamp
-        if age < 0:
-            return 0.0
-        return max(0.0, min(default, milliseconds / 1000.0 - age))
-    return default
+        return request
+    return {}
+
+
+def received_shutdown_budget(default: float) -> float:
+    request = received_shutdown_request()
+    if not request:
+        return default
+    age = time.time() - request["requested_at"]
+    if age < 0:
+        return 0.0
+    return max(0.0, min(default, request["budget_ms"] / 1000.0 - age))

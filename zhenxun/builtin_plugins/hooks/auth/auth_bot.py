@@ -37,6 +37,17 @@ async def auth_bot(
         if context is not None:
             bot_id = context.event.bot_id
             bot_data = context.bot_data
+            from zhenxun.services.bot_group_policy import bot_group_policy_service
+
+            event = context.event
+            if bot_group_policy_service.blocked(
+                bot_id,
+                event.platform_scope,
+                event.group_id,
+                plugin.module,
+                channel_id=event.channel_id,
+            ):
+                raise SkipPluginException("Bot独立群设置已禁用该插件")
         bot: BotConsole | BotSnapshot | None = bot_data
         if bot is None and not skip_fetch:
             bot = await provider.get_bot(bot_id)

@@ -5,11 +5,13 @@ from collections import Counter
 from collections.abc import Callable
 from datetime import datetime, timezone
 import re
+import ssl
 import sys
 from threading import RLock
 import time
 from typing import Any
 import uuid
+import weakref
 
 _UVICORN_HTTP_PREFIX = "uvicorn.protocols.http."
 _UVICORN_WEBSOCKET_PREFIX = "uvicorn.protocols.websockets."
@@ -43,6 +45,10 @@ class TransportRuntime:
         self._uvicorn_original_handle_exit: Callable[..., Any] | None = None
         self._uvicorn_wrapped_handle_exit: Callable[..., Any] | None = None
         self._shutdown_task: asyncio.Task[None] | None = None
+        self._tls_transports: weakref.WeakSet[Any] = weakref.WeakSet()
+        self._original_ssl_factory: Callable[..., Any] | None = None
+        self._wrapped_ssl_factory: Callable[..., Any] | None = None
+        self._ssl_factory_was_local = False
         self._lock = RLock()
 
     def install(self) -> None:
@@ -57,6 +63,27 @@ class TransportRuntime:
             self._installed_handler = self._handle_exception
             self._lifespan_stopped = False
             loop.set_exception_handler(self._installed_handler)
+            original = getattr(loop, "_make_ssl_transport", None)
+            if callable(original):
+                self._original_ssl_factory = original
+                self._ssl_factory_was_local = "_make_ssl_transport" in vars(loop)
+
+                def track_ssl(*args, **kwargs):
+                    transport = original(*args, **kwargs)
+                    protocol = self._safe_getattr(transport, "_ssl_protocol")
+                    app_protocol = self._safe_getattr(protocol, "_app_protocol")
+                    if (
+                        kwargs.get("server_side")
+                        and kwargs.get("server") is not None
+                        and type(app_protocol).__module__.startswith(
+                            "uvicorn.protocols."
+                        )
+                    ):
+                        self._tls_transports.add(transport)
+                    return transport
+
+                self._wrapped_ssl_factory = track_ssl
+                loop._make_ssl_transport = track_ssl
 
     def retain_until_loop_close(self) -> None:
         """Keep the proxy installed while Uvicorn tears transports down."""
@@ -71,6 +98,17 @@ class TransportRuntime:
             self._loop = None
             self._previous_handler = None
             self._installed_handler = None
+            if (
+                loop is not None
+                and getattr(loop, "_make_ssl_transport", None)
+                is self._wrapped_ssl_factory
+            ):
+                if self._ssl_factory_was_local:
+                    loop._make_ssl_transport = self._original_ssl_factory
+                else:
+                    del loop._make_ssl_transport
+            self._wrapped_ssl_factory = self._original_ssl_factory = None
+            self._tls_transports.clear()
         if loop is None or loop.is_closed():
             return
         if loop.get_exception_handler() is installed:
@@ -79,6 +117,20 @@ class TransportRuntime:
     def record(self, metric: str, amount: int = 1) -> None:
         with self._lock:
             self._counts[metric] += amount
+
+    def record_diagnostic(self, code: str) -> None:
+        self.record(code)
+        now = time.monotonic()
+        with self._lock:
+            if (
+                now - self._last_debug.get(code, float("-inf"))
+                < _DEBUG_INTERVAL_SECONDS
+            ):
+                return
+            self._last_debug[code] = now
+        from zhenxun.services.log import logger
+
+        logger.info(f"入站连接诊断 | code={code}", "WebUi")
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
@@ -105,7 +157,14 @@ class TransportRuntime:
             "cooperative_close_count": counts.get("cooperative_close", 0),
             "signal_shutdown_count": counts.get("signal_shutdown", 0),
             "predrained_connection_count": counts.get("predrained_connection", 0),
+            "tls_drain_abort_count": counts.get("tls_drain_abort", 0),
+            "tracked_inbound_tls_transports": len(self._tls_transports),
             "last_unclassified_reset": last_unclassified,
+            "inbound_diagnostics": {
+                key: value
+                for key, value in counts.items()
+                if key.startswith(("onebot_", "tls_"))
+            },
         }
 
     def _handle_exception(
@@ -113,6 +172,8 @@ class TransportRuntime:
     ) -> None:
         error = context.get("exception")
         channel = self._uvicorn_channel(context)
+        if channel and isinstance(error, ssl.SSLError):
+            self.record_diagnostic("tls_transport_failed")
         if channel and self._is_windows_connection_reset(error):
             metric = f"{channel}_reset"
             self.record(metric)
@@ -141,6 +202,9 @@ class TransportRuntime:
                 return self._uvicorn_server_type is server_type
 
             def wrapped(server: Any, sig: int, frame: Any) -> Any:
+                from zhenxun.services.lifecycle import lifecycle_kernel
+
+                lifecycle_kernel.request_shutdown()
                 self._begin_signal_shutdown(server)
                 return original(server, sig, frame)
 
@@ -176,18 +240,21 @@ class TransportRuntime:
         self.record("signal_shutdown")
         server_state = self._safe_getattr(server, "server_state")
         connections = tuple(self._safe_getattr(server_state, "connections") or ())
-        drained = 0
+        tls_transports = []
+        # connection_lost may remove a protocol from Uvicorn before the SSL
+        # transport releases its asyncio.Server reference.
+        for transport in tuple(self._tls_transports):
+            protocol = self._safe_getattr(transport, "_ssl_protocol")
+            if protocol is not None:
+                tls_transports.append((transport, protocol))
         for connection in connections:
-            shutdown = self._safe_getattr(connection, "shutdown")
-            if not callable(shutdown):
+            if not type(connection).__module__.startswith("uvicorn.protocols."):
                 continue
-            try:
-                shutdown()
-            except Exception:
-                continue
-            drained += 1
-        if drained:
-            self.record("predrained_connection", drained)
+            transport = self._safe_getattr(connection, "transport")
+            ssl_protocol = self._safe_getattr(transport, "_ssl_protocol")
+            if ssl_protocol is not None:
+                if not any(item[0] is transport for item in tls_transports):
+                    tls_transports.append((transport, ssl_protocol))
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -197,19 +264,57 @@ class TransportRuntime:
             if task is not None and not task.done():
                 return
             self._shutdown_task = loop.create_task(
-                self._quiesce_webui_connections(),
+                self._quiesce_webui_connections(
+                    server_state,
+                    tls_transports,
+                    tuple(self._safe_getattr(server, "servers") or ()),
+                ),
                 name="webui-transport-signal-quiesce",
             )
+            self._shutdown_task.add_done_callback(self._observe_shutdown_task)
 
-    @staticmethod
-    async def _quiesce_webui_connections() -> None:
+    def _observe_shutdown_task(self, task: asyncio.Task[None]) -> None:
+        if not task.cancelled() and task.exception() is not None:
+            self.record_diagnostic("tls_shutdown_cleanup_failed")
+
+    async def _quiesce_webui_connections(
+        self, server_state=None, tls_transports=(), servers=()
+    ) -> None:
+        from zhenxun.services.lifecycle import lifecycle_kernel
+
+        deadline = time.monotonic() + lifecycle_kernel.shutdown_remaining(2.0)
         try:
             security = sys.modules.get("zhenxun.builtin_plugins.web_ui.security")
             quiesce = getattr(security, "quiesce_authenticated_websockets", None)
-            if callable(quiesce):
-                await quiesce(timeout=0.75)
+            remaining = max(0.0, deadline - time.monotonic())
+            if callable(quiesce) and remaining > 0:
+                await quiesce(timeout=min(0.75, remaining))
         except Exception:
+            pass
+        if server_state is None:
             return
+        await asyncio.sleep(max(0.0, deadline - time.monotonic()))
+        # SSL close_notify can otherwise wait 30s for an idle HTTP client. Only
+        # finish transports already closed by Uvicorn; active requests keep its
+        # normal graceful-shutdown contract.
+        for transport, ssl_protocol in tls_transports:
+            try:
+                underlying = self._safe_getattr(ssl_protocol, "_transport")
+                owner_server = self._safe_getattr(underlying, "_server")
+                app_protocol = self._safe_getattr(ssl_protocol, "_app_protocol")
+                idle_stopped_listener = (
+                    owner_server in servers
+                    and not owner_server.is_serving()
+                    and app_protocol not in server_state.connections
+                    and not server_state.tasks
+                )
+                if underlying is not None and (
+                    transport.is_closing() or idle_stopped_listener
+                ):
+                    underlying.abort()
+                    self.record("tls_drain_abort")
+            except (AttributeError, OSError, RuntimeError):
+                continue
 
     def _delegate(
         self, loop: asyncio.AbstractEventLoop, context: dict[str, Any]
@@ -361,7 +466,7 @@ class TransportRuntime:
             from zhenxun.services.log import logger
 
             logger.debug(
-                "已回收连接关闭阶段重置 | " f"category={metric.removesuffix('_reset')}",
+                f"已回收连接关闭阶段重置 | category={metric.removesuffix('_reset')}",
                 "WebUi",
             )
         except Exception:

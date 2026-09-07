@@ -262,9 +262,6 @@ class HandlerActivationIndex:
                 result.selected.append(descriptor.matcher)
                 result.deterministic_selected.add(descriptor.matcher)
                 continue
-            if _is_throttleable_broad_passive(descriptor, context):
-                if not _consume_broad_passive_budget(descriptor, budget):
-                    continue
             result.selected.append(descriptor.matcher)
         result.candidate_count = len(result.selected)
         return result
@@ -1444,59 +1441,6 @@ def matcher_matches_ai_route_heads(
             if head and shortcut_matches_text(head, shortcut):
                 return True
     return False
-
-
-def _is_throttleable_broad_passive(
-    descriptor: HandlerDescriptor,
-    context: ActivationContext,
-) -> bool:
-    """Only broad, no-rule passive message matchers may be budget-throttled."""
-
-    if context.event_type != "message":
-        return False
-    if descriptor.temp or descriptor.lane == "system":
-        return False
-    if not descriptor.lane.startswith("passive_"):
-        return False
-    if descriptor.command_like or descriptor.deterministic_text:
-        return False
-    if descriptor.has_custom_rule or descriptor.rules:
-        return False
-    if descriptor.lane == "passive_http" and (
-        context.has_url or _looks_like_rich_message(context.raw_text)
-    ):
-        return False
-    return True
-
-
-def _looks_like_rich_message(text: str) -> bool:
-    lowered = (text or "").casefold()
-    return any(
-        marker in lowered
-        for marker in (
-            "[cq:json",
-            "[json:",
-            "[cq:xml",
-            "[xml:",
-            "qqdocurl",
-            "jumpurl",
-            "miniapp",
-            "com.tencent",
-        )
-    )
-
-
-def _consume_broad_passive_budget(
-    descriptor: HandlerDescriptor,
-    budget: dict[str, int],
-) -> bool:
-    lane = descriptor.lane
-    if lane not in budget:
-        return True
-    if budget[lane] <= 0:
-        return False
-    budget[lane] -= 1
-    return True
 
 
 PASSIVE_DB_HINTS = (

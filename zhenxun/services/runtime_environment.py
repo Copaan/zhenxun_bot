@@ -51,6 +51,7 @@ RESTART_KEYS = {
     "DRIVER",
     "HOST",
     "ONEBOT_ACCESS_TOKEN",
+    "ONEBOT_REVERSE_WS_HOST",
     "PORT",
     "QBOT_ID_DATA",
     "QQ_ADAPTER_LOAD",
