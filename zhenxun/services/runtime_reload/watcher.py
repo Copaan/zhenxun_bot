@@ -8,6 +8,10 @@ from typing import TYPE_CHECKING
 from watchfiles import Change, awatch
 
 from zhenxun.services.log import logger
+from zhenxun.services.runtime_mutation import (
+    RuntimeMutationBusyError,
+    runtime_mutation_coordinator,
+)
 
 if TYPE_CHECKING:
     from .manager import PluginRuntimeManager
@@ -73,6 +77,9 @@ def _interesting(change: Change, raw_path: str) -> bool:
 async def watch_runtime_changes(manager: PluginRuntimeManager) -> None:
     retry_index = 0
     while True:
+        if not runtime_mutation_coordinator.accepting:
+            manager.watcher_state = "stopped"
+            return
         try:
             roots = _watch_roots(manager)
             manager.watcher_roots = [str(path) for path in roots]
@@ -131,6 +138,12 @@ async def watch_runtime_changes(manager: PluginRuntimeManager) -> None:
             manager.watcher_state = "stopped"
             raise
         except Exception as e:
+            if (
+                isinstance(e, RuntimeMutationBusyError)
+                and not runtime_mutation_coordinator.accepting
+            ):
+                manager.watcher_state = "stopped"
+                return
             delay = _RETRY_DELAYS[min(retry_index, len(_RETRY_DELAYS) - 1)]
             retry_index += 1
             manager.watcher_state = "retrying"

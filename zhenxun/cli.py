@@ -861,24 +861,36 @@ def _http_sidecar_process_matches(
 async def _start_http_sidecar_async(settings, cwd: Path) -> subprocess.Popen | None:
     from uuid import uuid4
 
-    from zhenxun.services.webui_http_sidecar_state import sanitized_sidecar_error
+    from zhenxun.services.webui_http_sidecar_state import sidecar_error_details
 
     startup_id = uuid4().hex
+    started_process = None
+    started_handle = None
+    failure_code = "sidecar_startup_failed"
 
     async def wait_ready(process):
+        nonlocal started_process, started_handle, failure_code
+        started_process = process
+        _publish_http_sidecar_state(spawn_pid=process.pid)
         from zhenxun.services.lifecycle.launcher import launcher_supervisor
 
+        started_handle = launcher_supervisor._handles.get(process.pid)
         deadline = time.monotonic() + HTTP_SIDECAR_START_TIMEOUT
         while process.poll() is None and time.monotonic() < deadline:
             if launcher_supervisor.shutdown_deadline is not None:
+                failure_code = "sidecar_startup_interrupted"
                 raise OSError("sidecar_startup_interrupted")
             child_state = _publish_http_sidecar_state()
-            if _http_sidecar_process_matches(child_state, process, startup_id):
+            if _http_sidecar_failure_matches(
+                child_state, process, startup_id, handle=started_handle
+            ):
                 if child_state.get("state") == "ready":
                     return
                 if child_state.get("state") == "degraded":
                     break
             await asyncio.sleep(0.05)
+        if process.poll() is None and time.monotonic() >= deadline:
+            failure_code = "startup_timeout"
         raise OSError("sidecar_startup_failed")
 
     _publish_http_sidecar_state(
@@ -886,9 +898,17 @@ async def _start_http_sidecar_async(settings, cwd: Path) -> subprocess.Popen | N
         mode=settings.effective_http_mode,
         port=settings.redirect_port,
         pid=None,
+        spawn_pid=None,
         state="starting",
         active_connections=0,
         last_error=None,
+        error_code=None,
+        stage="spawn",
+        errno=None,
+        retry_in_seconds=0,
+        next_retry_at=None,
+        diagnostic_identity_verified=None,
+        unverified_child_diagnostic=None,
     )
     try:
         process = await _spawn_launcher_process(
@@ -908,20 +928,125 @@ async def _start_http_sidecar_async(settings, cwd: Path) -> subprocess.Popen | N
             startup_id=startup_id,
         )
     except OSError as error:
+        child_state = _publish_http_sidecar_state()
+        matching_failure = (
+            started_process is not None
+            and _http_sidecar_failure_matches(
+                child_state, started_process, startup_id, handle=started_handle
+            )
+            and child_state.get("last_error")
+        )
+        # Read after readiness cleanup too: a fast-failing child can publish its
+        # diagnostic immediately before exiting, between launcher polls.
+        details = _http_sidecar_failure_diagnostics(
+            child_state,
+            verified=bool(matching_failure),
+            fallback=sidecar_error_details(
+                error if started_process is None else failure_code,
+                stage="spawn" if started_process is None else "readiness",
+            ),
+        )
         _publish_http_sidecar_state(
             state="degraded",
-            pid=None,
-            last_error=sanitized_sidecar_error(error),
+            active_connections=0,
+            startup_id=startup_id,
+            **details,
         )
         return None
     _record_launcher_process_start("http_sidecar", process)
-    _publish_http_sidecar_state(state="ready", spawn_pid=process.pid)
+    _publish_http_sidecar_state(
+        state="ready",
+        spawn_pid=process.pid,
+        last_error=None,
+        error_code=None,
+        stage=None,
+        errno=None,
+        diagnostic_identity_verified=True,
+        unverified_child_diagnostic=None,
+    )
     _launcher_log(
         "WebUI HTTP compatibility sidecar ready on "
         f"{settings.host}:{settings.redirect_port} "
         f"(mode={settings.effective_http_mode})"
     )
     return process
+
+
+def _http_sidecar_failure_matches(
+    state: dict, process, startup_id: str, *, handle=None
+) -> bool:
+    import psutil
+
+    from zhenxun.services.lifecycle.launcher import launcher_supervisor
+
+    boot_id = os.getenv("ZHENXUN_LAUNCHER_BOOT_ID", "")
+    handle = handle or launcher_supervisor._handles.get(process.pid)
+    if (
+        not boot_id
+        or state.get("launcher_boot_id") != boot_id
+        or not startup_id
+        or state.get("startup_id") != startup_id
+        or handle is None
+        or handle.process is not process
+        or handle.role != "http_sidecar"
+        or handle.launcher_boot_id != boot_id
+        or handle.startup_id != startup_id
+        or state.get("spawn_pid") != process.pid
+    ):
+        return False
+    pid, created = state.get("pid"), state.get("process_created_at")
+    if type(pid) is not int or pid <= 0 or type(created) not in {int, float}:
+        return False
+    if pid not in handle.identities and process.poll() is None:
+        # Discovery checks the spawn process identity before traversing its tree.
+        with contextlib.suppress(psutil.Error, RuntimeError):
+            handle._live_processes(discover=True)
+    if handle.identities.get(pid) != created:
+        return False
+    try:
+        return psutil.Process(pid).create_time() == created
+    except psutil.NoSuchProcess:
+        # Cleanup can remove a delegated interpreter; the retained supervisor
+        # handle is trusted evidence, unlike PID claims in the state file.
+        return True
+    except psutil.Error:
+        return False
+
+
+def _http_sidecar_failure_diagnostics(
+    state: dict, *, verified: bool, fallback: dict
+) -> dict:
+    from zhenxun.services.webui_http_sidecar_state import (
+        sanitized_sidecar_error,
+        sidecar_error_details,
+    )
+
+    if verified:
+        return {
+            "diagnostic_identity_verified": True,
+            "unverified_child_diagnostic": None,
+        }
+    unverified = None
+    if type(state.get("pid")) is int and state["pid"] > 0 and state.get("last_error"):
+        unverified = {
+            "error_code": sanitized_sidecar_error(
+                state.get("error_code") or "sidecar_error"
+            )
+        }
+        fallback = sidecar_error_details(
+            "listener_identity_unverified", stage="identity"
+        )
+    return {
+        **fallback,
+        "diagnostic_identity_verified": False,
+        "unverified_child_diagnostic": unverified,
+        "pid": None,
+        "process_created_at": None,
+        "first_error": None,
+        "latest_error": None,
+        "first_error_at": None,
+        "latest_error_at": None,
+    }
 
 
 async def _start_qq_ingress_async(settings, tls, cwd: Path):
@@ -1363,6 +1488,12 @@ async def _run_launcher_async() -> None:
                     state="degraded",
                     active_connections=0,
                     last_error="https_worker_not_ready",
+                    error_code="https_worker_not_ready",
+                    stage="upstream_readiness",
+                    errno=None,
+                    retry_count=http_sidecar_retry_index,
+                    retry_in_seconds=1.0,
+                    next_retry_at=time.time() + 1.0,
                 )
                 next_http_sidecar_retry = time.monotonic() + 1.0
                 _launcher_log(
@@ -1375,6 +1506,11 @@ async def _run_launcher_async() -> None:
                     http_sidecar_retry_index = 0
                 else:
                     next_http_sidecar_retry = time.monotonic() + 1.0
+                    _publish_http_sidecar_state(
+                        retry_in_seconds=1.0,
+                        next_retry_at=time.time() + 1.0,
+                        retry_count=http_sidecar_retry_index,
+                    )
         if verify_nonebot_generation or verify_source_transaction:
             with contextlib.suppress(Exception):
                 transition_launcher_commit("verifying")
@@ -1509,6 +1645,10 @@ async def _run_launcher_async() -> None:
                     await _terminate_worker_async(worker)
                     raise SystemExit(ingress_code or 1)
                 if http_sidecar is not None and http_sidecar.poll() is not None:
+                    exit_state = _publish_http_sidecar_state()
+                    matching_failure = _http_sidecar_failure_matches(
+                        exit_state, http_sidecar, exit_state.get("startup_id", "")
+                    ) and exit_state.get("last_error")
                     _record_launcher_process_exit(http_sidecar, "unexpected_exit")
                     http_sidecar = None
                     http_sidecar_signature = None
@@ -1522,10 +1662,20 @@ async def _run_launcher_async() -> None:
                     next_http_sidecar_retry = time.monotonic() + delay
                     _publish_http_sidecar_state(
                         state="degraded",
-                        pid=None,
                         active_connections=0,
-                        last_error="sidecar_unexpected_exit",
+                        **_http_sidecar_failure_diagnostics(
+                            exit_state,
+                            verified=bool(matching_failure),
+                            fallback={
+                                "last_error": "sidecar_unexpected_exit",
+                                "error_code": "sidecar_unexpected_exit",
+                                "stage": "serve",
+                                "errno": None,
+                            },
+                        ),
                         retry_in_seconds=delay,
+                        next_retry_at=time.time() + delay,
+                        retry_count=http_sidecar_retry_index,
                     )
                     _launcher_log(
                         "WebUI HTTP sidecar exited unexpectedly; "
@@ -1597,12 +1747,13 @@ async def _run_launcher_async() -> None:
                             )
                         ]
                         http_sidecar_retry_index += 1
-                        next_http_sidecar_retry = now + delay
+                        next_http_sidecar_retry = time.monotonic() + delay
                         _publish_http_sidecar_state(
                             state="degraded",
-                            pid=None,
                             active_connections=0,
                             retry_in_seconds=delay,
+                            next_retry_at=time.time() + delay,
+                            retry_count=http_sidecar_retry_index,
                         )
                 if now >= next_status_check:
                     next_status_check = now + WORKER_STATUS_POLL_INTERVAL

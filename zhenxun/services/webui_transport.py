@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+from asyncio.sslproto import SSLProtocol
 from collections import Counter
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import re
+import socket
 import ssl
 import sys
 from threading import RLock
@@ -30,6 +33,15 @@ _RELATED_ATTRIBUTES = (
 )
 
 
+@dataclass
+class _InboundTLSOwner:
+    loop: weakref.ReferenceType[Any]
+    server: weakref.ReferenceType[Any]
+    socket: weakref.ReferenceType[Any]
+    recovery_transport: weakref.ReferenceType[Any] | None = None
+    recovered: bool = False
+
+
 class TransportRuntime:
     """Own event-loop reset handling and Uvicorn's outer transport lifetime."""
 
@@ -46,6 +58,9 @@ class TransportRuntime:
         self._uvicorn_wrapped_handle_exit: Callable[..., Any] | None = None
         self._shutdown_task: asyncio.Task[None] | None = None
         self._tls_transports: weakref.WeakSet[Any] = weakref.WeakSet()
+        self._tls_owners: weakref.WeakKeyDictionary[SSLProtocol, _InboundTLSOwner] = (
+            weakref.WeakKeyDictionary()
+        )
         self._original_ssl_factory: Callable[..., Any] | None = None
         self._wrapped_ssl_factory: Callable[..., Any] | None = None
         self._ssl_factory_was_local = False
@@ -80,6 +95,26 @@ class TransportRuntime:
                         )
                     ):
                         self._tls_transports.add(transport)
+                        raw_socket = (
+                            args[0]
+                            if args
+                            else kwargs.get("rawsock", kwargs.get("sock"))
+                        )
+                        server = kwargs["server"]
+                        if (
+                            isinstance(protocol, SSLProtocol)
+                            and protocol._loop is loop
+                            and isinstance(server, asyncio.Server)
+                            and server.get_loop() is loop
+                            and isinstance(raw_socket, socket.socket)
+                        ):
+                            # SSL connection_lost clears both app/underlying links
+                            # before Proactor closes the socket and detaches server.
+                            self._tls_owners[protocol] = _InboundTLSOwner(
+                                weakref.ref(loop),
+                                weakref.ref(server),
+                                weakref.ref(raw_socket),
+                            )
                     return transport
 
                 self._wrapped_ssl_factory = track_ssl
@@ -109,6 +144,7 @@ class TransportRuntime:
                     del loop._make_ssl_transport
             self._wrapped_ssl_factory = self._original_ssl_factory = None
             self._tls_transports.clear()
+            self._tls_owners.clear()
         if loop is None or loop.is_closed():
             return
         if loop.get_exception_handler() is installed:
@@ -150,6 +186,10 @@ class TransportRuntime:
             "http_reset_count": counts.get("http_reset", 0),
             "websocket_reset_count": counts.get("websocket_reset", 0),
             "proactor_close_reset_count": counts.get("proactor_close_reset", 0),
+            "tls_close_recovery_count": counts.get("tls_close_recovery", 0),
+            "tls_close_recovery_failed_count": counts.get(
+                "tls_close_recovery_failed", 0
+            ),
             "unclassified_windows_reset_count": counts.get(
                 "unclassified_windows_reset", 0
             ),
@@ -171,6 +211,16 @@ class TransportRuntime:
         self, loop: asyncio.AbstractEventLoop, context: dict[str, Any]
     ) -> None:
         error = context.get("exception")
+        callback = self._safe_getattr(
+            context.get("handle"), "_callback"
+        ) or context.get("callback")
+        if self._safe_getattr(callback, "__name__") == "_call_connection_lost":
+            if self._recover_proactor_tls_close(loop, callback, error):
+                self.record("proactor_close_reset")
+                self._debug_disconnect("proactor_close_reset")
+            else:
+                self._delegate(loop, context)
+            return
         channel = self._uvicorn_channel(context)
         if channel and isinstance(error, ssl.SSLError):
             self.record_diagnostic("tls_transport_failed")
@@ -180,10 +230,6 @@ class TransportRuntime:
             self._debug_disconnect(metric)
             return
         if self._is_windows_connection_reset(error):
-            if self._is_closing_proactor_cleanup(context):
-                self.record("proactor_close_reset")
-                self._debug_disconnect("proactor_close_reset")
-                return
             self.record("unclassified_windows_reset")
             self._record_unclassified_reset(context)
         self._delegate(loop, context)
@@ -238,6 +284,17 @@ class TransportRuntime:
 
     def _begin_signal_shutdown(self, server: Any) -> None:
         self.record("signal_shutdown")
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        servers = tuple(
+            listener
+            for listener in (self._safe_getattr(server, "servers") or ())
+            if isinstance(listener, asyncio.Server) and listener.get_loop() is loop
+        )
+        for listener in servers:
+            listener.close()
         server_state = self._safe_getattr(server, "server_state")
         connections = tuple(self._safe_getattr(server_state, "connections") or ())
         tls_transports = []
@@ -255,10 +312,6 @@ class TransportRuntime:
             if ssl_protocol is not None:
                 if not any(item[0] is transport for item in tls_transports):
                     tls_transports.append((transport, ssl_protocol))
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return
         with self._lock:
             task = self._shutdown_task
             if task is not None and not task.done():
@@ -267,7 +320,7 @@ class TransportRuntime:
                 self._quiesce_webui_connections(
                     server_state,
                     tls_transports,
-                    tuple(self._safe_getattr(server, "servers") or ()),
+                    servers,
                 ),
                 name="webui-transport-signal-quiesce",
             )
@@ -293,28 +346,55 @@ class TransportRuntime:
             pass
         if server_state is None:
             return
-        await asyncio.sleep(max(0.0, deadline - time.monotonic()))
-        # SSL close_notify can otherwise wait 30s for an idle HTTP client. Only
-        # finish transports already closed by Uvicorn; active requests keep its
-        # normal graceful-shutdown contract.
-        for transport, ssl_protocol in tls_transports:
-            try:
+        loop = asyncio.get_running_loop()
+        servers = tuple(
+            listener
+            for listener in servers
+            if isinstance(listener, asyncio.Server) and listener.get_loop() is loop
+        )
+        aborted = set()
+        # Accept completions and active responses may finish after the signal.
+        # Refresh ownership on every pass without extending the drain deadline.
+        while servers:
+            current = dict(tls_transports)
+            current.update(
+                (transport, self._safe_getattr(transport, "_ssl_protocol"))
+                for transport in tuple(self._tls_transports)
+            )
+            for transport, ssl_protocol in current.items():
+                if not isinstance(ssl_protocol, SSLProtocol):
+                    continue
+                owner = self._tls_owners.get(ssl_protocol)
+                if owner is None or owner.loop() is not loop:
+                    continue
                 underlying = self._safe_getattr(ssl_protocol, "_transport")
-                owner_server = self._safe_getattr(underlying, "_server")
+                owner_server = owner.server()
+                if (
+                    underlying is None
+                    or underlying in aborted
+                    or owner_server not in servers
+                    or self._safe_getattr(underlying, "_loop") is not loop
+                    or self._safe_getattr(underlying, "_server") is not owner_server
+                    or owner.socket() is None
+                    or self._safe_getattr(underlying, "_sock") is not owner.socket()
+                    or owner_server.is_serving()
+                ):
+                    continue
                 app_protocol = self._safe_getattr(ssl_protocol, "_app_protocol")
-                idle_stopped_listener = (
-                    owner_server in servers
-                    and not owner_server.is_serving()
-                    and app_protocol not in server_state.connections
+                if transport.is_closing() or (
+                    app_protocol not in server_state.connections
                     and not server_state.tasks
-                )
-                if underlying is not None and (
-                    transport.is_closing() or idle_stopped_listener
                 ):
                     underlying.abort()
+                    aborted.add(underlying)
                     self.record("tls_drain_abort")
-            except (AttributeError, OSError, RuntimeError):
-                continue
+            if all(listener._active_count == 0 for listener in servers):
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self.record_diagnostic("tls_shutdown_drain_incomplete")
+                return
+            await asyncio.sleep(min(0.05, remaining))
 
     def _delegate(
         self, loop: asyncio.AbstractEventLoop, context: dict[str, Any]
@@ -382,26 +462,88 @@ class TransportRuntime:
                 return "http"
         return None
 
-    @classmethod
-    def _is_closing_proactor_cleanup(cls, context: dict[str, Any]) -> bool:
-        for current in cls._context_objects(context):
-            owner = cls._safe_getattr(current, "__self__")
-            if owner is None:
-                continue
-            owner_module = str(getattr(type(owner), "__module__", ""))
-            callback_name = str(getattr(current, "__name__", ""))
-            if not owner_module.startswith("asyncio.proactor_events"):
-                continue
-            if callback_name != "_call_connection_lost":
-                continue
-            is_closing = cls._safe_getattr(owner, "is_closing")
-            try:
-                if callable(is_closing):
-                    return bool(is_closing())
-                return bool(cls._safe_getattr(owner, "_closing"))
-            except Exception:
-                return False
-        return False
+    def _recover_proactor_tls_close(self, loop, callback, error) -> bool:
+        if (
+            sys.platform != "win32"
+            or loop is not self._loop
+            or not isinstance(error, OSError)
+            or getattr(error, "winerror", None) != 10054
+        ):
+            return False
+        from asyncio.proactor_events import _ProactorSocketTransport
+
+        transport = self._safe_getattr(callback, "__self__")
+        if (
+            type(transport) is not _ProactorSocketTransport
+            or self._safe_getattr(callback, "__func__")
+            is not _ProactorSocketTransport._call_connection_lost
+            or transport._loop is not loop
+            or not transport.is_closing()
+        ):
+            return False
+        protocol = transport._protocol
+        if not isinstance(protocol, SSLProtocol):
+            return False
+        owner = self._tls_owners.get(protocol)
+        if owner is None or owner.loop() is not loop:
+            return False
+        trace = error.__traceback__
+        while trace is not None:
+            if (
+                trace.tb_frame.f_code
+                is _ProactorSocketTransport._call_connection_lost.__code__
+                and trace.tb_frame.f_locals.get("self") is transport
+            ):
+                break
+            trace = trace.tb_next
+        if trace is None:
+            return False
+        if owner.recovery_transport is not None:
+            return bool(
+                owner.recovery_transport() is transport
+                and owner.recovered
+                and transport._called_connection_lost
+                and transport._sock is None
+                and transport._server is None
+            )
+        server, raw_socket = owner.server(), owner.socket()
+        if (
+            server is None
+            or server.get_loop() is not loop
+            or transport._server is not server
+            or raw_socket is None
+            or transport._sock is not raw_socket
+            or transport._called_connection_lost
+            or not isinstance(protocol, SSLProtocol)
+            or protocol._loop is not loop
+            or protocol._transport is not None
+            or protocol._app_protocol is not None
+            or protocol._app_transport is not None
+        ):
+            return False
+        # Do not repeat protocol.connection_lost or socket.shutdown. A failed
+        # detach may have mutated accounting, so never retry an uncertain repair.
+        owner.recovery_transport = weakref.ref(transport)
+        try:
+            raw_socket.close()
+            transport._sock = None
+            server._detach()
+            transport._server = None
+            transport._called_connection_lost = True
+        except Exception as recovery_error:
+            self.record("tls_close_recovery_failed")
+            self._delegate(
+                loop,
+                {
+                    "message": "Inbound TLS close recovery failed",
+                    "exception": recovery_error,
+                    "transport": transport,
+                },
+            )
+            return False
+        owner.recovered = True
+        self.record("tls_close_recovery")
+        return True
 
     def _record_unclassified_reset(self, context: dict[str, Any]) -> None:
         objects = self._context_objects(context)

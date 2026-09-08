@@ -14,6 +14,7 @@ import uuid
 
 from filelock import FileLock, Timeout
 
+from zhenxun.plugin_archive_dependencies import ArchiveDependencyConflict
 from zhenxun.utils.atomic_json import (
     AtomicJsonLockTimeout,
     read_json_locked,
@@ -25,6 +26,66 @@ ROOT = Path("data/runtime/plugin-store-transaction")
 PENDING_FILE = ROOT / "pending-v1.json"
 LIFECYCLE_INDEX = Path("data/runtime/lifecycle-index-v2.json")
 _TRANSACTION_LOCK = ROOT / ".transaction.lock"
+
+
+class ArchiveSourceBuildConflict(RuntimeError):
+    code = "archive_source_build_transaction_conflict"
+
+    def __init__(self) -> None:
+        super().__init__(self.code)
+
+
+def _archive_wheels_only(transaction: dict[str, Any] | None) -> bool:
+    transaction = transaction or {}
+    return bool(transaction.get("archive_wheels_only")) or any(
+        str(operation.get("store_key") or "").startswith("local_archive:")
+        or (operation.get("receipt") or {}).get("source") == "local_archive"
+        for operation in transaction.get("operations", [])
+    )
+
+
+def _source_build_enabled(transaction: dict[str, Any] | None) -> bool:
+    transaction = transaction or {}
+    return bool(transaction.get("source_build_confirmed")) or any(
+        operation.get("source_build_confirmed")
+        for operation in transaction.get("operations", [])
+    )
+
+
+def _nonebot_pending() -> dict[str, Any] | None:
+    from zhenxun.nonebot_store import storage
+
+    return storage.pending_transaction() if storage.PENDING_FILE.exists() else None
+
+
+def _validate_archive_build_policy(*transactions: dict[str, Any] | None) -> bool:
+    from zhenxun.plugin_archive_dependencies import archive_dependency_contract
+
+    wheels_only = bool(archive_dependency_contract()["store_keys"]) or any(
+        _archive_wheels_only(item) for item in transactions
+    )
+    if wheels_only and any(_source_build_enabled(item) for item in transactions):
+        raise ArchiveSourceBuildConflict()
+    return wheels_only
+
+
+@contextmanager
+def archive_dependency_policy(transaction: dict[str, Any]) -> Iterator[None]:
+    """Serialize cross-store policy checks with source staging and layer builds."""
+    from zhenxun.plugin_archive_dependencies import preserve_archive_dependencies
+
+    with _locked_transaction():
+        if _validate_archive_build_policy(
+            _read_pending(), _nonebot_pending(), transaction
+        ):
+            # Keep the constraint after source cancellation: the layer may still
+            # contain dependencies already merged from that archive operation.
+            transaction["archive_wheels_only"] = True
+            transaction["source_build_confirmed"] = False
+        target = transaction.get("target_manifest")
+        if isinstance(target, dict):
+            preserve_archive_dependencies(target)
+        yield
 
 
 def _now() -> str:
@@ -215,6 +276,20 @@ def stage_operation(
                 "pending_operations": [_public_operation(item) for item in operations],
             }
         else:
+            prospective = {
+                **transaction,
+                "operations": [
+                    item for item in operations if item.get("store_key") != store_key
+                ]
+                + [
+                    {
+                        "store_key": store_key,
+                        "receipt": receipt,
+                        "source_build_confirmed": source_build_confirmed,
+                    }
+                ],
+            }
+            _validate_archive_build_policy(prospective, _nonebot_pending())
             operation_id = operation_id or uuid.uuid4().hex
             bundle = ROOT / operation_id
             old_path = bundle / "old"
@@ -332,6 +407,11 @@ def prepare_dependency_transaction() -> bool:
     source = pending_transaction()
     if not source or source.get("state") != "pending_restart":
         return True
+    try:
+        wheels_only = _validate_archive_build_policy(source, _nonebot_pending())
+    except (ArchiveSourceBuildConflict, ArchiveDependencyConflict) as error:
+        _fail_pending(error.code)
+        return False
     packages = dependency_packages()
     if not packages:
         return True
@@ -416,7 +496,13 @@ def prepare_dependency_transaction() -> bool:
             "updated_at": utc_now(),
             "source_transaction_revision": source.get("revision"),
         }
-    save_pending_transaction(transaction)
+    if wheels_only:
+        transaction["archive_wheels_only"] = True
+    try:
+        save_pending_transaction(transaction)
+    except (ArchiveSourceBuildConflict, ArchiveDependencyConflict) as error:
+        _fail_pending(error.code)
+        return False
     return True
 
 
@@ -434,6 +520,7 @@ def apply_pending_transaction() -> bool:
             return False
         switched: list[dict[str, Any]] = []
         try:
+            _validate_archive_build_policy(transaction, _nonebot_pending())
             for operation in transaction.get("operations", []):
                 live = Path(str(operation["live_path"]))
                 if operation.get("action") != "uninstall" and _digest(
@@ -550,7 +637,9 @@ def rollback_pending_transaction(
 
 
 __all__ = [
+    "ArchiveSourceBuildConflict",
     "apply_pending_transaction",
+    "archive_dependency_policy",
     "cancel_operation",
     "dependency_packages",
     "finalize_pending_transaction",

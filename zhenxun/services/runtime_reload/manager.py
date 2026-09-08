@@ -20,6 +20,7 @@ import threading
 import time
 from types import MethodType, ModuleType
 from typing import Any
+from uuid import uuid4
 import weakref
 
 import nonebot
@@ -27,6 +28,7 @@ from nonebot.plugin import get_loaded_plugins
 
 from zhenxun.services.lifecycle import (
     LeaseState,
+    LifecycleError,
     PluginIncarnation,
     ResourceReceipt,
     capture_runtime_providers,
@@ -70,10 +72,12 @@ from .ownership import (
     current_owner,
     import_owner,
     initialization_retainer,
+    lifecycle_callback_context,
     lifecycle_work_context,
     lifecycle_work_phase,
     owner_context,
     resource_context,
+    shared_executor_submission,
 )
 from .signatures import async_callable, typed_wraps
 
@@ -81,7 +85,7 @@ _INDEX_FILE = Path("data/runtime/lifecycle-index-v2.json")
 _TASK_CANCEL_TIMEOUT = 2.0
 
 
-class PluginRecoveryRequired(RuntimeError):
+class PluginRecoveryRequired(LifecycleError):
     """Old resources cannot be proven stopped; never reactivate a generation."""
 
 
@@ -176,6 +180,13 @@ class PluginRuntimeManager:
         self._original_task_factory: Callable[..., asyncio.Future[Any]] | None = None
         self._task_factory_installed = False
         self._loop_hook_originals: dict[str, Callable[..., Any]] = {}
+        self._tracked_loop: asyncio.AbstractEventLoop | None = None
+        self._shared_executors: weakref.WeakSet = weakref.WeakSet()
+        self._cancellation_work: dict[tuple, LifecycleWork] = {}
+        self._cancellation_requests: dict[asyncio.Task, tuple[str, int]] = {}
+        self._executor_owners: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+        self._original_executor_init = None
+        self._connection_tasks: weakref.WeakSet = weakref.WeakSet()
         self._watcher_task: asyncio.Task[Any] | None = None
         self._watcher_refresh_task: asyncio.Task[Any] | None = None
         self._watcher_refresh_requested = False
@@ -1241,7 +1252,12 @@ class PluginRuntimeManager:
                     result = _original(wrapped)
                     if registry is not None:
                         manage_registration(
-                            registry, before, manager, owner, incarnation.incarnation_id
+                            registry,
+                            before,
+                            manager,
+                            owner,
+                            incarnation.incarnation_id,
+                            kind=_hook_name,
                         )
                     return result
 
@@ -1474,9 +1490,25 @@ class PluginRuntimeManager:
             target.require = tracked_require
 
     def _install_thread_process_tracking(self) -> None:
-        if self._original_anyio_worker is None:
-            from anyio._backends._asyncio import AsyncIOBackend
+        from concurrent.futures import ThreadPoolExecutor
+        from concurrent.futures.thread import _worker
 
+        from anyio._backends._asyncio import AsyncIOBackend, WorkerThread
+
+        manager = self
+        if self._original_executor_init is None:
+            original_executor_init = ThreadPoolExecutor.__init__
+            self._original_executor_init = original_executor_init
+
+            @wraps(original_executor_init)
+            def tracked_executor_init(executor, *args, **kwargs):
+                original_executor_init(executor, *args, **kwargs)
+                if owner := current_owner():
+                    manager._executor_owners[executor] = owner
+
+            ThreadPoolExecutor.__init__ = tracked_executor_init
+
+        if self._original_anyio_worker is None:
             original_worker = AsyncIOBackend.run_sync_in_worker_thread
             self._original_anyio_worker = AsyncIOBackend.__dict__[
                 "run_sync_in_worker_thread"
@@ -1488,7 +1520,7 @@ class PluginRuntimeManager:
                 if not owner:
                     return await original_worker(func, args, *options, **kwargs)
                 incarnation = manager._ensure_incarnation(owner)
-                phase = lifecycle_work_phase(owner, incarnation.incarnation_id)
+                phase = manager._current_work(owner, incarnation.incarnation_id)
                 completion = ConcurrentFuture()
                 owned = manager._owned_executor_futures[owner]
                 owned.add(completion)
@@ -1529,20 +1561,21 @@ class PluginRuntimeManager:
             @wraps(original_start)
             def tracked_start(thread, *args, **kwargs):
                 owner = current_owner()
-                from concurrent.futures.thread import _worker
-
-                from anyio._backends._asyncio import WorkerThread
-
                 shared_worker = isinstance(thread, WorkerThread)
                 if getattr(thread, "_target", None) is _worker:
-                    pool_ref = getattr(thread, "_args", (None,))[0]
+                    pool_args = getattr(thread, "_args", ())
+                    pool_ref = pool_args[0] if pool_args else None
                     pool = pool_ref() if callable(pool_ref) else None
-                    try:
-                        shared_worker = (
-                            pool is asyncio.get_running_loop()._default_executor
-                        )
-                    except RuntimeError:
-                        pass
+                    shared_worker = shared_executor_submission.get() or (
+                        pool is not None and pool in manager._shared_executors
+                    )
+                    if shared_worker and pool is not None:
+                        manager._shared_executors.add(pool)
+                    elif pool in manager._executor_owners:
+                        owner = manager._executor_owners[pool]
+                    else:
+                        manager._entry_diagnostics["executor_ownership_unobserved"] += 1
+                        return Context().run(original_start, thread, *args, **kwargs)
                 if shared_worker:
                     from zhenxun.services.shared_workers import register_shared_worker
 
@@ -1607,6 +1640,11 @@ class PluginRuntimeManager:
             subprocess.Popen.__init__ = tracked_init
 
     def _restore_thread_process_tracking(self) -> None:
+        from concurrent.futures import ThreadPoolExecutor
+
+        if self._original_executor_init is not None:
+            ThreadPoolExecutor.__init__ = self._original_executor_init
+            self._original_executor_init = None
         if self._original_anyio_worker is not None:
             from anyio._backends._asyncio import AsyncIOBackend
 
@@ -2110,6 +2148,8 @@ class PluginRuntimeManager:
     def _work_lease_is_current(
         self, owner: str, incarnation_id: str, phase: LifecycleWork | None
     ) -> bool:
+        if phase is not None and phase.phase == "on_shutdown" and not phase.valid():
+            return False
         root = self._root_owner(owner) or owner
         incarnation = self._incarnations.get(owner) or self._incarnations.get(root)
         return bool(
@@ -2179,7 +2219,20 @@ class PluginRuntimeManager:
         if self._task_factory_installed:
             return
         loop = asyncio.get_running_loop()
+        for name in (
+            "get_task_factory",
+            "set_task_factory",
+            "run_in_executor",
+            "set_default_executor",
+            "call_later",
+            "call_at",
+        ):
+            if not callable(getattr(loop, name, None)):
+                self.enabled = False
+                self.compatibility_error = "event_loop_tracking_unsupported"
+                return
         self._original_task_factory = loop.get_task_factory()
+        self._tracked_loop = loop
 
         def factory(
             loop: asyncio.AbstractEventLoop, coro: Coroutine[Any, Any, Any], **kwargs
@@ -2200,10 +2253,10 @@ class PluginRuntimeManager:
                 if incarnation:
                     phase = (
                         context.run(
-                            lifecycle_work_phase, owner, incarnation.incarnation_id
+                            self._current_work, owner, incarnation.incarnation_id
                         )
                         if context is not None
-                        else lifecycle_work_phase(owner, incarnation.incarnation_id)
+                        else self._current_work(owner, incarnation.incarnation_id)
                     )
                 if incarnation and not self._work_lease_is_current(
                     owner, incarnation.incarnation_id, phase
@@ -2212,13 +2265,70 @@ class PluginRuntimeManager:
                 else:
                     if phase:
                         phase.children.add(task)
+                        if phase.phase == "on_shutdown" and any(
+                            phase is value for value in self._cancellation_work.values()
+                        ):
+                            self._cancellation_work[
+                                (task, owner, incarnation.incarnation_id)
+                            ] = LifecycleWork(
+                                owner,
+                                incarnation.incarnation_id,
+                                weakref.ref(task),
+                                "on_shutdown",
+                                phase.budget,
+                            )
+                            task.add_done_callback(self._forget_cancellation_task)
                     self._owned_tasks[owner].add(task)
                     task.add_done_callback(self._owned_tasks[owner].discard)
             return task
 
-        loop.set_task_factory(factory)
-        self._install_loop_resource_tracking(loop)
         self._task_factory_installed = True
+        try:
+            loop.set_task_factory(factory)
+            self._install_loop_resource_tracking(loop)
+        except Exception as error:
+            self._restore_task_factory()
+            self.enabled = False
+            if self.compatibility_error != "event_loop_tracking_restore_failed":
+                self.compatibility_error = (
+                    f"event_loop_tracking_unsupported:{type(error).__name__}"
+                )
+            logger.warning("Event loop tracking unavailable; hot operations disabled")
+
+    def _current_work(self, owner, incarnation_id):
+        phase = lifecycle_work_phase(owner, incarnation_id)
+        if phase is not None:
+            return phase
+        try:
+            task = asyncio.current_task()
+        except RuntimeError:
+            return None
+        phase = self._cancellation_work.get((task, owner, incarnation_id))
+        if phase is not None and (phase.owner, phase.incarnation_id) == (
+            owner,
+            incarnation_id,
+        ):
+            return phase
+        return None
+
+    def _forget_cancellation_task(self, task):
+        self._cancellation_requests.pop(task, None)
+        for key in list(self._cancellation_work):
+            if key[0] is task:
+                self._cancellation_work.pop(key, None)
+
+    def consume_connection_cancellation(self, task, error):
+        request = self._cancellation_requests.get(task)
+        if (
+            request is None
+            or error.args != (request[0],)
+            or request[1] != 0
+            or (hasattr(task, "cancelling") and task.cancelling() != 1)
+        ):
+            return False
+        if hasattr(task, "uncancel"):
+            task.uncancel()
+        return True
 
     def _install_loop_resource_tracking(self, loop: asyncio.AbstractEventLoop) -> None:
         if self._loop_hook_originals:
@@ -2235,7 +2345,7 @@ class PluginRuntimeManager:
                 callback_index = 1
                 callback = args[callback_index]
                 incarnation = manager._ensure_incarnation(owner)
-                phase = lifecycle_work_phase(owner, incarnation.incarnation_id)
+                phase = manager._current_work(owner, incarnation.incarnation_id)
                 holder: list[weakref.ReferenceType[asyncio.Handle]] = []
 
                 @wraps(callback)
@@ -2247,7 +2357,7 @@ class PluginRuntimeManager:
                         owner, incarnation.incarnation_id, phase
                     ):
                         return None
-                    with owner_context(owner):
+                    with owner_context(owner), lifecycle_callback_context(phase):
                         return callback(*callback_args)
 
                 replaced = list(args)
@@ -2276,7 +2386,7 @@ class PluginRuntimeManager:
                 if not owner:
                     return _original(fd, callback, *args)
                 incarnation = manager._ensure_incarnation(owner)
-                phase = lifecycle_work_phase(owner, incarnation.incarnation_id)
+                phase = manager._current_work(owner, incarnation.incarnation_id)
 
                 @wraps(callback)
                 def wrapped(*callback_args):
@@ -2284,7 +2394,7 @@ class PluginRuntimeManager:
                         owner, incarnation.incarnation_id, phase
                     ):
                         return None
-                    with owner_context(owner):
+                    with owner_context(owner), lifecycle_callback_context(phase):
                         return callback(*callback_args)
 
                 result = _original(fd, wrapped, *args)
@@ -2296,6 +2406,15 @@ class PluginRuntimeManager:
 
         original_run_in_executor = loop.run_in_executor
         self._loop_hook_originals["run_in_executor"] = original_run_in_executor
+        original_set_executor = loop.set_default_executor
+        self._loop_hook_originals["set_default_executor"] = original_set_executor
+
+        def tracked_set_executor(executor):
+            result = original_set_executor(executor)
+            manager._shared_executors.add(executor)
+            return result
+
+        loop.set_default_executor = tracked_set_executor
 
         def tracked_run_in_executor(executor, func, *args):
             owner = current_owner()
@@ -2303,7 +2422,7 @@ class PluginRuntimeManager:
                 return original_run_in_executor(executor, func, *args)
             incarnation = manager._ensure_incarnation(owner)
             budget = current_budget.get()
-            phase = lifecycle_work_phase(owner, incarnation.incarnation_id)
+            phase = manager._current_work(owner, incarnation.incarnation_id)
             completion: ConcurrentFuture[None] = ConcurrentFuture()
 
             @wraps(func)
@@ -2323,9 +2442,16 @@ class PluginRuntimeManager:
                 finally:
                     completion.set_result(None)
 
+            def shared_submit():
+                token = shared_executor_submission.set(True)
+                try:
+                    return original_run_in_executor(executor, run_with_owner)
+                finally:
+                    shared_executor_submission.reset(token)
+
             future = (
-                Context().run(original_run_in_executor, executor, run_with_owner)
-                if executor is None or executor is loop._default_executor
+                Context().run(shared_submit)
+                if executor is None or executor in manager._shared_executors
                 else original_run_in_executor(executor, run_with_owner)
             )
             owned = manager._owned_executor_futures[owner]
@@ -2347,14 +2473,30 @@ class PluginRuntimeManager:
     def _restore_task_factory(self) -> None:
         if not self._task_factory_installed:
             return
-        with contextlib.suppress(RuntimeError):
-            loop = asyncio.get_running_loop()
-            loop.set_task_factory(self._original_task_factory)
+        loop = self._tracked_loop
+        failed = False
+        if loop is not None:
+            try:
+                if loop.get_task_factory() is not self._original_task_factory:
+                    loop.set_task_factory(self._original_task_factory)
+            except Exception:
+                failed = True
             for method_name, original in self._loop_hook_originals.items():
-                setattr(loop, method_name, original)
+                try:
+                    if getattr(loop, method_name) != original:
+                        setattr(loop, method_name, original)
+                except Exception:
+                    failed = True
         self._loop_hook_originals.clear()
         self._task_factory_installed = False
         self._original_task_factory = None
+        self._tracked_loop = None
+        if failed:
+            from zhenxun.services.lifecycle import lifecycle_kernel
+
+            self.enabled = False
+            self.compatibility_error = "event_loop_tracking_restore_failed"
+            lifecycle_kernel.require_recovery("runtime_tracking_restore_failed")
 
     async def _cancel_all_owned_tasks(self) -> None:
         owners = (
@@ -4017,7 +4159,7 @@ class PluginRuntimeManager:
             self._persist_index()
         return operation
 
-    async def _cancel_plugin_tasks(self, owners: set[str]) -> None:
+    async def _cancel_plugin_tasks(self, owners: set[str], *, only_tasks=None) -> None:
         from zhenxun.services.lifecycle import lifecycle_kernel
 
         cleanup_tasks = lifecycle_kernel.owned_cleanup_task_ids()
@@ -4033,18 +4175,78 @@ class PluginRuntimeManager:
             for task in self._entry_tasks.get(owner, {})
             if id(task) not in cleanup_tasks
         )
+        if only_tasks is not None:
+            tasks.intersection_update(only_tasks)
         if asyncio.current_task() in tasks:
             raise PluginRecoveryRequired("plugin_cleanup_owns_current_task")
-        for task in tasks:
-            task.add_done_callback(self._consume_cleanup_task)
-            if not task.done():
-                task.cancel()
-        if tasks:
-            done, pending = await asyncio.wait(
-                tasks, timeout=remaining_timeout(_TASK_CANCEL_TIMEOUT)
-            )
-        else:
-            done, pending = set(), set()
+        # Cancellation continuations keep only a task-bound, bounded cleanup lease.
+        with shutdown_budget(_TASK_CANCEL_TIMEOUT) as budget:
+            works = []
+            for owner in owners:
+                incarnation = self._incarnations.get(owner) or self._incarnations.get(
+                    self._root_owner(owner)
+                )
+                if incarnation is None:
+                    continue
+                for task in tasks & (
+                    self._owned_tasks.get(owner, set())
+                    | set(self._entry_tasks.get(owner, {}))
+                ):
+                    if task.done():
+                        continue
+                    work = LifecycleWork(
+                        owner,
+                        incarnation.incarnation_id,
+                        weakref.ref(task),
+                        "on_shutdown",
+                        budget,
+                    )
+                    self._cancellation_work[
+                        (task, owner, incarnation.incarnation_id)
+                    ] = work
+                    works.append(work)
+                    task.add_done_callback(self._forget_cancellation_task)
+            try:
+                for task in tasks:
+                    task.add_done_callback(self._consume_cleanup_task)
+                    if not task.done():
+                        marker = f"plugin_cleanup_cancel:{uuid4().hex}"
+                        self._cancellation_requests[task] = (
+                            marker,
+                            task.cancelling() if hasattr(task, "cancelling") else 0,
+                        )
+                        task.cancel(marker)
+                if tasks:
+                    done, pending = await asyncio.wait(
+                        tasks, timeout=budget.remaining()
+                    )
+                else:
+                    done, pending = set(), set()
+                observed = set(tasks)
+                while True:
+                    children = {
+                        key[0]
+                        for key, work in self._cancellation_work.items()
+                        if work.budget is budget
+                    } - observed
+                    if not children:
+                        break
+                    observed.update(children)
+                    for child in children:
+                        child.add_done_callback(self._consume_cleanup_task)
+                        if not child.done():
+                            child.cancel()
+                    child_done, child_pending = await asyncio.wait(
+                        children, timeout=budget.remaining()
+                    )
+                    done.update(child_done)
+                    pending.update(child_pending)
+                    if not budget.remaining():
+                        break
+            finally:
+                for work in self._cancellation_work.values():
+                    if work.budget is budget:
+                        work.active = False
         for task in done:
             if not task.cancelled():
                 task.exception()
@@ -4104,6 +4306,9 @@ class PluginRuntimeManager:
         if running_executor_work:
             raise RuntimeError(f"plugin_executor_in_flight:{unit.plugin_id}")
         unit.draining = True
+        await self._cancel_plugin_tasks(
+            self._owned_keys_for_unit(unit.plugin_id), only_tasks=self._connection_tasks
+        )
         if unit.in_flight:
             try:
                 await asyncio.wait_for(
@@ -4207,15 +4412,26 @@ class PluginRuntimeManager:
             unit.draining = True
             owners = self._owned_keys_for_unit(unit.plugin_id)
             try:
-                if unit.in_flight:
-                    timeout = remaining_timeout(2.0)
-                    if timeout <= 0:
-                        raise PluginRecoveryRequired("plugin_drain_timeout")
-                    await asyncio.wait_for(
-                        self._drained_event(unit.plugin_id).wait(), timeout=timeout
+                drain_error = None
+                try:
+                    await self._cancel_plugin_tasks(
+                        owners, only_tasks=self._connection_tasks
                     )
+                    if unit.in_flight:
+                        timeout = remaining_timeout(2.0)
+                        if timeout <= 0:
+                            raise PluginRecoveryRequired("plugin_drain_timeout")
+                        await asyncio.wait_for(
+                            self._drained_event(unit.plugin_id).wait(), timeout=timeout
+                        )
+                except (TimeoutError, PluginRecoveryRequired) as error:
+                    drain_error = error
                 self._revoke_incarnation(unit.plugin_id)
                 await self._cancel_plugin_tasks(owners)
+                if drain_error is not None:
+                    raise PluginRecoveryRequired(
+                        "plugin_drain_timeout"
+                    ) from drain_error
             finally:
                 self._stop_owned_callbacks(owners)
 

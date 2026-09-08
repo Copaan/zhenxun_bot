@@ -108,7 +108,10 @@ def pending_transaction() -> dict[str, Any] | None:
 
 
 def save_pending_transaction(value: dict[str, Any]) -> None:
-    write_json(PENDING_FILE, value)
+    from zhenxun.plugin_store_transaction import archive_dependency_policy
+
+    with archive_dependency_policy(value):
+        write_json(PENDING_FILE, value)
 
 
 def clear_pending_transaction() -> None:

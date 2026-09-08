@@ -578,6 +578,7 @@ async def _compile(
         ]
         if wheels_only:
             command.append("--only-binary=:all:")
+            command.append("--no-build")
         process = await asyncio.create_subprocess_exec(
             *command,
             cwd=str(Path.cwd()),
@@ -714,6 +715,10 @@ async def solve_install(
     *,
     manifest: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    from zhenxun.plugin_archive_dependencies import archive_dependency_contract
+
+    archive = archive_dependency_contract()
+    archive_wheels = bool(archive["store_keys"])
     report = environment_report()
     blocking_drift = [
         *(
@@ -741,7 +746,10 @@ async def solve_install(
             details=blocking_drift,
         )
     manifest = manifest or load_manifest()
-    active_requirements: list[str] = []
+    active_requirements: list[str] = [
+        *archive["requirements"],
+        *(f"{name}=={version}" for name, version in archive["packages"].items()),
+    ]
     for item in manifest.get("plugins", {}).values():
         if (
             not isinstance(item, dict)
@@ -770,15 +778,17 @@ async def solve_install(
 
     project_locked = project_closure()
     resolved, strict_error = await _compile(
-        requirements, project_locked, wheels_only=False
+        requirements, project_locked, wheels_only=archive_wheels
     )
     relaxed = False
     if resolved is None:
         relaxed = True
         resolved, relaxed_error = await _compile(
-            requirements, immutable, wheels_only=False
+            requirements, immutable, wheels_only=archive_wheels
         )
         if resolved is None:
+            if archive_wheels:
+                raise DependencyAnalysisError("archive_dependency_conflict")
             candidate_requirements = [*project_requirements(), *candidate_inputs]
             candidate_core, candidate_core_error = await _compile(
                 candidate_requirements, immutable, wheels_only=False
@@ -804,6 +814,10 @@ async def solve_install(
                 or strict_error,
             )
 
+    if any(
+        resolved.get(name) != version for name, version in archive["packages"].items()
+    ):
+        raise DependencyAnalysisError("archive_dependency_conflict")
     core_changes = [
         {
             "name": name,
@@ -825,6 +839,8 @@ async def solve_install(
         plugin_inputs, resolved, wheels_only=True
     )
     if plugin_resolved is None:
+        if archive_wheels:
+            raise DependencyAnalysisError("archive_wheel_dependencies_unresolved")
         plugin_resolved, source_error = await _compile(
             plugin_inputs, resolved, wheels_only=False
         )
@@ -882,6 +898,8 @@ async def solve_install(
         if isinstance(item, dict)
     )
     source_required = source_required or not root_wheel_available
+    if archive_wheels and source_required:
+        raise DependencyAnalysisError("archive_wheel_dependencies_unresolved")
     candidate_requirement_names = {
         canonicalize_name(requirement.name)
         for requirement in _active_metadata_requirements(metadata)
@@ -935,13 +953,25 @@ async def solve_install(
 def uninstall_plan(
     plugin: dict[str, Any], *, manifest: dict[str, Any] | None = None
 ) -> dict[str, Any]:
+    from zhenxun.plugin_archive_dependencies import archive_dependency_contract
+
+    archive = archive_dependency_contract()
     manifest = manifest or load_manifest()
     packages = {
         canonicalize_name(name): str(info["version"])
         for name, info in manifest.get("packages", {}).items()
         if isinstance(info, dict) and info.get("version")
     }
-    packages.pop(canonicalize_name(str(plugin["project_link"])), None)
+    project = canonicalize_name(str(plugin["project_link"]))
+    if project in archive["packages"]:
+        raise DependencyAnalysisError("archive_dependency_conflict")
+    packages.pop(project, None)
+    core = protected_core()
+    for name, version in archive["packages"].items():
+        if name in packages and packages[name] != version:
+            raise DependencyAnalysisError("archive_dependency_conflict")
+        if name not in core:
+            packages[name] = version
     return {
         "requirements": [],
         "resolved_packages": packages,
@@ -981,6 +1011,10 @@ def uninstall_plan(
 
 async def preflight_source_requirements(files: list[Path]) -> dict[str, Any]:
     """Validate source-store requirements before the legacy installer mutates .venv."""
+    from zhenxun.plugin_archive_dependencies import archive_dependency_contract
+
+    archive = archive_dependency_contract()
+    archive_wheels = bool(archive["store_keys"])
     requirements: list[str] = []
     for path in files:
         for raw_line in path.read_text(encoding="utf-8-sig").splitlines():
@@ -1011,11 +1045,23 @@ async def preflight_source_requirements(files: list[Path]) -> dict[str, Any]:
         raise DependencyAnalysisError("environment_drift")
     current = installed_inventory()
     core = protected_core()
-    resolved, error = await _compile(requirements, current, wheels_only=False)
+    candidate_inputs = list(requirements)
+    if archive_wheels:
+        requirements.extend(archive["requirements"])
+        requirements.extend(
+            f"{name}=={version}" for name, version in archive["packages"].items()
+        )
+    resolved, error = await _compile(requirements, current, wheels_only=archive_wheels)
     if resolved is None:
-        resolved, error = await _compile(requirements, core, wheels_only=False)
+        resolved, error = await _compile(requirements, core, wheels_only=archive_wheels)
     if resolved is None:
+        if archive_wheels:
+            raise DependencyAnalysisError("archive_dependency_conflict")
         raise DependencyAnalysisError("core_dependency_conflict", error)
+    if any(
+        resolved.get(name) != version for name, version in archive["packages"].items()
+    ):
+        raise DependencyAnalysisError("archive_dependency_conflict")
     for name, version in resolved.items():
         if name in core and core[name] != version:
             raise DependencyAnalysisError("core_dependency_conflict")
@@ -1025,10 +1071,12 @@ async def preflight_source_requirements(files: list[Path]) -> dict[str, Any]:
         wheels_only=True,
     )
     source_build_required = wheel_resolved is None
+    if archive_wheels and source_build_required:
+        raise DependencyAnalysisError("archive_wheel_dependencies_unresolved")
     return {
         "resolved_packages": resolved,
         "package_changes": _package_changes(resolved, current),
-        "candidate_inputs": requirements,
+        "candidate_inputs": candidate_inputs,
         "source_build_required": source_build_required,
         "source_build_detail": wheel_error if source_build_required else None,
     }

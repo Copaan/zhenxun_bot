@@ -13,6 +13,12 @@ from typing import Any
 
 from packaging.utils import canonicalize_name
 
+from zhenxun.plugin_archive_dependencies import ArchiveDependencyConflict
+from zhenxun.plugin_store_transaction import (
+    ArchiveSourceBuildConflict,
+    archive_dependency_policy,
+)
+
 from .dependencies import protected_core, safe_process_error
 from .storage import (
     LAYER_ROOT,
@@ -136,6 +142,14 @@ def _layer_digest(root: Path) -> str:
 
 
 def build_generation(transaction: dict[str, Any]) -> dict[str, Any]:
+    try:
+        with archive_dependency_policy(transaction):
+            return _build_generation(transaction)
+    except (ArchiveSourceBuildConflict, ArchiveDependencyConflict) as error:
+        raise LayerBuildError(error.code) from error
+
+
+def _build_generation(transaction: dict[str, Any]) -> dict[str, Any]:
     packages = transaction.get("target_manifest", {}).get("packages", {})
     if not isinstance(packages, dict):
         raise LayerBuildError("dependency_plan_invalid")
@@ -176,8 +190,11 @@ def build_generation(transaction: dict[str, Any]) -> dict[str, Any]:
                 "--python",
                 sys.executable,
             ]
-            if not transaction.get("source_build_confirmed"):
+            if transaction.get("archive_wheels_only") or not transaction.get(
+                "source_build_confirmed"
+            ):
                 command.append("--only-binary=:all:")
+                command.append("--no-build")
             completed = subprocess.run(
                 command,
                 cwd=str(Path.cwd()),
@@ -215,30 +232,55 @@ def build_generation(transaction: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _validate_archive_generation(
+    transaction: dict[str, Any], build: dict[str, Any]
+) -> None:
+    if not transaction.get("archive_wheels_only"):
+        return
+    path = generation_path(int(build["generation"]))
+    metadata = read_json(path / ".zhenxun-generation.json", {})
+    expected = sorted(
+        f"{canonicalize_name(name)}=={info['version']}"
+        for name, info in transaction["target_manifest"]["packages"].items()
+    )
+    # A later archive merge can change the manifest after this layer was built.
+    # Its old digest alone does not prove it contains the newly owned pins.
+    if (
+        not isinstance(metadata, dict)
+        or metadata.get("packages") != expected
+        or _layer_digest(path) != build.get("digest")
+    ):
+        raise LayerBuildError("archive_dependency_conflict")
+
+
 def commit_generation(
     transaction: dict[str, Any], build: dict[str, Any], *, verify_on_start: bool
 ) -> dict[str, Any]:
-    previous = load_manifest()
-    target = deepcopy(transaction["target_manifest"])
-    target["active_generation"] = int(build["generation"])
-    target["previous_generation"] = previous.get("active_generation")
-    target["pending_verification"] = bool(verify_on_start)
-    target["generation_digest"] = build["digest"]
-    write_json(ROLLBACK_FILE, previous)
-    save_manifest(target)
-    return target
+    with archive_dependency_policy(transaction):
+        _validate_archive_generation(transaction, build)
+        previous = load_manifest()
+        target = deepcopy(transaction["target_manifest"])
+        target["active_generation"] = int(build["generation"])
+        target["previous_generation"] = previous.get("active_generation")
+        target["pending_verification"] = bool(verify_on_start)
+        target["generation_digest"] = build["digest"]
+        write_json(ROLLBACK_FILE, previous)
+        save_manifest(target)
+        return target
 
 
 def stage_generation(transaction: dict[str, Any], build: dict[str, Any]) -> None:
     """Persist a built generation without exposing it to the running worker."""
-    previous = transaction.get("generation")
-    if isinstance(previous, int) and previous != build["generation"]:
-        remove_generation(previous)
-    transaction["generation"] = int(build["generation"])
-    transaction["generation_digest"] = str(build["digest"])
-    transaction["native_extensions"] = list(build.get("native_extensions") or [])
-    transaction["state"] = "pending_restart"
-    write_json(PENDING_FILE, transaction)
+    with archive_dependency_policy(transaction):
+        _validate_archive_generation(transaction, build)
+        previous = transaction.get("generation")
+        if isinstance(previous, int) and previous != build["generation"]:
+            remove_generation(previous)
+        transaction["generation"] = int(build["generation"])
+        transaction["generation_digest"] = str(build["digest"])
+        transaction["native_extensions"] = list(build.get("native_extensions") or [])
+        transaction["state"] = "pending_restart"
+        write_json(PENDING_FILE, transaction)
 
 
 def _staged_build(transaction: dict[str, Any]) -> dict[str, Any] | None:
@@ -249,12 +291,17 @@ def _staged_build(transaction: dict[str, Any]) -> dict[str, Any] | None:
     digest = str(transaction.get("generation_digest") or "")
     if not path.is_dir() or not digest:
         return None
-    return {
+    build = {
         "generation": generation,
         "path": path,
         "digest": digest,
         "native_extensions": list(transaction.get("native_extensions") or []),
     }
+    try:
+        _validate_archive_generation(transaction, build)
+    except LayerBuildError:
+        return None
+    return build
 
 
 def _run_orm_migration(action: str) -> int:
@@ -284,9 +331,11 @@ def apply_pending_transaction() -> bool:
         "migration_blocked",
     }:
         return False
-    transaction["state"] = "building"
-    write_json(PENDING_FILE, transaction)
     try:
+        # Check even when reusing a generation, before any migration execution.
+        with archive_dependency_policy(transaction):
+            transaction["state"] = "building"
+            write_json(PENDING_FILE, transaction)
         build = _staged_build(transaction) or build_generation(transaction)
         if transaction.get("database_migration_possible"):
             transaction["generation"] = int(build["generation"])

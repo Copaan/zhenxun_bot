@@ -23,6 +23,8 @@ resource_owner: ContextVar[str | None] = ContextVar(
 )
 _lifecycle_work = ContextVar("zhenxun_lifecycle_work", default=None)
 initialization_retainer = ContextVar("plugin_initialization_retainer", default=None)
+shared_executor_submission = ContextVar("shared_executor_submission", default=False)
+_callback_work = ContextVar("plugin_cleanup_callback_work", default=None)
 
 
 @dataclass
@@ -59,6 +61,10 @@ def _execution_owner():
 
 @contextmanager
 def lifecycle_work_context(owner: str, incarnation_id: str, phase: str):
+    if phase not in {"on_startup", "on_ready", "on_shutdown"}:
+        # Connection hooks are business activities, not bounded initialization.
+        yield None
+        return
     from zhenxun.services.lifecycle import lifecycle_kernel
     from zhenxun.services.lifecycle.deadline import shutdown_budget
 
@@ -144,7 +150,31 @@ def lifecycle_work_phase(owner: str, incarnation_id: str) -> LifecycleWork | Non
         and value.valid()
     ):
         return value
+    callback = _callback_work.get()
+    if callback is not None:
+        phase, executor, active = callback
+        if (
+            active[0]
+            and executor is _execution_owner()
+            and phase.valid()
+            and (phase.owner, phase.incarnation_id) == (owner, incarnation_id)
+        ):
+            return phase
     return None
+
+
+@contextmanager
+def lifecycle_callback_context(work: LifecycleWork | None):
+    if work is None:
+        yield
+        return
+    active = [True]
+    token = _callback_work.set((work, _execution_owner(), active))
+    try:
+        yield
+    finally:
+        active[0] = False
+        _callback_work.reset(token)
 
 
 def current_owner() -> str | None:

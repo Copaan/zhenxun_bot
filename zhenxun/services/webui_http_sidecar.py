@@ -17,13 +17,15 @@ from aiohttp import (
     Fingerprint,
     TCPConnector,
     WSMsgType,
+    WSServerHandshakeError,
     web,
 )
 
 from zhenxun.utils.network import is_private_client
 
 from .webui_http_sidecar_state import (
-    sanitized_sidecar_error,
+    read_http_sidecar_state,
+    sidecar_error_details,
     write_http_sidecar_state,
 )
 from .webui_transport import transport_runtime
@@ -78,6 +80,8 @@ class HttpSidecar:
         self._active_connections = 0
         self._proxy_failures = 0
         self._last_error: str | None = None
+        self._error_details: dict[str, Any] = {}
+        self._stage = "initialization"
         self._state = "starting"
         self._state_lock = asyncio.Lock()
         self._state_task: asyncio.Task[None] | None = None
@@ -92,6 +96,7 @@ class HttpSidecar:
         return Fingerprint(bytes.fromhex(self.settings.certificate_sha256))
 
     async def start(self, _app: web.Application) -> None:
+        self._stage = "upstream_tls"
         transport_runtime.install()
         connector = TCPConnector(ssl=self._fingerprint())
         self._session = ClientSession(
@@ -102,6 +107,7 @@ class HttpSidecar:
         )
         try:
             if self.settings.mode == "serve":
+                self._stage = "upstream_probe"
                 async with self._session.get(
                     f"{self.settings.upstream_base}/zhenxun/api/configure/status",
                     timeout=ClientTimeout(total=5),
@@ -171,6 +177,7 @@ class HttpSidecar:
         self._state = state
         values = {
             **changes,
+            **self._error_details,
             **listener_identity(),
             "mode": self.settings.mode,
             "port": self.settings.listen_port,
@@ -223,12 +230,14 @@ class HttpSidecar:
             if self._state == "ready" and self._last_error is None:
                 return
             self._last_error = None
+            self._error_details = {"error_code": None, "stage": None, "errno": None}
             self._write_state("ready")
 
     async def _failed(self, error: BaseException) -> None:
         async with self._state_lock:
             self._proxy_failures += 1
-            self._last_error = sanitized_sidecar_error(error)
+            self._error_details = sidecar_error_details(error, stage="upstream_proxy")
+            self._last_error = self._error_details["last_error"]
             self._write_state("stopping" if self._closing else "degraded")
 
     @staticmethod
@@ -482,6 +491,19 @@ class HttpSidecar:
                 await self._succeeded()
                 return client_ws
         except (ClientError, ConnectionError, OSError, asyncio.TimeoutError) as error:
+            if (
+                client_ws is None
+                and isinstance(error, WSServerHandshakeError)
+                and 400 <= error.status < 500
+            ):
+                # A worker rejection is not a broken gateway. Never relay its
+                # diagnostic body, cookies or other upstream response headers.
+                await self._succeeded()
+                return web.Response(
+                    status=error.status,
+                    text="WebSocket handshake rejected by HTTPS worker",
+                    headers={"Cache-Control": "no-store"},
+                )
             await self._failed(error)
             if client_ws is None or not client_ws.prepared:
                 raise web.HTTPBadGateway(text="HTTPS worker is unavailable") from error
@@ -556,10 +578,17 @@ async def _serve_http_sidecar(settings: HttpSidecarSettings) -> None:
             if sig is not None:
                 previous[sig] = signal.signal(sig, request_stop)
         await runner.setup()
+        sidecar._stage = "bind"
         site = web.TCPSite(runner, settings.listen_host, settings.listen_port)
         await site.start()
         sidecar._write_state("ready")
+        sidecar._stage = "serve"
         await stopped.wait()
+    except BaseException as error:
+        sidecar._error_details = sidecar_error_details(error, stage=sidecar._stage)
+        sidecar._last_error = sidecar._error_details["last_error"]
+        sidecar._write_state("degraded")
+        raise
     finally:
         try:
             await asyncio.wait_for(runner.cleanup(), timeout=5)
@@ -582,18 +611,31 @@ def run_http_sidecar(settings: HttpSidecarSettings) -> None:
         active_connections=0,
         proxy_failures=0,
         last_error=None,
+        error_code=None,
+        stage="initialization",
+        errno=None,
         startup_id=os.environ.get("ZHENXUN_HTTP_SIDECAR_STARTUP_ID", ""),
     )
     try:
         asyncio.run(_serve_http_sidecar(settings))
     except BaseException as error:
+        state = read_http_sidecar_state()
+        details = (
+            {
+                key: state.get(key)
+                for key in ("last_error", "error_code", "stage", "errno")
+            }
+            if state.get("startup_id") == os.getenv("ZHENXUN_HTTP_SIDECAR_STARTUP_ID")
+            and state.get("error_code")
+            else sidecar_error_details(error, stage="initialization")
+        )
         write_http_sidecar_state(
             mode=settings.mode,
             port=settings.listen_port,
             pid=os.getpid(),
             state="degraded",
             active_connections=0,
-            last_error=sanitized_sidecar_error(error),
+            **details,
         )
         raise
 

@@ -119,6 +119,26 @@ def network_configuration_status() -> dict[str, Any]:
             "http_error": sidecar.get("last_error")
             if managed and tls.http_sidecar_enabled
             else None,
+            **{
+                f"http_{key}": sidecar.get(key)
+                if managed and tls.http_sidecar_enabled
+                else None
+                for key in (
+                    "error_code",
+                    "stage",
+                    "errno",
+                    "first_error",
+                    "latest_error",
+                    "first_error_at",
+                    "latest_error_at",
+                    "retry_count",
+                    "retry_in_seconds",
+                    "next_retry_at",
+                    "total_retries",
+                    "diagnostic_identity_verified",
+                    "unverified_child_diagnostic",
+                )
+            },
         },
         "network_configured": {
             "scheme": desired.scheme,

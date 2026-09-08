@@ -20,8 +20,8 @@ __plugin_meta__ = PluginMetadata(
         使用-s时指定源，git为github，ali为阿里云
     移除插件 id或module: 移除插件
     搜索插件 name或author: 搜索插件
-    更新插件 id或module: 更新插件
-    更新全部插件     : 更新全部插件
+    更新插件 id或module ?[-s [git, ali]]: 更新插件
+    更新全部插件 ?[-s [git, ali]]: 更新全部插件
 
     示例：
         添加插件 pix
@@ -44,8 +44,8 @@ _matcher = on_alconna(
         ),
         Subcommand("remove", Args["plugin_id", str]),
         Subcommand("search", Args["plugin_name_or_author", str]),
-        Subcommand("update", Args["plugin_id", str]),
-        Subcommand("update_all"),
+        Subcommand("update", Args["plugin_id", str], Option("-s", Args["source", str])),
+        Subcommand("update_all", Option("-s", Args["source", str])),
     ),
     permission=SUPERUSER,
     priority=1,
@@ -101,17 +101,13 @@ async def _(session: EventSession):
 
 @_matcher.assign("add")
 async def _(session: EventSession, plugin_id: str, source: Match[str]):
+    source_str = await _command_source(source)
     if is_number(plugin_id):
         await MessageUtils.build_message(f"正在添加插件 Id: {plugin_id}").send()
     else:
         await MessageUtils.build_message(
             f"正在添加插件 Module/名称: {plugin_id}"
         ).send()
-    source_str = source.result if source.available else None
-    if source_str and source_str not in ["ali", "git"]:
-        await MessageUtils.build_message(
-            f"源类型错误: {source_str} 请使用 ali 或 git"
-        ).finish()
     try:
         result = await StoreManager.add_plugin(plugin_id, source_str)
     except Exception as e:
@@ -155,13 +151,14 @@ async def _(session: EventSession, plugin_name_or_author: str):
 
 
 @_matcher.assign("update")
-async def _(session: EventSession, plugin_id: str):
+async def _(session: EventSession, plugin_id: str, source: Match[str]):
+    source_str = await _command_source(source)
     try:
         if is_number(plugin_id):
             await MessageUtils.build_message(f"正在更新插件 Id: {plugin_id}").send()
         else:
             await MessageUtils.build_message(f"正在更新插件 Module: {plugin_id}").send()
-        result = await StoreManager.update_plugin(plugin_id)
+        result = await StoreManager.update_plugin(plugin_id, source_str)
     except Exception as e:
         logger.error(f"更新插件 Id: {plugin_id}失败", "插件商店", session=session, e=e)
         await MessageUtils.build_message(
@@ -172,12 +169,22 @@ async def _(session: EventSession, plugin_id: str):
 
 
 @_matcher.assign("update_all")
-async def _(session: EventSession):
+async def _(session: EventSession, source: Match[str]):
+    source_str = await _command_source(source)
     try:
         await MessageUtils.build_message("正在更新全部插件").send()
-        result = await StoreManager.update_all_plugin()
+        result = await StoreManager.update_all_plugin(source_str)
     except Exception as e:
         logger.error("更新全部插件失败", "插件商店", session=session, e=e)
         await MessageUtils.build_message(f"更新全部插件失败 e: {e}").finish()
     logger.info("更新全部插件", "插件商店", session=session)
     await MessageUtils.build_message(result).send()
+
+
+async def _command_source(source: Match[str]) -> str | None:
+    source_str = source.result if source.available else None
+    if source_str is not None and source_str not in {"ali", "git"}:
+        await MessageUtils.build_message(
+            f"源类型错误: {source_str} 请使用 ali 或 git"
+        ).finish()
+    return source_str

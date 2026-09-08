@@ -16,6 +16,8 @@ from ....apply_result import (
 from ....base_model import Result
 from ....restart_service import restart_status_data
 from ....utils import authentication
+from .archive import decorate_archive_plugin
+from .archive import router as archive_router
 from .data_source import ApiDataSource
 from .model import (
     BatchUpdatePlugins,
@@ -30,6 +32,7 @@ from .model import (
 )
 
 router = APIRouter(prefix="/plugin")
+router.include_router(archive_router)
 
 
 @router.get(
@@ -44,6 +47,7 @@ async def _(
 ) -> Result[list[PluginInfo]]:
     try:
         result = await ApiDataSource.get_plugin_list(plugin_type, menu_type)
+        result = [decorate_archive_plugin(plugin) for plugin in result]
         return Result.ok(result, "拿到信息啦!")
     except Exception as e:
         logger.error(f"{router.prefix}/get_plugin_list 调用错误", "WebUi", e=e)
@@ -186,6 +190,7 @@ async def _() -> Result[list[str]]:
 async def _(module: str) -> Result[PluginDetail]:
     try:
         detail = await ApiDataSource.get_plugin_detail(module)
+        detail = decorate_archive_plugin(detail)
         return Result.ok(detail, "已经帮你写好啦!")
     except (ValueError, KeyError):
         return Result.fail("插件数据不存在...")

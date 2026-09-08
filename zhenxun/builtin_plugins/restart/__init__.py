@@ -10,9 +10,14 @@ from nonebot_plugin_uninfo import Uninfo
 from zhenxun.configs.config import BotConfig
 from zhenxun.configs.utils import PluginExtraData
 from zhenxun.services.log import logger
-from zhenxun.utils._restart_utils import handle_restart_connect, request_restart
+from zhenxun.utils._restart_utils import (
+    handle_restart_connect,
+    handle_restart_disconnect,
+    request_restart,
+)
 from zhenxun.utils.enum import PluginType
 from zhenxun.utils.message import MessageUtils
+from zhenxun.utils.platform import PlatformUtils
 
 __plugin_meta__ = PluginMetadata(
     name="重启",
@@ -47,10 +52,20 @@ async def _(bot: Bot, session: Uninfo, flag: str = ArgStr("flag")):
             f"开始重启{BotConfig.self_nickname}..请稍等..."
         ).send()
         logger.info("开始重启真寻...", "重启", session=session)
+        scene = session.scene
+        group_id = None
+        channel_id = None
+        if not scene.is_private:
+            group_id = str(scene.parent.id if scene.parent else scene.id)
+            if scene.parent:
+                channel_id = str(scene.id)
         ok, message = await request_restart(
             "command.matcher",
             receipt_bot_id=str(bot.self_id),
             receipt_user_id=str(session.user.id),
+            receipt_group_id=group_id,
+            receipt_channel_id=channel_id,
+            receipt_platform_scope=PlatformUtils.get_platform_scope(bot),
         )
         if not ok:
             await MessageUtils.build_message(message).send()
@@ -61,3 +76,8 @@ async def _(bot: Bot, session: Uninfo, flag: str = ArgStr("flag")):
 @driver.on_bot_connect
 async def _(bot: Bot):
     await handle_restart_connect(bot)
+
+
+@driver.on_bot_disconnect
+async def _(bot: Bot):
+    await handle_restart_disconnect(bot)

@@ -27,6 +27,28 @@ def normalize_reverse_ws_host(value: str) -> str:
     return host
 
 
+def reverse_ws_address(settings, configured_host: str, page_host: str) -> dict:
+    try:
+        host = normalize_reverse_ws_host(configured_host or page_host)
+    except ValueError:
+        host = ""
+    if host in {"0.0.0.0", "::"}:
+        host = ""
+    authority = f"[{host}]" if ":" in host else host
+    scheme = "wss" if settings.enabled else "ws"
+    return {
+        "connection_host": host,
+        "configured_host": configured_host,
+        "host_source": "configured" if configured_host else "page_host",
+        "scheme": scheme,
+        "port": settings.port,
+        "url": f"{scheme}://{authority}:{settings.port}/onebot/v11/ws"
+        if host
+        else None,
+        "reachability": "unverified",
+    }
+
+
 def reverse_ws_diagnostic(
     settings,
     configured_host: str,
@@ -34,22 +56,20 @@ def reverse_ws_diagnostic(
     *,
     certificate_pem: bytes | None = None,
 ) -> dict:
-    host = normalize_reverse_ws_host(configured_host or page_host)
-    if host in {"0.0.0.0", "::"}:
-        host = ""
-    authority = f"[{host}]" if ":" in host else host
+    address = reverse_ws_address(settings, configured_host, page_host)
+    host = address["connection_host"]
     result = {
-        "connection_host": host,
-        "configured_host": configured_host,
-        "url": f"{'wss' if settings.enabled else 'ws'}://{authority}:{settings.port}/onebot/v11/ws"
-        if host
-        else None,
+        **address,
         "certificate_name_match": None,
         "certificate_valid_now": None,
         "certificate_expires_at": None,
         "certificate_domains": [],
+        "certificate_candidates": [],
+        "certificate_wildcards": [],
         "trust": "client_verification_required",
-        "code": "tls_not_enabled"
+        "code": "connection_host_invalid"
+        if not host
+        else "tls_not_enabled"
         if not settings.enabled
         else "tls_certificate_unavailable",
     }
@@ -66,24 +86,58 @@ def reverse_ws_diagnostic(
         ).value
         domains = san.get_values_for_type(x509.DNSName)
         ips = san.get_values_for_type(x509.IPAddress)
-        result["certificate_domains"] = domains[:20]
+        normalized_domains = []
+        for domain in domains:
+            wildcard = domain.startswith("*.")
+            try:
+                normalized = normalize_reverse_ws_host(
+                    domain[2:] if wildcard else domain
+                )
+            except ValueError:
+                continue
+            if not normalized:
+                continue
+            normalized = f"*.{normalized}" if wildcard else normalized
+            if normalized not in normalized_domains:
+                normalized_domains.append(normalized)
+        result["certificate_domains"] = normalized_domains[:20]
+        result["certificate_wildcards"] = [
+            name for name in normalized_domains[:20] if name.startswith("*.")
+        ]
         before = certificate.not_valid_before_utc
         after = certificate.not_valid_after_utc
         result["certificate_expires_at"] = after.isoformat()
         result["certificate_valid_now"] = before <= datetime.now(timezone.utc) <= after
-        try:
-            match_hostname(
-                {
-                    "subjectAltName": [("DNS", name) for name in domains]
-                    + [("IP Address", str(ip)) for ip in ips]
-                },
-                host,
-            )
-            result["certificate_name_match"] = True
-        except CertificateError:
-            result["certificate_name_match"] = False
+
+        def name_matches(name: str) -> bool:
+            try:
+                match_hostname(
+                    {
+                        "subjectAltName": [("DNS", domain) for domain in domains]
+                        + [("IP Address", str(ip)) for ip in ips]
+                    },
+                    name,
+                )
+                return True
+            except CertificateError:
+                return False
+
+        result["certificate_candidates"] = [
+            {
+                **reverse_ws_address(settings, name, ""),
+                "host_source": "certificate_san",
+                "certificate_name_match": name_matches(name),
+                "certificate_valid_now": result["certificate_valid_now"],
+                "trust": "client_verification_required",
+            }
+            for name in normalized_domains[:20]
+            if not name.startswith("*.")
+        ]
+        result["certificate_name_match"] = name_matches(host)
         result["code"] = (
-            "tls_certificate_time_invalid"
+            "connection_host_invalid"
+            if not host
+            else "tls_certificate_time_invalid"
             if not result["certificate_valid_now"]
             else "tls_certificate_name_mismatch"
             if not result["certificate_name_match"]
@@ -92,6 +146,28 @@ def reverse_ws_diagnostic(
     except (OSError, ValueError, x509.ExtensionNotFound):
         pass
     return result
+
+
+def configured_reverse_ws_endpoint(values: dict, page_host: str) -> dict:
+    import nonebot
+
+    from zhenxun.configs.webui_tls import runtime_webui_settings, settings_from_values
+
+    desired = settings_from_values(values)
+    current = runtime_webui_settings()
+    host = str(values.get("ONEBOT_REVERSE_WS_HOST") or "")
+    current_host = str(
+        getattr(nonebot.get_driver().config, "onebot_reverse_ws_host", "") or ""
+    )
+    return {
+        **reverse_ws_address(desired, host, page_host),
+        "pending_restart": host != current_host
+        or any(
+            getattr(desired, key) != getattr(current, key)
+            for key in ("enabled", "host", "port", "certfile", "keyfile")
+        ),
+        "scope": "saved_configuration",
+    }
 
 
 def current_reverse_ws_diagnostic(page_host: str) -> dict:

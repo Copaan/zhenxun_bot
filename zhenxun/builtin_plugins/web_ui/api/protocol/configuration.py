@@ -373,11 +373,17 @@ async def protocol_configuration(response: Response, request: Request) -> Result
     content = _source_path().read_text(encoding="utf-8")
     _validate_env(content)
     response.headers["Cache-Control"] = "no-store"
-    from zhenxun.services.onebot_endpoint import current_reverse_ws_diagnostic
+    from zhenxun.services.onebot_endpoint import (
+        configured_reverse_ws_endpoint,
+        current_reverse_ws_diagnostic,
+    )
 
     result = _masked_configuration(content)
     result["onebot"]["endpoint"] = current_reverse_ws_diagnostic(
         request.url.hostname or ""
+    )
+    result["onebot"]["configured_endpoint"] = configured_reverse_ws_endpoint(
+        dict(dotenv_values(stream=StringIO(content))), request.url.hostname or ""
     )
     return Result.ok(result)
 
@@ -413,6 +419,7 @@ async def probe_qq_credential(payload: QQCredentialProbe) -> Result:
 )
 async def save_protocol_configuration(
     payload: ProtocolConfigurationUpdate,
+    request: Request,
 ) -> Result:
     source = _source_path()
     current = source.read_text(encoding="utf-8")
@@ -505,6 +512,9 @@ async def save_protocol_configuration(
     if restart_required and launcher_managed:
         issue_restart_ticket("webui.settings", ttl_seconds=10 * 60)
     status = restart_status_data()
+    from zhenxun.services.onebot_endpoint import configured_reverse_ws_endpoint
+
+    saved_values = dict(dotenv_values(stream=StringIO(updated)))
     return Result.ok(
         apply_result_data(
             apply_mode=(APPLY_RESTART_PENDING if restart_required else APPLY_NO_CHANGE),
@@ -515,6 +525,15 @@ async def save_protocol_configuration(
             access_targets=status["access_targets"],
             revision=_revision(updated),
             callback_url=_callback_url(base_url),
+            onebot={
+                "reverse_ws_host": str(
+                    saved_values.get("ONEBOT_REVERSE_WS_HOST") or ""
+                ),
+                "configured_endpoint": configured_reverse_ws_endpoint(
+                    saved_values,
+                    request.url.hostname or "",
+                ),
+            },
         ),
         info=(
             "协议配置已保存，需要重启后生效。"

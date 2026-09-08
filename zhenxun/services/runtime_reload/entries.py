@@ -81,8 +81,26 @@ class ManagedDependent(Dependent):
     manager: Any = field(default=None, compare=False, repr=False)
     owner: str = ""
     incarnation: str = ""
+    kind: str = ""
 
     async def __call__(self, **kwargs):
+        import asyncio
+
+        task = asyncio.current_task()
+        connection = self.kind in {"on_bot_connect", "on_bot_disconnect"}
+        if connection:
+            self.manager._connection_tasks.add(task)
+        try:
+            return await self._invoke(**kwargs)
+        except asyncio.CancelledError as error:
+            if connection and self.manager.consume_connection_cancellation(task, error):
+                return None
+            raise
+        finally:
+            if connection:
+                self.manager._connection_tasks.discard(task)
+
+    async def _invoke(self, **kwargs):
         with self.manager._entry_admission(self.owner, self.incarnation) as admitted:
             if not admitted:
                 return None
@@ -94,7 +112,7 @@ class ManagedDependent(Dependent):
             return await super().__call__(**kwargs)
 
 
-def manage_registration(registry, before, manager, owner, incarnation):
+def manage_registration(registry, before, manager, owner, incarnation, *, kind=""):
     for dependent in list(registry):
         if id(dependent) in before:
             continue
@@ -105,6 +123,7 @@ def manage_registration(registry, before, manager, owner, incarnation):
             manager=manager,
             owner=owner,
             incarnation=incarnation,
+            kind=kind,
         )
         registry.remove(dependent)
         registry.add(managed)

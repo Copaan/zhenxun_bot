@@ -507,6 +507,7 @@ class StoreManager:
         返回:
             str: 返回消息
         """
+        cls._get_source_order(source)
         plugin_info, is_external = await cls.get_plugin_by_value(index_or_module)
         if plugin_info.github_url is None:
             plugin_info.github_url = DEFAULT_GITHUB_URL
@@ -920,6 +921,7 @@ class StoreManager:
     async def update_plugin(
         cls,
         index_or_module: str,
+        source: str | None = None,
         *,
         install_dependencies: bool = True,
         confirm_source_build: bool = False,
@@ -933,6 +935,7 @@ class StoreManager:
         返回:
             str: 返回消息
         """
+        cls._get_source_order(source)
         plugin_info, is_external = await cls.get_plugin_by_value(index_or_module, True)
         logger.info(f"尝试更新插件 {plugin_info.name}", LOG_COMMAND)
         suc_plugin = await cls.get_installed_plugins()
@@ -942,6 +945,7 @@ class StoreManager:
         install_result = await cls.install_plugin_with_repo(
             plugin_info,
             is_external,
+            source,
             install_dependencies=install_dependencies,
             confirm_source_build=confirm_source_build,
         )
@@ -950,7 +954,7 @@ class StoreManager:
         return f"插件 {plugin_info.name} 更新成功! 重启后生效"
 
     @classmethod
-    async def update_all_plugin(cls) -> str:
+    async def update_all_plugin(cls, source: str | None = None) -> str:
         """更新插件
 
         参数:
@@ -959,6 +963,7 @@ class StoreManager:
         返回:
             str: 返回消息
         """
+        cls._get_source_order(source)
         plugin_list, extra_plugin_list = await cls.get_data()
         all_plugin_list = plugin_list + extra_plugin_list
         plugin_name_list = [p.name for p in all_plugin_list]
@@ -993,6 +998,7 @@ class StoreManager:
                 await cls.install_plugin_with_repo(
                     plugin_info,
                     is_external,
+                    source,
                 )
                 update_success_list.append(plugin_info.name)
             except Exception as e:

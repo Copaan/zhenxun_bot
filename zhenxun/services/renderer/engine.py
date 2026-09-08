@@ -8,9 +8,11 @@ from importlib import import_module
 import inspect
 import json
 from pathlib import Path
+import re
 import sys
 import time
 from typing import Any, ClassVar, cast
+from urllib.parse import unquote, urlsplit
 
 import nonebot
 import psutil
@@ -33,15 +35,114 @@ _DISCONNECT_SUPPRESSION_WINDOW_SECONDS = 10.0
 
 htmlrender_module: Any | None = None
 htmlrender_browser: Any | None = None
-_render_diagnostic_times: dict[str, float] = {}
+_DIAGNOSTIC_ROOT = Path(__file__).resolve().parents[3]
+_DIAGNOSTIC_WINDOW_SECONDS = 30.0
+_DIAGNOSTIC_MAX_ITEMS = 256
+_DIAGNOSTIC_TEMPLATE_BURST = 5
+_SCRIPT_ERROR_CATEGORIES = frozenset(
+    {
+        "Error",
+        "EvalError",
+        "RangeError",
+        "ReferenceError",
+        "SyntaxError",
+        "TypeError",
+        "URIError",
+        "AggregateError",
+    }
+)
+_render_diagnostic_times: OrderedDict[str, float] = OrderedDict()
+_render_diagnostic_templates: OrderedDict[str, tuple[float, int]] = OrderedDict()
 
 
-def _render_diagnostic(code: str) -> None:
+def _diagnostic_resource(value: Any) -> str:
+    """Only disclose repository-local paths, never URL authorities or payloads."""
+    if not isinstance(value, str) or not value or len(value) > 4096:
+        return "unknown"
+    try:
+        url = urlsplit(value)
+        if url.scheme not in {"", "file"}:
+            return "remote" if url.scheme in {"http", "https"} else "redacted"
+        if url.netloc:
+            return "external"
+        path_text = unquote(url.path)
+        if re.match(r"^/[A-Za-z]:/", path_text):
+            path_text = path_text[1:]
+        path = Path(path_text)
+        if not path.is_absolute():
+            path = _DIAGNOSTIC_ROOT / path
+        relative = path.resolve().relative_to(_DIAGNOSTIC_ROOT).as_posix()
+        if len(relative) > 180 or not re.fullmatch(r"[\w ./-]+", relative):
+            return "local"
+        return relative
+    except (ValueError, OSError):
+        return "external"
+
+
+def _script_error_location(error: Any) -> tuple[str, int | None, int | None]:
+    stack = getattr(error, "stack", None)
+    if isinstance(stack, str):
+        stack = stack[:16384]
+        message = getattr(error, "message", "")
+        name = getattr(error, "name", "")
+        if isinstance(message, str) and message:
+            if len(message) > 8192 or not isinstance(name, str) or len(name) > 128:
+                return "inline", None, None
+            prefix = f"{name}: {message}"
+            if not stack.startswith(prefix):
+                return "inline", None, None
+            stack = stack[len(prefix) :]
+        # Ignore the message, source excerpts and function names. Only parse frames.
+        for frame in stack.splitlines()[1:21]:
+            match = re.fullmatch(
+                r"\s*at (?:.*? \()?((?:file|https?)://[^\r\n]+):(\d{1,9}):(\d{1,9})\)?",
+                frame,
+            )
+            if match:
+                return (_diagnostic_resource(match[1]), int(match[2]), int(match[3]))
+    return "inline", None, None
+
+
+def _render_diagnostic(
+    code: str,
+    *,
+    template: str,
+    category: str,
+    resource: str,
+    line: int | None = None,
+    column: int | None = None,
+) -> None:
+    details = {
+        "template": template,
+        "category": category,
+        "resource": resource,
+        "line": line,
+        "column": column,
+    }
+    serialized = json.dumps(details, ensure_ascii=True, sort_keys=True)
+    diagnostic_id = hashlib.sha256(f"{code}:{serialized}".encode()).hexdigest()[:16]
     now = time.monotonic()
-    if now - _render_diagnostic_times.get(code, float("-inf")) < 30:
+    for cache in (_render_diagnostic_times, _render_diagnostic_templates):
+        while cache:
+            value = next(iter(cache.values()))
+            timestamp = value[0] if isinstance(value, tuple) else value
+            if now - timestamp < _DIAGNOSTIC_WINDOW_SECONDS:
+                break
+            cache.popitem(last=False)
+    if diagnostic_id in _render_diagnostic_times:
         return
-    _render_diagnostic_times[code] = now
-    logger.warning(f"渲染页面异常 | code={code}", "Renderer")
+    started, count = _render_diagnostic_templates.get(template, (now, 0))
+    if count >= _DIAGNOSTIC_TEMPLATE_BURST:
+        return
+    _render_diagnostic_times[diagnostic_id] = now
+    _render_diagnostic_templates[template] = (started, count + 1)
+    for cache in (_render_diagnostic_times, _render_diagnostic_templates):
+        while len(cache) > _DIAGNOSTIC_MAX_ITEMS:
+            cache.popitem(last=False)
+    logger.warning(
+        f"渲染页面异常 | code={code} | diagnostic_id={diagnostic_id} | {serialized}",
+        "Renderer",
+    )
 
 
 def _load_htmlrender_modules() -> tuple[Any, Any]:
@@ -698,6 +799,7 @@ class PlaywrightEngine(BaseScreenshotEngine):
         options.pop("clip_selector", None)
         options.pop("clip_padding", None)
         options.pop("disable_animations", None)
+        options.pop("diagnostic_template", None)
         if pooled:
             options.pop("base_url", None)
             options.pop("device_scale_factor", None)
@@ -748,15 +850,57 @@ class PlaywrightEngine(BaseScreenshotEngine):
         template_path: str,
         render_options: dict[str, Any],
     ) -> bytes:
-        def script_error(_error):
-            _render_diagnostic("render_page_script_error")
+        # Finish the base-directory document before observing rendered content.
+        # Chromium directory-listing scripts are not part of the template.
+        await page.goto(template_path, wait_until="load")
+        template = _diagnostic_resource(
+            render_options.get("diagnostic_template", template_path)
+        )
+
+        def script_error(error):
+            name = getattr(error, "name", None)
+            category = (
+                name
+                if isinstance(name, str) and name in _SCRIPT_ERROR_CATEGORIES
+                else "ScriptError"
+            )
+            resource, line, column = _script_error_location(error)
+            _render_diagnostic(
+                "render_page_script_error",
+                template=template,
+                category=category,
+                resource=resource,
+                line=line,
+                column=column,
+            )
 
         def request_failed(request):
             if request.resource_type in {"script", "stylesheet"}:
-                _render_diagnostic("render_page_resource_failed")
+                _render_diagnostic(
+                    "render_page_resource_failed",
+                    template=template,
+                    category=request.resource_type,
+                    resource=_diagnostic_resource(request.url),
+                )
+
+        def console_message(message):
+            # Console text and arguments can contain rendered data or credentials.
+            if message.type not in {"warning", "error"}:
+                return
+            location = message.location
+            _render_diagnostic(
+                "render_page_console",
+                template=template,
+                category=f"console_{message.type}",
+                resource=_diagnostic_resource(location.get("url")),
+                line=location.get("lineNumber", 0) + 1,
+                column=location.get("columnNumber", 0) + 1,
+            )
 
         page.on("pageerror", script_error)
         page.on("requestfailed", request_failed)
+        if self._debug_console_log:
+            page.on("console", console_message)
         try:
             return await self._capture_rendered_page(
                 page, html, template_path, render_options
@@ -764,11 +908,10 @@ class PlaywrightEngine(BaseScreenshotEngine):
         finally:
             page.remove_listener("pageerror", script_error)
             page.remove_listener("requestfailed", request_failed)
+            if self._debug_console_log:
+                page.remove_listener("console", console_message)
 
     async def _capture_rendered_page(self, page, html, template_path, render_options):
-        if self._debug_console_log:
-            page.on("console", lambda msg: logger.debug(f"浏览器控制台: {msg.text}"))
-        await page.goto(template_path, wait_until="commit")
         await page.set_content(html, wait_until=self._SET_CONTENT_WAIT_UNTIL)
         if bool(render_options.get("disable_animations", False)):
             await self._disable_page_animations(page)

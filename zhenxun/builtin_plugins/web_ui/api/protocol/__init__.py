@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Request, Response
 from fastapi.responses import JSONResponse
 import nonebot
 
@@ -128,9 +128,10 @@ def build_protocol_status() -> ProtocolStatus:
     response_class=JSONResponse,
     description="获取协议端连接状态",
 )
-async def _(request: Request) -> Result[ProtocolStatus]:
+async def _(request: Request, response: Response) -> Result[ProtocolStatus]:
     from zhenxun.services.onebot_endpoint import current_reverse_ws_diagnostic
 
+    response.headers["Cache-Control"] = "no-store"
     status = build_protocol_status()
     status.onebot_endpoint = current_reverse_ws_diagnostic(request.url.hostname or "")
     from zhenxun.services.qq_ingress_state import read_ingress_state

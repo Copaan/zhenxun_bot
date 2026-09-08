@@ -51,6 +51,14 @@ from zhenxun.nonebot_store.storage import (
     save_pending_transaction,
     utc_now,
 )
+from zhenxun.plugin_archive_dependencies import (
+    ArchiveDependencyConflict,
+    preserve_archive_dependencies,
+)
+from zhenxun.plugin_store_transaction import (
+    ArchiveSourceBuildConflict,
+    archive_dependency_policy,
+)
 from zhenxun.services.lifecycle.operations import operation_registry
 from zhenxun.services.log import logger
 from zhenxun.services.runtime_reload import plugin_runtime_manager
@@ -465,12 +473,12 @@ async def _analyze(analysis_id: str) -> None:
                 "plugin": _catalog_item(plugin, manifest=manifest, inventory=inventory),
             }
         )
-    except DependencyAnalysisError as error:
+    except (DependencyAnalysisError, ArchiveDependencyConflict) as error:
         reason: dict[str, Any] = {
             "code": error.code,
             "message": safe_process_error(str(error)),
         }
-        if error.details is not None:
+        if getattr(error, "details", None) is not None:
             reason["details"] = error.details
         analysis.update(
             {
@@ -575,6 +583,7 @@ def _target_manifest(analysis: dict[str, Any]) -> dict[str, Any]:
         for name, version in analysis["plan"]["resolved_packages"].items()
         if canonicalize_name(name) not in core
     }
+    preserve_archive_dependencies(target, core=core)
     return target
 
 
@@ -1043,6 +1052,8 @@ async def apply_analysis(payload: ApplyPayload) -> Result[dict]:
                     _operation_result("rolled_back", ["transaction_canceled"]),
                     "待应用插件变更已相互抵消",
                 )
+            with archive_dependency_policy(transaction):
+                pass
             module_name = str(plugin["module_name"])
             runtime = plugin_runtime_manager.classification_for(module_name)
             root_change = next(
@@ -1156,6 +1167,9 @@ async def apply_analysis(payload: ApplyPayload) -> Result[dict]:
     except StoreOperationBusyError:
         record_failure("plugin_operation_in_progress")
         return Result.fail("plugin_operation_in_progress", code=409)
+    except (ArchiveSourceBuildConflict, ArchiveDependencyConflict) as error:
+        record_failure(error.code)
+        return Result.fail(error.code, code=409)
     except LayerBuildError as error:
         if new_generation is not None:
             remove_generation(new_generation)
