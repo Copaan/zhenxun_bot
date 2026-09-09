@@ -179,13 +179,13 @@ class UpdateManager:
             str: 返回消息
         """
         if not source:
-            await ZhenxunRepoManager.resources_zip_update()
-            return "真寻资源更新完成!"
-        result = await ZhenxunRepoManager.resources_git_update(
-            source,
-            branch=branch,
-            force=force,
-        )
+            result = await ZhenxunRepoManager.resources_zip_update(force=force)
+        else:
+            result = await ZhenxunRepoManager.resources_git_update(
+                source,
+                branch=branch,
+                force=force,
+            )
         if not result.success:
             logger.error(
                 f"真寻资源更新失败...错误: {result.error_message}", LOG_COMMAND

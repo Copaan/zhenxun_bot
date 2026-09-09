@@ -77,11 +77,17 @@ class TransportRuntime:
             self._previous_handler = loop.get_exception_handler()
             self._installed_handler = self._handle_exception
             self._lifespan_stopped = False
-            loop.set_exception_handler(self._installed_handler)
+            try:
+                loop.set_exception_handler(self._installed_handler)
+            except Exception:
+                self.restore()
+                raise
             original = getattr(loop, "_make_ssl_transport", None)
             if callable(original):
                 self._original_ssl_factory = original
-                self._ssl_factory_was_local = "_make_ssl_transport" in vars(loop)
+                self._ssl_factory_was_local = "_make_ssl_transport" in getattr(
+                    loop, "__dict__", {}
+                )
 
                 def track_ssl(*args, **kwargs):
                     transport = original(*args, **kwargs)
@@ -118,7 +124,11 @@ class TransportRuntime:
                     return transport
 
                 self._wrapped_ssl_factory = track_ssl
-                loop._make_ssl_transport = track_ssl
+                try:
+                    loop._make_ssl_transport = track_ssl
+                except Exception:
+                    self.restore()
+                    raise
 
     def retain_until_loop_close(self) -> None:
         """Keep the proxy installed while Uvicorn tears transports down."""
@@ -126,6 +136,7 @@ class TransportRuntime:
             self._lifespan_stopped = True
 
     def restore(self) -> None:
+        restore_error: Exception | None = None
         with self._lock:
             loop = self._loop
             previous = self._previous_handler
@@ -135,20 +146,28 @@ class TransportRuntime:
             self._installed_handler = None
             if (
                 loop is not None
+                and self._wrapped_ssl_factory is not None
                 and getattr(loop, "_make_ssl_transport", None)
                 is self._wrapped_ssl_factory
             ):
-                if self._ssl_factory_was_local:
-                    loop._make_ssl_transport = self._original_ssl_factory
-                else:
-                    del loop._make_ssl_transport
+                try:
+                    if self._ssl_factory_was_local:
+                        loop._make_ssl_transport = self._original_ssl_factory
+                    else:
+                        del loop._make_ssl_transport
+                except Exception as error:
+                    restore_error = error
             self._wrapped_ssl_factory = self._original_ssl_factory = None
             self._tls_transports.clear()
             self._tls_owners.clear()
-        if loop is None or loop.is_closed():
-            return
-        if loop.get_exception_handler() is installed:
+        if (
+            loop is not None
+            and not loop.is_closed()
+            and loop.get_exception_handler() is installed
+        ):
             loop.set_exception_handler(previous)
+        if restore_error is not None:
+            raise restore_error
 
     def record(self, metric: str, amount: int = 1) -> None:
         with self._lock:

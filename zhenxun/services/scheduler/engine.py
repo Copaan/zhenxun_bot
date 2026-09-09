@@ -228,6 +228,13 @@ async def _run_dependent_task(
     func: Callable, injected_params: dict, bot: Bot, state: T_State
 ):
     """将普通函数包装为 NoneBot Dependent 并执行的内部辅助方法"""
+    from zhenxun.services.ai.chat_switch import chat_plugin_enabled
+
+    owner = getattr(func, "__zhenxun_registration_owner__", None) or getattr(
+        func, "__module__", None
+    )
+    if not chat_plugin_enabled(owner):
+        return
 
     async def wrapper(bot: Bot):
         return await func(bot=bot, **injected_params)

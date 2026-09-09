@@ -60,6 +60,10 @@ def _http_error(error: Exception) -> HTTPException:
     if isinstance(error, ArchiveDependencyConflict | ArchiveSourceBuildConflict):
         return HTTPException(409, error.code)
     if isinstance(error, service.ArchiveError):
+        if error.candidates:
+            return HTTPException(
+                error.status, {"code": error.code, "candidates": error.candidates}
+            )
         return HTTPException(error.status, error.code)
     if isinstance(error, StoreOperationBusyError):
         return HTTPException(409, "plugin_operation_in_progress")

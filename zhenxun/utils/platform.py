@@ -4,7 +4,6 @@ import contextlib
 import random
 from typing import cast
 
-import httpx
 import nonebot
 from nonebot.adapters import Bot
 from nonebot.utils import is_coroutine_callable
@@ -18,6 +17,7 @@ from zhenxun.configs.config import BotConfig
 from zhenxun.models.friend_user import FriendUser
 from zhenxun.models.group_console import GroupConsole
 from zhenxun.services.log import logger
+from zhenxun.services.network_proxy import ManagedAsyncClient
 from zhenxun.utils.exception import NotFindSuperuser
 from zhenxun.utils.http_utils import AsyncHttpx
 from zhenxun.utils.message import MessageUtils
@@ -371,7 +371,7 @@ class PlatformUtils:
         """
         if platform == "qq":
             url = f"http://p.qlogo.cn/gh/{gid}/{gid}/640/"
-            async with httpx.AsyncClient() as client:
+            async with ManagedAsyncClient() as client:
                 for _ in range(3):
                     try:
                         return (await client.get(url)).content

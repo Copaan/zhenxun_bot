@@ -21,6 +21,7 @@ from zhenxun.configs.webui_tls import (
     settings_from_values,
     validate_webui_tls_settings,
 )
+from zhenxun.services.network_proxy import PROXY_KEYS, ProxyPolicy, proxy_runtime
 from zhenxun.services.runtime_config_reload import reload_runtime_config
 from zhenxun.services.runtime_environment import (
     KNOWN_ENV_KEYS,
@@ -28,6 +29,7 @@ from zhenxun.services.runtime_environment import (
     is_sensitive_env_key,
     runtime_environment_manager,
 )
+from zhenxun.services.runtime_mutation import managed_mutation
 from zhenxun.services.runtime_reload.models import ApplyMode, RuntimeOperation
 from zhenxun.utils._restart_utils import issue_restart_ticket
 from zhenxun.utils.pydantic_compat import (
@@ -68,6 +70,10 @@ _ENV_FORM_KEYS = (
     "WEBUI_HTTP_REDIRECT_PORT",
     "LOG_LEVEL",
     "SYSTEM_PROXY",
+    "NETWORK_PROXY_MODE",
+    "NETWORK_PROXY_PLUGINS",
+    "NETWORK_PROXY_CORE_ENABLED",
+    "NETWORK_PROXY_BYPASS",
     "NICKNAME",
     "SELF_NICKNAME",
     "COMMAND_START",
@@ -104,6 +110,7 @@ class ConfigurationValidation(BaseModel):
 def _validate_env(content: str) -> list[dict[str, Any]]:
     warnings = validate_dotenv(content)
     values = dict(dotenv_values(stream=StringIO(content)))
+    ProxyPolicy.from_values(values)
     qq_enabled = str(values.get("QQ_ADAPTER_LOAD") or "").casefold() == "true"
     qq_builtin = str(values.get("QQ_WEBHOOK_MODE") or "") == "builtin_https"
     try:
@@ -351,7 +358,10 @@ async def configuration_summary() -> Result:
     env_path = _path("env")
     env_content = _read(env_path)
     values = dotenv_values(stream=StringIO(env_content))
-    env_fields = {key: values.get(key) for key in _ENV_FORM_KEYS}
+    env_fields = {
+        key: None if is_sensitive_env_key(key) else values.get(key)
+        for key in _ENV_FORM_KEYS
+    }
     custom_env = []
     for key, value in sorted(values.items(), key=lambda item: str(item[0]).casefold()):
         if str(key).upper() in KNOWN_ENV_KEYS:
@@ -429,6 +439,7 @@ async def validate_configuration(payload: ConfigurationValidation) -> Result:
     response_model=Result,
     response_class=JSONResponse,
 )
+@managed_mutation("webui.configuration")
 async def update_configuration_file(
     file: str, payload: ConfigurationFileUpdate
 ) -> Result:
@@ -467,6 +478,11 @@ async def update_configuration_file(
     except Exception as error:
         raise _validation_error(file, error) from error
 
+    if file == "env":
+        values = dict(dotenv_values(stream=StringIO(content)))
+        previous_values = dict(dotenv_values(stream=StringIO(current)))
+        if any(values.get(key) != previous_values.get(key) for key in PROXY_KEYS):
+            await proxy_runtime.prepare(ProxyPolicy.from_values(values))
     original = target.read_bytes() if target.exists() else None
     operation: RuntimeOperation | None = None
     env_operation = None

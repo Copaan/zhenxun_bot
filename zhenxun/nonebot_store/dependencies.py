@@ -24,6 +24,8 @@ from packaging.specifiers import SpecifierSet
 from packaging.utils import canonicalize_name
 from packaging.version import InvalidVersion, Version
 
+from zhenxun.services.network_proxy import ManagedAsyncClient
+
 try:
     import tomllib
 except ModuleNotFoundError:  # pragma: no cover - Python 3.10
@@ -474,7 +476,7 @@ async def fetch_pypi_metadata(project: str, version: str) -> dict[str, Any]:
     safe_project = quote(project, safe="-._")
     safe_version = quote(version, safe="-._+")
     url = f"https://pypi.org/pypi/{safe_project}/{safe_version}/json"
-    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+    async with ManagedAsyncClient(timeout=15, follow_redirects=True) as client:
         response = await client.get(url, headers={"Accept": "application/json"})
         if response.status_code == 404:
             raise DependencyAnalysisError("registry_version_not_on_pypi")

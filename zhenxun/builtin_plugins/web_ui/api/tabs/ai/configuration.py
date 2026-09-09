@@ -126,6 +126,23 @@ class SectionUpdate(BaseModel):
 
 class RoutingValidationRequest(BaseModel):
     value: Any
+    default_models: dict[str, Any] | None = None
+    expected_revision: str | None = None
+
+
+class RoutingUpdate(BaseModel):
+    expected_revision: str = Field(min_length=64, max_length=64)
+    model_groups: Any
+    default_models: dict[str, Any]
+
+
+class ReferenceRepairRequest(BaseModel):
+    expected_revision: str = Field(min_length=64, max_length=64)
+
+
+class ChatPluginSwitchRequest(ReferenceRepairRequest):
+    module: str = Field(min_length=1, max_length=255)
+    enabled: bool
 
 
 class ProviderDiscoveryRequest(BaseModel):
@@ -317,13 +334,13 @@ def _reference_issues(config: LLMConfig) -> list[dict[str, str]]:
             )
             return
         targets = config.model_groups.get(group, [])
-        for target in targets:
+        for index, target in enumerate(targets):
             if target in group_names:
                 visit(target, (*stack, group))
             elif target not in available_models:
                 add(
                     "model_reference_missing",
-                    "AI.MODEL_GROUPS",
+                    f"AI.MODEL_GROUPS.{group}.{index}",
                     f"模型路由组 {group} 引用了不存在的模型 {target}。",
                 )
 
@@ -1118,6 +1135,8 @@ async def update_section(section: str, payload: SectionUpdate) -> Result:
                     update_value(advanced_key, payload.value[advanced_key])
         elif section == "model_groups" and key:
             _ai_set(ai, key, deepcopy(_normalize_model_groups(payload.value)))
+        elif section == "default_models" and key:
+            _ai_set(ai, key, _normalize_defaults(payload.value))
         elif key:
             update_value(key, payload.value)
 
@@ -1198,12 +1217,217 @@ async def update_section(section: str, payload: SectionUpdate) -> Result:
     response_class=JSONResponse,
 )
 async def validate_routing(payload: RoutingValidationRequest) -> Result:
+    if payload.expected_revision and payload.expected_revision != _revision(_read()):
+        raise HTTPException(409, detail={"code": "configuration_revision_conflict"})
     data = _load(_read())
     candidate = deepcopy(data)
     _ai_set(candidate["AI"], "MODEL_GROUPS", _normalize_model_groups(payload.value))
+    if payload.default_models is not None:
+        _ai_set(
+            candidate["AI"],
+            "default_models",
+            _normalize_defaults(payload.default_models),
+        )
     config = _validate_full(candidate["AI"], strict_references=False)
     issues = _reference_issues(config)
-    return Result.ok({"valid": not issues, "issues": issues})
+    baseline = _reference_issues(_validate_full(data["AI"], strict_references=False))
+    blockers = [issue for issue in issues if issue not in baseline]
+    return Result.ok(
+        {
+            "valid": not blockers,
+            "issues": blockers,
+            "warnings": [issue for issue in issues if issue in baseline],
+        }
+    )
+
+
+def _normalize_defaults(value: Any) -> dict[str, str | None]:
+    tasks = {"chat", "embedding", "tts", "image", "rerank"}
+    if (
+        not isinstance(value, dict)
+        or set(value) - tasks
+        or any(
+            item is not None and not isinstance(item, str) for item in value.values()
+        )
+    ):
+        raise _configuration_error(
+            "default_models_invalid",
+            "默认模型必须是任务与模型名称的映射。",
+            "AI.default_models",
+        )
+    return {task: (value.get(task) or "").strip() or None for task in sorted(tasks)}
+
+
+@router.put(
+    "/configuration/routing", dependencies=[authentication()], response_model=Result
+)
+async def update_routing(payload: RoutingUpdate) -> Result:
+    def mutate(ai):
+        _ai_set(ai, "MODEL_GROUPS", _normalize_model_groups(payload.model_groups))
+        _ai_set(ai, "default_models", _normalize_defaults(payload.default_models))
+
+    revision, config, operation = await _persist_with_operation(
+        payload.expected_revision, mutate
+    )
+    return Result.ok(
+        _apply_response(config, revision, operation), info="模型路由与默认模型已保存。"
+    )
+
+
+def _repair_references(
+    ai: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    config = _validate_full(ai, strict_references=False)
+    groups = deepcopy(config.model_groups)
+    defaults = _normalize_defaults(model_dump(config.default_models))
+    models = {
+        f"{p.name}/{m.model_name}"
+        for p in config.providers
+        for m in p.models
+        if m.is_available
+    }
+    changes = []
+    while True:
+        changed = False
+        for group, targets in list(groups.items()):
+            kept = [
+                target for target in targets if target in models or target in groups
+            ]
+            if kept != targets:
+                changes.append(
+                    {
+                        "path": f"AI.MODEL_GROUPS.{group}",
+                        "before": targets,
+                        "after": kept,
+                    }
+                )
+                groups[group] = kept
+                changed = True
+            if not kept:
+                groups.pop(group)
+                changes.append(
+                    {"path": f"AI.MODEL_GROUPS.{group}", "before": [], "after": None}
+                )
+                changed = True
+        if not changed:
+            break
+    result = deepcopy(ai)
+    _ai_set(result, "MODEL_GROUPS", groups)
+    _ai_set(result, "default_models", defaults)
+    for task, target in defaults.items():
+        if target and target not in models and target not in groups:
+            changes.append(
+                {"path": f"AI.default_models.{task}", "before": target, "after": None}
+            )
+            defaults[task] = None
+    for issue in _reference_issues(_validate_full(result, strict_references=False)):
+        if issue["code"] in {
+            "default_model_missing",
+            "default_model_capability_mismatch",
+        }:
+            task = issue["path"].rsplit(".", 1)[-1]
+            changes.append(
+                {"path": issue["path"], "before": defaults[task], "after": None}
+            )
+            defaults[task] = None
+    return result, changes
+
+
+@router.post(
+    "/configuration/repair-references/preview",
+    dependencies=[authentication()],
+    response_model=Result,
+)
+async def preview_reference_repair(payload: ReferenceRepairRequest) -> Result:
+    content = _read()
+    if _revision(content) != payload.expected_revision:
+        raise HTTPException(409, detail={"code": "configuration_revision_conflict"})
+    candidate, changes = _repair_references(_load(content)["AI"])
+    config = _validate_full(candidate, strict_references=False)
+    return Result.ok(
+        {
+            "revision": payload.expected_revision,
+            "changes": changes,
+            "remaining_issues": _reference_issues(config),
+            "model_groups": config.model_groups,
+            "default_models": model_dump(config.default_models),
+        }
+    )
+
+
+@router.post(
+    "/configuration/repair-references/apply",
+    dependencies=[authentication()],
+    response_model=Result,
+)
+async def apply_reference_repair(payload: ReferenceRepairRequest) -> Result:
+    def mutate(ai):
+        candidate, _ = _repair_references(ai)
+        _ai_set(ai, "MODEL_GROUPS", _ai_get(candidate, "MODEL_GROUPS"))
+        _ai_set(ai, "default_models", _ai_get(candidate, "default_models"))
+
+    revision, config, operation = await _persist_with_operation(
+        payload.expected_revision, mutate
+    )
+    return Result.ok(
+        _apply_response(config, revision, operation),
+        info="失效引用已修复，服务商和密钥保持不变。",
+    )
+
+
+@router.get(
+    "/chat-plugins/switches", dependencies=[authentication()], response_model=Result
+)
+async def chat_plugin_switches() -> Result:
+    content = _read()
+    return Result.ok(
+        {
+            "revision": _revision(content),
+            "switches": _ai_get(_load(content)["AI"], "CHAT_PLUGIN_ENABLED", {}),
+        }
+    )
+
+
+@router.put(
+    "/chat-plugins/switches", dependencies=[authentication()], response_model=Result
+)
+async def update_chat_plugin_switch(payload: ChatPluginSwitchRequest) -> Result:
+    from zhenxun.models.plugin_info import PluginInfo
+    from zhenxun.services.ai.chat_switch import module_identity
+
+    from ..plugin_manage.store import _AI_CHAT_PLUGIN_MODULES, _plugin_capabilities
+
+    plugin = await PluginInfo.get_plugin(module=payload.module)
+    supported = plugin is not None and plugin.module in _AI_CHAT_PLUGIN_MODULES
+    if plugin is not None and not supported:
+        from zhenxun.builtin_plugins.plugin_store.data_source import StoreManager
+
+        catalogs = await StoreManager.get_data()
+        supported = any(
+            item.module == plugin.module and "ai_chat" in _plugin_capabilities(item)
+            for catalog in catalogs
+            for item in catalog
+        )
+    if not supported:
+        raise HTTPException(422, detail={"code": "ai_chat_plugin_not_supported"})
+    identity = module_identity(plugin.module_path or plugin.module)
+
+    def mutate(ai):
+        switches = dict(_ai_get(ai, "CHAT_PLUGIN_ENABLED", {}) or {})
+        switches[identity] = payload.enabled
+        _ai_set(ai, "CHAT_PLUGIN_ENABLED", switches)
+
+    revision, _, operation = await _persist_with_operation(
+        payload.expected_revision, mutate
+    )
+    return Result.ok(
+        {
+            "revision": revision,
+            "switches": _ai_get(_load(_read())["AI"], "CHAT_PLUGIN_ENABLED", {}),
+            "operation": operation.public_dict() if operation else None,
+        },
+        info="AI 聊天即时开关已更新，进行中的请求将正常收尾。",
+    )
 
 
 def _discovery_url(api_type: str, api_base: str) -> str:
@@ -1346,6 +1570,20 @@ def _probe_error(
 
 
 def _map_probe_error(error: Exception, phase: str) -> HTTPException:
+    from zhenxun.services.ai.core.exceptions import LocationNotSupportedException
+    from zhenxun.services.network_proxy import ProxyPolicyError, ProxyRequestError
+
+    if isinstance(error, ProxyPolicyError | ProxyRequestError):
+        return _probe_error(
+            502, "proxy", error.code, "代理配置、连接或认证失败，请检查网络代理设置。"
+        )
+    if isinstance(error, LocationNotSupportedException):
+        return _probe_error(
+            422,
+            "upstream",
+            "provider_location_unsupported",
+            "服务商不支持当前出口所在地区。",
+        )
     if isinstance(error, AuthenticationException):
         return _probe_error(
             422, phase, "provider_credentials_invalid", "服务商拒绝了当前凭据。"

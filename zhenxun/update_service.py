@@ -19,6 +19,14 @@ import zipfile
 import httpx
 
 from zhenxun.services.lifecycle.operations import operation_registry
+from zhenxun.services.network_proxy import ManagedAsyncClient
+from zhenxun.services.resource_install import (
+    ResourceInstallError,
+    ResourceTransaction,
+    prepare_resource_overlay,
+    resources_ready,
+    validate_resources,
+)
 from zhenxun.services.runtime_mutation import runtime_mutation_coordinator
 from zhenxun.utils.atomic_json import write_json_locked
 
@@ -130,7 +138,7 @@ def _read_webui_version() -> tuple[str, str | None]:
 
 
 async def _get_json(url: str) -> Any:
-    async with httpx.AsyncClient(
+    async with ManagedAsyncClient(
         timeout=_HTTP_TIMEOUT, follow_redirects=True
     ) as client:
         response = await client.get(
@@ -142,7 +150,7 @@ async def _get_json(url: str) -> Any:
 
 
 async def _get_text(url: str) -> str:
-    async with httpx.AsyncClient(
+    async with ManagedAsyncClient(
         timeout=_HTTP_TIMEOUT, follow_redirects=True
     ) as client:
         response = await client.get(url)
@@ -395,7 +403,7 @@ async def _download_archive(
     kind = "heads" if ref in {"main", "dist"} else "tags"
     url = _ARCHIVES[component].format(kind=kind, ref=ref)
     digest = hashlib.sha256()
-    async with httpx.AsyncClient(timeout=None, follow_redirects=True) as client:
+    async with ManagedAsyncClient(timeout=None, follow_redirects=True) as client:
         async with client.stream("GET", url, timeout=_HTTP_TIMEOUT) as response:
             response.raise_for_status()
             with destination.open("wb") as stream:
@@ -529,11 +537,7 @@ def _validate_staging(component: UpdateComponent, root: Path) -> None:
     if component == "webui":
         _validate_webui_staging(root)
     elif component == "resource":
-        if any(not (root / name).is_dir() for name in _RESOURCE_REQUIRED_DIRS):
-            raise UpdateServiceError("resource_directories_incomplete")
-        default_theme = root / "themes" / "default"
-        if not default_theme.is_dir() or not any(default_theme.iterdir()):
-            raise UpdateServiceError("resource_default_theme_invalid")
+        validate_resources(root, _ROOT / "resources.spec")
 
 
 def _remove_path(path: Path) -> None:
@@ -549,17 +553,8 @@ def _prepare_resource_swap(job_id: str, staged: Path) -> tuple[Path, Path]:
         shutil.rmtree(swap_root)
     next_root = swap_root / "next"
     old_root = swap_root / "old"
-    next_root.mkdir(parents=True)
     old_root.mkdir(parents=True)
-    for name in _RESOURCE_ENTRIES:
-        source = staged / name
-        if not source.exists():
-            continue
-        destination = next_root / name
-        if source.is_dir():
-            shutil.copytree(source, destination)
-        else:
-            shutil.copy2(source, destination)
+    prepare_resource_overlay(staged, _ROOT / "resources", next_root, fill_only=False)
     return next_root, old_root
 
 
@@ -604,15 +599,21 @@ async def _apply_resource_update_hot(job_id: str, staged: Path) -> dict[str, Any
     from zhenxun.services.renderer import renderer_service
     from zhenxun.services.renderer.engine import drain_rendering
 
-    next_root, old_root = await asyncio.to_thread(
-        _prepare_resource_swap, job_id, staged
+    target = _ROOT / "resources"
+    force = bool(read_job(job_id).get("force"))
+    ready = await asyncio.to_thread(resources_ready, target, _ROOT / "resources.spec")
+    transaction = await asyncio.to_thread(
+        ResourceTransaction,
+        staged,
+        target,
+        _STAGING_ROOT / job_id / "resource-transaction",
+        fill_only=not force and not ready,
+        spec=_ROOT / "resources.spec",
+        protect_modified=not force,
     )
-    swapped: list[str] = []
     try:
         async with drain_rendering("resource_update", timeout=15):
-            swapped = await asyncio.to_thread(
-                _swap_resource_entries, next_root, old_root
-            )
+            await asyncio.to_thread(transaction.apply)
             try:
                 renderer_service.clear_runtime_caches()
                 await renderer_service.reload_theme()
@@ -620,12 +621,15 @@ async def _apply_resource_update_hot(job_id: str, staged: Path) -> dict[str, Any
                 await asyncio.to_thread(shutil.rmtree, UI_CACHE_PATH, True)
                 UI_CACHE_PATH.mkdir(parents=True, exist_ok=True)
             except Exception:
-                await asyncio.to_thread(_rollback_resource_entries, swapped, old_root)
+                await asyncio.to_thread(transaction.rollback)
                 renderer_service.clear_runtime_caches()
                 await renderer_service.reload_theme()
                 raise
+            await asyncio.to_thread(transaction.commit)
     except TimeoutError as error:
         raise ResourceHotSwapUnavailable("resource_render_drain_timeout") from error
+    except PermissionError as error:
+        raise ResourceHotSwapUnavailable("resource_file_locked") from error
 
     return {
         "apply_mode": "hot_reloaded",
@@ -793,7 +797,9 @@ async def _prepare_job(job_id: str) -> None:
             issue_restart_ticket("webui.update", ttl_seconds=10 * 60)
     except Exception as exc:
         code = (
-            str(exc) if isinstance(exc, UpdateServiceError) else exc.__class__.__name__
+            str(exc)
+            if isinstance(exc, UpdateServiceError | ResourceInstallError)
+            else exc.__class__.__name__
         )
         logger.error("WebUIUpdate: 更新任务失败 component=%s code=%s", component, code)
         _update_job(
@@ -990,44 +996,18 @@ def _sync_dependencies(
         raise UpdateServiceError("dependency_sync_failed")
 
 
-def _apply_resource_update(staged: Path, backup: Path) -> None:
-    destination = _ROOT / "resources"
-    if backup.exists():
-        shutil.rmtree(backup)
-    backup.parent.mkdir(parents=True, exist_ok=True)
-    backup.mkdir(parents=True)
-    destination.mkdir(parents=True, exist_ok=True)
-    replaced: list[str] = []
-    try:
-        for name in _RESOURCE_ENTRIES:
-            source = staged / name
-            if not source.exists():
-                continue
-            target = destination / name
-            previous = backup / name
-            if target.exists():
-                if target.is_dir():
-                    shutil.copytree(target, previous)
-                else:
-                    shutil.copy2(target, previous)
-                _remove_path(target)
-            if source.is_dir():
-                shutil.copytree(source, target)
-            else:
-                shutil.copy2(source, target)
-            replaced.append(name)
-    except Exception:
-        for name in reversed(replaced):
-            target = destination / name
-            previous = backup / name
-            if target.exists():
-                _remove_path(target)
-            if previous.exists():
-                if previous.is_dir():
-                    shutil.copytree(previous, target)
-                else:
-                    shutil.copy2(previous, target)
-        raise
+def _apply_resource_update(staged: Path, backup: Path, *, force: bool = False) -> None:
+    target = _ROOT / "resources"
+    transaction = ResourceTransaction(
+        staged,
+        target,
+        backup,
+        fill_only=not force and not resources_ready(target, _ROOT / "resources.spec"),
+        spec=_ROOT / "resources.spec",
+        protect_modified=not force,
+    )
+    transaction.apply()
+    transaction.commit()
 
 
 def apply_pending_update(project_root: Path | None = None) -> bool:
@@ -1052,12 +1032,16 @@ def apply_pending_update(project_root: Path | None = None) -> bool:
 
             precompile_path(_ROOT / "zhenxun")
         elif component == "resource":
-            _apply_resource_update(staged, backup)
+            _apply_resource_update(
+                staged, backup, force=bool(read_job(job_id).get("force"))
+            )
         else:
             raise UpdateServiceError("pending_component_invalid")
     except Exception as exc:
         code = (
-            str(exc) if isinstance(exc, UpdateServiceError) else exc.__class__.__name__
+            str(exc)
+            if isinstance(exc, UpdateServiceError | ResourceInstallError)
+            else exc.__class__.__name__
         )
         _update_job(job_id, state="failed", error=code, progress=100)
         _PENDING_FILE.unlink(missing_ok=True)

@@ -8,12 +8,12 @@ import time
 from types import TracebackType
 from typing import Any, ClassVar
 
-import httpx
 from nonebot_plugin_uninfo import Uninfo
 import pypinyin
 
 from zhenxun.configs.config import Config
 from zhenxun.services.log import logger
+from zhenxun.services.network_proxy import ManagedAsyncClient
 
 from .limiters import CountLimiter, FreqLimiter, UserBlockLimiter  # noqa: F401
 
@@ -83,7 +83,7 @@ async def get_user_avatar(uid: int | str) -> bytes | None:
         uid: 用户id
     """
     url = f"http://q1.qlogo.cn/g?b=qq&nk={uid}&s=160"
-    async with httpx.AsyncClient() as client:
+    async with ManagedAsyncClient() as client:
         for _ in range(3):
             try:
                 return (await client.get(url)).content
@@ -99,7 +99,7 @@ async def get_group_avatar(gid: int | str) -> bytes | None:
         gid: 群号
     """
     url = f"http://p.qlogo.cn/gh/{gid}/{gid}/640/"
-    async with httpx.AsyncClient() as client:
+    async with ManagedAsyncClient() as client:
         for _ in range(3):
             try:
                 return (await client.get(url)).content

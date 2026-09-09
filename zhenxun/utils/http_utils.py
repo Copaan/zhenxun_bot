@@ -8,7 +8,7 @@ from typing import Any, ClassVar, cast
 
 import aiofiles
 import httpx
-from httpx import AsyncClient, AsyncHTTPTransport, HTTPStatusError, Proxy, Response
+from httpx import AsyncClient, HTTPStatusError, Response
 from rich.progress import (
     BarColumn,
     DownloadColumn,
@@ -21,6 +21,11 @@ import ujson as json
 from zhenxun.configs.config import BotConfig
 from zhenxun.services.cache.bounded_ttl import BoundedTTLCache
 from zhenxun.services.log import logger
+from zhenxun.services.network_proxy import (
+    ManagedAsyncClient,
+    ProxyPolicyError,
+    proxy_runtime,
+)
 from zhenxun.utils.decorator.retry import Retry
 from zhenxun.utils.exception import AllURIsFailedError
 from zhenxun.utils.manager.priority_manager import PriorityLifecycle
@@ -44,7 +49,7 @@ def _http_client_healthy(_value=None) -> bool:
     component_id="management:http_client",
     depends_on=("management:runtime_concurrency",),
     restart_policy="component",
-    config_keys=("SYSTEM_PROXY",),
+    config_keys=(),
     pass_context=True,
     health=_http_client_healthy,
 )
@@ -53,31 +58,10 @@ async def _(context):
     在Bot启动时初始化全局httpx客户端。
     """
     global _client
-    client_kwargs = {}
-    if proxy_url := BotConfig.system_proxy or None:
-        try:
-            version_parts = httpx.__version__.split(".")
-            major = int("".join(c for c in version_parts[0] if c.isdigit()))
-            minor = (
-                int("".join(c for c in version_parts[1] if c.isdigit()))
-                if len(version_parts) > 1
-                else 0
-            )
-            if (major, minor) >= (0, 28):
-                client_kwargs["proxy"] = proxy_url
-            else:
-                client_kwargs["proxies"] = proxy_url
-        except (ValueError, IndexError):
-            client_kwargs["proxy"] = proxy_url
-            logger.warning(
-                f"无法解析 httpx 版本 '{httpx.__version__}'，"
-                "将默认使用新版 'proxy' 参数语法。"
-            )
-
+    proxy_runtime.attach(context)
     _client = get_async_client(
         headers=get_user_agent(),
         follow_redirects=True,
-        **client_kwargs,
     )
     context.own_resource(
         receipt_id=f"httpx:{id(_client)}",
@@ -121,65 +105,25 @@ def get_client() -> AsyncClient:
 
 
 async def reload_system_proxy(proxy: str | None) -> None:
-    """Replace the shared HTTP client after a runtime proxy change."""
-    global _client
+    """Publish a proxy policy without interrupting existing managed requests."""
+    from dotenv import dotenv_values
 
-    normalized = proxy.strip() if proxy else None
-    kwargs: dict[str, str] = {}
-    if normalized:
-        kwargs["proxy"] = normalized
-    replacement = get_async_client(
-        headers=get_user_agent(),
-        follow_redirects=True,
-        **kwargs,
-    )
-    previous = _client
-    _client = replacement
-    AsyncHttpx.default_proxy = (
-        {"http://": normalized, "https://": normalized} if normalized else None
-    )
-    if previous:
-        await previous.aclose()
+    values = dict(dotenv_values(".env.dev"))
+    values["SYSTEM_PROXY"] = proxy or ""
+    await proxy_runtime.apply(values)
 
 
 def get_async_client(
     proxies: dict[str, str] | str | None = None,
     proxy: str | None = None,
-    verify: bool = False,
+    verify: bool = True,
     **kwargs,
 ) -> httpx.AsyncClient:
     """
     [向后兼容] 创建 httpx.AsyncClient 实例的工厂函数。
     此函数完全保留了旧版本的接口，确保现有代码无需修改即可使用。
     """
-    transport = kwargs.pop("transport", None) or AsyncHTTPTransport(verify=verify)
-    if proxies:
-        if isinstance(proxies, str):
-            proxies = {"http://": proxies, "https://": proxies}
-        http_proxy = proxies.get("http://")
-        https_proxy = proxies.get("https://")
-        return httpx.AsyncClient(
-            mounts={
-                "http://": AsyncHTTPTransport(
-                    proxy=Proxy(http_proxy) if http_proxy else None
-                ),
-                "https://": AsyncHTTPTransport(
-                    proxy=Proxy(https_proxy) if https_proxy else None
-                ),
-            },
-            transport=transport,
-            **kwargs,
-        )
-    elif proxy:
-        return httpx.AsyncClient(
-            mounts={
-                "http://": AsyncHTTPTransport(proxy=Proxy(proxy)),
-                "https://": AsyncHTTPTransport(proxy=Proxy(proxy)),
-            },
-            transport=transport,
-            **kwargs,
-        )
-    return httpx.AsyncClient(transport=transport, **kwargs)
+    return ManagedAsyncClient(proxies=proxies, proxy=proxy, verify=verify, **kwargs)
 
 
 class AsyncHttpx:
@@ -259,10 +203,6 @@ class AsyncHttpx:
         """
         final_config = client_kwargs.copy()
 
-        use_proxy = final_config.pop("use_proxy", True)
-
-        if "proxies" not in final_config and "proxy" not in final_config:
-            final_config["proxies"] = cls.default_proxy if use_proxy else None
         return final_config
 
     @classmethod
@@ -284,11 +224,17 @@ class AsyncHttpx:
         - 自动处理临时客户端的关闭。
         """
         if kwargs:
-            logger.debug(f"为单次请求创建临时客户端，配置: {kwargs}")
+            logger.debug("为单次请求创建受管临时客户端", "HTTPClient")
             temp_client_config = cls._prepare_temporary_client_config(kwargs)
             async with get_async_client(**temp_client_config) as temp_client:
                 yield temp_client
         else:
+            if client is not None and (
+                not isinstance(client, ManagedAsyncClient)
+                or client.proxy_runtime is not proxy_runtime
+            ):
+                if proxy_runtime.request_is_forced():
+                    raise ProxyPolicyError("proxy_explicit_client_unmanaged")
             yield client or get_client()
 
     @Retry.simple(log_name="内部HTTP请求")
@@ -327,7 +273,7 @@ class AsyncHttpx:
             return response
 
     @classmethod
-    async def _execute_with_fallbacks(
+    async def _execute_with_fallbacks_unscoped(
         cls,
         urls: str | list[str],
         worker: Callable[..., Awaitable[Any]],
@@ -379,6 +325,13 @@ class AsyncHttpx:
                     )
 
         raise AllURIsFailedError(url_list, exceptions)
+
+    @classmethod
+    async def _execute_with_fallbacks(cls, urls, worker, *, client=None, **kwargs):
+        async with proxy_runtime.request_scope():
+            return await cls._execute_with_fallbacks_unscoped(
+                urls, worker, client=client, **kwargs
+            )
 
     @classmethod
     async def get(
@@ -465,11 +418,20 @@ class AsyncHttpx:
         cls, url: str | list[str], *, client: AsyncClient | None = None, **kwargs
     ) -> bytes:
         """获取指定 URL 的二进制内容。"""
+        async with proxy_runtime.request_scope():
+            return await cls._get_content_scoped(url, client=client, **kwargs)
+
+    @classmethod
+    async def _get_content_scoped(
+        cls, url: str | list[str], *, client: AsyncClient | None = None, **kwargs
+    ) -> bytes:
         if not isinstance(url, str):
             res = await cls.get(url, client=client, **kwargs)
             return res.content
 
-        cache_key = url
+        if client is not None or kwargs:
+            return (await cls.get(url, client=client, **kwargs)).content
+        cache_key = proxy_runtime.cache_partition() + ":" + url
         if cached := await cls._content_cache.get(cache_key):
             return cached
 

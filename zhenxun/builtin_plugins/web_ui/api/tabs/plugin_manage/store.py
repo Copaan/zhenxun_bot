@@ -8,7 +8,7 @@ import shutil
 import tempfile
 from typing import Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
 from nonebot import require
 from nonebot.compat import model_dump
@@ -41,6 +41,7 @@ router = APIRouter(prefix="/store")
 _AI_CHAT_PLUGIN_MODULES = frozenset(
     {
         "ai",
+        "chatinter",
         "bym_ai",
         "chat_toolkit",
         "leekchat",
@@ -556,7 +557,7 @@ def _record_failed_operation(
 
 
 def _replayed_operation(
-    operation_id: str | None, store_key: str
+    operation_id: str | None, store_key: str, download_source: str | None = None
 ) -> dict[str, Any] | None:
     if not operation_id:
         return None
@@ -565,10 +566,24 @@ def _replayed_operation(
         return None
     if entry.get("store_key") != store_key:
         raise ValueError("plugin_operation_id_conflict")
+    if (
+        download_source is not None
+        and entry.get("result", {}).get("download_source", "auto") != download_source
+    ):
+        raise HTTPException(409, detail="plugin_download_source_conflict")
     if entry.get("status") == "running":
         raise StoreOperationBusyError("plugin_operation_in_progress")
     result = entry.get("result")
     return result if isinstance(result, dict) else None
+
+
+def _replay_store_request(param: PluginIr) -> dict[str, Any] | None:
+    if not param.store_key:
+        return None
+    _request_value(param)
+    return _replayed_operation(
+        param.operation_id, param.store_key, param.download_source
+    )
 
 
 @router.get(
@@ -735,6 +750,8 @@ async def _(param: PluginIr) -> Result:
         async with _store_operation(
             operation_id=param.operation_id, owner="webui.plugin_store"
         ):
+            if replayed := _replay_store_request(param):
+                return Result.ok(replayed, info="重复请求已复用原操作结果")
             require("plugin_store")
             from zhenxun.builtin_plugins.plugin_store import StoreManager
 
@@ -748,10 +765,15 @@ async def _(param: PluginIr) -> Result:
                     return Result.fail("catalog_source_missing", code=409)
             source = _validate_requested_source(param, is_external=is_external)
             journal_store_key = _store_key(source, plugin_info.module)
-            if replayed := _replayed_operation(param.operation_id, journal_store_key):
+            if replayed := _replayed_operation(
+                param.operation_id, journal_store_key, param.download_source
+            ):
                 return Result.ok(replayed, info="重复请求已复用原操作结果")
             journal_operation_id = begin_operation(
-                journal_store_key, "install", param.operation_id
+                journal_store_key,
+                "install",
+                param.operation_id,
+                download_source=param.download_source,
             )
             path = StoreManager._resolve_local_plugin_path(
                 plugin_info, is_external=is_external
@@ -761,6 +783,9 @@ async def _(param: PluginIr) -> Result:
                 before = _snapshot_plugin_files(path)
                 install_result = await StoreManager.add_plugin(
                     request_value,
+                    source=None
+                    if param.download_source == "auto"
+                    else param.download_source,
                     install_dependencies=False,
                     confirm_source_build=param.confirm_source_build,
                     return_result=True,
@@ -826,9 +851,15 @@ async def _(param: PluginIr) -> Result:
                     path=path,
                 )
         operation.setdefault("operation_id", journal_operation_id)
+        operation["download_source"] = param.download_source
+        operation["actual_download_source"] = getattr(
+            install_result, "download_source", "auto"
+        )
         operation = _decorate_operation(operation, journal_store_key)
         info = _log_store_operation("安装", plugin_info.name, operation)
         return Result.ok(operation, info=info)
+    except HTTPException:
+        raise
     except StoreOperationBusyError:
         return Result.fail("plugin_operation_in_progress", code=409)
     except PluginRuntimeModuleError:
@@ -868,6 +899,8 @@ async def _(param: PluginIr) -> Result:
         async with _store_operation(
             operation_id=param.operation_id, owner="webui.plugin_store"
         ):
+            if replayed := _replay_store_request(param):
+                return Result.ok(replayed, info="重复请求已复用原操作结果")
             require("plugin_store")
             from zhenxun.builtin_plugins.plugin_store import StoreManager
 
@@ -877,10 +910,15 @@ async def _(param: PluginIr) -> Result:
             )
             source = _validate_requested_source(param, is_external=is_external)
             journal_store_key = _store_key(source, plugin_info.module)
-            if replayed := _replayed_operation(param.operation_id, journal_store_key):
+            if replayed := _replayed_operation(
+                param.operation_id, journal_store_key, param.download_source
+            ):
                 return Result.ok(replayed, info="重复请求已复用原操作结果")
             journal_operation_id = begin_operation(
-                journal_store_key, "update", param.operation_id
+                journal_store_key,
+                "update",
+                param.operation_id,
+                download_source=param.download_source,
             )
             path = StoreManager._resolve_local_plugin_path(
                 plugin_info, is_external=is_external
@@ -893,6 +931,9 @@ async def _(param: PluginIr) -> Result:
                         before = _snapshot_plugin_files(path)
                         install_result = await StoreManager.update_plugin(
                             request_value,
+                            source=None
+                            if param.download_source == "auto"
+                            else param.download_source,
                             install_dependencies=False,
                             confirm_source_build=param.confirm_source_build,
                             return_result=True,
@@ -977,9 +1018,15 @@ async def _(param: PluginIr) -> Result:
                     )
                     raise
         operation.setdefault("operation_id", journal_operation_id)
+        operation["download_source"] = param.download_source
+        operation["actual_download_source"] = getattr(
+            install_result, "download_source", "auto"
+        )
         operation = _decorate_operation(operation, journal_store_key)
         info = _log_store_operation("更新", plugin_info.name, operation)
         return Result.ok(operation, info=info)
+    except HTTPException:
+        raise
     except StoreOperationBusyError:
         return Result.fail("plugin_operation_in_progress", code=409)
     except Exception as e:
@@ -1154,6 +1201,8 @@ async def _(param: PluginIr) -> Result:
         operation = _decorate_operation(operation, journal_store_key)
         info = _log_store_operation("卸载", plugin_info.name, operation)
         return Result.ok(operation, info=info)
+    except HTTPException:
+        raise
     except StoreOperationBusyError:
         return Result.fail("plugin_operation_in_progress", code=409)
     except Exception as e:
@@ -1211,6 +1260,8 @@ async def _(param: PluginReloadPayload) -> Result:
             operation_data,
             info=_store_operation_info("热重载", module, operation_data),
         )
+    except HTTPException:
+        raise
     except StoreOperationBusyError:
         return Result.fail("plugin_operation_in_progress", code=409)
     except Exception as e:

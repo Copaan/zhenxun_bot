@@ -267,6 +267,12 @@ class BaseRepoManager(ABC):
                 authenticated_url = prepare_repo_url(repo_url)
             repo_url = canonicalize_git_url(authenticated_url)
             git_env = git_auth_environment(authenticated_url, repo_url)
+            from zhenxun.services.git_proxy import git_download_environment
+            from zhenxun.services.network_proxy import proxy_runtime
+
+            git_env, _ = git_download_environment(
+                proxy_runtime.policy_snapshot(), repo_url, git_env
+            )
 
             # 检查本地目录是否存在
             if not await AsyncPath(local_path).exists():
@@ -278,6 +284,7 @@ class BaseRepoManager(ABC):
                 success, _stdout, stderr = await run_git_command(
                     ["clone", "--progress", "-b", branch, repo_url, str(local_path)],
                     env=git_env,
+                    isolated_env=True,
                 )
                 if not success:
                     return RepoUpdateResult(
@@ -293,6 +300,8 @@ class BaseRepoManager(ABC):
                 success, new_version, _ = await run_git_command(
                     "rev-parse HEAD", cwd=local_path
                 )
+                if not success:
+                    raise RuntimeError("无法确认仓库提交")
                 result.new_version = new_version.strip()
                 result.success = True
                 return result
@@ -337,7 +346,8 @@ class BaseRepoManager(ABC):
             success, old_version, _ = await run_git_command(
                 "rev-parse HEAD", cwd=local_path
             )
-            result.old_version = old_version.strip()
+            old_version = old_version.strip() if success else ""
+            result.old_version = old_version
 
             # 获取当前远程URL
             success, remote_url, _ = await run_git_command(
@@ -358,7 +368,7 @@ class BaseRepoManager(ABC):
             # 获取远程更新
             logger.info(f"获取远程更新: {redact_git_output(repo_url)}", LOG_COMMAND)
             success, _, stderr = await run_git_command(
-                "fetch origin", cwd=local_path, env=git_env
+                "fetch origin", cwd=local_path, env=git_env, isolated_env=True
             )
             if not success:
                 return RepoUpdateResult(
@@ -398,7 +408,7 @@ class BaseRepoManager(ABC):
                 logger.info("使用强制拉取模式", LOG_COMMAND)
                 # 强制模式需要两步：先 fetch，再 reset，不能用 shell && 链式写法
                 success, _, stderr = await run_git_command(
-                    "fetch --all", cwd=local_path, env=git_env
+                    "fetch origin", cwd=local_path, env=git_env, isolated_env=True
                 )
                 if not success:
                     return RepoUpdateResult(
@@ -414,7 +424,10 @@ class BaseRepoManager(ABC):
                 )
             else:
                 success, _, stderr = await run_git_command(
-                    f"pull origin {branch}", cwd=local_path, env=git_env
+                    ["pull", "origin", branch],
+                    cwd=local_path,
+                    env=git_env,
+                    isolated_env=True,
                 )
             if not success:
                 return RepoUpdateResult(
@@ -430,6 +443,8 @@ class BaseRepoManager(ABC):
             success, new_version, _ = await run_git_command(
                 "rev-parse HEAD", cwd=local_path
             )
+            if not success:
+                raise RuntimeError("无法确认资源仓库提交")
             result.new_version = new_version.strip()
 
             # 如果版本相同，则无需更新
@@ -444,7 +459,9 @@ class BaseRepoManager(ABC):
 
             # 获取变更的文件列表
             success, changed_files_output, _ = await run_git_command(
-                f"diff --name-only {old_version.strip()} {new_version.strip()}",
+                ["diff", "--name-only", old_version, new_version.strip()]
+                if old_version
+                else ["ls-files"],
                 cwd=local_path,
             )
             if success:

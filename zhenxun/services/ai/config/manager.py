@@ -117,6 +117,13 @@ def register_llm_configs():
     """注册 LLM 服务的配置项"""
 
     llm_config = LLMConfig()
+    Config.add_plugin_config(
+        "AI",
+        "CHAT_PLUGIN_ENABLED",
+        {},
+        type=dict,
+        help="按插件模块保存的 AI 聊天即时开关，不影响新群默认状态。",
+    )
 
     Config.add_plugin_config(
         "AI",
@@ -318,7 +325,7 @@ def get_llm_config() -> LLMConfig:
         "default_models": ai_config.get("default_models", {}),
         "client_settings": ai_config.get("client_settings", {}),
         "debug_log": debug_log_val,
-        "PROVIDERS": ai_config.get("PROVIDERS", []),
+        "providers": ai_config.get("PROVIDERS", []),
         "context_settings": ai_config.get("context_settings", {}),
         "model_groups": ai_config.get("MODEL_GROUPS", {}),
         "agent_settings": ai_config.get("agent_settings", {}),

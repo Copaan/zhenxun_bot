@@ -16,7 +16,11 @@ def _now() -> str:
 
 
 def begin_operation(
-    store_key: str, action: str, operation_id: str | None = None
+    store_key: str,
+    action: str,
+    operation_id: str | None = None,
+    *,
+    download_source: str = "auto",
 ) -> str:
     operation_id = operation_id or uuid.uuid4().hex
     record_operation(
@@ -25,6 +29,7 @@ def begin_operation(
             "operation_id": operation_id,
             "status": "running",
             "action": action,
+            "download_source": download_source,
             "apply_mode": None,
         },
     )
@@ -37,6 +42,10 @@ def record_operation(store_key: str, result: dict[str, Any]) -> str:
 
     def update(state: dict[str, Any]) -> None:
         operations = state.setdefault("operations", {})
+        prior = operations.get(operation_id, {}).get("result", {})
+        for key in ("download_source",):
+            if key in prior and key not in result:
+                result[key] = prior[key]
         operations[operation_id] = {
             "operation_id": operation_id,
             "store_key": store_key,

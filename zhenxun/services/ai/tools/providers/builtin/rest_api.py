@@ -1,14 +1,13 @@
 import json
 from typing import Any, Literal
 
-import httpx
-
 from zhenxun.services.ai.core.stream_events import ToolStreamChunkEvent
 from zhenxun.services.ai.run.context import RunContext
 from zhenxun.services.ai.tools.core.decorators import tool
 from zhenxun.services.ai.tools.core.toolkit import BaseToolkit
 from zhenxun.services.ai.tools.models import ToolResult
 from zhenxun.services.ai.utils.logger import log_tool as logger
+from zhenxun.services.network_proxy import ManagedAsyncClient
 
 
 class RestApiToolkit(BaseToolkit):
@@ -82,7 +81,7 @@ class RestApiToolkit(BaseToolkit):
         logger.info(f"🌐 [RestApiToolkit] 正在请求 {method} {url}")
 
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
+            async with ManagedAsyncClient(timeout=self.timeout) as client:
                 response = await client.request(
                     method=method,
                     url=url,

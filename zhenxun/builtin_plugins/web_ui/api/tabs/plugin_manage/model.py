@@ -169,6 +169,7 @@ class RenameMenuTypePayload(BaseModel):
 
 
 class PluginIr(BaseModel):
+    download_source: Literal["auto", "ali", "git"] = "auto"
     id: int | None = None
     """插件id"""
     store_key: str | None = Field(default=None, min_length=3, max_length=300)

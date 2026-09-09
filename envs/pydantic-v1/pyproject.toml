@@ -6,6 +6,7 @@ authors = [{ name = "HibiKier", email = "775757368@qq.com" }]
 license = { text = "AGPL-3.0" }
 requires-python = ">=3.10"
 dependencies = [
+    "httpx[socks]>=0.28.1,<0.29",
     "playwright>=1.41.1,<2.0.0",
     "nonebot-adapter-onebot>=2.3.1",
     "nonebot-plugin-apscheduler>=0.5,<0.6",
@@ -47,6 +48,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+migration = ["pyzipper>=0.3.6,<0.4"]
 redis = ["redis>=5"]
 postgresql = ["asyncpg>=0.20.0"]
 

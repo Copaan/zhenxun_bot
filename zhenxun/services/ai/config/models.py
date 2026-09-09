@@ -120,11 +120,11 @@ class ProviderConfig(BaseModel):
 class DefaultModelsConfig(BaseModel):
     """按任务分类的默认模型配置"""
 
-    chat: str | None = Field(default="Gemini/gemini-3.5-flash")
-    embedding: str | None = Field(default="Gemini/gemini-embedding-2")
-    tts: str | None = Field(default="Gemini/gemini-3.1-flash-tts-preview")
-    image: str | None = Field(default="Gemini/gemini-2.5-flash-image")
-    rerank: str | None = Field(default="siliconflow/BAAI/bge-reranker-v2-m3")
+    chat: str | None = None
+    embedding: str | None = None
+    tts: str | None = None
+    image: str | None = None
+    rerank: str | None = None
 
 
 class AgentEngineSettings(BaseModel):
@@ -177,14 +177,7 @@ class LLMConfig(BaseModel):
         default_factory=ContextManagementSettings
     )
     """上下文管理相关配置"""
-    model_groups: dict[str, list[str]] = Field(
-        default_factory=lambda: {
-            "cheap_models": [
-                "Gemini/gemini-3.5-flash",
-                "Doubao/doubao-seed-1-6-250615",
-            ],
-        }
-    )
+    model_groups: dict[str, list[str]] = Field(default_factory=dict)
     """虚拟模型路由组配置 (Virtual Router Groups)"""
     agent_settings: AgentEngineSettings = Field(default_factory=AgentEngineSettings)
     """Agent 执行引擎层核心默认参数配置"""

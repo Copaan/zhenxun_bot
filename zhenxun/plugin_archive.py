@@ -36,6 +36,11 @@ from packaging.requirements import InvalidRequirement, Requirement
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
 
 from zhenxun import plugin_store_transaction as transaction
+from zhenxun.plugin_archive_metadata import (
+    MetadataError,
+    declared_package_paths,
+    poetry_dependencies,
+)
 from zhenxun.plugin_store_receipts import StoreReceiptStore, source_digest
 from zhenxun.utils.atomic_json import read_json_locked, write_json_locked
 
@@ -54,10 +59,11 @@ _RESERVED = re.compile(
 
 
 class ArchiveError(ValueError):
-    def __init__(self, code: str, status: int = 400):
+    def __init__(self, code: str, status: int = 400, *, candidates=None):
         super().__init__(code)
         self.code = code
         self.status = status
+        self.candidates = candidates or []
 
 
 def _name(raw: str) -> tuple[str, ...]:
@@ -266,19 +272,59 @@ def _module(name: str) -> str:
 
 
 def identify_plugin(root: Path) -> tuple[Path, list[Path], dict[str, Any]]:
+    def multiple(paths):
+        return ArchiveError(
+            "archive_multiple_plugins",
+            candidates=sorted({p.relative_to(root).as_posix() for p in paths})[:100],
+        )
+
     current = root
     scopes = [root]
     wrapper = False
     src = False
+    ignored = {".github", "docs", "tests", "__MACOSX", "LICENSES", "licenses"}
     while True:
         children = list(current.iterdir())
-        packages = [p for p in children if p.is_dir() and (p / "__init__.py").is_file()]
+        packages = [
+            p
+            for p in children
+            if p.name not in ignored and p.is_dir() and (p / "__init__.py").is_file()
+        ]
         modules = [
             p
             for p in children
             if p.suffix == ".py" and p.name not in {"setup.py", "__init__.py"}
         ]
         candidates = packages + modules
+        metadata_path = current / "pyproject.toml"
+        if metadata_path.is_file():
+            if metadata_path.stat().st_size > 1024 * 1024:
+                raise ArchiveError("archive_dependency_metadata_limit")
+            try:
+                declared = declared_package_paths(
+                    tomllib.loads(metadata_path.read_text(encoding="utf-8-sig"))
+                )
+            except (ValueError, TypeError, AttributeError) as error:
+                raise ArchiveError(
+                    str(error)
+                    if isinstance(error, MetadataError)
+                    else "archive_dependency_metadata_invalid"
+                ) from error
+            if declared is not None:
+                declared_candidates = [current / path for path in declared]
+                if len(declared_candidates) != 1 or any(
+                    p not in declared_candidates for p in candidates
+                ):
+                    raise multiple(declared_candidates + candidates)
+                candidate = declared_candidates[0]
+                if not (
+                    (candidate.is_dir() and (candidate / "__init__.py").is_file())
+                    or (candidate.is_file() and candidate.suffix == ".py")
+                ):
+                    raise ArchiveError("archive_package_declaration_invalid")
+                if candidate.parent != current:
+                    scopes.append(candidate.parent)
+                break
         if (current / "__init__.py").is_file():
             if current == root or current.name == "src":
                 raise ArchiveError("archive_package_name_missing")
@@ -286,21 +332,18 @@ def identify_plugin(root: Path) -> tuple[Path, list[Path], dict[str, Any]]:
             break
         if len(candidates) == 1:
             if any(
-                p.is_dir()
-                and p not in candidates
-                and p.name not in {".github", "docs", "tests", "__MACOSX"}
+                p.is_dir() and p not in candidates and p.name not in ignored
                 for p in children
             ):
-                raise ArchiveError("archive_multiple_plugins")
+                raise multiple(
+                    candidates
+                    + [p for p in children if p.is_dir() and p.name not in ignored]
+                )
             candidate = candidates[0]
             break
         if candidates:
-            raise ArchiveError("archive_multiple_plugins")
-        directories = [
-            p
-            for p in children
-            if p.is_dir() and p.name not in {".github", "docs", "tests", "__MACOSX"}
-        ]
+            raise multiple(candidates)
+        directories = [p for p in children if p.is_dir() and p.name not in ignored]
         if len(directories) != 1:
             raise ArchiveError("archive_plugin_not_identified")
         current = directories[0]
@@ -386,11 +429,24 @@ def static_requirements(
                 ):
                     raise ArchiveError("archive_dependency_metadata_invalid")
                 requirements.extend(values)
-                if data.get("tool", {}).get("poetry", {}).get("dependencies"):
-                    raise ArchiveError("archive_dependency_format_unsupported")
+                poetry = data.get("tool", {}).get("poetry", {})
+                if poetry.get("dependencies"):
+                    poetry_values, poetry_python = poetry_dependencies(poetry)
+                    requirements.extend(poetry_values)
+                    if poetry_python:
+                        if not SpecifierSet(poetry_python).contains(
+                            platform.python_version(), prereleases=True
+                        ):
+                            raise ArchiveError("archive_python_incompatible")
+                        if metadata is not None:
+                            metadata.setdefault("requires_python", []).append(
+                                poetry_python
+                            )
             except (ValueError, TypeError, AttributeError) as error:
                 if isinstance(error, ArchiveError):
                     raise
+                if isinstance(error, MetadataError):
+                    raise ArchiveError(str(error)) from error
                 raise ArchiveError("archive_dependency_metadata_invalid") from error
         if (scope / "setup.py").exists() or (scope / "setup.cfg").exists():
             raise ArchiveError("archive_setup_dependencies_unsupported")
@@ -427,7 +483,11 @@ async def inspect_in_worker(path: Path, kind: str) -> dict[str, Any]:
             raise ArchiveError("archive_inspection_failed")
         result = json.loads(result_path.read_text(encoding="utf-8"))
         if result.get("error"):
-            raise ArchiveError(result["error"], result.get("status", 400))
+            raise ArchiveError(
+                result["error"],
+                result.get("status", 400),
+                candidates=result.get("candidates"),
+            )
         if process.returncode:
             raise ArchiveError("archive_inspection_failed")
         return result

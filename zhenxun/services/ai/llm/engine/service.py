@@ -10,6 +10,7 @@ from typing import Any, TypeVar
 
 from pydantic import BaseModel
 
+from zhenxun.services.ai.chat_switch import admit_ai_call
 from zhenxun.services.ai.config import ProviderConfig, get_llm_config
 from zhenxun.services.ai.core.exceptions import ConfigurationException
 from zhenxun.services.ai.core.messages import (
@@ -201,6 +202,7 @@ class LLMModel(
         if self._is_closed:
             raise RuntimeError(f"LLMModel实例已关闭: {self}")
 
+    @admit_ai_call
     async def invoke(
         self,
         request: BaseRequest,

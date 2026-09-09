@@ -12,7 +12,6 @@ from zhenxun.services.ai.llm.manager import (
     _resolve_model_group,
     get_default_model,
     get_model_instance,
-    list_available_models,
 )
 from zhenxun.services.ai.llm.system.capabilities import get_model_capabilities
 from zhenxun.services.ai.llm.system.network import health_manager
@@ -131,11 +130,9 @@ class BaseOrchestrator:
         if resolved_model_name is None:
             resolved_model_name = get_default_model(task)
             if resolved_model_name is None:
-                available_models = list_available_models()
-                if not available_models:
-                    raise ConfigurationException("未配置任何AI模型")
-                resolved_model_name = available_models[0]["full_name"]
-                logger.warning(f"未指定模型，使用第一个可用模型: {resolved_model_name}")
+                raise ConfigurationException(
+                    f"尚未配置 {task} 默认模型，请选择模型后再调用。"
+                )
 
         group_name = _get_group_name(resolved_model_name)
         if group_name is not None:
@@ -147,13 +144,16 @@ class BaseOrchestrator:
         else:
             model_names = [resolved_model_name]
 
-        return await self.router.route(
-            request=request,
-            model_names=model_names,
-            task=task,
-            override_config=override_config,
-            cancellation_token=cancellation_token,
-        )
+        from zhenxun.services.ai.chat_switch import admitted_ai_request
+
+        with admitted_ai_request():
+            return await self.router.route(
+                request=request,
+                model_names=model_names,
+                task=task,
+                override_config=override_config,
+                cancellation_token=cancellation_token,
+            )
 
 
 LLMOrchestrator = BaseOrchestrator()

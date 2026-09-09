@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from functools import wraps
+from pathlib import Path
 from typing import Any
 import uuid
 
@@ -216,6 +217,13 @@ class RuntimeMutationCoordinator:
         async with self._lock:
             if self._state != "open":
                 raise RuntimeMutationBusyError(f"runtime_mutation_{self._state}")
+            from zhenxun.migration.errors import MigrationError
+            from zhenxun.migration.mutation import require_mutation_available
+
+            try:
+                require_mutation_available(Path.cwd())
+            except MigrationError as error:
+                raise RuntimeMutationBusyError(error.code) from None
             token = self._depth.set(1)
             self._owner_task = asyncio.current_task()
             self._transaction = object()

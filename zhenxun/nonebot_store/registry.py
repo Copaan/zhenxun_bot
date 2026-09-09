@@ -9,6 +9,8 @@ from typing import Any
 import httpx
 from packaging.version import InvalidVersion, Version
 
+from zhenxun.services.network_proxy import ManagedAsyncClient
+
 from .storage import (
     REGISTRY_CACHE_FILE,
     REGISTRY_META_FILE,
@@ -105,7 +107,7 @@ async def get_registry(
         headers = {"Accept": "application/json"}
         if meta.get("etag"):
             headers["If-None-Match"] = str(meta["etag"])
-        async with httpx.AsyncClient(timeout=12, follow_redirects=True) as client:
+        async with ManagedAsyncClient(timeout=12, follow_redirects=True) as client:
             for index, url in enumerate(REGISTRY_URLS):
                 try:
                     response = await client.get(

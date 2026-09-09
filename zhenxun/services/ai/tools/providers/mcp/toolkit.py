@@ -7,7 +7,6 @@ from typing import Any, Literal, cast
 
 import anyio
 from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
-import httpx
 from mcp import ClientSession  # type: ignore
 from mcp.client.sse import sse_client
 from mcp.client.stdio import StdioServerParameters, stdio_client
@@ -24,6 +23,7 @@ from zhenxun.services.ai.tools.core.tool import BaseTool
 from zhenxun.services.ai.tools.core.toolkit import BaseToolkit
 from zhenxun.services.ai.tools.models import ToolkitConfig, ToolResult
 from zhenxun.services.ai.utils.logger import log_tool as logger
+from zhenxun.services.network_proxy import ManagedAsyncClient
 from zhenxun.utils.lifespan import LifespanManager
 from zhenxun.utils.pydantic_compat import model_dump
 
@@ -447,7 +447,7 @@ class MCPToolkit(BaseToolkit):
                             if not self.url:
                                 raise ValueError("streamable-http requires 'url'")
 
-                            http_client = httpx.AsyncClient(
+                            http_client = ManagedAsyncClient(
                                 headers=dynamic_headers, timeout=self.timeout
                             )
                             await stack.enter_async_context(http_client)

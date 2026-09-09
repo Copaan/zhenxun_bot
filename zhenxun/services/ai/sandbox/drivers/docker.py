@@ -421,7 +421,11 @@ class DockerSandboxClient(BaseSandboxClient):
         eff_cname = bp.container_name
 
         proxy_envs = []
-        if BotConfig.system_proxy:
+        if BotConfig.system_proxy and BotConfig.network_proxy_mode in {
+            None,
+            "",
+            "legacy",
+        }:
             sandbox_proxy = BotConfig.system_proxy.replace(
                 "127.0.0.1", "host.docker.internal"
             ).replace("localhost", "host.docker.internal")

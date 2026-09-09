@@ -36,7 +36,11 @@ def main() -> None:
     try:
         result = inspect(path, sys.argv[2])
     except ArchiveError as error:
-        result = {"error": error.code, "status": error.status}
+        result = {
+            "error": error.code,
+            "status": error.status,
+            "candidates": error.candidates,
+        }
     except Exception:
         result = {"error": "archive_inspection_failed", "status": 400}
     (path / "inspection.json").write_text(json.dumps(result), encoding="utf-8")

@@ -146,7 +146,17 @@ class StartupCoordinator:
 
     @property
     def runtime_ready(self) -> bool:
-        return self.state in {"runtime_ready", "warmup_ready", "degraded"}
+        return self._business_allowed() and self.state in {
+            "runtime_ready",
+            "warmup_ready",
+            "degraded",
+        }
+
+    @staticmethod
+    def _business_allowed() -> bool:
+        from zhenxun.migration.validation import validation_gate
+
+        return validation_gate.business_allowed
 
     def begin_stage(self, stage: StartupStage) -> None:
         with self._lock:
@@ -590,7 +600,9 @@ class StartupCoordinator:
                 "persistence": self.persistence_status(),
                 "server_bound": self._server_bound,
                 "operating_mode": (
-                    "management_only"
+                    "migration_validation"
+                    if not self._business_allowed()
+                    else "management_only"
                     if self._state == "failed"
                     else "setup_only"
                     if self._setup_required

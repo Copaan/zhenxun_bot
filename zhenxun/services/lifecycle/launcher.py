@@ -55,6 +55,7 @@ class ProcessHandle:
     identities: dict[int, float] = field(default_factory=dict)
     stop_stages: list[dict[str, Any]] = field(default_factory=list)
     readiness: str = "spawned"
+    completion_expected: bool = False
     _next_tree_discovery: float = 0.0
     _tree_scan_count: int = 0
 
@@ -232,8 +233,12 @@ class ProcessHandle:
         raise RuntimeError("process_tree_recovery_required")
 
     def health(self) -> dict[str, object]:
+        live = bool(self._live_processes())
+        # A finite child can exit during the process-tree scan.
+        completed = self.completion_expected and self.process.poll() == 0
         return {
-            "healthy": bool(self._live_processes()),
+            "healthy": live or completed,
+            "completed": completed,
             "spawn_pid": self.spawn_pid,
             "runtime_pid": self.runtime_pid,
             "return_code": self.process.poll(),
@@ -423,7 +428,13 @@ class LauncherSupervisor:
                 handle.shutdown_id = self.shutdown_id
 
     async def start_process(
-        self, role: str, factory, *, ready=None, startup_id: str | None = None
+        self,
+        role: str,
+        factory,
+        *,
+        ready=None,
+        startup_id: str | None = None,
+        completion_expected: bool = False,
     ) -> subprocess.Popen:
         if self.shutdown_deadline is not None:
             raise OSError("launcher_startup_interrupted")
@@ -445,6 +456,7 @@ class LauncherSupervisor:
                 raise OSError("launcher_startup_interrupted")
             process = factory()
             handle = ProcessHandle(role, process, self.boot_id)
+            handle.completion_expected = completion_expected
             if startup_id:
                 handle.startup_id = startup_id
             self._handles[process.pid] = handle

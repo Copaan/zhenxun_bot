@@ -190,7 +190,7 @@ def list_model_identifiers() -> dict[str, list[str]]:
 def get_default_model(task: str = "chat") -> str | None:
     """根据任务类型获取默认模型名称"""
     config = get_llm_config()
-    return getattr(config.default_models, task, None)
+    return getattr(config.default_models, task, None) or None
 
 
 async def resolve_model_capabilities(
@@ -201,10 +201,9 @@ async def resolve_model_capabilities(
     if resolved_name is None:
         resolved_name = get_default_model(task)
         if resolved_name is None:
-            avail = list_available_models()
-            if not avail:
-                return get_model_capabilities("unknown")
-            resolved_name = avail[0]["full_name"]
+            raise ConfigurationException(
+                f"尚未配置 {task} 默认模型，请选择模型后再调用。"
+            )
 
     group_name = _get_group_name(resolved_name)
     if group_name is not None:
@@ -298,11 +297,9 @@ async def get_model_instance(
     if resolved_model_name_str is None:
         resolved_model_name_str = get_default_model(task)
         if resolved_model_name_str is None:
-            available_models_list = list_available_models()
-            if not available_models_list:
-                raise ConfigurationException("未配置任何AI模型")
-            resolved_model_name_str = available_models_list[0]["full_name"]
-            logger.warning(f"未指定模型，使用第一个可用模型: {resolved_model_name_str}")
+            raise ConfigurationException(
+                f"尚未配置 {task} 默认模型，请选择模型后再调用。"
+            )
 
     prov_name_str, mod_name_str = parse_provider_model_string(resolved_model_name_str)
     if not prov_name_str or not mod_name_str:

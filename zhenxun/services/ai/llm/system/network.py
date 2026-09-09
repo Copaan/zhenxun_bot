@@ -14,7 +14,6 @@ from typing import Any
 import aiofiles
 import httpx
 
-from zhenxun.configs.config import BotConfig
 from zhenxun.configs.path_config import DATA_PATH
 from zhenxun.services.ai.config import ProviderConfig
 from zhenxun.services.ai.core.exceptions import (
@@ -25,6 +24,7 @@ from zhenxun.services.ai.core.exceptions import (
     RateLimitException,
 )
 from zhenxun.services.ai.utils.logger import log_llm as logger
+from zhenxun.services.network_proxy import ManagedAsyncClient
 from zhenxun.utils.pydantic_compat import model_dump, parse_as
 from zhenxun.utils.user_agent import get_user_agent
 
@@ -65,35 +65,11 @@ class LLMHttpClient:
                     )
                     timeout = httpx.Timeout(self.config.timeout)
 
-                    client_kwargs = {}
-                    if BotConfig.system_proxy:
-                        try:
-                            version_parts = httpx.__version__.split(".")
-                            major = int(
-                                "".join(c for c in version_parts[0] if c.isdigit())
-                            )
-                            minor = (
-                                int("".join(c for c in version_parts[1] if c.isdigit()))
-                                if len(version_parts) > 1
-                                else 0
-                            )
-                            if (major, minor) >= (0, 28):
-                                client_kwargs["proxy"] = BotConfig.system_proxy
-                            else:
-                                client_kwargs["proxies"] = BotConfig.system_proxy
-                        except (ValueError, IndexError):
-                            client_kwargs["proxies"] = BotConfig.system_proxy
-                            logger.warning(
-                                f"无法解析 httpx version '{httpx.__version__}'，"
-                                "LLM模块将默认使用旧版 'proxies' 参数语法。"
-                            )
-
-                    self._client = httpx.AsyncClient(
+                    self._client = ManagedAsyncClient(
                         headers=headers,
                         limits=limits,
                         timeout=timeout,
                         follow_redirects=True,
-                        **client_kwargs,
                     )
         if self._client is None:
             raise ConfigurationException(
@@ -103,6 +79,9 @@ class LLMHttpClient:
 
     async def request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
         """发送异步 HTTP 请求"""
+        from zhenxun.services.ai.chat_switch import require_chat_enabled
+
+        require_chat_enabled()
         client = await self._ensure_client_initialized()
         async with self._lock:
             self._active_requests += 1

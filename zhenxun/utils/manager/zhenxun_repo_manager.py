@@ -3,24 +3,33 @@
 负责真寻主仓库的更新、版本检查、文件处理等功能
 """
 
+import asyncio
 import os
 from pathlib import Path
 import shutil
 from typing import ClassVar, Literal
+from uuid import uuid4
 import zipfile
 
 import aiofiles
 
 from zhenxun.configs.path_config import DATA_PATH, TEMP_PATH
 from zhenxun.services.log import logger
+from zhenxun.services.network_proxy import core_network_operation
+from zhenxun.services.resource_install import (
+    ResourceTransaction,
+    extract_resources_zip,
+    resources_ready,
+)
 from zhenxun.utils.github_utils import GithubUtils
 from zhenxun.utils.http_utils import AsyncHttpx
 from zhenxun.utils.manager.virtual_env_package_manager import VirtualEnvPackageManager
 from zhenxun.utils.repo_utils import AliyunRepoManager, GithubRepoManager
-from zhenxun.utils.repo_utils.models import RepoUpdateResult
-from zhenxun.utils.repo_utils.utils import check_git
+from zhenxun.utils.repo_utils.models import RepoType, RepoUpdateResult
+from zhenxun.utils.repo_utils.utils import check_git, redact_git_output
 
 LOG_COMMAND = "ZhenxunRepoManager"
+_RESOURCE_UPDATE_LOCK = asyncio.Lock()
 
 
 class ZhenxunUpdateException(Exception):
@@ -347,134 +356,136 @@ class ZhenxunRepoManagerClass:
     # ==================== 资源管理相关方法 ====================
 
     def check_resources_exists(self) -> bool:
-        """检查资源文件是否存在
+        return resources_ready(self.config.RESOURCE_PATH, Path("resources.spec"))
 
-        返回:
-            bool: 是否存在
-        """
-        if self.config.RESOURCE_PATH.exists():
-            font_path = self.config.RESOURCE_PATH / "font"
-            if font_path.exists() and os.listdir(font_path):
-                return True
-        return False
-
-    async def resources_download_zip(self):
-        """下载资源文件"""
+    async def resources_download_zip(self, destination: Path | None = None):
         download_url = await GithubUtils.parse_github_url(
             self.config.RESOURCE_GITHUB_URL
         ).get_archive_download_urls()
-        logger.info("开始下载资源压缩包...", LOG_COMMAND)
-        if await AsyncHttpx.download_file(
-            download_url,
-            self.config.RESOURCE_ZIP_FILE,
-            stream=True,
-            show_progress=True,
+        destination = destination or self.config.RESOURCE_ZIP_FILE
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if not await AsyncHttpx.download_file(
+            download_url, destination, stream=True, show_progress=True
         ):
-            logger.info("下载资源压缩包成功!", LOG_COMMAND)
-        else:
-            raise ZhenxunUpdateException("下载资源压缩包失败...")
+            raise ZhenxunUpdateException("下载资源压缩包失败")
 
-    async def resources_unzip(self):
-        """解压资源文件"""
-        if not self.config.RESOURCE_ZIP_FILE.exists():
-            raise FileNotFoundError("资源文件压缩包不存在")
-        if self.config.RESOURCE_UNZIP_PATH.exists():
-            shutil.rmtree(self.config.RESOURCE_UNZIP_PATH)
-        tf = None
-        try:
-            tf = zipfile.ZipFile(self.config.RESOURCE_ZIP_FILE)
-            tf.extractall(self.config.RESOURCE_UNZIP_PATH)
-            logger.debug("解压文件压缩包完成...", LOG_COMMAND)
-            unzip_dir = next(self.config.RESOURCE_UNZIP_PATH.iterdir())
-            self.__copy_files(unzip_dir, self.config.RESOURCE_PATH, True)
-            logger.debug("复制资源文件完成!", LOG_COMMAND)
-            shutil.rmtree(self.config.RESOURCE_UNZIP_PATH, ignore_errors=True)
-        except Exception as e:
-            logger.error("解压资源文件失败...", LOG_COMMAND, e=e)
-            raise
-        finally:
-            if tf:
-                tf.close()
+    def _apply_resource_candidate(self, staged: Path, work: Path, force: bool):
+        target = self.config.RESOURCE_PATH
+        repair = not self.check_resources_exists() and not force
+        transaction = ResourceTransaction(
+            staged,
+            target,
+            work / "transaction",
+            fill_only=repair,
+            spec=Path("resources.spec"),
+            protect_modified=not force,
+        )
+        changed = transaction.apply()
+        transaction.commit()
+        return changed, transaction.version, repair
 
-    async def resources_zip_update(self):
-        """使用zip更新资源文件"""
-        await self.resources_download_zip()
-        await self.resources_unzip()
+    async def resources_unzip(self, force: bool = False):
+        async with _RESOURCE_UPDATE_LOCK:
+            work = self.config.RESOURCE_ZIP_FILE.parent / ("resource-" + uuid4().hex)
+            work.mkdir(parents=True)
+            staged = await asyncio.to_thread(
+                extract_resources_zip, self.config.RESOURCE_ZIP_FILE, work / "source"
+            )
+            return await asyncio.to_thread(
+                self._apply_resource_candidate, staged, work, force
+            )
+
+    async def resources_zip_update(self, force: bool = False) -> RepoUpdateResult:
+        return await self._resources_install(None, "main", force)
 
     async def resources_git_update(
         self, source: Literal["git", "ali"], branch: str = "main", force: bool = False
     ) -> RepoUpdateResult:
-        """使用git或阿里云更新资源文件
+        return await self._resources_install(source, branch, force)
 
-        参数:
-            source: 更新源，git 为 git 更新，ali 为阿里云更新
-            branch: 分支名称
-            force: 是否强制更新
-        """
-        if source == "git":
-            return await GithubRepoManager.update_via_git(
-                self.config.RESOURCE_GIT,
-                self.config.RESOURCE_PATH,
-                branch=branch,
-                force=force,
+    @core_network_operation
+    async def _resources_install(
+        self,
+        source: Literal["git", "ali"] | None,
+        branch: str,
+        force: bool,
+        *,
+        fallback: bool = False,
+    ) -> RepoUpdateResult:
+        async with _RESOURCE_UPDATE_LOCK:
+            result = RepoUpdateResult(
+                repo_type=RepoType.ALIYUN if source == "ali" else RepoType.GITHUB,
+                repo_name="zhenxun-bot-resources",
+                owner="zhenxun-org",
+                old_version="",
+                new_version="",
             )
-        else:
-            return await AliyunRepoManager.update_via_git(
-                self.config.RESOURCE_GIT,
-                self.config.RESOURCE_PATH,
-                branch=branch,
-                force=force,
-            )
+            work = self.config.RESOURCE_ZIP_FILE.parent / ("resource-" + uuid4().hex)
+            work.mkdir(parents=True)
+            try:
+                if source is not None:
+                    manager = (
+                        GithubRepoManager if source == "git" else AliyunRepoManager
+                    )
+                    result = await manager.update_via_git(
+                        self.config.RESOURCE_GIT,
+                        work / "git",
+                        branch=branch,
+                    )
+                    if not result.success and not fallback:
+                        return result
+                    staged = work / "git"
+                if source is None or not result.success:
+                    await self.resources_download_zip(work / "resources.zip")
+                    staged = await asyncio.to_thread(
+                        extract_resources_zip, work / "resources.zip", work / "zip"
+                    )
+                result.success = False
+                changed, version, repair = await asyncio.to_thread(
+                    self._apply_resource_candidate, staged, work, force
+                )
+                result.changed_files = changed
+                result.new_version = version
+                result.success = True
+                result.error_message = ""
+                mode = "补齐缺失资源" if repair else "更新资源"
+                logger.info(
+                    f"{mode}完成，实际写入 {len(changed)} 个文件，资源校验通过。",
+                    LOG_COMMAND,
+                )
+                for path in (
+                    work / "git",
+                    work / "zip",
+                    work / "resources.zip",
+                    work / "transaction" / "candidate",
+                ):
+                    try:
+                        if path.is_dir():
+                            shutil.rmtree(path)
+                        elif path.exists():
+                            path.unlink()
+                    except OSError:
+                        logger.warning(
+                            f"资源已安装，暂存清理未完成: {path}", LOG_COMMAND
+                        )
+            except Exception as error:
+                result.success = False
+                result.error_message = redact_git_output(error)
+                logger.error(
+                    f"资源安装失败: {result.error_message}；诊断与撤销记录: {work}",
+                    LOG_COMMAND,
+                )
+            return result
 
     async def resources_update(
         self,
         source: Literal["git", "ali"] = "ali",
         branch: str = "main",
         force: bool = False,
-    ) -> RepoUpdateResult | None:
-        """更新资源文件
-
-        参数:
-            source: 更新源，git 为 git 更新，ali 为阿里云更新
-            branch: 分支名称
-            force: 是否强制更新
-
-        返回:
-            RepoUpdateResult | None: git 更新时返回结果，zip 更新时返回 None
-        """
-        critical_dir = self.config.RESOURCE_PATH / "themes" / "default"
-        if not critical_dir.exists() or not any(critical_dir.iterdir()):
-            logger.warning(
-                f"检测到关键资源目录 {critical_dir} 缺失或为空，将开启强制修复模式。",
-                LOG_COMMAND,
-            )
-            force = True
-
-        if await check_git():
-            result = await self.resources_git_update(source, branch, force)
-            if result.success:
-                logger.info("使用git更新资源文件完成!", LOG_COMMAND)
-                return result
-            else:
-                logger.warning(
-                    f"使用git更新资源文件失败: {result.error_message}，"
-                    "尝试回退到zip下载...",
-                    LOG_COMMAND,
-                )
-                # git 失败时回退 zip，确保资源文件一定能获取到
-                try:
-                    await self.resources_zip_update()
-                    logger.info("回退zip下载资源文件完成!", LOG_COMMAND)
-                    result.success = True
-                    result.error_message = ""
-                    return result
-                except Exception as e:
-                    logger.error("回退zip下载资源文件也失败", LOG_COMMAND, e=e)
-                    return result
-        else:
-            await self.resources_zip_update()
-            logger.info("使用zip更新资源文件完成!", LOG_COMMAND)
-            return None
+    ) -> RepoUpdateResult:
+        return await self._resources_install(
+            source if await check_git() else None, branch, force, fallback=True
+        )
 
     # ==================== Web UI 管理相关方法 ====================
 

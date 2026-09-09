@@ -36,6 +36,12 @@ default_menus = [
     ),
     MenuItem(name="AI 配置", module="ai", router="/ai", icon="magic"),
     MenuItem(
+        name="网络代理",
+        module="network-proxy",
+        router="/network-proxy",
+        icon="protocol",
+    ),
+    MenuItem(
         name="数据与缓存",
         module="database",
         router="/database",

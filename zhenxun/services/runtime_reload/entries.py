@@ -101,7 +101,12 @@ class ManagedDependent(Dependent):
                 self.manager._connection_tasks.discard(task)
 
     async def _invoke(self, **kwargs):
-        with self.manager._entry_admission(self.owner, self.incarnation) as admitted:
+        with self.manager._entry_admission(
+            self.owner,
+            self.incarnation,
+            business=self.kind
+            not in {"on_startup", "on_ready", "on_shutdown", "on_bot_disconnect"},
+        ) as admitted:
             if not admitted:
                 return None
             stack = kwargs.get("stack")

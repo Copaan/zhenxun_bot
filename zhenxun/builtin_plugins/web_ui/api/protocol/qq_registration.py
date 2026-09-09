@@ -36,6 +36,7 @@ from ...apply_result import (
 )
 from ...base_model import Result
 from ...restart_service import restart_status_data
+from ...security import decode_access_token_status
 from ...utils import authentication
 from ..configure.persistence import _write_transaction
 from .configuration import (
@@ -69,6 +70,8 @@ class _RegistrationSession:
     next_poll_at: float = 0.0
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     completed: dict[str, Any] | None = None
+    cancelled: bool = False
+    saving: bool = False
 
 
 class _RegistrationStore:
@@ -130,11 +133,25 @@ class _RegistrationStore:
             self._sessions.move_to_end(registration_id)
             return session
 
-    async def delete(self, registration_id: str, owner: str) -> None:
+    async def delete(self, registration_id: str, owner: str) -> dict[str, Any] | None:
         async with self._lock:
             session = self._sessions.get(registration_id)
-            if session is not None and secrets.compare_digest(session.owner, owner):
-                self._sessions.pop(registration_id, None)
+            if session is None or not secrets.compare_digest(session.owner, owner):
+                return None
+            if not session.saving:
+                session.cancelled = True
+        # A save that has already started owns the outcome. Do not tell the
+        # browser it was cancelled while a configuration transaction is pending.
+        async with session.lock:
+            if session.completed is not None:
+                return session.completed
+            session.cancelled = True
+            session.key = b""
+            session.task_id = ""
+            async with self._lock:
+                if self._sessions.get(registration_id) is session:
+                    self._sessions.pop(registration_id, None)
+        return None
 
 
 _sessions = _RegistrationStore()
@@ -154,10 +171,22 @@ def _registration_error(
 
 
 def _owner(request: Request) -> str:
-    authorization = request.headers.get("authorization", "")
-    client_host = request.client.host if request.client else "unknown"
-    material = f"{client_host}\0{authorization}".encode("utf-8", "replace")
+    claims, _ = decode_access_token_status(request.headers.get("authorization", ""))
+    if not claims or not claims.get("sub") or not claims.get("sid"):
+        raise _registration_error(
+            401, "registration_session_required", "登录会话已失效，请重新登录后扫码。"
+        )
+    material = f"{claims['sub']}\0{claims['sid']}".encode()
     return hashlib.sha256(material).hexdigest()
+
+
+def _require_pending(session: _RegistrationSession) -> None:
+    if session.cancelled:
+        raise _registration_error(410, "registration_cancelled", "扫码会话已取消。")
+    if session.expires_at <= time.monotonic():
+        raise _registration_error(
+            410, "registration_expired", "二维码已过期，请重新生成。"
+        )
 
 
 def _response_data(response: httpx.Response) -> dict[str, Any]:
@@ -329,6 +358,7 @@ async def poll_qq_registration(registration_id: str, request: Request) -> Result
     async with session.lock:
         if session.completed is not None:
             return Result.ok(session.completed)
+        _require_pending(session)
         now = time.monotonic()
         if now < session.next_poll_at:
             return Result.ok(
@@ -350,6 +380,7 @@ async def poll_qq_registration(registration_id: str, request: Request) -> Result
                 502, "registration_poll_failed", "扫码状态查询失败，请稍后重试。"
             ) from exc
 
+        _require_pending(session)
         if status == 3:
             session.expires_at = 0
             return Result.ok({"status": "expired"})
@@ -365,9 +396,14 @@ async def poll_qq_registration(registration_id: str, request: Request) -> Result
         try:
             secret = _decrypt_secret(encrypted_secret, session.key)
             identity = await _probe_credential(app_id, secret)
+            _require_pending(session)
+            session.saving = True
             saved = await _save_websocket_bot(app_id, secret)
         except HTTPException as exc:
+            session.saving = False
             public_detail = exc.detail if isinstance(exc.detail, dict) else {}
+            if str(public_detail.get("code", "")).startswith("registration_"):
+                raise
             logger.warning(
                 "QQ Bot扫码凭据验证失败 "
                 f"code={public_detail.get('code', 'credential_invalid')} "
@@ -386,6 +422,7 @@ async def poll_qq_registration(registration_id: str, request: Request) -> Result
                 retryable=bool(public_detail.get("retryable", False)),
             ) from exc
         except Exception as exc:
+            session.saving = False
             logger.warning(
                 f"QQ Bot扫码配置保存失败 result={exc.__class__.__name__}",
                 "QQOfficialRegistration",
@@ -418,6 +455,7 @@ async def poll_qq_registration(registration_id: str, request: Request) -> Result
             updated_existing=saved["updated_existing"],
         )
         session.completed = result
+        session.saving = False
         session.key = b""
         session.task_id = ""
         logger.info("QQ Bot扫码绑定完成并已保存", "QQOfficialRegistration")
@@ -431,8 +469,10 @@ async def poll_qq_registration(registration_id: str, request: Request) -> Result
     response_class=JSONResponse,
 )
 async def cancel_qq_registration(registration_id: str, request: Request) -> Result:
-    await _sessions.delete(registration_id, _owner(request))
-    return Result.ok(info="扫码会话已取消。")
+    completed = await _sessions.delete(registration_id, _owner(request))
+    if completed is not None:
+        return Result.ok(completed, info="机器人配置已保存。")
+    return Result.ok({"status": "cancelled"}, info="扫码会话已取消。")
 
 
 __all__ = ["router"]

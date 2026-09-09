@@ -13,8 +13,15 @@ from zhenxun.utils.atomic_json import read_json_locked, write_json_locked
 
 
 def execute(action: str) -> None:
+    from zhenxun.migration.lease import validate_delegation
+
     if os.getenv("ZHENXUN_MAINTENANCE_CHILD") != "1":
         raise RuntimeError("maintenance_requires_launcher")
+    launcher = os.environ.get("ZHENXUN_LAUNCHER_PID", "")
+    identity = os.environ.get("ZHENXUN_INSTANCE_LEASE_ID")
+    if not launcher.isdecimal() or not identity:
+        raise RuntimeError("maintenance_requires_launcher_identity")
+    validate_delegation(Path.cwd(), int(launcher), identity=identity)
 
     interruption_requested = False
 
@@ -72,6 +79,7 @@ async def run(action: str) -> bool:
             env={
                 **os.environ,
                 "ZHENXUN_MAINTENANCE_CHILD": "1",
+                "ZHENXUN_LAUNCHER_PID": str(os.getpid()),
                 "ZHENXUN_MAINTENANCE_STARTUP_ID": startup_id,
                 "ZHENXUN_MAINTENANCE_RESULT_PATH": str(path),
             },

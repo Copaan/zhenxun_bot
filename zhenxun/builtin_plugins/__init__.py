@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime
 from pathlib import Path
 import uuid
@@ -107,7 +108,7 @@ async def _prepare_resources():
         version_file = resource_path / "__version__"
 
         if (
-            not ZhenxunRepoManager.check_resources_exists()
+            not await asyncio.to_thread(ZhenxunRepoManager.check_resources_exists)
             or not default_theme_path.exists()
             or not version_file.exists()
         ):

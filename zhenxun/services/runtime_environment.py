@@ -17,6 +17,7 @@ from nonebot.config import Config as NoneBotConfig
 
 from zhenxun.configs.config import BotConfig, BotSetting
 from zhenxun.services.log import logger
+from zhenxun.services.network_proxy import PROXY_KEYS, proxy_runtime
 from zhenxun.services.runtime_reload.models import ApplyMode
 from zhenxun.utils._restart_utils import (
     clear_restart_pending,
@@ -36,7 +37,8 @@ DIRECT_KEYS = {
     "SESSION_EXPIRE_TIMEOUT",
     "SUPERUSERS",
 }
-COMPONENT_KEYS = {"RUNTIME_WATCH_MODE", "SYSTEM_PROXY"}
+DIRECT_KEYS |= PROXY_KEYS
+COMPONENT_KEYS = {"RUNTIME_WATCH_MODE"}
 COMMAND_KEYS = {"COMMAND_START", "COMMAND_SEP", "ALCONNA_USE_COMMAND_START"}
 CACHE_KEYS = {
     "CACHE_MODE",
@@ -94,6 +96,10 @@ _BOT_ATTRS = {
     "PLATFORM_SUPERUSERS": "platform_superusers",
     "SELF_NICKNAME": "self_nickname",
     "SYSTEM_PROXY": "system_proxy",
+    "NETWORK_PROXY_MODE": "network_proxy_mode",
+    "NETWORK_PROXY_PLUGINS": "network_proxy_plugins",
+    "NETWORK_PROXY_CORE_ENABLED": "network_proxy_core_enabled",
+    "NETWORK_PROXY_BYPASS": "network_proxy_bypass",
     "RUNTIME_WATCH_MODE": "runtime_watch_mode",
 }
 _CACHE_ATTRS = {
@@ -156,7 +162,7 @@ def is_known_env_key(key: str) -> bool:
 
 def is_sensitive_env_key(key: str) -> bool:
     normalized = key.upper()
-    return any(
+    return normalized == "SYSTEM_PROXY" or any(
         marker in normalized
         for marker in ("TOKEN", "SECRET", "PASSWORD", "COOKIE", "API_KEY", "APIKEY")
     )
@@ -323,10 +329,6 @@ class RuntimeEnvironmentManager:
             from zhenxun.services.log import reload_log_level
 
             reload_log_level(getattr(driver_config, "log_level", "INFO"))
-        if rebuild_components and "SYSTEM_PROXY" in keys:
-            from zhenxun.utils.http_utils import reload_system_proxy
-
-            await reload_system_proxy(BotConfig.system_proxy)
         if rebuild_components and keys & CACHE_KEYS:
             await self._reconfigure_cache(values)
 
@@ -377,6 +379,7 @@ class RuntimeEnvironmentManager:
                 key
                 for key in (hot_candidates | self.pending_keys)
                 if key in DIRECT_KEYS | COMPONENT_KEYS | COMMAND_KEYS
+                and key not in PROXY_KEYS
             }
             _, unsafe_consumers = plugin_runtime_manager.environment_consumers(
                 pending_consumer_keys
@@ -461,7 +464,7 @@ class RuntimeEnvironmentManager:
                             ext_operation.reason or "ext_path_apply_failed"
                         )
 
-                reload_keys = hot_candidates - CACHE_KEYS - EXT_PATH_KEYS
+                reload_keys = hot_candidates - CACHE_KEYS - EXT_PATH_KEYS - PROXY_KEYS
                 if reload_keys:
                     hot_operation = await plugin_runtime_manager.reload_env_consumers(
                         reload_keys, submit_restart=False
@@ -470,6 +473,8 @@ class RuntimeEnvironmentManager:
                         raise RuntimeEnvironmentError(
                             hot_operation.reason or "env_consumer_reload_failed"
                         )
+                if hot_candidates & PROXY_KEYS:
+                    await proxy_runtime.apply(after)
                 for key in hot_candidates - pending_keys:
                     self.effective_values[key] = after.get(key)
             except Exception:

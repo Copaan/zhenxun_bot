@@ -4,6 +4,7 @@
     zx run          启动 launcher
     zx run-worker   启动 worker（由 launcher 调用）
     zx version      显示版本信息
+    zx migration    实例迁移导出、包核验及任务状态
 
 进程环境变量:
     ZHENXUN_STARTUP_BANNER=0  禁用启动图案
@@ -184,6 +185,10 @@ def _ensure_project_root() -> Path:
     return cwd
 
 
+class _WorkerReexec(Exception):
+    pass
+
+
 def _run_worker() -> None:
     """启动 Bot worker（必须在项目目录下执行）"""
     worker_started = time.monotonic()
@@ -193,12 +198,18 @@ def _run_worker() -> None:
     if not os.environ.get("ZHENXUN_LAUNCHER_PID") and apply_pending_update(
         project_root
     ):
-        os.execv(sys.executable, [sys.executable, "-m", "zhenxun.cli", "run-worker"])
+        raise _WorkerReexec
     _sync_env_missing_items(project_root)
 
+    from zhenxun.migration.validation import validation_gate
     from zhenxun.nonebot_store.runtime import activate_current_generation
 
-    activate_current_generation()
+    if validation_gate.task_id:
+        from zhenxun.migration.generation import activate_candidate
+
+        activate_candidate(project_root, validation_gate.task_id)
+    else:
+        activate_current_generation()
 
     import contextlib
     import platform
@@ -248,6 +259,9 @@ def _run_worker() -> None:
     from zhenxun.configs.config import BotConfig
 
     driver = nonebot.get_driver()
+    from zhenxun.migration.validation_worker import install as install_validation
+
+    install_validation(driver)
     driver.register_adapter(OneBotV11Adapter)
     from zhenxun.services.onebot_endpoint import OneBotHandshakeDiagnostics
 
@@ -365,6 +379,9 @@ def _run_worker() -> None:
             ", ".join(item["store_key"] for item in managed_status["failed"]),
         )
 
+    from zhenxun.migration.validation_worker import register as register_validation
+
+    register_validation(driver)
     startup_load_planner.instrument_prebind_hooks(driver)
 
     from zhenxun.configs.webui_tls import (
@@ -1228,6 +1245,24 @@ async def _run_launcher_async() -> None:
     from zhenxun.services.lifecycle.launcher import launcher_supervisor
 
     await launcher_supervisor.run_recovery(lambda: None)
+    from zhenxun.migration.launcher import install_launcher_migration
+    from zhenxun.migration.lease import current_instance_lease
+
+    migration_service = await install_launcher_migration(
+        current_instance_lease(), launcher_supervisor
+    )
+    if migration_service is not None:
+        try:
+            await migration_service.recover_with_management()
+        except Exception as error:
+            if getattr(error, "code", None) == "migration_launcher_stopping":
+                raise SystemExit(
+                    128 + int(launcher_supervisor.shutdown_signal or signal.SIGINT)
+                ) from None
+            raise
+    from zhenxun.migration.lease import require_resolved_restore
+
+    require_resolved_restore(cwd)
     pending_bot_verification = applied_update_pending()
     if pending_job():
         pending_bot_verification = (
@@ -1262,7 +1297,12 @@ async def _run_launcher_async() -> None:
     http_sidecar_retry_index = 0
     next_http_sidecar_retry = 0.0
     stop_requested = False
+    launcher_stop_event = asyncio.Event()
     stop_signal: int | None = None
+    migration_export = None
+    migration_adopted_worker = (
+        migration_service.recovered_worker if migration_service else None
+    )
 
     def _handle_launcher_signal(signum, _frame) -> None:
         nonlocal stop_requested, stop_signal
@@ -1272,6 +1312,7 @@ async def _run_launcher_async() -> None:
 
         launcher_supervisor.begin_shutdown(signal_number=signum)
         stop_requested = True
+        launcher_stop_event.set()
         stop_signal = int(signum)
         _launcher_log(f"received signal {signum}, scheduling worker shutdown")
 
@@ -1461,20 +1502,27 @@ async def _run_launcher_async() -> None:
         worker_env["ZHENXUN_LAUNCHER_BOOT_ID"] = launcher_boot_id
         worker_startup_id = uuid.uuid4().hex
         worker_env["ZHENXUN_WORKER_STARTUP_ID"] = worker_startup_id
+        if migration_export is not None:
+            worker_env.update(migration_export.resume_environment(worker_startup_id))
         if stop_requested:
             raise SystemExit(128 + int(stop_signal or signal.SIGINT))
-        worker = await _spawn_launcher_process(
-            "worker",
-            partial(
-                subprocess.Popen,
-                _build_worker_command(),
-                cwd=str(cwd),
-                creationflags=_get_worker_creationflags(),
-                env=worker_env,
-            ),
-            startup_id=worker_startup_id,
-        )
-        _record_launcher_process_start("worker", worker)
+        if migration_adopted_worker is not None:
+            worker, migration_adopted_worker = migration_adopted_worker, None
+            if worker.poll() is not None:
+                raise RuntimeError("migration promoted worker exited before adoption")
+        else:
+            worker = await _spawn_launcher_process(
+                "worker",
+                partial(
+                    subprocess.Popen,
+                    _build_worker_command(),
+                    cwd=str(cwd),
+                    creationflags=_get_worker_creationflags(),
+                    env=worker_env,
+                ),
+                startup_id=worker_startup_id,
+            )
+            _record_launcher_process_start("worker", worker)
         current_worker = worker
         # Management HTTP does not depend on plugin verification or QQ runtime.
         if webui_tls.http_sidecar_enabled and http_sidecar is None:
@@ -1627,6 +1675,34 @@ async def _run_launcher_async() -> None:
                     f"{qq_settings.config.qq_webhook_listen_host}:"
                     f"{qq_settings.config.qq_webhook_listen_port}"
                 )
+        if migration_export is not None:
+            try:
+                ready = await migration_service._wait(
+                    lambda: _wait_worker_ready_async(
+                        worker,
+                        qq_settings,
+                        scheme=webui_tls.scheme,
+                        require_warmup=True,
+                    ),
+                    migration_export.budget.phase(),
+                )
+                if not ready:
+                    from zhenxun.migration.errors import MigrationError
+
+                    raise MigrationError("migration_original_worker_resume_failed")
+                migration_export.resumed(worker)
+            except BaseException:
+                migration_export.fail(
+                    "migration_original_worker_resume_failed", recovery=True
+                )
+                raise
+        if migration_service is not None:
+            migration_service.bind_export_worker(worker)
+        migration_snapshot = False
+        migration_shutdown = None
+        migration_restore = None
+        migration_preparation = None
+        migration_resume_original = False
         restart_requested = False
         restart_action: tuple[str, list[str]] | None = None
         return_code: int | None = None
@@ -1634,8 +1710,14 @@ async def _run_launcher_async() -> None:
         next_status_check = 0.0
         try:
             while True:
+                if migration_export is not None and migration_export.collect():
+                    migration_export = None
                 return_code = worker.poll()
                 if return_code is not None:
+                    if migration_export is not None:
+                        await migration_export.interrupt(
+                            "migration_resumed_worker_exited"
+                        )
                     break
                 if ingress is not None and ingress.poll() is not None:
                     ingress_code = ingress.returncode
@@ -1682,6 +1764,16 @@ async def _run_launcher_async() -> None:
                         f"HTTPS remains available, retrying in {delay:g}s"
                     )
                 if stop_requested:
+                    if migration_preparation is not None:
+                        migration_service.store.request_cancel(
+                            migration_restore.identity
+                        )
+                        migration_preparation.cancel()
+                        await asyncio.gather(
+                            migration_preparation, return_exceptions=True
+                        )
+                    if migration_export is not None:
+                        await migration_export.interrupt("migration_launcher_stopping")
                     clear_launcher_restart_signal()
                     if ingress is not None:
                         await _terminate_named_process_async(
@@ -1696,7 +1788,136 @@ async def _run_launcher_async() -> None:
                     await _terminate_worker_async(worker)
                     raise SystemExit(128 + int(stop_signal or signal.SIGINT))
                 now = time.monotonic()
-                if now >= next_restart_check:
+                if migration_service is not None and migration_export is None:
+                    if migration_restore is None:
+                        migration_restore = migration_service.take_restore()
+                        if migration_restore is not None:
+                            migration_preparation = asyncio.create_task(
+                                migration_restore.prepare(),
+                                name="migration-restore-prepare",
+                            )
+                    if (
+                        migration_preparation is not None
+                        and migration_preparation.done()
+                    ):
+                        from zhenxun.migration.errors import MigrationError
+
+                        try:
+                            migration_preparation.result()
+                        except BaseException as error:
+                            await migration_restore.fail(
+                                getattr(
+                                    error, "code", "migration_dependency_prepare_failed"
+                                )
+                            )
+                            migration_restore = None
+                            migration_preparation = None
+                        else:
+                            # The same 15 seconds covers every original ingress
+                            # and worker; RestoreTransaction performs its stop.
+                            async def stop_restore_ingress():
+                                nonlocal ingress, ingress_signature
+                                nonlocal http_sidecar, http_sidecar_signature
+                                if ingress is not None:
+                                    await _terminate_named_process_async(
+                                        ingress, "QQ HTTPS ingress"
+                                    )
+                                    ingress = None
+                                    ingress_signature = None
+                                if http_sidecar is not None:
+                                    await _terminate_named_process_async(
+                                        http_sidecar, "WebUI HTTP sidecar"
+                                    )
+                                    http_sidecar = None
+                                    http_sidecar_signature = None
+
+                            try:
+                                migration_adopted_worker = (
+                                    await migration_restore.execute(
+                                        worker=worker,
+                                        network=webui_tls,
+                                        prepared=True,
+                                        stop_ingress=stop_restore_ingress,
+                                    )
+                                )
+                            except MigrationError:
+                                state = migration_service.store.read(
+                                    "jobs", migration_restore.identity
+                                )
+                                if state["stage"] not in {
+                                    "failed",
+                                    "rolled_back",
+                                    "cancelled",
+                                    "needs_preflight",
+                                }:
+                                    # Preserve the authenticated maintenance listener
+                                    # and do not boot a partially recovered instance.
+                                    wait = migration_service.wait_for_reauthorization
+                                    recover = migration_service.recover_before_startup
+                                    while await wait(launcher_stop_event):
+                                        try:
+                                            await recover()
+                                        except MigrationError as error:
+                                            migration_service.recovery_failed(
+                                                migration_restore.identity, error
+                                            )
+                                            continue
+                                        if migration_service.store.active() is None:
+                                            break
+                                    if stop_requested:
+                                        raise SystemExit(
+                                            128 + int(stop_signal or signal.SIGINT)
+                                        )
+                                if migration_restore.maintenance is not None:
+                                    await migration_restore.maintenance.close()
+                                migration_resume_original = migration_restore.stopped
+                                if not migration_resume_original:
+                                    migration_restore = None
+                                    migration_preparation = None
+                                    continue
+                            if migration_adopted_worker is not None:
+                                migration_service._validation = None
+                                migration_restore.validation.private.clear()
+                            return_code = worker.poll()
+                            break
+                if migration_service is not None and migration_export is None:
+                    migration_export = migration_service.take_export()
+                    if migration_export is not None:
+                        if not migration_export.begin():
+                            migration_export = None
+                        else:
+                            from zhenxun.migration.launcher import (
+                                stop_worker_for_snapshot,
+                            )
+                            from zhenxun.services.lifecycle.deadline import (
+                                shutdown_budget,
+                            )
+
+                            # One deadline includes ingress, sidecar and worker.
+                            with shutdown_budget(15):
+                                if ingress is not None:
+                                    await _terminate_named_process_async(
+                                        ingress, "QQ HTTPS ingress"
+                                    )
+                                    ingress = None
+                                    ingress_signature = None
+                                if http_sidecar is not None:
+                                    await _terminate_named_process_async(
+                                        http_sidecar, "WebUI HTTP sidecar"
+                                    )
+                                    http_sidecar = None
+                                    http_sidecar_signature = None
+                                migration_shutdown = await stop_worker_for_snapshot(
+                                    worker, launcher_supervisor
+                                )
+                            migration_snapshot = True
+                            return_code = worker.poll()
+                            break
+                if (
+                    migration_export is None
+                    and migration_restore is None
+                    and now >= next_restart_check
+                ):
                     next_restart_check = now + RESTART_POLL_INTERVAL
                     if action := consume_launcher_action():
                         from zhenxun.services.lifecycle.launcher import (
@@ -1775,6 +1996,14 @@ async def _run_launcher_async() -> None:
             await _terminate_worker_async(worker)
             return
         finally:
+            if migration_preparation is not None and not migration_preparation.done():
+                migration_preparation.cancel()
+                await asyncio.gather(migration_preparation, return_exceptions=True)
+            if migration_service is not None:
+                migration_service.bind_export_worker(None)
+            if migration_export is not None and not migration_snapshot:
+                if not migration_export.collect():
+                    await migration_export.interrupt("migration_launcher_interrupted")
             if ingress is not None:
                 await _terminate_named_process_async(ingress, "QQ HTTPS ingress")
                 ingress = None
@@ -1797,6 +2026,13 @@ async def _run_launcher_async() -> None:
             if current_worker is worker:
                 current_worker = None
 
+        if migration_adopted_worker is not None or migration_resume_original:
+            continue
+        if migration_snapshot:
+            await migration_export.snapshot_after_shutdown(
+                migration_shutdown, network=webui_tls
+            )
+            continue
         if restart_requested or (restart_action := consume_launcher_action()):
             if stop_requested:
                 raise SystemExit(128 + int(stop_signal or signal.SIGINT))
@@ -1860,16 +2096,56 @@ def main() -> None:
     args = sys.argv[1:]
 
     if not args or args[0] == "run":
+        from zhenxun.migration.lease import InstanceLease
         from zhenxun.startup_banner import show_startup_banner
 
         show_startup_banner()
-        _run_launcher()
+        with InstanceLease(_ensure_project_root(), role="launcher") as lease:
+            previous = os.environ.get("ZHENXUN_INSTANCE_LEASE_ID")
+            os.environ["ZHENXUN_INSTANCE_LEASE_ID"] = lease.identity
+            try:
+                _run_launcher()
+            finally:
+                if previous is None:
+                    os.environ.pop("ZHENXUN_INSTANCE_LEASE_ID", None)
+                else:
+                    os.environ["ZHENXUN_INSTANCE_LEASE_ID"] = previous
     elif args[0] == "run-worker":
-        if not os.environ.get("ZHENXUN_LAUNCHER_PID"):
+        from zhenxun.migration.errors import MigrationError
+        from zhenxun.migration.lease import (
+            InstanceLease,
+            require_resolved_restore,
+            validate_delegation,
+        )
+
+        project = _ensure_project_root()
+        launcher = os.environ.get("ZHENXUN_LAUNCHER_PID")
+        if launcher:
+            identity = os.environ.get("ZHENXUN_INSTANCE_LEASE_ID")
+            if not launcher.isdecimal() or not identity:
+                raise MigrationError("migration_launcher_identity_mismatch")
+            validate_delegation(project, int(launcher), identity=identity)
+            if validation_id := os.getenv("ZHENXUN_MIGRATION_VALIDATION_ID"):
+                from zhenxun.migration.validation_worker import authorize
+
+                authorize(project, validation_id)
+            else:
+                require_resolved_restore(project)
+            _run_worker()
+        else:
             from zhenxun.startup_banner import show_startup_banner
 
             show_startup_banner(role="worker")
-        _run_worker()
+            try:
+                with InstanceLease(project, role="worker"):
+                    require_resolved_restore(project)
+                    _run_worker()
+            except _WorkerReexec:
+                # Release the old process lease before the Windows exec handoff.
+                # The replacement must acquire it anew before touching runtime.
+                os.execv(
+                    sys.executable, [sys.executable, "-m", "zhenxun.cli", "run-worker"]
+                )
     elif args[0] == "run-ingress":
         _run_ingress(args[1:])
     elif args[0] == "run-http-redirect":
@@ -1880,6 +2156,10 @@ def main() -> None:
         from zhenxun.services.launcher_maintenance import execute
 
         execute(args[1])
+    elif args[0] == "migration":
+        from zhenxun.migration.cli import main as migration_main
+
+        raise SystemExit(migration_main(args[1:], project=Path.cwd()))
     elif args[0] == "version":
         _print_version()
     elif args[0] in ("-h", "--help", "help"):

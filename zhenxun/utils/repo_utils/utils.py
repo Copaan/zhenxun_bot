@@ -59,7 +59,7 @@ def redact_git_output(value: object) -> str:
         )
         return urlunsplit((parsed.scheme, netloc, parsed.path, query, parsed.fragment))
 
-    text = re.sub(r"https?://[^\s'\"<>]+", redact_url, text)
+    text = re.sub(r"(?:https?|socks5h?)://[^\s'\"<>]+", redact_url, text)
     text = re.sub(
         r"(?i)(authorization\s*[:=]\s*)(?:bearer|basic)\s+[^\s,;]+",
         r"\1[redacted]",
@@ -142,6 +142,7 @@ async def run_git_command(
     cwd: Path | None = None,
     timeout_seconds: float | None = None,
     env: Mapping[str, str] | None = None,
+    isolated_env: bool = False,
 ) -> tuple[bool, str, str]:
     """
     运行git命令，实时输出 stderr 进度信息（如 git clone --progress）。
@@ -159,7 +160,7 @@ async def run_git_command(
         args = command.split() if isinstance(command, str) else list(command)
         process_env = None
         if env:
-            process_env = {**os.environ, **env}
+            process_env = dict(env) if isolated_env else {**os.environ, **env}
         process = await asyncio.create_subprocess_exec(
             "git",
             *args,
@@ -344,6 +345,11 @@ async def sparse_checkout_clone(
     authenticated_url = repo_url
     repo_url = canonicalize_git_url(repo_url)
     git_env = git_auth_environment(authenticated_url, repo_url)
+    from zhenxun.services.git_proxy import git_download_environment
+    from zhenxun.services.network_proxy import proxy_runtime
+
+    policy = proxy_runtime.policy_snapshot()
+    git_env, git_route = git_download_environment(policy, repo_url, git_env)
 
     if not await check_git():
         raise GitUnavailableError()
@@ -381,7 +387,8 @@ async def sparse_checkout_clone(
         # 防止一次下载永久占住插件商店任务。
         fetch_error = ""
         for attempt in range(3):
-            fetch_options = {"env": git_env} if git_env else {}
+            fetch_options = {"env": git_env, "isolated_env": True}
+            proxy_runtime.counts[f"git_{git_route}"] += 1
             success, out, err = await run_git_command(
                 [
                     "-c",

@@ -680,13 +680,20 @@ class PluginRuntimeManager:
         Matcher.run = run_with_owner
 
     @contextlib.contextmanager
-    def _entry_admission(self, owner, incarnation_id):
+    def _entry_admission(self, owner, incarnation_id, *, business=True):
         if not owner:
             yield True
             return
         task = asyncio.current_task()
         key = (owner, incarnation_id, task)
         nested = key in self._entry_calls
+        if not nested and business:
+            from zhenxun.services.ai.chat_switch import chat_plugin_enabled
+
+            if not chat_plugin_enabled(owner):
+                self._entry_diagnostics["ai_chat_plugin_disabled"] += 1
+                yield False
+                return
         root = self._root_owner(owner) or owner
         unit = self.units.get(root)
         if not nested and (

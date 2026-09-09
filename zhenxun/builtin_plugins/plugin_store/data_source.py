@@ -15,6 +15,7 @@ from zhenxun.models.plugin_info import PluginInfo
 from zhenxun.plugin_store_coordinator import coordinated_store_operation
 from zhenxun.services.cache.bounded_ttl import BoundedTTLCache
 from zhenxun.services.log import logger
+from zhenxun.services.network_proxy import core_network_operation
 from zhenxun.services.plugin_init import PluginInitManager
 from zhenxun.utils.enum import PluginType
 from zhenxun.utils.image_utils import BuildImage, ImageTemplate, RowStyle
@@ -45,6 +46,7 @@ _PLUGIN_STORE_GENERATION = 0
 @dataclass(frozen=True, slots=True)
 class StoreInstallResult:
     dependency_plan: dict[str, Any] = field(default_factory=dict)
+    download_source: str = "auto"
 
     @property
     def dependency_changes(self) -> bool:
@@ -145,6 +147,7 @@ class StoreManager:
         return BASE_PATH / "plugins" / f"{plugin_name}.py"
 
     @classmethod
+    @core_network_operation
     async def get_data(
         cls, *, refresh: bool = False
     ) -> tuple[list[StorePluginInfo], list[StorePluginInfo]]:
@@ -220,6 +223,7 @@ class StoreManager:
             cls._catalog_health_checked_at = 0.0
 
     @classmethod
+    @core_network_operation
     async def catalog_health(
         cls, plugins: list[StorePluginInfo], *, refresh: bool = False
     ) -> dict[str, dict[str, Any]]:
@@ -634,7 +638,10 @@ class StoreManager:
                     await VirtualEnvPackageManager.install_requirement(requirement_file)
 
             cls._deploy_staged_plugin(plugin_info, deploy_files)
-            return StoreInstallResult(dependency_plan=dependency_plan)
+            return StoreInstallResult(
+                dependency_plan=dependency_plan,
+                download_source="ali" if selected_source == RepoType.ALIYUN else "git",
+            )
 
     @classmethod
     def _deploy_staged_plugin(
@@ -732,6 +739,7 @@ class StoreManager:
         return cls._get_repository_branch(branch_source_url, default_branch)
 
     @classmethod
+    @core_network_operation
     async def _download_plugin_to_staging(
         cls,
         plugin_info: StorePluginInfo,
