@@ -14,7 +14,11 @@ nonebot.load_plugins(str(Path(__file__).parent.resolve()))
 driver = nonebot.get_driver()
 
 
-@PriorityLifecycle.on_startup(priority=5)
+@PriorityLifecycle.on_startup(
+    priority=5,
+    component_id="runtime:cache_types",
+    depends_on=("management:cache_root", "runtime:reconcile_config"),
+)
 async def _():
     register_cache_types()
     logger.info("缓存类型注册完成")

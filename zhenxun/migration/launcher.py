@@ -309,11 +309,21 @@ class LauncherMigrationService:
         if (
             active is None
             or active["id"] != identity
-            or active["action"] != "restore"
             or active["stage"] not in {"awaiting_credentials", "recovery_required"}
         ):
             raise MigrationError("migration_recovery_stage_invalid", status=409)
         directory = self.store.path("jobs", identity).parent
+        if active["action"] == "export":
+            if payload.get("database") != {}:
+                raise MigrationError("migration_database_credentials_not_applicable")
+            with self._dispatch_lock:
+                self._recovery_credentials[identity] = {}
+                if (
+                    self._recovery_loop is not None
+                    and not self._recovery_loop.is_closed()
+                ):
+                    self._recovery_loop.call_soon_threadsafe(self._recovery_event.set)
+            return {"task_id": identity, "credentials_received": True}
         plan = read_json_locked(directory / "restore-plan.json", None)
         if not isinstance(plan, dict) or plan.get("job_id") != identity:
             raise MigrationError("migration_recovery_receipt_invalid", status=409)
@@ -342,24 +352,35 @@ class LauncherMigrationService:
         if job is None:
             return None
         if job["action"] != "restore":
-            if job["stage"] == "recovery_required":
-                raise MigrationError("migration_startup_recovery_required", status=409)
             assert_offline(self.lease.project, management_peers=self.management_peers())
             directory = self.store.path("jobs", job["id"]).parent
             if (directory / "publication.json").exists():
-                raise MigrationError(
-                    "migration_publication_recovery_required", status=409
-                )
-            if job["stage"] == "quiescing":
-                self.store.transition(
-                    job["id"],
-                    "recovery_required",
-                    error_code="migration_shutdown_unconfirmed",
-                )
-                raise MigrationError("migration_shutdown_unconfirmed", status=409)
-            return self.store.transition(
-                job["id"], "cancelled", error_code="migration_export_interrupted"
-            )
+                resumed = read_json_locked(directory / "resumed.json", {})
+                quiesced = read_json_locked(directory / "quiesced.json", {})
+                handoff = read_json_locked(directory / "handoff.json", {})
+                remaining = handoff.get("deadline_at", 0) - time.time()
+                if (
+                    resumed.get("job_id") == job["id"]
+                    and resumed.get("launcher_boot_id")
+                    == quiesced.get("launcher_boot_id")
+                    and quiesced.get("job_id") == job["id"]
+                    and quiesced.get("result") == "confirmed"
+                    and quiesced.get("process_tree_released") is True
+                    and quiesced.get("forced") is False
+                    and not job.get("first_error")
+                    and not job.get("cancel_requested")
+                    and remaining > 0
+                ):
+                    try:
+                        return await self.phases.run(
+                            job["id"],
+                            "export_reconcile",
+                            budget=MigrationBudget.start(remaining).phase(),
+                        )
+                    except MigrationError as error:
+                        if error.code != "migration_publication_unconfirmed":
+                            raise
+            return self.store.finish_interrupted_export(job["id"], lease=self.lease)
         identity = job["id"]
         directory = self.store.path("jobs", identity).parent
         if (directory / "restore-commit.json").exists() or job.get("committed_at"):

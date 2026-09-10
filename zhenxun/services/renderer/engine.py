@@ -339,41 +339,28 @@ async def _shutdown_browser_instance() -> None:
 
     browser_obj = getattr(htmlrender_browser, "_browser", None)
     playwright_obj = getattr(htmlrender_browser, "_playwright", None)
-    if browser_obj is not None:
-        is_connected_fn = getattr(browser_obj, "is_connected", None)
-        if callable(is_connected_fn) and not is_connected_fn():
-            with contextlib.suppress(Exception):
-                setattr(htmlrender_browser, "_browser", None)
-            with contextlib.suppress(Exception):
-                setattr(htmlrender_browser, "_playwright", None)
-            return
-
     if browser_obj is None and playwright_obj is None:
         return
-
+    failures = []
     close_func = getattr(browser_obj, "close", None) if browser_obj else None
-    if callable(close_func):
+    disconnected = browser_obj is not None and not browser_obj.is_connected()
+    if callable(close_func) and not disconnected:
         try:
             await _await_if_needed(close_func())
-        except Exception as e:
-            if _PLAYWRIGHT_DISCONNECT_ERROR not in str(e):
-                logger.debug(f"关闭浏览器实例时忽略异常: {e}")
-
+        except Exception as error:
+            if browser_obj.is_connected():
+                failures.append(error)
     stop_func = getattr(playwright_obj, "stop", None) if playwright_obj else None
     if callable(stop_func):
         try:
             await _await_if_needed(stop_func())
-        except Exception as e:
-            if _PLAYWRIGHT_DISCONNECT_ERROR not in str(e):
-                logger.debug(f"关闭 Playwright 实例时忽略异常: {e}")
-
-    with contextlib.suppress(Exception):
-        setattr(htmlrender_browser, "_browser", None)
-    with contextlib.suppress(Exception):
-        setattr(htmlrender_browser, "_playwright", None)
-
-    if callable(close_func) or callable(stop_func):
-        await asyncio.sleep(0)
+        except Exception as error:
+            failures.append(error)
+    if failures:
+        raise RuntimeError("renderer_browser_cleanup_failed") from failures[0]
+    setattr(htmlrender_browser, "_browser", None)
+    setattr(htmlrender_browser, "_playwright", None)
+    await asyncio.sleep(0)
 
 
 def _patch_htmlrender_task_tracking() -> None:
@@ -589,9 +576,12 @@ class PlaywrightEngine(BaseScreenshotEngine):
         self._generation_counter = 0
         self._active_generation: ContextGeneration | None = None
         self._retiring_generations: list[ContextGeneration] = []
+        self._preparing_generations: list[ContextGeneration] = []
         self._idle_recycle_task: asyncio.Task[None] | None = None
         self._closing = False
         self._process = psutil.Process()
+        self._preparation_timings: dict[str, float] = {}
+        self._preparation_tasks: set[asyncio.Task] = set()
 
     @staticmethod
     def _normalize_base_url(path: Path) -> str:
@@ -686,6 +676,13 @@ class PlaywrightEngine(BaseScreenshotEngine):
             ]
             return {
                 "closing": self._closing,
+                "preparation_timings": dict(self._preparation_timings),
+                "preparation_task_count": sum(
+                    not task.done() for task in self._preparation_tasks
+                ),
+                "ready_contexts": len(self._active_generation.all_contexts)
+                if self._active_generation
+                else 0,
                 "active_renders": self._active_renders,
                 "render_count": self._render_count,
                 "recycle_pending": self._recycle_pending,
@@ -694,6 +691,7 @@ class PlaywrightEngine(BaseScreenshotEngine):
                 "active_generation": active_generation,
                 "retiring_generations": retiring_generations,
                 "retiring_generation_count": len(retiring_generations),
+                "preparing_generation_count": len(self._preparing_generations),
                 "inflight_task_count": len(self._inflight_tasks),
                 "recent_result_count": len(self._recent_results),
                 "htmlrender_active_tasks": _HTMLRENDER_TASK_TRACKER.active_tasks,
@@ -740,6 +738,9 @@ class PlaywrightEngine(BaseScreenshotEngine):
             self._recent_results.clear()
             self._recycle_pending = False
 
+        for task in tuple(self._preparation_tasks):
+            await stop_preparation(task)
+            self._preparation_tasks.discard(task)
         await _HTMLRENDER_TASK_TRACKER.mark_draining("engine_close")
 
         if idle_task:
@@ -1165,97 +1166,129 @@ class PlaywrightEngine(BaseScreenshotEngine):
 
     async def _dispose_generation(self, generation: ContextGeneration) -> None:
         contexts = list(generation.all_contexts)
-        generation.all_contexts.clear()
         while True:
             try:
                 generation.context_pool.get_nowait()
             except asyncio.QueueEmpty:
                 break
 
+        failures = []
         for context in contexts:
-            with contextlib.suppress(Exception):
+            try:
                 await context.close()
+            except Exception as error:
+                failures.append(error)
+            else:
+                generation.all_contexts.discard(context)
+        if failures:
+            raise RuntimeError("renderer_context_cleanup_failed") from failures[0]
 
     async def _cleanup_retiring_generations(self) -> None:
-        disposable: list[ContextGeneration] = []
         async with self._state_lock:
-            remaining: list[ContextGeneration] = []
-            for generation in self._retiring_generations:
-                if generation.active_leases <= 0:
-                    disposable.append(generation)
-                else:
-                    remaining.append(generation)
-            self._retiring_generations = remaining
-
+            disposable = [
+                generation
+                for generation in self._retiring_generations
+                if generation.active_leases <= 0
+            ]
         for generation in disposable:
             await self._dispose_generation(generation)
+            async with self._state_lock:
+                if generation in self._retiring_generations:
+                    self._retiring_generations.remove(generation)
 
     async def _dispose_context_pool(self) -> None:
         async with self._state_lock:
-            generations: list[ContextGeneration] = []
+            generations = [*self._retiring_generations, *self._preparing_generations]
             if self._active_generation is not None:
                 generations.append(self._active_generation)
-                self._active_generation = None
-            generations.extend(self._retiring_generations)
-            self._retiring_generations = []
-
         for generation in generations:
             await self._dispose_generation(generation)
+            async with self._state_lock:
+                if self._active_generation is generation:
+                    self._active_generation = None
+                if generation in self._retiring_generations:
+                    self._retiring_generations.remove(generation)
+                if generation in self._preparing_generations:
+                    self._preparing_generations.remove(generation)
 
     async def _build_generation(self, *, strict: bool = False) -> ContextGeneration:
         async with self._state_lock:
+            if self._closing:
+                raise RuntimeError("renderer_closing")
             generation = self._create_generation_nolock()
-
-        if self._closing:
-            return generation
-
+            self._preparing_generations.append(generation)
+        tasks: list[asyncio.Task] = []
+        started = time.monotonic()
         try:
             browser = await _get_browser_instance()
-        except Exception as e:
-            logger.warning("截图引擎浏览器预热失败。", "PlaywrightEngine", e=e)
-            if strict:
-                raise
+            if not browser.is_connected():
+                raise RuntimeError("renderer_browser_disconnected")
+            self._preparation_timings["browser_start_ms"] = (
+                time.monotonic() - started
+            ) * 1000
+            semaphore = asyncio.Semaphore(2)
+
+            async def prepare_context() -> None:
+                async with semaphore:
+                    if self._closing:
+                        raise RuntimeError("renderer_closing")
+                    context = await browser.new_context(
+                        viewport={"width": 800, "height": 10}, device_scale_factor=2
+                    )
+                    generation.all_contexts.add(context)
+                    page = await context.new_page()
+                    try:
+                        await page.goto("about:blank", wait_until="domcontentloaded")
+                        await page.set_content(
+                            "<html><body></body></html>", wait_until="domcontentloaded"
+                        )
+                    finally:
+                        await page.close()
+                    generation.context_pool.put_nowait(context)
+
+            started = time.monotonic()
+            count = max(1, min(self._PREWARM_CONTEXT_COUNT, self._CONTEXT_POOL_SIZE))
+            tasks = [
+                asyncio.create_task(prepare_context(), name="renderer-prewarm-context")
+                for _ in range(count)
+            ]
+            self._preparation_tasks.update(tasks)
+            await asyncio.gather(*tasks)
+            if self._closing or not browser.is_connected():
+                raise RuntimeError("renderer_browser_disconnected")
+            self._preparation_timings["context_prewarm_ms"] = (
+                time.monotonic() - started
+            ) * 1000
             return generation
-
-        for _ in range(self._PREWARM_CONTEXT_COUNT):
-            if self._closing:
-                break
-            if len(generation.all_contexts) >= self._CONTEXT_POOL_SIZE:
-                break
-
-            context = None
-            try:
-                context = await browser.new_context(
-                    viewport={"width": 800, "height": 10},
-                    device_scale_factor=2,
-                )
-                page = await context.new_page()
-                await page.goto("about:blank", wait_until="domcontentloaded")
-                await page.set_content(
-                    "<html><body></body></html>",
-                    wait_until="domcontentloaded",
-                )
-                await page.close()
-            except Exception as e:
-                logger.warning("截图引擎上下文预热失败。", "PlaywrightEngine", e=e)
-                if context is not None:
-                    with contextlib.suppress(Exception):
-                        await context.close()
-                break
-
-            generation.all_contexts.add(context)
-            generation.context_pool.put_nowait(context)
-
-        return generation
+        except BaseException:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            for task in tasks:
+                await stop_preparation(task)
+            await self._dispose_generation(generation)
+            if generation in self._preparing_generations:
+                self._preparing_generations.remove(generation)
+            raise
+        finally:
+            self._preparation_tasks.difference_update(
+                task for task in tasks if task.done()
+            )
 
     async def _swap_generation(self, reason: str, *, strict: bool = False) -> None:
         new_generation = await self._build_generation(strict=strict)
         async with self._state_lock:
+            if self._closing:
+                await self._dispose_generation(new_generation)
+                if new_generation in self._preparing_generations:
+                    self._preparing_generations.remove(new_generation)
+                raise RuntimeError("renderer_closing")
             old_generation = self._active_generation
             if old_generation is not None:
                 old_generation.retiring = True
                 self._retiring_generations.append(old_generation)
             self._active_generation = new_generation
+            self._preparing_generations.remove(new_generation)
 
         await self._cleanup_retiring_generations()
         logger.debug(
@@ -1428,12 +1461,15 @@ class PlaywrightEngine(BaseScreenshotEngine):
                 dispose_generation = True
             elif self._active_generation is None:
                 self._active_generation = generation
+                self._preparing_generations.remove(generation)
                 return
             else:
                 dispose_generation = True
 
         if dispose_generation:
             await self._dispose_generation(generation)
+            if generation in self._preparing_generations:
+                self._preparing_generations.remove(generation)
 
     async def _idle_recycle_loop(self) -> None:
         while True:
@@ -1535,37 +1571,110 @@ class PlaywrightEngine(BaseScreenshotEngine):
                         self._inflight_tasks.pop(dedupe_key, None)
 
 
+async def stop_preparation(task: asyncio.Task | None) -> None:
+    if task is None or task is asyncio.current_task():
+        return
+    if task.done():
+        if not task.cancelled():
+            task.exception()
+        return
+    from zhenxun.services.lifecycle.deadline import remaining_timeout
+
+    task.cancel()
+    _, pending = await asyncio.wait({task}, timeout=remaining_timeout(5.0))
+    if pending:
+        raise TimeoutError("renderer_preparation_cleanup_timeout")
+    if not task.cancelled():
+        task.exception()
+
+
 class EngineManager:
-    """
-    引擎管理器，负责加载和提供具体的截图引擎实例。
-    未来可在此处根据 Config 读取不同的驱动配置。
-    """
+    """One shared, owned initialization and warmup per engine generation."""
 
     def __init__(self):
         self._engine_class: type[BaseScreenshotEngine] = PlaywrightEngine
         self._instance: BaseScreenshotEngine | None = None
+        self._init_task: asyncio.Task | None = None
+        self._warmup_task: asyncio.Task | None = None
+        self._closing = False
+        self._state = "not_started"
+
+    def reopen(self) -> None:
+        if self._instance is not None or any(
+            task and not task.done() for task in (self._init_task, self._warmup_task)
+        ):
+            if self._closing:
+                raise RuntimeError("renderer_cleanup_pending")
+            return
+        self._closing = False
+        self._state = "not_started"
+        self._init_task = self._warmup_task = None
+
+    async def _initialize(self) -> BaseScreenshotEngine:
+        self._state = "initializing"
+        engine = self._engine_class()
+        self._instance = engine
+        try:
+            await engine.initialize()
+            return engine
+        except BaseException:
+            self._state = "failed"
+            raise
 
     async def get_engine(self) -> BaseScreenshotEngine:
-        if not self._instance:
-            self._instance = self._engine_class()
-            await self._instance.initialize()
-        return self._instance
+        if self._closing:
+            raise RuntimeError("renderer_closing")
+        if self._init_task is None:
+            self._init_task = asyncio.create_task(
+                self._initialize(), name="renderer-initialize"
+            )
+        return await asyncio.shield(self._init_task)
 
     async def get_runtime_snapshot(self) -> dict[str, Any]:
-        engine = await self.get_engine()
-        if isinstance(engine, PlaywrightEngine):
-            return await engine.get_runtime_snapshot()
-        return {"engine": type(engine).__name__}
+        engine = self._instance
+        snapshot = (
+            await engine.get_runtime_snapshot()
+            if isinstance(engine, PlaywrightEngine)
+            else {}
+        )
+        return {
+            **snapshot,
+            "initialization_state": self._state,
+            "closing": self._closing or snapshot.get("closing", False),
+        }
+
+    async def _prepare(self) -> None:
+        try:
+            engine = await self.get_engine()
+            self._state = "warming"
+            if isinstance(engine, PlaywrightEngine):
+                await engine.warmup()
+            if self._closing:
+                raise RuntimeError("renderer_closing")
+            self._state = "ready"
+        except BaseException:
+            self._state = "failed"
+            raise
 
     async def warmup(self) -> None:
-        engine = await self.get_engine()
-        if isinstance(engine, PlaywrightEngine):
-            await engine.warmup()
+        if self._closing:
+            raise RuntimeError("renderer_closing")
+        if self._warmup_task is None:
+            self._warmup_task = asyncio.create_task(
+                self._prepare(), name="renderer-warmup"
+            )
+        await asyncio.shield(self._warmup_task)
 
     async def close(self):
-        if self._instance:
+        self._closing = True
+        self._state = "closing"
+        await stop_preparation(self._warmup_task)
+        await stop_preparation(self._init_task)
+        if self._instance is not None:
             await self._instance.close()
             self._instance = None
+        self._init_task = self._warmup_task = None
+        self._state = "closed"
 
 
 engine_manager = EngineManager()

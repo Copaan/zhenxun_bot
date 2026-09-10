@@ -16,6 +16,11 @@ class PluginSwitch(BaseModel):
     """开关状态"""
 
 
+class ArchiveResolvePayload(BaseModel):
+    archive_digest: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+    confirm_dependency_source_build: bool = False
+
+
 class ArchiveConfirmPayload(BaseModel):
     archive_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
     replace: bool = False

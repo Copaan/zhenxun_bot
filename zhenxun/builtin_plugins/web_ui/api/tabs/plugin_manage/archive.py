@@ -19,7 +19,7 @@ from ....apply_result import update_pending_restart
 from ....base_model import Result
 from ....security import decode_access_token_status
 from ....utils import authentication, oauth2_scheme
-from .model import ArchiveActionPayload, ArchiveConfirmPayload
+from .model import ArchiveActionPayload, ArchiveConfirmPayload, ArchiveResolvePayload
 from .operation_journal import operation_status, record_operation
 
 
@@ -57,6 +57,10 @@ router = APIRouter(prefix="/archive", dependencies=[authentication()])
 
 
 def _http_error(error: Exception) -> HTTPException:
+    from zhenxun.services.network_proxy import ProxyPolicyError
+
+    if isinstance(error, ProxyPolicyError):
+        return HTTPException(400, error.code)
     if isinstance(error, ArchiveDependencyConflict | ArchiveSourceBuildConflict):
         return HTTPException(409, error.code)
     if isinstance(error, service.ArchiveError):
@@ -113,6 +117,24 @@ async def confirm(
                     issue_ticket=False,
                 )
         return Result.ok(result, "归档安装已暂存，重启验证后生效。")
+    except Exception as error:
+        raise _http_error(error) from error
+
+
+@router.post("/preflight/{preflight_id}/resolve", response_model=Result[dict])
+async def resolve(
+    preflight_id: str,
+    payload: ArchiveResolvePayload,
+    session: str = Depends(archive_session),
+):
+    try:
+        result = await service.resolve_preflight(
+            preflight_id,
+            session,
+            payload.archive_digest,
+            trusted=payload.confirm_dependency_source_build,
+        )
+        return Result.ok(result)
     except Exception as error:
         raise _http_error(error) from error
 

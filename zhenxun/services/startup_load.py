@@ -23,6 +23,7 @@ from zhenxun.utils.atomic_json import read_json_locked, write_json_locked
 from .startup import startup_coordinator
 
 _INDEX_PATH = Path("data/runtime/startup-load-index-v1.json")
+_RECORD_VERSION = 5
 _CORE_BUILTINS = {"hooks", "init", "web_ui"}
 _PREBIND_HOOK_PREFIXES = (
     "nonebot_plugin_orm",
@@ -86,27 +87,47 @@ def _literal_string(node: ast.AST) -> str | None:
 class _ImportBoundaryVisitor(ast.NodeVisitor):
     """Inspect definitions and statements that execute while a module imports."""
 
-    def __init__(self, module_name: str) -> None:
+    def __init__(self, module_name: str, *, is_package: bool = False) -> None:
         self.module_name = module_name
+        self.package = module_name if is_package else module_name.rpartition(".")[0]
         self.reasons: set[str] = set()
         self.imports: set[str] = set()
         self.requires: set[str] = set()
         self.import_time_dependency_calls: set[str] = set()
         self.aliases: dict[str, str] = {}
         self.env_dependencies: set[str] = set()
+        self.deferred_annotations = False
+
+    def visit_Module(self, node: ast.Module) -> None:
+        self.deferred_annotations = any(
+            isinstance(statement, ast.ImportFrom)
+            and statement.module == "__future__"
+            and any(item.name == "annotations" for item in statement.names)
+            for statement in node.body
+        )
+        self.generic_visit(node)
+
+    def _resolve_expression(self, node: ast.expr) -> str:
+        if isinstance(node, ast.Name):
+            return self.aliases.get(node.id, node.id)
+        if isinstance(node, ast.Attribute):
+            owner = self._resolve_expression(node.value)
+            return f"{owner}.{node.attr}" if owner else ""
+        return ""
 
     def visit_Import(self, node: ast.Import) -> None:
         for item in node.names:
             self.imports.add(item.name)
-            self.aliases[item.asname or item.name.split(".")[0]] = item.name
+            self.aliases[item.asname or item.name.split(".")[0]] = (
+                item.name if item.asname else item.name.split(".")[0]
+            )
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         module = node.module or ""
         if node.level:
-            package = self.module_name.rpartition(".")[0]
             try:
                 module = importlib.util.resolve_name(
-                    f"{'.' * node.level}{module}", package
+                    f"{'.' * node.level}{module}", self.package
                 )
             except (ImportError, ValueError):
                 module = ""
@@ -117,35 +138,53 @@ class _ImportBoundaryVisitor(ast.NodeVisitor):
                 continue
             resolved = f"{module}.{item.name}" if module else item.name
             self.aliases[item.asname or item.name] = resolved
+            if module:
+                self.imports.add(resolved)
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         for base in node.bases:
-            if isinstance(base, ast.Name):
-                resolved = self.aliases.get(base.id, base.id)
-            elif isinstance(base, ast.Attribute):
-                owner = base.value.id if isinstance(base.value, ast.Name) else ""
-                resolved = f"{self.aliases.get(owner, owner)}.{base.attr}"
-            else:
-                resolved = ""
+            self.visit(base)
+            resolved = self._resolve_expression(base)
             module, _, name = resolved.rpartition(".")
             if name in {"Model", "AbstractModel"} and module in _MODEL_MODULES:
                 self.reasons.add("orm_model")
         for decorator in node.decorator_list:
             self.visit(decorator)
+        for keyword in node.keywords:
+            self.visit(keyword.value)
         for statement in node.body:
-            if not isinstance(statement, ast.FunctionDef | ast.AsyncFunctionDef):
-                self.visit(statement)
+            self.visit(statement)
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         self._inspect_function_decorators(node.decorator_list)
+        for value in [*node.args.defaults, *node.args.kw_defaults]:
+            if value is not None:
+                self.visit(value)
+        if not self.deferred_annotations:
+            arguments = [*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs]
+            arguments.extend(arg for arg in (node.args.vararg, node.args.kwarg) if arg)
+            for value in [*(arg.annotation for arg in arguments), node.returns]:
+                if value is not None:
+                    self.visit(value)
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        for value in [*node.args.defaults, *node.args.kw_defaults]:
+            if value is not None:
+                self.visit(value)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        self.visit(node.target)
+        if node.value is not None:
+            self.visit(node.value)
+        if not self.deferred_annotations:
+            self.visit(node.annotation)
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-        self._inspect_function_decorators(node.decorator_list)
+        self.visit_FunctionDef(node)
 
     def _inspect_function_decorators(self, decorators: list[ast.expr]) -> None:
         for decorator in decorators:
-            if isinstance(decorator, ast.Call):
-                self.visit(decorator)
+            self.visit(decorator)
 
     def visit_Call(self, node: ast.Call) -> None:
         name = _call_name(node)
@@ -161,6 +200,12 @@ class _ImportBoundaryVisitor(ast.NodeVisitor):
             if isinstance(owner, ast.Name) and owner.id in self.aliases:
                 resolved = ".".join([self.aliases[owner.id], *reversed(parts)])
         resolved_name = resolved.rsplit(".", 1)[-1]
+        if resolved in {
+            "nonebot.require",
+            "importlib.import_module",
+            "builtins.__import__",
+        }:
+            name = resolved_name
         if resolved and resolved_name[:1].islower():
             self.import_time_dependency_calls.add(resolved)
         if name in _ROUTE_CALLS:
@@ -206,7 +251,9 @@ def _file_record(
         }
     if (
         cached
-        and cached.get("record_version") == 4
+        and cached.get("record_version") == _RECORD_VERSION
+        and cached.get("module_name") == module_name
+        and cached.get("ctime_ns") == stat.st_ctime_ns
         and cached.get("size") == stat.st_size
         and cached.get("mtime_ns") == stat.st_mtime_ns
     ):
@@ -214,6 +261,13 @@ def _file_record(
     try:
         data = path.read_bytes()
         tree = ast.parse(data.decode("utf-8"), filename=str(path))
+        after = path.stat()
+        if (stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns) != (
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ):
+            raise OSError("source_changed_during_analysis")
     except (OSError, UnicodeError, SyntaxError):
         return {
             "size": stat.st_size,
@@ -223,12 +277,14 @@ def _file_record(
             "imports": [],
             "requires": [],
         }
-    visitor = _ImportBoundaryVisitor(module_name)
+    visitor = _ImportBoundaryVisitor(module_name, is_package=path.name == "__init__.py")
     visitor.visit(tree)
     runtime_reasons = set(visitor.reasons)
     return {
         "size": stat.st_size,
-        "record_version": 4,
+        "record_version": _RECORD_VERSION,
+        "module_name": module_name,
+        "ctime_ns": stat.st_ctime_ns,
         "mtime_ns": stat.st_mtime_ns,
         "digest": hashlib.sha256(data).hexdigest(),
         "reasons": sorted(visitor.reasons),
@@ -306,6 +362,7 @@ class StartupLoadPlanner:
         self._file_lookup: dict[str, dict[str, Any]] = {}
         self.warming_plugins: set[str] = set()
         self._warmup_hook_counts: dict[str, int] = {}
+        self.dependency_cycles: list[list[str]] = []
         self._recovery_preview = ContextVar("plugin_recovery_preview", default=None)
 
     def reset(self) -> None:
@@ -318,6 +375,7 @@ class StartupLoadPlanner:
         self._file_lookup.clear()
         self.warming_plugins.clear()
         self._warmup_hook_counts.clear()
+        self.dependency_cycles.clear()
 
     def prepare(self, roots: Iterable[tuple[str, Path]]) -> None:
         from nonebot.plugin import _managers
@@ -398,18 +456,20 @@ class StartupLoadPlanner:
         for path in files:
             key = str(path)
             previous = cached_files.get(key)
+            module_name = _module_for_file(entry.module_name, entry.root, path)
             before_hit = False
             try:
                 stat = path.stat()
                 before_hit = bool(
                     isinstance(previous, dict)
-                    and previous.get("record_version") == 4
+                    and previous.get("record_version") == _RECORD_VERSION
+                    and previous.get("module_name") == module_name
+                    and previous.get("ctime_ns") == stat.st_ctime_ns
                     and previous.get("size") == stat.st_size
                     and previous.get("mtime_ns") == stat.st_mtime_ns
                 )
             except OSError:
                 pass
-            module_name = _module_for_file(entry.module_name, entry.root, path)
             record = _file_record(
                 path,
                 module_name,
@@ -477,9 +537,34 @@ class StartupLoadPlanner:
                 if self.entries[plugin_id].dependencies <= completed
             )
             if not ready:
-                ready = [min(remaining)]
-                self.entries[ready[0]].reasons.add("dependency_cycle")
-                self.entries[ready[0]].phase = "critical_preload"
+                # Choose a complete source SCC, not an arbitrary downstream node.
+                reachable: dict[str, set[str]] = {}
+                for member in sorted(remaining):
+                    seen: set[str] = set()
+                    queue = [member]
+                    while queue:
+                        current = queue.pop()
+                        if current in seen:
+                            continue
+                        seen.add(current)
+                        queue.extend(self.entries[current].dependencies & remaining)
+                    reachable[member] = seen
+                for member in sorted(remaining):
+                    cycle = {
+                        other
+                        for other in reachable[member]
+                        if member in reachable[other]
+                    }
+                    if all(reachable[other] <= cycle for other in cycle):
+                        ready = sorted(cycle)
+                        break
+                self.dependency_cycles.append(ready)
+                for member in ready:
+                    self.entries[member].reasons.add("dependency_cycle")
+                    self.entries[member].phase = "critical_preload"
+                nonebot_logger.warning(
+                    "启动依赖循环，按稳定顺序加载: {}", ", ".join(ready)
+                )
             for plugin_id in ready:
                 remaining.remove(plugin_id)
                 completed.add(plugin_id)
@@ -799,6 +884,11 @@ class StartupLoadPlanner:
             "total": len(self.entries),
             "completed": completed,
             "failed_plugins": sorted(self.failed_plugins),
+            "dependency_cycles": [list(cycle) for cycle in self.dependency_cycles],
+            "cache_hits": sum(entry.cache_hits for entry in self.entries.values()),
+            "scanned_files": sum(
+                entry.scanned_files for entry in self.entries.values()
+            ),
         }
         if detail:
             result["plugins"] = [

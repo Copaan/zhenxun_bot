@@ -231,6 +231,8 @@ def _inspect_file(path: Path, cached: dict[str, object] | None) -> dict[str, obj
         }
     if (
         cached
+        and cached.get("analysis_version") == 5
+        and cached.get("ctime_ns") == stat.st_ctime_ns
         and cached.get("size") == stat.st_size
         and cached.get("mtime_ns") == stat.st_mtime_ns
     ):
@@ -243,11 +245,15 @@ def _inspect_file(path: Path, cached: dict[str, object] | None) -> dict[str, obj
         shared = None
     if (
         shared
+        and shared.get("record_version") == 5
+        and shared.get("ctime_ns") == stat.st_ctime_ns
         and shared.get("size") == stat.st_size
         and shared.get("mtime_ns") == stat.st_mtime_ns
         and "import_time_dependency_calls" in shared
     ):
         return {
+            "analysis_version": 5,
+            "ctime_ns": stat.st_ctime_ns,
             "size": stat.st_size,
             "mtime_ns": stat.st_mtime_ns,
             "digest": shared.get("digest", ""),
@@ -288,6 +294,8 @@ def _inspect_file(path: Path, cached: dict[str, object] | None) -> dict[str, obj
     if "import_time_dependency_calls" not in locals():
         import_time_dependency_calls = set()
     return {
+        "analysis_version": 5,
+        "ctime_ns": stat.st_ctime_ns,
         "size": stat.st_size,
         "mtime_ns": stat.st_mtime_ns,
         "digest": hashlib.sha256(data).hexdigest(),

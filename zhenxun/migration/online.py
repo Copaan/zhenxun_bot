@@ -45,12 +45,22 @@ class OnlineExport:
             },
         )
 
-    def begin(self) -> bool:
+    def begin(self, *, network=None) -> bool:
         try:
             self.budget.checkpoint()
+            if network is not None:
+                from .recovery_context import save_management_context
+
+                self.management_snapshot, _ = save_management_context(
+                    self.store,
+                    self.identity,
+                    self.management_snapshot,
+                    network,
+                    lease=self.service.lease,
+                )
         except MigrationError as error:
             self.fail(error.code)
-            raise
+            return False
         if self.store.read("jobs", self.identity)["cancel_requested"]:
             self.store.transition(self.identity, "cancelled")
             self.password = None

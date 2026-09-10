@@ -2760,7 +2760,12 @@ class RuntimeCacheHandle:
 @PriorityLifecycle.on_startup(
     priority=6,
     task_id="runtime:runtime_cache",
-    depends_on=("management:cache_root", "runtime:reconcile_tasks"),
+    depends_on=(
+        "management:cache_root",
+        "runtime:reconcile_tasks",
+        "runtime:cache_types",
+        "runtime:legacy_data",
+    ),
     component_id="runtime:runtime_cache",
     restart_policy="component",
     config_keys=(

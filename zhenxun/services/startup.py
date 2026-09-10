@@ -622,6 +622,20 @@ class StartupCoordinator:
                 from zhenxun.services.lifecycle import lifecycle_kernel
 
                 lifecycle = lifecycle_kernel.status()
+                result["running_operations"] = [
+                    {
+                        **item,
+                        "name": item.get("component_id"),
+                        "stage": (
+                            lifecycle_kernel.component_status(
+                                item.get("component_id", "")
+                            )
+                            or {}
+                        ).get("stage", "warmup"),
+                    }
+                    for item in lifecycle.get("current_operations", [])
+                    if item.get("action") in {"start", "rebuild"}
+                ]
                 result["lifecycle"] = {
                     key: value
                     for key, value in lifecycle.items()

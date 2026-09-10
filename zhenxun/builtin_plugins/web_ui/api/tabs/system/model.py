@@ -27,6 +27,7 @@ class LifecycleComponentStatus(BaseModel):
     started_at: str | None = None
     stopped_at: str | None = None
     duration_ms: float | None = None
+    dependency_wait_ms: float = 0.0
     health: str
     error_code: str | None = None
     last_health_checked_at: str | None = None

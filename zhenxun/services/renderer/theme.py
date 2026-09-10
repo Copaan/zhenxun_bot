@@ -594,14 +594,16 @@ class ThemeManager:
 
         default_palette_path = THEMES_PATH / "default" / "palette.json"
         default_palette = (
-            json.loads(default_palette_path.read_text("utf-8"))
+            json.loads(await asyncio.to_thread(default_palette_path.read_text, "utf-8"))
             if default_palette_path.exists()
             else {}
         )
 
         palette_path = theme_dir / "palette.json"
         target_palette = (
-            json.loads(palette_path.read_text("utf-8")) if palette_path.exists() else {}
+            json.loads(await asyncio.to_thread(palette_path.read_text, "utf-8"))
+            if palette_path.exists()
+            else {}
         )
 
         final_palette = deep_merge_dict(default_palette, target_palette)

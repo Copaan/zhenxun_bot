@@ -23,12 +23,13 @@ class RendererRuntimeHandle:
             await asyncio.sleep(0.05)
 
     async def close(self) -> None:
-        await engine_manager.close()
+        await renderer_service.close()
 
     async def health(self) -> dict[str, object]:
         snapshot = await engine_manager.get_runtime_snapshot()
         return {
-            "healthy": bool(snapshot.get("active_generation"))
+            "healthy": snapshot.get("initialization_state") == "ready"
+            and bool(snapshot.get("ready_contexts"))
             and not snapshot.get("closing", False),
             "active_renders": int(snapshot.get("active_renders") or 0),
         }
@@ -57,6 +58,10 @@ class RendererRuntimeHandle:
         if engine is not None:
             tasks = [
                 getattr(engine, "_idle_recycle_task", None),
+                engine_manager._init_task,
+                engine_manager._warmup_task,
+                renderer_service._initialization_task,
+                *engine._preparation_tasks,
                 *list(getattr(engine, "_inflight_tasks", {}).values()),
             ]
             receipts.extend(
@@ -75,8 +80,10 @@ class RendererRuntimeHandle:
 
 async def _renderer_healthy(_value=None) -> bool:
     snapshot = await engine_manager.get_runtime_snapshot()
-    return bool(snapshot.get("active_generation")) and not snapshot.get(
-        "closing", False
+    return (
+        snapshot.get("initialization_state") == "ready"
+        and bool(snapshot.get("ready_contexts"))
+        and not snapshot.get("closing", False)
     )
 
 
@@ -97,7 +104,16 @@ async def _renderer_healthy(_value=None) -> bool:
 )
 async def _init_renderer_service(context):
     """在Bot启动时初始化渲染服务及其依赖。"""
+    renderer_service.bind_context(context)
+    context.add_finalizer(renderer_service.close)
     await renderer_service.initialize()
+    from zhenxun.services.startup import startup_coordinator
+
+    snapshot = await engine_manager.get_runtime_snapshot()
+    for name, elapsed in snapshot.get("preparation_timings", {}).items():
+        startup_coordinator.record_operation(
+            f"renderer:{name}", "warmup", "completed", elapsed
+        )
     return RuntimeHandle(
         value=renderer_service,
         controller=RendererRuntimeHandle(),

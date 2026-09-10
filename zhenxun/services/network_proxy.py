@@ -1,4 +1,4 @@
-"""Explicit routing for managed HTTP clients; never patches third-party clients."""
+"""Shared routing policy for managed HTTP and supported client compatibility hooks."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from functools import wraps
 import hashlib
 import ipaddress
 import json
+import os
 from pathlib import Path
 import time
 from typing import Any
@@ -284,6 +285,9 @@ class ProxyRuntime:
             if values is None:
                 path = Path(".env.dev") if Path(".env.dev").exists() else Path(".env")
                 values = dict(dotenv_values(path))
+                values.update(
+                    {key: os.environ[key] for key in PROXY_KEYS if key in os.environ}
+                )
             try:
                 policy = ProxyPolicy.from_values(values)
             except ProxyPolicyError as error:
@@ -446,6 +450,8 @@ class ProxyRuntime:
         return self.initialize().policy.selected(request_owner())
 
     def status(self):
+        from .proxy_clients import coverage
+
         current = self.initialize()
         return {
             "current": current.policy.public(),
@@ -457,9 +463,11 @@ class ProxyRuntime:
             "cleanup_tasks": len(self._closing),
             "active_probes": len(self.probes),
             "ownership_scope": "observed_call_context_only",
-            "coverage": "managed_http_and_plugin_store_git",
+            "coverage": "managed_http_supported_clients_and_plugin_store_git",
+            "clients": dict(coverage),
             "unmanaged": [
-                "third_party_clients",
+                "custom_transports_and_connectors",
+                "external_downloaders",
                 "browser",
                 "unmanaged_git_pip_uv",
                 "subprocesses",

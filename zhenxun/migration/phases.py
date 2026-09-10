@@ -26,6 +26,7 @@ from .tasks import MigrationBudget, TaskStore
 PHASES = {
     "export_snapshot": ("export", "snapshotting"),
     "export_pack": ("export", "compressing"),
+    "export_reconcile": ("export", ("compressing", "recovery_required")),
     "restore_prepare": ("restore", "snapshotting"),
     "restore_dependencies": ("restore", "preparing"),
     "restore_publish": ("restore", "committed"),
@@ -103,7 +104,8 @@ class PhaseSupervisor:
         if self.store.active() is None or self.store.active()["id"] != job_id:
             raise MigrationError("migration_operation_not_reserved")
         action, expected = PHASES[phase]
-        if job["action"] != action or job["stage"] != expected:
+        stages = (expected,) if isinstance(expected, str) else expected
+        if job["action"] != action or job["stage"] not in stages:
             raise MigrationError("migration_phase_stage_mismatch")
         invocation = uuid.uuid4().hex
         directory = self.store.path("jobs", job_id).parent / "phases" / invocation
@@ -233,6 +235,8 @@ def execute_phase(project: Path, request: dict, *, lease: DelegatedLease) -> dic
     directory = store.path("jobs", identity).parent
     snapshot = directory / "snapshot"
     description = directory / "snapshot.json"
+    if phase == "export_reconcile":
+        return store.reconcile_export(identity, lease=lease, checkpoint=check)
     if phase == "export_snapshot":
         files, metadata = capture_snapshot(
             project,

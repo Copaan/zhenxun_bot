@@ -277,6 +277,39 @@ class TaskStore:
 
         return mutate_json_locked(self.path("jobs", identity), None, cancel)
 
+    def finish_interrupted_export(self, identity: str, *, lease) -> dict:
+        """End a read-only export only after proving no instance writer remains."""
+        from .snapshot import assert_offline
+
+        lease.require_held()
+        if lease.project.resolve() != self.project.resolve():
+            raise MigrationError("migration_instance_lease_mismatch")
+        assert_offline(self.project)
+        directory = self.path("jobs", identity).parent
+        if any(directory.glob("restore-*.json")) or any(
+            (directory / name).exists() for name in ("restore-stage", "database-stage")
+        ):
+            raise MigrationError("migration_recovery_receipt_invalid")
+
+        def finish(value):
+            if not isinstance(value, dict) or value.get("action") != "export":
+                raise MigrationError("migration_export_phase_invalid")
+            if value["stage"] in TERMINAL:
+                return dict(value)
+            value.update(
+                stage="failed",
+                updated_at=self.clock(),
+                revision=value["revision"] + 1,
+                first_error=value.get("first_error") or "migration_export_interrupted",
+                progress={
+                    "export_recovered": True,
+                    "original_instance_start_allowed": True,
+                },
+            )
+            return dict(value)
+
+        return mutate_json_locked(self.path("jobs", identity), None, finish)
+
     def publish_export(
         self, identity: str, source: Path, destination: Path, result: dict
     ) -> dict:

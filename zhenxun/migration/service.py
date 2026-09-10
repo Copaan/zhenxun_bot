@@ -19,11 +19,18 @@ def recovery_requirements(store, identity: str) -> dict:
     from .archive import MANIFEST_LIMIT
 
     job = store.read("jobs", identity)
-    if job["action"] != "restore" or job["stage"] not in {
+    if job["stage"] not in {
         "awaiting_credentials",
         "recovery_required",
     }:
         raise MigrationError("migration_recovery_stage_invalid", status=409)
+    if job["action"] == "export":
+        return {
+            "task_id": identity,
+            "engine": None,
+            "target": {},
+            "credentials_required": False,
+        }
     path = contained_path(
         store.path("jobs", identity).parent, "restore-plan.json", regular=True
     )

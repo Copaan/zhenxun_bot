@@ -61,18 +61,49 @@ def _nonebot_pending() -> dict[str, Any] | None:
 def _validate_archive_build_policy(*transactions: dict[str, Any] | None) -> bool:
     from zhenxun.plugin_archive_dependencies import archive_dependency_contract
 
-    wheels_only = bool(archive_dependency_contract()["store_keys"]) or any(
+    contract = archive_dependency_contract()
+    wheels_only = bool(contract["store_keys"]) or any(
         _archive_wheels_only(item) for item in transactions
     )
+    if contract.get("source_build_packages"):
+        from zhenxun.services.installer_network import source_revision
+
+        if any(
+            revision != source_revision() for revision in contract["source_revisions"]
+        ):
+            raise ArchiveSourceBuildConflict()
+        return False
     if wheels_only and any(_source_build_enabled(item) for item in transactions):
-        raise ArchiveSourceBuildConflict()
+        approved = [
+            operation
+            for item in transactions
+            if item
+            for operation in item.get("operations", [])
+            if (operation.get("receipt") or {}).get("dependency_source_build") is True
+            and operation.get("source_build_confirmed") is True
+        ]
+        if not approved:
+            raise ArchiveSourceBuildConflict()
+        from zhenxun.services.installer_network import source_revision
+
+        if any(
+            operation["receipt"].get("dependency_source_revision") != source_revision()
+            for operation in approved
+        ):
+            raise ArchiveSourceBuildConflict()
+        # Legacy archive dependencies remain wheel-only individually; consent
+        # for this operation does not grant build rights to their packages.
+        return False
     return wheels_only
 
 
 @contextmanager
 def archive_dependency_policy(transaction: dict[str, Any]) -> Iterator[None]:
     """Serialize cross-store policy checks with source staging and layer builds."""
-    from zhenxun.plugin_archive_dependencies import preserve_archive_dependencies
+    from zhenxun.plugin_archive_dependencies import (
+        archive_dependency_contract,
+        preserve_archive_dependencies,
+    )
 
     with _locked_transaction():
         if _validate_archive_build_policy(
@@ -82,6 +113,14 @@ def archive_dependency_policy(transaction: dict[str, Any]) -> Iterator[None]:
             # contain dependencies already merged from that archive operation.
             transaction["archive_wheels_only"] = True
             transaction["source_build_confirmed"] = False
+        else:
+            contract = archive_dependency_contract()
+            if contract.get("source_build_packages"):
+                transaction.pop("archive_wheels_only", None)
+                transaction["source_build_confirmed"] = True
+                transaction["archive_build_allowlist"] = contract[
+                    "source_build_packages"
+                ]
         target = transaction.get("target_manifest")
         if isinstance(target, dict):
             preserve_archive_dependencies(target)
@@ -498,6 +537,8 @@ def prepare_dependency_transaction() -> bool:
         }
     if wheels_only:
         transaction["archive_wheels_only"] = True
+    else:
+        transaction.pop("archive_wheels_only", None)
     try:
         save_pending_transaction(transaction)
     except (ArchiveSourceBuildConflict, ArchiveDependencyConflict) as error:

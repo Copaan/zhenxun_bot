@@ -518,6 +518,7 @@ class _OwnedArchiveProcess:
     resource: Any = None
     stopping: bool = False
     killing: bool = False
+    diagnostic: bytes = b""
 
     @property
     def confirmed(self) -> bool:
@@ -558,6 +559,12 @@ class _OwnedArchiveProcess:
         self.resource.detail["pid"] = getattr(self.process, "pid", None)
         if self.stopping:
             self.signal()
+        if (
+            kwargs.get("stderr") == asyncio.subprocess.PIPE
+            and getattr(self.process, "stderr", None) is not None
+        ):
+            while chunk := await self.process.stderr.read(8192):
+                self.diagnostic = (self.diagnostic + chunk)[-65536:]
         await self.process.wait()
         return self.process
 
@@ -670,14 +677,29 @@ def _process_directory_busy(path: Path) -> bool:
     )
 
 
-async def _compile_wheels(requirements: list[str], constraints: dict[str, str]):
+async def _compile_wheels(
+    requirements: list[str], constraints: dict[str, str], *, source_build=False
+):
     from zhenxun.nonebot_store import dependencies as deps
+    from zhenxun.services.installer_network import (
+        installer_environment,
+        resolver_failure,
+    )
 
     # Reuse the store's constraints/output parser, but own process cancellation:
     # its general resolver has neither a deadline nor child cleanup on cancel.
     directory = Path(tempfile.mkdtemp(prefix="zhenxun_archive_deps_"))
     job = None
     try:
+        build_restrictions = []
+        if source_build:
+            from zhenxun.plugin_archive_dependencies import archive_dependency_contract
+
+            for name in sorted(
+                set(deps.protected_core())
+                | set(archive_dependency_contract().get("wheels_only_packages", []))
+            ):
+                build_restrictions.extend(["--no-build-package", name])
         source = directory / "requirements.in"
         constraints_file = directory / "constraints.txt"
         output = directory / "requirements.txt"
@@ -697,16 +719,18 @@ async def _compile_wheels(requirements: list[str], constraints: dict[str, str]):
             "--no-annotate",
             "--python",
             sys.executable,
-            "--only-binary=:all:",
-            "--no-build",
+            *([] if source_build else ["--only-binary=:all:", "--no-build"]),
+            *build_restrictions,
             stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-            env={**os.environ, "UV_NO_PROGRESS": "1"},
+            stderr=asyncio.subprocess.PIPE,
+            env=installer_environment(),
         )
         try:
             process = await _wait_process(job)
             if process.returncode or not output.exists():
-                return None
+                return {
+                    "failure": resolver_failure(job.diagnostic.decode(errors="replace"))
+                }
             if output.stat().st_size > 2 * 1024 * 1024:
                 raise ArchiveError("archive_dependency_metadata_limit")
             return deps._parse_compiled(output)
@@ -720,9 +744,12 @@ async def _compile_wheels(requirements: list[str], constraints: dict[str, str]):
             shutil.rmtree(directory, ignore_errors=True)
 
 
-async def dependency_plan(requirements: list[str]) -> dict[str, Any]:
+async def dependency_plan(
+    requirements: list[str], *, source_build=False
+) -> dict[str, Any]:
     from zhenxun.nonebot_store import dependencies as deps
     from zhenxun.plugin_archive_dependencies import archive_dependency_contract
+    from zhenxun.services.installer_network import source_revision
 
     fingerprint = dependency_fingerprint()
     if not requirements:
@@ -747,9 +774,27 @@ async def dependency_plan(requirements: list[str]) -> dict[str, Any]:
             if name in pins and pins[name] != version:
                 raise ArchiveError("archive_dependency_conflict", 409)
             pins[name] = version
-    resolved = await _compile_wheels(requirements, pins)
+    index_revision = source_revision()
+    resolved = (
+        await _compile_wheels(requirements, pins, source_build=True)
+        if source_build
+        else await _compile_wheels(requirements, pins)
+    )
+    if index_revision != source_revision():
+        raise ArchiveError("archive_environment_changed", 409)
     if resolved is None:
         raise ArchiveError("archive_wheel_dependencies_unresolved")
+    if "failure" in resolved:
+        return {
+            "candidate_inputs": requirements,
+            "resolved_packages": {},
+            "package_changes": {},
+            "fingerprint": fingerprint,
+            "source_revision": index_revision,
+            "status": "blocked",
+            "diagnostic": resolved["failure"],
+            "source_build_confirmed": source_build,
+        }
     if any(
         name in core and core[name] != version for name, version in resolved.items()
     ):
@@ -767,7 +812,10 @@ async def dependency_plan(requirements: list[str]) -> dict[str, Any]:
         "resolved_packages": resolved,
         "package_changes": deps._package_changes(resolved, current),
         "fingerprint": fingerprint,
-        "source_build_required": False,
+        "source_build_required": source_build,
+        "source_build_confirmed": source_build,
+        "source_revision": index_revision,
+        "status": "ready",
     }
 
 
@@ -780,10 +828,6 @@ def _pending_dependency_pins() -> dict[str, str]:
         other and other.get("state") != "pending_restart"
     ):
         raise ArchiveError("plugin_transaction_not_mutable", 409)
-    if other.get("source_build_confirmed") or any(
-        op.get("source_build_confirmed") for op in source.get("operations", [])
-    ):
-        raise ArchiveError("archive_source_build_transaction_conflict", 409)
     pins = transaction.dependency_packages() if source else {}
     base = other.get("base_manifest", {}).get("packages", {})
     for name, info in other.get("target_manifest", {}).get("packages", {}).items():
@@ -1021,6 +1065,46 @@ async def preflight(
         _preflight_directory.reset(token)
 
 
+async def resolve_preflight(
+    preflight_id: str, session_id: str, digest: str, *, trusted: bool
+):
+    from zhenxun.plugin_store_coordinator import plugin_store_operation_coordinator
+    from zhenxun.services.installer_network import source_revision
+
+    async with plugin_store_operation_coordinator.operation(
+        owner="webui.archive_resolve"
+    ):
+        path, data = _session(preflight_id, session_id)
+        plan = data["dependency_plan"]
+        if digest != data["archive_digest"] or _file_digest(path / "upload") != digest:
+            raise ArchiveError("archive_digest_changed", 409)
+        if dependency_fingerprint() != plan[
+            "fingerprint"
+        ] or source_revision() != plan.get("source_revision"):
+            raise ArchiveError("archive_environment_changed", 409)
+        if plan.get("status") == "ready":
+            return _public(data)
+        if trusted and not plan.get("diagnostic", {}).get("source_build_available"):
+            raise ArchiveError("archive_source_build_not_applicable")
+        token = _preflight_directory.set(path.resolve())
+        try:
+            resolved = await dependency_plan(
+                plan["candidate_inputs"], source_build=trusted
+            )
+            # A login/session expiry or concurrent discard must not resurrect a draft.
+            _session(preflight_id, session_id)
+            if (
+                resolved.get("source_revision") != plan.get("source_revision")
+                or resolved["fingerprint"] != plan["fingerprint"]
+            ):
+                raise ArchiveError("archive_environment_changed", 409)
+            data["dependency_plan"] = resolved
+            write_json_locked(path / "session.json", data)
+            return _public(data)
+        finally:
+            _preflight_directory.reset(token)
+
+
 def confirm(
     preflight_id: str, session_id: str, digest: str, *, replace: bool, trusted: bool
 ) -> dict[str, Any]:
@@ -1083,6 +1167,13 @@ def confirm(
         if dependency_fingerprint() != data["dependency_plan"]["fingerprint"]:
             raise ArchiveError("archive_environment_changed", 409)
         plan = data["dependency_plan"]
+        if plan.get("status") == "blocked":
+            raise ArchiveError("archive_dependency_plan_not_ready", 409)
+        if plan.get("source_revision"):
+            from zhenxun.services.installer_network import source_revision
+
+            if source_revision() != plan["source_revision"]:
+                raise ArchiveError("archive_environment_changed", 409)
         receipt = {
             "source": "local_archive",
             "module": data["module"],
@@ -1097,6 +1188,8 @@ def confirm(
             "package": data["package"],
             "dependency_inputs": list(plan["candidate_inputs"]),
             "dependency_packages": dict(plan["resolved_packages"]),
+            "dependency_source_build": bool(plan.get("source_build_confirmed")),
+            "dependency_source_revision": plan.get("source_revision"),
         }
         record_operation(
             key,
@@ -1120,7 +1213,7 @@ def confirm(
             reason="local_archive_install",
             dependency_inputs=plan["candidate_inputs"],
             dependency_packages=plan["resolved_packages"],
-            source_build_confirmed=False,
+            source_build_confirmed=bool(plan.get("source_build_confirmed")),
             operation_id=operation_id,
         )
     result.update(

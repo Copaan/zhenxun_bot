@@ -383,6 +383,7 @@ class GeminiToolSerializer(ToolSerializer):
         )
 
         unsupported_keys = [
+            "uniqueItems",
             "exclusiveMinimum",
             "exclusiveMaximum",
             "default",

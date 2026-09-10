@@ -149,23 +149,23 @@ async def _prepare_resources():
             logger.info("开始下载资源文件，请耐心等待...", "资源检查")
             result = await ZhenxunRepoManager.resources_update()
             if result and not result.success:
-                logger.error(
-                    f"资源下载失败: {result.error_message}",
-                    "资源检查",
-                )
+                raise RuntimeError("resource_initialization_failed")
             else:
                 logger.info("资源文件下载/更新完成", "资源检查")
+        if not await asyncio.to_thread(ZhenxunRepoManager.check_resources_exists):
+            raise RuntimeError("resource_validation_failed")
     except Exception as e:
         logger.error(f"资源检查或更新失败: {e}", "资源检查")
+        raise
 
 
 @PriorityLifecycle.on_startup(
-    priority=10,
-    stage="warmup",
+    priority=5,
+    stage="runtime",
     timeout=300,
-    parallel_safe=True,
-    failure_policy="degrade",
-    task_id="warmup:legacy_data",
+    failure_policy="fatal",
+    task_id="runtime:legacy_data",
+    depends_on=("management:database", "runtime:reconcile_tasks"),
     resource_group="database",
 )
 async def _migrate_legacy_data():
@@ -268,3 +268,4 @@ async def _migrate_legacy_data():
                 logger.info("迁移签到数据完成!")
         except OperationalError as e:
             logger.warning("数据迁移", e=e)
+            raise

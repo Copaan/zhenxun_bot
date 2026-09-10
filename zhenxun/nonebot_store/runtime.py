@@ -150,6 +150,9 @@ def build_generation(transaction: dict[str, Any]) -> dict[str, Any]:
 
 
 def _build_generation(transaction: dict[str, Any]) -> dict[str, Any]:
+    from zhenxun.plugin_archive_dependencies import archive_dependency_contract
+    from zhenxun.services.installer_network import installer_environment
+
     packages = transaction.get("target_manifest", {}).get("packages", {})
     if not isinstance(packages, dict):
         raise LayerBuildError("dependency_plan_invalid")
@@ -195,6 +198,16 @@ def _build_generation(transaction: dict[str, Any]) -> dict[str, Any]:
             ):
                 command.append("--only-binary=:all:")
                 command.append("--no-build")
+            else:
+                forbidden_builds = set(
+                    archive_dependency_contract().get("wheels_only_packages", [])
+                )
+                if "archive_build_allowlist" in transaction:
+                    forbidden_builds.update(
+                        set(packages) - set(transaction["archive_build_allowlist"])
+                    )
+                for name in sorted(forbidden_builds):
+                    command.extend(["--no-build-package", name])
             completed = subprocess.run(
                 command,
                 cwd=str(Path.cwd()),
@@ -202,7 +215,8 @@ def _build_generation(transaction: dict[str, Any]) -> dict[str, Any]:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                env={**os.environ, "UV_NO_PROGRESS": "1"},
+                env=installer_environment(),
+                timeout=900,
                 check=False,
             )
             requirements.unlink(missing_ok=True)

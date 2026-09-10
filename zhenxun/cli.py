@@ -247,6 +247,9 @@ def _run_worker() -> None:
             f"使用 {htmlrender_browser_channel} 作为 htmlrender 驱动启动..."
         )
 
+    from zhenxun.services import proxy_clients
+
+    proxy_clients.install()
     nonebot.init(
         _env_file=ENV_DEV_FILE,
         htmlrender_browser_channel=htmlrender_browser_channel,
@@ -460,6 +463,7 @@ def _run_worker() -> None:
     finally:
         transport_runtime.restore_uvicorn_signal_bridge()
         transport_runtime.restore()
+        proxy_clients.restore()
         from zhenxun.services.runtime_bootstrap import finalize_runtime_executor
 
         finalize_runtime_executor()
@@ -1691,11 +1695,25 @@ async def _run_launcher_async() -> None:
 
                     raise MigrationError("migration_original_worker_resume_failed")
                 migration_export.resumed(worker)
-            except BaseException:
+            except Exception:
                 migration_export.fail(
                     "migration_original_worker_resume_failed", recovery=True
                 )
-                raise
+                if ingress is not None:
+                    await _terminate_named_process_async(ingress, "QQ HTTPS ingress")
+                    ingress = None
+                    ingress_signature = None
+                if http_sidecar is not None:
+                    await _terminate_named_process_async(
+                        http_sidecar, "WebUI HTTP sidecar"
+                    )
+                    http_sidecar = None
+                    http_sidecar_signature = None
+                await _terminate_worker_async(worker)
+                current_worker = None
+                await migration_service.recover_with_management()
+                migration_export = None
+                continue
         if migration_service is not None:
             migration_service.bind_export_worker(worker)
         migration_snapshot = False
@@ -1883,7 +1901,7 @@ async def _run_launcher_async() -> None:
                 if migration_service is not None and migration_export is None:
                     migration_export = migration_service.take_export()
                     if migration_export is not None:
-                        if not migration_export.begin():
+                        if not migration_export.begin(network=webui_tls):
                             migration_export = None
                         else:
                             from zhenxun.migration.launcher import (
@@ -1985,6 +2003,20 @@ async def _run_launcher_async() -> None:
                     )
                     _bind_worker_runtime_status(worker, status)
                 await asyncio.sleep(WORKER_POLL_INTERVAL)
+        except Exception as error:
+            if (
+                migration_export is None
+                or migration_service.store.read("jobs", migration_export.identity)[
+                    "stage"
+                ]
+                != "quiescing"
+            ):
+                raise
+            migration_export.fail(
+                getattr(error, "code", "migration_shutdown_unconfirmed"), recovery=True
+            )
+            migration_snapshot = True
+            migration_shutdown = {"result": "unconfirmed"}
         except KeyboardInterrupt:
             clear_launcher_restart_signal()
             if ingress is not None:
@@ -2029,9 +2061,16 @@ async def _run_launcher_async() -> None:
         if migration_adopted_worker is not None or migration_resume_original:
             continue
         if migration_snapshot:
-            await migration_export.snapshot_after_shutdown(
-                migration_shutdown, network=webui_tls
-            )
+            try:
+                await migration_export.snapshot_after_shutdown(
+                    migration_shutdown, network=webui_tls
+                )
+            except Exception as error:
+                migration_export.fail(
+                    getattr(error, "code", "migration_snapshot_failed"), recovery=True
+                )
+                await migration_service.recover_with_management()
+                migration_export = None
             continue
         if restart_requested or (restart_action := consume_launcher_action()):
             if stop_requested:

@@ -78,6 +78,7 @@ class DependencyAnalysisError(RuntimeError):
 
 
 def safe_process_error(value: str) -> str:
+    value = re.sub(r"https?://[^\s<>]+", "<package-source>", value)
     value = _SENSITIVE.sub(r"\1=<redacted>", value)
     return " ".join(value.split())[-1200:]
 
@@ -557,6 +558,8 @@ def _parse_compiled(path: Path) -> dict[str, str]:
 async def _compile(
     requirements: list[str], constraints: dict[str, str], *, wheels_only: bool
 ) -> tuple[dict[str, str] | None, str]:
+    from zhenxun.services.installer_network import installer_environment
+
     with tempfile.TemporaryDirectory(prefix="zhenxun_nb_analyze_") as root:
         directory = Path(root)
         source = directory / "requirements.in"
@@ -586,7 +589,7 @@ async def _compile(
             cwd=str(Path.cwd()),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env={**os.environ, "UV_NO_PROGRESS": "1"},
+            env=installer_environment(),
         )
         stdout, stderr = await process.communicate()
         details = safe_process_error((stderr or stdout).decode(errors="replace"))

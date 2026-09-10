@@ -1036,100 +1036,137 @@ class LifecycleKernel:
                 raise error
 
     async def _start_subset(self, pending: set[str], started: list[str]) -> None:
-        while pending:
-            if self._shutdown_requested:
-                raise asyncio.CancelledError
-            blocked = [
-                component_id
-                for component_id in pending
-                if any(
-                    self._registrations[dependency].runtime.state
-                    in {ComponentState.DEGRADED, ComponentState.FAILED}
-                    for dependency in self._registrations[component_id].spec.depends_on
-                )
-            ]
-            for component_id in sorted(blocked):
-                pending.remove(component_id)
-                registration = self._registrations[component_id]
-                registration.runtime.error_code = "component_dependency_not_ready"
-                registration.runtime.health = "blocked"
-                registration.runtime.state = (
-                    ComponentState.FAILED
-                    if registration.spec.failure_policy == "fatal"
-                    else ComponentState.DEGRADED
-                )
-                self._emit("dependency_blocked", component_id)
-                if registration.spec.failure_policy == "fatal":
-                    raise LifecycleError(
-                        f"component_dependency_not_ready:{component_id}"
+        running: dict[asyncio.Task, str] = {}
+        queued_at = time.monotonic()
+        try:
+            while pending or running:
+                if self._shutdown_requested:
+                    raise asyncio.CancelledError
+                for component_id in sorted(pending):
+                    registration = self._registrations[component_id]
+                    if not any(
+                        self._registrations[dependency].runtime.state
+                        in {ComponentState.DEGRADED, ComponentState.FAILED}
+                        for dependency in registration.spec.depends_on
+                    ):
+                        continue
+                    pending.remove(component_id)
+                    registration.runtime.error_code = "component_dependency_not_ready"
+                    registration.runtime.health = "blocked"
+                    registration.runtime.state = (
+                        ComponentState.FAILED
+                        if registration.spec.failure_policy == "fatal"
+                        else ComponentState.DEGRADED
                     )
-            if not pending:
-                return
-            ready = [
-                component_id
-                for component_id in pending
-                if all(
-                    self._registrations[dependency].runtime.state
-                    is ComponentState.READY
-                    for dependency in self._registrations[component_id].spec.depends_on
+                    self._emit("dependency_blocked", component_id)
+                    if registration.spec.failure_policy == "fatal":
+                        raise LifecycleError(
+                            f"component_dependency_not_ready:{component_id}"
+                        )
+                ready = sorted(
+                    component_id
+                    for component_id in pending
+                    if all(
+                        self._registrations[dependency].runtime.state
+                        is ComponentState.READY
+                        for dependency in self._registrations[
+                            component_id
+                        ].spec.depends_on
+                    )
                 )
-            ]
-            if not ready:
-                raise LifecycleError(
-                    f"component_dependencies_not_ready:{','.join(sorted(pending))}"
+                active_specs = [
+                    self._registrations[item].spec for item in running.values()
+                ]
+                # Keep priority barriers, but release same-priority dependants as
+                # soon as their own prerequisite finishes, not the entire batch.
+                priority = (
+                    active_specs[0].priority
+                    if active_specs
+                    else min(
+                        (self._registrations[item].spec.priority for item in ready),
+                        default=None,
+                    )
                 )
-            min_priority = min(
-                self._registrations[component_id].spec.priority
-                for component_id in ready
-            )
-            batch_candidates = sorted(
-                component_id
-                for component_id in ready
-                if self._registrations[component_id].spec.priority == min_priority
-            )
-            batch: list[str] = []
-            groups: set[str] = set()
-            for component_id in batch_candidates:
-                spec = self._registrations[component_id].spec
-                group = spec.resource_group or component_id
-                if batch and not spec.parallel_safe:
-                    continue
-                if batch and not all(
-                    self._registrations[item].spec.parallel_safe for item in batch
-                ):
-                    continue
-                if group in groups:
-                    continue
-                batch.append(component_id)
-                groups.add(group)
-                if not spec.parallel_safe:
+                groups = {
+                    spec.resource_group or spec.component_id for spec in active_specs
+                }
+                exclusive = any(not spec.parallel_safe for spec in active_specs)
+                for component_id in ready:
+                    spec = self._registrations[component_id].spec
+                    group = spec.resource_group or component_id
+                    if len(running) >= 4 or exclusive:
+                        break
+                    if spec.priority != priority or group in groups:
+                        continue
+                    if running and not spec.parallel_safe:
+                        continue
+                    pending.remove(component_id)
+                    task = asyncio.create_task(
+                        self._start_one(component_id, queued_at=queued_at),
+                        name=f"lifecycle-start:{component_id}",
+                    )
+                    running[task] = component_id
+                    groups.add(group)
+                    exclusive = not spec.parallel_safe
+                if not running:
+                    if pending:
+                        raise LifecycleError(
+                            f"component_dependencies_not_ready:{','.join(sorted(pending))}"
+                        )
                     break
-            results = await asyncio.gather(
-                *(self._start_one(component_id) for component_id in batch),
-                return_exceptions=True,
-            )
-            fatal: BaseException | None = None
-            for component_id, result in zip(batch, results):
-                pending.remove(component_id)
-                registration = self._registrations[component_id]
-                if isinstance(result, BaseException):
-                    if registration.spec.failure_policy == "fatal" and fatal is None:
-                        fatal = result
-                    continue
-                if registration.runtime.state is ComponentState.READY:
-                    started.append(component_id)
-            if fatal is not None:
-                raise fatal
+                done, _ = await asyncio.wait(
+                    running, return_when=asyncio.FIRST_COMPLETED
+                )
+                fatal = None
+                for task in sorted(done, key=lambda item: running[item]):
+                    component_id = running.pop(task)
+                    registration = self._registrations[component_id]
+                    try:
+                        task.result()
+                    except BaseException as error:
+                        fatal = fatal or error
+                    if registration.runtime.state is ComponentState.READY:
+                        started.append(component_id)
+                if fatal is not None:
+                    raise fatal
+        finally:
+            if running:
+                for task in running:
+                    task.cancel()
+                done, unresolved = await asyncio.wait(
+                    running, timeout=remaining_timeout(5.0)
+                )
+                for task in done:
+                    if not task.cancelled():
+                        task.exception()
+                    component_id = running[task]
+                    if (
+                        self._registrations[component_id].runtime.state
+                        is ComponentState.READY
+                    ):
+                        started.append(component_id)
+                for task in unresolved:
+                    self.require_recovery(running[task])
+                    task.add_done_callback(
+                        lambda completed: completed.exception()
+                        if not completed.cancelled()
+                        else None
+                    )
 
-    async def _start_one(self, component_id: str) -> None:
+    async def _start_one(
+        self, component_id: str, *, queued_at: float | None = None
+    ) -> None:
         if self._shutdown_requested:
             raise asyncio.CancelledError
         registration = self._registrations[component_id]
         runtime = registration.runtime
         runtime.state = ComponentState.STARTING
         runtime.error_code = None
-        runtime.metadata = {}
         started_at = time.monotonic()
+        runtime.metadata = {}
+        runtime.dependency_wait_ms = (
+            round((started_at - queued_at) * 1000, 2) if queued_at is not None else 0.0
+        )
         context = LifecycleContext(self, registration.spec)
         registration.context = context
         registration.controller = None
@@ -1162,7 +1199,7 @@ class LifecycleKernel:
             if isinstance(result, RuntimeHandle):
                 if result.health != "healthy":
                     raise LifecycleError("component_health_failed")
-                runtime.metadata = dict(result.metadata)
+                runtime.metadata.update(result.metadata)
                 registration.controller = result.controller
                 result = result.value
             registration.value = context.value = result

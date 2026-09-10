@@ -46,6 +46,9 @@ def archive_dependency_contract() -> dict[str, Any]:
             )
     requirements: set[str] = set()
     packages: dict[str, str] = {}
+    wheels_only_packages: set[str] = set()
+    source_build_packages: set[str] = set()
+    source_revisions: set[str] = set()
     for _key, receipt in records:
         if not isinstance(receipt, dict):
             raise ArchiveDependencyConflict("archive_dependency_receipt_invalid")
@@ -77,6 +80,16 @@ def archive_dependency_contract() -> dict[str, Any]:
             if name in local_pins and local_pins[name] != version:
                 raise ArchiveDependencyConflict()
             local_pins[name] = version
+            if receipt.get("dependency_source_build") is not True:
+                wheels_only_packages.add(name)
+            else:
+                revision = receipt.get("dependency_source_revision")
+                if not isinstance(revision, str) or len(revision) != 64:
+                    raise ArchiveDependencyConflict(
+                        "archive_dependency_receipt_invalid"
+                    )
+                source_revisions.add(revision)
+                source_build_packages.add(name)
         # One receipt cannot borrow missing evidence from another archive.
         for requirement in parsed:
             if requirement.marker and not requirement.marker.evaluate():
@@ -94,6 +107,9 @@ def archive_dependency_contract() -> dict[str, Any]:
         "requirements": sorted(requirements),
         "packages": dict(sorted(packages.items())),
         "store_keys": sorted({key for key, _ in records}),
+        "wheels_only_packages": sorted(wheels_only_packages),
+        "source_build_packages": sorted(source_build_packages),
+        "source_revisions": sorted(source_revisions),
     }
 
 

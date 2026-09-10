@@ -402,7 +402,7 @@ class PluginRuntimeManager:
         ):
             raise NoneBotCompatibilityError("provider_round_trip_failed")
 
-    def _build_loaded_plugin_index(
+    def _capture_loaded_plugin_index(
         self,
     ) -> tuple[dict[str, PluginUnit], dict[str, str]]:
         build_started = time.monotonic()
@@ -439,7 +439,6 @@ class PluginRuntimeManager:
             (time.monotonic() - build_started) * 1000,
         )
 
-        classification_started = time.monotonic()
         units: dict[str, PluginUnit] = {}
         module_to_unit: dict[str, str] = {}
         for root_id, members in roots.items():
@@ -457,9 +456,6 @@ class PluginRuntimeManager:
                 root_path = (
                     root_file.parent if root_file.name == "__init__.py" else root_file
                 )
-                if root_path.is_dir():
-                    files.update(root_path.rglob("*.py"))
-                    files.update(root_path.glob("requirement*.txt"))
             unit = PluginUnit(
                 plugin_id=root_id,
                 module_name=root_plugin.module_name,
@@ -475,7 +471,6 @@ class PluginRuntimeManager:
                 module_names=module_names,
                 files=files,
             )
-            classify_unit(unit, self._classification_cache.get(root_id))
             for owner, dependencies in self._pending_config_dependencies.items():
                 if owner == root_id or owner.startswith(f"{root_id}:"):
                     unit.config_dependencies.update(dependencies)
@@ -493,14 +488,70 @@ class PluginRuntimeManager:
             for name in module_names:
                 module_to_unit[name] = root_id
 
+        return units, module_to_unit
+
+    @staticmethod
+    def _classify_loaded_plugin_index(index, classification_cache):
+        started = time.monotonic()
+        units, _ = index
+        for root_id, unit in units.items():
+            if unit.root and unit.root.is_dir():
+                unit.files.update(unit.root.rglob("*.py"))
+                unit.files.update(unit.root.glob("requirement*.txt"))
+            env_dependencies = set(unit.env_dependencies)
+            classify_unit(unit, classification_cache.get(root_id))
+            unit.env_dependencies.update(env_dependencies)
         startup_coordinator.record_operation(
             "runtime_index:file_classification",
             "warmup",
             "completed",
-            (time.monotonic() - classification_started) * 1000,
+            (time.monotonic() - started) * 1000,
+        )
+        return index
+
+    def _build_loaded_plugin_index(self):
+        return self._classify_loaded_plugin_index(
+            self._capture_loaded_plugin_index(), deepcopy(self._classification_cache)
         )
 
-        return units, module_to_unit
+    @staticmethod
+    def _index_files_current(index) -> bool:
+        for unit in index[0].values():
+            for name, record in unit.file_cache.items():
+                try:
+                    stat = Path(name).stat()
+                except OSError:
+                    return False
+                if any(
+                    record.get(key) != value
+                    for key, value in (
+                        ("size", stat.st_size),
+                        ("mtime_ns", stat.st_mtime_ns),
+                        ("ctime_ns", stat.st_ctime_ns),
+                    )
+                ):
+                    return False
+            if unit.root and unit.root.is_dir():
+                current = set(unit.root.rglob("*.py")) | set(
+                    unit.root.glob("requirement*.txt")
+                )
+                previous = {
+                    path for path in unit.files if path.is_relative_to(unit.root)
+                }
+                if current != previous:
+                    return False
+        return True
+
+    def _index_source_revision(self):
+        return (
+            self.generation,
+            tuple(
+                sorted(
+                    (plugin.id_, id(plugin), id(plugin.module))
+                    for plugin in get_loaded_plugins()
+                )
+            ),
+        )
 
     def _commit_loaded_plugin_index(
         self,
@@ -577,8 +628,18 @@ class PluginRuntimeManager:
         )
 
     async def discover_loaded_plugins_async(self) -> None:
-        index = await asyncio.to_thread(self._build_loaded_plugin_index)
-        self._commit_loaded_plugin_index(*index)
+        for _ in range(2):
+            revision = self._index_source_revision()
+            captured = self._capture_loaded_plugin_index()
+            cached = deepcopy(self._classification_cache)
+            index = await asyncio.to_thread(
+                self._classify_loaded_plugin_index, captured, cached
+            )
+            files_current = await asyncio.to_thread(self._index_files_current, index)
+            if files_current and revision == self._index_source_revision():
+                self._commit_loaded_plugin_index(*index)
+                return
+        raise RuntimeError("runtime_index_source_changed")
 
     def activate_loaded_incarnations(self) -> None:
         for plugin in get_loaded_plugins():

@@ -250,6 +250,7 @@ class ComponentRuntime:
     started_at: str | None = None
     stopped_at: str | None = None
     duration_ms: float | None = None
+    dependency_wait_ms: float = 0.0
     health: str = "unknown"
     error_code: str | None = None
     last_health_checked_at: str | None = None
@@ -267,6 +268,7 @@ class ComponentRuntime:
             "started_at": self.started_at,
             "stopped_at": self.stopped_at,
             "duration_ms": self.duration_ms,
+            "dependency_wait_ms": self.dependency_wait_ms,
             "health": self.health,
             "error_code": self.error_code,
             "last_health_checked_at": self.last_health_checked_at,

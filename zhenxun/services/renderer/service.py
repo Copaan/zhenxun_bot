@@ -2,6 +2,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 import hashlib
 from pathlib import Path
+import time
 from typing import Any, ClassVar
 
 import aiofiles
@@ -29,7 +30,7 @@ from zhenxun.utils.exception import RenderingError
 from zhenxun.utils.log_sanitizer import sanitize_for_logging
 from zhenxun.utils.pydantic_compat import _dump_pydantic_obj
 
-from .engine import engine_manager
+from .engine import engine_manager, stop_preparation
 from .theme import ThemeManager
 
 
@@ -54,6 +55,9 @@ class RendererService:
         self._screenshot_engine: BaseScreenshotEngine | None = None
         self._initialized = False
         self._init_lock = asyncio.Lock()
+        self._initialization_task: asyncio.Task | None = None
+        self._closed = False
+        self._context = None
         self._custom_filters: dict[str, Callable] = {}
         self._custom_globals: dict[str, Callable] = {}
 
@@ -148,7 +152,53 @@ class RendererService:
         except TemplateNotFound:
             return f"<!-- Asset not found: {namespaced_path} -->"
 
+    def bind_context(self, context) -> None:
+        self._context = context
+        if self._closed:
+            engine_manager.reopen()
+            self._closed = False
+            self._initialization_task = None
+
     async def initialize(self):
+        if self._closed:
+            raise RuntimeError("renderer_closing")
+        if self._initialized:
+            return
+        if self._initialization_task is None:
+            spawn = self._context.spawn_task if self._context else asyncio.create_task
+            self._initialization_task = spawn(
+                self._initialize(), name="renderer-service-initialize"
+            )
+        await asyncio.shield(self._initialization_task)
+
+    async def close(self) -> None:
+        self._closed = True
+        await stop_preparation(self._initialization_task)
+        await engine_manager.close()
+        self._initialized = False
+        self._initialization_task = None
+
+    async def _prepare_theme(self) -> None:
+        started = time.monotonic()
+        current_theme_name = Config.get_config("UI", "THEME", "default")
+        await self._theme_manager.load_theme(current_theme_name)
+        if self._theme_manager.current_theme:
+            self._template_engine.update_theme_loaders(
+                self._theme_manager.current_theme.assets_dir.parent
+            )
+        self._template_engine.set_global(
+            "theme", self._theme_manager.current_theme_context
+        )
+        self._template_engine.set_global(
+            "default_theme_palette", self._theme_manager.current_default_palette
+        )
+        from zhenxun.services.startup import startup_coordinator
+
+        startup_coordinator.record_operation(
+            "renderer:theme", "warmup", "completed", (time.monotonic() - started) * 1000
+        )
+
+    async def _initialize(self):
         """
         延迟初始化方法，在 on_startup 钩子中调用。
 
@@ -189,23 +239,19 @@ class RendererService:
                     "md", self._theme_manager._markdown_filter
                 )
 
-                self._screenshot_engine = await engine_manager.get_engine()
-                await engine_manager.warmup()
-
-                current_theme_name = Config.get_config("UI", "THEME", "default")
-                await self._theme_manager.load_theme(current_theme_name)
-
-                if self._theme_manager.current_theme:
-                    self._template_engine.update_theme_loaders(
-                        self._theme_manager.current_theme.assets_dir.parent
-                    )
-
-                self._template_engine.set_global(
-                    "theme", self._theme_manager.current_theme_context
+                theme_task = asyncio.create_task(
+                    self._prepare_theme(), name="renderer-theme"
                 )
-                self._template_engine.set_global(
-                    "default_theme_palette", self._theme_manager.current_default_palette
+                warmup_task = asyncio.create_task(
+                    engine_manager.warmup(), name="renderer-service-warmup"
                 )
+                try:
+                    await asyncio.gather(theme_task, warmup_task)
+                    self._screenshot_engine = await engine_manager.get_engine()
+                except BaseException:
+                    await stop_preparation(theme_task)
+                    await stop_preparation(warmup_task)
+                    raise
 
                 self._initialized = True
             except Exception as e:
