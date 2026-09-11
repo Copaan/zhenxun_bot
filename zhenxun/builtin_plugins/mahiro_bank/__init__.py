@@ -145,19 +145,20 @@ async def _(session: Uninfo, arparma: Arparma, amount: Match[int]):
     amount_num = amount.result if amount.available else await get_amount("存款")
     if result := await BankManager.deposit_check(session.user.id, amount_num):
         await MessageUtils.build_message(result).finish(reply_to=True)
-    _, rate, event_rate = await BankManager.deposit(session.user.id, amount_num)
+    try:
+        _, rate, event_rate = await BankManager.deposit(session.user.id, amount_num)
+    except ValueError as error:
+        await MessageUtils.build_message(str(error)).finish(reply_to=True)
     result = (
-        f"存款成功！\n此次存款金额为: {amount.result}\n"
+        f"存款成功！\n此次存款金额为: {amount_num}\n"
         f"当前小时利率为: {rate * 100:.2f}%"
     )
     effective_hour = int(24 - datetime.now().hour)
     if event_rate:
         result += f"（小真寻偷偷将小时利率给你增加了 {event_rate:.2f}% 哦）"
-    result += (
-        f"\n预计总收益为: {int(amount.result * rate * effective_hour) or 1} 金币。"
-    )
+    result += f"\n预计总收益为: {int(amount_num * rate * effective_hour) or 1} 金币。"
     logger.info(
-        f"小真寻银行存款:{amount_num},当前存款数:{amount.result},存款小时利率: {rate}",
+        f"小真寻银行存款:{amount_num},存款小时利率: {rate}",
         arparma.header_result,
         session=session,
     )

@@ -70,6 +70,35 @@ DependencyTier = Literal[
 ]
 
 
+def _installed_distribution_details(
+    names: set[str], *, include_layer: bool = True
+) -> dict[str, dict[str, Any]]:
+    """Return distribution metadata without treating distribution names as modules."""
+    result: dict[str, dict[str, Any]] = {}
+    top_levels = importlib.metadata.packages_distributions()
+    modules: dict[str, set[str]] = {}
+    for module, distributions in top_levels.items():
+        for distribution in distributions:
+            key = canonicalize_name(distribution)
+            if key in names:
+                modules.setdefault(key, set()).add(module)
+    for distribution in importlib.metadata.distributions():
+        raw_name = distribution.metadata.get("Name")
+        if not raw_name:
+            continue
+        name = canonicalize_name(raw_name)
+        if name not in names or (not include_layer and name in result):
+            continue
+        result[name] = {
+            "distribution_name": name,
+            "version": distribution.version,
+            "top_level_modules": sorted(modules.get(name, set())),
+            "nonebot_plugin_ids": [],
+            "runtime_role": "python_dependency",
+        }
+    return result
+
+
 class DependencyAnalysisError(RuntimeError):
     def __init__(self, code: str, message: str | None = None, *, details: Any = None):
         super().__init__(f"{code}: {message}" if message else code)
@@ -884,12 +913,24 @@ async def solve_install(
     private_packages = {
         name: version for name, version in layer_packages.items() if name not in shared
     }
+    dependency_details = {
+        name: {
+            "distribution_name": name,
+            "version": version,
+            "top_level_modules": [],
+            "nonebot_plugin_ids": [],
+            "source": "source" if source_required else "wheel",
+            "runtime_role": "python_dependency",
+        }
+        for name, version in sorted(layer_packages.items())
+    }
     changes = _package_changes(layer_packages, current)
     private_changes = [
         item
         for item in [*changes["added"], *changes["changed"]]
         if item["name"] in private_packages
     ]
+    dependency_source_build_required = source_required
     root_files = metadata.get("urls") or []
     root_wheel_available = any(
         str(item.get("filename", "")).endswith(".whl")
@@ -902,7 +943,8 @@ async def solve_install(
         for item in root_files
         if isinstance(item, dict)
     )
-    source_required = source_required or not root_wheel_available
+    plugin_source_build_required = not root_wheel_available
+    source_required = dependency_source_build_required or plugin_source_build_required
     if archive_wheels and source_required:
         raise DependencyAnalysisError("archive_wheel_dependencies_unresolved")
     candidate_requirement_names = {
@@ -943,6 +985,16 @@ async def solve_install(
         ],
         "non_core_changes": [*shared_changes, *changes["changed"]],
         "source_build_required": source_required,
+        "dependency_source_build_required": dependency_source_build_required,
+        "plugin_source_build_required": plugin_source_build_required,
+        "source_build_reasons": [
+            *(
+                ["dependency_wheel_unavailable"]
+                if dependency_source_build_required
+                else []
+            ),
+            *(["plugin_wheel_unavailable"] if plugin_source_build_required else []),
+        ],
         "pure_python_candidate": (
             pure_root_wheel and not source_required and not overrides
         ),
@@ -950,6 +1002,7 @@ async def solve_install(
         "resolver_note": strict_error if relaxed else None,
         "solver_policy_version": SOLVER_POLICY_VERSION,
         "candidate_inputs": candidate_inputs,
+        "dependency_details": dependency_details,
         "database_migration_possible": database_migration_possible,
         "database_type": database_type,
     }
@@ -1082,6 +1135,17 @@ async def preflight_source_requirements(files: list[Path]) -> dict[str, Any]:
         "resolved_packages": resolved,
         "package_changes": _package_changes(resolved, current),
         "candidate_inputs": candidate_inputs,
+        "dependency_details": {
+            name: {
+                "distribution_name": name,
+                "version": version,
+                "top_level_modules": [],
+                "nonebot_plugin_ids": [],
+                "source": "source" if source_build_required else "wheel",
+                "runtime_role": "python_dependency",
+            }
+            for name, version in sorted(resolved.items())
+        },
         "source_build_required": source_build_required,
         "source_build_detail": wheel_error if source_build_required else None,
     }

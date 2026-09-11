@@ -18,6 +18,7 @@ from zhenxun.models.goods_info import GoodsInfo
 from zhenxun.models.group_member_info import GroupInfoUser
 from zhenxun.models.sign_user import SignUser
 from zhenxun.models.user_console import UserConsole
+from zhenxun.services.db_context import database_ready
 from zhenxun.services.log import logger
 from zhenxun.utils.decorator.shop import shop_register
 from zhenxun.utils.manager.priority_manager import PriorityLifecycle
@@ -30,6 +31,9 @@ driver: Driver = nonebot.get_driver()
 @driver.on_bot_connect
 async def _(bot: Bot):
     logger.debug(f"Bot: {bot.self_id} 建立连接...")
+    if not database_ready():
+        logger.warning("bot_connect_database_not_ready: 跳过连接记录，数据库尚未就绪")
+        return
     storage_bot_id = PlatformUtils.get_storage_bot_id(bot)
     await BotConnectLog.create(
         bot_id=storage_bot_id,
@@ -49,6 +53,9 @@ async def _(bot: Bot):
 @driver.on_bot_disconnect
 async def _(bot: Bot):
     logger.debug(f"Bot: {bot.self_id} 断开连接...")
+    if not database_ready():
+        logger.debug("bot_disconnect_database_not_ready: 跳过断连记录")
+        return
     try:
         await BotConnectLog.create(
             bot_id=PlatformUtils.get_storage_bot_id(bot),

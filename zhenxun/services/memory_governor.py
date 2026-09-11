@@ -287,9 +287,11 @@ def _get_total_rss() -> int | None:
     try:
         import psutil
 
+        from zhenxun.utils.process_tree import verified_descendants
+
         process = psutil.Process()
         total = process.memory_info().rss
-        for child in process.children(recursive=True):
+        for child in verified_descendants(process):
             with contextlib.suppress(Exception):
                 total += child.memory_info().rss
         return int(total)

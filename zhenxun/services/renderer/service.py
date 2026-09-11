@@ -165,10 +165,16 @@ class RendererService:
         if self._initialized:
             return
         if self._initialization_task is None:
-            spawn = self._context.spawn_task if self._context else asyncio.create_task
-            self._initialization_task = spawn(
-                self._initialize(), name="renderer-service-initialize"
-            )
+            if self._context:
+                self._initialization_task = self._context.spawn_task(
+                    self._initialize(),
+                    name="renderer-service-initialize",
+                    persistent=False,
+                )
+            else:
+                self._initialization_task = asyncio.create_task(
+                    self._initialize(), name="renderer-service-initialize"
+                )
         await asyncio.shield(self._initialization_task)
 
     async def close(self) -> None:

@@ -99,6 +99,12 @@ def register_low_priority_writer(config: LowPriorityWriterConfig) -> None:
 
 async def append_low_priority_record(name: str, record: Any) -> bool:
     """Append a record without doing DB work in the caller's hot path."""
+    from .message_execution import current_execution
+
+    if name in {"chat_history", "statistics"} and current_execution.get() is not None:
+        from .message_inbox import message_inbox
+
+        return await message_inbox.enqueue_delivery(name, record)
     state = _WRITERS.get(name)
     if state is None:
         raise KeyError(f"low priority writer not registered: {name}")

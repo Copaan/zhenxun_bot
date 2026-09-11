@@ -187,10 +187,12 @@ class SideEffectCommit:
             return
         try:
             await _release_reservation(record.reservation)
-        finally:
-            record.state = "released"
-            record.released_at = time.monotonic()
-            record.reason = reason
+        except BaseException:
+            record.reason = "release_unconfirmed"
+            raise
+        record.state = "released"
+        record.released_at = time.monotonic()
+        record.reason = reason
 
     async def reserve_limit(self, reservation: ReservationLike) -> None:
         await self.reserve("limit", reservation)
@@ -227,8 +229,17 @@ class SideEffectCommit:
         await self.release("gold", reason)
 
     async def rollback_all(self, reason: str | None = None) -> None:
+        first_error = None
         for kind in list(self._reservations):
-            await self.release(kind, reason)
+            try:
+                await self.release(kind, reason)
+            except BaseException as error:
+                # Fee and rate-limit reservations own independent resources.
+                # A failed refund remains pending while the others are released.
+                if first_error is None:
+                    first_error = error
+        if first_error is not None:
+            raise first_error
 
     async def commit_all(self, *, order: Sequence[str] = ("gold", "limit")) -> None:
         for name in order:

@@ -14,6 +14,7 @@ from typing import Any, ClassVar
 import uuid
 
 from zhenxun.utils.atomic_json import read_json_locked, write_json_locked
+from zhenxun.utils.process_tree import verified_descendants
 
 from .deadline import ShutdownBudget, current_budget, shutdown_budget
 from .diagnostics import merge_terminal_receipt
@@ -83,9 +84,11 @@ class ProcessHandle:
                     or not process.is_running()
                     or process.status() == psutil.STATUS_ZOMBIE
                 ):
+                    self.identities.pop(pid, None)
                     continue
                 live.append(process)
-            except psutil.Error:
+            except psutil.NoSuchProcess:
+                self.identities.pop(pid, None)
                 continue
         now = time.monotonic()
         if discover or not self.accepting or now >= self._next_tree_discovery:
@@ -100,7 +103,7 @@ class ProcessHandle:
                     continue
                 try:
                     self._tree_scan_count += 1
-                    children = process.children(recursive=True)
+                    children = verified_descendants(process)
                     covered.update(child.pid for child in children)
                     for child in children:
                         created = child.create_time()
@@ -111,7 +114,7 @@ class ProcessHandle:
                         if child.pid not in known and child.is_running():
                             live.append(child)
                             known.add(child.pid)
-                except psutil.Error:
+                except psutil.NoSuchProcess:
                     continue
         return live
 

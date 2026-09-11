@@ -3,7 +3,6 @@ from __future__ import annotations
 from zhenxun.models.user_gold_log import UserGoldLog
 from zhenxun.services.low_priority_writer import (
     LowPriorityWriterConfig,
-    append_low_priority_record,
     flush_low_priority_writer,
     register_low_priority_writer,
 )
@@ -52,8 +51,9 @@ async def append_user_gold_log(
     handle: GoldHandle,
     source: str | None = None,
 ) -> None:
-    record = UserGoldLog(user_id=user_id, gold=gold, handle=handle, source=source)
-    await append_low_priority_record(_WRITER_NAME, record)
+    # Financial evidence belongs to the caller's transaction, never a volatile
+    # operational buffer. The old flush entry point remains for pending batches.
+    await UserGoldLog.create(user_id=user_id, gold=gold, handle=handle, source=source)
 
 
 async def flush_user_gold_log_buffer(reason: str) -> int:

@@ -578,11 +578,18 @@ def _target_manifest(analysis: dict[str, Any]) -> dict[str, Any]:
             ),
         }
     core = protected_core()
-    target["packages"] = {
-        name: {"version": version}
-        for name, version in analysis["plan"]["resolved_packages"].items()
-        if canonicalize_name(name) not in core
-    }
+    details = analysis["plan"].get("dependency_details") or {}
+    target["packages"] = {}
+    for name, version in analysis["plan"]["resolved_packages"].items():
+        if canonicalize_name(name) in core:
+            continue
+        item = deepcopy(details.get(name) or {})
+        item["distribution_name"] = str(item.get("distribution_name") or name)
+        item["version"] = str(version)
+        item.setdefault("top_level_modules", [])
+        item.setdefault("nonebot_plugin_ids", [])
+        item.setdefault("runtime_role", "python_dependency")
+        target["packages"][name] = item
     preserve_archive_dependencies(target, core=core)
     return target
 

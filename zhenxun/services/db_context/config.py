@@ -15,13 +15,13 @@ LOG_COMMAND = "DbContext"
 
 
 POSTGRESQL_CONFIG = {
-    "max_size": 30,  # 最大连接数
-    "min_size": 5,  # 最小保持的连接数（可选）
+    "maxsize": 30,  # 最大连接数
+    "minsize": 5,  # 最小保持的连接数（可选）
 }
 
 
 MYSQL_CONFIG = {
-    "max_connections": 20,  # 最大连接数
+    "maxsize": 20,  # 最大连接数
     "connect_timeout": 30,  # 连接超时（可选）
 }
 

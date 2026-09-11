@@ -34,6 +34,13 @@ class BotGroupPolicyService:
         self._queue = asyncio.Queue(maxsize=1000)
         self.context = None
         self.loaded = False
+        self.write_counts = {
+            "queued": 0,
+            "capacity_skipped": 0,
+            "shutdown_pending": 0,
+            "write_failed": 0,
+            "written": 0,
+        }
 
     async def start(self, context):
         self.context = context
@@ -53,6 +60,7 @@ class BotGroupPolicyService:
         context.spawn_task(self._write_memberships(), name="bot-group-memberships")
 
     def close(self):
+        self.write_counts["shutdown_pending"] += len(self._pending)
         self.loaded = False
         self.context = None
         self._pending.clear()
@@ -77,8 +85,9 @@ class BotGroupPolicyService:
         try:
             self._queue.put_nowait(key)
             self._pending.add(key)
+            self.write_counts["queued"] += 1
         except asyncio.QueueFull:
-            pass
+            self.write_counts["capacity_skipped"] += 1
 
     async def _write_memberships(self):
         while True:
@@ -89,7 +98,9 @@ class BotGroupPolicyService:
                 await self.record_memberships(
                     [key_fields(key) for key in batch], source="event"
                 )
+                self.write_counts["written"] += len(batch)
             except Exception:
+                self.write_counts["write_failed"] += len(batch)
                 logger.warning(
                     "Bot群关联写入失败 | code=group_membership_write_failed",
                     "PluginPolicy",

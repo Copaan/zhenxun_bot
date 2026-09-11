@@ -1024,7 +1024,7 @@ class LifecycleKernel:
                 raise
 
     async def stop_components(self, component_ids: set[str]) -> None:
-        async with self._operation_lock:
+        async with self._shutdown_operation_lock():
             selected = self._component_stop_order(component_ids)
             error = None
             for component_id in selected:

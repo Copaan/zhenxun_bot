@@ -158,13 +158,17 @@ class BoundedTTLCache(Generic[K, V]):
             self._hits += 1
             return value
 
-    async def set(self, key: K, value: V) -> bool:
+    async def set(
+        self, key: K, value: V, *, valid_if: Callable[[], bool] | None = None
+    ) -> bool:
         value_size = self._value_size(value)
         if self._max_total_bytes is not None and value_size > self._max_total_bytes:
             return False
 
         now = time.monotonic()
         async with self._lock:
+            if valid_if is not None and not valid_if():
+                return False
             self._remove_key_nolock(key)
             self._cache[key] = (self._expire_at(now), value, value_size)
             self._total_bytes += value_size

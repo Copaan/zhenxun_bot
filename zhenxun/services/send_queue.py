@@ -151,6 +151,15 @@ def _log_queue_pressure(reason: str) -> None:
     )
 
 
+async def _invoke_adapter_api(
+    adapter: OneBotV11Adapter, bot: OneBotV11Bot, api: str, **data: Any
+) -> Any:
+    managed = getattr(adapter, "_call_api_unqueued", None)
+    if callable(managed):
+        return await managed(bot, api, **data)
+    return await _ORIG_CALL_API(adapter, bot, api, **data)
+
+
 async def _direct_call_api(
     adapter: OneBotV11Adapter,
     bot: Bot,
@@ -161,7 +170,7 @@ async def _direct_call_api(
     await _rate_limit()
     async with _API_SEMAPHORE:
         try:
-            result = await _ORIG_CALL_API(
+            result = await _invoke_adapter_api(
                 adapter,
                 cast(OneBotV11Bot, bot),
                 api,
@@ -215,10 +224,33 @@ async def _queued_call_api(
     api: str,
     **data: Any,
 ):
+    from .message_execution import current_execution, operation_key
+
+    execution = current_execution.get()
+    if execution is None or api not in _OBSERVED_SEND_APIS:
+        return await _queued_call_api_impl(adapter, bot, api, **data)
+    identity = operation_key(f"reply:{api}", str(bot.self_id))
+    execution.deliveries[identity] = "sending"
+    try:
+        result = await _queued_call_api_impl(adapter, bot, api, **data)
+    except BaseException:
+        execution.deliveries[identity] = "reply_unconfirmed"
+        execution.errors.append("reply_unconfirmed")
+        raise
+    execution.deliveries[identity] = "reply_delivered"
+    return result
+
+
+async def _queued_call_api_impl(
+    adapter: OneBotV11Adapter,
+    bot: Bot,
+    api: str,
+    **data: Any,
+):
     if _send_platform_scope(adapter) != "qq_client":
-        return await _ORIG_CALL_API(adapter, cast(OneBotV11Bot, bot), api, **data)
+        return await _invoke_adapter_api(adapter, cast(OneBotV11Bot, bot), api, **data)
     if api not in _SEND_APIS:
-        return await _ORIG_CALL_API(adapter, cast(OneBotV11Bot, bot), api, **data)
+        return await _invoke_adapter_api(adapter, cast(OneBotV11Bot, bot), api, **data)
     if _STOPPING:
         return await _direct_call_api(
             adapter,

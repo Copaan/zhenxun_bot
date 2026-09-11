@@ -8,7 +8,6 @@ from tortoise.backends.base.client import BaseDBAsyncClient
 from tortoise.exceptions import (
     IntegrityError,
     MultipleObjectsReturned,
-    TransactionManagementError,
 )
 from tortoise.manager import Manager
 from tortoise.models import Model as TortoiseModel
@@ -16,6 +15,7 @@ from tortoise.queryset import QuerySet
 from tortoise.transactions import in_transaction
 
 from zhenxun.services.cache import CacheRoot
+from zhenxun.services.cache.write import WriteQuery, notify_bulk_write, write_boundary
 from zhenxun.services.log import logger
 from zhenxun.services.platform_identity import guard_legacy_identity_write
 from zhenxun.utils.enum import DbLockType
@@ -30,11 +30,11 @@ class _PlatformGuardedQuerySet(QuerySet):
 
     def update(self, **kwargs: Any):
         self._guard_platform_write()
-        return super().update(**kwargs)
+        return WriteQuery(super().update(**kwargs), self.model)
 
     def delete(self):
         self._guard_platform_write()
-        return super().delete()
+        return WriteQuery(super().delete(), self.model)
 
     def bulk_create(
         self,
@@ -45,17 +45,20 @@ class _PlatformGuardedQuerySet(QuerySet):
         on_conflict=None,
     ):
         self._guard_platform_write()
-        return super().bulk_create(
-            objects,
-            batch_size,
-            ignore_conflicts,
-            update_fields,
-            on_conflict,
+        return WriteQuery(
+            super().bulk_create(
+                objects,
+                batch_size,
+                ignore_conflicts,
+                update_fields,
+                on_conflict,
+            ),
+            self.model,
         )
 
     def bulk_update(self, objects, fields, batch_size=None):
         self._guard_platform_write()
-        return super().bulk_update(objects, fields, batch_size)
+        return WriteQuery(super().bulk_update(objects, fields, batch_size), self.model)
 
     def raw(self, sql: str):
         self._guard_platform_write()
@@ -72,13 +75,24 @@ class Model(TortoiseModel):
     增强的ORM基类，解决锁嵌套问题
     """
 
-    sem_data: ClassVar[dict[str, dict[str, asyncio.Semaphore]]] = {}
-    _current_locks: ClassVar[dict[tuple[str, int], DbLockType]] = {}
+    sem_data: ClassVar[dict[type, dict[DbLockType, asyncio.Semaphore]]] = {}
+    _current_locks: ClassVar[
+        dict[tuple[type, asyncio.Task], tuple[DbLockType, ...]]
+    ] = {}
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
 
         cls._meta.manager = _PlatformGuardedManager(cls)
+
+        for name in ("create", "save", "delete", "get_or_create", "update_or_create"):
+            descriptor = next(
+                base.__dict__[name] for base in cls.__mro__ if name in base.__dict__
+            )
+            if isinstance(descriptor, classmethod):
+                setattr(cls, name, classmethod(write_boundary(descriptor.__func__)))
+            else:
+                setattr(cls, name, write_boundary(descriptor))
 
         is_abstract = (
             getattr(cls.Meta, "abstract", False) if hasattr(cls, "Meta") else False
@@ -138,30 +152,36 @@ class Model(TortoiseModel):
         if not enable_lock or lock_type not in enable_lock:
             return None
 
-        if cls.__name__ not in cls.sem_data:
-            cls.sem_data[cls.__name__] = {}
-        if lock_type not in cls.sem_data[cls.__name__]:
-            cls.sem_data[cls.__name__][lock_type] = asyncio.Semaphore(1)
-        return cls.sem_data[cls.__name__][lock_type]
+        if cls not in cls.sem_data:
+            cls.sem_data[cls] = {}
+        if lock_type not in cls.sem_data[cls]:
+            cls.sem_data[cls][lock_type] = asyncio.Semaphore(1)
+        return cls.sem_data[cls][lock_type]
 
     @classmethod
     def _require_lock(cls, lock_type: DbLockType) -> bool:
         """检查是否需要真正加锁"""
-        lock_key = (cls.__name__, id(asyncio.current_task()))
-        return cls._current_locks.get(lock_key) != lock_type
+        lock_key = (cls, asyncio.current_task())
+        return lock_type not in cls._current_locks.get(lock_key, ())
 
     @classmethod
     @contextlib.asynccontextmanager
     async def _lock_context(cls, lock_type: DbLockType):
         """带重入检查的锁上下文"""
-        lock_key = (cls.__name__, id(asyncio.current_task()))
+        lock_key = (cls, asyncio.current_task())
         need_lock = cls._require_lock(lock_type)
 
         if need_lock and (sem := cls.get_semaphore(lock_type)):
-            cls._current_locks[lock_key] = lock_type
             async with sem:
-                yield
-            cls._current_locks.pop(lock_key, None)
+                previous = cls._current_locks.get(lock_key, ())
+                cls._current_locks[lock_key] = (*previous, lock_type)
+                try:
+                    yield
+                finally:
+                    if previous:
+                        cls._current_locks[lock_key] = previous
+                    else:
+                        cls._current_locks.pop(lock_key, None)
         else:
             yield
 
@@ -191,22 +211,46 @@ class Model(TortoiseModel):
     ) -> tuple[Self, bool]:
         """获取或创建数据（无锁版本，依赖数据库约束）"""
         cls._guard_platform_write()
-        try:
-            result = await super().get_or_create(
-                defaults=defaults, using_db=using_db, **kwargs
-            )
-        except IntegrityError:
-            # 并发创建冲突时，回退为查询已存在记录
+        from uuid import uuid4
+
+        db = using_db or cls._choose_db(True)
+        existing = await cls.filter(**kwargs).using_db(db).get_or_none()
+        if existing is not None:
+            return existing, False
+        active = getattr(db, "_finalized", None) is False
+        context = (
+            contextlib.nullcontext(db) if active else in_transaction(db.connection_name)
+        )
+        async with context as connection:
+            savepoint = "zx_create_" + uuid4().hex
+            await connection.execute_query(f"SAVEPOINT {savepoint}")
             try:
-                if using_db is not None:
-                    obj = await cls.filter(**kwargs).using_db(using_db).get()
-                    result = (obj, False)
-                else:
-                    raise TransactionManagementError("fallback to new transaction")
-            except TransactionManagementError:
-                async with in_transaction() as connection:
-                    obj = await cls.filter(**kwargs).using_db(connection).get()
-                    result = (obj, False)
+                result = (
+                    await cls.create(
+                        using_db=connection, **{**(defaults or {}), **kwargs}
+                    ),
+                    True,
+                )
+            except IntegrityError:
+                await connection.execute_query(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                obj = (
+                    await cls.filter(**kwargs)
+                    .using_db(connection)
+                    .select_for_update()
+                    .get_or_none()
+                )
+                if obj is None:
+                    raise
+                result = obj, False
+            except BaseException:
+                with contextlib.suppress(Exception):
+                    await connection.execute_query(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                raise
+            finally:
+                # Release errors after a successful write must remain visible;
+                # don't attempt SQL on an already disconnected/aborted transaction.
+                if "result" in locals():
+                    await connection.execute_query(f"RELEASE SAVEPOINT {savepoint}")
 
         if result[1] and (cache_type := cls.get_cache_type()):
             await CacheRoot.invalidate_cache(cache_type, cls.get_cache_key(result[0]))
@@ -222,26 +266,30 @@ class Model(TortoiseModel):
         """更新或创建数据（使用UPSERT锁）"""
         cls._guard_platform_write()
         async with cls._lock_context(DbLockType.UPSERT):
-            try:
-                # 先尝试更新（带行锁）
-                async with in_transaction():
-                    if obj := await cls.filter(**kwargs).select_for_update().first():
-                        await obj.update_from_dict(defaults or {})
-                        await obj.save()
-                        result = (obj, False)
-                    else:
-                        obj = await super().create(**kwargs, **(defaults or {}))
-                        result = (obj, True)
-
-                if cache_type := cls.get_cache_type():
-                    await CacheRoot.invalidate_cache(
-                        cache_type, cls.get_cache_key(result[0])
+            db = using_db or cls._choose_db(True)
+            active = getattr(db, "_finalized", None) is False
+            context = (
+                contextlib.nullcontext(db)
+                if active
+                else in_transaction(db.connection_name)
+            )
+            async with context as connection:
+                obj, created = await cls.get_or_create(
+                    defaults=defaults, using_db=connection, **kwargs
+                )
+                if not created:
+                    obj = (
+                        await cls.filter(pk=obj.pk)
+                        .using_db(connection)
+                        .select_for_update()
+                        .get()
                     )
-                return result
-            except IntegrityError:
-                # 处理极端情况下的唯一约束冲突
-                obj = await cls.get(**kwargs)
-                return obj, False
+                    obj.update_from_dict(defaults or {})
+                    if defaults:
+                        await obj.save(
+                            using_db=connection, update_fields=list(defaults)
+                        )
+                return obj, created
 
     async def save(
         self,
@@ -264,6 +312,8 @@ class Model(TortoiseModel):
                 force_create=force_create,
                 force_update=force_update,
             )
+            if self._meta.db_table in {"group_info_users", "group_plugin_settings"}:
+                await notify_bulk_write(type(self))
             if cache_type := getattr(self, "cache_type", None):
                 await CacheRoot.invalidate_cache(
                     cache_type, self.__class__.get_cache_key(self)
@@ -275,6 +325,8 @@ class Model(TortoiseModel):
         key = self.__class__.get_cache_key(self) if cache_type else None
         # 执行删除操作
         await super().delete(using_db=using_db)
+        if self._meta.db_table in {"group_info_users", "group_plugin_settings"}:
+            await notify_bulk_write(type(self))
 
         # 清除缓存
         if cache_type:

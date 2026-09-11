@@ -48,6 +48,7 @@ __all__ = [
     "DbConnectError",
     "DbUrlIsNode",
     "Model",
+    "database_ready",
     "disconnect",
     "init",
     "with_db_timeout",
@@ -57,6 +58,12 @@ driver = nonebot.get_driver()
 
 _SCRIPT_HASH_DIR = Path() / "data" / ".db_script_hashes"
 _TRUE_VALUES = {"1", "true", "yes", "on"}
+_database_ready = False
+
+
+def database_ready() -> bool:
+    """Only admit connection-hook writes after schema preparation has succeeded."""
+    return _database_ready
 
 
 def _connection_dialect() -> Dialect:
@@ -147,8 +154,8 @@ def get_config() -> dict:
                 "user": parsed.username,
                 "password": parsed.password,
                 "database": parsed.path[1:],
+                **POSTGRESQL_CONFIG,
             },
-            **POSTGRESQL_CONFIG,
         }
     elif parsed.scheme == "mysql":
         config["connections"]["default"] = {
@@ -159,8 +166,8 @@ def get_config() -> dict:
                 "user": parsed.username,
                 "password": parsed.password,
                 "database": parsed.path[1:],
+                **MYSQL_CONFIG,
             },
-            **MYSQL_CONFIG,
         }
     elif parsed.scheme == "sqlite":
         if is_sqlite_memory_url(BotConfig.db_url):
@@ -173,8 +180,8 @@ def get_config() -> dict:
             "engine": "tortoise.backends.sqlite",
             "credentials": {
                 "file_path": sqlite_file_path,
+                **SQLITE_CONFIG,
             },
-            **SQLITE_CONFIG,
         }
     return config
 
@@ -189,7 +196,9 @@ def get_config() -> dict:
     config_keys=("DB_URL", "DATABASE_MODELS", "DATABASE_SCHEMA"),
 )
 async def init():
-    global MODELS, SCRIPT_METHOD
+    global MODELS, SCRIPT_METHOD, _database_ready
+
+    _database_ready = False
 
     env_example_file = Path() / ".env.example"
     env_dev_file = Path() / ".env.dev"
@@ -368,6 +377,7 @@ async def init():
         await Tortoise.generate_schemas()
         logger.debug("数据库表结构生成完毕!")
         await repair_safe_schema_drift()
+        _database_ready = True
         logger.info("Database loaded successfully!")
     except Exception as e:
         raise DbConnectError(f"数据库连接错误... e:{e}") from e
@@ -375,6 +385,9 @@ async def init():
 
 @PriorityLifecycle.on_shutdown(priority=100, component_id="management:database")
 async def disconnect():
+    global _database_ready
+
+    _database_ready = False
     try:
         await connections.close_all()
     except ConfigurationError:

@@ -237,6 +237,14 @@ class CacheManager:
         if not self.enabled or cache_config.cache_mode == CacheMode.NONE:
             return True
 
+        from .write import defer
+
+        if defer(
+            ("model_invalidate", str(cache_type), repr(key)),
+            lambda: self.invalidate_cache(cache_type, key),
+        ):
+            return True
+
         try:
             if key is not None:
                 # 只清除特定的缓存项
@@ -267,6 +275,10 @@ class CacheManager:
             Any: 缓存数据，如果不存在返回默认值
         """
 
+        from .write import in_write_transaction
+
+        if in_write_transaction():
+            return default
         # 如果缓存被禁用或缓存模式为NONE，直接返回默认值
         if not self.enabled or cache_config.cache_mode == CacheMode.NONE:
             return default
@@ -314,6 +326,11 @@ class CacheManager:
             bool: 是否成功
         """
         from zhenxun.services.db_context import DB_TIMEOUT_SECONDS
+
+        from .write import in_write_transaction
+
+        if in_write_transaction():
+            return False
 
         # 如果缓存被禁用或缓存模式为NONE，直接返回False
         if not self.enabled or cache_config.cache_mode == CacheMode.NONE:

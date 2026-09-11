@@ -8,6 +8,7 @@ from zhenxun.configs.utils import PluginExtraData
 from zhenxun.models.bot_console import BotConsole
 from zhenxun.models.plugin_info import PluginInfo
 from zhenxun.models.task_info import TaskInfo
+from zhenxun.services.db_context import database_ready
 from zhenxun.services.log import logger
 from zhenxun.utils.enum import PluginType
 from zhenxun.utils.platform import PlatformUtils
@@ -47,6 +48,12 @@ async def init_bot_console(bot: Bot):
     参数:
         bot: Bot
     """
+
+    if not database_ready():
+        logger.warning(
+            "bot_console_database_not_ready: 跳过Bot管理初始化，数据库尚未就绪"
+        )
+        return
 
     async def _filter_blocked_items(
         items_list: list[str], block_list: list[str]

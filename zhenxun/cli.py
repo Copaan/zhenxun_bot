@@ -257,8 +257,7 @@ def _run_worker() -> None:
         render_playwright={"channel": htmlrender_browser_channel},
     )
 
-    from nonebot.adapters.onebot.v11 import Adapter as OneBotV11Adapter
-
+    from zhenxun.adapters.onebot_managed import ManagedOneBotAdapter as OneBotV11Adapter
     from zhenxun.configs.config import BotConfig
 
     driver = nonebot.get_driver()

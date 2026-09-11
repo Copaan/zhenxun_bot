@@ -8,6 +8,7 @@ from nonebot_plugin_uninfo import Uninfo
 from zhenxun.configs.utils import PluginExtraData
 from zhenxun.models.sign_user import SignUser
 from zhenxun.models.user_console import UserConsole
+from zhenxun.services.asset_transaction import asset_transaction
 from zhenxun.services.log import logger
 from zhenxun.utils.enum import PluginType
 from zhenxun.utils.message import MessageUtils
@@ -79,11 +80,9 @@ _impression_matcher = on_alconna(
 
 @_gold_matcher.handle()
 async def _(session: Uninfo, arparma: Arparma, gold: int, at_user: At):
-    user = await UserConsole.get_user(
-        at_user.target, PlatformUtils.get_platform(session)
+    await UserConsole.set_gold(
+        at_user.target, gold, PlatformUtils.get_platform(session)
     )
-    user.gold = gold
-    await user.save(update_fields=["gold"])
     await MessageUtils.build_message(
         ["成功将用户", at_user, f"的金币设置为 {gold}"]
     ).send(reply_to=True)
@@ -97,13 +96,13 @@ async def _(session: Uninfo, arparma: Arparma, gold: int, at_user: At):
 @_impression_matcher.handle()
 async def _(session: Uninfo, arparma: Arparma, impression: float, at_user: At):
     platform = PlatformUtils.get_platform(session)
-    user_console = await UserConsole.get_user(at_user.target, platform)
-    user, _ = await SignUser.get_or_create(
-        user_id=at_user.target,
-        defaults={"user_console": user_console, "platform": platform},
-    )
-    user.impression = Decimal(impression)
-    await user.save(update_fields=["impression"])
+    async with asset_transaction(at_user.target, platform):
+        user = await SignUser.get_user(at_user.target, platform)
+        value = Decimal(str(impression))
+        if not value.is_finite() or not 0 <= value < 10**7:
+            raise ValueError("impression_out_of_range")
+        user.impression = value
+        await user.save(update_fields=["impression"])
     await MessageUtils.build_message(
         ["成功将用户", at_user, f"的好感度设置为 {impression}"]
     ).send(reply_to=True)

@@ -125,9 +125,10 @@ async def _drop_message_before_cache_ready(event: Event, bot: Bot):
         return
     if not is_cache_ready():
         raise IgnoredException("cache not ready ignore")
+    from zhenxun.services.message_execution import current_execution
     from zhenxun.utils.platform import PlatformUtils
 
-    if connection_epochs.is_backlog(
+    if current_execution.get() is None and connection_epochs.is_backlog(
         bot, PlatformUtils.get_platform_scope(bot), getattr(event, "time", None)
     ):
         raise IgnoredException("drop backlog message")

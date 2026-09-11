@@ -13,12 +13,11 @@ from zhenxun.models.goods_info import GoodsInfo
 from zhenxun.models.sign_log import SignLog
 from zhenxun.models.sign_user import SignUser
 from zhenxun.models.user_console import UserConsole
+from zhenxun.services.asset_transaction import asset_call, asset_transaction
 from zhenxun.services.avatar_service import avatar_service
-from zhenxun.services.buffered_writers import append_user_gold_log
 from zhenxun.services.hot_query_cache import get_group_user_ids, get_member_names
 from zhenxun.services.log import logger
 from zhenxun.ui.models import ImageCell, TextCell
-from zhenxun.utils.enum import GoldHandle
 from zhenxun.utils.exception import GoodsNotFound
 from zhenxun.utils.platform import PlatformUtils
 
@@ -122,34 +121,34 @@ class SignManage:
         返回:
             Path: 卡片路径
         """
+        card_args = await cls._commit_sign(session, nickname, is_card_view)
+        return await get_card(*card_args, is_card_view=is_card_view)
+
+    @classmethod
+    @asset_call
+    async def _commit_sign(cls, session, nickname, is_card_view):
         platform = PlatformUtils.get_platform(session)
         now = datetime.now(pytz.timezone("Asia/Shanghai"))
-        user_console = await UserConsole.get_user(session.user.id, platform)
-        user, _ = await SignUser.get_or_create(
-            user_id=session.user.id,
-            defaults={"user_console": user_console, "platform": platform},
-        )
-        new_log = (
-            await SignLog.filter(user_id=session.user.id)
-            .order_by("-create_time")
-            .first()
-        )
-        log_time = None
-        if new_log:
-            log_time = new_log.create_time.astimezone(
-                pytz.timezone("Asia/Shanghai")
-            ).date()
-        if not is_card_view and (not new_log or (log_time and log_time != now.date())):
-            return await cls._handle_sign_in(user, nickname, session)
-        return await get_card(
-            user,
-            session,
-            nickname,
-            -1,
-            user_console.gold,
-            "",
-            is_card_view=is_card_view,
-        )
+        async with asset_transaction(session.user.id, platform) as user_console:
+            user, _ = await SignUser.get_or_create(
+                user_id=session.user.id,
+                defaults={"user_console": user_console, "platform": platform},
+            )
+            new_log = (
+                await SignLog.filter(user_id=session.user.id)
+                .order_by("-create_time")
+                .first()
+            )
+            log_time = (
+                new_log.create_time.astimezone(pytz.timezone("Asia/Shanghai")).date()
+                if new_log
+                else None
+            )
+            if not is_card_view and log_time != now.date():
+                card_args = await cls._handle_sign_in(user, nickname, session)
+            else:
+                card_args = (user, session, nickname, -1, user_console.gold, "")
+        return card_args
 
     @classmethod
     async def _handle_sign_in(
@@ -157,7 +156,7 @@ class SignManage:
         user: SignUser,
         nickname: str,
         session: Uninfo,
-    ) -> Path:
+    ) -> tuple:
         """签到处理
 
         参数:
@@ -175,37 +174,19 @@ class SignManage:
         specify_probability = float(user.specify_probability)
         if rand + add_probability > 0.97 or rand < specify_probability:
             impression_added *= 2
-        await SignUser.sign(user, impression_added, session.self_id, platform)
+        user = await SignUser.sign(user, impression_added, session.self_id, platform)
         gold = random.randint(1, 100)
         gift = random_event(float(user.impression))
         if isinstance(gift, int):
             gold += gift
-            user_console = await UserConsole.get_user(user.user_id, platform)
-            user_console.gold += gold
-            await user_console.save(update_fields=["gold"])
-            await append_user_gold_log(
-                user_id=user.user_id,
-                gold=gold,
-                handle=GoldHandle.GET,
-                source="sign_in",
-            )
+            await UserConsole.add_gold(user.user_id, gold, "sign_in", platform)
             gift = f"额外金币 +{gift}"
         else:
             goods = await GoodsInfo.get_or_none(goods_name=gift)
             if not goods:
                 raise GoodsNotFound("未找到商品...")
-            user_console = await UserConsole.get_user(user.user_id, platform)
-            user_console.gold += gold
-            if goods.uuid not in user_console.props:
-                user_console.props[goods.uuid] = 0
-            user_console.props[goods.uuid] += 1
-            await user_console.save(update_fields=["gold", "props"])
-            await append_user_gold_log(
-                user_id=user.user_id,
-                gold=gold,
-                handle=GoldHandle.GET,
-                source="sign_in",
-            )
+            await UserConsole.add_gold(user.user_id, gold, "sign_in", platform)
+            await UserConsole.add_props(user.user_id, goods.uuid, 1, platform)
             gift += " + 1"
         logger.info(
             f"签到成功. score: {user.impression:.2f} "
@@ -213,7 +194,7 @@ class SignManage:
             "签到",
             session=session,
         )
-        return await get_card(
+        return (
             user,
             session,
             nickname,

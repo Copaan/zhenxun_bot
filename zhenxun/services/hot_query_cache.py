@@ -2,15 +2,89 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterable
+from contextlib import nullcontext
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Literal
+from functools import wraps
+from typing import Any, Literal, TypeVar
 
 from tortoise.functions import Count
 
 from zhenxun.services.cache.bounded_ttl import BoundedTTLCache
+from zhenxun.services.cache.keyed import KeyedLocks
+from zhenxun.services.cache.write import in_write_transaction
 from zhenxun.services.db_context import with_db_timeout
 from zhenxun.services.message_load import is_db_unhealthy
+
+_revision = 0
+_READ_LOCKS = KeyedLocks()
+_DB_LOCKS = KeyedLocks()
+
+
+@dataclass
+class _ReadAttempt:
+    owner: object
+    revision: int
+    failed: bool = False
+
+
+_attempt: ContextVar[_ReadAttempt | None] = ContextVar("hot_cache_read", default=None)
+_diagnostics = {"query_failures": 0, "discarded_fills": 0}
+
+
+def guarded_read(function):
+    @wraps(function)
+    async def wrapped(*args, **kwargs):
+        current = _attempt.get()
+        task = asyncio.current_task()
+        if current is not None and current.owner is task:
+            return await function(*args, **kwargs)
+        # Normalize only for coordination, not for the actual query arguments.
+        key = (function.__name__, repr(args), repr(sorted(kwargs.items())))
+        async with nullcontext() if in_write_transaction() else _READ_LOCKS.hold(key):
+            token = _attempt.set(_ReadAttempt(task, _revision))
+            try:
+                return await function(*args, **kwargs)
+            finally:
+                _attempt.reset(token)
+
+    return wrapped
+
+
+K = TypeVar("K")
+V = TypeVar("V")
+
+
+class HotCache(BoundedTTLCache[K, V]):
+    async def get(self, key, default=None):
+        if in_write_transaction():
+            return default
+        value = await super().get(key)
+        return default if value is None else value
+
+    async def set(self, key, value):
+        if in_write_transaction():
+            return
+        attempt = _attempt.get()
+
+        def valid():
+            ok = attempt is None or (
+                not attempt.failed and attempt.revision == _revision
+            )
+            if not ok:
+                _diagnostics["discarded_fills"] += 1
+            return ok
+
+        return await super().set(key, value, valid_if=valid)
+
+
+def hot_query_snapshot():
+    return {
+        **_diagnostics,
+        "coalesced_waits": _READ_LOCKS.waits,
+        "lock_entries": len(_READ_LOCKS._entries) + len(_DB_LOCKS._entries),
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,44 +107,44 @@ def _member_cache_sizeof(members: tuple[GroupMemberSnapshot, ...]) -> int:
     return size
 
 
-_GROUP_MEMBER_CACHE = BoundedTTLCache[str, tuple[GroupMemberSnapshot, ...]](
+_GROUP_MEMBER_CACHE = HotCache[str, tuple[GroupMemberSnapshot, ...]](
     "hot_group_info_users",
     ttl_seconds=45,
     max_items=512,
     max_total_bytes=32 * 1024 * 1024,
     sizeof=_member_cache_sizeof,
 )
-_GROUP_USER_IDS_CACHE = BoundedTTLCache[str, tuple[str, ...]](
+_GROUP_USER_IDS_CACHE = HotCache[str, tuple[str, ...]](
     "hot_group_info_user_ids",
     ttl_seconds=45,
     max_items=2048,
 )
-_GROUP_MEMBER_BY_ID_CACHE = BoundedTTLCache[str, tuple[GroupMemberSnapshot | None]](
+_GROUP_MEMBER_BY_ID_CACHE = HotCache[str, tuple[GroupMemberSnapshot | None]](
     "hot_group_info_user_by_id",
     ttl_seconds=45,
     max_items=50000,
 )
-_USER_GROUP_CACHE = BoundedTTLCache[str, tuple[str, ...]](
+_USER_GROUP_CACHE = HotCache[str, tuple[str, ...]](
     "hot_group_info_user_groups",
     ttl_seconds=45,
     max_items=4096,
 )
-_USER_NAME_CACHE = BoundedTTLCache[str, str](
+_USER_NAME_CACHE = HotCache[str, str](
     "hot_group_info_user_names",
     ttl_seconds=45,
     max_items=20000,
 )
-_CHAT_RANK_CACHE = BoundedTTLCache[str, tuple[tuple[str, int], ...]](
+_CHAT_RANK_CACHE = HotCache[str, tuple[tuple[str, int], ...]](
     "hot_chat_history_rank",
     ttl_seconds=20,
     max_items=512,
 )
-_CHAT_FIRST_MSG_CACHE = BoundedTTLCache[str, tuple[datetime | None]](
+_CHAT_FIRST_MSG_CACHE = HotCache[str, tuple[datetime | None]](
     "hot_chat_history_first_msg",
     ttl_seconds=300,
     max_items=2048,
 )
-_STATISTICS_COUNT_CACHE = BoundedTTLCache[str, tuple[tuple[str, int], ...]](
+_STATISTICS_COUNT_CACHE = HotCache[str, tuple[tuple[str, int], ...]](
     "hot_statistics_plugin_counts",
     ttl_seconds=20,
     max_items=512,
@@ -101,21 +175,18 @@ async def _read_or_default(
             operation=operation,
             source="hot_query_cache",
         )
-    except TimeoutError:
+    except (TimeoutError, asyncio.TimeoutError):
+        attempt = _attempt.get()
+        if attempt is not None:
+            attempt.failed = True
+        _diagnostics["query_failures"] += 1
         return default
 
 
-def _get_lock(pool: dict[str, asyncio.Lock], key: str) -> asyncio.Lock:
-    lock = pool.get(key)
-    if lock is None:
-        if len(pool) >= _MAX_LOCK_POOL_SIZE:
-            for old_key, old_lock in list(pool.items()):
-                if not old_lock.locked():
-                    pool.pop(old_key, None)
-                    break
-        lock = asyncio.Lock()
-        pool[key] = lock
-    return lock
+def _get_lock(pool, key):
+    if in_write_transaction():
+        return nullcontext()
+    return _DB_LOCKS.hold((id(pool), key))
 
 
 def _normalize_id(value: object) -> str:
@@ -128,6 +199,7 @@ def _normalize_ids(values: Iterable[object] | None) -> tuple[str, ...] | None:
     return tuple(dict.fromkeys(v for value in values if (v := _normalize_id(value))))
 
 
+@guarded_read
 async def get_group_members(
     group_id: str | int | None,
 ) -> tuple[GroupMemberSnapshot, ...]:
@@ -183,6 +255,7 @@ async def get_group_members(
         return members
 
 
+@guarded_read
 async def get_group_member_map(
     group_id: str | int | None,
     user_ids: Iterable[object] | None = None,
@@ -260,6 +333,7 @@ async def get_group_member_map(
     return result
 
 
+@guarded_read
 async def get_group_member(
     group_id: str | int | None,
     user_id: str | int | None,
@@ -270,6 +344,7 @@ async def get_group_member(
     return (await get_group_member_map(group_id, [user_key])).get(user_key)
 
 
+@guarded_read
 async def get_group_user_ids(group_id: str | int | None) -> set[str]:
     group_key = _normalize_id(group_id)
     if not group_key:
@@ -305,6 +380,7 @@ async def get_group_user_ids(group_id: str | int | None) -> set[str]:
         return set(user_ids)
 
 
+@guarded_read
 async def get_user_group_ids(user_id: str | int | None) -> list[str]:
     user_key = _normalize_id(user_id)
     if not user_key:
@@ -335,6 +411,7 @@ async def get_user_group_ids(user_id: str | int | None) -> list[str]:
         return list(group_ids)
 
 
+@guarded_read
 async def get_member_names(
     user_ids: Iterable[object],
     group_id: str | int | None = None,
@@ -377,6 +454,7 @@ async def get_member_names(
     return result
 
 
+@guarded_read
 async def get_member_name(
     user_id: str | int | None,
     group_id: str | int | None = None,
@@ -391,6 +469,9 @@ async def invalidate_group_members(
     group_id: str | int | None = None,
     user_ids: Iterable[object] | None = None,
 ) -> None:
+    global _revision
+    _revision += 1
+
     if group_id is None:
         await _GROUP_MEMBER_CACHE.clear()
         await _GROUP_USER_IDS_CACHE.clear()
@@ -408,6 +489,9 @@ async def invalidate_group_members(
 
 
 async def invalidate_member_names(user_ids: Iterable[object] | None = None) -> None:
+    global _revision
+    _revision += 1
+
     if user_ids is None:
         await _USER_NAME_CACHE.clear()
         await _USER_GROUP_CACHE.clear()
@@ -428,6 +512,7 @@ def _date_scope_key(date_scope: tuple[datetime, datetime] | None) -> str:
     return f"{_datetime_key(date_scope[0])}..bucket:{end_bucket}"
 
 
+@guarded_read
 async def get_chat_history_rank_cached(
     model: Any,
     gid: str | None,
@@ -471,6 +556,7 @@ async def get_chat_history_rank_cached(
         return list(result)
 
 
+@guarded_read
 async def get_chat_history_first_msg_datetime_cached(
     model: Any,
     group_id: str | None,
@@ -500,6 +586,7 @@ async def get_chat_history_first_msg_datetime_cached(
         return result
 
 
+@guarded_read
 async def get_statistics_plugin_counts_cached(
     scope: Literal["global", "user", "group"],
     *,

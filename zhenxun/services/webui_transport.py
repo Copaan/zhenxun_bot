@@ -46,6 +46,9 @@ class TransportRuntime:
     """Own event-loop reset handling and Uvicorn's outer transport lifetime."""
 
     def __init__(self) -> None:
+        from .websocket_flow import WebSocketFlowRuntime
+
+        self._websocket_flow = WebSocketFlowRuntime()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._previous_handler: Callable[..., Any] | None = None
         self._installed_handler: Callable[..., Any] | None = None
@@ -73,6 +76,7 @@ class TransportRuntime:
                 return
             if self._loop is not None:
                 self.restore()
+            self._websocket_flow.install()
             self._loop = loop
             self._previous_handler = loop.get_exception_handler()
             self._installed_handler = self._handle_exception
@@ -136,6 +140,7 @@ class TransportRuntime:
             self._lifespan_stopped = True
 
     def restore(self) -> None:
+        self._websocket_flow.restore()
         restore_error: Exception | None = None
         with self._lock:
             loop = self._loop

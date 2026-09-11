@@ -719,20 +719,39 @@ def _auth_lane_context_from_state(
 
 @contextlib.asynccontextmanager
 async def _dispatch_lane_section(lane: str):
+    release = await _acquire_dispatch_lane(lane)
+    try:
+        yield
+    finally:
+        release()
+
+
+async def _acquire_dispatch_lane(lane: str):
     semaphore = _DISPATCH_LANE_SEMAPHORES.get(lane)
     if semaphore is None:
-        yield
-        return
+        return lambda: None
     started = time.perf_counter()
     await semaphore.acquire()
     wait_ms = (time.perf_counter() - started) * 1000
     if wait_ms >= AUTH_OVERLOAD_LANE_WAIT_MS:
         signal_overload(2.0)
-    try:
-        yield
-    finally:
-        with contextlib.suppress(Exception):
+    released = False
+
+    def release():
+        nonlocal released
+        if not released:
+            released = True
             semaphore.release()
+
+    async def reacquire():
+        nonlocal released
+        if released:
+            await semaphore.acquire()
+            released = False
+
+    release.reacquire = reacquire
+
+    return release
 
 
 def get_dispatch_snapshot() -> dict[str, object]:
@@ -814,14 +833,30 @@ async def _run_selected_matcher(
     # state is copied per matcher before dispatch; keep lane matcher-local.
     state["_zx_dispatch_lane"] = lane
     async with _dispatch_lane_section(lane):
-        await nb_message.check_and_run_matcher(
+        await _run_admitted_matcher(
             matcher,
             bot,
             event,
             state,
             stack,
             dependency_cache,
+            lane,
         )
+
+
+async def _run_admitted_matcher(
+    matcher, bot, event, state, stack, dependency_cache, lane
+):
+    from zhenxun.services.message_execution import current_dispatch_lease
+
+    state["_zx_dispatch_lane"] = lane
+    token = current_dispatch_lease.set(state.get("_zx_dispatch_lease"))
+    try:
+        await nb_message.check_and_run_matcher(
+            matcher, bot, event, state, stack, dependency_cache
+        )
+    finally:
+        current_dispatch_lease.reset(token)
 
 
 _MAX_MATCHER_CACHE = 512
@@ -838,6 +873,8 @@ _SELECTOR_DEPS = HandleEventSelectorDependencies(
     merge_dispatch_budget=_merge_dispatch_budget,
     build_matcher_state=_build_matcher_state,
     run_selected_matcher=_run_selected_matcher,
+    acquire_dispatch_lane=_acquire_dispatch_lane,
+    run_admitted_matcher=_run_admitted_matcher,
 )
 
 
@@ -1459,6 +1496,10 @@ async def _resolve_cost_gold(
             LOGGER_COMMAND,
             session=session,
         )
+        from zhenxun.services.cache.diagnostics import record_availability_fallback
+
+        record_availability_fallback("cost_timeout_zero")
+        hook_recorder.set("cost_gold", "timeout_zero_cost")
         return 0
 
 

@@ -141,6 +141,46 @@ def _layer_digest(root: Path) -> str:
     return digest.hexdigest()
 
 
+def _package_runtime_details(
+    root: Path, packages: dict[str, Any]
+) -> dict[str, dict[str, Any]]:
+    """Read installed distribution metadata without guessing import names."""
+    details: dict[str, dict[str, Any]] = {}
+    for dist_info in root.glob("*.dist-info"):
+        metadata = dist_info / "METADATA"
+        if not metadata.is_file():
+            continue
+        values: dict[str, str] = {}
+        for line in metadata.read_text(encoding="utf-8", errors="replace").splitlines():
+            if ": " in line:
+                key, value = line.split(": ", 1)
+                values.setdefault(key, value.strip())
+        raw_name = values.get("Name")
+        if not raw_name:
+            continue
+        name = canonicalize_name(raw_name)
+        if name not in packages:
+            continue
+        top_level_file = dist_info / "top_level.txt"
+        modules = (
+            sorted(
+                line.strip()
+                for line in top_level_file.read_text(encoding="utf-8").splitlines()
+                if line.strip() and line.strip().isidentifier()
+            )
+            if top_level_file.is_file()
+            else []
+        )
+        details[name] = {
+            "distribution_name": name,
+            "version": str(packages[name].get("version")),
+            "top_level_modules": modules,
+            "nonebot_plugin_ids": [],
+            "runtime_role": "python_dependency",
+        }
+    return details
+
+
 def build_generation(transaction: dict[str, Any]) -> dict[str, Any]:
     try:
         with archive_dependency_policy(transaction):
@@ -207,7 +247,7 @@ def _build_generation(transaction: dict[str, Any]) -> dict[str, Any]:
                         set(packages) - set(transaction["archive_build_allowlist"])
                     )
                 for name in sorted(forbidden_builds):
-                    command.extend(["--no-build-package", name])
+                    command.extend(["--only-binary", name])
             completed = subprocess.run(
                 command,
                 cwd=str(Path.cwd()),
@@ -226,11 +266,13 @@ def _build_generation(transaction: dict[str, Any]) -> dict[str, Any]:
                     safe_process_error(completed.stderr or completed.stdout),
                 )
         native_files = _scan_native_extensions(staging)
+        package_details = _package_runtime_details(staging, packages)
         metadata = {
             "version": 1,
             "generation": generation,
             "created_at": utc_now(),
             "packages": sorted(requested),
+            "package_details": package_details,
             "native_extensions": native_files,
         }
         (staging / ".zhenxun-generation.json").write_text(
@@ -274,6 +316,14 @@ def commit_generation(
         _validate_archive_generation(transaction, build)
         previous = load_manifest()
         target = deepcopy(transaction["target_manifest"])
+        generation_metadata = read_json(
+            generation_path(int(build["generation"])) / ".zhenxun-generation.json", {}
+        )
+        package_details = generation_metadata.get("package_details", {})
+        if isinstance(package_details, dict):
+            for name, detail in package_details.items():
+                if isinstance(target.get("packages", {}).get(name), dict):
+                    target["packages"][name].update(detail)
         target["active_generation"] = int(build["generation"])
         target["previous_generation"] = previous.get("active_generation")
         target["pending_verification"] = bool(verify_on_start)

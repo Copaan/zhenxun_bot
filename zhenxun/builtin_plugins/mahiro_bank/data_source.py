@@ -1,10 +1,11 @@
 import asyncio
-from datetime import datetime, timedelta
+from datetime import timedelta
 import random
 
 from nonebot_plugin_uninfo import Uninfo
 from tortoise.expressions import RawSQL
 from tortoise.functions import Count, Sum
+from tortoise.timezone import localtime
 
 from zhenxun.configs.config import Config
 from zhenxun.models.mahiro_bank import MahiroBank
@@ -12,6 +13,11 @@ from zhenxun.models.mahiro_bank_log import MahiroBankLog
 from zhenxun.models.sign_user import SignUser
 from zhenxun.models.user_console import UserConsole
 from zhenxun.services import avatar_service
+from zhenxun.services.asset_transaction import (
+    account_write,
+    asset_call,
+    asset_transaction,
+)
 from zhenxun.utils.enum import BankHandleType, GoldHandle
 from zhenxun.utils.platform import PlatformUtils
 
@@ -43,13 +49,9 @@ class BankManager:
         """
         if amount <= 0:
             return "存款数量必须大于 0 啊笨蛋！"
-        user, sign_user, bank_user = await asyncio.gather(
-            *[
-                UserConsole.get_user(user_id),
-                SignUser.get_user(user_id),
-                cls.get_user(user_id),
-            ]
-        )
+        user = await UserConsole.get_user(user_id)
+        sign_user = await SignUser.get_user(user_id)
+        bank_user = await cls.get_user(user_id)
         sign_max_deposit: int = base_config.get("sign_max_deposit")
         max_deposit = max(int(float(sign_user.impression) * sign_max_deposit), 100)
         if user.gold < amount:
@@ -116,8 +118,7 @@ class BankManager:
         返回:
             MahiroBank
         """
-        user, _ = await MahiroBank.get_or_create(user_id=user_id)
-        return user
+        return await MahiroBank.get_account(user_id)
 
     @classmethod
     async def get_user_data(
@@ -188,11 +189,9 @@ class BankManager:
                 .values("sum"),
             ]
         )
-        now = datetime.now()
-        end_time = (
-            now
-            + timedelta(days=1)
-            - timedelta(hours=now.hour, minutes=now.minute, seconds=now.second)
+        now = localtime()
+        end_time = (now + timedelta(days=1)).replace(
+            hour=0, minute=0, second=0, microsecond=0
         )
         today_deposit_amount = sum(deposit.amount for deposit in user_today_deposit)
         deposit_list = [
@@ -234,10 +233,8 @@ class BankManager:
         返回:
             dict: 银行总览数据字典
         """
-        now = datetime.now()
-        now_start = now - timedelta(
-            hours=now.hour, minutes=now.minute, seconds=now.second
-        )
+        now = localtime()
+        now_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         (
             bank_data,
             today_count,
@@ -300,6 +297,7 @@ class BankManager:
         }
 
     @classmethod
+    @account_write
     async def deposit(
         cls, user_id: str, amount: int
     ) -> tuple[MahiroBank, float, float | None]:
@@ -312,6 +310,8 @@ class BankManager:
         返回:
             tuple[MahiroBank, float, float]: MahiroBank，利率，增加的利率
         """
+        if error := await cls.deposit_check(user_id, amount):
+            raise ValueError(error)
         rate_range = base_config.get("rate_range")
         rate = random.uniform(rate_range[0], rate_range[1])
         sign_user = await SignUser.get_user(user_id)
@@ -322,6 +322,7 @@ class BankManager:
         return await MahiroBank.deposit(user_id, amount, rate), rate, random_add_rate
 
     @classmethod
+    @account_write
     async def withdraw(cls, user_id: str, amount: int) -> MahiroBank:
         """取款
 
@@ -332,10 +333,13 @@ class BankManager:
         返回:
             MahiroBank
         """
+        if error := await cls.withdraw_check(user_id, amount):
+            raise ValueError(error)
         await UserConsole.add_gold(user_id, amount, "bank")
         return await MahiroBank.withdraw(user_id, amount)
 
     @classmethod
+    @account_write
     async def loan(cls, user_id: str, amount: int) -> tuple[MahiroBank, float | None]:
         """贷款
 
@@ -349,7 +353,7 @@ class BankManager:
         rate_range = base_config.get("rate_range")
         rate = random.uniform(rate_range[0], rate_range[1])
         sign_user = await SignUser.get_user(user_id)
-        user, _ = await MahiroBank.get_or_create(user_id=user_id)
+        user = await MahiroBank.get_account(user_id)
         if user.loan_amount + amount > sign_user.impression * 150:
             raise ValueError("贷款数量超过最大限制，请签到提升好感度获取更多额度吧...")
         random_reduce_rate = await cls.random_event(float(sign_user.impression))
@@ -359,6 +363,7 @@ class BankManager:
         return await MahiroBank.loan(user_id, amount, rate), random_reduce_rate
 
     @classmethod
+    @account_write
     async def repayment(cls, user_id: str, amount: int) -> MahiroBank:
         """还款
 
@@ -375,57 +380,60 @@ class BankManager:
     @classmethod
     async def settlement(cls):
         """结算每日利率"""
-        bank_user_list = await MahiroBank.filter(amount__gt=0).all()
-        log_list = await MahiroBankLog.filter(
+        period = localtime().date().isoformat()
+        user_ids = await MahiroBank.filter(amount__gt=0).values_list(
+            "user_id", flat=True
+        )
+        pending_ids = await MahiroBankLog.filter(
             is_completed=False, handle_type=BankHandleType.DEPOSIT
-        ).all()
-        user_list = await UserConsole.filter(
-            user_id__in=[user.user_id for user in bank_user_list]
-        ).all()
-        user_data = {user.user_id: user for user in user_list}
-        bank_data: dict[str, list[MahiroBankLog]] = {}
-        for log in log_list:
-            if log.user_id not in bank_data:
-                bank_data[log.user_id] = []
-            bank_data[log.user_id].append(log)
-        log_create_list = []
-        log_update_list = []
-        for bank_user in bank_user_list:
-            if user := user_data.get(bank_user.user_id):
-                amount = bank_user.amount
-                if logs := bank_data.get(bank_user.user_id):
-                    amount -= sum(log.amount for log in logs)
-                if not amount:
-                    continue
-                gold = int(amount * bank_user.rate)
-                user.gold += gold
-                log_create_list.append(
-                    MahiroBankLog(
-                        user_id=bank_user.user_id,
-                        amount=gold,
-                        rate=bank_user.rate,
-                        handle_type=BankHandleType.INTEREST,
-                        is_completed=True,
-                    )
+        ).values_list("user_id", flat=True)
+        for user_id in sorted(set(user_ids) | set(pending_ids)):
+            await cls._settle_account(user_id, period)
+
+    @classmethod
+    @asset_call
+    async def _settle_account(cls, user_id, period):
+        from hashlib import sha256
+
+        from zhenxun.models.asset_operation import AssetOperation
+
+        async with asset_transaction(user_id):
+            key = sha256(f"bank-interest:{user_id}:{period}".encode()).hexdigest()
+            if await AssetOperation.filter(id=key).exists():
+                return
+            bank = await MahiroBank.get_account(user_id)
+            logs = await MahiroBankLog.filter(
+                user_id=user_id,
+                is_completed=False,
+                handle_type=BankHandleType.DEPOSIT,
+            ).all()
+            payments = []
+            amount = bank.amount - sum(log.amount for log in logs)
+            if bank.amount > 0 and amount:
+                payments.append((int(amount * bank.rate), bank.rate))
+            for log in logs:
+                payments.append(
+                    (int(log.amount * log.rate * log.effective_hour) or 1, log.rate)
                 )
-        for user_id, logs in bank_data.items():
-            if user := user_data.get(user_id):
-                for log in logs:
-                    gold = int(log.amount * log.rate * log.effective_hour) or 1
-                    user.gold += gold
-                    log.is_completed = True
-                    log_update_list.append(log)
-                    log_create_list.append(
-                        MahiroBankLog(
-                            user_id=user_id,
-                            amount=gold,
-                            rate=log.rate,
-                            handle_type=BankHandleType.INTEREST,
-                            is_completed=True,
-                        )
-                    )
-        if log_create_list:
-            await MahiroBankLog.bulk_create(log_create_list, 10)
-        if log_update_list:
-            await MahiroBankLog.bulk_update(log_update_list, ["is_completed"], 10)
-        await UserConsole.bulk_update(user_list, ["gold"], 10)
+                log.is_completed = True
+                await log.save(update_fields=["is_completed"])
+            total = sum(gold for gold, _ in payments)
+            if total < 0:
+                raise RuntimeError("bank_settlement_negative_interest")
+            if total:
+                await UserConsole.add_gold(user_id, total, "bank_interest")
+            for gold, rate in payments:
+                await MahiroBankLog.create(
+                    user_id=user_id,
+                    amount=gold,
+                    rate=rate,
+                    handle_type=BankHandleType.INTEREST,
+                    is_completed=True,
+                )
+            await AssetOperation.create(
+                id=key,
+                user_id=user_id,
+                kind="bank_interest",
+                state="committed",
+                payload={"period": period, "gold": total},
+            )

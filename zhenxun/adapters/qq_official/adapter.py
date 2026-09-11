@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 from collections import Counter
 import hashlib
+import inspect
+import json
 import time
 from typing import Any, cast
 from typing_extensions import override
@@ -38,11 +40,27 @@ from .dispatcher import QQWebhookDispatcher, dispatch_routing_key
 
 ACK_BODY = '{"op":12}'
 
+# These upstream boundaries parse and dispatch the events intercepted below.
+# Refuse an unreviewed adapter upgrade instead of silently bypassing persistence.
+_INGRESS_HASHES = {
+    "_forward_ws": "639eeb40df6563054e76c1e2b96e4da32a8ed5b69a1f36a594b5d324786dfea1",
+    "payload_to_event": (
+        "6fba40f56bb62375164805cd554ad6a51f4d93de7a209af098d10b9bd6f6e0c6"
+    ),
+    "data_to_payload": (
+        "e9ba3afb175835942ae7049a2276379c74a7397cc0e81e11fa32dcf38aab5e44"
+    ),
+}
+
 
 class ZhenxunQQAdapter(QQAdapter):
     """QQ Webhook adapter with durable replay protection and bounded replies."""
 
     def __init__(self, driver, **kwargs: Any):
+        for name, expected in _INGRESS_HASHES.items():
+            source = inspect.getsource(getattr(QQAdapter, name)).rstrip()
+            if hashlib.sha256(source.encode()).hexdigest() != expected:
+                raise RuntimeError(f"qq_ingress_version_unsupported:{name}")
         self._webhook_bots: dict[str, ZhenxunQQBot] = {}
         self._websocket_bot_infos: dict[str, Any] = {}
         self._websocket_started = False
@@ -53,6 +71,7 @@ class ZhenxunQQAdapter(QQAdapter):
         self._health_route_registered = False
         self._shutting_down = False
         self._dispatcher = QQWebhookDispatcher()
+        self._control_tasks: set[asyncio.Task] = set()
         self._metrics: Counter[str] = Counter()
         super().__init__(driver, **kwargs)
         _runtime.register_adapter_runtime(self)
@@ -74,6 +93,7 @@ class ZhenxunQQAdapter(QQAdapter):
         )
         update_connection_diagnostic(bot.self_id, mode, "connected")
         logger.info("QQ 官方 Bot连接成功", "QQOfficial", target=bot.self_id)
+        self._register_inbox_bot(bot)
 
     @override
     def bot_disconnect(self, bot: ZhenxunQQBot) -> None:
@@ -435,6 +455,17 @@ class ZhenxunQQAdapter(QQAdapter):
         if isinstance(event, MessageAuditEvent):
             audit_result.add_result(event)
 
+        if event.get_type() == "message":
+            receipt = self._persist_message(bot, event, payload)
+            receipt.add_done_callback(self._observe_inbox_receipt)
+            return
+
+        # Audit acknowledgments above must bypass both business persistence and
+        # notification backpressure, otherwise a pending send can deadlock.
+        if len(self._control_tasks) >= 64:
+            self._record("control_capacity_rejected")
+            return
+
         async def _handle() -> None:
             try:
                 await prepare_event_context(bot.self_id, event)
@@ -448,8 +479,67 @@ class ZhenxunQQAdapter(QQAdapter):
                 )
 
         task = asyncio.create_task(_handle(), name=f"qq-official-event-{bot.self_id}")
+        self._control_tasks.add(task)
+        task.add_done_callback(self._control_tasks.discard)
         task.add_done_callback(self.tasks.discard)
         self.tasks.add(task)
+
+    def _observe_inbox_receipt(self, future):
+        if future.cancelled():
+            self._record("persistence_unconfirmed")
+            return
+        try:
+            receipt = future.result()
+        except Exception:
+            self._record("persistence_failed")
+        else:
+            self._record("persisted" if receipt["accepted"] else "persistence_rejected")
+
+    def _register_inbox_bot(self, bot):
+        from datetime import datetime, timezone
+
+        from nonebot.compat import type_validate_python
+
+        from zhenxun.services.message_execution import (
+            MessageExecutionUnavailable,
+            current_execution,
+        )
+        from zhenxun.services.message_inbox import message_inbox
+
+        async def dispatch(restored):
+            execution = current_execution.get()
+            received = (
+                datetime.fromtimestamp(execution.received_at, timezone.utc)
+                if execution is not None and execution.received_at is not None
+                else None
+            )
+            context = await prepare_event_context(
+                bot.self_id, restored, received_at=received
+            )
+            if (
+                context is not None
+                and datetime.now(timezone.utc) >= context.reply_deadline
+            ):
+                raise MessageExecutionUnavailable("reply_capability_expired")
+            await bot.handle_event(restored)
+
+        def decode(raw):
+            return self.payload_to_event(type_validate_python(Dispatch, raw))
+
+        message_inbox.register_bot(bot, decode, dispatch)
+        return decode, dispatch
+
+    def _persist_message(self, bot, event, payload):
+        from zhenxun.services.message_inbox import message_inbox
+
+        decode, dispatch = self._register_inbox_bot(bot)
+        return message_inbox.observe(
+            bot,
+            event,
+            decode=decode,
+            dispatch=dispatch,
+            raw_payload=json.loads(payload.json()),
+        )
 
     def _resolve_webhook_bot(self, app_id: str) -> ZhenxunQQBot | None:
         if app_id in self.bots:
@@ -498,6 +588,25 @@ class ZhenxunQQAdapter(QQAdapter):
 
         if not self.is_ready():
             return Response(503, content="Webhook worker not ready")
+
+        try:
+            message_event = self.payload_to_event(payload)
+        except Exception:
+            return Response(400, content="Invalid event payload")
+        if message_event is not None and message_event.get_type() == "message":
+            # The inbox commit is the sole message receipt. Reserving the old
+            # business-DB receipt first could acknowledge a retry after a crash
+            # that happened before the payload reached the durable inbox.
+            try:
+                receipt = await self._persist_message(bot, message_event, payload)
+            except Exception:
+                self._record("persistence_failed")
+                return Response(503, content="Message persistence unavailable")
+            if not receipt["accepted"]:
+                self._record("persistence_rejected")
+                return Response(503, content="Message persistence unavailable")
+            self._record("accepted")
+            return self._ack()
 
         raw_content = (
             request.content.encode()

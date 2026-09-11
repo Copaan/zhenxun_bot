@@ -1,13 +1,20 @@
+import asyncio
+from contextlib import nullcontext
+from copy import deepcopy
 from typing import Any, TypeVar, overload
 
 from pydantic import BaseModel, ValidationError
+from tortoise.transactions import in_transaction
 import ujson as json
 
 from zhenxun.configs.config import Config
 from zhenxun.models.group_plugin_setting import GroupPluginSetting
 from zhenxun.services.cache import BoundedTTLCache
+from zhenxun.services.cache.keyed import KeyedLocks
+from zhenxun.services.cache.write import defer, in_write_transaction
+from zhenxun.services.db_context import with_db_timeout
 from zhenxun.services.log import logger
-from zhenxun.utils.pydantic_compat import model_dump, model_validate, parse_as
+from zhenxun.utils.pydantic_compat import model_dump, parse_as
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -19,7 +26,9 @@ class GroupSettingsService:
     """
 
     def __init__(self):
-        self._cache = BoundedTTLCache[str, dict[str, Any]](
+        self._epoch = 0
+        self._locks = KeyedLocks()
+        self._cache = BoundedTTLCache(
             "GROUP_PLUGIN_SETTINGS_VIEW",
             ttl_seconds=600,
             max_items=10000,
@@ -29,62 +38,91 @@ class GroupSettingsService:
     def _build_cache_key(group_id: str, plugin_name: str) -> str:
         return f"{group_id}:{plugin_name}"
 
+    async def invalidate_all(self) -> None:
+        if defer(("group_settings_all", id(self)), self.invalidate_all):
+            return
+        self._epoch += 1
+        await self._cache.clear()
+
     async def _clear_merged_cache(self, group_id: str, plugin_name: str) -> None:
-        await self._cache.delete(self._build_cache_key(group_id, plugin_name))
+        key = self._build_cache_key(group_id, plugin_name)
+        if defer(
+            ("group_settings", id(self), key),
+            lambda: self._clear_merged_cache(group_id, plugin_name),
+        ):
+            return
+        self._epoch += 1
+        await self._cache.delete(key)
+
+    async def _mutate(self, group_id, plugin_name, change, *, create=True):
+        key = self._build_cache_key(group_id, plugin_name)
+        async with nullcontext() if in_write_transaction() else self._locks.hold(key):
+            async with in_transaction() as connection:
+                row = (
+                    await GroupPluginSetting.filter(
+                        group_id=group_id,
+                        plugin_name=plugin_name,
+                    )
+                    .using_db(connection)
+                    .select_for_update()
+                    .first()
+                )
+                created = False
+                if row is None and create:
+                    row, created = await GroupPluginSetting.get_or_create(
+                        group_id=group_id,
+                        plugin_name=plugin_name,
+                        defaults={"settings": {}},
+                        using_db=connection,
+                    )
+                    if not created:
+                        row = (
+                            await GroupPluginSetting.filter(id=row.id)
+                            .using_db(connection)
+                            .select_for_update()
+                            .get()
+                        )
+                if row is None:
+                    return False, False
+                values = row.settings
+                if isinstance(values, str):
+                    values = json.loads(values)
+                values = deepcopy(values) if isinstance(values, dict) else {}
+                changed = change(values)
+                if changed is None:
+                    return False, created
+                if changed:
+                    row.settings = changed
+                    await row.save(using_db=connection, update_fields=["settings"])
+                else:
+                    await row.delete(using_db=connection)
+                await self._clear_merged_cache(group_id, plugin_name)
+                return True, created
 
     async def set(
         self, group_id: str, plugin_name: str, settings_model: BaseModel
     ) -> None:
-        """
-        为一个插件在指定群组中设置完整的配置模型。
-
-        参数:
-            group_id: 目标群组ID。
-            plugin_name: 插件的模块名。
-            settings_model: 包含完整配置的Pydantic模型实例。
-        """
-        settings_dict = model_dump(settings_model)
-        json_value = json.dumps(settings_dict, ensure_ascii=False)
-
-        await GroupPluginSetting.update_or_create(
-            defaults={"settings": json_value},  # type: ignore
-            group_id=group_id,
-            plugin_name=plugin_name,
-        )
-
-        await self._clear_merged_cache(group_id, plugin_name)
+        values = deepcopy(model_dump(settings_model))
+        await self._mutate(group_id, plugin_name, lambda _: values)
 
     async def set_key_value(
         self, group_id: str, plugin_name: str, key: str, value: Any
     ) -> None:
-        """为一个插件在指定群组中设置单个配置项的值。"""
-        setting_entry, _ = await GroupPluginSetting.get_or_create(
-            defaults={"settings": {}},
-            group_id=group_id,
-            plugin_name=plugin_name,
-        )
+        def change(values):
+            values[key] = deepcopy(value)
+            return values
 
-        if not isinstance(setting_entry.settings, dict):
-            setting_entry.settings = {}
-
-        setting_entry.settings[key] = value
-        await setting_entry.save(update_fields=["settings"])
-        await self._clear_merged_cache(group_id, plugin_name)
+        await self._mutate(group_id, plugin_name, change)
 
     async def reset_key(self, group_id: str, plugin_name: str, key: str) -> bool:
-        """重置单个配置项"""
-        setting = await GroupPluginSetting.safe_get_or_none(
-            group_id=group_id, plugin_name=plugin_name
-        )
-        if setting and isinstance(setting.settings, dict) and key in setting.settings:
-            del setting.settings[key]
-            if not setting.settings:
-                await setting.delete()
-            else:
-                await setting.save(update_fields=["settings"])
-            await self._clear_merged_cache(group_id, plugin_name)
-            return True
-        return False
+        def change(values):
+            if key not in values:
+                return None
+            values.pop(key)
+            return values
+
+        changed, _ = await self._mutate(group_id, plugin_name, change, create=False)
+        return changed
 
     async def get(
         self, group_id: str, plugin_name: str, key: str, default: Any = None
@@ -105,27 +143,10 @@ class GroupSettingsService:
         return full_settings.get(key, default)
 
     async def reset_all_for_plugin(self, group_id: str, plugin_name: str) -> bool:
-        """
-        重置一个插件在指定群组的配置，使其回退到全局默认值。
-        这通过删除数据库中的对应记录来实现。
-
-        参数:
-            group_id: 目标群组ID。
-            plugin_name: 插件的模块名。
-
-        返回:
-            bool: 如果成功删除了一个条目，则返回 True，否则返回 False。
-        """
-        deleted_count = await GroupPluginSetting.filter(
-            group_id=group_id, plugin_name=plugin_name
-        ).delete()
-
-        if deleted_count > 0:
-            await self._clear_merged_cache(group_id, plugin_name)
-            logger.debug(f"已重置插件 '{plugin_name}' 在群组 '{group_id}' 的配置。")
-            return True
-
-        return False
+        changed, _ = await self._mutate(
+            group_id, plugin_name, lambda _: {}, create=False
+        )
+        return changed
 
     @overload
     async def get_all_for_plugin(
@@ -150,59 +171,60 @@ class GroupSettingsService:
             parse_model: (可选) Pydantic模型，用于解析和验证配置。
         """
         cache_key = self._build_cache_key(group_id, plugin_name)
-        cached_settings = await self._cache.get(cache_key)
-        if cached_settings is not None:
-            logger.debug(f"缓存命中: {cache_key}")
-            if parse_model:
-                try:
-                    return parse_as(parse_model, cached_settings)
-                except (ValidationError, TypeError) as e:
-                    logger.warning(
-                        f"缓存数据 '{cache_key}' 与模型 '{parse_model.__name__}' "
-                        f"不匹配: {e}。将从数据库重新加载。"
-                    )
-            else:
-                return cached_settings
 
-        logger.debug(f"缓存未命中: {cache_key}，从数据库加载。")
+        def defaults():
+            group = Config.get(plugin_name)
+            return deepcopy(
+                {key: group.get(key, build_model=False) for key in group.configs}
+            )
 
-        global_config_group = Config.get(plugin_name)
-        final_settings_dict = {
-            key: global_config_group.get(key, build_model=False)
-            for key in global_config_group.configs.keys()
-        }
-
-        group_setting_entry = await GroupPluginSetting.safe_get_or_none(
-            group_id=group_id, plugin_name=plugin_name
-        )
-        if group_setting_entry:
-            try:
-                group_specific_settings = group_setting_entry.settings
-                if isinstance(group_specific_settings, dict):
-                    final_settings_dict.update(group_specific_settings)
+        global_values = defaults()
+        transactional = in_write_transaction()
+        cached = None if transactional else await self._cache.get(cache_key)
+        if cached is not None and cached[0] == global_values:
+            final_settings = deepcopy(cached[1])
+        else:
+            async with nullcontext() if transactional else self._locks.hold(cache_key):
+                global_values = defaults()
+                cached = None if transactional else await self._cache.get(cache_key)
+                if cached is not None and cached[0] == global_values:
+                    final_settings = deepcopy(cached[1])
                 else:
-                    logger.warning(
-                        f"群组 {group_id} 插件 '{plugin_name}' 的配置格式不正确"
-                        f"（不是字典），已忽略。"
+                    epoch = self._epoch
+                    # A timeout must not be cached as an absent override.
+                    loaded = True
+                    try:
+                        row = await with_db_timeout(
+                            GroupPluginSetting.get_or_none(
+                                group_id=group_id, plugin_name=plugin_name
+                            ),
+                            operation="group_settings.get",
+                            source="group_settings",
+                        )
+                    except (TimeoutError, asyncio.TimeoutError):
+                        row = None
+                        loaded = False
+                    final_settings = defaults()
+                    global_values = deepcopy(final_settings)
+                    if row and isinstance(row.settings, dict):
+                        final_settings.update(deepcopy(row.settings))
+                    await self._cache.set(
+                        cache_key,
+                        (global_values, deepcopy(final_settings)),
+                        valid_if=lambda: loaded
+                        and not transactional
+                        and epoch == self._epoch
+                        and defaults() == global_values,
                     )
-            except Exception as e:
-                logger.warning(
-                    f"加载群组 {group_id} 插件 '{plugin_name}' 的特定配置时出错: {e}"
-                )
-
-        await self._cache.set(cache_key, final_settings_dict)
-
         if parse_model:
             try:
-                return parse_as(parse_model, final_settings_dict)
-            except (ValidationError, TypeError) as e:
+                return parse_as(parse_model, final_settings)
+            except (ValidationError, TypeError):
                 logger.warning(
-                    f"插件 '{plugin_name}' 的配置无法解析为 '{parse_model.__name__}'。"
-                    f"值: {final_settings_dict}, 错误: {e}。将返回一个默认模型实例。"
+                    f"Plugin '{plugin_name}' group settings validation failed"
                 )
                 return parse_as(parse_model, {})
-
-        return final_settings_dict
+        return final_settings
 
     async def set_bulk(
         self, group_ids: list[str], plugin_name: str, key: str, value: Any
@@ -222,13 +244,18 @@ class GroupSettingsService:
         if not group_ids:
             return 0, 0
 
-        for group_id in group_ids:
-            current_settings = await self.get_all_for_plugin(group_id, plugin_name)
-            current_settings[key] = value
-            await self.set(
-                group_id, plugin_name, model_validate(BaseModel, current_settings)
-            )
-        return len(group_ids), 0
+        updated = created = 0
+        for group_id in dict.fromkeys(group_ids):
+
+            def change(values):
+                values[key] = deepcopy(value)
+                return values
+
+            changed, is_new = await self._mutate(group_id, plugin_name, change)
+            if changed:
+                created += int(is_new)
+                updated += int(not is_new)
+        return updated, created
 
 
 group_settings_service = GroupSettingsService()

@@ -112,6 +112,10 @@ class AuthPipelineContext:
         effect: str,
         reason: str,
     ) -> None:
+        from zhenxun.services.cache.diagnostics import record_availability_fallback
+
+        if allowed:
+            record_availability_fallback(reason)
         self.auth_allowed = allowed
         self.decision_effect = effect
         self.decision_reason = reason

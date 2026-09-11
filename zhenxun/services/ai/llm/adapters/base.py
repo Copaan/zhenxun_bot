@@ -66,7 +66,7 @@ def join_api_url(api_base: str, endpoint: str) -> str:
     relative = endpoint.lstrip("/")
     base_tail = base.rsplit("/", 1)[-1].casefold()
     first_segment, separator, remainder = relative.partition("/")
-    if separator and first_segment.casefold() == base_tail:
+    if first_segment.casefold() == base_tail:
         relative = remainder
     return f"{base}/{relative}" if relative else base
 
@@ -540,7 +540,7 @@ class BaseAdapter(ABC):
         ep = endpoint.lstrip("/")
 
         if prefix:
-            return join_api_url(base_url, f"{prefix}/{ep}")
+            base_url = join_api_url(base_url, prefix)
         return join_api_url(base_url, ep)
 
     def get_base_headers(self, api_key: str) -> dict[str, str]:

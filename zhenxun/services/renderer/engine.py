@@ -9,6 +9,7 @@ import inspect
 import json
 from pathlib import Path
 import re
+import subprocess
 import sys
 import time
 from typing import Any, ClassVar, cast
@@ -35,6 +36,34 @@ _DISCONNECT_SUPPRESSION_WINDOW_SECONDS = 10.0
 
 htmlrender_module: Any | None = None
 htmlrender_browser: Any | None = None
+
+
+def _isolate_playwright_signals() -> None:
+    if sys.platform != "win32":
+        return
+    import playwright._impl._transport as transport
+
+    if getattr(transport.asyncio, "_zx_process_group", False):
+        return
+    original = transport.asyncio
+
+    class PlaywrightAsyncio:
+        _zx_process_group = True
+
+        def __getattr__(self, name):
+            return getattr(original, name)
+
+        async def create_subprocess_exec(self, *args, **kwargs):
+            # CTRL_BREAK to the business worker must not kill the Node driver
+            # before its owner has closed pages and the Playwright transport.
+            kwargs["creationflags"] = (
+                kwargs.get("creationflags", 0) | subprocess.CREATE_NEW_PROCESS_GROUP
+            )
+            return await original.create_subprocess_exec(*args, **kwargs)
+
+    transport.asyncio = PlaywrightAsyncio()
+
+
 _DIAGNOSTIC_ROOT = Path(__file__).resolve().parents[3]
 _DIAGNOSTIC_WINDOW_SECONDS = 30.0
 _DIAGNOSTIC_MAX_ITEMS = 256
@@ -331,14 +360,44 @@ def _arm_disconnect_exception_suppression(
     state["suppress_until"] = max(float(state.get("suppress_until", 0.0)), deadline)
 
 
+_browser_cleanup_task: asyncio.Task | None = None
+_browser_cleanup_identity: tuple | None = None
+
+
 async def _shutdown_browser_instance() -> None:
+    global _browser_cleanup_task, _browser_cleanup_identity
+    if htmlrender_browser is None:
+        return
+    identity = (
+        getattr(htmlrender_browser, "_browser", None),
+        getattr(htmlrender_browser, "_playwright", None),
+    )
+    if identity == (None, None):
+        return
+    retry_failed = (
+        _browser_cleanup_task is not None
+        and _browser_cleanup_task.done()
+        and (
+            _browser_cleanup_task.cancelled()
+            or _browser_cleanup_task.exception() is not None
+        )
+    )
+    if _browser_cleanup_identity != identity or retry_failed:
+        if _browser_cleanup_task is not None and not _browser_cleanup_task.done():
+            await asyncio.shield(_browser_cleanup_task)
+        _browser_cleanup_identity = identity
+        _browser_cleanup_task = asyncio.create_task(
+            _close_browser_resources(*identity), name="renderer-browser-cleanup"
+        )
+    await asyncio.shield(_browser_cleanup_task)
+
+
+async def _close_browser_resources(browser_obj, playwright_obj) -> None:
     if htmlrender_browser is None:
         return
     loop = asyncio.get_running_loop()
     _arm_disconnect_exception_suppression(loop)
 
-    browser_obj = getattr(htmlrender_browser, "_browser", None)
-    playwright_obj = getattr(htmlrender_browser, "_playwright", None)
     if browser_obj is None and playwright_obj is None:
         return
     failures = []
@@ -358,8 +417,10 @@ async def _shutdown_browser_instance() -> None:
             failures.append(error)
     if failures:
         raise RuntimeError("renderer_browser_cleanup_failed") from failures[0]
-    setattr(htmlrender_browser, "_browser", None)
-    setattr(htmlrender_browser, "_playwright", None)
+    if getattr(htmlrender_browser, "_browser", None) is browser_obj:
+        setattr(htmlrender_browser, "_browser", None)
+    if getattr(htmlrender_browser, "_playwright", None) is playwright_obj:
+        setattr(htmlrender_browser, "_playwright", None)
     await asyncio.sleep(0)
 
 
@@ -409,6 +470,7 @@ def _patch_htmlrender_shutdown() -> None:
 
 
 def _patch_playwright_env_check_once() -> None:
+    _isolate_playwright_signals()
     _, browser_module = _load_htmlrender_modules()
     _patch_htmlrender_task_tracking()
     _patch_htmlrender_shutdown()
@@ -626,7 +688,9 @@ class PlaywrightEngine(BaseScreenshotEngine):
     def _get_total_rss(self) -> int | None:
         try:
             total_rss = self._process.memory_info().rss
-            for child in self._process.children(recursive=True):
+            from zhenxun.utils.process_tree import verified_descendants
+
+            for child in verified_descendants(self._process):
                 with contextlib.suppress(Exception):
                     total_rss += child.memory_info().rss
             return total_rss
@@ -1598,6 +1662,7 @@ class EngineManager:
         self._warmup_task: asyncio.Task | None = None
         self._closing = False
         self._state = "not_started"
+        self._last_error: str | None = None
 
     def reopen(self) -> None:
         if self._instance is not None or any(
@@ -1608,17 +1673,26 @@ class EngineManager:
             return
         self._closing = False
         self._state = "not_started"
+        self._last_error = None
         self._init_task = self._warmup_task = None
+
+    def _record_failure(self, phase: str, error: BaseException) -> None:
+        # Keep diagnostics useful without disclosing browser URLs or launch arguments.
+        reason = str(error)
+        if not re.fullmatch(r"renderer_[a-z_]+", reason):
+            reason = type(error).__name__
+        self._last_error = f"{phase}:{reason}"
+        self._state = "failed"
 
     async def _initialize(self) -> BaseScreenshotEngine:
         self._state = "initializing"
-        engine = self._engine_class()
-        self._instance = engine
         try:
+            engine = self._engine_class()
+            self._instance = engine
             await engine.initialize()
             return engine
-        except BaseException:
-            self._state = "failed"
+        except BaseException as error:
+            self._record_failure("initialize", error)
             raise
 
     async def get_engine(self) -> BaseScreenshotEngine:
@@ -1640,6 +1714,7 @@ class EngineManager:
         return {
             **snapshot,
             "initialization_state": self._state,
+            "initialization_error": self._last_error,
             "closing": self._closing or snapshot.get("closing", False),
         }
 
@@ -1652,8 +1727,10 @@ class EngineManager:
             if self._closing:
                 raise RuntimeError("renderer_closing")
             self._state = "ready"
-        except BaseException:
-            self._state = "failed"
+            self._last_error = None
+        except BaseException as error:
+            if self._last_error is None:
+                self._record_failure("warmup", error)
             raise
 
     async def warmup(self) -> None:

@@ -2,6 +2,8 @@ import asyncio
 from collections.abc import AsyncIterator
 import contextlib
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
+import inspect
 import time
 
 from zhenxun.services.log import logger
@@ -17,6 +19,23 @@ _SQLITE_STALL_UNTIL = 0.0
 _SQLITE_STALL_REASON = ""
 _SQLITE_OPERATION_LOCK = asyncio.Lock()
 _ACTIVE_MANAGED_DB_OPERATIONS = 0
+_OPERATION_OWNER = None
+_DB_DEADLINE: ContextVar[tuple[object, float] | None] = ContextVar(
+    "db_deadline", default=None
+)
+_DB_TIMING = {
+    "operations": 0,
+    "queue_timeouts": 0,
+    "execution_timeouts": 0,
+    "queue_wait_ms": 0.0,
+    "execution_ms": 0.0,
+}
+
+
+def db_timing_snapshot():
+    return dict(_DB_TIMING)
+
+
 _DB_UNHEALTHY_TIMEOUT_SECONDS = 30.0
 _SQLITE_STALL_TIMEOUT_SECONDS = 60.0
 _SQLITE_LOCK_PATTERNS = (
@@ -87,16 +106,29 @@ def sqlite_operation_locked() -> bool:
 
 @asynccontextmanager
 async def _managed_db_operation() -> AsyncIterator[None]:
-    global _ACTIVE_MANAGED_DB_OPERATIONS
+    global _ACTIVE_MANAGED_DB_OPERATIONS, _OPERATION_OWNER
+    task = asyncio.current_task()
+    if _OPERATION_OWNER is task:
+        yield
+        return
     lock = _SQLITE_OPERATION_LOCK if _is_sqlite_connection() else None
     if lock is not None:
+        from zhenxun.services.cache.write import in_write_transaction
+
+        # The transaction already holds the ORM connection lock. Waiting for
+        # a reader holding our admission gate would invert the two locks.
+        if in_write_transaction():
+            lock = None
+    if lock is not None:
         await lock.acquire()
+        _OPERATION_OWNER = task
     _ACTIVE_MANAGED_DB_OPERATIONS += 1
     try:
         yield
     finally:
         _ACTIVE_MANAGED_DB_OPERATIONS = max(0, _ACTIVE_MANAGED_DB_OPERATIONS - 1)
         if lock is not None:
+            _OPERATION_OWNER = None
             lock.release()
 
 
@@ -120,15 +152,56 @@ async def with_db_timeout(
     source: str | None = None,
 ):
     """带超时控制的数据库操作"""
-    start_time = time.time()
+    loop = asyncio.get_running_loop()
+    task = asyncio.current_task()
+    start_time = loop.time()
+    inherited = _DB_DEADLINE.get()
+    deadline = start_time + max(0.0, timeout)
+    owns_deadline = True
+    if inherited and inherited[0] is task:
+        owns_deadline = deadline < inherited[1]
+        deadline = min(deadline, inherited[1])
+    token = _DB_DEADLINE.set((task, deadline))
+    expired = False
+    entered = False
+    queued = start_time
+    _DB_TIMING["operations"] += 1
+
+    def expire():
+        nonlocal expired
+        expired = True
+        task.cancel()
+
+    cancellation_count = task.cancelling() if hasattr(task, "cancelling") else 0
+    timer = loop.call_at(deadline, expire) if owns_deadline else None
     try:
-        async with _managed_db_operation():
-            result = await asyncio.wait_for(coro, timeout=timeout)
-        elapsed = time.time() - start_time
+        try:
+            async with _managed_db_operation():
+                queued = loop.time()
+                _DB_TIMING["queue_wait_ms"] += (queued - start_time) * 1000
+                entered = True
+                if queued >= deadline:
+                    if inspect.iscoroutine(coro):
+                        coro.close()
+                    raise asyncio.TimeoutError
+                result = await coro
+        except asyncio.CancelledError:
+            if not expired or (
+                hasattr(task, "cancelling")
+                and task.cancelling() > cancellation_count + 1
+            ):
+                raise
+            raise asyncio.TimeoutError from None
+        elapsed = loop.time() - start_time
         if elapsed > SLOW_QUERY_THRESHOLD and operation:
             logger.warning(f"慢查询: {operation} 耗时 {elapsed:.3f}s", LOG_COMMAND)
         return result
     except asyncio.TimeoutError:
+        if not entered:
+            _DB_TIMING["queue_timeouts"] += 1
+            _DB_TIMING["queue_wait_ms"] += (loop.time() - start_time) * 1000
+            raise
+        _DB_TIMING["execution_timeouts"] += 1
         timeout_reason = f"{operation or 'database_operation'} from {source or '-'}"
         unhealthy_duration = _DB_UNHEALTHY_TIMEOUT_SECONDS
         if _is_sqlite_connection():
@@ -158,3 +231,14 @@ async def with_db_timeout(
         if _is_sqlite_lock_error(exc):
             _mark_sqlite_lock_unhealthy(exc, operation, source)
         raise
+
+    finally:
+        if timer is not None:
+            timer.cancel()
+        if expired and hasattr(task, "uncancel"):
+            task.uncancel()
+        _DB_DEADLINE.reset(token)
+        if entered:
+            _DB_TIMING["execution_ms"] += (loop.time() - queued) * 1000
+        elif inspect.iscoroutine(coro):
+            coro.close()

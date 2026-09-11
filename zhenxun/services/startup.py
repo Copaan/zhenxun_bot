@@ -158,6 +158,16 @@ class StartupCoordinator:
 
         return validation_gate.business_allowed
 
+    @property
+    def final_business_ready(self) -> bool:
+        with self._lock:
+            return (
+                self._business_allowed()
+                and self._stages.get("runtime", {}).get("state") == "completed"
+                and self._stages.get("warmup", {}).get("state") == "completed"
+                and self._state in {"warmup_ready", "degraded"}
+            )
+
     def begin_stage(self, stage: StartupStage) -> None:
         with self._lock:
             self._stage_started[stage] = time.monotonic()

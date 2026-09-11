@@ -2,6 +2,7 @@ from typing_extensions import Self
 
 from tortoise import fields
 
+from zhenxun.services.asset_transaction import asset_call, asset_transaction
 from zhenxun.services.db_context import Model
 
 from .sign_log import SignLog
@@ -55,6 +56,7 @@ class SignUser(Model):
         return user
 
     @classmethod
+    @asset_call
     async def sign(
         cls,
         user_id: str | Self,
@@ -70,21 +72,47 @@ class SignUser(Model):
             bot_id: bot Id
             platform: 平台
         """
-        if isinstance(user_id, SignUser):
-            user = user_id
-        else:
-            user, _ = await cls.get_or_create(
-                user_id=user_id, defaults={"platform": platform}
+        identity = user_id.user_id if isinstance(user_id, SignUser) else user_id
+        async with asset_transaction(identity, platform):
+            from datetime import datetime
+            from hashlib import sha256
+            from zoneinfo import ZoneInfo
+
+            from zhenxun.services.message_execution import current_execution
+
+            from .asset_operation import AssetOperation
+
+            today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+            key = sha256(f"daily-sign:{identity}:{today}".encode()).hexdigest()
+            user = await cls.get_user(identity, platform)
+            previous = (
+                await SignLog.filter(user_id=identity).order_by("-create_time").first()
             )
-        user.impression = float(user.impression) + impression
-        user.add_probability = 0
-        user.specify_probability = 0
-        user.sign_count += 1
-        await user.save()
-        await SignLog.create(
-            user_id=user.user_id,
-            impression=impression,
-            bot_id=bot_id,
-            platform=platform,
-        )
-        return user
+            if (await AssetOperation.filter(id=key).exists()) or (
+                previous
+                and previous.create_time.astimezone(ZoneInfo("Asia/Shanghai")).date()
+                == today
+            ):
+                return user
+            user.impression = float(user.impression) + impression
+            user.add_probability = 0
+            user.specify_probability = 0
+            user.sign_count += 1
+            await user.save()
+            await SignLog.create(
+                user_id=user.user_id,
+                impression=impression,
+                bot_id=bot_id,
+                platform=platform,
+            )
+            await AssetOperation.create(
+                id=key,
+                user_id=identity,
+                event_id=current_execution.get().identity
+                if current_execution.get()
+                else None,
+                kind="daily_sign",
+                state="committed",
+                payload={"date": str(today)},
+            )
+            return user

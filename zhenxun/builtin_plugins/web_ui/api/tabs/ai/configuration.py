@@ -1603,7 +1603,22 @@ def _map_probe_error(error: Exception, phase: str) -> HTTPException:
             "provider_response_parse_failed",
             "服务商响应与所选 API 协议不匹配。",
         )
-    if isinstance(error, ConfigurationException | InvalidRequestException):
+    if isinstance(error, InvalidRequestException):
+        fields = [
+            name
+            for name in ("maxOutputTokens", "thinkingConfig", "safetySettings", "tools")
+            if name in str(error) or name in str(getattr(error, "details", {}))
+        ]
+        mapped = _probe_error(
+            422,
+            phase,
+            "provider_request_invalid",
+            "服务商拒绝了请求参数，请检查模型参数及服务商限制。"
+            + (f" 涉及字段：{', '.join(fields)}。" if fields else ""),
+        )
+        mapped.detail["parameter_fields"] = fields
+        return mapped
+    if isinstance(error, ConfigurationException):
         return _probe_error(
             422,
             "request_build",
@@ -1615,7 +1630,7 @@ def _map_probe_error(error: Exception, phase: str) -> HTTPException:
     )
 
 
-def _minimal_model_request(task: str):
+def _minimal_model_request(task: str, *, api_type: str | None = None):
     if task == "embedding":
         return EmbeddingRequest(
             batch=EmbedBatch(payloads=[EmbedPayload(parts=[TextPart(text="test")])]),
@@ -1628,7 +1643,7 @@ def _minimal_model_request(task: str):
     if task == "tts":
         return SpeechRequest(input_text="test", timeout=20)
     config = GenerationConfig()
-    config.common.max_tokens = 1
+    config.common.max_tokens = 64 if api_type == "gemini" else 1
     return ChatRequest(
         messages=[LLMMessage.user("Reply OK")], config=config, timeout=20
     )
@@ -1656,8 +1671,12 @@ async def _run_exact_model_probe(
         capabilities=capabilities,
         generation_config=None,
     )
-    request = _minimal_model_request(task)
+    request = _minimal_model_request(task, api_type=api_type)
     request_data = await adapter.prepare_payload(identity, api_key, request)
+    if api_type == "gemini" and task == "chat":
+        # Connectivity probes use provider safety defaults, not the global
+        # BLOCK_NONE override which some credentials/models cannot request.
+        request_data.body.pop("safetySettings", None)
     client = await http_client_manager.get_client(provider)
     started = time.monotonic()
     kwargs: dict[str, Any] = {

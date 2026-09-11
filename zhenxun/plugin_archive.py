@@ -699,7 +699,7 @@ async def _compile_wheels(
                 set(deps.protected_core())
                 | set(archive_dependency_contract().get("wheels_only_packages", []))
             ):
-                build_restrictions.extend(["--no-build-package", name])
+                build_restrictions.extend(["--only-binary", name])
         source = directory / "requirements.in"
         constraints_file = directory / "constraints.txt"
         output = directory / "requirements.txt"

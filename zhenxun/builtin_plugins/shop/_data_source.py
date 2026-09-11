@@ -3,6 +3,7 @@ from collections import defaultdict
 from collections.abc import Callable
 from datetime import datetime, timedelta
 import inspect
+import math
 import time
 from types import MappingProxyType
 from typing import Any, Literal
@@ -12,6 +13,8 @@ from nonebot_plugin_alconna import At, UniMessage, UniMsg
 from nonebot_plugin_uninfo import Uninfo
 from pydantic import BaseModel, Field, create_model
 from tortoise.expressions import Q
+from tortoise.functions import Sum
+from tortoise.timezone import localtime
 
 from zhenxun import ui
 from zhenxun.configs.config import BotConfig
@@ -20,6 +23,7 @@ from zhenxun.models.goods_info import GoodsInfo
 from zhenxun.models.user_console import UserConsole
 from zhenxun.models.user_props_log import UserPropsLog
 from zhenxun.services import avatar_service
+from zhenxun.services.asset_transaction import account_write
 from zhenxun.services.buffered_writers import append_user_gold_log
 from zhenxun.services.hot_query_cache import get_group_user_ids, get_member_names
 from zhenxun.services.log import logger
@@ -345,14 +349,11 @@ class ShopManage:
                 user = await UserConsole.get_user(user_id=session.user.id)
                 goods_list = await GoodsInfo.filter(uuid__in=user.props.keys()).all()
                 goods_by_uuid = {item.uuid: item for item in goods_list}
-                props_str = str(user.props)
                 user.props = {
                     uuid: count
                     for uuid, count in user.props.items()
                     if count > 0 and goods_by_uuid.get(uuid)
                 }
-                if props_str != str(user.props):
-                    await user.save(update_fields=["props"])
                 uuid = list(user.props.keys())[int(goods_name)]
                 goods_info = await GoodsInfo.get_or_none(uuid=uuid)
             except IndexError:
@@ -426,6 +427,7 @@ class ShopManage:
         )
 
     @classmethod
+    @account_write
     async def buy_prop(
         cls, user_id: str, name: str, num: int = 1, platform: str | None = None
     ) -> str:
@@ -440,8 +442,10 @@ class ShopManage:
         返回:
             str: 返回小
         """
-        if num < 0:
+        if isinstance(num, bool) or not isinstance(num, int) or num <= 0:
             return "购买的数量要大于0!"
+        if num > 2**31 - 1:
+            return "购买数量超出支持范围。"
         goods_list = (
             await GoodsInfo.filter(
                 Q(goods_limit_time__gte=time.time()) | Q(goods_limit_time=0)
@@ -460,19 +464,24 @@ class ShopManage:
             return "道具名称不存在..."
         user = await UserConsole.get_user(user_id, platform)
         price = goods.goods_price * num * goods.goods_discount
+        if not math.isfinite(price) or price < 0:
+            raise ValueError("invalid_goods_price")
         if user.gold < price:
             return "糟糕! 您的金币好像不太够哦..."
-        today = datetime.now()
-        create_time = today - timedelta(
-            hours=today.hour, minutes=today.minute, seconds=today.second
+        create_time = localtime().replace(hour=0, minute=0, second=0, microsecond=0)
+        purchases = (
+            await UserPropsLog.filter(
+                user_id=user_id,
+                handle=PropHandle.BUY,
+                uuid=goods.uuid,
+                create_time__gte=create_time,
+                create_time__lt=create_time + timedelta(days=1),
+            )
+            .annotate(total=Sum("num"))
+            .values("total")
         )
-        count = await UserPropsLog.filter(
-            user_id=user_id,
-            handle=PropHandle.BUY,
-            uuid=goods.uuid,
-            create_time__gte=create_time,
-        ).count()
-        if goods.daily_limit and count >= goods.daily_limit:
+        count = (purchases[0]["total"] if purchases else 0) or 0
+        if goods.daily_limit and count + num > goods.daily_limit:
             return "今天的购买已达限制了喔!"
         logger.info(
             f"花费 {price} 金币购买 {goods.goods_name} ×{num} 成功！",
@@ -482,6 +491,11 @@ class ShopManage:
         user.gold -= int(price)
         if goods.uuid not in user.props:
             user.props[goods.uuid] = 0
+        if (
+            not isinstance(user.props[goods.uuid], int)
+            or not 0 <= user.props[goods.uuid] <= 2**31 - 1 - num
+        ):
+            raise ValueError("props_quantity_out_of_range")
         user.props[goods.uuid] += num
         await user.save(update_fields=["gold", "props"])
         await append_user_gold_log(
@@ -512,14 +526,11 @@ class ShopManage:
 
         goods_list = await GoodsInfo.filter(uuid__in=user.props.keys()).all()
         goods_by_uuid = {item.uuid: item for item in goods_list}
-        props_str = str(user.props)
         user.props = {
             uuid: count
             for uuid, count in user.props.items()
             if count > 0 and goods_by_uuid.get(uuid)
         }
-        if props_str != str(user.props):
-            await user.save(update_fields=["props"])
 
         table_rows = []
         for i, prop_uuid in enumerate(user.props):

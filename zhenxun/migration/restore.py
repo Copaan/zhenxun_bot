@@ -180,6 +180,9 @@ def prepare_files(
     administrator_overrides: dict | None = None,
 ) -> dict:
     """Prepare candidate bytes without modifying the target instance."""
+    from zhenxun.services.message_store import assert_replaceable_inbox
+
+    assert_replaceable_inbox(root)
     boundary = SourceBoundary.read(root)
     actions, skipped, conflicts = [], [], []
     directory_candidates = set()
@@ -551,6 +554,9 @@ def apply_files(
     rollback_checkpoint=lambda: None,
 ) -> dict:
     """Caller must hold the instance lease and keep all business writers stopped."""
+    from zhenxun.services.message_store import assert_replaceable_inbox
+
+    assert_replaceable_inbox(root)
     if plan["conflicts"]:
         raise MigrationError("migration_conflicts_unresolved", status=409)
     if plan["target_revision"] != expected_revision:

@@ -34,6 +34,8 @@ class HandleEventSelectorDependencies:
     merge_dispatch_budget: Callable[[dict[str, int], dict[str, int]], None]
     build_matcher_state: Callable[[dict], dict]
     run_selected_matcher: Callable[..., Awaitable[None]]
+    acquire_dispatch_lane: Callable[[str], Awaitable[Callable[[], None]]] | None = None
+    run_admitted_matcher: Callable[..., Awaitable[None]] | None = None
 
 
 _HANDLE_EVENT_PATCHED = False
@@ -64,12 +66,19 @@ async def _run_matcher_with_deadline(
     coro: Awaitable[None],
     matcher: type[Matcher],
     lane: str,
+    remaining: float | None = None,
 ) -> None:
-    timeout = _matcher_deadline_for_lane(lane)
+    timeout = (
+        _matcher_deadline_for_lane(lane) if remaining is None else max(0, remaining)
+    )
     try:
         with anyio_mod.fail_after(timeout):
             await coro
     except TimeoutError:
+        from zhenxun.services.message_execution import current_execution
+
+        if execution := current_execution.get():
+            execution.errors.append("matcher_dispatch_timeout")
         logger.warning(
             "matcher dispatch timeout: "
             f"matcher={_matcher_name(matcher)}, lane={lane}, timeout={timeout:.1f}s",
@@ -159,7 +168,15 @@ async def patched_handle_event(
 
     log_msg = f"<m>{escape_tag(bot.type)} {escape_tag(bot.self_id)}</m> | "
     try:
-        log_msg += event.get_log_string()
+        description = event.get_log_string()
+        from zhenxun.services.message_execution import current_execution
+
+        execution = current_execution.get()
+        log_msg += (
+            f"Durable message {execution.identity[:16]}"
+            if execution is not None
+            else description
+        )
     except no_log_exception:
         show_log = False
     if show_log:
@@ -264,16 +281,38 @@ async def patched_handle_event(
                 else:
                     selected_matchers = priority_matchers
 
-                async def dispatch_one(coro, matcher, lane):
+                async def dispatch_one(arguments, matcher, lane, deadline):
+                    release = None
                     # Catch inside each child: TaskGroup must not cancel peers
                     # when one matcher blocks the next priority or fails a Rule.
-                    with catch(
-                        {
-                            stop_propagation: _handle_stop_propagation,
-                            Exception: handle_exception("Error when checking Matcher."),
-                        }
-                    ):
-                        await _run_matcher_with_deadline(anyio_mod, coro, matcher, lane)
+                    try:
+                        if getattr(deps, "acquire_dispatch_lane", None) is not None:
+                            with anyio_mod.fail_after(_matcher_deadline_for_lane(lane)):
+                                release = await deps.acquire_dispatch_lane(lane)
+                            arguments[3]["_zx_dispatch_lease"] = release
+                        with catch(
+                            {
+                                stop_propagation: _handle_stop_propagation,
+                                Exception: handle_exception(
+                                    "Error when checking Matcher."
+                                ),
+                            }
+                        ):
+                            run = (
+                                deps.run_admitted_matcher
+                                if release
+                                else deps.run_selected_matcher
+                            )
+                            await _run_matcher_with_deadline(
+                                anyio_mod,
+                                run(*arguments),
+                                matcher,
+                                lane,
+                                deadline - anyio_mod.current_time(),
+                            )
+                    finally:
+                        if release:
+                            release()
 
                 async with anyio_mod.create_task_group() as tg:
                     for matcher in selected_matchers:
@@ -301,9 +340,12 @@ async def patched_handle_event(
                                     if not single_result.selected:
                                         continue
                         matcher_state = deps.build_matcher_state(state)
+                        deadline = (
+                            anyio_mod.current_time() + _matcher_deadline_for_lane(lane)
+                        )
                         tg.start_soon(
                             dispatch_one,
-                            deps.run_selected_matcher(
+                            (
                                 matcher,
                                 bot,
                                 event,
@@ -314,6 +356,7 @@ async def patched_handle_event(
                             ),
                             matcher,
                             lane,
+                            deadline,
                         )
 
         if show_log:

@@ -164,7 +164,7 @@ async def _resolve_principal(
 
 
 async def prepare_event_context(
-    app_id: str, event: Event
+    app_id: str, event: Event, *, received_at: datetime | None = None
 ) -> OfficialQQEventContext | None:
     address = _event_address(event)
     if address is None:
@@ -184,7 +184,7 @@ async def prepare_event_context(
     source_kind: Literal["msg_id", "event_id"] = (
         "msg_id" if getattr(event, "id", None) else "event_id"
     )
-    received_at = datetime.now(timezone.utc)
+    received_at = received_at or datetime.now(timezone.utc)
     window = timedelta(minutes=60 if scene == "c2c" else 5)
     context = OfficialQQEventContext(
         app_id=app_id,

@@ -2,6 +2,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import contextlib
 from datetime import datetime, timezone
+from functools import lru_cache
 import os
 from pathlib import Path
 import signal
@@ -258,6 +259,13 @@ def install_runtime_worker_teardown(app) -> None:
                 yield state
         finally:
             try:
+                # A native shutdown hook can raise before NoneBot reaches the
+                # kernel hook. Always release core-owned resources as well.
+                try:
+                    await lifecycle_kernel.stop_all()
+                except Exception as error:
+                    lifecycle_kernel.require_recovery("lifecycle:teardown_failed")
+                    logger.error("Core lifecycle teardown failed", e=error)
                 await finish_runtime_workers()
             finally:
                 try:
@@ -278,9 +286,11 @@ def install_runtime_worker_teardown(app) -> None:
 def _sample_process() -> dict[str, object]:
     import psutil
 
+    from zhenxun.utils.process_tree import verified_descendants
+
     process = psutil.Process()
     return {
-        "child_process_count": len(process.children(recursive=True)),
+        "child_process_count": len(verified_descendants(process)),
         "rss_bytes": process.memory_info().rss,
         "process_sampled_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -332,6 +342,16 @@ class _ProcessSampler:
             raise LifecycleError("process_sampler_shutdown_timeout")
 
 
+@lru_cache(maxsize=4096)
+def _is_core_task_source(filename: str, code_identity: object) -> bool:
+    # Code objects change on reload; cache filesystem classification per code
+    # generation rather than resolving the same path for every live task.
+    try:
+        return Path(filename).resolve().is_relative_to(_PACKAGE_ROOT)
+    except (OSError, ValueError):
+        return False
+
+
 def _runtime_health_snapshot(
     loop_lag_ms: float, lifecycle_kernel=None, sampler: _ProcessSampler | None = None
 ) -> dict[str, object]:
@@ -371,15 +391,14 @@ def _runtime_health_snapshot(
             coroutine, "gi_code", None
         )
         filename = str(getattr(code, "co_filename", ""))
-        try:
-            is_zhenxun_source = Path(filename).resolve().is_relative_to(_PACKAGE_ROOT)
-        except (OSError, ValueError):
-            is_zhenxun_source = False
+        is_zhenxun_source = _is_core_task_source(filename, code)
         if not is_zhenxun_source:
             continue
         first_seen = _unowned_task_seen.setdefault(id(task), now)
         age = now - first_seen
         if age < _UNOWNED_TASK_GRACE_SECONDS:
+            continue
+        if len(unowned) >= 32:
             continue
         unowned.append(
             {
@@ -474,7 +493,14 @@ def register_runtime_bootstrap(_driver) -> None:
     _runtime_hooks_registered = True
 
     from nonebot.exception import IgnoredException
-    from nonebot.message import event_preprocessor
+    from nonebot.message import event_preprocessor, run_postprocessor
+
+    @run_postprocessor
+    async def _record_message_failure(exception: Exception | None) -> None:
+        from zhenxun.services.message_execution import current_execution
+
+        if exception is not None and (execution := current_execution.get()):
+            execution.errors.append(f"matcher:{type(exception).__name__}")
 
     @event_preprocessor
     async def _reject_events_until_runtime_ready() -> None:
@@ -500,6 +526,26 @@ def register_runtime_bootstrap(_driver) -> None:
         with contextlib.suppress(Exception):
             limiter = anyio.to_thread.current_default_thread_limiter()
             limiter.total_tokens = _get_anyio_tokens(workers)
+
+    @PriorityLifecycle.on_startup(
+        priority=-98,
+        stage="management",
+        component_id="management:message_inbox",
+        depends_on=("management:runtime_concurrency",),
+        pass_context=True,
+    )
+    async def _setup_message_inbox(context):
+        from zhenxun.services.message_inbox import message_inbox
+
+        await message_inbox.start(context)
+
+    @PriorityLifecycle.on_shutdown(
+        priority=1000, component_id="management:message_inbox"
+    )
+    async def _stop_message_inbox():
+        from zhenxun.services.message_inbox import message_inbox
+
+        await message_inbox.close()
 
     @PriorityLifecycle.on_startup(
         priority=-99,

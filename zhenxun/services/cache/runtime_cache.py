@@ -10,6 +10,11 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import uuid
 
 from zhenxun.services.cache.config import CacheMode
+from zhenxun.services.cache.write import (
+    deferred_mutation,
+    publication_snapshot,
+    write_scope,
+)
 from zhenxun.services.lifecycle import ResourceReceipt, RuntimeHandle
 from zhenxun.services.log import logger
 from zhenxun.services.message_load import is_db_unhealthy
@@ -967,6 +972,7 @@ class PluginInfoMemoryCache:
             cls._by_module_path.pop(snapshot.module_path, None)
 
     @classmethod
+    @deferred_mutation
     async def upsert_from_model(cls, plugin) -> None:
         if not plugin:
             return
@@ -985,6 +991,7 @@ class PluginInfoMemoryCache:
             cls._store_snapshot(snapshot)
 
     @classmethod
+    @deferred_mutation
     async def remove(
         cls, module: str | None = None, module_path: str | None = None
     ) -> None:
@@ -1025,14 +1032,7 @@ class PluginInfoMemoryCache:
 
     @classmethod
     def start_refresh_task(cls) -> None:
-        interval = PLUGININFO_MEM_REFRESH_INTERVAL
-        if interval <= 0:
-            return
-        if cls._refresh_task and not cls._refresh_task.done():
-            return
-        cls._refresh_task = _spawn_runtime_task(
-            cls._refresh_loop(interval), name=f"{cls.__name__}-refresh"
-        )
+        runtime_cache_refresh_coordinator.request_refresh(cls)
 
     @classmethod
     def stop_tasks(cls) -> None:
@@ -1162,6 +1162,7 @@ class BotMemoryCache:
         RuntimeCacheMutation.publish("bot", "upsert", updated.to_payload())
 
     @classmethod
+    @deferred_mutation
     async def upsert_from_model(cls, record) -> None:
         entry = BotSnapshot.from_model(record)
         async with cls._lock:
@@ -1179,6 +1180,7 @@ class BotMemoryCache:
             RuntimeCacheMutation.clear_negative_key(cls, entry.bot_id)
 
     @classmethod
+    @deferred_mutation
     async def remove(cls, bot_id: str | None) -> None:
         bot_id = cls._normalize(bot_id)
         if not bot_id:
@@ -1208,14 +1210,7 @@ class BotMemoryCache:
 
     @classmethod
     def start_tasks(cls) -> None:
-        interval = BOT_MEM_REFRESH_INTERVAL
-        if interval <= 0:
-            return
-        if cls._refresh_task and not cls._refresh_task.done():
-            return
-        cls._refresh_task = _spawn_runtime_task(
-            cls._refresh_loop(interval), name=f"{cls.__name__}-refresh"
-        )
+        runtime_cache_refresh_coordinator.request_refresh(cls)
 
     @classmethod
     def stop_tasks(cls) -> None:
@@ -1339,6 +1334,7 @@ class GroupMemoryCache:
         return None
 
     @classmethod
+    @deferred_mutation
     async def upsert_from_model(cls, record) -> None:
         entry = GroupSnapshot.from_model(record)
         key = cls._key(entry.group_id, entry.channel_id)
@@ -1360,6 +1356,7 @@ class GroupMemoryCache:
             RuntimeCacheMutation.clear_negative_key(cls, key)
 
     @classmethod
+    @deferred_mutation
     async def remove(cls, group_id: str | None, channel_id: str | None = None) -> None:
         key = cls._key(group_id, channel_id)
         if not key:
@@ -1391,14 +1388,7 @@ class GroupMemoryCache:
 
     @classmethod
     def start_tasks(cls) -> None:
-        interval = GROUP_MEM_REFRESH_INTERVAL
-        if interval <= 0:
-            return
-        if cls._refresh_task and not cls._refresh_task.done():
-            return
-        cls._refresh_task = _spawn_runtime_task(
-            cls._refresh_loop(interval), name=f"{cls.__name__}-refresh"
-        )
+        runtime_cache_refresh_coordinator.request_refresh(cls)
 
     @classmethod
     def stop_tasks(cls) -> None:
@@ -1562,6 +1552,7 @@ class LevelUserMemoryCache:
         return cls._by_user_max.get(user_id, 0)
 
     @classmethod
+    @deferred_mutation
     async def upsert_from_model(cls, record) -> None:
         entry = LevelUserSnapshot.from_model(record)
         key = cls._key(entry.user_id, entry.group_id)
@@ -1595,6 +1586,7 @@ class LevelUserMemoryCache:
             RuntimeCacheMutation.clear_negative_key(cls, key)
 
     @classmethod
+    @deferred_mutation
     async def remove(cls, user_id: str | None, group_id: str | None) -> None:
         key = cls._key(user_id, group_id)
         if not key:
@@ -1639,14 +1631,7 @@ class LevelUserMemoryCache:
 
     @classmethod
     def start_tasks(cls) -> None:
-        interval = LEVEL_MEM_REFRESH_INTERVAL
-        if interval <= 0:
-            return
-        if cls._refresh_task and not cls._refresh_task.done():
-            return
-        cls._refresh_task = _spawn_runtime_task(
-            cls._refresh_loop(interval), name=f"{cls.__name__}-refresh"
-        )
+        runtime_cache_refresh_coordinator.request_refresh(cls)
 
     @classmethod
     def stop_tasks(cls) -> None:
@@ -1776,6 +1761,7 @@ class TaskInfoMemoryCache:
         return not entry.status or not entry.load_status
 
     @classmethod
+    @deferred_mutation
     async def upsert_from_model(cls, record) -> None:
         entry = TaskInfoSnapshot.from_model(record)
         async with cls._lock:
@@ -1797,6 +1783,7 @@ class TaskInfoMemoryCache:
             RuntimeCacheMutation.clear_negative_key(cls, entry.module)
 
     @classmethod
+    @deferred_mutation
     async def remove(cls, module: str | None) -> None:
         module = cls._normalize(module)
         if not module:
@@ -1830,14 +1817,7 @@ class TaskInfoMemoryCache:
 
     @classmethod
     def start_tasks(cls) -> None:
-        interval = TASK_MEM_REFRESH_INTERVAL
-        if interval <= 0:
-            return
-        if cls._refresh_task and not cls._refresh_task.done():
-            return
-        cls._refresh_task = _spawn_runtime_task(
-            cls._refresh_loop(interval), name=f"{cls.__name__}-refresh"
-        )
+        runtime_cache_refresh_coordinator.request_refresh(cls)
 
     @classmethod
     def stop_tasks(cls) -> None:
@@ -1958,6 +1938,7 @@ class PluginLimitMemoryCache:
         return list(cls._by_id.values())
 
     @classmethod
+    @deferred_mutation
     async def upsert_from_model(cls, record) -> None:
         entry = PluginLimitSnapshot.from_model(record)
         await cls._upsert_entry(entry)
@@ -2001,6 +1982,7 @@ class PluginLimitMemoryCache:
             RuntimeCacheMutation.clear_negative_key(cls, entry.module)
 
     @classmethod
+    @deferred_mutation
     async def remove_by_id(cls, limit_id: int | None) -> None:
         if not limit_id:
             return
@@ -2035,14 +2017,7 @@ class PluginLimitMemoryCache:
 
     @classmethod
     def start_tasks(cls) -> None:
-        interval = LIMIT_MEM_REFRESH_INTERVAL
-        if interval <= 0:
-            return
-        if cls._refresh_task and not cls._refresh_task.done():
-            return
-        cls._refresh_task = _spawn_runtime_task(
-            cls._refresh_loop(interval), name=f"{cls.__name__}-refresh"
-        )
+        runtime_cache_refresh_coordinator.request_refresh(cls)
 
     @classmethod
     def stop_tasks(cls) -> None:
@@ -2167,6 +2142,7 @@ class BanMemoryCache:
         return cls._loaded
 
     @classmethod
+    @deferred_mutation
     async def upsert_from_model(cls, record) -> None:
         entry = cls._build_entry(record)
         if not entry:
@@ -2182,6 +2158,7 @@ class BanMemoryCache:
         RuntimeCacheMutation.publish("ban", "upsert", entry.to_payload())
 
     @classmethod
+    @deferred_mutation
     async def remove(cls, user_id: str | None, group_id: str | None) -> None:
         await cls._remove_local(user_id, group_id)
         RuntimeCacheMutation.publish(
@@ -2319,17 +2296,18 @@ class BanMemoryCache:
 
         from zhenxun.models.ban_console import BanConsole
 
-        for entry in expired:
-            query = BanConsole.filter()
-            if entry.user_id:
-                query = query.filter(user_id=entry.user_id)
-            else:
-                query = query.filter(Q(user_id__isnull=True) | Q(user_id=""))
-            if entry.group_id:
-                query = query.filter(group_id=entry.group_id)
-            else:
-                query = query.filter(Q(group_id__isnull=True) | Q(group_id=""))
-            await query.delete()
+        async with write_scope():
+            for entry in expired:
+                query = BanConsole.filter()
+                if entry.user_id:
+                    query = query.filter(user_id=entry.user_id)
+                else:
+                    query = query.filter(Q(user_id__isnull=True) | Q(user_id=""))
+                if entry.group_id:
+                    query = query.filter(group_id=entry.group_id)
+                else:
+                    query = query.filter(Q(group_id__isnull=True) | Q(group_id=""))
+                await query.delete()
 
     @classmethod
     async def _refresh_loop(cls, interval: int) -> None:
@@ -2351,19 +2329,7 @@ class BanMemoryCache:
 
     @classmethod
     def start_tasks(cls) -> None:
-        refresh_interval = BAN_MEM_REFRESH_INTERVAL
-        clean_interval = BAN_MEM_CLEAN_INTERVAL
-        cleanup_db = BAN_MEM_CLEANUP_DB
-
-        if refresh_interval > 0 and (not cls._refresh_task or cls._refresh_task.done()):
-            cls._refresh_task = _spawn_runtime_task(
-                cls._refresh_loop(refresh_interval), name=f"{cls.__name__}-refresh"
-            )
-        if clean_interval > 0 and (not cls._cleanup_task or cls._cleanup_task.done()):
-            cls._cleanup_task = _spawn_runtime_task(
-                cls._cleanup_loop(clean_interval, cleanup_db),
-                name=f"{cls.__name__}-cleanup",
-            )
+        runtime_cache_refresh_coordinator.request_refresh(cls)
 
     @classmethod
     def start_cleanup_task(cls) -> None:
@@ -2443,6 +2409,21 @@ class RuntimeCacheRefreshCoordinator:
             return dialect.startswith("sqlite")
         except Exception:
             return False
+
+    def request_refresh(self, cache_cls: type) -> None:
+        for name, (candidate, _) in self._specs().items():
+            if candidate is cache_cls:
+                self._next_due[name] = time.monotonic()
+                self._wake.set()
+                if (
+                    (self._task is None or self._task.done())
+                    and _LIFECYCLE_CONTEXT is not None
+                    and _LIFECYCLE_CONTEXT.accepting
+                ):
+                    self._task = _spawn_runtime_task(
+                        self._run(), name="runtime-cache-refresh-coordinator"
+                    )
+                return
 
     async def start(self) -> None:
         if self._task is not None and not self._task.done():
@@ -2588,11 +2569,21 @@ class RuntimeCacheRefreshCoordinator:
                     await asyncio.gather(*(refresh(name) for name in due_names))
 
     def snapshot(self) -> dict[str, Any]:
+        import sys
+
+        from zhenxun.services.cache.diagnostics import availability_snapshot
+        from zhenxun.services.db_context.utils import db_timing_snapshot
+
+        hot = sys.modules.get("zhenxun.services.hot_query_cache")
         return {
             "running": self._task is not None and not self._task.done(),
             "queue_depth": self._queue_depth,
             "current_cache": self._current_cache,
             "last_failed_cache": self._last_failed_cache,
+            "cache_publication": publication_snapshot(),
+            "database_timing": db_timing_snapshot(),
+            "availability_fallbacks": availability_snapshot(),
+            "hot_queries": hot.hot_query_snapshot() if hot is not None else {},
             "last_error_code": self._last_error_code,
             "failure_counts": dict(self._failure_counts),
             "sqlite_serial": self._sqlite(),

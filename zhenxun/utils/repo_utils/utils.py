@@ -169,6 +169,10 @@ async def run_git_command(
             cwd=cwd,
             env=process_env,
         )
+        owned_parent = None
+        with contextlib.suppress(psutil.Error):
+            owned_parent = psutil.Process(process.pid)
+            owned_parent.create_time()
 
         stderr_lines: list[str] = []
 
@@ -217,9 +221,12 @@ async def run_git_command(
                     output_tasks,
                     timeout=timeout_seconds,
                 )
-        except TimeoutError:
-            await _kill_process_tree(process)
+        except (TimeoutError, asyncio.TimeoutError):
+            await _kill_process_tree(process, owned_parent)
             return False, "", f"命令执行超时（{timeout_seconds:g} 秒）"
+        except asyncio.CancelledError:
+            await _kill_process_tree(process, owned_parent)
+            raise
 
         await process.wait()
         stdout = redact_git_output(
@@ -235,22 +242,36 @@ async def run_git_command(
         return False, "", safe_error
 
 
-async def _kill_process_tree(process: asyncio.subprocess.Process) -> None:
+async def _kill_process_tree(
+    process: asyncio.subprocess.Process, owned_parent: psutil.Process | None = None
+) -> None:
     """终止超时的 Git 进程及其派生的认证、网络辅助进程。"""
-    with contextlib.suppress(psutil.Error):
-        parent = psutil.Process(process.pid)
-        children = parent.children(recursive=True)
-        for child in reversed(children):
-            with contextlib.suppress(psutil.Error):
+    from zhenxun.utils.process_tree import verified_descendants
+
+    errors: list[psutil.Error] = []
+    if owned_parent is not None:
+        children = []
+        try:
+            children = verified_descendants(owned_parent)
+        except psutil.NoSuchProcess:
+            pass
+        except psutil.Error as error:
+            errors.append(error)
+        for child in [*reversed(children), owned_parent]:
+            try:
                 child.kill()
-        with contextlib.suppress(psutil.Error):
-            parent.kill()
+            except psutil.NoSuchProcess:
+                pass
+            except psutil.Error as error:
+                errors.append(error)
 
     if process.returncode is None:
         with contextlib.suppress(ProcessLookupError):
             process.kill()
-    with contextlib.suppress(TimeoutError):
+    with contextlib.suppress(TimeoutError, asyncio.TimeoutError):
         await asyncio.wait_for(process.wait(), timeout=5)
+    if errors:
+        raise errors[0]
 
 
 async def _collect_stdout(process: asyncio.subprocess.Process) -> bytes:
