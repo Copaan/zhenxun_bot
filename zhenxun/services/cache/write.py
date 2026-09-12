@@ -16,6 +16,8 @@ from typing import Any
 
 from tortoise.connection import connections
 
+from zhenxun.services.pipeline_metrics import pipeline_metrics
+
 Effect = Callable[[], Awaitable[Any]]
 _scope: ContextVar[WriteBatch | None] = ContextVar("cache_write_batch", default=None)
 _connection: ContextVar[Any] = ContextVar("cache_write_connection", default=None)
@@ -140,6 +142,7 @@ def _observe_transaction_exit() -> None:
         def wrap_enter(enter_method, pooled):
             @wraps(enter_method)
             async def enter_with_cleanup(context):
+                started = time.monotonic()
                 try:
                     if getattr(
                         context.connection._parent,
@@ -152,6 +155,10 @@ def _observe_transaction_exit() -> None:
                     if connections.get(context.connection_name) is context.connection:
                         await _recover_transaction_context(context, pooled)
                     raise
+                finally:
+                    pipeline_metrics.observe(
+                        "transaction_enter_ms", time.monotonic() - started
+                    )
 
             return enter_with_cleanup
 
@@ -241,8 +248,10 @@ def _transaction_batch(connection) -> WriteBatch | None:
     _observe_transaction_exit()
     batch = WriteBatch()
     original_commit, original_rollback = connection.commit, connection.rollback
+    client_timed = bool(getattr(connection, "_zx_pipeline_timing", False))
 
     async def commit():
+        started = time.monotonic()
         try:
             await original_commit()
         except BaseException:
@@ -256,14 +265,20 @@ def _transaction_batch(connection) -> WriteBatch | None:
             }
             batch.discard()
             raise
+        finally:
+            if not client_timed:
+                pipeline_metrics.observe("commit_ms", time.monotonic() - started)
         batch.committed = True
         if not _exiting.get():
             await batch.flush()
 
     async def rollback():
+        started = time.monotonic()
         try:
             await original_rollback()
         finally:
+            if not client_timed:
+                pipeline_metrics.observe("rollback_ms", time.monotonic() - started)
             batch.discard()
 
     # Bind to this transaction instance, including caller-supplied connections;

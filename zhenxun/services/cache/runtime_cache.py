@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+import inspect
 import json
 import os
 import time
@@ -822,6 +823,8 @@ class RuntimeCacheMutation:
             RuntimeCacheMutation.mark_error(
                 cache_cls, RuntimeError("database unhealthy")
             )
+            if inspect.iscoroutine(coro):
+                coro.close()
             return None
         try:
             return await with_db_timeout(
@@ -836,6 +839,9 @@ class RuntimeCacheMutation:
 
     @staticmethod
     def mark_refreshed(cache_cls: type) -> None:
+        from zhenxun.services.permission_revision import advance_revision
+
+        advance_revision()
         setattr(cache_cls, "_loaded", True)
         setattr(cache_cls, "_last_refresh", time.time())
         setattr(cache_cls, "_last_error", None)
@@ -858,6 +864,9 @@ class RuntimeCacheMutation:
 
     @staticmethod
     def publish(cache_type: str, action: str, data: dict[str, Any]) -> None:
+        from zhenxun.services.permission_revision import advance_revision
+
+        advance_revision()
         if _APPLYING_REMOTE_CACHE_EVENT.get():
             return
         RuntimeCacheSync.publish_event(cache_type, action, data)
@@ -2581,6 +2590,25 @@ class RuntimeCacheRefreshCoordinator:
             "current_cache": self._current_cache,
             "last_failed_cache": self._last_failed_cache,
             "cache_publication": publication_snapshot(),
+            "permission_revision": (
+                sys.modules["zhenxun.services.permission_revision"].snapshot()
+                if "zhenxun.services.permission_revision" in sys.modules
+                else {}
+            ),
+            "cache_refill": (
+                {
+                    "discarded": sys.modules[
+                        "zhenxun.services.cache"
+                    ].CacheRoot._refill_fence.discarded,
+                    "degraded_stripes": sum(
+                        sys.modules[
+                            "zhenxun.services.cache"
+                        ].CacheRoot._refill_fence.poisoned
+                    ),
+                }
+                if "zhenxun.services.cache" in sys.modules
+                else {}
+            ),
             "database_timing": db_timing_snapshot(),
             "availability_fallbacks": availability_snapshot(),
             "hot_queries": hot.hot_query_snapshot() if hot is not None else {},

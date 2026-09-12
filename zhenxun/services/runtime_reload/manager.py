@@ -734,7 +734,23 @@ class PluginRuntimeManager:
         async def run_with_owner(matcher, *args, **kwargs):
             with manager._matcher_admission(type(matcher)) as admitted:
                 if admitted:
-                    return await original(matcher, *args, **kwargs)
+                    from zhenxun.services.message_execution import current_execution
+                    from zhenxun.services.pipeline_metrics import pipeline_metrics
+
+                    execution = current_execution.get()
+                    if execution is not None:
+                        execution.handlers_started += 1
+                        if execution.received_at is not None:
+                            pipeline_metrics.observe(
+                                "handler_wait_ms", time.time() - execution.received_at
+                            )
+                    started = time.monotonic()
+                    try:
+                        return await original(matcher, *args, **kwargs)
+                    finally:
+                        pipeline_metrics.observe(
+                            "handler_execution_ms", time.monotonic() - started
+                        )
             return None
 
         run_with_owner.__zhenxun_runtime_owner__ = self

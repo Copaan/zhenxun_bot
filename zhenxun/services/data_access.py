@@ -190,12 +190,14 @@ class DataAccess(Generic[T]):
 
         # 尝试从缓存获取
         cache_key = None
+        refill_token = None
         try:
             # 尝试构建缓存键
             cache_key = self._build_cache_key_from_kwargs(**kwargs)
 
             # 如果成功构建缓存键，尝试从缓存获取
             if cache_key is not None:
+                refill_token = CacheRoot.refill_token(self.cache_type, cache_key)
                 data = await self.cache.get(cache_key) if self.cache else None
                 logger.debug(
                     f"{self.model_cls.__name__}  key: {cache_key}"
@@ -228,43 +230,18 @@ class DataAccess(Generic[T]):
         except Exception as e:
             logger.error(f"{self.model_cls.__name__} 从缓存获取数据失败: {kwargs}", e=e)
 
-        # 如果缓存中没有，从数据库获取
-        logger.debug(f"{self.model_cls.__name__} 从数据库获取数据: {kwargs}")
-        data = await db_query_func(*args, **kwargs)
-
-        # 如果获取到数据，存入缓存
-        if data:
-            try:
-                # 生成缓存键
-                cache_key = self._build_cache_key_for_item(data)
-                if cache_key is not None:
-                    # 存入缓存
-                    if self.cache:
-                        await self.cache.set(cache_key, data)
-                    self._bump_cache_stat(self.cache_type, "sets")
-                    logger.debug(
-                        f"{self.model_cls.__name__} 数据已存入缓存: {cache_key}"
-                    )
-            except Exception as e:
-                logger.error(
-                    f"{self.model_cls.__name__} 存入缓存失败，参数: {kwargs}", e=e
-                )
-        elif cache_key is not None:
-            # 如果没有获取到数据，缓存空结果
-            try:
-                # 存入空结果缓存，使用较短的过期时间
-                await self.cache.set(
-                    cache_key, self._NULL_RESULT, expire=self._NULL_RESULT_TTL
-                ) if self.cache else None
-                self._bump_cache_stat(self.cache_type, "null_sets")
-                logger.debug(
-                    f"{self.model_cls.__name__} 空结果已存入缓存: {cache_key},"
-                    f" TTL={self._NULL_RESULT_TTL}秒"
-                )
-            except Exception as e:
-                logger.error(
-                    f"{self.model_cls.__name__} 存入空结果缓存失败，参数: {kwargs}", e=e
-                )
+        data = await with_db_timeout(
+            db_query_func(*args, **kwargs),
+            operation=f"{self.model_cls.__name__}.{db_query_func.__name__}",
+            source="DataAccess",
+        )
+        # A cache miss is not a durable absence. Only fill a known key from a
+        # successful query if no committed write invalidated its revision.
+        if data is not None and cache_key is not None and refill_token is not None:
+            if await CacheRoot.set_if_current(
+                self.cache_type, cache_key, data, refill_token
+            ):
+                self._bump_cache_stat(self.cache_type, "sets")
 
         return data
 

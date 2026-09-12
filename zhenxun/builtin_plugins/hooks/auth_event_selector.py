@@ -36,6 +36,8 @@ class HandleEventSelectorDependencies:
     run_selected_matcher: Callable[..., Awaitable[None]]
     acquire_dispatch_lane: Callable[[str], Awaitable[Callable[[], None]]] | None = None
     run_admitted_matcher: Callable[..., Awaitable[None]] | None = None
+    resource_lane_for_matcher: Callable[[type[Matcher]], str] | None = None
+    acquire_resource_lane: Callable[..., Awaitable[Any]] | None = None
 
 
 _HANDLE_EVENT_PATCHED = False
@@ -160,6 +162,10 @@ async def patched_handle_event(
     event: Event,
     deps: HandleEventSelectorDependencies,
 ) -> None:
+    import time
+
+    from zhenxun.services.pipeline_metrics import pipeline_metrics
+
     _normalize_qq_self_at_message(bot, event)
     show_log = True
     escape_tag = getattr(nb_message, "escape_tag")
@@ -204,28 +210,39 @@ async def patched_handle_event(
         ):
             return
 
+        route_release = None
+        if getattr(deps, "acquire_resource_lane", None) is not None:
+            route_release = await deps.acquire_resource_lane("chat")
         try:
-            trie_rule.get_value(bot, event, state)
-        except Exception as e:
-            logger_.opt(colors=True, exception=e).warning(
-                "Error while parsing command for event"
+            route_started = time.perf_counter()
+            try:
+                trie_rule.get_value(bot, event, state)
+            except Exception as e:
+                logger_.opt(colors=True, exception=e).warning(
+                    "Error while parsing command for event"
+                )
+            deps.prepare_handle_event_state(event, state)
+            dispatch_context = await deps.build_dispatch_context(event, state)
+            activation_context = deps.activation_context_from_dispatch(
+                dispatch_context,
+                event,
             )
-        deps.prepare_handle_event_state(event, state)
-        dispatch_context = await deps.build_dispatch_context(event, state)
-        activation_context = deps.activation_context_from_dispatch(
-            dispatch_context,
-            event,
-        )
-        activation_available = True
-        try:
-            deps.activation_index.ensure_fresh(matchers)
-        except Exception as exc:
-            activation_available = False
-            logger.warning(
-                "HandlerActivationIndex 构建失败，回退到旧 matcher 选择逻辑",
-                LOGGER_COMMAND,
-                e=exc,
+            pipeline_metrics.observe(
+                "route_select_ms", time.perf_counter() - route_started
             )
+            activation_available = True
+            try:
+                deps.activation_index.ensure_fresh(matchers)
+            except Exception as exc:
+                activation_available = False
+                logger.warning(
+                    "HandlerActivationIndex 构建失败，回退到旧 matcher 选择逻辑",
+                    LOGGER_COMMAND,
+                    e=exc,
+                )
+        finally:
+            if route_release is not None:
+                route_release()
 
         break_flag = False
 
@@ -281,14 +298,13 @@ async def patched_handle_event(
                 else:
                     selected_matchers = priority_matchers
 
-                async def dispatch_one(arguments, matcher, lane, deadline):
-                    release = None
+                leases = {}
+
+                async def dispatch_one(arguments, matcher, lane, deadline, release):
                     # Catch inside each child: TaskGroup must not cancel peers
                     # when one matcher blocks the next priority or fails a Rule.
                     try:
-                        if getattr(deps, "acquire_dispatch_lane", None) is not None:
-                            with anyio_mod.fail_after(_matcher_deadline_for_lane(lane)):
-                                release = await deps.acquire_dispatch_lane(lane)
+                        if release is not None:
                             arguments[3]["_zx_dispatch_lease"] = release
                         with catch(
                             {
@@ -313,51 +329,137 @@ async def patched_handle_event(
                     finally:
                         if release:
                             release()
+                            leases.pop(id(release), None)
 
-                async with anyio_mod.create_task_group() as tg:
-                    for matcher in selected_matchers:
-                        lane = deps.dispatch_lane_for_matcher(matcher, dispatch_context)
-                        if activation_result is None:
-                            descriptor = deps.activation_index.descriptor_for(matcher)
-                            if descriptor is not None:
-                                single_budget = dict(priority_budget)
-                                try:
-                                    single_result = (
-                                        deps.activation_index.select_priority(
-                                            priority,
-                                            [matcher],
-                                            activation_context,
+                async def admit_lane(tg, lane, resource_lane, candidates):
+                    for matcher, deadline in candidates:
+                        release = None
+                        resource_release = None
+                        admitted = time.perf_counter()
+                        try:
+                            with catch(
+                                {
+                                    Exception: handle_exception(
+                                        "Matcher admission failed"
+                                    )
+                                }
+                            ):
+                                with anyio_mod.fail_after(
+                                    max(0, deadline - anyio_mod.current_time())
+                                ):
+                                    if resource_lane is not None:
+                                        resource_release = (
+                                            await deps.acquire_resource_lane(
+                                                resource_lane
+                                            )
+                                        )
+                                    release = await deps.acquire_dispatch_lane(lane)
+                                if resource_release is not None:
+                                    from zhenxun.services.message_resources import (
+                                        combined_lease,
+                                    )
+
+                                    release = combined_lease(resource_release, release)
+                                    resource_release = None
+                                pipeline_metrics.observe(
+                                    "admission_wait_ms", time.perf_counter() - admitted
+                                )
+                                leases[id(release)] = release
+                                tg.start_soon(
+                                    dispatch_one,
+                                    (
+                                        matcher,
+                                        bot,
+                                        event,
+                                        deps.build_matcher_state(state),
+                                        stack,
+                                        dependency_cache,
+                                        lane,
+                                    ),
+                                    matcher,
+                                    lane,
+                                    deadline,
+                                    release,
+                                )
+                                release = None  # The child now owns the lease.
+                        finally:
+                            if release is not None:
+                                release()
+                                leases.pop(id(release), None)
+                            if resource_release is not None:
+                                resource_release()
+
+                lanes = {}
+                try:
+                    async with anyio_mod.create_task_group() as tg:
+                        for matcher in selected_matchers:
+                            lane = deps.dispatch_lane_for_matcher(
+                                matcher, dispatch_context
+                            )
+                            if activation_result is None:
+                                descriptor = deps.activation_index.descriptor_for(
+                                    matcher
+                                )
+                                if descriptor is not None:
+                                    single_budget = dict(priority_budget)
+                                    try:
+                                        single_result = (
+                                            deps.activation_index.select_priority(
+                                                priority,
+                                                [matcher],
+                                                activation_context,
+                                                single_budget,
+                                            )
+                                        )
+                                    except Exception:
+                                        single_result = None
+                                    if single_result is not None:
+                                        deps.merge_dispatch_budget(
+                                            priority_budget,
                                             single_budget,
                                         )
+                                        if not single_result.selected:
+                                            continue
+                            deadline = (
+                                anyio_mod.current_time()
+                                + _matcher_deadline_for_lane(lane)
+                            )
+                            if getattr(deps, "acquire_dispatch_lane", None) is not None:
+                                resource_lane = None
+                                if getattr(deps, "resource_lane_for_matcher", None):
+                                    resource_lane = deps.resource_lane_for_matcher(
+                                        matcher
                                     )
-                                except Exception:
-                                    single_result = None
-                                if single_result is not None:
-                                    deps.merge_dispatch_budget(
-                                        priority_budget,
-                                        single_budget,
-                                    )
-                                    if not single_result.selected:
-                                        continue
-                        matcher_state = deps.build_matcher_state(state)
-                        deadline = (
-                            anyio_mod.current_time() + _matcher_deadline_for_lane(lane)
-                        )
-                        tg.start_soon(
-                            dispatch_one,
-                            (
+                                lanes.setdefault((lane, resource_lane), []).append(
+                                    (matcher, deadline)
+                                )
+                                continue
+                            tg.start_soon(
+                                dispatch_one,
+                                (
+                                    matcher,
+                                    bot,
+                                    event,
+                                    deps.build_matcher_state(state),
+                                    stack,
+                                    dependency_cache,
+                                    lane,
+                                ),
                                 matcher,
-                                bot,
-                                event,
-                                matcher_state,
-                                stack,
-                                dependency_cache,
                                 lane,
-                            ),
-                            matcher,
-                            lane,
-                            deadline,
-                        )
+                                deadline,
+                                None,
+                            )
+                        # One admission waiter per lane, not one per matcher. A
+                        # saturated database lane cannot stall independent I/O lanes.
+                        for (lane, resource_lane), candidates in lanes.items():
+                            tg.start_soon(
+                                admit_lane, tg, lane, resource_lane, candidates
+                            )
+                finally:
+                    # Includes children canceled before their first instruction.
+                    for release in leases.values():
+                        release()
 
         if show_log:
             logger_.debug("Checking for matchers completed")

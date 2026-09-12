@@ -14,6 +14,36 @@ class InboxConflict(RuntimeError):
     pass
 
 
+def _message_summary(raw: str | None) -> tuple[str, str]:
+    """Return a safe preview for the management UI without exposing raw payloads."""
+    if not raw:
+        return "", "unknown"
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError):
+        return "消息内容解析失败", "invalid"
+    if not isinstance(payload, dict):
+        return "消息内容不可用", "unknown"
+    message_type = str(payload.get("post_type") or payload.get("type") or "message")
+    content = payload.get("message", payload.get("content", ""))
+    if isinstance(content, str):
+        preview = content
+    elif isinstance(content, list):
+        parts = []
+        for segment in content:
+            if isinstance(segment, dict):
+                data = segment.get("data") or {}
+                value = data.get("text") if isinstance(data, dict) else None
+                parts.append(
+                    str(value) if value else f"[{segment.get('type', '消息段')}]"
+                )
+        preview = "".join(parts)
+    else:
+        preview = ""
+    preview = " ".join(preview.split())[:200]
+    return preview or "[无文本内容]", message_type
+
+
 def assert_replaceable_inbox(root: Path):
     path = root / "data/runtime/message-inbox/inbox.sqlite3"
     if not path.exists():
@@ -94,6 +124,8 @@ class MessageStore:
                 );
                 CREATE INDEX IF NOT EXISTS inbox_dispatch
                     ON inbox(state, sequence);
+                CREATE INDEX IF NOT EXISTS inbox_pending_age
+                    ON inbox(state, received);
                 CREATE INDEX IF NOT EXISTS inbox_conversation
                     ON inbox(conversation, state);
                 CREATE TABLE IF NOT EXISTS counters (
@@ -148,7 +180,58 @@ class MessageStore:
                 "WHERE state='waiting_input'",
                 (time.time(),),
             )
+            self._initialize_state_counts(db)
         return self.snapshot()
+
+    @staticmethod
+    def _initialize_state_counts(db):
+        # Reconcile once at startup, then maintain occupancy in the SAME SQLite
+        # transaction as each row. Admission/status no longer scan retained rows.
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS state_counts ("
+            "scope TEXT NOT NULL, state TEXT NOT NULL, count INTEGER NOT NULL, "
+            "PRIMARY KEY(scope,state))"
+        )
+        for table in ("inbox", "deliveries"):
+            db.execute("DELETE FROM state_counts WHERE scope=?", (table,))
+            db.execute(
+                f"INSERT INTO state_counts SELECT ?,state,COUNT(*) FROM {table} "
+                "GROUP BY state",
+                (table,),
+            )
+            increment = (
+                "INSERT INTO state_counts(scope,state,count) "
+                f"VALUES('{table}',NEW.state,1) ON CONFLICT(scope,state) "
+                "DO UPDATE SET count=count+1;"
+            )
+            decrement = (
+                "UPDATE state_counts SET count=count-1 "
+                f"WHERE scope='{table}' AND state=OLD.state;"
+            )
+            for action, operation in (
+                ("INSERT", increment),
+                ("DELETE", decrement),
+                ("UPDATE OF state", decrement + increment),
+            ):
+                trigger = f"{table}_count_{action.split()[0].lower()}"
+                condition = (
+                    " WHEN OLD.state != NEW.state"
+                    if action.startswith("UPDATE")
+                    else ""
+                )
+                db.execute(
+                    f"CREATE TRIGGER IF NOT EXISTS {trigger} AFTER {action} ON {table}"
+                    f"{condition} BEGIN {operation} END"
+                )
+
+    @staticmethod
+    def _state_counts(db, table):
+        return dict(
+            db.execute(
+                "SELECT state,count FROM state_counts WHERE scope=? AND count>0",
+                (table,),
+            ).fetchall()
+        )
 
     def enqueue_delivery(self, identity, event_id, writer, payload):
         with self.connect() as db:
@@ -266,7 +349,7 @@ class MessageStore:
         results = []
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            count = db.execute("SELECT COUNT(*) FROM inbox").fetchone()[0]
+            count = sum(self._state_counts(db, "inbox").values())
             disk_bytes = self.disk_bytes()
             for item in envelopes:
                 existing = db.execute(
@@ -390,13 +473,20 @@ class MessageStore:
             rows = db.execute(
                 "SELECT "
                 "sequence,id,bot,adapter,revision,received,updated,state,reason,"
-                "result,history_state "
+                "result,history_state,payload "
                 "FROM inbox WHERE sequence>? "
                 + ("AND state=? " if state else "")
                 + "ORDER BY sequence LIMIT ?",
                 (after, state, limit) if state else (after, limit),
             ).fetchall()
-            return [dict(row) for row in rows]
+            result = []
+            for row in rows:
+                item = dict(row)
+                preview, message_type = _message_summary(item.pop("payload", None))
+                item["content_preview"] = preview
+                item["message_type"] = message_type
+                result.append(item)
+            return result
 
     def resolve(self, identity, revision, action):
         if action != "dismiss":
@@ -427,18 +517,12 @@ class MessageStore:
 
     def snapshot(self):
         with self.connect() as db:
-            states = dict(
-                db.execute("SELECT state,COUNT(*) FROM inbox GROUP BY state").fetchall()
-            )
+            states = self._state_counts(db, "inbox")
             oldest = db.execute(
                 "SELECT MIN(received) FROM inbox WHERE state='pending'"
             ).fetchone()[0]
             counters = dict(db.execute("SELECT name,value FROM counters").fetchall())
-            deliveries = dict(
-                db.execute(
-                    "SELECT state,COUNT(*) FROM deliveries GROUP BY state"
-                ).fetchall()
-            )
+            deliveries = self._state_counts(db, "deliveries")
             history = dict(
                 db.execute(
                     "SELECT history_state,COUNT(*) FROM inbox WHERE state='held' "

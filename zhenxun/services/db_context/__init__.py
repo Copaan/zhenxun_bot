@@ -218,6 +218,9 @@ async def init():
         await Tortoise.init(
             config=get_config(),
         )
+        from .timing import instrument_client
+
+        instrument_client(Tortoise.get_connection("default"))
         if db_model.script_method:
             logger.debug(
                 "即将运行SCRIPT_METHOD方法, 合计 "

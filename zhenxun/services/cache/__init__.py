@@ -83,6 +83,7 @@ __all__ = [
 
 from . import runtime_cache as _runtime_cache  # noqa: F401
 from .bounded_ttl import BoundedTTLCache
+from .refill import RefillFence
 
 T = TypeVar("T")
 U = TypeVar("U")
@@ -145,6 +146,35 @@ class CacheManager:
     _registry: ClassVar[dict[str, CacheModel]] = {}
     _dict_caches: ClassVar[dict[str, "CacheDict"]] = {}
     _enabled = False  # 缓存启用标记
+    _refill_fence = RefillFence()
+
+    def refill_token(self, cache_type, key):
+        return self._refill_fence.token(self._build_key(cache_type, key))
+
+    async def set_if_current(self, cache_type, key, value, token, expire=None):
+        from .write import in_write_transaction
+
+        if in_write_transaction() or not self.enabled:
+            return False
+        fence = self._refill_fence
+        index = None
+        try:
+            index = fence.stripe(self._build_key(cache_type, key))
+            async with fence.locks[index]:
+                if token[1] != index or not fence.valid(token):
+                    fence.discarded += 1
+                    return False
+                success = await self._set_value(cache_type, key, value, expire)
+                if not success:
+                    fence.poisoned[index] = True
+                return success
+        except asyncio.CancelledError:
+            if index is not None:
+                fence.poisoned[index] = True
+            raise
+        except Exception as error:
+            logger.warning("Cache refill failed", LOG_COMMAND, e=error)
+            return False
 
     def __new__(cls) -> Self:
         """单例模式"""
@@ -248,10 +278,7 @@ class CacheManager:
         try:
             if key is not None:
                 # 只清除特定的缓存项
-                cache_key = self._build_key(cache_type, key)
-                await self.cache_backend.delete(cache_key)  # type: ignore
-                logger.debug(f"清除缓存: {cache_type}, 键: {key}", LOG_COMMAND)
-                return True
+                return await self.delete(cache_type, key)
             else:
                 # 清除指定类型的所有缓存
                 logger.debug(f"清除所有 {cache_type} 缓存", LOG_COMMAND)
@@ -285,12 +312,16 @@ class CacheManager:
         cache_key = None
         try:
             cache_key = self._build_key(cache_type, key)
+            fence = self._refill_fence
+            token = fence.token(cache_key)
+            if fence.locks[token[1]].locked() or not fence.valid(token):
+                return default
             data = await asyncio.wait_for(
                 self.cache_backend.get(cache_key),  # type: ignore
                 timeout=CACHE_TIMEOUT,
             )
 
-            if data is None:
+            if data is None or not fence.valid(token):
                 return default
 
             # 获取缓存模型
@@ -299,7 +330,7 @@ class CacheManager:
             # 反序列化
             if model.result_type:
                 return self._deserialize_value(data, model.result_type)
-            return data
+            return self._deserialize_value(data)
         except asyncio.TimeoutError:
             logger.error(f"获取缓存 {cache_type}:{cache_key} 超时", LOG_COMMAND)
             return default
@@ -308,6 +339,35 @@ class CacheManager:
             return default
 
     async def set(
+        self,
+        cache_type: str,
+        key: str | dict[str, Any],
+        value: Any,
+        expire: int | None = None,
+    ) -> bool:
+        from .write import in_write_transaction
+
+        if in_write_transaction():
+            return False
+        if not self.enabled or cache_config.cache_mode == CacheMode.NONE:
+            return False
+        try:
+            cache_key = self._build_key(cache_type, key)
+            fence = self._refill_fence
+            index = fence.invalidate(cache_key)
+            async with fence.locks[index]:
+                try:
+                    success = await self._set_value(cache_type, key, value, expire)
+                except asyncio.CancelledError:
+                    fence.poisoned[index] = True
+                    raise
+                if not success:
+                    fence.poisoned[index] = True
+                return success
+        except CacheException:
+            return False
+
+    async def _set_value(
         self,
         cache_type: str,
         key: str | dict[str, Any],
@@ -373,11 +433,29 @@ class CacheManager:
         if not self.enabled or cache_config.cache_mode == CacheMode.NONE:
             return False
 
+        from .write import defer
+
+        if defer(
+            ("model_invalidate", str(cache_type), repr(key)),
+            lambda: self.delete(cache_type, key),
+        ):
+            return True
+
+        index = None
         try:
             cache_key = self._build_key(cache_type, key)
-            await self.cache_backend.delete(cache_key)  # type: ignore
+            fence = self._refill_fence
+            index = fence.invalidate(cache_key)
+            async with fence.locks[index]:
+                await self.cache_backend.delete(cache_key)  # type: ignore
             return True
+        except asyncio.CancelledError:
+            if index is not None:
+                self._refill_fence.poisoned[index] = True
+            raise
         except Exception as e:
+            if index is not None:
+                self._refill_fence.poisoned[index] = True
             logger.error(f"删除缓存 {cache_type} 失败", LOG_COMMAND, e=e)
             return False
 
@@ -420,6 +498,11 @@ class CacheManager:
         if not self.enabled or cache_config.cache_mode == CacheMode.NONE:
             return True
 
+        from .write import defer
+
+        if defer(("model_clear", str(cache_type)), lambda: self.clear(cache_type)):
+            return True
+        self._refill_fence.epoch += 1
         try:
             if cache_type:
                 logger.warning(
@@ -429,6 +512,7 @@ class CacheManager:
                 )
                 return False
             await self.cache_backend.clear()  # type: ignore
+            self._refill_fence.poisoned[:] = [False] * len(self._refill_fence.poisoned)
             return True
         except Exception as e:
             logger.warning("清除缓存失败", LOG_COMMAND, e=e)

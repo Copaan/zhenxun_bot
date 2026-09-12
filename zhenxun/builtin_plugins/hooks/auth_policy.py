@@ -206,6 +206,17 @@ class PolicyDecisionPoint:
                 return PolicyDecision("deny", "plugin_disabled_in_group")
         elif self._private_disabled(profile):
             return PolicyDecision("deny", "plugin_disabled_in_private")
+        else:
+            from zhenxun.services.bot_group_policy import bot_group_policy_service
+
+            if bot_group_policy_service.blocked(
+                snapshot.context.bot_id,
+                "private",
+                bot_group_policy_service.PRIVATE_KEY,
+                profile.module,
+                task=False,
+            ):
+                return PolicyDecision("deny", "plugin_blocked_in_private")
         if self._globally_disabled(profile):
             if group is not None and getattr(group, "is_super", False):
                 return PolicyDecision("allow", "super_group_bypass")

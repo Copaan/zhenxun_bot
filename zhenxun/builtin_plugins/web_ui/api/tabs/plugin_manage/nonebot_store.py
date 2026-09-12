@@ -578,18 +578,15 @@ def _target_manifest(analysis: dict[str, Any]) -> dict[str, Any]:
             ),
         }
     core = protected_core()
-    details = analysis["plan"].get("dependency_details") or {}
     target["packages"] = {}
     for name, version in analysis["plan"]["resolved_packages"].items():
         if canonicalize_name(name) in core:
             continue
-        item = deepcopy(details.get(name) or {})
-        item["distribution_name"] = str(item.get("distribution_name") or name)
-        item["version"] = str(version)
-        item.setdefault("top_level_modules", [])
-        item.setdefault("nonebot_plugin_ids", [])
-        item.setdefault("runtime_role", "python_dependency")
-        target["packages"][name] = item
+        # The manifest keeps the resolver contract deliberately small. Runtime
+        # metadata is derived from the installed generation after activation;
+        # embedding it here made package entries differ across machines and
+        # confused distribution records with plugin records.
+        target["packages"][name] = {"version": str(version)}
     preserve_archive_dependencies(target, core=core)
     return target
 

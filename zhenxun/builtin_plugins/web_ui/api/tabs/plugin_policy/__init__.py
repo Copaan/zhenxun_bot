@@ -23,6 +23,31 @@ from .model import (
 router = APIRouter(prefix="/plugin-policy")
 
 
+@router.get("/accounts/{bot_id}/private", dependencies=[authentication()])
+async def get_account_private(bot_id: str):
+    from zhenxun.services.bot_group_policy import bot_group_policy_service
+
+    return Result.ok(await bot_group_policy_service.get_private(bot_id))
+
+
+@router.put("/accounts/{bot_id}/private", dependencies=[authentication()])
+async def update_account_private(bot_id: str, payload: AccountPolicyUpdate):
+    from zhenxun.services.bot_group_policy import bot_group_policy_service
+
+    try:
+        return Result.ok(
+            await bot_group_policy_service.update_private(
+                bot_id,
+                expected_revision=payload.expected_revision,
+                block_plugins=payload.block_plugins,
+                block_tasks=payload.block_tasks,
+            ),
+            "私聊设置已保存并生效",
+        )
+    except (PluginPolicyError, RuntimeMutationBusyError) as error:
+        _raise_api_error(error)
+
+
 @router.get("/accounts/{bot_id}/groups", dependencies=[authentication()])
 async def get_account_groups(bot_id: str):
     from zhenxun.services.bot_group_policy import bot_group_policy_service

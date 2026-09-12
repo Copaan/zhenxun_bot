@@ -7,6 +7,7 @@ from contextvars import Context
 from datetime import datetime, timezone
 import json
 import logging
+import os
 from pathlib import Path
 import threading
 import time
@@ -113,6 +114,26 @@ class LifecycleStateWriter:
         self.duration_ms: float | None = None
         self.shutdown_timed_out = False
         self._deadline: float | None = None
+        self._archive_pending: list[tuple[dict, Callable[[], None]]] = []
+        self.archived_receipts = 0
+
+    def archive_receipt(self, record: dict, written: Callable[[], None]) -> bool:
+        if self._closed or len(self._archive_pending) >= 256:
+            return False
+        self._archive_pending.append((value_snapshot(record), written))
+        self.mark_dirty()
+        return True
+
+    def _write_with_archive(self, snapshot: dict, records: list[dict]) -> None:
+        if records:
+            path = self.path.with_suffix(".receipts.jsonl")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as handle:
+                for record in records:
+                    handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+        write_json_locked(self.path, snapshot)
 
     def mark_dirty(self) -> None:
         try:
@@ -142,6 +163,8 @@ class LifecycleStateWriter:
             "shutdown_timed_out": self.shutdown_timed_out,
             "worker_released": self.worker.released,
             "writer_task_active": self.task is not None and not self.task.done(),
+            "pending_receipt_archive": len(self._archive_pending),
+            "archived_receipts": self.archived_receipts,
         }
 
     def _failed(self, code: str) -> None:
@@ -177,8 +200,13 @@ class LifecycleStateWriter:
                 return
             try:
                 snapshot = value_snapshot(self.snapshot())
+                archive = list(self._archive_pending)
                 await asyncio.shield(
-                    self.worker.submit(write_json_locked, self.path, snapshot)
+                    self.worker.submit(
+                        self._write_with_archive,
+                        snapshot,
+                        [record for record, _ in archive],
+                    )
                 )
             except Exception:
                 self._failed("state_write_failed")
@@ -186,6 +214,10 @@ class LifecycleStateWriter:
                 self._written_revision = revision
                 self.last_success_at = datetime.now(timezone.utc).isoformat()
                 self.error_code = None
+                del self._archive_pending[: len(archive)]
+                self.archived_receipts += len(archive)
+                for _, written in archive:
+                    written()
             self.duration_ms = round((time.monotonic() - started) * 1000, 2)
             self._next_write = time.monotonic() + 1.0
             if self._closing:

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Callable, Coroutine
 import contextlib
 from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
@@ -38,6 +38,7 @@ HealthCallback = Callable[..., Any]
 LifecycleObserver = Callable[[dict[str, Any]], Any]
 
 _DEFAULT_STATE_PATH = Path("data/runtime/lifecycle-state-v2.json")
+_COMPLETED_TASK_HISTORY = 200
 
 
 class LifecycleError(RuntimeError):
@@ -75,6 +76,11 @@ class LifecycleContext:
         self._tasks: set[asyncio.Task[Any]] = set()
         self._task_receipts: dict[asyncio.Task[Any], ResourceReceipt] = {}
         self._task_cancel_callbacks: dict[asyncio.Task[Any], Callable[[], None]] = {}
+        self._completed_task_history: deque[ResourceReceipt] = deque()
+        self._archived_task_history: deque[ResourceReceipt] = deque()
+        self._pending_task_archives: deque[ResourceReceipt] = deque()
+        self._archive_blocked = False
+        self.task_totals: dict[str, int] = defaultdict(int)
         self._in_flight = 0
         self._drained = asyncio.Event()
         self._drained.set()
@@ -127,6 +133,9 @@ class LifecycleContext:
         if not self.accepting:
             coroutine.close()
             raise LifecycleError("component_scope_revoked")
+        if self._archive_blocked:
+            coroutine.close()
+            raise LifecycleError("task_receipt_archive_backpressure")
         task = asyncio.create_task(coroutine, name=name)
         receipt = ResourceReceipt(
             receipt_id=f"task:{id(task)}",
@@ -407,6 +416,7 @@ class LifecycleKernel:
         self._recovery_required: set[str] = set()
         self._plugin_scope_contexts: dict[str, LifecycleContext] = {}
         self._state_writer: LifecycleStateWriter | None = None
+        self._archive_waiters: set[LifecycleContext] = set()
         self._defer_state_writer_close = False
         self._rebuilding: set[str] = set()
         self._shutdown_requested = False
@@ -1952,6 +1962,20 @@ class LifecycleKernel:
             elif receipt.state == "active":
                 receipt.state = "completed"
         if not context.accepting or not persistent:
+            context.task_totals[receipt.state] += 1
+            # A message task completes for every event. Retaining all receipts
+            # makes both memory and every diagnostic snapshot grow with uptime.
+            # Keep failures/unresolved resources; only compact confirmed success.
+            if not persistent and receipt.state == "completed":
+                history = context._completed_task_history
+                history.append(receipt)
+                if len(history) > _COMPLETED_TASK_HISTORY:
+                    expired = history.popleft()
+                    context.resources[:] = [
+                        item for item in context.resources if item is not expired
+                    ]
+            elif not persistent and receipt.state in {"failed", "cancelled"}:
+                self._archive_task_receipt(context, receipt)
             self._persist()
             return
         registration = self._registrations.get(context.spec.component_id)
@@ -1970,6 +1994,47 @@ class LifecycleKernel:
             )
             self._emit("background_task_failed", context.spec.component_id)
         self._persist()
+
+    def _archive_task_receipt(self, context, receipt):
+        self._persist()
+        if self._state_writer is None:
+            return
+        context._pending_task_archives.append(receipt)
+        self._archive_waiters.add(context)
+        self._drain_task_archives()
+
+    def _drain_task_archives(self):
+        for context in tuple(self._archive_waiters):
+            while context._pending_task_archives:
+                receipt = context._pending_task_archives[0]
+                record = {
+                    "runtime_generation": self._generation,
+                    "receipt": receipt.public_dict(),
+                }
+                if not self._state_writer.archive_receipt(
+                    record,
+                    lambda ctx=context, item=receipt: self._confirm_task_archive(
+                        ctx, item
+                    ),
+                ):
+                    # Retain unconfirmed evidence; do not admit more tasks for
+                    # this producer while its existing archive is backlogged.
+                    context._archive_blocked = True
+                    break
+                context._pending_task_archives.popleft()
+            if not context._pending_task_archives:
+                context._archive_blocked = False
+                self._archive_waiters.discard(context)
+
+    def _confirm_task_archive(self, context, receipt):
+        history = context._archived_task_history
+        history.append(receipt)
+        if len(history) > _COMPLETED_TASK_HISTORY:
+            expired = history.popleft()
+            context.resources[:] = [
+                item for item in context.resources if item is not expired
+            ]
+        self._drain_task_archives()
 
     async def check_health(self) -> dict[str, str]:
         async with self._operation_lock:
@@ -2026,6 +2091,12 @@ class LifecycleKernel:
         if registration is None:
             return None
         result = registration.runtime.public_dict()
+        if registration.context is not None:
+            result["task_totals"] = dict(registration.context.task_totals)
+            result["task_archive_blocked"] = registration.context._archive_blocked
+            result["pending_task_archives"] = len(
+                registration.context._pending_task_archives
+            )
         result["dynamic_scopes"] = [
             record.public_dict()
             for record in sorted(

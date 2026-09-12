@@ -12,7 +12,7 @@ import time
 import anyio.to_thread
 
 from zhenxun.services.lifecycle.diagnostics import DiagnosticWorker
-from zhenxun.services.log import logger
+from zhenxun.services.log import install_asyncio_exception_handler, logger
 from zhenxun.services.memory_governor import (
     memory_governor_healthy,
     start_memory_governor,
@@ -518,6 +518,7 @@ def register_runtime_bootstrap(_driver) -> None:
         global _thread_executor
         workers = _get_executor_workers()
         loop = asyncio.get_running_loop()
+        install_asyncio_exception_handler(loop)
         if _thread_executor is None:
             _thread_executor = ThreadPoolExecutor(
                 max_workers=workers, thread_name_prefix="zhenxun-worker"

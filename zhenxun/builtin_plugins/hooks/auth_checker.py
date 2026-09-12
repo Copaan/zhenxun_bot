@@ -3,6 +3,7 @@ import contextlib
 import re
 import time
 from typing import cast
+from weakref import WeakKeyDictionary
 
 from nonebot import get_loaded_plugins
 from nonebot.adapters import Bot, Event
@@ -164,7 +165,9 @@ _DISPATCH_LANE_SEMAPHORES = {
 _DISPATCH_BUDGET_LANES = set(_DISPATCH_LANE_LIMITS)
 _HANDLER_ACTIVATION_INDEX = HandlerActivationIndex()
 _AUTH_PDP = PolicyDecisionPoint()
-_MATCHER_COMMAND_TYPE_CACHE: dict[type[Matcher], bool] = {}
+_MATCHER_COMMAND_TYPE_CACHE: WeakKeyDictionary[type[Matcher], bool] = (
+    WeakKeyDictionary()
+)
 _CHECK_MATCHER_ROUTE_CACHE = CacheDict(
     "AUTH_MATCHER_ROUTE_CACHE", expire=MATCHER_ROUTE_PREFILTER_TTL
 )
@@ -862,6 +865,8 @@ async def _run_admitted_matcher(
 _MAX_MATCHER_CACHE = 512
 
 
+from zhenxun.services.message_resources import matcher_resource_lane, resource_lanes
+
 _SELECTOR_DEPS = HandleEventSelectorDependencies(
     activation_index=_HANDLER_ACTIVATION_INDEX,
     overload_selected_threshold=AUTH_OVERLOAD_SELECTED_THRESHOLD,
@@ -874,6 +879,8 @@ _SELECTOR_DEPS = HandleEventSelectorDependencies(
     build_matcher_state=_build_matcher_state,
     run_selected_matcher=_run_selected_matcher,
     acquire_dispatch_lane=_acquire_dispatch_lane,
+    resource_lane_for_matcher=matcher_resource_lane,
+    acquire_resource_lane=resource_lanes.acquire,
     run_admitted_matcher=_run_admitted_matcher,
 )
 

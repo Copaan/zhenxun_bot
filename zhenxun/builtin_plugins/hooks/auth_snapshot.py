@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-import asyncio
 from dataclasses import dataclass, field
 import time
 from typing import TYPE_CHECKING
 
+from zhenxun.services.cache.cache_containers import CacheDict
+from zhenxun.services.cache.keyed import KeyedLocks
 from zhenxun.services.cache.runtime_cache import (
     BotSnapshot,
     GroupSnapshot,
@@ -26,8 +27,10 @@ if TYPE_CHECKING:
     from nonebot.adapters import Bot
 
 QQ_CLIENT_GROUP_REPAIR_TTL = 60
-_QQ_CLIENT_GROUP_REPAIR_FAILURES: dict[tuple[str, str], float] = {}
-_QQ_CLIENT_GROUP_REPAIR_LOCKS: dict[tuple[str, str], asyncio.Lock] = {}
+_QQ_CLIENT_GROUP_REPAIR_FAILURES = CacheDict[float](
+    "AUTH_GROUP_REPAIR_FAILURES", expire=QQ_CLIENT_GROUP_REPAIR_TTL, max_items=4096
+)
+_QQ_CLIENT_GROUP_REPAIR_LOCKS = KeyedLocks(capacity=4096)
 
 
 def _build_runtime_group_snapshot(context: EventContext) -> GroupSnapshot | None:
@@ -121,8 +124,9 @@ async def _repair_missing_qq_client_group(
     try:
         from zhenxun.models.group_console import GroupConsole
 
-        lock = _QQ_CLIENT_GROUP_REPAIR_LOCKS.setdefault(key, asyncio.Lock())
-        async with lock:
+        async with _QQ_CLIENT_GROUP_REPAIR_LOCKS.hold(key):
+            if _qq_client_group_repair_on_cooldown(key):
+                return None
             existing = provider.get_group_if_ready(
                 group_id,
                 context.channel_id,
@@ -377,7 +381,13 @@ async def get_or_build_auth_snapshot(
     allow_cache_load: bool = False,
     provider: PermissionDataProvider = DEFAULT_PERMISSION_DATA_PROVIDER,
 ) -> AuthSnapshot:
+    from zhenxun.services.permission_revision import (
+        current_revision,
+        refresh_event_revision,
+    )
+
     event_cache = context.event_cache
+    revision = refresh_event_revision(event_cache)
     module = profile.module
     if event_cache is not None:
         snapshot_cache = event_cache.setdefault("auth_snapshots", {})
@@ -394,7 +404,7 @@ async def get_or_build_auth_snapshot(
         allow_cache_load=allow_cache_load,
         provider=provider,
     )
-    if event_cache is not None:
+    if event_cache is not None and current_revision() == revision:
         event_cache.setdefault("auth_snapshots", {})[module] = snapshot
     return snapshot
 

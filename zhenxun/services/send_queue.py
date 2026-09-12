@@ -231,12 +231,17 @@ async def _queued_call_api(
         return await _queued_call_api_impl(adapter, bot, api, **data)
     identity = operation_key(f"reply:{api}", str(bot.self_id))
     execution.deliveries[identity] = "sending"
+    from .pipeline_metrics import pipeline_metrics
+
+    started = time.monotonic()
     try:
         result = await _queued_call_api_impl(adapter, bot, api, **data)
     except BaseException:
         execution.deliveries[identity] = "reply_unconfirmed"
         execution.errors.append("reply_unconfirmed")
         raise
+    finally:
+        pipeline_metrics.observe("reply_wait_ms", time.monotonic() - started)
     execution.deliveries[identity] = "reply_delivered"
     return result
 

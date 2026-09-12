@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, overload
 
@@ -19,6 +20,29 @@ from zhenxun.configs.path_config import LOG_PATH
 driver = nonebot.get_driver()
 
 log_level = driver.config.log_level or "INFO"
+
+
+def install_asyncio_exception_handler(
+    loop: asyncio.AbstractEventLoop | None = None,
+) -> None:
+    """Ensure unhandled task failures reach the dedicated error sink."""
+    loop = loop or asyncio.get_running_loop()
+    if getattr(loop, "_zhenxun_exception_handler", False):
+        return
+    previous = loop.get_exception_handler()
+
+    def handle(current_loop: asyncio.AbstractEventLoop, context: dict) -> None:
+        error = context.get("exception")
+        message = str(context.get("message") or "未处理的 asyncio 任务异常")
+        if error is not None:
+            logger.error(message, "Asyncio", e=error)
+        else:
+            logger.error(message, "Asyncio")
+        if previous:
+            previous(current_loop, context)
+
+    loop.set_exception_handler(handle)
+    setattr(loop, "_zhenxun_exception_handler", True)
 
 
 def _session_kind(value: Any) -> str | None:

@@ -12,6 +12,7 @@ class MessageExecution:
     operations: dict = field(default_factory=dict)
     errors: list = field(default_factory=list)
     deliveries: dict = field(default_factory=dict)
+    handlers_started: int = 0
 
 
 class MessageExecutionUnavailable(RuntimeError):

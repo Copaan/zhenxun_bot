@@ -192,6 +192,45 @@ class BotGroupPolicyService:
             "missing_tasks": sorted(set(tasks) - catalog_tasks),
         }
 
+    PRIVATE_KEY = "__all__"
+
+    async def get_private(self, bot_id):
+        bot_id = await plugin_policy_service._resolve_bot_id(bot_id)
+        key = group_key(bot_id, "private", self.PRIVATE_KEY, "")
+        row = await BotGroupPluginPolicy.get_or_none(**key_fields(key))
+        account = await plugin_policy_service.get_account(bot_id)
+        plugins = sorted(row.block_plugins if row else [])
+        tasks = sorted(row.block_tasks if row else [])
+        return {
+            **key_fields(key),
+            "block_plugins": plugins,
+            "block_tasks": tasks,
+            "account_block_plugins": account["block_plugins"],
+            "account_block_tasks": account["block_tasks"],
+            "revision": _revision({"block_plugins": plugins, "block_tasks": tasks}),
+        }
+
+    async def update_private(
+        self, bot_id, *, expected_revision, block_plugins, block_tasks
+    ):
+        async with runtime_mutation_coordinator.operation("bot_private_policy"):
+            current = await self.get_private(bot_id)
+            plugin_policy_service._check_revision(
+                expected_revision, current["revision"]
+            )
+            plugins, tasks = await plugin_policy_service._validate_modules(
+                block_plugins, block_tasks
+            )
+            key = group_key(current["bot_id"], "private", self.PRIVATE_KEY, "")
+            async with in_transaction() as connection:
+                await BotGroupPluginPolicy.update_or_create(
+                    defaults={"block_plugins": plugins, "block_tasks": tasks},
+                    using_db=connection,
+                    **key_fields(key),
+                )
+            self._policies[key] = (frozenset(plugins), frozenset(tasks))
+            return await self.get_private(current["bot_id"])
+
     async def update_group(
         self,
         bot_id,

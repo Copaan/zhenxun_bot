@@ -12,23 +12,27 @@ import time
 
 from .lifecycle.deadline import remaining_timeout
 from .lifecycle.diagnostics import DiagnosticWorker
+from .message_buffer import PayloadCapacityError, PayloadQueue
 from .message_execution import (
     MessageExecution,
     MessageExecutionUnavailable,
     current_execution,
 )
 from .message_store import MessageStore
+from .pipeline_metrics import pipeline_metrics
 
 
 class MessageInbox:
     def __init__(self, path=Path("data/runtime/message-inbox/inbox.sqlite3")):
         self.store = MessageStore(path)
         self.worker = None
-        self.queue = asyncio.Queue(maxsize=256)
-        self.mutations = asyncio.Queue(maxsize=256)
+        self.queue = PayloadQueue(256, 32 * 1024**2, lambda item: item[0])
+        self.mutations = PayloadQueue(256, 16 * 1024**2, lambda item: item[1])
+        self._close_task = None
         self.mutation_task = None
         self.io_lock = asyncio.Lock()
         self.context = None
+        self.resource_snapshot = {}
         self.accepting = False
         self.active = {}
         self.finalizing = set()
@@ -86,7 +90,11 @@ class MessageInbox:
             if lease is not None:
                 lease()
             canceled = False
+            wait_release = None
             try:
+                from .message_resources import resource_lanes
+
+                wait_release = await resource_lanes.acquire("interactive_wait")
                 # A live prompt yields this conversation so its answer can enter
                 # the normal adapter and current permission/matcher pipeline.
                 await self.io(self.store.waiting_input, identity, True)
@@ -96,6 +104,8 @@ class MessageInbox:
                 canceled = True
                 raise
             finally:
+                if wait_release is not None:
+                    wait_release()
                 try:
                     if (
                         not canceled
@@ -174,6 +184,7 @@ class MessageInbox:
         if self.worker is not None and not self.worker.released:
             raise RuntimeError("message_inbox_previous_worker_unreleased")
         self.context = context
+        self._close_task = None
         self.worker = DiagnosticWorker("zhenxun-message-inbox")
         worker = self.worker
         context.own_resource(
@@ -200,6 +211,22 @@ class MessageInbox:
             context.spawn_task(self._delivery_loop(), name="message-inbox-delivery"),
             self.mutation_task,
         ]
+        self.tasks.append(
+            context.spawn_task(self._sample_resources(), name="message-resources")
+        )
+
+    async def _sample_resources(self):
+        from .resource_metrics import ResourceSampler
+
+        sampler = ResourceSampler()
+        while self.accepting:
+            try:
+                sample = await self.io(sampler.sample)
+                sample["asyncio_tasks"] = len(asyncio.all_tasks())
+                self.resource_snapshot = sample
+            except Exception as error:
+                self.resource_snapshot = {"sample_error": type(error).__name__}
+            await asyncio.sleep(5)
 
     async def mutate(self, method, *args):
         if self.mutation_task is None:
@@ -212,6 +239,11 @@ class MessageInbox:
         )
         try:
             self.mutations.put_nowait((method, args, future))
+        except PayloadCapacityError:
+            self.metrics["mutation_bytes_rejected"] = (
+                self.metrics.get("mutation_bytes_rejected", 0) + 1
+            )
+            raise RuntimeError("inbox_mutation_bytes_full") from None
         except asyncio.QueueFull:
             self.metrics["mutation_staging_rejected"] = (
                 self.metrics.get("mutation_staging_rejected", 0) + 1
@@ -314,6 +346,11 @@ class MessageInbox:
         }
         try:
             self.queue.put_nowait((envelope, future))
+        except PayloadCapacityError:
+            self.metrics["staging_bytes_rejected"] = (
+                self.metrics.get("staging_bytes_rejected", 0) + 1
+            )
+            future.set_result({"accepted": False, "reason": "inbox_staging_bytes_full"})
         except asyncio.QueueFull:
             self.metrics["staging_rejected"] += 1
             future.set_result({"accepted": False, "reason": "inbox_staging_full"})
@@ -340,6 +377,10 @@ class MessageInbox:
             while len(batch) < 64 and not self.queue.empty():
                 batch.append(self.queue.get_nowait())
             started = time.monotonic()
+            for item, _ in batch:
+                pipeline_metrics.observe(
+                    "ingress_wait_ms", time.time() - item["received"]
+                )
             try:
                 receipts = await self.io(self.store.accept, [item for item, _ in batch])
             except Exception:
@@ -356,6 +397,7 @@ class MessageInbox:
                     self.queue.task_done()
                 raise
             self.metrics["last_commit_ms"] = (time.monotonic() - started) * 1000
+            pipeline_metrics.observe("persistence_wait_ms", time.monotonic() - started)
             for (_, future), receipt in zip(batch, receipts):
                 if not future.done():
                     future.set_result(receipt)
@@ -419,6 +461,15 @@ class MessageInbox:
             await asyncio.sleep(delay)
 
     async def _deliver_batch(self, rows):
+        from .message_resources import resource_lanes
+
+        release = await resource_lanes.acquire("delivery")
+        try:
+            return await self._deliver_batch_impl(rows)
+        finally:
+            release()
+
+    async def _deliver_batch_impl(self, rows):
         from collections import defaultdict
         from importlib import import_module
 
@@ -483,6 +534,10 @@ class MessageInbox:
                         ]
                     )
             await self.mutate(self.store.delivered, identities)
+            for row, _ in items:
+                pipeline_metrics.observe(
+                    "background_delivery_wait_ms", time.time() - row["created"]
+                )
 
     async def _dispatch_loop(self):
         last_snapshot = 0.0
@@ -552,7 +607,11 @@ class MessageInbox:
             if time.monotonic() >= next_cleanup:
                 await self.io(self.store.cleanup)
                 next_cleanup = time.monotonic() + 3600
+            wake_at = asyncio.get_running_loop().time() + 0.02
             await asyncio.sleep(0.02)
+            pipeline_metrics.observe(
+                "event_loop_lag_ms", asyncio.get_running_loop().time() - wake_at
+            )
 
     async def _execute(self, row):
         self.install_waiter_bridge()
@@ -560,6 +619,9 @@ class MessageInbox:
         execution = MessageExecution(row["id"], received_at=row["received"])
         token = current_execution.set(execution)
         handler_started = time.monotonic()
+        pipeline_metrics.observe(
+            "business_queue_wait_ms", time.time() - row["received"]
+        )
         try:
             bot, dispatch = self.bots[row["bot"]]
             event = self.codecs[row["adapter"]](row["payload"])
@@ -581,6 +643,11 @@ class MessageInbox:
         finally:
             current_execution.reset(token)
             handler_ms = (time.monotonic() - handler_started) * 1000
+            pipeline_metrics.observe("business_dispatch_ms", handler_ms / 1000)
+            if not execution.handlers_started and row["state"] != "held":
+                self.metrics["no_handler_events"] = (
+                    self.metrics.get("no_handler_events", 0) + 1
+                )
             self.timing["handler_count"] += 1
             self.timing["handler_ms"] += handler_ms
             self.timing["handler_max_ms"] = max(
@@ -620,6 +687,7 @@ class MessageInbox:
                     )
             finally:
                 finalize_ms = (time.monotonic() - finalize_started) * 1000
+                pipeline_metrics.observe("finalization_wait_ms", finalize_ms / 1000)
                 self.timing["finalize_count"] += 1
                 self.timing["finalize_ms"] += finalize_ms
                 self.timing["finalize_max_ms"] = max(
@@ -635,7 +703,11 @@ class MessageInbox:
         await record_expired_message(bot, event)
 
     def snapshot(self):
+        from .message_resources import resource_lanes
+
         return {
+            "resource_lanes": resource_lanes.snapshot(),
+            "resources": dict(self.resource_snapshot),
             **self.status,
             **self.metrics,
             "rates": dict(self.rates),
@@ -646,9 +718,23 @@ class MessageInbox:
             "waiting_input": len(self.waiting_inputs),
             "staging": self.queue.qsize(),
             "mutation_staging": self.mutations.qsize(),
+            "staging_payload_bytes": self.queue.payload_bytes,
+            "staging_max_bytes": self.queue.max_bytes,
+            "staging_peak_bytes": self.queue.peak_bytes,
+            "mutation_payload_bytes": self.mutations.payload_bytes,
+            "mutation_max_bytes": self.mutations.max_bytes,
+            "mutation_peak_bytes": self.mutations.peak_bytes,
+            "pipeline": pipeline_metrics.snapshot(),
         }
 
     async def close(self):
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(
+                self._close_once(), name="message-inbox-close"
+            )
+        await asyncio.shield(self._close_task)
+
+    async def _close_once(self):
         self.accepting = False
         deadline = time.monotonic() + remaining_timeout(15)
         # Stop dispatch before waiting for staged ingress writes.
@@ -691,6 +777,11 @@ class MessageInbox:
             self.waiter_bridge = None
         if close_error or not released or any(not task.done() for task in pending):
             raise RuntimeError("message_inbox_shutdown_unresolved")
+        self.bots.clear()
+        self.codecs.clear()
+        self.tasks.clear()
+        self.active.clear()
+        self.context = None
 
 
 message_inbox = MessageInbox()

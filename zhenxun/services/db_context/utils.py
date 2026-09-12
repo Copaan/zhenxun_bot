@@ -8,6 +8,7 @@ import time
 
 from zhenxun.services.log import logger
 from zhenxun.services.message_load import signal_db_unhealthy
+from zhenxun.services.pipeline_metrics import pipeline_metrics
 
 from .config import (
     DB_TIMEOUT_SECONDS,
@@ -238,7 +239,11 @@ async def with_db_timeout(
         if expired and hasattr(task, "uncancel"):
             task.uncancel()
         _DB_DEADLINE.reset(token)
+        pipeline_metrics.observe(
+            "queue_wait_ms", (queued if entered else loop.time()) - start_time
+        )
         if entered:
             _DB_TIMING["execution_ms"] += (loop.time() - queued) * 1000
+            pipeline_metrics.observe("database_operation_ms", loop.time() - queued)
         elif inspect.iscoroutine(coro):
             coro.close()

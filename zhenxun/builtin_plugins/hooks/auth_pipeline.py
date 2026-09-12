@@ -103,6 +103,7 @@ class AuthPipelineContext:
     decision_effect: str | None = None
     decision_reason: str | None = None
     stopped: bool = False
+    permission_revision: int = -1
     stage_timings: dict[str, float] = field(default_factory=dict)
 
     def stop(
@@ -127,12 +128,22 @@ class AuthPipeline:
         self._stages = tuple(stages)
 
     async def run(self, context: AuthPipelineContext) -> None:
-        for stage in self._stages:
-            started = time.perf_counter()
-            await stage.handler(context)
-            context.stage_timings[stage.name] = (time.perf_counter() - started) * 1000
-            if context.stopped:
-                break
+        from zhenxun.services.pipeline_metrics import pipeline_metrics
+
+        total_started = time.perf_counter()
+        try:
+            for stage in self._stages:
+                started = time.perf_counter()
+                await stage.handler(context)
+                context.stage_timings[stage.name] = (
+                    time.perf_counter() - started
+                ) * 1000
+                if context.stopped:
+                    break
+        finally:
+            pipeline_metrics.observe(
+                "permission_wait_ms", time.perf_counter() - total_started
+            )
 
 
 @dataclass(slots=True)
@@ -235,6 +246,13 @@ async def route_gate_stage(
     ctx.side_effect_lock = side_effect_cache.lock_for(ctx.module)
     await ctx.side_effect_lock.acquire()
     ctx.entered_side_effect_lock = True
+
+    from zhenxun.services.permission_revision import refresh_event_revision
+
+    ctx.permission_revision = refresh_event_revision(ctx.event_cache)
+    if side_effect_cache.revision != ctx.permission_revision:
+        side_effect_cache.auth_results.clear()
+        side_effect_cache.revision = ctx.permission_revision
 
     auth_result_cache = side_effect_cache.auth_results
     ctx.auth_result_cache = auth_result_cache
@@ -415,12 +433,15 @@ async def decision_log_stage(
     ctx: AuthPipelineContext,
     deps: AuthPipelineDependencies,
 ) -> None:
+    from zhenxun.services.permission_revision import current_revision
+
     commit = ctx.side_effect_commit
     has_deferred_commit = commit is not None and commit.has_pending
     if (
         ctx.auth_result_cache is not None
         and ctx.auth_allowed is not None
         and not has_deferred_commit
+        and ctx.permission_revision == current_revision()
     ):
         ctx.auth_result_cache[ctx.module] = (
             ctx.auth_allowed,

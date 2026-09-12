@@ -5,6 +5,7 @@ LLM 核心基础设施模块
 """
 
 import asyncio
+from contextvars import Token
 import json
 import os
 from pathlib import Path
@@ -24,6 +25,7 @@ from zhenxun.services.ai.core.exceptions import (
     RateLimitException,
 )
 from zhenxun.services.ai.utils.logger import log_llm as logger
+from zhenxun.services.lifecycle.deadline import current_budget
 from zhenxun.services.network_proxy import ManagedAsyncClient
 from zhenxun.utils.pydantic_compat import model_dump, parse_as
 from zhenxun.utils.user_agent import get_user_agent
@@ -198,7 +200,14 @@ class HealthStatePersister:
         """启动后台异步保存定时任务"""
         if self._watchdog_task is None or self._watchdog_task.done():
             self._stop_event.clear()
-            self._watchdog_task = asyncio.create_task(self._watchdog_loop())
+            # A watchdog is a runtime task. It must not inherit a shutdown
+            # deadline from a caller that happens to initialize AI during
+            # teardown or a restart handoff.
+            token: Token = current_budget.set(None)
+            try:
+                self._watchdog_task = asyncio.create_task(self._watchdog_loop())
+            finally:
+                current_budget.reset(token)
 
     def mark_dirty(self):
         """标记内存状态已脏，需要存盘"""
