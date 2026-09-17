@@ -765,6 +765,24 @@ class RuntimeCacheSync:
                 await PluginLimitMemoryCache.apply_sync_event(action, data)
             elif cache_type == "plugin":
                 await PluginInfoMemoryCache.apply_sync_event(action, data)
+            elif cache_type == "permission":
+                from zhenxun.services.permission_revision import advance_revision
+
+                if action == "policy_changed":
+                    from zhenxun.services.bot_group_policy import (
+                        bot_group_policy_service,
+                        group_key,
+                    )
+
+                    await bot_group_policy_service.refresh_policy(
+                        group_key(
+                            data.get("bot_id"),
+                            data.get("platform_scope"),
+                            data.get("group_id"),
+                            data.get("channel_id"),
+                        )
+                    )
+                advance_revision()
         finally:
             _APPLYING_REMOTE_CACHE_EVENT.reset(token)
 
@@ -1031,15 +1049,6 @@ class PluginInfoMemoryCache:
             await cls.refresh()
 
     @classmethod
-    async def _refresh_loop(cls, interval: int) -> None:
-        while True:
-            await asyncio.sleep(interval)
-            try:
-                await cls.refresh()
-            except Exception as exc:
-                logger.error("plugin cache refresh failed", LOG_COMMAND, e=exc)
-
-    @classmethod
     def start_refresh_task(cls) -> None:
         runtime_cache_refresh_coordinator.request_refresh(cls)
 
@@ -1209,15 +1218,6 @@ class BotMemoryCache:
             await cls.refresh()
 
     @classmethod
-    async def _refresh_loop(cls, interval: int) -> None:
-        while True:
-            await asyncio.sleep(interval)
-            try:
-                await cls.refresh()
-            except Exception as exc:
-                logger.error("bot cache refresh failed", LOG_COMMAND, e=exc)
-
-    @classmethod
     def start_tasks(cls) -> None:
         runtime_cache_refresh_coordinator.request_refresh(cls)
 
@@ -1385,15 +1385,6 @@ class GroupMemoryCache:
             await cls.remove(data.get("group_id"), data.get("channel_id"))
         elif action == "refresh":
             await cls.refresh()
-
-    @classmethod
-    async def _refresh_loop(cls, interval: int) -> None:
-        while True:
-            await asyncio.sleep(interval)
-            try:
-                await cls.refresh()
-            except Exception as exc:
-                logger.error("group cache refresh failed", LOG_COMMAND, e=exc)
 
     @classmethod
     def start_tasks(cls) -> None:
@@ -1630,15 +1621,6 @@ class LevelUserMemoryCache:
             await cls.refresh()
 
     @classmethod
-    async def _refresh_loop(cls, interval: int) -> None:
-        while True:
-            await asyncio.sleep(interval)
-            try:
-                await cls.refresh()
-            except Exception as exc:
-                logger.error("level cache refresh failed", LOG_COMMAND, e=exc)
-
-    @classmethod
     def start_tasks(cls) -> None:
         runtime_cache_refresh_coordinator.request_refresh(cls)
 
@@ -1814,15 +1796,6 @@ class TaskInfoMemoryCache:
             await cls.remove(data.get("module"))
         elif action == "refresh":
             await cls.refresh()
-
-    @classmethod
-    async def _refresh_loop(cls, interval: int) -> None:
-        while True:
-            await asyncio.sleep(interval)
-            try:
-                await cls.refresh()
-            except Exception as exc:
-                logger.error("task info cache refresh failed", LOG_COMMAND, e=exc)
 
     @classmethod
     def start_tasks(cls) -> None:
@@ -2014,15 +1987,6 @@ class PluginLimitMemoryCache:
             await cls.remove_by_id(data.get("id"))
         elif action == "refresh":
             await cls.refresh()
-
-    @classmethod
-    async def _refresh_loop(cls, interval: int) -> None:
-        while True:
-            await asyncio.sleep(interval)
-            try:
-                await cls.refresh()
-            except Exception as exc:
-                logger.error("plugin limit cache refresh failed", LOG_COMMAND, e=exc)
 
     @classmethod
     def start_tasks(cls) -> None:
@@ -2319,15 +2283,6 @@ class BanMemoryCache:
                 await query.delete()
 
     @classmethod
-    async def _refresh_loop(cls, interval: int) -> None:
-        while True:
-            await asyncio.sleep(interval)
-            try:
-                await cls.refresh()
-            except Exception as exc:
-                logger.error("ban cache refresh failed", LOG_COMMAND, e=exc)
-
-    @classmethod
     async def _cleanup_loop(cls, interval: int, delete_db: bool) -> None:
         while True:
             await asyncio.sleep(interval)
@@ -2532,13 +2487,13 @@ class RuntimeCacheRefreshCoordinator:
                 self._queue_depth = 0
 
     async def _run(self) -> None:
-        while True:
+        # stop() clears ownership before waking/cancelling the wait. Python 3.10
+        # wait_for can consume cancellation when its inner wait just completed.
+        while self._task is asyncio.current_task():
             specs = self._specs()
             now = time.monotonic()
             active_due = {
-                name: due
-                for name, due in self._next_due.items()
-                if name in specs and specs[name][1] > 0
+                name: due for name, due in self._next_due.items() if name in specs
             }
             delay = max(0.0, min(active_due.values(), default=now + 60.0) - now)
             try:
@@ -2551,15 +2506,24 @@ class RuntimeCacheRefreshCoordinator:
             due_names = [name for name, due in active_due.items() if due <= now]
             if not due_names:
                 continue
-            # Advance deadlines before work. A resumed process therefore runs each
-            # overdue cache once instead of replaying every missed interval.
-            for name in due_names:
-                interval = specs[name][1]
-                failures = self._failure_counts.get(name, 0)
-                self._next_due[name] = now + (
-                    min(interval, max(5, 2**failures * 5)) if failures else interval
-                )
             async with self._lock:
+                now = time.monotonic()
+                due_names = [
+                    name
+                    for name, due in self._next_due.items()
+                    if name in specs and due <= now
+                ]
+                # Consume requests before work so new invalidations survive awaits.
+                # A disabled periodic timer still permits a one-shot refresh.
+                for name in due_names:
+                    interval = specs[name][1]
+                    if interval <= 0:
+                        self._next_due.pop(name, None)
+                        continue
+                    failures = self._failure_counts.get(name, 0)
+                    self._next_due[name] = now + (
+                        min(interval, max(5, 2**failures * 5)) if failures else interval
+                    )
                 self._queue_depth = len(due_names)
                 if self._sqlite():
                     for name in due_names:
@@ -2687,55 +2651,6 @@ def health_snapshot() -> dict[str, dict[str, Any]]:
 async def refresh_all_runtime_caches() -> dict[str, bool]:
     """Refresh authoritative runtime snapshots without clearing them first."""
     return await runtime_cache_refresh_coordinator.refresh_all()
-
-
-def passive_status_snapshot(max_modules: int = 50) -> dict[str, Any]:
-    """Return passive-task state from in-memory caches only.
-
-    This is a local diagnostic helper: it does not query or write the database,
-    and it is not used by runtime decisions.
-    """
-    tasks = list(TaskInfoMemoryCache._by_module.values())
-    disabled = sorted(task.module for task in tasks if not task.status)
-    unloaded = sorted(task.module for task in tasks if not task.load_status)
-    runtime_enabled = [
-        task.module for task in tasks if task.status and task.load_status
-    ]
-    bot_block_total = sum(
-        len(_parse_block_modules(bot.block_tasks))
-        for bot in BotMemoryCache._by_id.values()
-    )
-    group_block_total = sum(
-        len(group.block_task_set) + len(group.superuser_block_task_set)
-        for group in GroupMemoryCache._by_key.values()
-    )
-    return {
-        "cache": health_snapshot(),
-        "passive_tasks": {
-            "total": len(tasks),
-            "status_enabled": sum(1 for task in tasks if task.status),
-            "load_status_enabled": sum(1 for task in tasks if task.load_status),
-            "runtime_enabled": len(runtime_enabled),
-            "disabled_modules": disabled[:max_modules],
-            "disabled_modules_total": len(disabled),
-            "unloaded_modules": unloaded[:max_modules],
-            "unloaded_modules_total": len(unloaded),
-        },
-        "scoped_blocks": {
-            "bot_block_tasks_total": bot_block_total,
-            "group_block_tasks_total": group_block_total,
-        },
-        "semantics": {
-            "available_tasks": "management_display_mirror_not_runtime_whitelist",
-            "runtime_truth": [
-                "TaskInfo.status",
-                "TaskInfo.load_status",
-                "BotConsole.block_tasks",
-                "GroupConsole.block_task",
-                "GroupConsole.superuser_block_task",
-            ],
-        },
-    }
 
 
 class RuntimeCacheHandle:

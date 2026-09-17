@@ -425,6 +425,8 @@ def _resolve_uninstall_runtime_module_name(path: Path) -> str:
 
 
 def _store_operation_info(action: str, plugin_name: str, operation: dict) -> str:
+    if operation.get("unchanged"):
+        return f"插件 {plugin_name} 已是最新版本"
     mode = operation.get("apply_mode")
     if mode == "hot_reloaded":
         if action == "热重载":
@@ -940,7 +942,16 @@ async def _(param: PluginIr) -> Result:
                         )
                         after = _snapshot_plugin_files(path)
                         _mark_store_content_processed(before, after)
-                    if install_result.dependency_changes:
+                    if install_result.unchanged:
+                        operation = {
+                            "apply_mode": "hot_reloaded",
+                            "status": "completed",
+                            "changed": [],
+                            "reason": "already_latest",
+                            "unchanged": True,
+                            "generation": plugin_runtime_manager.generation,
+                        }
+                    elif install_result.dependency_changes:
                         runtime_operation = (
                             await plugin_runtime_manager.request_restart(
                                 {runtime_module},

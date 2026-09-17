@@ -6,6 +6,7 @@ from typing import Any, cast
 
 from nonebot.adapters import Bot, Event
 from nonebot.adapters.onebot.v11.event import GroupMessageEvent
+from nonebot.adapters.qq.event import DirectMessageCreateEvent
 from nonebot.log import logger
 
 _PATCHED = False
@@ -14,6 +15,13 @@ _ORIGINAL_ONEBOT11_GROUP_MESSAGE: Callable[..., Awaitable[dict[str, Any]]] | Non
 _ORIGINAL_QQ_C2C_MESSAGE: Callable[..., Awaitable[dict[str, Any]]] | None = None
 _ORIGINAL_QQ_GROUP_AT_MESSAGE: Callable[..., Awaitable[dict[str, Any]]] | None = None
 _ORIGINAL_QQ_GUILD_MESSAGE: Callable[..., Awaitable[dict[str, Any]]] | None = None
+
+_QQ_ROLE_INFO = {
+    "4": ("OWNER", 100, "创建者"),
+    "2": ("ADMINISTRATOR", 10, "管理员"),
+    "5": ("CHANNEL_ADMINISTRATOR", 8, "子频道管理员"),
+    "1": ("MEMBER", 1, "成员"),
+}
 
 
 def _sender_value(sender: Any, key: str, default: Any = None) -> Any:
@@ -91,6 +99,21 @@ def _qq_bot_app_id(bot: Bot) -> str:
     return str(app_id or getattr(bot, "self_id", ""))
 
 
+def _qq_user_payload(
+    bot: Bot, user_id: str, name: str = "", **fields: Any
+) -> dict[str, Any]:
+    """Build the common part of an official QQ Uninfo payload."""
+
+    payload: dict[str, Any] = {
+        "user_id": user_id,
+        "name": name,
+        "nickname": name,
+        "avatar": f"https://q.qlogo.cn/qqapp/{_qq_bot_app_id(bot)}/{user_id}/100",
+    }
+    payload.update(fields)
+    return payload
+
+
 async def _fast_qq_c2c_message(bot: Bot, event: Event) -> dict[str, Any]:
     """Build Uninfo session for QQ official C2C messages from event fields."""
 
@@ -100,13 +123,12 @@ async def _fast_qq_c2c_message(bot: Bot, event: Event) -> dict[str, Any]:
         or _sender_value(author, "id")
         or _event_value(event, "user_id", "")
     )
+    if not user_id:
+        if _ORIGINAL_QQ_C2C_MESSAGE is not None:
+            return await _ORIGINAL_QQ_C2C_MESSAGE(bot, event)
+        return {}
     username = str(_sender_value(author, "username", "") or "")
-    return {
-        "user_id": user_id,
-        "name": username,
-        "nickname": username,
-        "avatar": f"https://q.qlogo.cn/qqapp/{_qq_bot_app_id(bot)}/{user_id}/100",
-    }
+    return _qq_user_payload(bot, user_id, username)
 
 
 async def _fast_qq_group_at_message(bot: Bot, event: Event) -> dict[str, Any]:
@@ -122,13 +144,11 @@ async def _fast_qq_group_at_message(bot: Bot, event: Event) -> dict[str, Any]:
     group_id = str(
         _event_value(event, "group_openid") or _event_value(event, "group_id") or ""
     )
-    return {
-        "user_id": user_id,
-        "name": username,
-        "nickname": username,
-        "avatar": f"https://q.qlogo.cn/qqapp/{_qq_bot_app_id(bot)}/{user_id}/100",
-        "group_id": group_id,
-    }
+    if not user_id or not group_id:
+        if _ORIGINAL_QQ_GROUP_AT_MESSAGE is not None:
+            return await _ORIGINAL_QQ_GROUP_AT_MESSAGE(bot, event)
+        return {}
+    return _qq_user_payload(bot, user_id, username, group_id=group_id)
 
 
 async def _fast_qq_guild_message(bot: Bot, event: Event) -> dict[str, Any]:
@@ -146,21 +166,33 @@ async def _fast_qq_guild_message(bot: Bot, event: Event) -> dict[str, Any]:
     user_id = str(_sender_value(author, "id", "") or "")
     nickname = str(_sender_value(member, "nick", "") or "")
     username = str(_sender_value(author, "username", "") or "")
-    base: dict[str, Any] = {
-        "user_id": user_id,
-        "name": username,
-        "nickname": nickname or username,
-        "avatar": _sender_value(author, "avatar"),
-        "guild_id": guild_id,
-        "channel_id": channel_id,
-        "guild_name": "",
-        "guild_avatar": None,
-        "channel_name": "",
-        "channel_type": -1,
-    }
+    if not user_id or not guild_id or not channel_id:
+        if _ORIGINAL_QQ_GUILD_MESSAGE is not None:
+            return await _ORIGINAL_QQ_GUILD_MESSAGE(bot, event)
+        return {}
+    base: dict[str, Any] = _qq_user_payload(
+        bot,
+        user_id,
+        username,
+        nickname=nickname or username,
+        avatar=_sender_value(author, "avatar"),
+        guild_id=guild_id,
+        channel_id=channel_id,
+        guild_name="",
+        guild_avatar=None,
+        channel_name="",
+        channel_type=-1 if isinstance(event, DirectMessageCreateEvent) else 0,
+    )
     roles = _sender_value(member, "roles")
     if roles is not None:
-        base["roles"] = roles
+        from nonebot_plugin_uninfo.model import Role
+
+        base["roles"] = [
+            Role(*_QQ_ROLE_INFO.get(str(role), _QQ_ROLE_INFO["1"]))
+            if isinstance(role, str)
+            else role
+            for role in roles
+        ]
     joined_at = _sender_value(member, "joined_at")
     if joined_at is not None:
         base["joined_at"] = joined_at
@@ -178,21 +210,68 @@ async def _singleflight_fetch(self: Any, bot: Bot, event: Event) -> Any:
         return await original(self, bot, event)
 
     session_cache = getattr(self, "session_cache", None)
-    if isinstance(session_cache, dict) and sess_id in session_cache:
-        return session_cache[sess_id]
+    bot_id = str(getattr(bot, "self_id", ""))
+    per_bot = getattr(self, "_zx_session_cache_by_bot", None)
+    if not isinstance(per_bot, dict):
+        per_bot = {}
+        setattr(self, "_zx_session_cache_by_bot", per_bot)
+    elif isinstance(session_cache, dict) and not session_cache and per_bot:
+        # InfoFetcher.clean() clears the upstream cache.  Keep the added
+        # per-bot cache lifecycle aligned with it for reconnect and reload.
+        per_bot.clear()
+    bot_cache = per_bot.setdefault(bot_id, {})
+    if sess_id in bot_cache:
+        return bot_cache[sess_id]
+    # Preserve old manually populated caches only when their session belongs
+    # to this bot.  A plain session id cannot otherwise distinguish bots.
+    legacy = session_cache.get(sess_id) if isinstance(session_cache, dict) else None
+    if legacy is not None and str(getattr(legacy, "self_id", "")) == bot_id:
+        bot_cache[sess_id] = legacy
+        return legacy
 
     inflight = getattr(self, "_zx_fetch_inflight", None)
     if not isinstance(inflight, dict):
         inflight = {}
         setattr(self, "_zx_fetch_inflight", inflight)
 
-    key = (str(getattr(bot, "self_id", "")), event.__class__, sess_id)
+    key = (bot_id, event.__class__, sess_id)
     task = inflight.get(key)
     if task is None or task.done():
-        task = asyncio.ensure_future(original(self, bot, event))
+        lock = getattr(self, "_zx_fetch_cache_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            setattr(self, "_zx_fetch_cache_lock", lock)
+
+        async def fetch_for_bot():
+            async with lock:
+                old_legacy = (
+                    session_cache.pop(sess_id, None)
+                    if isinstance(session_cache, dict)
+                    else None
+                )
+                try:
+                    result = await original(self, bot, event)
+                    bot_cache[sess_id] = result
+                    return result
+                finally:
+                    # Do not restore a value created for another bot.  The
+                    # per-bot cache above is the authoritative lookup path.
+                    if (
+                        old_legacy is not None
+                        and str(getattr(old_legacy, "self_id", "")) == bot_id
+                        and isinstance(session_cache, dict)
+                    ):
+                        session_cache[sess_id] = old_legacy
+
+        task = asyncio.ensure_future(fetch_for_bot())
         inflight[key] = task
+        task.add_done_callback(
+            lambda completed: (
+                inflight.pop(key, None) if inflight.get(key) is completed else None
+            )
+        )
     try:
-        return await task
+        return await asyncio.shield(task)
     finally:
         if inflight.get(key) is task and task.done():
             inflight.pop(key, None)

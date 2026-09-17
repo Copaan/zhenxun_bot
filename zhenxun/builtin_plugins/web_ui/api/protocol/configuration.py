@@ -419,7 +419,7 @@ async def probe_qq_credential(payload: QQCredentialProbe) -> Result:
 )
 async def save_protocol_configuration(
     payload: ProtocolConfigurationUpdate,
-    request: Request,
+    request: Request = None,  # type: ignore[assignment]
 ) -> Result:
     source = _source_path()
     current = source.read_text(encoding="utf-8")
@@ -531,7 +531,7 @@ async def save_protocol_configuration(
                 ),
                 "configured_endpoint": configured_reverse_ws_endpoint(
                     saved_values,
-                    request.url.hostname or "",
+                    request.url.hostname if request is not None else "",
                 ),
             },
         ),

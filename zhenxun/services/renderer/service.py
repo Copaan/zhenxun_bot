@@ -266,14 +266,6 @@ class RendererService:
                 )
                 raise
 
-    async def _collect_dependencies_recursive(
-        self, component: Renderable, context: "RenderContext"
-    ):
-        """
-        递归遍历组件树，收集所有依赖项（CSS, JS, 额外CSS）并存入上下文。
-        """
-        await DependencyCollector.collect(component, context)
-
     async def _render_component(
         self,
         context: "RenderContext",

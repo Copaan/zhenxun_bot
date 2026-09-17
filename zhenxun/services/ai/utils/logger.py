@@ -27,6 +27,9 @@ class AILoggerProxy:
         cmd = command or self._cmd
         global_logger.debug(self._format(info), command=cmd, **kwargs)
 
+    def is_enabled(self, level: str) -> bool:
+        return global_logger.is_enabled(level)
+
     def warning(self, info: str, command: str | None = None, **kwargs: Any):
         cmd = command or self._cmd
         global_logger.warning(self._format(info), command=cmd, **kwargs)

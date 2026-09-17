@@ -142,10 +142,10 @@ def network_configuration_status() -> dict[str, Any]:
         },
         "network_configured": {
             "scheme": desired.scheme,
-            "port": desired.port,
-            "http_mode": desired.effective_http_mode,
-            "http_port": desired.redirect_port
-            if desired.http_sidecar_enabled
+            "port": getattr(desired, "port", 8080),
+            "http_mode": getattr(desired, "effective_http_mode", "disabled"),
+            "http_port": getattr(desired, "redirect_port", 0)
+            if getattr(desired, "http_sidecar_enabled", False)
             else None,
             "pending_restart": desired != tls,
         },
@@ -162,8 +162,8 @@ def restart_status_data(*, access_urls: list[str] | None = None) -> dict[str, An
             [
                 *(access_urls or []),
                 *preferred_access_urls(
-                    desired.host,
-                    desired.port,
+                    getattr(desired, "host", "127.0.0.1"),
+                    getattr(desired, "port", 8080),
                     settings=desired,
                     sidecar_available=bool(os.getenv("ZHENXUN_LAUNCHER_PID")),
                 ),

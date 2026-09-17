@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import json
 import os
 import ssl
+from typing import Any
 
 import aiohttp
 from starlette.applications import Starlette
@@ -107,13 +108,16 @@ class QQWebhookIngress:
         if client is None:
             return JSONResponse({"status": "degraded"}, status_code=503)
         try:
-            async with client.get(
-                f"{self.upstream_url}/qq/healthz", allow_redirects=False
-            ) as response:
+            response = await self._request(
+                client, "GET", f"{self.upstream_url}/qq/healthz"
+            )
+            try:
                 ready = (
-                    response.status == 200
-                    and (await response.json()).get("status") == "ready"
+                    self._response_status(response) == 200
+                    and (await self._response_json(response)).get("status") == "ready"
                 )
+            finally:
+                await self._close_response(response)
         except (aiohttp.ClientError, TimeoutError, json.JSONDecodeError, ValueError):
             ready = False
         return JSONResponse(
@@ -164,19 +168,23 @@ class QQWebhookIngress:
                 if name in request.headers
             }
             try:
-                async with client.post(
+                upstream = await self._request(
+                    client,
+                    "POST",
                     f"{self.upstream_url}/qq/webhook",
                     data=body,
                     headers=headers,
-                    allow_redirects=False,
-                ) as upstream:
-                    response_body = await upstream.read()
-                    status = upstream.status
+                )
+                try:
+                    response_body = await self._response_read(upstream)
+                    status = self._response_status(upstream)
                     response_headers = {
                         name: upstream.headers[name]
                         for name in ("Content-Type", "Content-Encoding")
                         if name in upstream.headers
                     }
+                finally:
+                    await self._close_response(upstream)
             except (aiohttp.ClientError, TimeoutError):
                 self._counts["worker_unavailable"] += 1
                 return Response("Webhook worker unavailable", status_code=503)
@@ -188,6 +196,55 @@ class QQWebhookIngress:
             )
         finally:
             await self._leave()
+
+    @staticmethod
+    async def _request(client: Any, method: str, url: str, **kwargs: Any) -> Any:
+        """Issue a request through aiohttp or an async test double."""
+
+        try:
+            request = getattr(client, method.lower())(
+                url, allow_redirects=False, **kwargs
+            )
+        except TypeError:
+            request = getattr(client, method.lower())(
+                url, follow_redirects=False, **kwargs
+            )
+        return await request
+
+    @staticmethod
+    async def _close_response(response: Any) -> None:
+        release = getattr(response, "release", None)
+        if release is not None:
+            release()
+        close = getattr(response, "aclose", None)
+        if close is not None:
+            result = close()
+            if asyncio.iscoroutine(result):
+                await result
+
+    @staticmethod
+    def _response_status(response: Any) -> int:
+        status = getattr(response, "status", None)
+        if status is None:
+            status = response.status_code
+        return int(status)
+
+    @staticmethod
+    async def _response_read(response: Any) -> bytes:
+        content = getattr(response, "read", None)
+        if content is not None:
+            result = content()
+            if asyncio.iscoroutine(result):
+                return await result
+            return result
+        return bytes(getattr(response, "content", b""))
+
+    @staticmethod
+    async def _response_json(response: Any) -> Any:
+        result = response.json()
+        if asyncio.iscoroutine(result):
+            return await result
+        return result
 
     @staticmethod
     async def _read_bounded_body(request: Request) -> bytes | None:

@@ -47,6 +47,7 @@ _PLUGIN_STORE_GENERATION = 0
 class StoreInstallResult:
     dependency_plan: dict[str, Any] = field(default_factory=dict)
     download_source: str = "auto"
+    unchanged: bool = False
 
     @property
     def dependency_changes(self) -> bool:
@@ -948,6 +949,11 @@ class StoreManager:
         logger.info(f"尝试更新插件 {plugin_info.name}", LOG_COMMAND)
         suc_plugin = await cls.get_installed_plugins()
         logger.debug(f"当前插件列表: {suc_plugin}", LOG_COMMAND)
+        if cls.check_version_is_new(plugin_info, suc_plugin):
+            result = StoreInstallResult(unchanged=True)
+            if return_result:
+                return result
+            return f"插件 {plugin_info.name} 已是最新版本"
         if plugin_info.github_url is None:
             plugin_info.github_url = DEFAULT_GITHUB_URL
         install_result = await cls.install_plugin_with_repo(

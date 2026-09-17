@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 import time
 from typing import Any
@@ -26,12 +27,15 @@ def write_restart_state(state: dict[str, Any]) -> None:
     write_json_locked(_RESTART_STATE_FILE, state)
 
 
-def mutate_restart_state(mutator) -> Any:
+def mutate_restart_state(
+    mutator, *, write_if: Callable[[Any], bool] | None = None
+) -> Any:
     return mutate_json_locked(
         _RESTART_STATE_FILE,
         {},
         mutator,
         quarantine_corrupt=True,
+        write_if=write_if,
     )
 
 
@@ -100,7 +104,7 @@ def consume_launcher_action() -> tuple[str, list[str]] | None:
         state.pop(_DEPENDENCY_PATHS_KEY, None)
         return str(action), paths
 
-    return mutate_restart_state(consume)
+    return mutate_restart_state(consume, write_if=lambda action: action is not None)
 
 
 def clear_launcher_restart_signal() -> None:

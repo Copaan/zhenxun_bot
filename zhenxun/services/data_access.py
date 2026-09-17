@@ -1,9 +1,15 @@
+import asyncio
+from contextlib import nullcontext
+from contextvars import ContextVar
+from copy import deepcopy
 import re
 from typing import Any, ClassVar, Generic, TypeVar, cast
 
 from zhenxun.services.cache import Cache, CacheRoot, cache_config
 from zhenxun.services.cache.config import COMPOSITE_KEY_SEPARATOR, CacheMode
-from zhenxun.services.db_context import Model, with_db_timeout
+from zhenxun.services.cache.keyed import KeyedLocks
+from zhenxun.services.cache.write import in_write_transaction
+from zhenxun.services.db_context import DB_TIMEOUT_SECONDS, Model, with_db_timeout
 from zhenxun.services.log import logger
 
 T = TypeVar("T", bound=Model)
@@ -49,6 +55,11 @@ class DataAccess(Generic[T]):
     # 添加缓存统计信息
     _cache_stats: ClassVar[dict] = {}
     _ENABLE_CACHE_STATS: ClassVar[bool] = False
+    _refill_locks: ClassVar[KeyedLocks] = KeyedLocks()
+    _refills: ClassVar[dict[tuple, asyncio.Future]] = {}
+    _refill_owner: ClassVar[ContextVar[asyncio.Task | None]] = ContextVar(
+        "data_access_refill_owner", default=None
+    )
     # 空结果标记
     _NULL_RESULT = "__NULL_RESULT_PLACEHOLDER__"
     # 默认空结果缓存时间（秒）- 设置为5分钟，避免频繁查询数据库
@@ -155,6 +166,13 @@ class DataAccess(Generic[T]):
         # 单条主键缓存键,退化为直查 DB,避免空串与 NULL 语义混淆导致错误命中(A5)。
         if any("__" in key for key in kwargs):
             return None
+        fields = (
+            set(self.key_field)
+            if isinstance(self.key_field, tuple)
+            else {self.key_field}
+        )
+        if set(kwargs) != fields:
+            return None
         if isinstance(self.key_field, tuple):
             # 多字段主键
             key_parts = []
@@ -180,7 +198,13 @@ class DataAccess(Generic[T]):
             Optional[T]: 查询结果，如果不存在返回None
         """
         # 如果没有缓存类型，直接从数据库获取
-        if not self.cache_type or cache_config.cache_mode == CacheMode.NONE:
+        if (
+            not self.cache_type
+            or cache_config.cache_mode == CacheMode.NONE
+            or not CacheRoot.enabled
+            or in_write_transaction()
+            or self._refill_owner.get() is asyncio.current_task()
+        ):
             logger.debug(f"{self.model_cls.__name__} 直接从数据库获取数据: {kwargs}")
             return await with_db_timeout(
                 db_query_func(*args, **kwargs),
@@ -193,35 +217,24 @@ class DataAccess(Generic[T]):
         refill_token = None
         try:
             # 尝试构建缓存键
-            cache_key = self._build_cache_key_from_kwargs(**kwargs)
+            cache_key = None if args else self._build_cache_key_from_kwargs(**kwargs)
 
             # 如果成功构建缓存键，尝试从缓存获取
             if cache_key is not None:
                 refill_token = CacheRoot.refill_token(self.cache_type, cache_key)
                 data = await self.cache.get(cache_key) if self.cache else None
-                logger.debug(
-                    f"{self.model_cls.__name__}  key: {cache_key}"
-                    f" 从缓存获取到的数据 {type(data)}: {data}"
-                )
-
                 if data == self._NULL_RESULT:
                     # 空结果缓存命中
                     self._bump_cache_stat(self.cache_type, "null_hits")
-                    logger.debug(
-                        f"{self.model_cls.__name__} 从缓存获取到空结果: {cache_key}"
-                    )
                     if allow_not_exist:
                         logger.debug(
-                            f"{self.model_cls.__name__} 从缓存获取"
-                            f"到空结果: {cache_key}, 允许数据不存在，返回None"
+                            f"{self.model_cls.__name__} 缓存负命中: {cache_key}"
                         )
                         return None
                 elif data:
                     # 缓存命中
                     self._bump_cache_stat(self.cache_type, "hits")
-                    logger.debug(
-                        f"{self.model_cls.__name__} 从缓存获取数据成功: {cache_key}"
-                    )
+                    logger.debug(f"{self.model_cls.__name__} 缓存命中: {cache_key}")
                     return cast(T, data)
                 else:
                     # 缓存未命中
@@ -229,21 +242,89 @@ class DataAccess(Generic[T]):
                     logger.debug(f"{self.model_cls.__name__} 缓存未命中: {cache_key}")
         except Exception as e:
             logger.error(f"{self.model_cls.__name__} 从缓存获取数据失败: {kwargs}", e=e)
+            cache_key = None
+            refill_token = None
 
-        data = await with_db_timeout(
-            db_query_func(*args, **kwargs),
+        identity = (
+            id(self.model_cls),
+            self.cache_type,
+            cache_key,
+            id(getattr(db_query_func, "__func__", db_query_func)),
+            allow_not_exist,
+        )
+        flight = self._refills.get(identity) if cache_key is not None else None
+        if flight is not None:
+            success, result, token = await asyncio.wait_for(
+                asyncio.shield(flight), timeout=DB_TIMEOUT_SECONDS
+            )
+            if not success:
+                raise result
+            if token == CacheRoot.refill_token(self.cache_type, cache_key):
+                # Share only the in-flight read, including absence. No negative
+                # entry survives the query, and callers never share mutable models.
+                return cast(T | None, deepcopy(result))
+
+        async def refill():
+            token = refill_token
+            lock = (
+                self._refill_locks.hold((self.cache_type, cache_key))
+                if cache_key is not None
+                else nullcontext()
+            )
+            async with lock:
+                pending = None
+                if (
+                    cache_key is not None
+                    and len(self._refills) < self._refill_locks.capacity
+                ):
+                    pending = asyncio.get_running_loop().create_future()
+                    self._refills[identity] = pending
+                try:
+                    data = None
+                    hit = False
+                    if cache_key is not None and self.cache is not None:
+                        # Recheck after waiting, with a new invalidation fence.
+                        data = await self.cache.get(cache_key)
+                        hit = data is not None
+                        if data == self._NULL_RESULT:
+                            hit = allow_not_exist
+                            data = None
+                        token = CacheRoot.refill_token(self.cache_type, cache_key)
+                    if not hit:
+                        owner_token = self._refill_owner.set(asyncio.current_task())
+                        try:
+                            data = await db_query_func(*args, **kwargs)
+                        finally:
+                            self._refill_owner.reset(owner_token)
+                    # Absence is not cached; writes can create a record immediately.
+                    if (
+                        not hit
+                        and data is not None
+                        and cache_key is not None
+                        and token is not None
+                    ):
+                        if await CacheRoot.set_if_current(
+                            self.cache_type, cache_key, data, token
+                        ):
+                            self._bump_cache_stat(self.cache_type, "sets")
+                    if pending is not None:
+                        pending.set_result((True, deepcopy(data), token))
+                    return data
+                except BaseException as error:
+                    if pending is not None:
+                        pending.set_result((False, error, token))
+                    raise
+                finally:
+                    if pending is not None:
+                        self._refills.pop(identity, None)
+
+        # Admission precedes refill locks, including callers already holding
+        # SQLite admission. The same timeout budget covers both waits.
+        return await with_db_timeout(
+            refill(),
             operation=f"{self.model_cls.__name__}.{db_query_func.__name__}",
             source="DataAccess",
         )
-        # A cache miss is not a durable absence. Only fill a known key from a
-        # successful query if no committed write invalidated its revision.
-        if data is not None and cache_key is not None and refill_token is not None:
-            if await CacheRoot.set_if_current(
-                self.cache_type, cache_key, data, refill_token
-            ):
-                self._bump_cache_stat(self.cache_type, "sets")
-
-        return data
 
     async def get_or_none(
         self, allow_not_exist: bool = True, *args, **kwargs

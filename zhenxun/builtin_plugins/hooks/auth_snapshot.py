@@ -179,6 +179,7 @@ class AuthSnapshot:
     user_balance: int | None = None
     db_unhealthy: bool = False
     cache_misses: frozenset[str] = field(default_factory=frozenset)
+    permission_revision: int = -1
 
     @property
     def module(self) -> str:
@@ -219,6 +220,8 @@ async def build_auth_snapshot(
     allow_cache_load: bool = False,
     provider: PermissionDataProvider = DEFAULT_PERMISSION_DATA_PROVIDER,
 ) -> AuthSnapshot:
+    from zhenxun.services.permission_revision import current_revision
+
     event_cache = context.event_cache
     entity = context.entity
     cache_misses: set[str] = set()
@@ -368,6 +371,7 @@ async def build_auth_snapshot(
         ban_state=ban_state,
         db_unhealthy=db_unhealthy,
         cache_misses=frozenset(cache_misses),
+        permission_revision=current_revision(),
     )
 
 
@@ -393,7 +397,9 @@ async def get_or_build_auth_snapshot(
         snapshot_cache = event_cache.setdefault("auth_snapshots", {})
         cached = snapshot_cache.get(module)
         if isinstance(cached, AuthSnapshot):
-            if not (allow_cache_load and cached.cache_misses):
+            if cached.permission_revision == revision and not (
+                allow_cache_load and cached.cache_misses
+            ):
                 return cached
     snapshot = await build_auth_snapshot(
         context=context,

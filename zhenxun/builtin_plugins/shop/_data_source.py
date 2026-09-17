@@ -446,43 +446,44 @@ class ShopManage:
             return "购买的数量要大于0!"
         if num > 2**31 - 1:
             return "购买数量超出支持范围。"
-        goods_list = (
-            await GoodsInfo.filter(
-                Q(goods_limit_time__gte=time.time()) | Q(goods_limit_time=0)
-            )
-            .annotate()
-            .order_by("id")
-            .all()
-        )
+        goods_query = GoodsInfo.filter(
+            Q(goods_limit_time__gte=time.time()) | Q(goods_limit_time=0)
+        ).order_by("id")
         if name.isdigit():
-            if int(name) > len(goods_list) or int(name) <= 0:
+            index = int(name)
+            if index <= 0 or index > 2**63 - 1:
                 return "道具编号不存在..."
-            goods = goods_list[int(name) - 1]
-        elif filter_goods := [g for g in goods_list if g.goods_name == name]:
-            goods = filter_goods[0]
+            goods = await goods_query.offset(index - 1).first()
+            if goods is None:
+                return "道具编号不存在..."
         else:
-            return "道具名称不存在..."
+            # Keep Python's exact name comparison even on case-insensitive DBs.
+            matches = await goods_query.filter(goods_name=name)
+            goods = next((item for item in matches if item.goods_name == name), None)
+            if goods is None:
+                return "道具名称不存在..."
         user = await UserConsole.get_user(user_id, platform)
         price = goods.goods_price * num * goods.goods_discount
         if not math.isfinite(price) or price < 0:
             raise ValueError("invalid_goods_price")
         if user.gold < price:
             return "糟糕! 您的金币好像不太够哦..."
-        create_time = localtime().replace(hour=0, minute=0, second=0, microsecond=0)
-        purchases = (
-            await UserPropsLog.filter(
-                user_id=user_id,
-                handle=PropHandle.BUY,
-                uuid=goods.uuid,
-                create_time__gte=create_time,
-                create_time__lt=create_time + timedelta(days=1),
+        if goods.daily_limit:
+            create_time = localtime().replace(hour=0, minute=0, second=0, microsecond=0)
+            purchases = (
+                await UserPropsLog.filter(
+                    user_id=user_id,
+                    handle=PropHandle.BUY,
+                    uuid=goods.uuid,
+                    create_time__gte=create_time,
+                    create_time__lt=create_time + timedelta(days=1),
+                )
+                .annotate(total=Sum("num"))
+                .values("total")
             )
-            .annotate(total=Sum("num"))
-            .values("total")
-        )
-        count = (purchases[0]["total"] if purchases else 0) or 0
-        if goods.daily_limit and count + num > goods.daily_limit:
-            return "今天的购买已达限制了喔!"
+            count = (purchases[0]["total"] if purchases else 0) or 0
+            if count + num > goods.daily_limit:
+                return "今天的购买已达限制了喔!"
         logger.info(
             f"花费 {price} 金币购买 {goods.goods_name} ×{num} 成功！",
             "购买道具",

@@ -323,7 +323,9 @@ class MessageInbox:
             bot, decode or bot.adapter.json_to_event, dispatch or bot.handle_event
         )
         payload = json.loads(event.json())
-        message_id = payload.get("message_id") or payload.get("id")
+        message_id = payload.get("message_id")
+        if message_id is None:
+            message_id = payload.get("id")
         conversation = ":".join(
             str(payload.get(field) or "")
             for field in ("guild_id", "channel_id", "group_id", "group_openid")

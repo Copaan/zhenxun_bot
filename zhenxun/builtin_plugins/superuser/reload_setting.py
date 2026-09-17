@@ -17,8 +17,6 @@ from zhenxun.utils.enum import PluginType
 from zhenxun.utils.manager.priority_manager import PriorityLifecycle
 from zhenxun.utils.message import MessageUtils
 
-AUTO_RELOAD_JOB_ID = "zhenxun.reload_setting.auto_reload"
-
 __plugin_meta__ = PluginMetadata(
     name="重载配置",
     description="重新加载config.yaml",
@@ -57,25 +55,6 @@ _matcher = on_alconna(
     priority=1,
     block=True,
 )
-
-
-def _get_auto_reload_interval() -> int:
-    value = Config.get_config("reload_setting", "AUTO_RELOAD_TIME", 180)
-    try:
-        seconds = int(value)
-    except (TypeError, ValueError):
-        logger.warning(
-            f"AUTO_RELOAD_TIME 配置无效: {value!r}，已使用默认值 180 秒",
-            "重载配置",
-        )
-        return 180
-    if seconds <= 0:
-        logger.warning(
-            f"AUTO_RELOAD_TIME 配置小于等于 0: {seconds}，已使用默认值 180 秒",
-            "重载配置",
-        )
-        return 180
-    return seconds
 
 
 async def _reload_runtime_config() -> RuntimeOperation:

@@ -283,7 +283,7 @@ async def _execute_single_job_instance(
             if actual_group_id
             else (f"用户 {actual_user_id}" if actual_user_id else "全局")
         )
-        logger.info(
+        logger.debug(
             f"插件 '{plugin_name}' 的定时任务在目标 [{target_desc}] "
             f"因功能被禁用而跳过执行。"
         )
@@ -349,7 +349,7 @@ async def _execute_single_job_instance(
             decorated_executor = retry_decorator(task_execution_coro)
             await decorated_executor()
         else:
-            logger.info(
+            logger.debug(
                 f"插件 '{plugin_name}' 开始为目标 [{target_log or '全局'}] "
                 f"执行定时任务 (ID: {schedule.id})。"
             )
@@ -434,13 +434,13 @@ async def _execute_ephemeral_job(context: ScheduleContext):
             return
 
         context.platform_scope = PlatformUtils.get_platform_scope(bot)
-        logger.info(f"开始执行临时任务: {plugin_name}")
+        logger.debug(f"开始执行临时任务: {plugin_name}")
         injected_params = {"context": context}
         state: T_State = {ScheduleContext: context}
 
         func = cast(Callable, task_meta["func"])
         await _run_dependent_task(func, injected_params, bot, state)
-        logger.info(f"临时任务 '{plugin_name}' 执行完成。")
+        logger.debug(f"临时任务 '{plugin_name}' 执行完成。")
     except Exception as e:
         logger.error(f"执行临时任务 '{plugin_name}' 时发生错误", e=e)
 
@@ -495,6 +495,7 @@ async def _execute_persistent_job(schedule_id: int, force: bool = False):
         await ExecutionDispatcher.dispatch(schedule, bot, resolved_targets)
 
         await ScheduleRepository.update_run_status(schedule, is_success=True)
+        logger.info(f"任务 {schedule.id} 执行完成 | 目标总数={len(resolved_targets)}")
 
         if schedule.is_one_off:
             logger.info(f"一次性任务 {schedule.id} 执行成功，将被删除。")

@@ -248,14 +248,6 @@ class PolicyDecisionPoint:
                 setattr(bot_data, "block_plugin_set", block_set)
         return block_set
 
-    @staticmethod
-    def _module_in_block_string(module: str, value: str | None) -> bool:
-        if not value:
-            return False
-        return CommonUtils.format(module) in value or module in _parse_block_modules(
-            value
-        )
-
 
 def principal_from_snapshot(snapshot: AuthSnapshot) -> PolicyPrincipal:
     return PolicyPrincipal(

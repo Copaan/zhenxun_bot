@@ -47,72 +47,6 @@ ENV_DEV_FILE = ".env.dev"
 _worker_certificate_pin: str | None = None
 
 
-def _env_assignment_key(line: str, *, include_commented: bool = False) -> str | None:
-    stripped = line.strip()
-    if include_commented and stripped.startswith("#"):
-        stripped = stripped[1:].lstrip()
-    if not stripped or stripped.startswith("#") or "=" not in stripped:
-        return None
-    key = stripped.split("=", 1)[0].strip()
-    return key if key.replace("_", "").isalnum() else None
-
-
-def _env_key(line: str) -> str | None:
-    return _env_assignment_key(line)
-
-
-def _env_block_key(block: list[str]) -> str | None:
-    for line in block:
-        if key := _env_key(line):
-            return key
-    return None
-
-
-def _env_block_anchor_key(block: list[str]) -> str | None:
-    for line in block:
-        if key := _env_assignment_key(line, include_commented=True):
-            return key
-    return None
-
-
-def _split_env_blocks(lines: list[str]) -> list[tuple[int, list[str]]]:
-    blocks: list[tuple[int, list[str]]] = []
-    current: list[str] = []
-    start_index = 0
-    for index, line in enumerate(lines):
-        if line.strip():
-            if not current:
-                start_index = index
-            current.append(line)
-        elif current:
-            blocks.append((start_index, current))
-            current = []
-
-    if current:
-        blocks.append((start_index, current))
-    return blocks
-
-
-def _find_env_block_start(lines: list[str], key: str) -> int | None:
-    for start_index, block in _split_env_blocks(lines):
-        if _env_block_anchor_key(block) == key:
-            return start_index
-    return None
-
-
-def _insert_env_block_before(
-    lines: list[str],
-    index: int,
-    block: list[str],
-) -> list[str]:
-    insert_block = block.copy()
-    if index > 0 and lines[index - 1].strip():
-        insert_block.insert(0, "\n")
-    if index < len(lines) and insert_block and insert_block[-1].strip():
-        insert_block.append("\n")
-    return lines[:index] + insert_block + lines[index:]
-
-
 def _sync_env_missing_items(project_root: Path) -> None:
     """Copy missing .env keys from .env.example without touching existing values."""
     example_path = project_root / ENV_EXAMPLE_FILE
@@ -187,6 +121,22 @@ def _ensure_project_root() -> Path:
 
 class _WorkerReexec(Exception):
     pass
+
+
+def _record_process_crash(error: BaseException, *, role: str) -> None:
+    """Flush a last-chance process failure through the normal error sink."""
+    try:
+        from zhenxun.services.log import logger
+
+        logger.error(
+            f"进程崩溃 | role={role} | code=process_crash",
+            "Process",
+            e=error if isinstance(error, Exception) else Exception(str(error)),
+        )
+    except Exception:
+        # Startup can fail before the logging module is available. Keep the
+        # original exception and let the process supervisor handle it.
+        pass
 
 
 def _run_worker() -> None:
@@ -493,18 +443,6 @@ def _build_ingress_command(settings, *, upstream_scheme: str = "http") -> list[s
         config.qq_webhook_tls_certfile,
         config.qq_webhook_tls_keyfile,
         f"{upstream_scheme}://{upstream_host}:{settings.worker_port}",
-    ]
-
-
-def _build_redirect_command(settings) -> list[str]:
-    return [
-        sys.executable,
-        "-m",
-        "zhenxun.cli",
-        "run-http-redirect",
-        settings.host,
-        str(settings.redirect_port),
-        str(settings.port),
     ]
 
 
@@ -2169,7 +2107,11 @@ def main() -> None:
                 authorize(project, validation_id)
             else:
                 require_resolved_restore(project)
-            _run_worker()
+            try:
+                _run_worker()
+            except Exception as error:
+                _record_process_crash(error, role="worker")
+                raise
         else:
             from zhenxun.startup_banner import show_startup_banner
 
@@ -2177,7 +2119,11 @@ def main() -> None:
             try:
                 with InstanceLease(project, role="worker"):
                     require_resolved_restore(project)
-                    _run_worker()
+                    try:
+                        _run_worker()
+                    except Exception as error:
+                        _record_process_crash(error, role="worker")
+                        raise
             except _WorkerReexec:
                 # Release the old process lease before the Windows exec handoff.
                 # The replacement must acquire it anew before touching runtime.

@@ -101,6 +101,22 @@ def reload_log_level(level: str | int) -> None:
     log_level = normalized
 
 
+def _level_enabled(level: str) -> bool:
+    """Avoid building debug context when no sink can accept it."""
+    try:
+        configured = log_level
+        if isinstance(configured, str) and configured.isdigit():
+            configured = int(configured)
+        minimum = (
+            logger_.level(configured).no
+            if isinstance(configured, str)
+            else int(configured)
+        )
+        return logger_.level(level.upper()).no >= minimum
+    except Exception:
+        return True
+
+
 class logger:
     """
     一个经过优化的、支持多种上下文和格式的日志记录器。
@@ -113,6 +129,10 @@ class logger:
     TEMPLATE_PLATFORM = "平台[<u><m>{}</m></u>]"
     TEMPLATE_TARGET = "[Target]([<u><e>{}</e></u>])"
     SUCCESS_TEMPLATE = "[<u><c>{}</c></u>]: {} | 参数[{}] 返回: [<y>{}</y>]"
+
+    @classmethod
+    def is_enabled(cls, level: str) -> bool:
+        return _level_enabled(level)
 
     @classmethod
     def __parser_template(
@@ -161,6 +181,9 @@ class logger:
         """
         核心日志处理方法，处理所有日志级别的通用逻辑。
         """
+        if level in {"debug", "trace"} and not _level_enabled(level):
+            return
+
         user_id: str | None = str(session) if isinstance(session, int | str) else None
 
         session_kind = _session_kind(session)
@@ -184,11 +207,14 @@ class logger:
             template += f" || 错误 <r>{type(e).__name__}: {e}</r>"
 
         try:
-            log_func = getattr(logger_.opt(colors=True), level)
-            log_func(template)
+            options = {"colors": True}
+            if e is not None:
+                options["exception"] = e
+            logger_.opt(**options).log(level.upper(), template)
         except Exception:
-            log_func_fallback = getattr(logger_, level)
-            log_func_fallback(template)
+            logger_.opt(exception=e if e is not None else False).log(
+                level.upper(), template
+            )
 
     @overload
     @classmethod

@@ -11,7 +11,10 @@ from zhenxun.models.goods_info import GoodsInfo
 from zhenxun.services.asset_transaction import (
     account_write,
     asset_call,
+    asset_db_kwargs,
+    asset_queryset,
     asset_transaction,
+    current_asset_connection,
     require_positive_amount,
 )
 from zhenxun.services.buffered_writers import append_user_gold_log
@@ -36,7 +39,9 @@ class GoldReservation:
         from zhenxun.models.asset_operation import AssetOperation
 
         async with asset_transaction(self.user_id, self.platform):
-            record = await AssetOperation.get(id=self.operation_id)
+            record = await asset_queryset(
+                AssetOperation.filter(id=self.operation_id)
+            ).get()
             if (
                 record.kind != "fee"
                 or record.user_id != self.user_id
@@ -52,16 +57,21 @@ class GoldReservation:
                         gold=amount,
                         handle=GoldHandle(record.payload["handle"]),
                         source=record.payload["plugin_module"],
+                        using_db=current_asset_connection(),
                     )
                 else:
-                    updated = await UserConsole.filter(
-                        user_id=self.user_id, gold__lte=2**31 - 1 - amount
+                    updated = await asset_queryset(
+                        UserConsole.filter(
+                            user_id=self.user_id, gold__lte=2**31 - 1 - amount
+                        )
                     ).update(gold=F("gold") + amount)
                     if not updated:
                         raise ValueError("fee_refund_balance_out_of_range")
                     await UserConsole.invalidate_user_cache(self.user_id)
                 record.state = action
-                await record.save(update_fields=["state", "update_time"])
+                await record.save(
+                    update_fields=["state", "update_time"], **asset_db_kwargs()
+                )
             state = record.state
         # Publish local state only after the transaction is confirmed.
         self.committed = state == "committed"
@@ -147,10 +157,21 @@ class UserConsole(Model):
         cls, user_id: str, platform: str | None = None
     ) -> "UserConsole":
         """获取写入用用户；已有用户不走 get_or_create，避免重复清理缓存。"""
-        user = await cls.get_or_none(user_id=user_id)
+        connection = current_asset_connection()
+        query = cls.filter(user_id=user_id)
+        if connection is not None:
+            query = query.using_db(connection)
+        user = await query.get_or_none()
         if user is not None:
             return user
-        user, _ = await cls.get_or_create_user(user_id=user_id, platform=platform)
+        if connection is None:
+            user, _ = await cls.get_or_create_user(user_id=user_id, platform=platform)
+        else:
+            user, _ = await cls.get_or_create(
+                using_db=connection,
+                user_id=user_id,
+                defaults={"platform": platform, "uid": await cls.get_new_uid()},
+            )
         return user
 
     @classmethod
@@ -162,7 +183,7 @@ class UserConsole(Model):
         """
         async with cls._uid_lock:
             if cls._uid_counter is None:
-                user = await cls.annotate().order_by("-uid").first()
+                user = await asset_queryset(cls.annotate()).order_by("-uid").first()
                 cls._uid_counter = user.uid if user else 0
             cls._uid_counter += 1
             return cls._uid_counter
@@ -178,13 +199,14 @@ class UserConsole(Model):
             raise ValueError("gold_out_of_range")
         user = await cls._get_user_for_write(user_id, platform)
         delta = gold - user.gold
-        await cls.filter(user_id=user_id).update(gold=gold)
+        await asset_queryset(cls.filter(user_id=user_id)).update(gold=gold)
         if delta:
             await append_user_gold_log(
                 user_id,
                 abs(delta),
                 GoldHandle.GET if delta > 0 else GoldHandle.PLUGIN,
                 "superuser_set",
+                current_asset_connection(),
             )
         await cls.invalidate_user_cache(user_id)
 
@@ -202,17 +224,21 @@ class UserConsole(Model):
             platform: 平台.
         """
         require_positive_amount(gold)
-        await cls._get_user_for_write(user_id=user_id, platform=platform)
+        # account_write has already created and locked this account.
         # 原子自增,避免并发 read-modify-write 丢币(A2);filter().update()
         # 不触发基类 save() 的缓存失效,需手动失效。
-        updated = await cls.filter(user_id=user_id, gold__lte=2**31 - 1 - gold).update(
-            gold=F("gold") + gold
-        )
+        updated = await asset_queryset(
+            cls.filter(user_id=user_id, gold__lte=2**31 - 1 - gold)
+        ).update(gold=F("gold") + gold)
         if not updated:
             raise ValueError("gold_out_of_range")
         await cls.invalidate_user_cache(user_id)
         await append_user_gold_log(
-            user_id=user_id, gold=gold, handle=GoldHandle.GET, source=source
+            user_id=user_id,
+            gold=gold,
+            handle=GoldHandle.GET,
+            source=source,
+            using_db=current_asset_connection(),
         )
 
     @classmethod
@@ -243,14 +269,18 @@ class UserConsole(Model):
             raise InsufficientGold()
         # 原子扣减 + gold__gte 守卫,防并发超扣(A2);未命中说明余额已被
         # 其他协程扣走,按金币不足处理。
-        updated = await cls.filter(user_id=user_id, gold__gte=gold).update(
-            gold=F("gold") - gold
-        )
+        updated = await asset_queryset(
+            cls.filter(user_id=user_id, gold__gte=gold)
+        ).update(gold=F("gold") - gold)
         if not updated:
             raise InsufficientGold()
         await cls.invalidate_user_cache(user_id)
         await append_user_gold_log(
-            user_id=user_id, gold=gold, handle=handle, source=plugin_module
+            user_id=user_id,
+            gold=gold,
+            handle=handle,
+            source=plugin_module,
+            using_db=current_asset_connection(),
         )
 
     @classmethod
@@ -270,7 +300,9 @@ class UserConsole(Model):
         require_positive_amount(gold)
         operation_id = operation_key(f"fee:{plugin_module}", user_id) or uuid4().hex
         async with asset_transaction(user_id, platform) as user:
-            existing = await AssetOperation.get_or_none(id=operation_id)
+            existing = await asset_queryset(
+                AssetOperation.filter(id=operation_id)
+            ).get_or_none()
             if existing:
                 if {
                     key: existing.payload.get(key)
@@ -294,12 +326,13 @@ class UserConsole(Model):
                 )
             if user.gold < gold:
                 raise InsufficientGold()
-            updated = await cls.filter(user_id=user_id, gold__gte=gold).update(
-                gold=F("gold") - gold
-            )
+            updated = await asset_queryset(
+                cls.filter(user_id=user_id, gold__gte=gold)
+            ).update(gold=F("gold") - gold)
             if not updated:
                 raise InsufficientGold()
             await AssetOperation.create(
+                **asset_db_kwargs(),
                 id=operation_id,
                 user_id=user_id,
                 kind="fee",

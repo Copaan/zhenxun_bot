@@ -3421,19 +3421,29 @@ class PluginRuntimeManager:
                 "reload_support": "restart_required",
                 "reload_reasons": ["not_loaded"],
             }
+        owners = self._owned_keys_for_unit(unit.plugin_id)
+        summary = self._resource_summary(unit, owners=owners)
         return {
             "reload_support": unit.classification.value,
             "reload_reasons": sorted(unit.reasons),
-            "runtime_resources": self._resource_summary(unit),
+            "runtime_resources": summary,
             "dynamic_validation": (
                 "verified"
                 if unit.classification is ReloadClassification.HOT_RELOADABLE
                 else "restart_boundary"
             ),
-            "rollback_precision": self._rollback_precision(unit),
+            "rollback_precision": self._rollback_precision(
+                unit, summary=summary, owners=owners
+            ),
         }
 
-    def _rollback_precision(self, unit: PluginUnit) -> str:
+    def _rollback_precision(
+        self,
+        unit: PluginUnit,
+        *,
+        summary: dict[str, int] | None = None,
+        owners: set[str] | None = None,
+    ) -> str:
         if unit.classification is not ReloadClassification.HOT_RELOADABLE:
             return "worker_recovery_required"
         if any(
@@ -3442,7 +3452,8 @@ class PluginRuntimeManager:
             if getattr(receipt, "state", "active") == "active"
         ):
             return "worker_recovery_required"
-        summary = self._resource_summary(unit)
+        if summary is None:
+            summary = self._resource_summary(unit, owners=owners)
         if any(
             summary.get(resource_type, 0)
             for resource_type in (
@@ -3455,7 +3466,8 @@ class PluginRuntimeManager:
             )
         ):
             return "semantic"
-        owners = self._owned_keys_for_unit(unit.plugin_id)
+        if owners is None:
+            owners = self._owned_keys_for_unit(unit.plugin_id)
         if any(
             owner in self._config_registrations for owner in owners | {unit.plugin_id}
         ):
@@ -3489,8 +3501,11 @@ class PluginRuntimeManager:
             return "semantic"
         return "exact"
 
-    def _resource_summary(self, unit: PluginUnit) -> dict[str, int]:
-        owners = self._owned_keys_for_unit(unit.plugin_id)
+    def _resource_summary(
+        self, unit: PluginUnit, *, owners: set[str] | None = None
+    ) -> dict[str, int]:
+        if owners is None:
+            owners = self._owned_keys_for_unit(unit.plugin_id)
         counts = {
             "entry_tasks": len(
                 {
@@ -4804,13 +4819,6 @@ class PluginRuntimeManager:
             if registered == module_name or registered.startswith(f"{module_name}."):
                 await PluginInitManager.install(registered, raise_on_error=True)
 
-    async def _run_plugin_remove(self, module_names: set[str]) -> None:
-        from zhenxun.services.plugin_init import PluginInitManager
-
-        for registered in list(PluginInitManager.plugins):
-            if registered in module_names:
-                await PluginInitManager.remove(registered, raise_on_error=True)
-
     async def _run_reload_shutdown_hooks(self, module_names: set[str]) -> None:
         from zhenxun.utils.enum import PriorityLifecycleType
         from zhenxun.utils.manager.priority_manager import (
@@ -5250,6 +5258,24 @@ class PluginRuntimeManager:
         counts = {item.value: 0 for item in ReloadClassification}
         for unit in self.units.values():
             counts[unit.classification.value] += 1
+        plugins = []
+        for unit in sorted(self.units.values(), key=lambda item: item.plugin_id):
+            owners = self._owned_keys_for_unit(unit.plugin_id)
+            summary = self._resource_summary(unit, owners=owners)
+            plugins.append(
+                {
+                    **unit.public_dict(),
+                    "runtime_resources": summary,
+                    "dynamic_validation": (
+                        "verified"
+                        if unit.classification is ReloadClassification.HOT_RELOADABLE
+                        else "restart_boundary"
+                    ),
+                    "rollback_precision": self._rollback_precision(
+                        unit, summary=summary, owners=owners
+                    ),
+                }
+            )
         return {
             "index_ready": self._index_ready.is_set(),
             "watching": self._watcher_task is not None
@@ -5275,19 +5301,7 @@ class PluginRuntimeManager:
                 plugin_id: list(values)
                 for plugin_id, values in self._shared_dependency_evidence.items()
             },
-            "plugins": [
-                {
-                    **unit.public_dict(),
-                    "runtime_resources": self._resource_summary(unit),
-                    "dynamic_validation": (
-                        "verified"
-                        if unit.classification is ReloadClassification.HOT_RELOADABLE
-                        else "restart_boundary"
-                    ),
-                    "rollback_precision": self._rollback_precision(unit),
-                }
-                for unit in sorted(self.units.values(), key=lambda item: item.plugin_id)
-            ],
+            "plugins": plugins,
             "last_operation": self.last_operation.public_dict()
             if self.last_operation
             else None,

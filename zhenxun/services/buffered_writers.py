@@ -50,10 +50,17 @@ async def append_user_gold_log(
     gold: int,
     handle: GoldHandle,
     source: str | None = None,
+    using_db=None,
 ) -> None:
     # Financial evidence belongs to the caller's transaction, never a volatile
     # operational buffer. The old flush entry point remains for pending batches.
-    await UserGoldLog.create(user_id=user_id, gold=gold, handle=handle, source=source)
+    await UserGoldLog.create(
+        using_db=using_db,
+        user_id=user_id,
+        gold=gold,
+        handle=handle,
+        source=source,
+    )
 
 
 async def flush_user_gold_log_buffer(reason: str) -> int:

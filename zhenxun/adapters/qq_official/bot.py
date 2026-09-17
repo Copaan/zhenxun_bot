@@ -16,6 +16,7 @@ from .context import (
     allocate_reply_sequence,
     event_official_context,
     finish_reply,
+    with_official_event_context,
 )
 
 
@@ -74,6 +75,10 @@ class ZhenxunQQBot(QQBot):
         finally:
             with suppress(Exception):
                 await finish_reply(state, successful=successful)
+
+    @with_official_event_context
+    async def handle_event(self, event: Event) -> None:
+        await super().handle_event(event)
 
 
 __all__ = ["ZhenxunQQBot"]

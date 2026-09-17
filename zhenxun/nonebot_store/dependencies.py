@@ -70,35 +70,6 @@ DependencyTier = Literal[
 ]
 
 
-def _installed_distribution_details(
-    names: set[str], *, include_layer: bool = True
-) -> dict[str, dict[str, Any]]:
-    """Return distribution metadata without treating distribution names as modules."""
-    result: dict[str, dict[str, Any]] = {}
-    top_levels = importlib.metadata.packages_distributions()
-    modules: dict[str, set[str]] = {}
-    for module, distributions in top_levels.items():
-        for distribution in distributions:
-            key = canonicalize_name(distribution)
-            if key in names:
-                modules.setdefault(key, set()).add(module)
-    for distribution in importlib.metadata.distributions():
-        raw_name = distribution.metadata.get("Name")
-        if not raw_name:
-            continue
-        name = canonicalize_name(raw_name)
-        if name not in names or (not include_layer and name in result):
-            continue
-        result[name] = {
-            "distribution_name": name,
-            "version": distribution.version,
-            "top_level_modules": sorted(modules.get(name, set())),
-            "nonebot_plugin_ids": [],
-            "runtime_role": "python_dependency",
-        }
-    return result
-
-
 class DependencyAnalysisError(RuntimeError):
     def __init__(self, code: str, message: str | None = None, *, details: Any = None):
         super().__init__(f"{code}: {message}" if message else code)

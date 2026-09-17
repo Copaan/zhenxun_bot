@@ -140,10 +140,6 @@ def _validate_env(content: str) -> list[dict[str, Any]]:
     return warnings
 
 
-def _validate_simple(content: str) -> list[dict[str, Any]]:
-    return validate_simple_yaml(content)
-
-
 def _path(file: str) -> Path:
     if file == "env":
         return _ENV_FILE if _ENV_FILE.exists() else _ENV_TEMPLATE

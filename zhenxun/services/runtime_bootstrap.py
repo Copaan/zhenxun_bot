@@ -486,7 +486,14 @@ async def _lifecycle_health_loop(sampler: _ProcessSampler) -> None:
 
 def register_runtime_bootstrap(_driver) -> None:
     _apply_alconna_conflict_patch()
-    apply_uninfo_onebot11_patch()
+    # Auth hooks can register before library plugins are loaded.  Importing
+    # Uninfo here marks it as a normal module and prevents ``nonebot.require``
+    # from loading it as a plugin later.  The CLI applies the patch again
+    # after requiring the library plugins.
+    import nonebot
+
+    if nonebot.get_plugin("nonebot_plugin_uninfo") is not None:
+        apply_uninfo_onebot11_patch()
     global _runtime_hooks_registered
     if _runtime_hooks_registered:
         return

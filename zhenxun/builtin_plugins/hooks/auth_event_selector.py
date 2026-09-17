@@ -10,6 +10,7 @@ from nonebot.adapters import Bot, Event
 from nonebot.matcher import Matcher
 import nonebot.message as nb_message
 
+from zhenxun.adapters.qq_official.context import with_official_event_context
 from zhenxun.services.log import logger
 from zhenxun.services.message_load import signal_overload
 
@@ -157,6 +158,7 @@ def _normalize_qq_self_at_message(bot: Bot, event: Event) -> None:
         _ensure_nonempty_qq_message(message)
 
 
+@with_official_event_context
 async def patched_handle_event(
     bot: Bot,
     event: Event,

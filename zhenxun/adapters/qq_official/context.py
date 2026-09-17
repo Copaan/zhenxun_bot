@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-from contextvars import ContextVar
+from collections.abc import Awaitable, Callable
+from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from functools import wraps
 import hashlib
 from typing import Literal
 from uuid import UUID
@@ -66,6 +68,12 @@ class OfficialQQEventContext:
 CURRENT_OFFICIAL_CONTEXT: ContextVar[OfficialQQEventContext | None] = ContextVar(
     "zhenxun_qq_official_context", default=None
 )
+_OFFICIAL_CONTEXT_TOKEN: ContextVar[Token | None] = ContextVar(
+    "zhenxun_qq_official_context_token", default=None
+)
+_PLATFORM_SCOPE_TOKEN: ContextVar[Token | None] = ContextVar(
+    "zhenxun_qq_platform_scope_token", default=None
+)
 
 
 def get_current_official_context() -> OfficialQQEventContext | None:
@@ -84,9 +92,52 @@ def bind_event_official_context(event: Event, context: OfficialQQEventContext) -
 def activate_event_official_context(event: Event) -> OfficialQQEventContext | None:
     context = event_official_context(event)
     if context is not None:
-        CURRENT_OFFICIAL_CONTEXT.set(context)
-        CURRENT_PLATFORM_SCOPE.set("qq_api")
+        _OFFICIAL_CONTEXT_TOKEN.set(CURRENT_OFFICIAL_CONTEXT.set(context))
+        _PLATFORM_SCOPE_TOKEN.set(CURRENT_PLATFORM_SCOPE.set("qq_api"))
     return context
+
+
+def deactivate_event_official_context() -> None:
+    """Restore context values after an event finishes dispatching."""
+
+    context_token = _OFFICIAL_CONTEXT_TOKEN.get()
+    if context_token is not None:
+        CURRENT_OFFICIAL_CONTEXT.reset(context_token)
+        _OFFICIAL_CONTEXT_TOKEN.set(None)
+    scope_token = _PLATFORM_SCOPE_TOKEN.get()
+    if scope_token is not None:
+        CURRENT_PLATFORM_SCOPE.reset(scope_token)
+        _PLATFORM_SCOPE_TOKEN.set(None)
+
+
+def with_official_event_context(
+    function: Callable[..., Awaitable[object]],
+) -> Callable[..., Awaitable[object]]:
+    """Keep the official context in the parent event task.
+
+    NoneBot runs event preprocessors in sibling tasks.  A ContextVar set by
+    one of those preprocessors therefore cannot reach matchers.  Binding the
+    scope around the parent handler also gives the fallback native handler the
+    same behavior.
+    """
+
+    @wraps(function)
+    async def wrapped(*args, **kwargs):
+        event = kwargs.get("event")
+        if event is None and len(args) > 1:
+            event = args[1]
+        context = event_official_context(event) if event is not None else None
+        if context is None:
+            return await function(*args, **kwargs)
+        context_token = CURRENT_OFFICIAL_CONTEXT.set(context)
+        scope_token = CURRENT_PLATFORM_SCOPE.set("qq_api")
+        try:
+            return await function(*args, **kwargs)
+        finally:
+            CURRENT_OFFICIAL_CONTEXT.reset(context_token)
+            CURRENT_PLATFORM_SCOPE.reset(scope_token)
+
+    return wrapped
 
 
 def _event_address(event: Event) -> tuple[OfficialScene, str, str] | None:
@@ -306,6 +357,7 @@ __all__ = [
     "activate_event_official_context",
     "allocate_reply_sequence",
     "bind_event_official_context",
+    "deactivate_event_official_context",
     "digest_identifier",
     "event_official_context",
     "finish_reply",
@@ -315,4 +367,5 @@ __all__ = [
     "receipt_seen",
     "release_webhook_receipt",
     "reserve_webhook_receipt",
+    "with_official_event_context",
 ]

@@ -293,43 +293,46 @@ class LoggingMiddleware:
         )
         context.runtime_state["request_data"] = request_data
 
-        logger.debug(f"📡 请求URL: {request_data.url}")
-        logger.debug(f"📋 请求头: {dict(request_data.headers)}")
+        if logger.is_enabled("debug"):
+            logger.debug(f"📡 请求URL: {request_data.url}")
+            logger.debug(f"📋 请求头: {dict(request_data.headers)}")
 
-        if self.identity.api_type == "smart":
-            from zhenxun.services.ai.llm.adapters.factory import SmartAdapter
+            if self.identity.api_type == "smart":
+                from zhenxun.services.ai.llm.adapters.factory import SmartAdapter
 
-            smart_adapter = cast(SmartAdapter, self.adapter)
-            delegate_adapter = smart_adapter._get_delegate_adapter(self.identity)
-            sanitizer_req_context = f"{delegate_adapter.api_type}_request"
-        else:
-            sanitizer_req_context = self.adapter.log_sanitization_context
+                smart_adapter = cast(SmartAdapter, self.adapter)
+                delegate_adapter = smart_adapter._get_delegate_adapter(self.identity)
+                sanitizer_req_context = f"{delegate_adapter.api_type}_request"
+            else:
+                sanitizer_req_context = self.adapter.log_sanitization_context
 
-        sanitized_body = sanitize_for_logging(
-            request_data.body, context=sanitizer_req_context
-        )
+            sanitized_body = sanitize_for_logging(
+                request_data.body, context=sanitizer_req_context
+            )
 
-        if request_data.files and isinstance(sanitized_body, dict):
-            file_info: list[str] = []
-            file_count = 0
-            if isinstance(request_data.files, list):
-                file_count = len(request_data.files)
-                for key, value in request_data.files:
-                    filename = (
-                        value[0]
-                        if isinstance(value, tuple) and len(value) > 0
-                        else "..."
-                    )
-                    file_info.append(f"{key}='{filename}'")
-            elif isinstance(request_data.files, dict):
-                file_count = len(request_data.files)
-                file_info = list(request_data.files.keys())
-            sanitized_body["[MULTIPART_FILES]"] = f"Count: {file_count} | {file_info}"
+            if request_data.files and isinstance(sanitized_body, dict):
+                file_info: list[str] = []
+                file_count = 0
+                if isinstance(request_data.files, list):
+                    file_count = len(request_data.files)
+                    for key, value in request_data.files:
+                        filename = (
+                            value[0]
+                            if isinstance(value, tuple) and len(value) > 0
+                            else "..."
+                        )
+                        file_info.append(f"{key}='{filename}'")
+                elif isinstance(request_data.files, dict):
+                    file_count = len(request_data.files)
+                    file_info = list(request_data.files.keys())
+                sanitized_body["[MULTIPART_FILES]"] = (
+                    f"Count: {file_count} | {file_info}"
+                )
 
-        request_body_str = dump_json_safely(
-            sanitized_body, ensure_ascii=False, indent=2
-        )
-        logger.debug(f"📦 请求体: {request_body_str}")
+            request_body_str = dump_json_safely(
+                sanitized_body, ensure_ascii=False, indent=2
+            )
+            logger.debug(f"📦 请求体: {request_body_str}")
 
         try:
             start_time = time.monotonic()

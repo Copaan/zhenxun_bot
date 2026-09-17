@@ -194,8 +194,14 @@ async def with_db_timeout(
                 raise
             raise asyncio.TimeoutError from None
         elapsed = loop.time() - start_time
+        execution_elapsed = loop.time() - queued if entered else 0.0
         if elapsed > SLOW_QUERY_THRESHOLD and operation:
-            logger.warning(f"慢查询: {operation} 耗时 {elapsed:.3f}s", LOG_COMMAND)
+            logger.warning(
+                f"数据库操作耗时过高: {operation} 总耗时 {elapsed:.3f}s "
+                f"(排队 {max(0.0, queued - start_time):.3f}s, "
+                f"执行 {execution_elapsed:.3f}s)",
+                LOG_COMMAND,
+            )
         return result
     except asyncio.TimeoutError:
         if not entered:

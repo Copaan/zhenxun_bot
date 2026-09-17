@@ -76,6 +76,17 @@ class BotGroupPolicyService:
         state = self._policies.get(group_key(bot_id, scope, group_id, channel_id))
         return bool(state and module in state[int(task)])
 
+    async def refresh_policy(self, key) -> None:
+        """Refresh one policy after a change made by another worker."""
+        row = await BotGroupPluginPolicy.get_or_none(**key_fields(key))
+        if row is None:
+            self._policies.pop(key, None)
+            return
+        self._policies[key] = (
+            frozenset(row.block_plugins),
+            frozenset(row.block_tasks),
+        )
+
     def observe(self, bot_id, scope, group_id, channel_id=None):
         if not group_id or not self.context or not self.context.accepting:
             return
@@ -176,6 +187,8 @@ class BotGroupPolicyService:
         catalog_plugins, catalog_tasks = await plugin_policy_service._catalog_modules()
         return {
             **state,
+            "scope": scope,
+            "scope_label": "群聊设置",
             "revision": _revision(state),
             "group_name": membership.group_name or group_id,
             "account_block_plugins": account["block_plugins"],
@@ -203,10 +216,13 @@ class BotGroupPolicyService:
         tasks = sorted(row.block_tasks if row else [])
         return {
             **key_fields(key),
+            "scope": "private",
+            "scope_label": "所有私聊",
             "block_plugins": plugins,
             "block_tasks": tasks,
             "account_block_plugins": account["block_plugins"],
             "account_block_tasks": account["block_tasks"],
+            "private_policy_exists": row is not None,
             "revision": _revision({"block_plugins": plugins, "block_tasks": tasks}),
         }
 
@@ -229,6 +245,7 @@ class BotGroupPolicyService:
                     **key_fields(key),
                 )
             self._policies[key] = (frozenset(plugins), frozenset(tasks))
+            self._publish_policy_revision(key)
             return await self.get_private(current["bot_id"])
 
     async def update_group(
@@ -261,7 +278,24 @@ class BotGroupPolicyService:
                     **key_fields(key),
                 )
             self._policies[key] = (frozenset(plugins), frozenset(tasks))
+            self._publish_policy_revision(key)
             return await self.get_group(*key)
+
+    @staticmethod
+    def _publish_policy_revision(key) -> None:
+        """Fence event-local auth snapshots after a committed policy change."""
+        from zhenxun.services.cache.runtime_cache import RuntimeCacheMutation
+
+        RuntimeCacheMutation.publish(
+            "permission",
+            "policy_changed",
+            {
+                "bot_id": key[0],
+                "platform_scope": key[1],
+                "group_id": key[2],
+                "channel_id": key[3],
+            },
+        )
 
 
 bot_group_policy_service = BotGroupPolicyService()

@@ -4,13 +4,10 @@ import asyncio
 import contextlib
 from datetime import datetime, timezone
 
-from nonebot.message import event_preprocessor
-
 from zhenxun.services.lifecycle import ResourceReceipt, RuntimeHandle
 from zhenxun.utils.manager.priority_manager import PriorityLifecycle
 
 from .cache import clear_qq_official_caches
-from .context import activate_event_official_context
 from .models import QQWebhookReceipt
 
 RECEIPT_CLEANUP_INTERVAL = 60 * 60
@@ -123,11 +120,6 @@ async def connect_prepared_adapter(adapter: object) -> None:
         connect = getattr(adapter, "connect_prepared_bots", None)
         if callable(connect):
             await connect()
-
-
-@event_preprocessor
-async def _activate_qq_official_context(event) -> None:
-    activate_event_official_context(event)
 
 
 async def cleanup_expired_receipts() -> int:

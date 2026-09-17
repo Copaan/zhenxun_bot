@@ -12,7 +12,6 @@ from pydantic import BaseModel
 
 from zhenxun.services.ai.chat_switch import admit_ai_call
 from zhenxun.services.ai.config import ProviderConfig, get_llm_config
-from zhenxun.services.ai.core.exceptions import ConfigurationException
 from zhenxun.services.ai.core.messages import (
     AudioResponse,
     BaseRequest,
@@ -146,28 +145,6 @@ class LLMModel(
                 self.provider_name, self.model_name, adapter, self.identity
             )
         )
-
-    async def _select_api_key(self, failed_keys: set[str] | None = None) -> str:
-        """选择可用的API密钥（使用轮询策略）"""
-        if not self.api_keys:
-            raise ConfigurationException(
-                f"提供商 {self.provider_name} 没有配置API密钥",
-            )
-
-        selected_key = await self.health_manager.get_next_available_key(
-            self.provider_name, self.api_keys, failed_keys
-        )
-
-        if not selected_key:
-            raise ConfigurationException(
-                f"提供商 {self.provider_name} 的所有API密钥当前都不可用",
-                details={
-                    "total_keys": len(self.api_keys),
-                    "failed_keys": len(failed_keys or set()),
-                },
-            )
-
-        return selected_key
 
     async def close(self):
         """标记模型实例的当前使用周期结束"""

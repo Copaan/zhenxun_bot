@@ -88,12 +88,15 @@ def mutate_json_locked(
     *,
     timeout: float = 5.0,
     quarantine_corrupt: bool = False,
+    write_if: Callable[[Any], bool] | None = None,
 ) -> Any:
+    """Mutate under one lock, optionally persisting only selected results."""
     try:
         with FileLock(_lock_path(path), timeout=timeout):
             value = _read_unlocked(path, default, quarantine_corrupt=quarantine_corrupt)
             result = mutator(value)
-            _write_unlocked(path, value)
+            if write_if is None or write_if(result):
+                _write_unlocked(path, value)
             return result
     except Timeout as error:
         raise AtomicJsonLockTimeout(str(path)) from error

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 from copy import deepcopy
 from hashlib import sha256
 import importlib
@@ -85,7 +86,7 @@ def referenced_generations() -> set[int]:
         if module_path is not None:
             try:
                 candidates.extend(tuple(module_path))
-            except TypeError:
+            except (KeyError, TypeError):
                 pass
         for candidate in candidates:
             if not isinstance(candidate, str | os.PathLike):
@@ -477,10 +478,15 @@ def _load_managed_plugin(module_name: str) -> None:
 
     manager = PluginManager([module_name])
     _managers.append(manager)
-    module = importlib.import_module(module_name)
-    plugin = getattr(module, "__plugin__", None)
-    if not isinstance(plugin, Plugin):
-        raise RuntimeError("nonebot_plugin_registration_missing")
+    try:
+        module = importlib.import_module(module_name)
+        plugin = getattr(module, "__plugin__", None)
+        if not isinstance(plugin, Plugin):
+            raise RuntimeError("nonebot_plugin_registration_missing")
+    except BaseException:
+        with contextlib.suppress(ValueError):
+            _managers.remove(manager)
+        raise
 
 
 def _safe_plugin_import_failure(error: Exception) -> dict[str, Any]:

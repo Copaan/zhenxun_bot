@@ -1510,31 +1510,6 @@ class PlaywrightEngine(BaseScreenshotEngine):
             except Exception as e:
                 logger.warning("浏览器实例重建失败。", "PlaywrightEngine", e=e)
 
-    async def _prewarm_browser_and_pool(self) -> None:
-        if self._closing:
-            return
-        async with self._state_lock:
-            has_active_generation = self._active_generation is not None
-        if has_active_generation:
-            return
-
-        generation = await self._build_generation()
-        dispose_generation = False
-        async with self._state_lock:
-            if self._closing:
-                dispose_generation = True
-            elif self._active_generation is None:
-                self._active_generation = generation
-                self._preparing_generations.remove(generation)
-                return
-            else:
-                dispose_generation = True
-
-        if dispose_generation:
-            await self._dispose_generation(generation)
-            if generation in self._preparing_generations:
-                self._preparing_generations.remove(generation)
-
     async def _idle_recycle_loop(self) -> None:
         while True:
             await asyncio.sleep(self._IDLE_CHECK_INTERVAL_SECONDS)

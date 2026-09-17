@@ -24,6 +24,16 @@ class AssetScope:
 _scope: ContextVar[AssetScope | None] = ContextVar("asset_transaction", default=None)
 
 
+def current_asset_connection():
+    """Return the connection owned by the current asset transaction.
+
+    Asset model code must use this connection explicitly. Relying on the
+    ORM's default connection can escape the transaction on pooled databases.
+    """
+    scope = _scope.get()
+    return scope.connection if scope is not None else None
+
+
 @asynccontextmanager
 async def asset_transactions(user_ids, platform: str | None = None):
     from zhenxun.models.user_console import UserConsole
@@ -62,6 +72,18 @@ async def asset_transaction(user_id: str, platform: str | None = None):
         yield users[str(user_id)]
 
 
+def asset_db_kwargs() -> dict[str, object]:
+    """Build ORM kwargs that keep an operation inside the active asset tx."""
+    connection = current_asset_connection()
+    return {"using_db": connection} if connection is not None else {}
+
+
+def asset_queryset(query):
+    """Bind an ORM queryset to the active asset transaction when present."""
+    connection = current_asset_connection()
+    return query.using_db(connection) if connection is not None else query
+
+
 def account_write(function):
     parameters = signature(function)
 
@@ -90,13 +112,18 @@ def account_write(function):
             "platform"
         )
         async with asset_transaction(user_id, platform):
-            if identity and (receipt := await AssetOperation.get_or_none(id=identity)):
+            if identity and (
+                receipt := await AssetOperation.filter(id=identity)
+                .using_db(current_asset_connection())
+                .get_or_none()
+            ):
                 if receipt.payload["fingerprint"] != fingerprint:
                     raise RuntimeError("asset_operation_input_conflict")
                 return _decode_result(receipt.payload["result"])
             result = await function(cls, user_id, *args, **kwargs)
             if identity:
                 await AssetOperation.create(
+                    using_db=current_asset_connection(),
                     id=identity,
                     user_id=str(user_id),
                     event_id=current_execution.get().identity,

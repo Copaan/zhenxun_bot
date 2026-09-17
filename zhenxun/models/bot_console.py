@@ -201,45 +201,6 @@ class BotConsole(Model):
             return "".join(cls.format(item) for item in data)
 
     @classmethod
-    async def _toggle_field(
-        cls,
-        bot_id: str,
-        from_field: str,
-        to_field: str,
-        data: str,
-    ) -> None:
-        """
-        在 from_field 和 to_field 之间移动指定的 data
-
-        参数:
-            bot_id (str): 目标 bot 的 ID
-            from_field (str): 源字段名称
-            to_field (str): 目标字段名称
-            data (str): 要插入的内容
-
-        Raises:
-            ValueError: 如果 data 不在 from_field 和 to_field 中
-        """
-        bot_data, _ = await cls.get_or_create(bot_id=bot_id)
-        formatted_data = cls.format(data)
-
-        from_list: str = getattr(bot_data, from_field)
-        to_list: str = getattr(bot_data, to_field)
-
-        if formatted_data not in (from_list + to_list):
-            raise ValueError(f"{data} 不在源字段和目标字段中")
-
-        if formatted_data in from_list:
-            from_list = from_list.replace(formatted_data, "", 1)
-            if formatted_data not in to_list:
-                to_list += formatted_data
-
-        setattr(bot_data, from_field, from_list)
-        setattr(bot_data, to_field, to_list)
-
-        await bot_data.save(update_fields=[from_field, to_field])
-
-    @classmethod
     async def disable_plugin(cls, bot_id: str | None, plugin_name: str) -> None:
         """
         禁用插件

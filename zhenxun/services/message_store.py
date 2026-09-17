@@ -14,17 +14,25 @@ class InboxConflict(RuntimeError):
     pass
 
 
-def _message_summary(raw: str | None) -> tuple[str, str]:
+def _message_summary(raw: str | dict | list | None) -> tuple[str, str]:
     """Return a safe preview for the management UI without exposing raw payloads."""
     if not raw:
-        return "", "unknown"
-    try:
-        payload = json.loads(raw)
-    except (TypeError, ValueError):
-        return "消息内容解析失败", "invalid"
+        return "[历史记录无正文]", "unknown"
+    if isinstance(raw, str):
+        try:
+            payload = json.loads(raw)
+        except (TypeError, ValueError):
+            return "消息内容解析失败", "invalid"
+    else:
+        payload = raw
     if not isinstance(payload, dict):
         return "消息内容不可用", "unknown"
     message_type = str(payload.get("post_type") or payload.get("type") or "message")
+    nested = payload.get("data")
+    if isinstance(nested, dict) and not any(
+        key in payload for key in ("message", "content", "raw_message")
+    ):
+        payload = nested
     content = payload.get("message", payload.get("content", ""))
     if isinstance(content, str):
         preview = content

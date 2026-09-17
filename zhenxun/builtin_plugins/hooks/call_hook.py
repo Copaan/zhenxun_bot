@@ -55,12 +55,16 @@ async def handle_api_result(
     try:
         if user_id and message_id:
             MessageManager.add(str(user_id), str(message_id))
-            logger.debug(
-                f"收集消息id，user_id: {user_id}, msg_id: {message_id}", LOG_COMMAND
-            )
+            if logger.is_enabled("debug"):
+                sanitized_message = sanitize_for_logging(
+                    message, context="nonebot_message"
+                )
+                logger.debug(
+                    f"消息发送记录，user_id: {user_id}, msg_id: {message_id}, "
+                    f"message: {sanitized_message}",
+                    LOG_COMMAND,
+                )
     except Exception as e:
         logger.warning(
             f"收集消息id发生错误...data: {data}, result: {result}", LOG_COMMAND, e=e
         )
-    sanitized_message = sanitize_for_logging(message, context="nonebot_message")
-    logger.debug(f"消息发送记录，message: {sanitized_message}")

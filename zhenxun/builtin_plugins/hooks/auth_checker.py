@@ -142,6 +142,56 @@ CACHE_SWEEP_INTERVAL = AUTH_DISPATCH_RUNTIME_CONFIG.cache_sweep_interval
 
 # 全局信号量与计数器
 HOOKS_ACTIVE_COUNT = 0
+_BACKPRESSURE_LOG_STATE: dict[tuple[str, str, str], list[float]] = {}
+_BACKPRESSURE_LOG_LIMIT = 128
+
+
+def _backpressure_key(
+    lane_context: "AuthLaneContext", reason: str
+) -> tuple[str, str, str]:
+    return (str(lane_context.scope_key), str(lane_context.lane), reason)
+
+
+def _log_backpressure_start(lane_context: "AuthLaneContext", reason: str) -> None:
+    """Report an overload transition instead of one warning per waiter."""
+    now = time.monotonic()
+    key = _backpressure_key(lane_context, reason)
+    state = _BACKPRESSURE_LOG_STATE.get(key)
+    if state is None:
+        if len(_BACKPRESSURE_LOG_STATE) >= _BACKPRESSURE_LOG_LIMIT:
+            oldest = min(
+                _BACKPRESSURE_LOG_STATE,
+                key=lambda item: _BACKPRESSURE_LOG_STATE[item][1],
+            )
+            _BACKPRESSURE_LOG_STATE.pop(oldest, None)
+        _BACKPRESSURE_LOG_STATE[key] = [1.0, now, now]
+        logger.warning(
+            f"hooks semaphore saturated, matcher waiting | scope={key[0]} "
+            f"lane={key[1]} reason={reason}",
+            LOGGER_COMMAND,
+        )
+        return
+    state[0] += 1
+    if now - state[2] >= 30:
+        logger.warning(
+            f"hooks semaphore remains saturated | scope={key[0]} lane={key[1]} "
+            f"reason={reason} suppressed={int(state[0] - 1)}",
+            LOGGER_COMMAND,
+        )
+        state[2] = now
+
+
+def _log_backpressure_recovered(lane_context: "AuthLaneContext", reason: str) -> None:
+    key = _backpressure_key(lane_context, reason)
+    state = _BACKPRESSURE_LOG_STATE.pop(key, None)
+    if state is not None and state[0] > 1:
+        logger.info(
+            f"hooks semaphore recovered | scope={key[0]} lane={key[1]} "
+            f"reason={reason} waited={int(state[0] - 1)}",
+            LOGGER_COMMAND,
+        )
+
+
 HOOKS_SEMAPHORE = asyncio.Semaphore(HOOKS_CONCURRENCY_LIMIT)
 
 DB_SEMAPHORE = asyncio.Semaphore(DB_CONCURRENCY_LIMIT)
@@ -1206,7 +1256,7 @@ async def time_hook(coro, name, recorder: HookTraceRecorder | None = None):
     try:
         # 检查熔断状态
         if check_circuit_breaker(name):
-            logger.info(f"{name} 熔断器激活中，跳过执行", LOGGER_COMMAND)
+            logger.debug(f"{name} 熔断器激活中，跳过执行", LOGGER_COMMAND)
             if recorder is not None:
                 recorder.set(name, "熔断跳过")
             return
@@ -1247,12 +1297,10 @@ async def _enter_hooks_section(lane_context: AuthLaneContext):
             reason="hooks_semaphore_saturated",
             action="wait",
         )
-        logger.warning(
-            "hooks semaphore saturated, matcher waiting",
-            LOGGER_COMMAND,
-        )
+        _log_backpressure_start(lane_context, "hooks_semaphore_saturated")
     started = time.perf_counter()
     await HOOKS_SEMAPHORE.acquire()
+    _log_backpressure_recovered(lane_context, "hooks_semaphore_saturated")
     wait_ms = (time.perf_counter() - started) * 1000
     if wait_ms >= AUTH_OVERLOAD_LANE_WAIT_MS:
         signal_overload(2.0)

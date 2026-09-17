@@ -178,10 +178,13 @@ class PluginPolicyService:
             pass
         return accounts
 
-    async def _resolve_bot_id(self, bot_id: str) -> str:
+    async def _resolve_bot_id(
+        self, bot_id: str, *, known: dict[str, dict[str, Any]] | None = None
+    ) -> str:
         """Resolve legacy runtime IDs to the canonical persistence identity."""
         candidate = str(bot_id).strip()
-        known = await self._known_accounts()
+        if known is None:
+            known = await self._known_accounts()
         if candidate in known:
             return candidate
         matches = [
@@ -199,11 +202,13 @@ class PluginPolicyService:
         raise PluginPolicyNotFound("机器人账号不存在", details={"bot_id": candidate})
 
     async def _resolve_bot_ids(self, bot_ids: Iterable[str]) -> list[str]:
-        resolved: list[str] = []
+        known = None
+        resolved: set[str] = set()
         for bot_id in bot_ids:
-            canonical = await self._resolve_bot_id(bot_id)
-            if canonical not in resolved:
-                resolved.append(canonical)
+            if known is None:
+                known = await self._known_accounts()
+            canonical = await self._resolve_bot_id(bot_id, known=known)
+            resolved.add(canonical)
         return sorted(resolved)
 
     @staticmethod
@@ -304,8 +309,8 @@ class PluginPolicyService:
         return sorted(result, key=lambda item: (not item["connected"], item["bot_id"]))
 
     async def get_account(self, bot_id: str) -> dict[str, Any]:
-        bot_id = await self._resolve_bot_id(bot_id)
         known = await self._known_accounts()
+        bot_id = await self._resolve_bot_id(bot_id, known=known)
         bot, binding, policy = await self._state_for_bot(bot_id)
         state = self._account_payload(bot_id, bot, binding, policy)
         plugin_modules, task_modules = await self._catalog_modules()

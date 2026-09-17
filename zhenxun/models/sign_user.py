@@ -2,7 +2,11 @@ from typing_extensions import Self
 
 from tortoise import fields
 
-from zhenxun.services.asset_transaction import asset_call, asset_transaction
+from zhenxun.services.asset_transaction import (
+    asset_call,
+    asset_transaction,
+    current_asset_connection,
+)
 from zhenxun.services.db_context import Model
 
 from .sign_log import SignLog
@@ -48,11 +52,22 @@ class SignUser(Model):
         返回:
             Self: SignUser
         """
-        user_console = await UserConsole.get_user(user_id, platform)
-        user, _ = await SignUser.get_or_create(
-            user_id=user_id,
-            defaults={"user_console": user_console, "platform": platform},
-        )
+        connection = current_asset_connection()
+        if connection is None:
+            user_console = await UserConsole.get_user(user_id, platform)
+        else:
+            user_console = await UserConsole._get_user_for_write(user_id, platform)
+        if connection is not None:
+            user, _ = await SignUser.get_or_create(
+                using_db=connection,
+                user_id=user_id,
+                defaults={"user_console": user_console, "platform": platform},
+            )
+        else:
+            user, _ = await SignUser.get_or_create(
+                user_id=user_id,
+                defaults={"user_console": user_console, "platform": platform},
+            )
         return user
 
     @classmethod
@@ -85,10 +100,14 @@ class SignUser(Model):
             today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
             key = sha256(f"daily-sign:{identity}:{today}".encode()).hexdigest()
             user = await cls.get_user(identity, platform)
-            previous = (
-                await SignLog.filter(user_id=identity).order_by("-create_time").first()
-            )
-            if (await AssetOperation.filter(id=key).exists()) or (
+            connection = current_asset_connection()
+            previous_query = SignLog.filter(user_id=identity).order_by("-create_time")
+            operation_query = AssetOperation.filter(id=key)
+            if connection is not None:
+                previous_query = previous_query.using_db(connection)
+                operation_query = operation_query.using_db(connection)
+            previous = await previous_query.first()
+            if (await operation_query.exists()) or (
                 previous
                 and previous.create_time.astimezone(ZoneInfo("Asia/Shanghai")).date()
                 == today
@@ -98,14 +117,16 @@ class SignUser(Model):
             user.add_probability = 0
             user.specify_probability = 0
             user.sign_count += 1
-            await user.save()
+            await user.save(using_db=connection)
             await SignLog.create(
+                using_db=connection,
                 user_id=user.user_id,
                 impression=impression,
                 bot_id=bot_id,
                 platform=platform,
             )
             await AssetOperation.create(
+                using_db=connection,
                 id=key,
                 user_id=identity,
                 event_id=current_execution.get().identity

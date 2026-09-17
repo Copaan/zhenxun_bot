@@ -7,6 +7,7 @@ from tortoise import fields
 from zhenxun.services.asset_transaction import (
     account_write,
     asset_call,
+    current_asset_connection,
     require_positive_amount,
 )
 from zhenxun.services.db_context import Model
@@ -56,7 +57,11 @@ class MahiroBank(Model):
 
     @classmethod
     async def _get_account_locked(cls, user_id: str) -> Self:
-        rows = await cls.filter(user_id=user_id).limit(2)
+        connection = current_asset_connection()
+        query = cls.filter(user_id=user_id)
+        if connection is not None:
+            query = query.using_db(connection)
+        rows = await query.limit(2)
         if len(rows) > 1:
             from hashlib import sha256
             from pathlib import Path
@@ -79,6 +84,8 @@ class MahiroBank(Model):
             )
         if rows:
             return rows[0]
+        if connection is not None:
+            return await cls.create(using_db=connection, user_id=user_id)
         return await cls.create(user_id=user_id)
 
     @classmethod
@@ -105,6 +112,7 @@ class MahiroBank(Model):
         user.rate = rate
         await user.save(update_fields=["amount", "rate"])
         await MahiroBankLog.create(
+            using_db=current_asset_connection(),
             user_id=user_id,
             amount=amount,
             rate=rate,
@@ -134,7 +142,10 @@ class MahiroBank(Model):
         user.amount -= amount
         await user.save(update_fields=["amount"])
         await MahiroBankLog.create(
-            user_id=user_id, amount=amount, handle_type=BankHandleType.WITHDRAW
+            using_db=current_asset_connection(),
+            user_id=user_id,
+            amount=amount,
+            handle_type=BankHandleType.WITHDRAW,
         )
         return user
 
@@ -161,7 +172,11 @@ class MahiroBank(Model):
         user.loan_rate = rate
         await user.save(update_fields=["loan_amount", "loan_rate"])
         await MahiroBankLog.create(
-            user_id=user_id, amount=amount, rate=rate, handle_type=BankHandleType.LOAN
+            using_db=current_asset_connection(),
+            user_id=user_id,
+            amount=amount,
+            rate=rate,
+            handle_type=BankHandleType.LOAN,
         )
         return user
 
@@ -186,6 +201,9 @@ class MahiroBank(Model):
         user.loan_amount -= amount
         await user.save(update_fields=["loan_amount"])
         await MahiroBankLog.create(
-            user_id=user_id, amount=amount, handle_type=BankHandleType.REPAYMENT
+            using_db=current_asset_connection(),
+            user_id=user_id,
+            amount=amount,
+            handle_type=BankHandleType.REPAYMENT,
         )
         return user

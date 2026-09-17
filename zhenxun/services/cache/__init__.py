@@ -502,6 +502,12 @@ class CacheManager:
 
         if defer(("model_clear", str(cache_type)), lambda: self.clear(cache_type)):
             return True
+        # A model cache may be disabled or not registered in this process. Treat
+        # that case as an idempotent no-op; never turn it into a misleading
+        # backend deletion error.
+        if cache_type and cache_type.upper() not in self._registry:
+            logger.debug(f"缓存类型 {cache_type} 未注册，跳过清理", LOG_COMMAND)
+            return True
         self._refill_fence.epoch += 1
         try:
             if cache_type:
