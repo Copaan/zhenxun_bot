@@ -15,6 +15,43 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _boot_id() -> str:
+    """Identify this worker process for journal reconciliation.
+
+    Imported lazily so the journal stays usable in contexts that never start a
+    worker, such as the launcher applying a pending transaction.
+    """
+    try:
+        from zhenxun.services.startup import startup_coordinator
+
+        return str(startup_coordinator.boot_id or "")
+    except Exception:
+        return ""
+
+
+def _reconciled(value: dict[str, Any]) -> dict[str, Any]:
+    """Report an operation that its own process never finished as interrupted.
+
+    A store operation lives entirely inside one request in one process: it holds
+    the runtime mutation lock, which is in-memory. So a record still marked
+    ``running`` under a different boot id cannot be running -- the process that
+    owned it is gone, and nothing will ever write its terminal state. Without
+    this, one crash mid-install leaves the WebUI reporting an operation in
+    progress forever, and callers polling for completion never stop.
+    """
+    if value.get("status") != "running":
+        return value
+    boot_id = _boot_id()
+    if not boot_id or value.get("boot_id") in {None, "", boot_id}:
+        return value
+    value["status"] = "interrupted"
+    result = value.get("result")
+    if isinstance(result, dict):
+        result["status"] = "interrupted"
+        result.setdefault("reason", "plugin_operation_interrupted")
+    return value
+
+
 def begin_operation(
     store_key: str,
     action: str,
@@ -53,6 +90,9 @@ def record_operation(store_key: str, result: dict[str, Any]) -> str:
             "apply_mode": result.get("apply_mode"),
             "result": deepcopy(result),
             "updated_at": _now(),
+            # Recorded so a ``running`` entry left behind by a crash can be told
+            # apart from one that is genuinely in flight in this process.
+            "boot_id": _boot_id(),
         }
         order = [item for item in state.get("order", []) if item != operation_id]
         order.append(operation_id)
@@ -67,7 +107,7 @@ def record_operation(store_key: str, result: dict[str, Any]) -> str:
 def operation_status(operation_id: str) -> dict[str, Any] | None:
     state = read_json_locked(_JOURNAL_FILE, {})
     value = state.get("operations", {}).get(operation_id)
-    return deepcopy(value) if isinstance(value, dict) else None
+    return _reconciled(deepcopy(value)) if isinstance(value, dict) else None
 
 
 def current_operation() -> dict[str, Any] | None:
@@ -76,7 +116,7 @@ def current_operation() -> dict[str, Any] | None:
     if not isinstance(order, list) or not order:
         return None
     value = state.get("operations", {}).get(str(order[-1]))
-    return deepcopy(value) if isinstance(value, dict) else None
+    return _reconciled(deepcopy(value)) if isinstance(value, dict) else None
 
 
 __all__ = [

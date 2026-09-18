@@ -501,9 +501,15 @@ class PlatformUtils:
             for group in fresh:
                 await GroupMemoryCache.upsert_from_model(group)
         if group_list:
-            await GroupConsole.bulk_update(
-                update_list, ["group_name", "max_member_count", "member_count"], 10
-            )
+            # 使用逐条保存替代 bulk_update，避免 SQLite 兼容性问题
+            for group in update_list:
+                await group.save(
+                    update_fields=[
+                        "group_name",
+                        "max_member_count",
+                        "member_count",
+                    ]
+                )
         return len(create_list)
 
     @classmethod

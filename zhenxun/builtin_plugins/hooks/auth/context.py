@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from dataclasses import dataclass, field
+from itertools import count
 from typing import TYPE_CHECKING, Any
+from weakref import WeakKeyDictionary
 
 from nonebot.adapters import Bot, Event
 from nonebot_plugin_alconna import UniMsg
@@ -185,6 +187,35 @@ def _event_message_id(event: Event) -> str | int | None:
     return msg_id
 
 
+_FALLBACK_TOKEN_ATTR = "_zx_auth_event_token"
+_fallback_tokens: "WeakKeyDictionary[Event, str]" = WeakKeyDictionary()
+_fallback_counter = count(1)
+
+
+def _event_fallback_token(event: Event) -> str:
+    """没有 message_id 时的稳定事件标识。
+
+    不能用 id(event)：CPython 的 id 是内存地址，对象回收后会复用，配合 5 秒
+    TTL 的 EVENT_CACHE，两个不同事件可能撞进同一条权限缓存。这里发单调 token，
+    优先挂在事件对象上，其次挂弱引用表，都不行才退回 id()。
+    """
+    token = getattr(event, _FALLBACK_TOKEN_ATTR, None)
+    if isinstance(token, str):
+        return token
+    token = _fallback_tokens.get(event)
+    if token is not None:
+        return token
+    token = f"anon{next(_fallback_counter)}"
+    with contextlib.suppress(Exception):
+        object.__setattr__(event, _FALLBACK_TOKEN_ATTR, token)
+        if getattr(event, _FALLBACK_TOKEN_ATTR, None) == token:
+            return token
+    with contextlib.suppress(TypeError):
+        _fallback_tokens[event] = token
+        return token
+    return f"addr{id(event)}"
+
+
 def event_cache_key(
     event: Event,
     *,
@@ -195,7 +226,7 @@ def event_cache_key(
 ) -> str:
     msg_id = _event_message_id(event)
     if msg_id is None:
-        msg_id = id(event)
+        msg_id = _event_fallback_token(event)
     group_id = entity.group_id or ""
     channel_id = entity.channel_id or ""
     scope = platform_scope or platform

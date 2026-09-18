@@ -24,11 +24,10 @@ from zhenxun.models.user_console import UserConsole
 from zhenxun.models.user_props_log import UserPropsLog
 from zhenxun.services import avatar_service
 from zhenxun.services.asset_transaction import account_write
-from zhenxun.services.buffered_writers import append_user_gold_log
 from zhenxun.services.hot_query_cache import get_group_user_ids, get_member_names
 from zhenxun.services.log import logger
 from zhenxun.ui.models import ImageCell, TextCell
-from zhenxun.utils.enum import GoldHandle, PropHandle
+from zhenxun.utils.enum import PropHandle
 from zhenxun.utils.platform import PlatformUtils
 from zhenxun.utils.pydantic_compat import model_dump
 
@@ -489,7 +488,12 @@ class ShopManage:
             "购买道具",
             session=user_id,
         )
-        user.gold -= int(price)
+        # 使用 UserConsole.reduce_gold 代替直接操作 user.gold，避免并发竞态
+        from zhenxun.utils.enum import GoldHandle as GoldHandleEnum
+
+        await UserConsole.reduce_gold(user_id, int(price), GoldHandleEnum.BUY, "shop")
+        # 重新获取用户对象以更新道具（reduce_gold 在另一个事务中）
+        user = await UserConsole.get_user(user_id, platform)
         if goods.uuid not in user.props:
             user.props[goods.uuid] = 0
         if (
@@ -498,10 +502,7 @@ class ShopManage:
         ):
             raise ValueError("props_quantity_out_of_range")
         user.props[goods.uuid] += num
-        await user.save(update_fields=["gold", "props"])
-        await append_user_gold_log(
-            user_id=user_id, gold=int(price), handle=GoldHandle.BUY
-        )
+        await user.save(update_fields=["props"])
         await UserPropsLog.create(
             user_id=user_id, uuid=goods.uuid, gold=price, num=num, handle=PropHandle.BUY
         )

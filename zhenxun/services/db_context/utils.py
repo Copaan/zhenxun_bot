@@ -7,7 +7,11 @@ import inspect
 import time
 
 from zhenxun.services.log import logger
-from zhenxun.services.message_load import signal_db_unhealthy
+from zhenxun.services.message_load import (
+    is_db_unhealthy,
+    signal_db_recovered,
+    signal_db_unhealthy,
+)
 from zhenxun.services.pipeline_metrics import pipeline_metrics
 
 from .config import (
@@ -39,6 +43,39 @@ def db_timing_snapshot():
 
 _DB_UNHEALTHY_TIMEOUT_SECONDS = 30.0
 _SQLITE_STALL_TIMEOUT_SECONDS = 60.0
+_DB_RECOVERY_STREAK = 0
+_DB_RECOVERY_STREAK_REQUIRED = 3
+"""降级窗口内需要连续多少次快速成功才提前解除。"""
+
+
+def _note_db_success(elapsed: float, timeout: float) -> None:
+    """降级窗口内累计快速成功，够数就提前解除。
+
+    只认明显快于超时阈值的操作，避免"勉强没超时"被当成恢复；一旦再次
+    signal_db_unhealthy，streak 由 _reset_db_recovery_streak 清零。
+    """
+    global _DB_RECOVERY_STREAK
+    if not is_db_unhealthy():
+        _DB_RECOVERY_STREAK = 0
+        return
+    if timeout <= 0 or elapsed > timeout / 4:
+        return
+    if _SQLITE_STALL_UNTIL > time.monotonic():
+        # SQLite 卡死窗口另有判定，不在这里抢先解除。
+        return
+    _DB_RECOVERY_STREAK += 1
+    if _DB_RECOVERY_STREAK < _DB_RECOVERY_STREAK_REQUIRED:
+        return
+    _DB_RECOVERY_STREAK = 0
+    if signal_db_recovered("db operation streak recovered"):
+        logger.info("数据库连续操作成功，提前解除降级窗口", LOG_COMMAND)
+
+
+def _reset_db_recovery_streak() -> None:
+    global _DB_RECOVERY_STREAK
+    _DB_RECOVERY_STREAK = 0
+
+
 _SQLITE_LOCK_PATTERNS = (
     "database is locked",
     "database is busy",
@@ -89,6 +126,7 @@ def _mark_sqlite_lock_unhealthy(
     reason = f"{operation or 'database_operation'} sqlite_lock"
     _mark_sqlite_stall(reason, _SQLITE_STALL_TIMEOUT_SECONDS)
     if source != "runtime_cache":
+        _reset_db_recovery_streak()
         signal_db_unhealthy(_SQLITE_STALL_TIMEOUT_SECONDS, reason=reason)
     logger.warning(
         "SQLite 数据库锁等待失败，已暂停低优先级数据库任务",
@@ -202,6 +240,8 @@ async def with_db_timeout(
                 f"执行 {execution_elapsed:.3f}s)",
                 LOG_COMMAND,
             )
+        if entered:
+            _note_db_success(execution_elapsed, timeout)
         return result
     except asyncio.TimeoutError:
         if not entered:
@@ -227,6 +267,7 @@ async def with_db_timeout(
                     LOG_COMMAND,
                 )
         if source != "runtime_cache":
+            _reset_db_recovery_streak()
             signal_db_unhealthy(unhealthy_duration, reason=timeout_reason)
         if operation:
             logger.error(

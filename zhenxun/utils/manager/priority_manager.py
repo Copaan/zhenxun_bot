@@ -456,7 +456,7 @@ async def _run_post_management() -> None:
         raise
     except BaseException as error:
         startup_coordinator.fail_stage(
-            "runtime", f"runtime_stage_failed:{type(error).__name__}"
+            "runtime", f"runtime_stage_failed:{type(error).__name__}", error=error
         )
         return
     if startup_load_planner.prepared:
@@ -470,7 +470,10 @@ async def _run_post_management() -> None:
         raise
     except BaseException as error:
         startup_coordinator.fail_stage(
-            "warmup", f"warmup_stage_failed:{type(error).__name__}", fatal=False
+            "warmup",
+            f"warmup_stage_failed:{type(error).__name__}",
+            fatal=False,
+            error=error,
         )
         return
     startup_coordinator.finish_stage("warmup")
@@ -496,7 +499,9 @@ async def _start_application_lifecycle() -> None:
         )
     except BaseException as error:
         startup_coordinator.fail_stage(
-            "management", f"management_stage_failed:{type(error).__name__}"
+            "management",
+            f"management_stage_failed:{type(error).__name__}",
+            error=error,
         )
         raise
     startup_coordinator.finish_stage("management")

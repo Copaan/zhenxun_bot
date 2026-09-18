@@ -180,11 +180,11 @@ async def patched_handle_event(
         from zhenxun.services.message_execution import current_execution
 
         execution = current_execution.get()
-        log_msg += (
-            f"Durable message {execution.identity[:16]}"
-            if execution is not None
-            else description
-        )
+        if execution is not None:
+            # 显示消息ID和实际内容
+            log_msg += f"Durable message {execution.identity[:16]} | {description}"
+        else:
+            log_msg += description
     except no_log_exception:
         show_log = False
     if show_log:

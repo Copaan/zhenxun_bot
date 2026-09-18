@@ -68,7 +68,9 @@ async def _():
                         "检测群组发言时间失败...", "Chat检测", target=group.group_id
                     )
     if update_list:
-        await GroupConsole.bulk_update(update_list, ["block_task"], 10)
+        # 使用逐条保存替代 bulk_update，避免 SQLite 兼容性问题
+        for group in update_list:
+            await group.save(update_fields=["block_task"])
         from zhenxun.services.cache.runtime_cache import GroupMemoryCache
 
         for group in update_list:

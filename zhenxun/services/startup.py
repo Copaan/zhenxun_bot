@@ -233,9 +233,11 @@ class StartupCoordinator:
                 "error_code": error_code,
             }
             self._stage_completed_wall[stage] = time.time()
-            error = {"stage": stage, "code": error_code}
-            if error not in self._errors:
-                self._errors.append(error)
+            # 不要复用 error 变量名：诊断负载需要原始异常来给出错误类型，
+            # 被字典覆盖后只会输出无意义的 "dict"。
+            item = {"stage": stage, "code": error_code}
+            if item not in self._errors:
+                self._errors.append(item)
             added = self._append_degraded_reason_locked(
                 stage,
                 error_code,

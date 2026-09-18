@@ -413,6 +413,9 @@ class Manager:
         if create_list:
             await PluginLimit.bulk_create(create_list)
         if update_list:
+            # 使用逐条保存替代 bulk_update，避免 SQLite 兼容性问题
+            # bulk_update 在某些版本的 Tortoise ORM + SQLite 组合下
+            # 可能产生不兼容的 SQL 语法
             for limit in update_list:
                 await limit.save(
                     update_fields=[
@@ -424,11 +427,6 @@ class Manager:
                         "max_count",
                     ]
                 )
-            # TODO: tortoise.exceptions.OperationalError:syntax error at or near "GROUP"
-            # await PluginLimit.bulk_update(
-            #     update_list,
-            #     ["status", "check_type", "watch_type", "result", "cd", "max_count"],
-            # )
         if delete_list:
             await PluginLimit.filter(id__in=delete_list).delete()
         from zhenxun.services.cache.runtime_cache import PluginLimitMemoryCache

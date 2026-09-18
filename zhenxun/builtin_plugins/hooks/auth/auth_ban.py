@@ -44,7 +44,8 @@ async def calculate_ban_time(ban_record: BanConsole | None) -> int:
     _time = time.time() - (ban_record.ban_time + ban_record.duration)
     if _time < 0:
         return int(abs(_time))
-    await ban_record.delete()
+    # 过期记录的清理由 BanMemoryCache.cleanup_expired 后台任务负责，
+    # 权限读路径不落写操作。
     return 0
 
 
@@ -61,9 +62,11 @@ async def is_ban(user_id: str | None, group_id: str | None) -> int:
     if not user_id and not group_id:
         return 0
     provider = DEFAULT_PERMISSION_DATA_PROVIDER
-    if not provider.ban_cache_loaded():
-        return 0
-    return provider.get_ban_remaining_time(user_id, group_id)
+    if provider.ban_cache_loaded():
+        return provider.get_ban_remaining_time(user_id, group_id)
+    # 缓存未就绪时走模型层：它会补加载，失败则读库。这里直接返回 0 等于
+    # 把一次缓存故障变成全员解封。
+    return await BanConsole.check_ban_time(user_id, group_id)
 
 
 def check_plugin_type(matcher: Matcher) -> bool:

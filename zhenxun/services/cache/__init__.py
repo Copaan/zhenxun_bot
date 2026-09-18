@@ -549,19 +549,24 @@ class CacheManager:
             key_format: 键格式
         """
         name = name.upper()
-        if name in self._registry:
-            logger.warning(f"缓存类型 {name} 已存在，将被覆盖", LOG_COMMAND)
 
         # 检查是否有特殊键格式
         if not key_format and name in SPECIAL_KEY_FORMATS:
             key_format = SPECIAL_KEY_FORMATS[name]
 
-        self._registry[name] = CacheModel(
+        model = CacheModel(
             name=name,
             expire=expire,
             result_type=result_type,
             key_format=key_format,
         )
+        if (existing := self._registry.get(name)) is not None:
+            if existing == model:
+                # 重复注册同一份定义（如启动钩子重跑）时保持静默幂等
+                return
+            logger.warning(f"缓存类型 {name} 已存在，将被覆盖", LOG_COMMAND)
+
+        self._registry[name] = model
         logger.debug(
             f"注册缓存类型: {name}, 类型: {result_type}, 过期时间: {expire}秒",
             LOG_COMMAND,

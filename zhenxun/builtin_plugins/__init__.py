@@ -180,7 +180,9 @@ async def _migrate_legacy_data():
     if goods_list := await GoodsInfo.filter(uuid__isnull=True).all():
         for goods in goods_list:
             goods.uuid = uuid.uuid1()  # type: ignore
-        await GoodsInfo.bulk_update(goods_list, ["uuid"], 10)
+        # 使用逐条保存替代 bulk_update，避免 SQLite 兼容性问题
+        for goods in goods_list:
+            await goods.save(update_fields=["uuid"])
     await shop_register.load_register()
     if (
         not await UserConsole.annotate().count()

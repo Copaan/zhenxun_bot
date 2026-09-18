@@ -184,7 +184,14 @@ class PluginIr(BaseModel):
 
 
 class PluginReloadPayload(BaseModel):
-    module: str | None = Field(default=None, min_length=1, max_length=200)
+    module: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=200,
+        # Dotted Python module path. Constrained so a reference cannot carry
+        # path separators or other non-identifier text into unit resolution.
+        pattern=r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$",
+    )
     store_key: str | None = Field(default=None, min_length=3, max_length=300)
     operation_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
 

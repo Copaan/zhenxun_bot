@@ -518,6 +518,20 @@ class LifecycleKernel:
         self._recovery_required.add(owner)
         self._persist()
 
+    def clear_recovery(self, owner: str) -> bool:
+        """Drop a recovery marker whose cause has been re-verified as resolved.
+
+        Only for markers a caller owns and has just re-checked, such as the
+        ``plugin:<id>`` entries the reload manager adds when a rollback cannot
+        prove a plugin idle. Component markers clear through their own
+        registration lifecycle instead.
+        """
+        if owner not in self._recovery_required:
+            return False
+        self._recovery_required.discard(owner)
+        self._persist()
+        return True
+
     def _create_scope_context(
         self,
         parent: LifecycleContext,
@@ -1208,14 +1222,14 @@ class LifecycleKernel:
                 result = await context.enter_async_context(result)
             if isinstance(result, RuntimeHandle):
                 if result.health != "healthy":
-                    raise LifecycleError("component_health_failed")
+                    raise LifecycleError("component_health_failed:handle")
                 runtime.metadata.update(result.metadata)
                 registration.controller = result.controller
                 result = result.value
             registration.value = context.value = result
             if registration.controller is not None:
                 if not await self._refresh_controller(component_id, check_health=True):
-                    raise LifecycleError("component_health_failed")
+                    raise LifecycleError("component_health_failed:controller")
             if registration.health is not None:
                 health = registration.health(result)
                 if inspect.isawaitable(health):
@@ -1246,7 +1260,7 @@ class LifecycleKernel:
                             "captured_resource_count": len(context.resources),
                         }
                     )
-                    raise LifecycleError("component_health_failed")
+                    raise LifecycleError("component_health_failed:initial_health")
             if self._shutdown_requested:
                 raise asyncio.CancelledError
             self._generation += 1
@@ -1272,7 +1286,7 @@ class LifecycleKernel:
             runtime.health = (
                 "degraded" if runtime.state is ComponentState.DEGRADED else "failed"
             )
-            runtime.error_code = f"component_start_failed:{type(error).__name__}"
+            runtime.error_code = f"component_start_failed:{_error_code(error)}"
             if cancelled:
                 runtime.state = ComponentState.STOPPED
                 runtime.health = "cancelled"

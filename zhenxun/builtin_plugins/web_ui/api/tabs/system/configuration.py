@@ -353,7 +353,47 @@ async def configuration_summary() -> Result:
 
     env_path = _path("env")
     env_content = _read(env_path)
-    values = dotenv_values(stream=StringIO(env_content))
+
+    # 预处理多行值：将 key = 'value' 格式的多行值转为单行
+    lines = []
+    i = 0
+    content_lines = env_content.splitlines()
+    while i < len(content_lines):
+        line = content_lines[i]
+        stripped = line.strip()
+
+        # 检测多行值开始：key = '
+        if "=" in stripped and stripped.endswith("'"):
+            key_part = stripped.split("=", 1)[0].strip()
+            if stripped.count("'") == 1:  # 只有开始引号
+                # 收集多行内容
+                value_lines = [stripped.split("=", 1)[1].strip()[1:]]  # 移除开始的 '
+                i += 1
+                while i < len(content_lines):
+                    inner = content_lines[i].rstrip()
+                    if inner.endswith("'"):
+                        value_lines.append(inner[:-1])  # 移除结束的 '
+                        i += 1
+                        break
+                    value_lines.append(inner)
+                    i += 1
+                # 合并为单行JSON
+                import json
+
+                try:
+                    merged = "".join(value_lines)
+                    parsed = json.loads(merged)
+                    serialized = json.dumps(parsed, ensure_ascii=False)
+                    lines.append(f"{key_part} = {serialized}")
+                except Exception:
+                    lines.append(line)
+                continue
+
+        lines.append(line)
+        i += 1
+
+    preprocessed_content = "\n".join(lines)
+    values = dotenv_values(stream=StringIO(preprocessed_content))
     env_fields = {
         key: None if is_sensitive_env_key(key) else values.get(key)
         for key in _ENV_FORM_KEYS

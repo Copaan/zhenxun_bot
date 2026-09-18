@@ -34,9 +34,14 @@ class QQOfficialRuntimeHandle:
         return None
 
     async def health(self) -> dict[str, object]:
+        # 用 runtime_healthy 而不是 runtime_ready：WebSocket bot 在后台任务里握手，
+        # 组件启动返回时必然还没连上，用严格就绪判定会把正常启动判成健康失败。
         return {
-            "healthy": runtime_ready() or not self._adapters,
+            "healthy": runtime_healthy() or not self._adapters,
+            "ready": runtime_ready(),
             "adapter_count": len(self._adapters),
+            "pending_bots": sorted(_collect_bot_ids("pending_bot_ids")),
+            "failed_bots": sorted(_collect_bot_ids("failed_bot_ids")),
         }
 
     async def snapshot(self) -> dict[str, object]:
@@ -80,11 +85,37 @@ def database_ready() -> bool:
 
 
 def runtime_ready() -> bool:
+    """所有已配置 bot 都已连接。用于对外展示的严格就绪。"""
     if not _database_ready or not _adapters:
         return False
     return all(
         bool(getattr(adapter, "is_ready", lambda: False)()) for adapter in _adapters
     )
+
+
+def runtime_healthy() -> bool:
+    """没有确定性故障即视为健康，正在握手的 bot 不算故障。"""
+    if not _database_ready or not _adapters:
+        return False
+    return all(
+        bool(
+            getattr(
+                adapter,
+                "is_healthy",
+                getattr(adapter, "is_ready", lambda: False),
+            )()
+        )
+        for adapter in _adapters
+    )
+
+
+def _collect_bot_ids(method_name: str) -> set[str]:
+    collected: set[str] = set()
+    for adapter in tuple(_adapters):
+        collector = getattr(adapter, method_name, None)
+        if callable(collector):
+            collected |= set(collector())
+    return collected
 
 
 async def runtime_diagnostics() -> dict[str, object]:
@@ -96,6 +127,7 @@ async def runtime_diagnostics() -> dict[str, object]:
     return {
         "database_ready": _database_ready,
         "ready": runtime_ready(),
+        "healthy": runtime_healthy(),
         "adapters": adapters,
     }
 
@@ -153,6 +185,10 @@ async def _cleanup_loop() -> None:
     restart_policy="worker",
     config_keys=("QQ_ADAPTER_LOAD", "QQ_BOTS", "QQ_WEBHOOK"),
     pass_context=True,
+    # 单个平台适配器出问题不应让整个 runtime 阶段失败、把 worker 打回
+    # management/setup_only（那会连带关掉其它平台的入口）。降级即可，
+    # 原因会记进 degraded_reasons 供 WebUI 展示。
+    failure_policy="degrade",
 )
 async def start_qq_official_runtime(context=None) -> RuntimeHandle:
     global _cleanup_task, _database_ready
@@ -194,6 +230,7 @@ __all__ = [
     "database_ready",
     "register_adapter_runtime",
     "runtime_diagnostics",
+    "runtime_healthy",
     "runtime_ready",
     "start_qq_official_runtime",
     "stop_qq_official_runtime",

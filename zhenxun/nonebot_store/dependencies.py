@@ -24,8 +24,6 @@ from packaging.specifiers import SpecifierSet
 from packaging.utils import canonicalize_name
 from packaging.version import InvalidVersion, Version
 
-from zhenxun.services.network_proxy import ManagedAsyncClient
-
 try:
     import tomllib
 except ModuleNotFoundError:  # pragma: no cover - Python 3.10
@@ -474,6 +472,11 @@ def environment_fingerprint(
 
 
 async def fetch_pypi_metadata(project: str, version: str) -> dict[str, Any]:
+    # 延迟导入：nonebot_store 要保证"被 import 时不拉起服务层"。
+    # 模块级 import 会经 runtime.py 把 zhenxun.services 带进 sys.modules，
+    # 破坏 launcher 的导入隔离（见 tests/test_launcher_import_safety.py）。
+    from zhenxun.services.network_proxy import ManagedAsyncClient
+
     safe_project = quote(project, safe="-._")
     safe_version = quote(version, safe="-._+")
     url = f"https://pypi.org/pypi/{safe_project}/{safe_version}/json"

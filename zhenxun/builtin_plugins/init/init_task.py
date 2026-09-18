@@ -71,7 +71,9 @@ async def update_to_group(create_list: list[tuple[bool, TaskInfo]]):
                     set(CommonUtils.convert_module_format(group.block_task) + blocks)
                 )
                 group.block_task = CommonUtils.convert_module_format(block_tasks)
-            await GroupConsole.bulk_update(group_list, ["block_task"], 10)
+            # 使用逐条保存替代 bulk_update，避免 SQLite 兼容性问题
+            for group in group_list:
+                await group.save(update_fields=["block_task"])
             for group in group_list:
                 await GroupMemoryCache.upsert_from_model(group)
 
@@ -93,11 +95,9 @@ async def to_db(
         await TaskInfo.bulk_create(_create_list, 10)
         await update_to_group(create_list)
     if update_list:
-        await TaskInfo.bulk_update(
-            update_list,
-            ["run_time", "name"],
-            10,
-        )
+        # 使用逐条保存替代 bulk_update，避免 SQLite 兼容性问题
+        for task in update_list:
+            await task.save(update_fields=["run_time", "name"])
     if load_task:
         await TaskInfo.filter(module__in=load_task).update(load_status=True)
         await TaskInfo.filter(module__not_in=load_task).update(load_status=False)

@@ -458,6 +458,7 @@ async def _apply_store_change(
     after: dict[Path, str] | None = None,
     include_requirements: bool = True,
     newly_installed: bool = False,
+    dependencies_verified: bool = False,
 ) -> dict:
     path = store_manager._resolve_local_plugin_path(
         plugin_info, is_external=is_external
@@ -477,9 +478,12 @@ async def _apply_store_change(
                     path,
                     changed,
                     submit_restart=False,
+                    dependencies_verified=dependencies_verified,
                 )
             except TypeError as error:
-                if "submit_restart" not in str(error):
+                if "submit_restart" not in str(
+                    error
+                ) and "dependencies_verified" not in str(error):
                     raise
                 operation = await plugin_runtime_manager.load_new_plugin(
                     module_name, path, changed
@@ -575,6 +579,13 @@ def _replayed_operation(
         raise HTTPException(409, detail="plugin_download_source_conflict")
     if entry.get("status") == "running":
         raise StoreOperationBusyError("plugin_operation_in_progress")
+    if entry.get("status") == "interrupted":
+        # The process that owned this operation died before it reached a terminal
+        # state, so there is no outcome to replay -- returning the partial record
+        # would report a half-finished install as a completed one. Retrying under
+        # the same operation id is safe: ``begin_operation`` overwrites the entry,
+        # and on-disk state is reconciled by the pending transaction and receipts.
+        return None
     result = entry.get("result")
     return result if isinstance(result, dict) else None
 
@@ -811,6 +822,10 @@ async def _(param: PluginIr) -> Result:
                     after=after,
                     include_requirements=False,
                     newly_installed=True,
+                    # add_plugin resolved the plugin's requirements against the
+                    # live environment above and reported no additions or
+                    # changes, so a shipped requirements.txt is satisfied.
+                    dependencies_verified=True,
                 )
             if operation.get("apply_mode") == "failed":
                 if not path_existed:
@@ -1283,6 +1298,44 @@ async def _(param: PluginReloadPayload) -> Result:
             "plugin_reload_failed",
         )
         return Result.fail("plugin_reload_failed")
+
+
+@router.post(
+    "/clear_integrity_freeze",
+    dependencies=[authentication()],
+    response_model=Result,
+    response_class=JSONResponse,
+    description="解除插件完整性冻结",  # type: ignore
+)
+async def _(param: PluginReloadPayload) -> Result:
+    """Re-check a frozen plugin's residual resources and lift the freeze if idle.
+
+    A freeze is evidence-based, so clearing it is too: the manager refuses while
+    anything is still attributed to the old incarnation. Without this the only
+    exit from a failed rollback is a full restart, even after the work it was
+    waiting on has finished.
+    """
+    if not param.module:
+        return Result.fail("plugin_runtime_module_required")
+    try:
+        async with _store_operation(
+            operation_id=param.operation_id, owner="webui.plugin_store"
+        ):
+            outcome = plugin_runtime_manager.clear_integrity_freeze(param.module)
+    except HTTPException:
+        raise
+    except StoreOperationBusyError:
+        return Result.fail("plugin_operation_in_progress", code=409)
+    except Exception as e:
+        logger.error(f"解除插件完整性冻结失败: {_safe_store_error(e)}", "WebUi")
+        return Result.fail("plugin_integrity_clear_failed")
+    if not outcome["cleared"]:
+        # The request itself succeeded; the refusal and its evidence are the answer.
+        return Result.ok(
+            outcome,
+            info=f"未解除完整性冻结: {outcome['reason']}",
+        )
+    return Result.ok(outcome, info=f"插件 {outcome['plugin_id']} 已解除完整性冻结")
 
 
 @router.get(

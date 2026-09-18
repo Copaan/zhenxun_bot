@@ -212,13 +212,54 @@ class ZhenxunQQAdapter(QQAdapter):
         self._health_route_registered = False
         clear_connection_diagnostics()
 
+    def configured_bot_ids(self) -> set[str]:
+        return set(self._webhook_bots) | set(self._websocket_bot_infos)
+
+    def failed_bot_ids(self) -> set[str]:
+        """连接诊断已判定失败（凭据/网关/鉴权）的 bot。"""
+        failed: set[str] = set()
+        for bot_id in self.configured_bot_ids():
+            if bot_id in self.bots:
+                continue
+            diagnostic = connection_diagnostic(bot_id)
+            if diagnostic is not None and diagnostic.state == "failed":
+                failed.add(bot_id)
+        return failed
+
+    def pending_bot_ids(self) -> set[str]:
+        """已配置但仍在连接过程中的 bot（WebSocket 在后台任务里握手）。"""
+        return self.configured_bot_ids() - set(self.bots) - self.failed_bot_ids()
+
     def is_ready(self) -> bool:
+        """严格就绪：所有已配置 bot 均已连接。仅用于诊断展示。"""
         if not _runtime.database_ready() or not self._startup_prepared:
             return False
-        configured_ids = set(self._webhook_bots) | set(self._websocket_bot_infos)
+        configured_ids = self.configured_bot_ids()
         if not configured_ids or not configured_ids.issubset(self.bots):
             return False
         return not self._webhook_bots or self._dispatcher.accepting
+
+    def is_healthy(self) -> bool:
+        """生命周期健康判定，语义与 is_ready 不同。
+
+        WebSocket bot 由 connect_prepared_bots 派生的后台任务握手，
+        start_qq_official_runtime 返回时它必然还没连上。若把「正在连接」
+        当作不健康，内核会抛 component_health_failed，runtime 阶段整体失败，
+        worker 退回 management/setup_only，连已经连上的 webhook bot 也一起断供。
+        因此这里只判定「是否确实坏了」：正在握手视为健康。
+        """
+        if not _runtime.database_ready():
+            return False
+        if not self._startup_prepared:
+            # startup() 是 driver 钩子，可能还没跑到，这不是故障。
+            return True
+        configured_ids = self.configured_bot_ids()
+        if not configured_ids:
+            # 没有配置任何 bot 的适配器是空载，不是故障。
+            return True
+        if self._webhook_bots and not self.webhook_ready():
+            return False
+        return bool(configured_ids - self.failed_bot_ids())
 
     def webhook_ready(self) -> bool:
         return bool(
@@ -248,10 +289,15 @@ class ZhenxunQQAdapter(QQAdapter):
     async def diagnostics(self) -> dict[str, object]:
         return {
             "ready": self.is_ready(),
+            "healthy": self.is_healthy(),
+            "startup_prepared": self._startup_prepared,
+            "webhook_ready": self.webhook_ready(),
             "configured_bots": len(self._webhook_bots),
             "configured_webhook_bots": len(self._webhook_bots),
             "configured_websocket_bots": len(self._websocket_bot_infos),
             "connected_bots": len(self.bots),
+            "pending_bots": sorted(self.pending_bot_ids()),
+            "failed_bots": sorted(self.failed_bot_ids()),
             "metrics": dict(getattr(self, "_metrics", {})),
             "dispatcher": await self._dispatcher.snapshot(),
         }
@@ -586,7 +632,8 @@ class ZhenxunQQAdapter(QQAdapter):
         if not isinstance(payload, Dispatch):
             return self._ack()
 
-        if not self.is_ready():
+        # 只看 webhook 侧：未连上的 WebSocket bot 不应把 webhook 入口堵成 503。
+        if not self.webhook_ready():
             return Response(503, content="Webhook worker not ready")
 
         try:

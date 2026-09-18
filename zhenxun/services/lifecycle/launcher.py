@@ -235,19 +235,35 @@ class ProcessHandle:
                 return
         raise RuntimeError("process_tree_recovery_required")
 
+    def _observed_running(self) -> tuple[bool, bool]:
+        """只读诊断用的存活判定，返回 (running, identity_verified)。
+
+        _live_processes() 在身份无法核实时故意抛错：停机路径上把"查不到"
+        当成"已退出"会漏杀整棵进程树。但 health()/snapshot() 是只读诊断，
+        kernel._refresh_controller 启动/健康检查也会调它们，抛错会让一次
+        psutil AccessDenied 变成组件启动失败。这里退回 Popen.poll() ——
+        对直接子进程它仍是权威结论，且"核实不了就算活着"依旧是 fail-closed。
+        """
+        try:
+            return bool(self._live_processes()), True
+        except RuntimeError:
+            return self.process.poll() is None, False
+
     def health(self) -> dict[str, object]:
-        live = bool(self._live_processes())
+        live, identity_verified = self._observed_running()
         # A finite child can exit during the process-tree scan.
         completed = self.completion_expected and self.process.poll() == 0
         return {
             "healthy": live or completed,
             "completed": completed,
+            "identity_verified": identity_verified,
             "spawn_pid": self.spawn_pid,
             "runtime_pid": self.runtime_pid,
             "return_code": self.process.poll(),
         }
 
     def snapshot(self) -> dict[str, object]:
+        running, identity_verified = self._observed_running()
         return {
             "role": self.role,
             "pid": self.runtime_pid or self.spawn_pid,
@@ -255,7 +271,8 @@ class ProcessHandle:
             "runtime_pid": self.runtime_pid,
             "worker_boot_id": self.worker_boot_id,
             "operating_mode": self.operating_mode,
-            "running": bool(self._live_processes()),
+            "running": running,
+            "identity_verified": identity_verified,
             "readiness": self.readiness,
             "return_code": self.process.poll(),
             "spawn_return_code": self.process.poll(),

@@ -18,6 +18,7 @@ from zhenxun.services.asset_transaction import (
     asset_call,
     asset_transaction,
 )
+from zhenxun.services.log import logger
 from zhenxun.utils.enum import BankHandleType, GoldHandle
 from zhenxun.utils.platform import PlatformUtils
 
@@ -68,6 +69,11 @@ class BankManager:
         return None
 
     @classmethod
+    def _today_start(cls):
+        """当日结算周期起点（本地时区 00:00）。"""
+        return localtime().replace(hour=0, minute=0, second=0, microsecond=0)
+
+    @classmethod
     async def withdraw_check(cls, user_id: str, amount: int) -> str | None:
         """检查取款是否合法
 
@@ -86,7 +92,8 @@ class BankManager:
         if user.amount - lock_amount < amount:
             return (
                 "取款金额不足，当前你的存款为："
-                f"{user.amount}（{lock_amount}已被锁定）！"
+                f"{user.amount}（{lock_amount}已被锁定）！\n"
+                "当日存款会锁定到今晚 00:00 结算发放利息后才能取出。"
             )
         return None
 
@@ -94,10 +101,14 @@ class BankManager:
     async def get_user_deposit(
         cls, user_id: str, is_completed: bool = False
     ) -> list[MahiroBankLog]:
-        """获取用户今日存款次数
+        """获取用户今日存款记录
+
+        只统计当日，避免漏结算（宕机、任务错过）留下的历史待结算记录
+        永久锁定存款、并永久占用每日存款次数。
 
         参数:
             user_id: 用户id
+            is_completed: 是否已结算
 
         返回:
             list[MahiroBankLog]: 存款列表
@@ -106,6 +117,7 @@ class BankManager:
             user_id=user_id,
             handle_type=BankHandleType.DEPOSIT,
             is_completed=is_completed,
+            create_time__gte=cls._today_start(),
         )
 
     @classmethod
@@ -387,12 +399,55 @@ class BankManager:
         pending_ids = await MahiroBankLog.filter(
             is_completed=False, handle_type=BankHandleType.DEPOSIT
         ).values_list("user_id", flat=True)
+        failed = 0
         for user_id in sorted(set(user_ids) | set(pending_ids)):
-            await cls._settle_account(user_id, period)
+            # 单个账户结算失败不能中断整批，否则后面的用户会一直漏结算。
+            try:
+                await cls._settle_account(user_id, period)
+            except Exception as error:
+                failed += 1
+                logger.error("小真寻银行结算失败", "定时任务", target=user_id, e=error)
+        if failed:
+            logger.warning(f"小真寻银行结算有 {failed} 个账户失败", "定时任务")
+
+    @classmethod
+    async def settle_missed_periods(cls) -> int:
+        """补结算错过的周期。
+
+        定时任务 misfire、进程在 00:00 前后不在线时，当日的存款记录会一直停在
+        ``is_completed=False``：既拿不到利息，也永久占用存款次数。启动时把
+        今日之前遗留的待结算记录补上。
+
+        返回:
+            int: 补结算的账户数量
+        """
+        today_start = cls._today_start()
+        stale_ids = await MahiroBankLog.filter(
+            is_completed=False,
+            handle_type=BankHandleType.DEPOSIT,
+            create_time__lt=today_start,
+        ).values_list("user_id", flat=True)
+        user_ids = sorted(set(stale_ids))
+        if not user_ids:
+            return 0
+        # 用独立的 period 前缀，避免与当日 00:00 的正常结算互相顶掉幂等键。
+        period = f"catchup:{today_start.date().isoformat()}"
+        settled = 0
+        for user_id in user_ids:
+            try:
+                await cls._settle_account(user_id, period, before=today_start)
+                settled += 1
+            except Exception as error:
+                logger.error(
+                    "小真寻银行补结算失败", "启动任务", target=user_id, e=error
+                )
+        if settled:
+            logger.info(f"小真寻银行补结算完成，共 {settled} 个账户", "启动任务")
+        return settled
 
     @classmethod
     @asset_call
-    async def _settle_account(cls, user_id, period):
+    async def _settle_account(cls, user_id, period, before=None):
         from hashlib import sha256
 
         from zhenxun.models.asset_operation import AssetOperation
@@ -402,13 +457,24 @@ class BankManager:
             if await AssetOperation.filter(id=key).exists():
                 return
             bank = await MahiroBank.get_account(user_id)
-            logs = await MahiroBankLog.filter(
-                user_id=user_id,
-                is_completed=False,
-                handle_type=BankHandleType.DEPOSIT,
-            ).all()
+            pending_filter = {
+                "user_id": user_id,
+                "is_completed": False,
+                "handle_type": BankHandleType.DEPOSIT,
+            }
+            all_pending = await MahiroBankLog.filter(**pending_filter).all()
+            # 补结算只处理 before 之前的记录，当日新存款仍留给 00:00 的正常结算。
+            logs = (
+                [log for log in all_pending if log.create_time < before]
+                if before
+                else all_pending
+            )
+            all_pending_amount = sum(log.amount for log in all_pending)
             payments = []
-            amount = bank.amount - sum(log.amount for log in logs)
+            # 基础利息只针对不属于任何待结算记录的余额。取款可能让余额小于
+            # 待结算总额（例如漏结算后存款已解锁被取出），此时基础部分按 0 计，
+            # 否则会算出负利息并触发 bank_settlement_negative_interest。
+            amount = max(0, bank.amount - all_pending_amount)
             if bank.amount > 0 and amount:
                 payments.append((int(amount * bank.rate), bank.rate))
             for log in logs:

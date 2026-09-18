@@ -207,6 +207,7 @@ class PluginRuntimeManager:
         self._original_matcher_new: Callable[..., Any] | None = None
         self._original_bot_api_hooks: dict[str, Callable[..., Any]] = {}
         self._original_asgi_methods: dict[str, Callable[..., Any]] = {}
+        self._original_asgi_mount_methods: dict[str, Callable[..., Any]] = {}
         self._original_processor_hooks: dict[str, tuple[Any, Any]] = {}
         self._original_driver_hooks: dict[str, Callable[..., Any]] = {}
         self._original_require_hooks: dict[tuple[Any, str], Callable[..., Any]] = {}
@@ -566,6 +567,7 @@ class PluginRuntimeManager:
         self._candidate_roots = {
             self._root_owner(root) or root for root in self._candidate_roots
         }
+        frozen_scope = self._frozen_scope()
         for unit in self.units.values():
             incarnation = self._incarnation_for_unit(unit)
             if incarnation is None or incarnation.lease_state in {
@@ -575,7 +577,12 @@ class PluginRuntimeManager:
                 incarnation = self._new_incarnation(unit.plugin_id)
             incarnation.plugin_id = unit.plugin_id
             incarnation.source_digest = unit.fingerprint
-            if activate:
+            # A frozen plugin must not get a lease that says it accepts work: its
+            # previous incarnation was never proven stopped. ``unit.draining``
+            # also bars its entries, but the lease should not disagree.
+            if unit.plugin_id in frozen_scope:
+                incarnation.lease_state = LeaseState.FAILED
+            elif activate:
                 incarnation.lease_state = LeaseState.ACTIVE
             self._incarnations[unit.plugin_id] = incarnation
             for module_name in unit.module_names:
@@ -1544,6 +1551,51 @@ class PluginRuntimeManager:
             tracked.__zhenxun_runtime_owner__ = self
             setattr(APIRouter, method_name, tracked)
 
+        self._install_asgi_mount_tracking()
+
+    def _install_asgi_mount_tracking(self) -> None:
+        """Record ownership of Mount/Host routes so hot unload can remove them.
+
+        ``mount()`` and ``host()`` append a Mount/Host route that carries no
+        ``endpoint``, so ``_remove_asgi_routes`` cannot attribute it by module.
+        The static classifier treats a module-level ``mount`` as a hard boundary,
+        but a call made from a function body (a startup hook, for instance) is
+        invisible to it and only reachable here. Without this the sub-application
+        stays mounted after its plugin is gone, and a reload stacks another copy.
+        """
+        try:
+            from starlette.routing import Router
+        except ImportError:
+            return
+        manager = self
+        for method_name in ("mount", "host"):
+            original = getattr(Router, method_name, None)
+            if not original or getattr(original, "__zhenxun_runtime_wrapped__", False):
+                continue
+            self._original_asgi_mount_methods[method_name] = original
+
+            @wraps(original)
+            def tracked_mount(router, *args, _original=original, **kwargs):
+                owner = current_owner()
+                before = len(router.routes)
+                if owner:
+                    incarnation = manager._ensure_incarnation(owner)
+                    with provider_capture(
+                        manager._root_owner(owner) or owner,
+                        incarnation.incarnation_id,
+                    ):
+                        result = _original(router, *args, **kwargs)
+                else:
+                    result = _original(router, *args, **kwargs)
+                if owner:
+                    for route in router.routes[before:]:
+                        manager._asgi_route_owners[id(route)] = owner
+                return result
+
+            tracked_mount.__zhenxun_runtime_wrapped__ = True
+            tracked_mount.__zhenxun_runtime_owner__ = self
+            setattr(Router, method_name, tracked_mount)
+
     def _install_require_tracking(self) -> None:
         import nonebot
         import nonebot.plugin as plugin_module
@@ -1837,6 +1889,15 @@ class PluginRuntimeManager:
         for name, original in self._original_asgi_methods.items():
             if owned(getattr(APIRouter, name, None)):
                 setattr(APIRouter, name, original)
+        if self._original_asgi_mount_methods:
+            try:
+                from starlette.routing import Router as _StarletteRouter
+            except ImportError:
+                _StarletteRouter = None
+            if _StarletteRouter is not None:
+                for name, original in self._original_asgi_mount_methods.items():
+                    if owned(getattr(_StarletteRouter, name, None)):
+                        setattr(_StarletteRouter, name, original)
         for (target, name), original in self._original_require_hooks.items():
             if owned(getattr(target, name, None)):
                 setattr(target, name, original)
@@ -1858,6 +1919,7 @@ class PluginRuntimeManager:
         self._original_driver_hooks.clear()
         self._original_bot_api_hooks.clear()
         self._original_asgi_methods.clear()
+        self._original_asgi_mount_methods.clear()
         self._original_require_hooks.clear()
 
     def _collect_runtime_boundaries(self) -> None:
@@ -2652,17 +2714,45 @@ class PluginRuntimeManager:
             if len(affected) == before:
                 return affected
 
+    def _match_units(self, module: str) -> tuple[list[PluginUnit], list[PluginUnit]]:
+        """Split candidates for ``module`` into exact and suffix matches.
+
+        Suffix matching is a convenience for callers that only know a plugin's
+        last module segment. It is inherently ambiguous once two plugins share
+        that segment, so the two tiers are kept apart and never merged.
+        """
+        exact: dict[str, PluginUnit] = {}
+        suffix: dict[str, PluginUnit] = {}
+        for candidate in self.units.values():
+            if candidate.plugin_id == module or candidate.module_name == module:
+                exact[candidate.plugin_id] = candidate
+            elif candidate.module_name.endswith(f".{module}"):
+                suffix[candidate.plugin_id] = candidate
+        return list(exact.values()), list(suffix.values())
+
+    def _resolve_unit(self, module: str) -> tuple[PluginUnit | None, str | None]:
+        """Resolve one module reference to a single unit.
+
+        Returns ``(unit, None)`` on success, or ``(None, reason)`` where reason
+        is ``plugin_not_loaded`` when nothing matches and
+        ``plugin_reference_ambiguous`` when a bare segment matches several
+        plugins. Never silently picks a winner by dict order: ``self.units`` is
+        rebuilt every generation, so that choice is not reproducible.
+        """
+        exact, suffix = self._match_units(module)
+        if len(exact) == 1:
+            return exact[0], None
+        if exact:
+            return None, "plugin_reference_ambiguous"
+        if not suffix:
+            return None, "plugin_not_loaded"
+        if len(suffix) > 1:
+            return None, "plugin_reference_ambiguous"
+        return suffix[0], None
+
     def _find_unit(self, module: str) -> PluginUnit | None:
-        return next(
-            (
-                candidate
-                for candidate in self.units.values()
-                if candidate.plugin_id == module
-                or candidate.module_name == module
-                or candidate.module_name.endswith(f".{module}")
-            ),
-            None,
-        )
+        unit, _ = self._resolve_unit(module)
+        return unit
 
     def _dependent_closure(self, direct: set[str]) -> set[str]:
         affected = set(direct)
@@ -2710,9 +2800,47 @@ class PluginRuntimeManager:
         self._persist_index()
         return operation
 
-    def _indexing_operation(self, module: str) -> RuntimeOperation | None:
-        if self._integrity_failures:
-            return self._failed_operation(module, "worker_recovery_required")
+    def _frozen_scope(self) -> set[str]:
+        """Frozen plugins plus everything whose reload would run through them.
+
+        A freeze means one plugin's old resources could not be proven stopped.
+        That is a statement about that plugin's own receipts, so it does not have
+        to bar every other plugin from hot work — only the frozen plugins and the
+        dependents that would import or reload through them.
+        """
+        if not self._integrity_failures:
+            return set()
+        return self._integrity_failures | self._dependent_closure(
+            {
+                plugin_id
+                for plugin_id in self._integrity_failures
+                if plugin_id in self.units
+            }
+        )
+
+    def _integrity_block(self, affected: set[str]) -> str | None:
+        """Return the blocking reason when ``affected`` touches a frozen plugin.
+
+        References may be plugin ids or module names, so each one is resolved
+        through ``_root_owner`` before it is compared with the frozen scope. An
+        unresolvable reference is a plugin that is not loaded here; it is checked
+        as given so a frozen-but-unindexed id still matches.
+        """
+        if not self._integrity_failures:
+            return None
+        frozen = self._frozen_scope()
+        for reference in affected:
+            root = self._root_owner(reference) or reference
+            if root in frozen or reference in frozen:
+                return "worker_recovery_required"
+        return None
+
+    def _indexing_operation(
+        self, module: str, *, affected: set[str] | None = None
+    ) -> RuntimeOperation | None:
+        scope = affected if affected is not None else {module}
+        if reason := self._integrity_block(scope):
+            return self._failed_operation(module, reason)
         if not self._installed or self._index_ready.is_set():
             return None
         return self._failed_operation(module, "runtime_indexing")
@@ -2721,9 +2849,9 @@ class PluginRuntimeManager:
         """Reload one loaded plugin and all of its runtime dependents."""
         if operation := self._indexing_operation(module):
             return operation
-        unit = self._find_unit(module)
+        unit, resolve_error = self._resolve_unit(module)
         if unit is None:
-            return self._failed_operation(module, "plugin_not_loaded")
+            return self._failed_operation(module, resolve_error or "plugin_not_loaded")
         if not self.enabled:
             return self._failed_operation(module, "nonebot_compatibility")
 
@@ -2742,9 +2870,9 @@ class PluginRuntimeManager:
         """Unload one managed plugin without requiring its files to disappear first."""
         if operation := self._indexing_operation(module):
             return operation
-        unit = self._find_unit(module)
+        unit, resolve_error = self._resolve_unit(module)
         if unit is None:
-            return self._failed_operation(module, "plugin_not_loaded")
+            return self._failed_operation(module, resolve_error or "plugin_not_loaded")
         if not self.enabled:
             return self._failed_operation(module, "nonebot_compatibility")
 
@@ -2787,7 +2915,11 @@ class PluginRuntimeManager:
         """Reload a plugin after its files were restored by a failed store update."""
         if operation := self._indexing_operation(module):
             return operation
-        unit = self._find_unit(module)
+        unit, resolve_error = self._resolve_unit(module)
+        if unit is None and resolve_error == "plugin_reference_ambiguous":
+            # Recovering the wrong plugin is worse than refusing: the caller
+            # restored files for one specific module and must name it exactly.
+            return self._failed_operation(module, resolve_error)
         if unit is None:
             root = Path.cwd() / Path(*module.split("."))
             return await self.load_new_plugin(
@@ -2824,8 +2956,16 @@ class PluginRuntimeManager:
         changed: set[Path] | None = None,
         *,
         submit_restart: bool = True,
+        dependencies_verified: bool = False,
     ) -> RuntimeOperation:
-        """Load a newly installed plugin when its source has no hard boundaries."""
+        """Load a newly installed plugin when its source has no hard boundaries.
+
+        ``dependencies_verified`` is asserted by callers that already resolved
+        the plugin's requirements against the live environment and found nothing
+        to add or change (the store does this before it ever gets here). Without
+        it the mere presence of a requirements file forces a restart, which
+        would deny hot install to every plugin that ships one.
+        """
         if operation := self._indexing_operation(module_name):
             return operation
         root = root.resolve()
@@ -2834,8 +2974,11 @@ class PluginRuntimeManager:
         if not files:
             return self._failed_operation(module_name, "plugin_source_missing")
         self.claim_content_changes(files | changed)
-        if unit := self._find_unit(module_name):
+        unit, resolve_error = self._resolve_unit(module_name)
+        if unit is not None:
             return await self.reload_plugin(unit.plugin_id)
+        if resolve_error == "plugin_reference_ambiguous":
+            return self._failed_operation(module_name, resolve_error)
         if not self.enabled:
             return await self._request_restart_compat(
                 {module_name},
@@ -2848,7 +2991,7 @@ class PluginRuntimeManager:
             for path in files | changed
             if path.name in {"requirements.txt", "requirement.txt", "pyproject.toml"}
         }
-        if dependency_files:
+        if dependency_files and not dependencies_verified:
             return await self._request_dependency_restart_compat(
                 dependency_files, submit_restart=submit_restart
             )
@@ -2871,8 +3014,8 @@ class PluginRuntimeManager:
             )
 
         async with runtime_mutation_coordinator.operation("plugin_load"):
-            if self._integrity_failures:
-                return self._failed_operation(module_name, "worker_recovery_required")
+            if reason := self._integrity_block({module_name}):
+                return self._failed_operation(module_name, reason)
             from nonebot.matcher import matchers
 
             previous_generation = self.generation
@@ -3195,7 +3338,7 @@ class PluginRuntimeManager:
         remove_processors(module_names)
         remove_bot_api_hooks(module_names)
         remove_driver_hooks(nonebot.get_driver(), module_names)
-        self._remove_asgi_routes(module_names)
+        self._remove_asgi_routes(module_names, {plugin_id})
         remove_priority_hooks(module_names)
         remove_plugin_init(module_names)
         self._remove_config_registrations(plugin_id)
@@ -3215,6 +3358,8 @@ class PluginRuntimeManager:
             or owner.startswith(f"{module_name}.")
         }
         await self._cancel_plugin_tasks(owners)
+        # A half-imported module may already have spawned an unattributed task.
+        await self._sweep_orphan_module_tasks(plugin_id, module_names)
         for owner in owners:
             for future in self._owned_executor_futures.pop(owner, set()):
                 future.cancel()
@@ -3310,11 +3455,9 @@ class PluginRuntimeManager:
     async def _unload_removed_units(
         self, affected: set[str], *, submit_restart: bool = True
     ) -> RuntimeOperation:
-        async with runtime_mutation_coordinator.operation("plugin_reload"):
-            if self._integrity_failures:
-                return self._failed_operation(
-                    "plugin_unload", "worker_recovery_required"
-                )
+        async with runtime_mutation_coordinator.operation("plugin_unload"):
+            if reason := self._integrity_block(affected):
+                return self._failed_operation("plugin_unload", reason)
             from zhenxun.utils.manager.priority_manager import lifecycle_component_ids
 
             checkpoint = self._capture_reload_checkpoint(affected)
@@ -3415,11 +3558,17 @@ class PluginRuntimeManager:
             return operation
 
     def classification_for(self, module: str) -> dict[str, Any]:
-        unit = self._find_unit(module)
+        unit, resolve_error = self._resolve_unit(module)
         if not unit:
+            # "not_loaded" is load-bearing for store callers (they read it to
+            # decide whether a runtime unload is needed), so an ambiguous
+            # reference keeps it and only adds its own reason alongside.
+            reasons = ["not_loaded"]
+            if resolve_error == "plugin_reference_ambiguous":
+                reasons.append(resolve_error)
             return {
                 "reload_support": "restart_required",
-                "reload_reasons": ["not_loaded"],
+                "reload_reasons": reasons,
             }
         owners = self._owned_keys_for_unit(unit.plugin_id)
         summary = self._resource_summary(unit, owners=owners)
@@ -3556,8 +3705,16 @@ class PluginRuntimeManager:
         }
         return {name: value for name, value in counts.items() if value}
 
-    def classification_for_source(self, module: str, root: Path) -> dict[str, Any]:
-        """Classify an unimported plugin tree without registering runtime resources."""
+    def classification_for_source(
+        self, module: str, root: Path, *, dependencies_verified: bool = False
+    ) -> dict[str, Any]:
+        """Classify an unimported plugin tree without registering runtime resources.
+
+        Mirrors every gate ``load_new_plugin`` applies, including the dependency
+        file rule. Callers use this as an admission gate before attempting a hot
+        apply, so a verdict that disagrees with the executor turns a clean
+        "needs restart" into a hard failure.
+        """
         root = root.resolve()
         files = self._source_files(root)
         if not files:
@@ -3575,6 +3732,12 @@ class PluginRuntimeManager:
         classify_unit(provisional)
         if provisional.model_files:
             provisional.reasons.add("orm_model_new_plugin")
+            provisional.classification = ReloadClassification.RESTART_REQUIRED
+        if not dependencies_verified and any(
+            path.name in {"requirements.txt", "requirement.txt", "pyproject.toml"}
+            for path in files
+        ):
+            provisional.reasons.add("dependencies_changed")
             provisional.classification = ReloadClassification.RESTART_REQUIRED
         return {
             "reload_support": provisional.classification.value,
@@ -4008,10 +4171,8 @@ class PluginRuntimeManager:
     @provider_transaction
     async def _reload_units(self, affected: set[str]) -> RuntimeOperation:
         async with runtime_mutation_coordinator.operation("plugin_reload_batch"):
-            if self._integrity_failures:
-                return self._failed_operation(
-                    "plugin_reload", "worker_recovery_required"
-                )
+            if reason := self._integrity_block(affected):
+                return self._failed_operation("plugin_reload", reason)
             order = self._reload_order(affected)
             runtime_mutation_coordinator.checkpoint()
             try:
@@ -4182,6 +4343,109 @@ class PluginRuntimeManager:
                 error,
                 generation=checkpoint.generation,
             )
+
+    def _residual_resources(self, plugin_id: str) -> dict[str, int]:
+        """Count everything still attributed to a plugin's revoked incarnations."""
+        owners = self._owned_keys_for_unit(plugin_id)
+        with self._ownership_lock:
+            threads = sum(
+                1
+                for owner in owners
+                for thread in self._owned_threads.get(owner, set())
+                if thread.is_alive()
+            )
+            processes = sum(
+                1
+                for owner in owners
+                for process in self._owned_processes.get(owner, set())
+                if process.poll() is None
+            )
+        counts = {
+            "tasks": sum(
+                1
+                for owner in owners
+                for task in self._owned_tasks.get(owner, set())
+                if not task.done()
+            )
+            + sum(
+                1
+                for owner in owners
+                for task in self._entry_tasks.get(owner, {})
+                if not task.done()
+            ),
+            "handles": sum(len(self._owned_handles.get(owner, ())) for owner in owners),
+            "io_watchers": sum(
+                len(self._owned_io_watchers.get(owner, set())) for owner in owners
+            ),
+            "executor_futures": sum(
+                1
+                for owner in owners
+                for future in self._owned_executor_futures.get(owner, set())
+                if not future.done()
+            ),
+            "threads": threads,
+            "processes": processes,
+            "in_flight": unit.in_flight if (unit := self.units.get(plugin_id)) else 0,
+        }
+        return {name: count for name, count in counts.items() if count}
+
+    def clear_integrity_freeze(self, module: str) -> dict[str, Any]:
+        """Lift one plugin's integrity freeze once its old resources are idle.
+
+        A freeze records that a rollback could not prove the previous incarnation
+        stopped. That claim can expire: the tasks it was waiting on may since have
+        finished. Rather than making a restart the only exit, this re-examines the
+        evidence and clears the freeze only when nothing is left running. It never
+        clears on request alone -- an operator cannot assert idleness the manager
+        can see is false.
+        """
+        root = self._root_owner(module) or module
+        if root not in self._integrity_failures:
+            return {
+                "cleared": False,
+                "plugin_id": root,
+                "reason": "not_frozen",
+                "residual": {},
+            }
+        residual = self._residual_resources(root)
+        if residual:
+            return {
+                "cleared": False,
+                "plugin_id": root,
+                "reason": "residual_resources_active",
+                "residual": residual,
+            }
+        # The lease state is deliberately not consulted: discover_loaded_plugins
+        # rebuilds incarnations on every operation, so a frozen plugin's lease is
+        # not durable evidence. ``_integrity_failures`` is the durable record and
+        # the residual resource count is the evidence that it can be lifted.
+        self._integrity_failures.discard(root)
+        from zhenxun.services.lifecycle import lifecycle_kernel
+
+        lifecycle_kernel.clear_recovery(f"plugin:{root}")
+        if unit := self.units.get(root):
+            unit.draining = False
+            unit.last_error = None
+        if not self._integrity_failures:
+            for reason in (
+                "plugin_rollback_recovery_required",
+                "plugin_reload_recovery_required",
+                "worker_recovery_required",
+            ):
+                self.pending_restart.discard(reason)
+        self._persist_index()
+        logger.info(f"插件 {root} 的完整性冻结已解除：残留资源已确认清空")
+        return {
+            "cleared": True,
+            "plugin_id": root,
+            "reason": None,
+            "residual": {},
+            "still_frozen": sorted(self._integrity_failures),
+            # The lease stays FAILED on purpose: what a failed rollback left in
+            # memory is not a trustworthy incarnation. Clearing only re-opens hot
+            # operations; a reload is what puts the plugin back into service.
+            "reload_required": True,
+        }
 
     def _freeze_plugins_for_recovery(
         self, affected: set[str], error: BaseException
@@ -4362,6 +4626,95 @@ class PluginRuntimeManager:
         if not task.cancelled():
             task.exception()
 
+    @staticmethod
+    def _task_frame_modules(task: asyncio.Task[Any]) -> set[str]:
+        """Return the module names appearing in a task's await chain.
+
+        A suspended task's own ``get_coro()`` only names the outermost coroutine,
+        so walking ``cr_await``/``ag_await`` is required to see the frame that is
+        actually parked inside a plugin's code.
+        """
+        modules: set[str] = set()
+        awaited: Any = task.get_coro()
+        seen: set[int] = set()
+        while awaited is not None and id(awaited) not in seen:
+            seen.add(id(awaited))
+            frame = getattr(awaited, "cr_frame", None) or getattr(
+                awaited, "ag_frame", None
+            )
+            if frame is None:
+                frame = getattr(awaited, "gi_frame", None)
+            if frame is not None:
+                name = frame.f_globals.get("__name__")
+                if isinstance(name, str):
+                    modules.add(name)
+            awaited = (
+                getattr(awaited, "cr_await", None)
+                or getattr(awaited, "ag_await", None)
+                or getattr(awaited, "gi_yieldfrom", None)
+            )
+        return modules
+
+    async def _sweep_orphan_module_tasks(
+        self, plugin_id: str, module_names: set[str]
+    ) -> None:
+        """Cancel unattributed tasks still running inside a departing module.
+
+        A task created while no owner was in the context (spawned from a plain
+        thread, from a callback captured before install, or handed an explicit
+        ``contextvars.Context``) is never recorded in ``_owned_tasks``, so
+        ``_cancel_plugin_tasks`` cannot reach it. Its module is about to leave
+        ``sys.modules``: leaving it running means a second incarnation of the
+        same worker once the plugin loads again.
+        """
+        loop = self._tracked_loop or asyncio.get_running_loop()
+        try:
+            all_tasks = asyncio.all_tasks(loop)
+        except RuntimeError:
+            return
+        from zhenxun.services.lifecycle import lifecycle_kernel
+
+        protected = lifecycle_kernel.owned_task_ids()
+        # A task owned by another plugin is that plugin's lease to end, even when
+        # its await chain happens to pass through a frame in the departing module.
+        # Tasks owned by this plugin stay in scope: _cancel_plugin_tasks has
+        # already finished them, so they fall out on the ``done()`` check, and an
+        # owner key that no longer resolves must not become a hiding place.
+        for owner, tasks in list(self._owned_tasks.items()):
+            if self._root_owner(owner) not in {None, "", plugin_id}:
+                protected.update(id(task) for task in tasks)
+        for owner, entries in list(self._entry_tasks.items()):
+            if self._root_owner(owner) not in {None, "", plugin_id}:
+                protected.update(id(task) for task in entries)
+        current = asyncio.current_task()
+        orphans = set()
+        for task in all_tasks:
+            if (
+                task.done()
+                or task is current
+                or id(task) in protected
+                or task in self._connection_tasks
+            ):
+                continue
+            if self._task_frame_modules(task) & module_names:
+                orphans.add(task)
+        if not orphans:
+            return
+        for task in orphans:
+            task.add_done_callback(self._consume_cleanup_task)
+            task.cancel()
+        _, pending = await asyncio.wait(
+            orphans, timeout=remaining_timeout(_TASK_CANCEL_TIMEOUT)
+        )
+        logger.warning(
+            f"插件 {plugin_id} 存在未归属的后台任务，已随卸载取消 "
+            f"{len(orphans) - len(pending)}/{len(orphans)} 个"
+        )
+        if pending:
+            # An orphan that survives cancellation keeps executing code whose
+            # module is about to disappear; the generation cannot be proven idle.
+            raise PluginRecoveryRequired("plugin_orphan_task_cancel_timeout")
+
     async def _request_integrity_recovery(
         self, affected: set[str], reason: str
     ) -> None:
@@ -4429,6 +4782,10 @@ class PluginRuntimeManager:
 
         await self._cancel_plugin_tasks(self._owned_keys_for_unit(unit.plugin_id))
 
+        # Owned tasks are gone; anything still parked in this module's frames was
+        # created without owner attribution and would outlive the module.
+        await self._sweep_orphan_module_tasks(unit.plugin_id, unit.module_names)
+
         self._stop_owned_callbacks(self._owned_keys_for_unit(unit.plugin_id))
 
         with provider_capture(unit.plugin_id, unit.incarnation_id):
@@ -4450,7 +4807,7 @@ class PluginRuntimeManager:
         remove_processors(unit.module_names)
         remove_bot_api_hooks(unit.module_names)
         remove_driver_hooks(nonebot.get_driver(), unit.module_names)
-        self._remove_asgi_routes(unit.module_names)
+        self._remove_asgi_routes(unit.module_names, {unit.plugin_id})
         remove_priority_hooks(unit.module_names)
         remove_plugin_init(unit.module_names)
         self._remove_config_registrations(unit.plugin_id)
@@ -4787,11 +5144,21 @@ class PluginRuntimeManager:
                     scheduler.remove_job(job.id)
                 self._job_owners.pop(job.id, None)
 
-    def _remove_asgi_routes(self, module_names: set[str]) -> None:
+    def _remove_asgi_routes(
+        self, module_names: set[str], owner_keys: set[str] | None = None
+    ) -> None:
+        """Remove routes belonging to the given modules or owner keys.
+
+        Mount/Host routes carry no ``endpoint``, so they can only be attributed
+        through ``_asgi_route_owners``. Owner keys are plugin ids, which coincide
+        with module names for a top-level plugin but not for a nested one, so the
+        caller passes them explicitly rather than letting them be inferred.
+        """
         try:
             app = nonebot.get_app()
         except (AssertionError, AttributeError, ValueError):
             return
+        match_keys = set(module_names) | set(owner_keys or set())
         retained = []
         for route in app.routes:
             endpoint = getattr(route, "endpoint", None)
@@ -4801,7 +5168,7 @@ class PluginRuntimeManager:
                 recorded_owner
                 and any(
                     recorded_owner == name or recorded_owner.startswith(f"{name}:")
-                    for name in module_names
+                    for name in match_keys
                 )
             )
             if owned:
@@ -5259,6 +5626,7 @@ class PluginRuntimeManager:
         for unit in self.units.values():
             counts[unit.classification.value] += 1
         plugins = []
+        frozen_scope = self._frozen_scope()
         for unit in sorted(self.units.values(), key=lambda item: item.plugin_id):
             owners = self._owned_keys_for_unit(unit.plugin_id)
             summary = self._resource_summary(unit, owners=owners)
@@ -5274,6 +5642,14 @@ class PluginRuntimeManager:
                     "rollback_precision": self._rollback_precision(
                         unit, summary=summary, owners=owners
                     ),
+                    "integrity_frozen": unit.plugin_id in frozen_scope,
+                    "integrity_frozen_reason": (
+                        "own_rollback_failed"
+                        if unit.plugin_id in self._integrity_failures
+                        else "depends_on_frozen_plugin"
+                        if unit.plugin_id in frozen_scope
+                        else None
+                    ),
                 }
             )
         return {
@@ -5287,8 +5663,12 @@ class PluginRuntimeManager:
                 "last_error_code": self.watcher_last_error,
                 "roots": list(self.watcher_roots),
             },
+            # Kept global for compatibility with existing readers: a freeze still
+            # means the worker is degraded. ``integrity_frozen_scope`` names what
+            # is actually barred, and per-plugin flags sit on each entry.
             "hot_reload_enabled": self.enabled and not self._integrity_failures,
             "integrity_recovery_required": sorted(self._integrity_failures),
+            "integrity_frozen_scope": sorted(frozen_scope),
             "compatibility_error": self.compatibility_error,
             "hook_failures": list(self._hook_failures),
             "entry_diagnostics": dict(self._entry_diagnostics),

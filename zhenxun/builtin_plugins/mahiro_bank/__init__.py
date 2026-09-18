@@ -10,6 +10,7 @@ from zhenxun import ui
 from zhenxun.configs.utils import PluginExtraData, RegisterConfig
 from zhenxun.services.log import logger
 from zhenxun.utils.depends import UserName
+from zhenxun.utils.manager.priority_manager import PriorityLifecycle
 from zhenxun.utils.message import MessageUtils
 from zhenxun.utils.utils import is_number
 
@@ -266,7 +267,29 @@ async def _(session: Uninfo, arparma: Arparma):
     "cron",
     hour=0,
     minute=0,
+    # apscheduler 默认 misfire_grace_time=1 秒：00:00 时事件循环稍忙就会整天跳过结算，
+    # 存款会一直停在未结算状态（锁定余额 + 占用存款次数）。给足够宽的补偿窗口。
+    misfire_grace_time=3600,
+    coalesce=True,
 )
 async def _():
     await BankManager.settlement()
     logger.info("小真寻银行结算", "定时任务")
+
+
+@PriorityLifecycle.on_startup(
+    priority=90,
+    stage="warmup",
+    timeout=120,
+    component_id="warmup:bank_settlement_catchup",
+    depends_on=("management:database",),
+    failure_policy="degrade",
+)
+async def _bank_settlement_catchup():
+    """补上进程离线期间错过的结算。
+
+    00:00 的定时结算只在进程活着时触发；宕机或错过窗口会让存款一直停在
+    未结算状态，锁定余额并占用当日存款次数。启动时补一次即可自愈。
+    """
+    if settled := await BankManager.settle_missed_periods():
+        logger.info(f"小真寻银行启动补结算 {settled} 个账户", "启动任务")

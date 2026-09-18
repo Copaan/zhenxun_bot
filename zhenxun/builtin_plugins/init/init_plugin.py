@@ -242,11 +242,9 @@ async def reconcile_plugin_runtime():
         if create_list:
             await PluginInfo.bulk_create(create_list, 10)
         if update_list:
-            await PluginInfo.bulk_update(
-                update_list,
-                _PLUGIN_REFRESH_FIELDS,
-                20,
-            )
+            # 使用逐条保存替代 bulk_update，避免 SQLite 兼容性问题
+            for plugin in update_list:
+                await plugin.save(update_fields=_PLUGIN_REFRESH_FIELDS)
         for plugin in type_updates:
             await PluginInfo.filter(id=plugin.id).update(plugin_type=plugin.plugin_type)
         current_loaded = {

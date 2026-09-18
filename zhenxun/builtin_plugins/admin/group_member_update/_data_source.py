@@ -165,7 +165,9 @@ class MemberUpdateManage:
                 except Exception as e:
                     logger.error("批量创建用户数据失败", "更新群组成员信息", e=e)
             if data_list[1]:
-                await GroupInfoUser.bulk_update(data_list[1], ["user_name"], 30)
+                # 使用逐条保存替代 bulk_update，避免 SQLite 兼容性问题
+                for user in data_list[1]:
+                    await user.save(update_fields=["user_name"])
                 logger.debug(
                     f"更新户数据 {len(data_list[1])} 条",
                     "更新群组成员信息",

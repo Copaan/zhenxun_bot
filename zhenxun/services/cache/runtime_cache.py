@@ -70,6 +70,7 @@ RUNTIME_CACHE_DB_TIMEOUT_SECONDS = 3.0
 
 INSTANCE_ID = uuid.uuid4().hex
 _CACHE_READY_EVENT = asyncio.Event()
+_STARTUP_FAILED_CACHES: tuple[str, ...] = ()
 _LIFECYCLE_CONTEXT: Any | None = None
 _APPLYING_REMOTE_CACHE_EVENT: ContextVar[bool] = ContextVar(
     "APPLYING_REMOTE_RUNTIME_CACHE_EVENT",
@@ -2374,6 +2375,14 @@ class RuntimeCacheRefreshCoordinator:
         except Exception:
             return False
 
+    def request_refresh_all(self) -> None:
+        """请求全部缓存尽快和解。
+
+        供写层在提交后发布失败时调用，避免外部模块伸手进 _specs()。
+        """
+        for cache_cls, _ in self._specs().values():
+            self.request_refresh(cache_cls)
+
     def request_refresh(self, cache_cls: type) -> None:
         for name, (candidate, _) in self._specs().items():
             if candidate is cache_cls:
@@ -2447,6 +2456,33 @@ class RuntimeCacheRefreshCoordinator:
         finally:
             self._current_cache = None
 
+    def _retry_delay(self, name: str, interval: int) -> float:
+        """失败退避，与 _run 循环同一公式。"""
+        failures = self._failure_counts.get(name, 0)
+        if not failures:
+            return float(interval)
+        return float(min(interval, max(5, 2**failures * 5)))
+
+    def _reschedule_failures(self, results: dict[str, bool]) -> None:
+        """把失败的缓存改排到退避窗口。
+
+        start() 会按 now + interval 铺满 _next_due，而 refresh_all 的失败原本
+        不改排期 —— ban 的 interval 是 300s，启动加载失败要等满 5 分钟才重试，
+        期间该缓存一直不可用。
+        """
+        specs = self._specs()
+        now = time.monotonic()
+        for name, success in results.items():
+            if success or name not in specs:
+                continue
+            interval = specs[name][1]
+            if interval <= 0:
+                continue
+            due = now + self._retry_delay(name, interval)
+            if due < self._next_due.get(name, float("inf")):
+                self._next_due[name] = due
+                self._wake.set()
+
     async def refresh_one(self, name: str, cache_cls: type) -> bool:
         async with self._lock:
             _, success = await self._refresh_entry(name, cache_cls)
@@ -2465,7 +2501,8 @@ class RuntimeCacheRefreshCoordinator:
                         )
                         self._queue_depth -= 1
                 else:
-                    semaphore = asyncio.Semaphore(3)
+                    # 增加并发数以加快缓存刷新速度（非SQLite数据库）
+                    semaphore = asyncio.Semaphore(5)
 
                     async def refresh(name: str, cache_cls: type):
                         async with semaphore:
@@ -2482,7 +2519,9 @@ class RuntimeCacheRefreshCoordinator:
                             for name, (cache_cls, _) in specs.items()
                         )
                     )
-                return dict(results)
+                outcome = dict(results)
+                self._reschedule_failures(outcome)
+                return outcome
             finally:
                 self._queue_depth = 0
 
@@ -2665,6 +2704,11 @@ class RuntimeCacheHandle:
         return {
             "healthy": _CACHE_READY_EVENT.is_set(),
             "loaded_caches": sum(item["loaded"] for item in snapshot.values()),
+            "total_caches": len(snapshot),
+            "pending_caches": tuple(
+                sorted(name for name, item in snapshot.items() if not item["loaded"])
+            ),
+            "startup_failed_caches": _STARTUP_FAILED_CACHES,
             "refresh_coordinator": refresh_coordinator_snapshot(),
         }
 
@@ -2714,10 +2758,22 @@ class RuntimeCacheHandle:
 )
 async def _init_runtime_cache(context):
     global _LIFECYCLE_CONTEXT
+    global _STARTUP_FAILED_CACHES
     _LIFECYCLE_CONTEXT = context
     await RuntimeCacheSync.start()
     await runtime_cache_refresh_coordinator.start()
-    await runtime_cache_refresh_coordinator.refresh_all(startup=True)
+    outcome = await runtime_cache_refresh_coordinator.refresh_all(startup=True)
+    # 返回值原本被丢弃：7 个缓存全挂组件依然 healthy。失败必须留痕，
+    # 否则 fail-open 的权限判定没有任何观测入口。
+    _STARTUP_FAILED_CACHES = tuple(
+        sorted(name for name, ok in outcome.items() if not ok)
+    )
+    if _STARTUP_FAILED_CACHES:
+        logger.warning(
+            "运行时缓存启动加载未全部成功: "
+            f"{', '.join(_STARTUP_FAILED_CACHES)}（已排入退避重试）",
+            LOG_COMMAND,
+        )
     BanMemoryCache.start_cleanup_task()
     _CACHE_READY_EVENT.set()
     return RuntimeHandle(
@@ -2728,6 +2784,8 @@ async def _init_runtime_cache(context):
 
 async def _stop_runtime_cache():
     global _LIFECYCLE_CONTEXT
+    global _STARTUP_FAILED_CACHES
+    _STARTUP_FAILED_CACHES = ()
     _CACHE_READY_EVENT.clear()
     await runtime_cache_refresh_coordinator.stop()
     PluginInfoMemoryCache.stop_tasks()

@@ -165,6 +165,37 @@ def _digest(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _source_digest(path: Path) -> str:
+    """Digest only the importable source of a plugin.
+
+    A staged uninstall has to tolerate the live directory changing while it waits
+    for the restart: a running plugin writes its own state there. Its ``.py``
+    files are a different matter -- if those changed, the code about to be
+    deleted is not the code the operation was reviewed against.
+    """
+    if not path.exists():
+        return "missing"
+    digest = sha256()
+    files = (
+        [path]
+        if path.is_file()
+        else sorted(item for item in path.rglob("*") if item.is_file())
+    )
+    root = path.parent if path.is_file() else path
+    for item in files:
+        if "__pycache__" in item.parts or item.suffix not in {".py", ".pyi"}:
+            continue
+        try:
+            payload = item.read_bytes()
+        except OSError as error:
+            raise RuntimeError("plugin_transaction_source_unreadable") from error
+        digest.update(item.relative_to(root).as_posix().encode())
+        digest.update(b"\0")
+        digest.update(payload)
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
 def _copy(source: Path, target: Path) -> None:
     if target.exists():
         _remove(target)
@@ -347,6 +378,7 @@ def stage_operation(
                     "runtime_module": runtime_module,
                     "live_path": _workspace_relative(live_path),
                     "base_digest": base_digest or _digest(old_source),
+                    "base_source_digest": _source_digest(old_source),
                     "candidate_digest": (
                         _digest(candidate_path) if candidate_path else "missing"
                     ),
@@ -564,9 +596,22 @@ def apply_pending_transaction() -> bool:
             _validate_archive_build_policy(transaction, _nonebot_pending())
             for operation in transaction.get("operations", []):
                 live = Path(str(operation["live_path"]))
-                if operation.get("action") != "uninstall" and _digest(
-                    live
-                ) != operation.get("base_digest"):
+                if operation.get("action") != "uninstall":
+                    if _digest(live) != operation.get("base_digest"):
+                        raise RuntimeError("plugin_transaction_stale")
+                    continue
+                # A staged uninstall cannot demand a whole-tree match: the plugin
+                # is still running and writes its own state inside ``live``. It is
+                # checked against its source digest instead, which ignores that
+                # churn but still refuses to delete code that was replaced after
+                # the operation was reviewed. A live path that is already gone has
+                # nothing left to delete, and failing it here would roll the
+                # plugin back into place -- the opposite of what was asked.
+                expected_source = operation.get("base_source_digest")
+                if expected_source is None:
+                    continue
+                current_source = _source_digest(live)
+                if current_source not in {expected_source, "missing"}:
                     raise RuntimeError("plugin_transaction_stale")
             transaction["state"] = "applying"
             _write_pending(transaction)

@@ -351,9 +351,16 @@ async def build_auth_snapshot(
                 event_cache["ban_state"] = ban_state
         elif can_load_cache:
             await provider.ensure_ban_loaded()
-            ban_state = provider.is_banned(entity.user_id, entity.group_id)
-            if event_cache is not None:
-                event_cache["ban_state"] = ban_state
+            if provider.ban_cache_loaded():
+                ban_state = provider.is_banned(entity.user_id, entity.group_id)
+                if event_cache is not None:
+                    event_cache["ban_state"] = ban_state
+            else:
+                # ensure_ban_loaded 会静默失败（DB 降级 / 退避窗口）。此时
+                # is_banned() 返回 False 是"缓存空"而非"未被 ban"，不能落盘成
+                # 硬 False，否则 _check_ban_from_snapshot 会直接短路。留 None
+                # 交给权威路径复核。
+                cache_misses.add("ban")
         elif db_unhealthy:
             ban_state = False
             if event_cache is not None:

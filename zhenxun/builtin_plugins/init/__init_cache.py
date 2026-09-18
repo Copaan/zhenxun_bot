@@ -26,3 +26,10 @@ def register_cache_types():
 
     if cache_config.cache_mode == CacheMode.REDIS and cache_config.redis_host:
         logger.info(f"已注册 Redis 模型缓存类型，缓存模式: {cache_config.cache_mode}")
+
+
+# 注册表本身只是内存字典，且 CacheRegistry.register 幂等。
+# 这里在导入期先注册一次，避免 runtime 阶段中先启动的组件
+# （如 runtime:qq_official，priority=2）连接 Bot 触发模型写入时，
+# runtime:cache_types（priority=5）尚未执行而抛出「缓存类型 ... 不存在」。
+register_cache_types()

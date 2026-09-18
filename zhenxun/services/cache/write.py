@@ -38,9 +38,7 @@ _stats = {
 def _request_reconciliation() -> None:
     runtime = sys.modules.get("zhenxun.services.cache.runtime_cache")
     if runtime is not None:
-        coordinator = runtime.runtime_cache_refresh_coordinator
-        for cache, _ in coordinator._specs().values():
-            coordinator.request_refresh(cache)
+        runtime.runtime_cache_refresh_coordinator.request_refresh_all()
         _stats["reconciliation_requests"] += 1
 
 

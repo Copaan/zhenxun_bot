@@ -638,7 +638,7 @@ async def _apply_hot(
             if root is None:
                 raise RuntimeError("plugin_module_missing_after_install")
             operation = await plugin_runtime_manager.load_new_plugin(
-                module_name, root, submit_restart=False
+                module_name, root, submit_restart=False, dependencies_verified=True
             )
         elif action == "update":
             operation = await plugin_runtime_manager.reload_plugin(module_name)
@@ -1124,8 +1124,12 @@ async def apply_analysis(payload: ApplyPayload) -> Result[dict]:
                 source_root = module_source_path(module_name, build["path"])
                 if source_root is None:
                     raise LayerBuildError("plugin_module_missing_after_install")
+                # The generation was built from a resolved dependency plan, so
+                # any requirements file inside the package is already satisfied
+                # by the layer. Tell the classifier, or it reports a dependency
+                # restart that _apply_hot can only turn into a hard failure.
                 source_runtime = plugin_runtime_manager.classification_for_source(
-                    module_name, source_root
+                    module_name, source_root, dependencies_verified=True
                 )
                 hot_candidate = hot_candidate and (
                     source_runtime["reload_support"] == "hot_reloadable"
