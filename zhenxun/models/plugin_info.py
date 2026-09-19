@@ -18,6 +18,7 @@ class PluginInfo(Model):
     name = fields.CharField(255, description="插件名称")
     """插件名称"""
     status = fields.BooleanField(default=True, description="全局开关状态")
+    policy_revision = fields.IntField(default=0, description="全局策略修订")
     """全局开关状态"""
     block_type: BlockType | None = fields.CharEnumField(
         BlockType, default=None, null=True, description="禁用类型"

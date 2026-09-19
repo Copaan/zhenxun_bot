@@ -8,15 +8,27 @@ import pytz
 
 from zhenxun import ui
 from zhenxun.configs.path_config import IMAGE_PATH
+from zhenxun.models.asset_operation import AssetOperation
 from zhenxun.models.friend_user import FriendUser
 from zhenxun.models.goods_info import GoodsInfo
 from zhenxun.models.sign_log import SignLog
 from zhenxun.models.sign_user import SignUser
 from zhenxun.models.user_console import UserConsole
-from zhenxun.services.asset_transaction import asset_call, asset_transaction
+from zhenxun.services.account_binding import identity_daily_claimed
+from zhenxun.services.asset_transaction import (
+    asset_call,
+    asset_transaction,
+    current_asset_connection,
+)
 from zhenxun.services.avatar_service import avatar_service
+from zhenxun.services.business_identity import (
+    BusinessIdentityError,
+    business_user_id,
+    official_group_business_keys,
+)
 from zhenxun.services.hot_query_cache import get_group_user_ids, get_member_names
 from zhenxun.services.log import logger
+from zhenxun.services.message_execution import current_execution, operation_key
 from zhenxun.ui.models import ImageCell, TextCell
 from zhenxun.utils.exception import GoodsNotFound
 from zhenxun.utils.platform import PlatformUtils
@@ -50,9 +62,15 @@ class SignManage:
             bytes: 构造图片
         """
         query = SignUser
+        own_key = await business_user_id(session)
         if group_id:
-            user_list = await get_group_user_ids(group_id)
-            if user_list:
+            if PlatformUtils.get_platform_scope(session) == "qq_api":
+                try:
+                    user_list = await official_group_business_keys(session)
+                except BusinessIdentityError as error:
+                    return str(error)
+                query = query.filter(user_id__in=user_list)
+            elif user_list := await get_group_user_ids(group_id):
                 query = query.filter(user_id__in=user_list)
         user_list = (
             await query.annotate()
@@ -62,8 +80,8 @@ class SignManage:
         if not user_list:
             return "当前还没有人签到过哦..."
         user_id_list = [user[0] for user in user_list]
-        if session.user.id in user_id_list:
-            index = user_id_list.index(session.user.id) + 1
+        if own_key in user_id_list:
+            index = user_id_list.index(own_key) + 1
         else:
             index = "-1（未统计）"
         user_list = user_list[:num] if num < len(user_list) else user_list
@@ -129,13 +147,24 @@ class SignManage:
     async def _commit_sign(cls, session, nickname, is_card_view):
         platform = PlatformUtils.get_platform(session)
         now = datetime.now(pytz.timezone("Asia/Shanghai"))
-        async with asset_transaction(session.user.id, platform) as user_console:
+        user_id = await business_user_id(session)
+        receipt_id = None if is_card_view else operation_key("sign.reward", user_id)
+        async with asset_transaction(user_id, platform) as user_console:
             user, _ = await SignUser.get_or_create(
-                user_id=session.user.id,
+                using_db=current_asset_connection(),
+                user_id=user_id,
                 defaults={"user_console": user_console, "platform": platform},
             )
+            if (
+                receipt_id
+                and await AssetOperation.filter(id=receipt_id)
+                .using_db(current_asset_connection())
+                .exists()
+            ):
+                return (user, session, nickname, -1, user_console.gold, "")
             new_log = (
-                await SignLog.filter(user_id=session.user.id)
+                await SignLog.filter(user_id=user_id)
+                .using_db(current_asset_connection())
                 .order_by("-create_time")
                 .first()
             )
@@ -144,10 +173,24 @@ class SignManage:
                 if new_log
                 else None
             )
-            if not is_card_view and log_time != now.date():
+            if (
+                not is_card_view
+                and log_time != now.date()
+                and not await identity_daily_claimed(current_asset_connection())
+            ):
                 card_args = await cls._handle_sign_in(user, nickname, session)
             else:
                 card_args = (user, session, nickname, -1, user_console.gold, "")
+            if receipt_id:
+                await AssetOperation.create(
+                    using_db=current_asset_connection(),
+                    id=receipt_id,
+                    user_id=user_id,
+                    event_id=current_execution.get().identity,
+                    kind="sign_reward",
+                    state="committed",
+                    payload={"day": str(now.date()), "rewarded": card_args[3] != -1},
+                )
         return card_args
 
     @classmethod

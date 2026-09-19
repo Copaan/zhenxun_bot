@@ -1670,7 +1670,7 @@ class PluginRuntimeManager:
                         if not manager._work_lease_is_current(
                             owner, incarnation.incarnation_id, phase
                         ):
-                            return None
+                            raise RuntimeError("plugin_work_lease_revoked")
                         with resource_context(owner):
                             return func(*args)
                     finally:
@@ -2383,19 +2383,16 @@ class PluginRuntimeManager:
         def factory(
             loop: asyncio.AbstractEventLoop, coro: Coroutine[Any, Any, Any], **kwargs
         ):
-            if self._original_task_factory:
-                task = self._original_task_factory(loop, coro, **kwargs)
-            else:
-                task = asyncio.Task(coro, loop=loop, **kwargs)
             context = kwargs.get("context")
             owner = (
                 context.run(current_owner) if context is not None else current_owner()
             )
+            phase = None
+            incarnation = None
             if owner:
                 incarnation = self._incarnations.get(owner) or self._incarnations.get(
                     self._root_owner(owner) or owner
                 )
-                phase = None
                 if incarnation:
                     phase = (
                         context.run(
@@ -2407,25 +2404,32 @@ class PluginRuntimeManager:
                 if incarnation and not self._work_lease_is_current(
                     owner, incarnation.incarnation_id, phase
                 ):
-                    task.cancel()
-                else:
-                    if phase:
-                        phase.children.add(task)
-                        if phase.phase == "on_shutdown" and any(
-                            phase is value for value in self._cancellation_work.values()
-                        ):
-                            self._cancellation_work[
-                                (task, owner, incarnation.incarnation_id)
-                            ] = LifecycleWork(
-                                owner,
-                                incarnation.incarnation_id,
-                                weakref.ref(task),
-                                "on_shutdown",
-                                phase.budget,
-                            )
-                            task.add_done_callback(self._forget_cancellation_task)
-                    self._owned_tasks[owner].add(task)
-                    task.add_done_callback(self._owned_tasks[owner].discard)
+                    # Cancelling before the coroutine starts hides the rejection
+                    # from task groups (e.g. AnyIO's connection attempts).
+                    coro.close()
+                    raise RuntimeError("plugin_work_lease_revoked")
+            if self._original_task_factory:
+                task = self._original_task_factory(loop, coro, **kwargs)
+            else:
+                task = asyncio.Task(coro, loop=loop, **kwargs)
+            if owner:
+                if phase:
+                    phase.children.add(task)
+                    if phase.phase == "on_shutdown" and any(
+                        phase is value for value in self._cancellation_work.values()
+                    ):
+                        self._cancellation_work[
+                            (task, owner, incarnation.incarnation_id)
+                        ] = LifecycleWork(
+                            owner,
+                            incarnation.incarnation_id,
+                            weakref.ref(task),
+                            "on_shutdown",
+                            phase.budget,
+                        )
+                        task.add_done_callback(self._forget_cancellation_task)
+                self._owned_tasks[owner].add(task)
+                task.add_done_callback(self._owned_tasks[owner].discard)
             return task
 
         self._task_factory_installed = True
@@ -2582,7 +2586,7 @@ class PluginRuntimeManager:
                     if not manager._work_lease_is_current(
                         owner, incarnation.incarnation_id, phase
                     ):
-                        return None
+                        raise RuntimeError("plugin_work_lease_revoked")
                     with resource_context(owner):
                         return func(*args)
                 finally:

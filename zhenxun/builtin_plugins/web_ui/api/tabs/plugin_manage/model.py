@@ -13,6 +13,7 @@ class PluginSwitch(BaseModel):
     module: str
     """模块"""
     status: bool
+    expected_revision: str | None = Field(default=None, min_length=64, max_length=64)
     """开关状态"""
 
 
@@ -53,6 +54,7 @@ class UpdatePlugin(BaseModel):
     """
 
     module: str
+    expected_revision: str | None = Field(default=None, min_length=64, max_length=64)
     """模块"""
     default_status: bool
     """是否默认开启"""
@@ -76,6 +78,7 @@ class PluginInfo(BaseModel):
     """
 
     id: int
+    policy_revision: str | None = None
     store_key: str | None = None
     runtime_module: str | None = None
     uninstall_supported: bool = False
@@ -128,6 +131,7 @@ class PluginConfig(BaseModel):
     default_value: Any = Field(None, description="默认值")
     type: str | None = Field(None, description="类型")
     type_inner: list[str] | None = Field(None, description="内部类型")
+    schema_info: dict[str, Any] = Field(default_factory=dict, alias="schema")
 
 
 class PluginCount(BaseModel):

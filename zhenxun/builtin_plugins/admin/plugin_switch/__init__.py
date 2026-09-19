@@ -198,6 +198,10 @@ async def _handle_switch_command(
                         status=status,
                         is_default=default_status.result if is_superuser else False,
                         group_id=gid,
+                        bot=bot,
+                        channel_id=getattr(
+                            getattr(session, "channel", None), "id", None
+                        ),
                         is_task=task.result,
                         is_superuser=is_superuser,
                         use_su_field=use_su_field_final,
@@ -209,6 +213,7 @@ async def _handle_switch_command(
                 status=status,
                 is_default=default_status.result,
                 group_id=None,
+                bot=bot if block_type_val is None else None,
                 is_task=task.result,
                 is_superuser=is_superuser,
                 use_su_field=use_su_field_final,
@@ -252,9 +257,27 @@ async def _handle_switch_command(
 
         if not targets:
             if is_superuser and not session.group:
-                target_block_type = None if status else BlockType.ALL
-                result = await PluginManager.superuser_set_status(
-                    name_str, status, target_block_type, None, is_task=task.result
+                from zhenxun.services.bot_group_policy import bot_group_policy_service
+
+                from .strategy import get_strategy
+
+                entity = await get_strategy(task.result).get_entity(name_str)
+                if entity is None:
+                    messages.append(f"未找到功能: {name_str}")
+                    continue
+                await bot_group_policy_service.set_features(
+                    PlatformUtils.get_storage_bot_id(bot),
+                    PlatformUtils.get_platform_scope(bot),
+                    None,
+                    [entity.module],
+                    status,
+                    task=task.result,
+                    is_superuser=True,
+                    force=use_su_field_final,
+                )
+                result = (
+                    f"已{'开启' if status else '关闭'}当前账号所有私聊中的 {name_str}；"
+                    "上层限制仍然有效。"
                 )
                 messages.append(result)
                 continue
@@ -270,6 +293,7 @@ async def _handle_switch_command(
             is_whitelist_mode=only_flag_value,
             use_su_field=use_su_field_final,
             bot=bot,
+            channel_id=getattr(getattr(session, "channel", None), "id", None),
         )
         action_name = "开启" if status else "关闭"
         logger.info(

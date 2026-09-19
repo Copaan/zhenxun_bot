@@ -1379,13 +1379,9 @@ async def apply_reference_repair(payload: ReferenceRepairRequest) -> Result:
     "/chat-plugins/switches", dependencies=[authentication()], response_model=Result
 )
 async def chat_plugin_switches() -> Result:
-    content = _read()
-    return Result.ok(
-        {
-            "revision": _revision(content),
-            "switches": _ai_get(_load(content)["AI"], "CHAT_PLUGIN_ENABLED", {}),
-        }
-    )
+    from zhenxun.services.plugin_policy import plugin_policy_service
+
+    return Result.ok(await plugin_policy_service.global_state())
 
 
 @router.put(
@@ -1393,7 +1389,6 @@ async def chat_plugin_switches() -> Result:
 )
 async def update_chat_plugin_switch(payload: ChatPluginSwitchRequest) -> Result:
     from zhenxun.models.plugin_info import PluginInfo
-    from zhenxun.services.ai.chat_switch import module_identity
 
     from ..plugin_manage.store import _AI_CHAT_PLUGIN_MODULES, _plugin_capabilities
 
@@ -1410,23 +1405,22 @@ async def update_chat_plugin_switch(payload: ChatPluginSwitchRequest) -> Result:
         )
     if not supported:
         raise HTTPException(422, detail={"code": "ai_chat_plugin_not_supported"})
-    identity = module_identity(plugin.module_path or plugin.module)
-
-    def mutate(ai):
-        switches = dict(_ai_get(ai, "CHAT_PLUGIN_ENABLED", {}) or {})
-        switches[identity] = payload.enabled
-        _ai_set(ai, "CHAT_PLUGIN_ENABLED", switches)
-
-    revision, _, operation = await _persist_with_operation(
-        payload.expected_revision, mutate
+    from zhenxun.services.plugin_policy import (
+        PluginPolicyConflict,
+        plugin_policy_service,
     )
+
+    try:
+        state = await plugin_policy_service.set_global(
+            plugin.module, payload.enabled, expected_revision=payload.expected_revision
+        )
+    except PluginPolicyConflict as error:
+        raise HTTPException(
+            409, detail={"code": error.code, **error.details}
+        ) from error
     return Result.ok(
-        {
-            "revision": revision,
-            "switches": _ai_get(_load(_read())["AI"], "CHAT_PLUGIN_ENABLED", {}),
-            "operation": operation.public_dict() if operation else None,
-        },
-        info="AI 聊天即时开关已更新，进行中的请求将正常收尾。",
+        {**state, "operation": None},
+        info="已更新数据库插件策略，进行中的请求正常收尾。",
     )
 
 

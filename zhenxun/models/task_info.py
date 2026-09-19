@@ -14,6 +14,7 @@ class TaskInfo(Model):
     name = fields.CharField(255, description="被动技能名称")
     """被动技能名称"""
     status = fields.BooleanField(default=True, description="全局开关状态")
+    policy_revision = fields.IntField(default=0, description="全局策略修订")
     """全局开关状态"""
     load_status = fields.BooleanField(default=True, description="进群默认开关状态")
     """加载状态"""

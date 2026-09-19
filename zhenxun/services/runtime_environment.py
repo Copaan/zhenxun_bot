@@ -130,7 +130,9 @@ def _canonical_values(values: dict[str, str | None]) -> dict[str, str | None]:
 
 
 def _env_source() -> Path:
-    return Path(".env.dev") if Path(".env.dev").exists() else Path(".env")
+    from zhenxun.configs.environment import environment_file
+
+    return environment_file()
 
 
 def _read_startup_env() -> dict[str, str | None]:
@@ -477,7 +479,7 @@ class RuntimeEnvironmentManager:
                     await proxy_runtime.apply(after)
                 for key in hot_candidates - pending_keys:
                     self.effective_values[key] = after.get(key)
-            except Exception:
+            except (Exception, asyncio.CancelledError):
                 if (
                     component_operation
                     and component_operation.apply_effect == "component_restarted"

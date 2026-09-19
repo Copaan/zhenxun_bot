@@ -564,6 +564,7 @@ class ZhenxunQQAdapter(QQAdapter):
             )
             if (
                 context is not None
+                and context.scene in {"c2c", "group"}
                 and datetime.now(timezone.utc) >= context.reply_deadline
             ):
                 raise MessageExecutionUnavailable("reply_capability_expired")

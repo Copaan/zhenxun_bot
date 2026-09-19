@@ -27,12 +27,17 @@ class GroupSettingsService:
 
     def __init__(self):
         self._epoch = 0
+        self._cache_version = 0
         self._locks = KeyedLocks()
         self._cache = BoundedTTLCache(
             "GROUP_PLUGIN_SETTINGS_VIEW",
             ttl_seconds=600,
             max_items=10000,
         )
+
+    def mark_stale(self) -> None:
+        self._epoch += 1
+        self._cache_version += 1
 
     @staticmethod
     def _build_cache_key(group_id: str, plugin_name: str) -> str:
@@ -181,13 +186,23 @@ class GroupSettingsService:
         global_values = defaults()
         transactional = in_write_transaction()
         cached = None if transactional else await self._cache.get(cache_key)
-        if cached is not None and cached[0] == global_values:
+        if (
+            cached is not None
+            and len(cached) == 3
+            and cached[2] == self._cache_version
+            and cached[0] == global_values
+        ):
             final_settings = deepcopy(cached[1])
         else:
             async with nullcontext() if transactional else self._locks.hold(cache_key):
                 global_values = defaults()
                 cached = None if transactional else await self._cache.get(cache_key)
-                if cached is not None and cached[0] == global_values:
+                if (
+                    cached is not None
+                    and len(cached) == 3
+                    and cached[2] == self._cache_version
+                    and cached[0] == global_values
+                ):
                     final_settings = deepcopy(cached[1])
                 else:
                     epoch = self._epoch
@@ -210,7 +225,7 @@ class GroupSettingsService:
                         final_settings.update(deepcopy(row.settings))
                     await self._cache.set(
                         cache_key,
-                        (global_values, deepcopy(final_settings)),
+                        (global_values, deepcopy(final_settings), self._cache_version),
                         valid_if=lambda: loaded
                         and not transactional
                         and epoch == self._epoch

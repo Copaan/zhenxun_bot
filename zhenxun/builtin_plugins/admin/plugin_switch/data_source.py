@@ -66,108 +66,38 @@ class PluginManager:
         is_whitelist_mode: bool = False,
         bot: Bot | None = None,
         use_su_field: bool = False,
+        channel_id: str | None = None,
     ) -> str:
         """批量更新状态 (已用策略模式完全重构)"""
+        from zhenxun.services.bot_group_policy import bot_group_policy_service
+
+        if bot is None:
+            return "缺少 Bot 作用域，请指定目标账号后重试。"
         strategy = get_strategy(is_task)
         entity = await strategy.get_entity(name)
         if not entity:
             return f"未找到{strategy.entity_type_name}: {name}"
-
-        module_name = entity.module
-        norm_field = strategy.norm_field
-        su_field = strategy.su_field
-
-        groups_to_open, groups_to_close = await cls._calculate_affected_groups(
+        to_open, to_close = await cls._calculate_affected_groups(
             target_groups, status, is_whitelist_mode, bot
         )
-
-        affected_ids = groups_to_open | groups_to_close
-        if not affected_ids:
-            return "没有目标群组需要操作。"
-
-        for gid in groups_to_open | groups_to_close:
-            platform = bot.adapter.get_name() if bot else "qq"
-            await GroupConsole.get_or_create_root_group(
-                group_id=gid, defaults={"platform": platform}
+        bot_id = PlatformUtils.get_storage_bot_id(bot)
+        scope = PlatformUtils.get_platform_scope(bot)
+        for gid in sorted(to_open | to_close):
+            await bot_group_policy_service.set_features(
+                bot_id,
+                scope,
+                gid,
+                [entity.module],
+                gid in to_open,
+                task=is_task,
+                channel_id=channel_id,
+                force=use_su_field,
+                is_superuser=is_superuser,
             )
-
-        groups_obj = await GroupConsole.filter(group_id__in=list(affected_ids)).all()
-        update_list = []
-        opened_groups: set[str] = set()
-        closed_groups: set[str] = set()
-
-        for group in groups_obj:
-            gid = str(group.group_id)
-            norm_val = getattr(group, norm_field)
-            su_val = getattr(group, su_field)
-            new_norm_val, new_su_val = norm_val, su_val
-            is_changed = False
-            change_type = None
-
-            if gid in groups_to_open:
-                new_norm_val = cls._modify_block_string(norm_val, module_name, False)
-                if is_superuser:
-                    new_su_val = cls._modify_block_string(su_val, module_name, False)
-                if norm_val != new_norm_val or su_val != new_su_val:
-                    is_changed = True
-                    change_type = "open"
-            elif gid in groups_to_close:
-                if is_superuser and use_su_field:
-                    new_su_val = cls._modify_block_string(su_val, module_name, True)
-                else:
-                    new_norm_val = cls._modify_block_string(norm_val, module_name, True)
-                if norm_val != new_norm_val or su_val != new_su_val:
-                    is_changed = True
-                    change_type = "close"
-
-            if is_changed:
-                setattr(group, norm_field, new_norm_val)
-                setattr(group, su_field, new_su_val)
-                update_list.append(group)
-                if change_type == "open":
-                    opened_groups.add(gid)
-                elif change_type == "close":
-                    closed_groups.add(gid)
-
-        if update_list:
-            await GroupConsole.bulk_update(
-                update_list, [norm_field, su_field], batch_size=500
-            )
-            for group in update_list:
-                await GroupMemoryCache.upsert_from_model(group)
-
-        item_str = strategy.entity_type_name
-        mode_str = "(白名单模式)" if is_whitelist_mode else ""
-
-        if not update_list:
-            if is_whitelist_mode:
-                return f"目标群组的 {item_str} {name} 已符合白名单配置，无需重复操作。"
-            status_desc = "开启" if status else ("系统禁用" if use_su_field else "关闭")
-            return (
-                f"目标群组的 {item_str} {name} 均已处于 {status_desc} 状态，"
-                "无需重复操作。"
-            )
-
-        opened_count, closed_count = len(opened_groups), len(closed_groups)
-
-        if status:
-            su_hint = " (已同步解除系统禁用)" if is_superuser else ""
-            success_msg = f"已开启 {opened_count} 个群组的 {item_str} {name}{su_hint}"
-        else:
-            if is_superuser and use_su_field:
-                success_msg = f"已系统级禁用 {closed_count} 个群组的 {item_str} {name}"
-            else:
-                success_msg = f"已在 {closed_count} 个群组中关闭了 {item_str} {name}"
-
-        if is_whitelist_mode:
-            msg_parts = []
-            if opened_count > 0:
-                msg_parts.append(f"已开启 {opened_count} 个群组")
-            if closed_count > 0:
-                msg_parts.append(f"已关闭 {closed_count} 个群组")
-            return f"{'，'.join(msg_parts)} 的 {item_str} {name} {mode_str}。"
-
-        return f"{success_msg}。"
+        return (
+            f"已更新当前账号策略：开启 {len(to_open)} 群，关闭 {len(to_close)} 群。"
+            "上层关闭仍然有效。"
+        )
 
     @classmethod
     async def set_default_status(
@@ -193,6 +123,8 @@ class PluginManager:
         is_task: bool = False,
         is_superuser: bool = False,
         use_su_field: bool = False,
+        bot: Bot | None = None,
+        channel_id: str | None = None,
     ) -> str:
         strategy = get_strategy(is_task)
         type_str = strategy.entity_type_name
@@ -204,37 +136,27 @@ class PluginManager:
                 f"{'开启' if status else '关闭'}"
             )
 
-        if group_id:
-            if group := await GroupConsole.get_group_db(group_id=group_id):
-                norm_field = strategy.norm_field
-                su_field = strategy.su_field
-                module_list = await strategy.get_all_modules()
-                all_modules_str = CommonUtils.convert_module_format(module_list)
-                update_fields = []
+        if group_id or bot is not None:
+            if bot is None:
+                return "缺少 Bot 作用域，请指定目标账号后重试。"
+            from zhenxun.services.bot_group_policy import bot_group_policy_service
 
-                if status:
-                    if is_superuser:
-                        setattr(group, norm_field, "")
-                        setattr(group, su_field, "")
-                        update_fields.extend([norm_field, su_field])
-                        msg = f"成功将此群组所有{type_str}完全开启 (包括解除系统禁用)"
-                    else:
-                        setattr(group, norm_field, "")
-                        update_fields.append(norm_field)
-                        msg = f"成功开启此群组所有{type_str}"
-                else:
-                    if is_superuser and use_su_field:
-                        setattr(group, su_field, all_modules_str)
-                        update_fields.append(su_field)
-                        msg = f"已由超级用户系统级禁用此群组所有{type_str}"
-                    else:
-                        setattr(group, norm_field, all_modules_str)
-                        update_fields.append(norm_field)
-                        msg = f"成功关闭此群组所有{type_str}"
-
-                await group.save(update_fields=update_fields)
-                return f"{msg}。"
-            return "获取群组失败..."
+            await bot_group_policy_service.set_features(
+                PlatformUtils.get_storage_bot_id(bot),
+                PlatformUtils.get_platform_scope(bot),
+                group_id,
+                await strategy.get_all_modules(),
+                status,
+                task=is_task,
+                channel_id=channel_id,
+                force=use_su_field,
+                is_superuser=is_superuser,
+            )
+            return (
+                f"当前账号{'当前群' if group_id else '所有私聊'}的所有{type_str}"
+                f"已{'开启' if status else '关闭'}；"
+                "上层限制仍然有效。"
+            )
 
         await strategy.set_all_global_status(status)
         return f"成功将所有{type_str}全局状态修改为: {'开启' if status else '关闭'}"
@@ -247,6 +169,8 @@ class PluginManager:
         block_type: BlockType | None,
         group_id: str | None,
         is_task: bool = False,
+        bot: Bot | None = None,
+        channel_id: str | None = None,
     ) -> str:
         strategy = get_strategy(is_task)
         entity = await strategy.get_entity(plugin_name)
@@ -254,29 +178,23 @@ class PluginManager:
 
         if entity:
             if group_id:
-                is_su_blocked, _ = await strategy.check_block_status(
-                    group_id, entity.module
+                if bot is None:
+                    from nonebot.matcher import current_bot
+
+                    try:
+                        bot = current_bot.get()
+                    except LookupError:
+                        return "缺少 Bot 作用域，请指定目标账号后重试。"
+                return await cls.batch_update_status(
+                    plugin_name,
+                    {group_id},
+                    status,
+                    is_task=is_task,
+                    is_superuser=True,
+                    use_su_field=True,
+                    bot=bot,
+                    channel_id=channel_id,
                 )
-                if status and is_su_blocked:
-                    await cls.batch_update_status(
-                        plugin_name,
-                        {group_id},
-                        True,
-                        is_task=is_task,
-                        is_superuser=True,
-                    )
-                    return f"已成功{action_cn}群组 {group_id} 的 {plugin_name} 功能!"
-                if not status and not is_su_blocked:
-                    await cls.batch_update_status(
-                        plugin_name,
-                        {group_id},
-                        False,
-                        is_task=is_task,
-                        is_superuser=True,
-                        use_su_field=True,
-                    )
-                    return f"已成功{action_cn}群组 {group_id} 的 {plugin_name} 功能!"
-                return f"此群组该功能已被超级用户{action_cn}，不要重复操作..."
 
             await strategy.set_global_status(entity, status, block_type)
             await strategy.refresh_cache()

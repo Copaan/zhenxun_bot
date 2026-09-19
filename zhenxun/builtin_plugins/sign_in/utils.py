@@ -1,4 +1,5 @@
 from datetime import datetime
+from hashlib import sha256
 import os
 from pathlib import Path
 import random
@@ -12,9 +13,8 @@ from zhenxun import ui
 from zhenxun.configs.config import BotConfig, Config
 from zhenxun.configs.path_config import THEMES_PATH
 from zhenxun.models.sign_user import SignUser
-from zhenxun.services import avatar_service
+from zhenxun.services.avatar_service import avatar_service
 from zhenxun.utils.manager.priority_manager import PriorityLifecycle
-from zhenxun.utils.platform import PlatformUtils
 
 from .config import (
     SIGN_TODAY_CARD_PATH,
@@ -88,6 +88,17 @@ async def init_image():
     clear_sign_data_pic()
 
 
+def _card_cache_key(user, session) -> str:
+    from zhenxun.services.business_identity import current_business_identity
+
+    identity = current_business_identity()
+    revision = identity.revision if identity else 0
+    display = sha256(
+        f"{session.scope}:{session.self_id}:{session.user.id}:{revision}".encode()
+    ).hexdigest()[:20]
+    return f"{user.user_console_id}_{display}"
+
+
 async def get_card(
     user: SignUser,
     session: Uninfo,
@@ -113,7 +124,7 @@ async def get_card(
     返回:
         Path: 卡片路径
     """
-    user_id = user.user_id
+    user_id = _card_cache_key(user, session)
     date = datetime.now().date()
     _type = "view" if is_card_view else "sign"
     file_name = f"{user_id}_{_type}_{date}.png"
@@ -205,7 +216,7 @@ async def _generate_html_card(
     now = datetime.now()
     date = now.date()
     _type = "view" if is_card_view else "sign"
-    file_name = f"{user.user_id}_{_type}_{date}.png"
+    file_name = f"{_card_cache_key(user, session)}_{_type}_{date}.png"
     card_file = SIGN_TODAY_CARD_PATH / file_name
 
     if card_file.exists():
@@ -253,9 +264,7 @@ async def _generate_html_card(
     if len(nickname) > 6:
         font_size = 27
 
-    avatar_path = await avatar_service.get_avatar_path(
-        PlatformUtils.get_platform(session), user.user_id
-    )
+    avatar_path = await avatar_service.get_session_avatar_path(session)
     user_info = {
         "nickname": nickname,
         "uid_str": uid_formatted,

@@ -1,6 +1,7 @@
 from typing_extensions import Self
 
 from tortoise import fields
+from tortoise.expressions import Q
 
 from zhenxun.services.asset_transaction import (
     asset_call,
@@ -54,20 +55,14 @@ class SignUser(Model):
         """
         connection = current_asset_connection()
         if connection is None:
-            user_console = await UserConsole.get_user(user_id, platform)
-        else:
-            user_console = await UserConsole._get_user_for_write(user_id, platform)
-        if connection is not None:
-            user, _ = await SignUser.get_or_create(
-                using_db=connection,
-                user_id=user_id,
-                defaults={"user_console": user_console, "platform": platform},
-            )
-        else:
-            user, _ = await SignUser.get_or_create(
-                user_id=user_id,
-                defaults={"user_console": user_console, "platform": platform},
-            )
+            async with asset_transaction(user_id, platform):
+                return await cls.get_user(user_id, platform)
+        user_console = await UserConsole._get_user_for_write(user_id, platform)
+        user, _ = await SignUser.get_or_create(
+            using_db=connection,
+            user_id=user_id,
+            defaults={"user_console": user_console, "platform": platform},
+        )
         return user
 
     @classmethod
@@ -93,6 +88,10 @@ class SignUser(Model):
             from hashlib import sha256
             from zoneinfo import ZoneInfo
 
+            from zhenxun.services.account_binding import (
+                identity_daily_claimed,
+                record_identity_daily_claim,
+            )
             from zhenxun.services.message_execution import current_execution
 
             from .asset_operation import AssetOperation
@@ -102,15 +101,26 @@ class SignUser(Model):
             user = await cls.get_user(identity, platform)
             connection = current_asset_connection()
             previous_query = SignLog.filter(user_id=identity).order_by("-create_time")
-            operation_query = AssetOperation.filter(id=key)
+            operation_filter = Q(id=key)
+            if execution := current_execution.get():
+                operation_filter |= Q(
+                    user_id=identity, event_id=execution.identity, kind="daily_sign"
+                )
+            operation_query = AssetOperation.filter(operation_filter)
             if connection is not None:
                 previous_query = previous_query.using_db(connection)
                 operation_query = operation_query.using_db(connection)
             previous = await previous_query.first()
-            if (await operation_query.exists()) or (
-                previous
-                and previous.create_time.astimezone(ZoneInfo("Asia/Shanghai")).date()
-                == today
+            if (
+                (await identity_daily_claimed(connection))
+                or (await operation_query.exists())
+                or (
+                    previous
+                    and previous.create_time.astimezone(
+                        ZoneInfo("Asia/Shanghai")
+                    ).date()
+                    == today
+                )
             ):
                 return user
             user.impression = float(user.impression) + impression
@@ -136,4 +146,5 @@ class SignUser(Model):
                 state="committed",
                 payload={"date": str(today)},
             )
+            await record_identity_daily_claim(connection)
             return user

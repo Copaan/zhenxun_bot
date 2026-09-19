@@ -3,6 +3,7 @@ from collections import defaultdict
 from collections.abc import Callable
 from datetime import datetime, timedelta
 import inspect
+import json
 import math
 import time
 from types import MappingProxyType
@@ -18,14 +19,27 @@ from tortoise.timezone import localtime
 
 from zhenxun import ui
 from zhenxun.configs.config import BotConfig
+from zhenxun.models.asset_operation import AssetOperation
 from zhenxun.models.friend_user import FriendUser
 from zhenxun.models.goods_info import GoodsInfo
 from zhenxun.models.user_console import UserConsole
 from zhenxun.models.user_props_log import UserPropsLog
-from zhenxun.services import avatar_service
-from zhenxun.services.asset_transaction import account_write
+from zhenxun.services.asset_transaction import (
+    account_write,
+    asset_transaction,
+    current_asset_connection,
+)
+from zhenxun.services.avatar_service import avatar_service
+from zhenxun.services.business_identity import (
+    BusinessIdentityError,
+    business_user_id,
+    identity_digest,
+    official_group_business_keys,
+    resolve_business_identity,
+)
 from zhenxun.services.hot_query_cache import get_group_user_ids, get_member_names
 from zhenxun.services.log import logger
+from zhenxun.services.message_execution import current_execution, operation_key
 from zhenxun.ui.models import ImageCell, TextCell
 from zhenxun.utils.enum import PropHandle
 from zhenxun.utils.platform import PlatformUtils
@@ -98,16 +112,22 @@ class ShopParam(BaseModel):
 
 async def gold_rank(session: Uninfo, group_id: str | None, num: int) -> bytes | str:
     query = UserConsole
+    own_key = await business_user_id(session)
     if group_id:
-        uid_list = await get_group_user_ids(group_id)
-        if uid_list:
+        if PlatformUtils.get_platform_scope(session) == "qq_api":
+            try:
+                uid_list = await official_group_business_keys(session)
+            except BusinessIdentityError as error:
+                return str(error)
+            query = query.filter(user_id__in=uid_list)
+        elif uid_list := await get_group_user_ids(group_id):
             query = query.filter(user_id__in=uid_list)
     user_list = await query.annotate().order_by("-gold").values_list("user_id", "gold")
     if not user_list:
         return "当前还没有人拥有金币哦..."
     user_id_list = [user[0] for user in user_list]
-    if session.user.id in user_id_list:
-        index = user_id_list.index(session.user.id) + 1
+    if own_key in user_id_list:
+        index = user_id_list.index(own_key) + 1
     else:
         index = "-1（未统计）"
     user_list = user_list[:num] if num < len(user_list) else user_list
@@ -166,6 +186,7 @@ class ShopManage:
         goods: Goods,
         num: int,
         text: str,
+        business_key: str,
         at_users: list[str] = [],
     ) -> tuple[ShopParam, dict[str, Any]]:
         """构造参数
@@ -190,7 +211,7 @@ class ShopManage:
                 "goods_name": goods.name,
                 "bot": bot,
                 "event": event,
-                "user_id": session.user.id,
+                "user_id": business_key,
                 "group_id": group_id,
                 "num": num,
                 "text": text,
@@ -204,7 +225,7 @@ class ShopManage:
             **_kwargs,
             "_bot": bot,
             "event": event,
-            "user_id": session.user.id,
+            "user_id": business_key,
             "group_id": group_id,
             "num": num,
             "text": text,
@@ -343,45 +364,102 @@ class ShopManage:
         返回:
             str | MessageFactory | None: 使用完成后返回信息
         """
-        if goods_name.isdigit():
-            try:
-                user = await UserConsole.get_user(user_id=session.user.id)
-                goods_list = await GoodsInfo.filter(uuid__in=user.props.keys()).all()
-                goods_by_uuid = {item.uuid: item for item in goods_list}
-                user.props = {
-                    uuid: count
-                    for uuid, count in user.props.items()
-                    if count > 0 and goods_by_uuid.get(uuid)
-                }
-                uuid = list(user.props.keys())[int(goods_name)]
-                goods_info = await GoodsInfo.get_or_none(uuid=uuid)
-            except IndexError:
-                return "仓库中道具不存在..."
-        else:
-            goods_info = await GoodsInfo.get_or_none(goods_name=goods_name)
-        if not goods_info:
-            return "对应的道具不存在..."
-        if goods_info.is_passive:
-            return f"{goods_info.goods_name} 是被动道具, 无法使用..."
-        goods = cls.uuid2goods.get(goods_info.uuid)
-        if not goods or not goods.func:
-            return f"{goods_info.goods_name} 未注册使用函数, 无法使用..."
+        identity = await resolve_business_identity(bot, event, session)
+        receipt_id = operation_key("shop.use", identity.storage_key)
         at_user_ids = [at.target for at in at_users]
-        param, kwargs = cls.__build_params(
-            bot, event, session, message, goods, num, text, at_user_ids
-        )
-        if num > param.max_num_limit:
-            return f"{goods_info.goods_name} 单次使用最大数量为{param.max_num_limit}..."
-        await cls.run_before_after(goods, param, session, message, "before", **kwargs)
-        await UserConsole.use_props(
-            session.user.id, goods_info.uuid, num, PlatformUtils.get_platform(session)
-        )
-        result = await cls.__run(goods, param, session, message, **kwargs)
+        fingerprint = identity_digest(goods_name, num, text, at_user_ids)
+        async with asset_transaction(identity.storage_key):
+            db = current_asset_connection()
+            if receipt_id and (
+                receipt := await AssetOperation.filter(id=receipt_id)
+                .using_db(db)
+                .get_or_none()
+            ):
+                if receipt.payload["fingerprint"] != fingerprint:
+                    raise RuntimeError("asset_operation_input_conflict")
+                saved = receipt.payload["result"]
+                return (
+                    UniMessage.load(saved["value"])
+                    if saved["type"] == "message"
+                    else saved["value"]
+                )
+            if goods_name.isdigit():
+                try:
+                    user = await UserConsole.get_user(user_id=identity.storage_key)
+                    goods_list = await GoodsInfo.filter(
+                        uuid__in=user.props.keys()
+                    ).all()
+                    goods_by_uuid = {item.uuid: item for item in goods_list}
+                    user.props = {
+                        uuid: count
+                        for uuid, count in user.props.items()
+                        if count > 0 and goods_by_uuid.get(uuid)
+                    }
+                    uuid = list(user.props.keys())[int(goods_name)]
+                    goods_info = await GoodsInfo.get_or_none(uuid=uuid)
+                except IndexError:
+                    return "仓库中道具不存在..."
+            else:
+                goods_info = await GoodsInfo.get_or_none(goods_name=goods_name)
+            if not goods_info:
+                return "对应的道具不存在..."
+            if goods_info.is_passive:
+                return f"{goods_info.goods_name} 是被动道具, 无法使用..."
+            goods = cls.uuid2goods.get(goods_info.uuid)
+            if not goods or not goods.func:
+                return f"{goods_info.goods_name} 未注册使用函数, 无法使用..."
+            param, kwargs = cls.__build_params(
+                bot,
+                event,
+                session,
+                message,
+                goods,
+                num,
+                text,
+                identity.storage_key,
+                at_user_ids,
+            )
+            if num > param.max_num_limit:
+                return (
+                    f"{goods_info.goods_name} 单次使用最大数量为"
+                    f"{param.max_num_limit}..."
+                )
+            await cls.run_before_after(
+                goods, param, session, message, "before", **kwargs
+            )
+            await UserConsole.use_props(
+                identity.storage_key,
+                goods_info.uuid,
+                num,
+                PlatformUtils.get_platform(session),
+            )
+            result = await cls.__run(goods, param, session, message, **kwargs)
 
-        await cls.run_before_after(goods, param, session, message, "after", **kwargs)
-        if not result and param.send_success_msg:
-            result = f"使用道具 {goods.name} {num} 次成功！"
-        return result
+            await cls.run_before_after(
+                goods, param, session, message, "after", **kwargs
+            )
+            if not result and param.send_success_msg:
+                result = f"使用道具 {goods.name} {num} 次成功！"
+            if receipt_id:
+                saved = {"type": "plain", "value": result}
+                if isinstance(result, UniMessage):
+                    # Inline media avoids creating files during a DB transaction.
+                    saved = {
+                        "type": "message",
+                        "value": json.loads(
+                            result.dump(media_save_dir=True, json=True)
+                        ),
+                    }
+                await AssetOperation.create(
+                    using_db=db,
+                    id=receipt_id,
+                    user_id=identity.storage_key,
+                    event_id=current_execution.get().identity,
+                    kind="shop.use",
+                    state="committed",
+                    payload={"fingerprint": fingerprint, "result": saved},
+                )
+            return result
 
     @classmethod
     async def register_use(

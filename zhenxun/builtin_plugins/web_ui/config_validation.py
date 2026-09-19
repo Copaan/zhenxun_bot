@@ -3,12 +3,11 @@ from __future__ import annotations
 from io import StringIO
 from typing import Any
 
-import cattrs
 from dotenv.parser import parse_stream
 from ruamel.yaml import YAML
 
 from zhenxun.configs.config import Config
-from zhenxun.utils.pydantic_compat import _is_pydantic_type, parse_as
+from zhenxun.utils.pydantic_compat import parse_as
 
 
 class ConfigurationValidationError(ValueError):
@@ -99,10 +98,7 @@ def _validate_registered_value(config: Any, value: Any) -> None:
         return
     if config.type is None:
         return
-    if _is_pydantic_type(config.type):
-        parse_as(config.type, value)
-    else:
-        cattrs.structure(value, config.type)
+    parse_as(config.type, value)
 
 
 def validate_simple_yaml(
@@ -194,6 +190,19 @@ def validate_simple_yaml(
             try:
                 _validate_registered_value(config, value)
             except Exception as exc:
+                if hasattr(exc, "errors"):
+                    for detail in exc.errors():
+                        issues.append(
+                            _issue(
+                                "yaml_value_invalid",
+                                file,
+                                detail.get("msg", "值不符合声明类型"),
+                                path=".".join([path, *map(str, detail.get("loc", ()))]),
+                                line=line,
+                                column=column,
+                            )
+                        )
+                    continue
                 issues.append(
                     _issue(
                         "yaml_value_invalid",

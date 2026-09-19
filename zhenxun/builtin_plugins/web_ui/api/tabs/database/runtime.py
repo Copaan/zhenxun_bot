@@ -15,6 +15,7 @@ from pydantic import BaseModel
 from redis.asyncio import Redis
 from tortoise import Tortoise
 
+from zhenxun.configs.environment import environment_file, environment_target
 from zhenxun.services.cache.bounded_ttl import BoundedTTLCache
 from zhenxun.services.cache.config import CACHE_KEY_PREFIX
 from zhenxun.services.cache.runtime_cache import (
@@ -65,7 +66,9 @@ class CacheAction(BaseModel):
 
 
 def _env_path() -> Path:
-    return _ENV_FILE if _ENV_FILE.exists() else _ENV_TEMPLATE
+    return environment_file(
+        template=True, preferred=_ENV_FILE, template_path=_ENV_TEMPLATE
+    )
 
 
 def _env_values() -> dict[str, str]:
@@ -320,7 +323,9 @@ async def update_database_configuration(
         updated = _update_env(current_text, fields)
         _validate_env(updated)
         if updated != current_text:
-            _write_transaction([(_ENV_FILE, updated.encode("utf-8"))])
+            _write_transaction(
+                [(environment_target(_env_path()), updated.encode("utf-8"))]
+            )
             operation = await runtime_environment_manager.apply(
                 current_text, updated, submit_restart=False
             )
@@ -328,7 +333,9 @@ async def update_database_configuration(
             operation = None
     except Exception as error:
         if updated != current_text:
-            _write_transaction([(_ENV_FILE, current_text.encode("utf-8"))])
+            _write_transaction(
+                [(environment_target(_env_path()), current_text.encode("utf-8"))]
+            )
         raise HTTPException(
             status_code=500,
             detail=f"数据服务配置保存失败（{error.__class__.__name__}）。",

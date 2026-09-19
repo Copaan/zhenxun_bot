@@ -6,6 +6,7 @@ from nonebot.adapters.onebot.v11 import ActionFailed
 from zhenxun.models.fg_request import FgRequest
 from zhenxun.models.group_console import GroupConsole
 from zhenxun.services.log import logger
+from zhenxun.services.plugin_policy import PluginPolicyError
 from zhenxun.utils.enum import RequestHandleType, RequestType
 from zhenxun.utils.exception import NotFoundError
 from zhenxun.utils.platform import PlatformUtils
@@ -72,6 +73,10 @@ async def _(group: UpdateGroup) -> Result[str]:
     try:
         await ApiDataSource.update_group(group)
         return Result.ok(info="已完成记录!")
+    except PluginPolicyError as error:
+        from ..plugin_policy import _raise_api_error
+
+        _raise_api_error(error)
     except Exception as e:
         logger.error(f"{router.prefix}/update_group 调用错误", "WebUi", e=e)
         return Result.fail(f"发生了一点错误捏 {type(e)}: {e}")
@@ -310,9 +315,11 @@ async def _(bot_id: str, user_id: str) -> Result[UserDetail]:
     response_class=JSONResponse,
     description="获取群组详情",
 )
-async def _(group_id: str) -> Result[GroupDetail]:
+async def _(group_id: str, bot_id: str | None = None) -> Result[GroupDetail]:
     try:
-        return Result.ok(await ApiDataSource.get_group_detail(group_id), "拿到信息啦!")
+        return Result.ok(
+            await ApiDataSource.get_group_detail(group_id, bot_id), "拿到信息啦!"
+        )
     except TimeoutError:
         return Result.fail(DB_BUSY_MESSAGE)
     except Exception as e:

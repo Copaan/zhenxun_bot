@@ -23,6 +23,7 @@ from zhenxun.adapters.qq_official.config import (
     QQOfficialIntent,
     validate_qq_config_data,
 )
+from zhenxun.configs.environment import environment_target
 from zhenxun.services.log import logger
 from zhenxun.utils._restart_utils import issue_restart_ticket
 from zhenxun.utils.pydantic_compat import model_dump
@@ -39,8 +40,8 @@ from ...restart_service import restart_status_data
 from ...security import decode_access_token_status
 from ...utils import authentication
 from ..configure.persistence import _write_transaction
+from .configuration import _ENV_FILE as _ENV_FILE
 from .configuration import (
-    _ENV_FILE,
     _PROTOCOL_ENV_KEYS,
     _parse_bots,
     _probe_credential,
@@ -289,7 +290,7 @@ async def _save_websocket_bot(app_id: str, secret: str) -> dict[str, Any]:
             },
         )
         if updated != current:
-            _write_transaction([(_ENV_FILE, updated.encode("utf-8"))])
+            _write_transaction([(environment_target(source), updated.encode("utf-8"))])
         changed_keys, pending_keys = env_change_impact(
             current, updated, _PROTOCOL_ENV_KEYS
         )

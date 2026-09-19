@@ -1,5 +1,5 @@
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import ClassVar
 from uuid import uuid4
 
@@ -33,9 +33,16 @@ class GoldReservation:
     operation_id: str = ""
     committed: bool = False
     released: bool = False
+    business_identity: object | None = field(default=None, repr=False)
+
+    async def _finish(self, action: str) -> None:
+        from zhenxun.services.business_identity import business_account_scope
+
+        with business_account_scope(self.business_identity):
+            await self._finish_account(action)
 
     @asset_call
-    async def _finish(self, action: str) -> None:
+    async def _finish_account(self, action: str) -> None:
         from zhenxun.models.asset_operation import AssetOperation
 
         async with asset_transaction(self.user_id, self.platform):
@@ -295,6 +302,7 @@ class UserConsole(Model):
     ) -> GoldReservation:
         """预扣金币；插件最终未执行时可 release 补偿。"""
         from zhenxun.models.asset_operation import AssetOperation
+        from zhenxun.services.business_identity import current_business_identity
         from zhenxun.services.message_execution import current_execution, operation_key
 
         require_positive_amount(gold)
@@ -323,6 +331,7 @@ class UserConsole(Model):
                     operation_id=operation_id,
                     committed=existing.state == "committed",
                     released=existing.state == "released",
+                    business_identity=current_business_identity(),
                 )
             if user.gold < gold:
                 raise InsufficientGold()
@@ -358,6 +367,7 @@ class UserConsole(Model):
             plugin_module=plugin_module,
             platform=platform,
             operation_id=operation_id,
+            business_identity=current_business_identity(),
         )
 
     @classmethod

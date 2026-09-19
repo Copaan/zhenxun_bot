@@ -19,6 +19,7 @@ from nonebot_plugin_alconna import (
 from nonebot_plugin_uninfo import Uninfo
 
 from zhenxun.configs.utils import BaseBlock, Command, PluginExtraData, RegisterConfig
+from zhenxun.services.business_identity import business_user_id
 from zhenxun.services.log import logger
 from zhenxun.utils.decorator.shop import NotMeetUseConditionsException
 from zhenxun.utils.depends import UserName
@@ -140,7 +141,7 @@ async def _(session: Uninfo, arparma: Arparma):
 async def _(session: Uninfo, arparma: Arparma):
     logger.info("查看金币", arparma.header_result, session=session)
     gold = await ShopManage.my_cost(
-        session.user.id, PlatformUtils.get_platform(session)
+        await business_user_id(session), PlatformUtils.get_platform(session)
     )
     await MessageUtils.build_message(f"你的当前余额: {gold}").send(reply_to=True)
 
@@ -149,7 +150,7 @@ async def _(session: Uninfo, arparma: Arparma):
 async def _(session: Uninfo, arparma: Arparma, nickname: str = UserName()):
     logger.info("查看道具", arparma.header_result, session=session)
     if image := await ShopManage.my_props(
-        session.user.id,
+        await business_user_id(session),
         nickname,
         PlatformUtils.get_platform(session),
     ):
@@ -173,7 +174,9 @@ async def _(
         arparma.header_result,
         session=session,
     )
-    result = await ShopManage.buy_prop(session.user.id, name.result, num.result)
+    result = await ShopManage.buy_prop(
+        await business_user_id(session), name.result, num.result
+    )
     await MessageUtils.build_message(result).send(reply_to=True)
 
 

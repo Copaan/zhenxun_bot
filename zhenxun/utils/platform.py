@@ -420,6 +420,12 @@ class PlatformUtils:
                 )
             if context.app_id != str(bot.self_id):
                 raise OfficialReplyUnavailable("QQ official reply context bot mismatch")
+            if context.scene == "guild":
+                if context.guild_event is None:
+                    raise OfficialReplyUnavailable("QQ guild reply event is missing")
+                # A DM event's guild_id is the existing private session, not
+                # the source guild required by Target's post_dms() path.
+                return await send_message.send(target=context.guild_event, bot=bot)
             state, sequence = await allocate_reply_sequence(context)
             successful = False
             try:

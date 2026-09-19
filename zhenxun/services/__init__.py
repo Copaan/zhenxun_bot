@@ -11,6 +11,10 @@ from importlib import import_module
 from typing import Any
 
 _EXPORTS: dict[str, tuple[str, str]] = {
+    "resolve_business_identity": (
+        "zhenxun.services.business_identity",
+        "resolve_business_identity",
+    ),
     "ExecutionPolicy": ("zhenxun.services.scheduler", "ExecutionPolicy"),
     "Model": ("zhenxun.services.db_context", "Model"),
     "PluginInit": ("zhenxun.services.plugin_init", "PluginInit"),

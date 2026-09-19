@@ -57,20 +57,30 @@ V = TypeVar("V")
 
 
 class HotCache(BoundedTTLCache[K, V]):
+    _publication_failed = False
+
     async def get(self, key, default=None):
         if in_write_transaction():
             return default
+        if self._publication_failed:
+            await self.clear()
         value = await super().get(key)
         return default if value is None else value
 
+    async def clear(self):
+        result = await super().clear()
+        self._publication_failed = False
+        return result
+
     async def set(self, key, value):
-        if in_write_transaction():
+        if in_write_transaction() or self._publication_failed:
             return
         attempt = _attempt.get()
 
         def valid():
-            ok = attempt is None or (
-                not attempt.failed and attempt.revision == _revision
+            ok = not self._publication_failed and (
+                attempt is None
+                or (not attempt.failed and attempt.revision == _revision)
             )
             if not ok:
                 _diagnostics["discarded_fills"] += 1
@@ -486,6 +496,19 @@ async def invalidate_group_members(
         return
     for user_id in normalized_ids:
         await _GROUP_MEMBER_BY_ID_CACHE.delete(f"{group_key}:{user_id}")
+
+
+def mark_members_stale() -> None:
+    global _revision
+    _revision += 1
+    for cache in (
+        _GROUP_MEMBER_CACHE,
+        _GROUP_USER_IDS_CACHE,
+        _GROUP_MEMBER_BY_ID_CACHE,
+        _USER_NAME_CACHE,
+        _USER_GROUP_CACHE,
+    ):
+        cache._publication_failed = True
 
 
 async def invalidate_member_names(user_ids: Iterable[object] | None = None) -> None:

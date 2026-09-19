@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from io import StringIO
 import json
@@ -16,11 +17,13 @@ from pydantic import BaseModel, Field
 from ruamel.yaml import YAML
 
 from zhenxun.configs.config import Config
+from zhenxun.configs.environment import environment_file, environment_target
 from zhenxun.configs.webui_tls import (
     WebUITLSConfigError,
     settings_from_values,
     validate_webui_tls_settings,
 )
+from zhenxun.services.log import logger
 from zhenxun.services.network_proxy import PROXY_KEYS, ProxyPolicy, proxy_runtime
 from zhenxun.services.runtime_config_reload import reload_runtime_config
 from zhenxun.services.runtime_environment import (
@@ -33,9 +36,7 @@ from zhenxun.services.runtime_mutation import managed_mutation
 from zhenxun.services.runtime_reload.models import ApplyMode, RuntimeOperation
 from zhenxun.utils._restart_utils import issue_restart_ticket
 from zhenxun.utils.pydantic_compat import (
-    _is_pydantic_type,
     model_dump,
-    model_json_schema,
 )
 
 from ....apply_result import (
@@ -44,6 +45,7 @@ from ....apply_result import (
     update_pending_restart,
 )
 from ....base_model import Result
+from ....config_schema import inferred_schema, schema_for_type
 from ....config_validation import (
     ConfigurationValidationError,
     validate_dotenv,
@@ -100,6 +102,7 @@ class ConfigurationFileUpdate(BaseModel):
     content: str | None = None
     fields: dict[str, Any] | None = None
     custom_operations: list[CustomEnvOperation] | None = None
+    unset_fields: list[list[str]] = Field(default_factory=list)
 
 
 class ConfigurationValidation(BaseModel):
@@ -142,7 +145,9 @@ def _validate_env(content: str) -> list[dict[str, Any]]:
 
 def _path(file: str) -> Path:
     if file == "env":
-        return _ENV_FILE if _ENV_FILE.exists() else _ENV_TEMPLATE
+        return environment_file(
+            template=True, preferred=_ENV_FILE, template_path=_ENV_TEMPLATE
+        )
     if file == "simple":
         return _SIMPLE_FILE
     raise HTTPException(status_code=404, detail="不支持的配置文件。")
@@ -174,25 +179,7 @@ def _type_name(value_type: Any) -> tuple[str, list[str]]:
 
 
 def _schema_for_type(value_type: Any) -> dict[str, Any]:
-    if value_type is None:
-        return {"type": "string"}
-    origin = get_origin(value_type)
-    if origin in (list, tuple, set):
-        args = get_args(value_type)
-        return {
-            "type": "array",
-            "items": _schema_for_type(args[0]) if args else {},
-        }
-    if origin is dict:
-        args = get_args(value_type)
-        return {
-            "type": "object",
-            "additionalProperties": _schema_for_type(args[1]) if len(args) > 1 else {},
-        }
-    if _is_pydantic_type(value_type) and isinstance(value_type, type):
-        return model_json_schema(value_type)
-    mapping = {str: "string", int: "integer", float: "number", bool: "boolean"}
-    return {"type": mapping.get(value_type, "string")}
+    return schema_for_type(value_type)
 
 
 def _registered_groups() -> list[dict[str, Any]]:
@@ -212,6 +199,9 @@ def _registered_groups() -> list[dict[str, Any]]:
                     "type": type_name,
                     "type_inner": type_inner,
                     "value": None if sensitive else jsonable_encoder(config.value),
+                    "effective_value": None
+                    if sensitive
+                    else jsonable_encoder(config.value),
                     "default_value": (
                         None if sensitive else jsonable_encoder(config.default_value)
                     ),
@@ -219,6 +209,12 @@ def _registered_groups() -> list[dict[str, Any]]:
                     "has_value": bool(config.value) if sensitive else None,
                     "schema": _schema_for_type(config.type),
                     "ui": ui,
+                    "authority": (
+                        "database"
+                        if module.casefold() == "ai"
+                        and key.upper() == "CHAT_PLUGIN_ENABLED"
+                        else "file"
+                    ),
                 }
             )
         fields.sort(key=lambda item: (item["ui"].get("order", 0), item["key"]))
@@ -229,7 +225,167 @@ def _registered_groups() -> list[dict[str, Any]]:
                 "fields": fields,
             }
         )
+    stored = _yaml_parser().load(StringIO(_read(_SIMPLE_FILE))) or {}
+    if isinstance(stored, dict):
+        known_groups = {item["module"]: item for item in groups}
+        for module, values in stored.items():
+            if not isinstance(values, dict):
+                groups.append(
+                    {
+                        "module": str(module),
+                        "name": str(module),
+                        "fields": [],
+                        "registered": False,
+                        "raw_value": jsonable_encoder(values),
+                        "readonly_reason": "此顶层值不是配置组映射，请使用原文编辑。",
+                    }
+                )
+                continue
+            group = known_groups.get(str(module))
+            if group is None:
+                group = {
+                    "module": str(module),
+                    "name": str(module),
+                    "fields": [],
+                    "registered": False,
+                }
+                groups.append(group)
+            existing = {item["key"].upper(): item for item in group["fields"]}
+            for key, value in values.items():
+                if str(key).upper() in existing:
+                    descriptor = existing[str(key).upper()]
+                    descriptor["configured"] = True
+                    if not descriptor["sensitive"]:
+                        descriptor["file_value"] = jsonable_encoder(value)
+                        descriptor["value"] = jsonable_encoder(value)
+                    continue
+                group["fields"].append(
+                    {
+                        "key": str(key),
+                        "help": "未注册配置，保存后需确认对应插件已加载。",
+                        "type": type(value).__name__,
+                        "value": jsonable_encoder(value),
+                        "default_value": None,
+                        "schema": inferred_schema(value),
+                        "ui": {},
+                        "registered": False,
+                        "sensitive": False,
+                    }
+                )
+    for group in groups:
+        for field in group["fields"]:
+            if (
+                group["module"].casefold() == "ai"
+                and field["key"].upper() == "CHAT_PLUGIN_ENABLED"
+            ):
+                field["help"] = (
+                    "历史首次导入值；当前开关以数据库插件策略为准。请在插件策略页面修改。"
+                )
+                field["authority"] = "database"
     return groups
+
+
+def _environment_fields(values: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    from nonebot import get_driver
+    from nonebot.config import Config as NoneBotConfig
+
+    from zhenxun.adapters.qq_official.config import QQOfficialConfig
+    from zhenxun.configs.config import BotSetting
+    from zhenxun.services.cache import Config as CacheConfig
+    from zhenxun.utils.pydantic_compat import model_json_schema
+
+    values = {key.upper(): value for key, value in values.items()}
+    schemas = {}
+    for model in (NoneBotConfig, BotSetting, QQOfficialConfig, CacheConfig):
+        root = model_json_schema(model)
+        for name, schema in root.get("properties", {}).items():
+            schemas[name.upper()] = {**schema, "x-root-schema": root}
+    keys = set(KNOWN_ENV_KEYS) | set(_ENV_FORM_KEYS) | set(schemas) | set(values)
+    runtime = get_driver().config
+    result = {}
+    for key in sorted(keys):
+        schema = schemas.get(key, {})
+        raw = values.get(key)
+        default = schema.get("default")
+        parsed = raw
+        if (
+            raw is not None
+            and schema.get("type") != "string"
+            and (schema or str(raw).lstrip().startswith(("{", "[")))
+        ):
+            try:
+                parsed = json.loads(raw)
+            except (ValueError, TypeError):
+                pass
+        if (
+            isinstance(parsed, str)
+            and parsed.lower() in {"true", "false"}
+            and schema.get("type") == "boolean"
+        ):
+            parsed = parsed.lower() == "true"
+        secret = is_sensitive_env_key(key)
+        effective = getattr(runtime, key.lower(), None)
+        result[key] = {
+            "key": key,
+            "schema": schema,
+            "sensitive": secret,
+            "value": None if secret else jsonable_encoder(parsed),
+            "default_value": None if secret else default,
+            "configured": key in values,
+            "effective_value": None if secret else jsonable_encoder(effective),
+            "overridden": key in os.environ,
+            "apply_effect": environment_effect(key),
+        }
+    return result
+
+
+def _validate_environment_types(
+    content: str, changed_keys: set[str] | None = None
+) -> None:
+    from nonebot.config import Config as NoneBotConfig
+
+    from zhenxun.adapters.qq_official.config import QQOfficialConfig
+    from zhenxun.configs.config import BotSetting
+    from zhenxun.services.cache import Config as CacheConfig
+    from zhenxun.utils.pydantic_compat import parse_as
+
+    values = {
+        key.upper(): value
+        for key, value in dotenv_values(stream=StringIO(content)).items()
+    }
+    descriptors = _environment_fields(values)
+    issues = []
+    for model in (NoneBotConfig, BotSetting, QQOfficialConfig, CacheConfig):
+        fields = getattr(model, "model_fields", None) or getattr(
+            model, "__fields__", {}
+        )
+        for name, field in fields.items():
+            key = name.upper()
+            if key not in values or (
+                changed_keys is not None and key not in changed_keys
+            ):
+                continue
+            raw = values[key]
+            value = descriptors[key]["value"]
+            if descriptors[key]["sensitive"]:
+                value = raw
+            annotation = getattr(field, "outer_type_", field.annotation)
+            try:
+                parse_as(annotation, value)
+            except Exception as error:
+                details = error.errors() if hasattr(error, "errors") else [{}]
+                for detail in details:
+                    issues.append(
+                        {
+                            "code": "env_value_invalid",
+                            "file": str(_path("env")),
+                            "path": ".".join([key, *map(str, detail.get("loc", ()))]),
+                            "message": detail.get("msg", "值不符合声明类型"),
+                            "severity": "error",
+                        }
+                    )
+    if issues:
+        raise ConfigurationValidationError(issues)
 
 
 def _env_encode(value: Any) -> str:
@@ -237,6 +393,9 @@ def _env_encode(value: Any) -> str:
         return "True" if value else "False"
     if isinstance(value, int | float):
         return str(value)
+    if isinstance(value, dict | list):
+        # The outer quoting belongs to dotenv; one json.loads recovers the object.
+        return json.dumps(json.dumps(value, ensure_ascii=False), ensure_ascii=False)
     return json.dumps(value, ensure_ascii=False)
 
 
@@ -249,7 +408,7 @@ def _update_env(content: str, fields: dict[str, Any]) -> str:
     for binding in parse_stream(StringIO(content)):
         key = binding.key.upper() if binding.key else None
         if key in remaining:
-            output.append(f"{key} = {_env_encode(remaining.pop(key))}\n")
+            output.append(_replace_env_binding(binding, remaining.pop(key)))
         else:
             output.append(binding.original.string)
     if remaining:
@@ -259,6 +418,25 @@ def _update_env(content: str, fields: dict[str, Any]) -> str:
             f"{key} = {_env_encode(value)}\n" for key, value in remaining.items()
         )
     return "".join(output)
+
+
+def _replace_env_binding(binding, value: Any) -> str:
+    original = binding.original.string
+    match = re.match(
+        r"(\s*(?:export[ \t]+)?(?:'[^']+'|[^\s=#]+)[ \t]*=[ \t]*)([\s\S]*)", original
+    )
+    if match is None:
+        return f"{binding.key} = {_env_encode(value)}\n"
+    prefix, old = match.groups()
+    quoted = re.match(r"""(?:"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*')""", old)
+    if quoted:
+        suffix = old[quoted.end() :]
+    else:
+        comment = re.search(r"[ \t]+#", old)
+        suffix = (
+            old[comment.start() :] if comment else ("\n" if old.endswith("\n") else "")
+        )
+    return prefix + _env_encode(value) + suffix
 
 
 def _update_custom_env(content: str, operations: list[CustomEnvOperation]) -> str:
@@ -296,6 +474,27 @@ def _update_custom_env(content: str, operations: list[CustomEnvOperation]) -> st
     return "".join(output)
 
 
+def _replace_value(previous: Any, value: Any) -> Any:
+    if previous == value:
+        return previous
+    if isinstance(previous, dict) and isinstance(value, dict):
+        for key in list(previous):
+            if key not in value:
+                del previous[key]
+        for key, child in value.items():
+            previous[key] = _replace_value(previous.get(key), child)
+        return previous
+    if isinstance(previous, list) and isinstance(value, list):
+        for index, child in enumerate(value):
+            if index < len(previous):
+                previous[index] = _replace_value(previous[index], child)
+            else:
+                previous.append(child)
+        del previous[len(value) :]
+        return previous
+    return value
+
+
 def _update_simple(content: str, fields: dict[str, Any]) -> str:
     parser = _yaml_parser()
     data = parser.load(StringIO(content)) or {}
@@ -308,7 +507,51 @@ def _update_simple(content: str, fields: dict[str, Any]) -> str:
         if not isinstance(group, dict):
             raise ValueError("yaml_group_mapping_required")
         for key, value in values.items():
-            group[str(key).upper()] = value
+            registered = Config.get_data().get(module)
+            normalized = str(key).upper()
+            target_key = next(
+                (old for old in group if str(old).upper() == normalized), None
+            )
+            if target_key is None:
+                target_key = (
+                    normalized
+                    if registered and normalized in registered.configs
+                    else str(key)
+                )
+            group[target_key] = _replace_value(group.get(target_key), value)
+    stream = StringIO()
+    parser.dump(data, stream)
+    return stream.getvalue()
+
+
+def _unset_fields(content: str, file: str, paths: list[list[str]]) -> str:
+    if not paths:
+        return content
+    if file == "env":
+        from dotenv.parser import parse_stream
+
+        if any(
+            len(path) != 1 or not _ENV_KEY_PATTERN.fullmatch(path[0]) for path in paths
+        ):
+            raise ValueError("invalid_unset_path")
+        keys = {path[0].upper() for path in paths}
+        return "".join(
+            binding.original.string
+            for binding in parse_stream(StringIO(content))
+            if not binding.key or binding.key.upper() not in keys
+        )
+    parser = _yaml_parser()
+    data = parser.load(StringIO(content)) or {}
+    for path in paths:
+        if len(path) != 2:
+            raise ValueError("invalid_unset_path")
+        group = data.get(path[0], {})
+        if isinstance(group, dict):
+            key = next(
+                (key for key in group if str(key).casefold() == path[1].casefold()),
+                path[1],
+            )
+            group.pop(key, None)
     stream = StringIO()
     parser.dump(data, stream)
     return stream.getvalue()
@@ -354,53 +597,15 @@ async def configuration_summary() -> Result:
     env_path = _path("env")
     env_content = _read(env_path)
 
-    # 预处理多行值：将 key = 'value' 格式的多行值转为单行
-    lines = []
-    i = 0
-    content_lines = env_content.splitlines()
-    while i < len(content_lines):
-        line = content_lines[i]
-        stripped = line.strip()
-
-        # 检测多行值开始：key = '
-        if "=" in stripped and stripped.endswith("'"):
-            key_part = stripped.split("=", 1)[0].strip()
-            if stripped.count("'") == 1:  # 只有开始引号
-                # 收集多行内容
-                value_lines = [stripped.split("=", 1)[1].strip()[1:]]  # 移除开始的 '
-                i += 1
-                while i < len(content_lines):
-                    inner = content_lines[i].rstrip()
-                    if inner.endswith("'"):
-                        value_lines.append(inner[:-1])  # 移除结束的 '
-                        i += 1
-                        break
-                    value_lines.append(inner)
-                    i += 1
-                # 合并为单行JSON
-                import json
-
-                try:
-                    merged = "".join(value_lines)
-                    parsed = json.loads(merged)
-                    serialized = json.dumps(parsed, ensure_ascii=False)
-                    lines.append(f"{key_part} = {serialized}")
-                except Exception:
-                    lines.append(line)
-                continue
-
-        lines.append(line)
-        i += 1
-
-    preprocessed_content = "\n".join(lines)
-    values = dotenv_values(stream=StringIO(preprocessed_content))
+    values = dict(dotenv_values(stream=StringIO(env_content)))
+    descriptors = _environment_fields(values)
     env_fields = {
         key: None if is_sensitive_env_key(key) else values.get(key)
-        for key in _ENV_FORM_KEYS
+        for key in descriptors
     }
     custom_env = []
     for key, value in sorted(values.items(), key=lambda item: str(item[0]).casefold()):
-        if str(key).upper() in KNOWN_ENV_KEYS:
+        if str(key).upper() in descriptors:
             continue
         sensitive = is_sensitive_env_key(str(key))
         custom_env.append(
@@ -416,9 +621,9 @@ async def configuration_summary() -> Result:
         {
             "env": {
                 "fields": env_fields,
-                "field_effects": {
-                    key: environment_effect(key) for key in _ENV_FORM_KEYS
-                },
+                "descriptors": list(descriptors.values()),
+                "source_file": str(env_path),
+                "field_effects": {key: environment_effect(key) for key in descriptors},
                 "custom_env": custom_env,
                 "revision": _revision(env_content),
             },
@@ -464,6 +669,8 @@ async def validate_configuration(payload: ConfigurationValidation) -> Result:
             if payload.file == "env"
             else validate_simple_yaml(payload.content)
         )
+        if payload.file == "env":
+            _validate_environment_types(payload.content)
     except Exception as error:
         raise _validation_error(payload.file, error) from error
     return Result.ok({"valid": True, "warnings": warnings})
@@ -479,7 +686,7 @@ async def validate_configuration(payload: ConfigurationValidation) -> Result:
 async def update_configuration_file(
     file: str, payload: ConfigurationFileUpdate
 ) -> Result:
-    target = _ENV_FILE if file == "env" else _path(file)
+    target = environment_target(_path("env")) if file == "env" else _path(file)
     current_path = _path(file)
     current = _read(current_path)
     if _revision(current) != payload.expected_revision:
@@ -490,16 +697,21 @@ async def update_configuration_file(
         payload.content is None
         and payload.fields is None
         and not payload.custom_operations
+        and not payload.unset_fields
     ):
         raise HTTPException(status_code=422, detail="没有可保存的配置内容。")
     try:
         content = payload.content
-        if payload.content is not None and payload.custom_operations:
+        if payload.content is not None and (
+            payload.custom_operations or payload.unset_fields
+        ):
             raise ValueError("custom_env_raw_conflict")
         if file != "env" and payload.custom_operations:
             raise ValueError("custom_env_file_invalid")
         if content is None:
-            if file == "env" and set(payload.fields or {}) - set(_ENV_FORM_KEYS):
+            if file == "env" and set(payload.fields or {}) - set(
+                _environment_fields(dict(dotenv_values(stream=StringIO(current))))
+            ):
                 raise ValueError("env_field_not_editable")
             content = (
                 _update_env(current, payload.fields or {})
@@ -508,9 +720,25 @@ async def update_configuration_file(
             )
             if file == "env":
                 content = _update_custom_env(content, payload.custom_operations or [])
+        content = _unset_fields(content, file, payload.unset_fields)
         warnings = (
             _validate_env(content) if file == "env" else validate_simple_yaml(content)
         )
+        if file == "env":
+            before = {
+                key.upper(): value
+                for key, value in dotenv_values(stream=StringIO(current)).items()
+            }
+            after = {
+                key.upper(): value
+                for key, value in dotenv_values(stream=StringIO(content)).items()
+            }
+            _validate_environment_types(
+                content,
+                None
+                if payload.content is not None
+                else {key for key in after if before.get(key) != after[key]},
+            )
     except Exception as error:
         raise _validation_error(file, error) from error
 
@@ -535,7 +763,7 @@ async def update_configuration_file(
             env_operation = await runtime_environment_manager.apply(
                 current, content, submit_restart=False
             )
-    except Exception as error:
+    except (Exception, asyncio.CancelledError) as error:
         if original is None:
             target.unlink(missing_ok=True)
         else:
@@ -543,8 +771,10 @@ async def update_configuration_file(
         if file == "simple":
             try:
                 await reload_runtime_config(submit_restart=False)
-            except Exception:
-                pass
+            except Exception as rollback_error:
+                logger.error("配置文件已恢复，但运行态恢复失败", e=rollback_error)
+        if isinstance(error, asyncio.CancelledError):
+            raise
         raise HTTPException(
             status_code=500,
             detail=f"配置保存或重载失败（{error.__class__.__name__}）。",

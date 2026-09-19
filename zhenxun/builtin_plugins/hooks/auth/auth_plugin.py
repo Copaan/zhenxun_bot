@@ -196,6 +196,38 @@ async def auth_plugin(
         if context is not None:
             group = context.group or group
             user_id = context.user_id
+        if context is not None:
+            from zhenxun.services.plugin_policy import plugin_policy_service
+
+            identity = context.event
+            reason = plugin_policy_service.availability(
+                plugin,
+                context.bot_data,
+                group,
+                bot_id=identity.bot_id,
+                platform_scope=identity.platform_scope,
+                group_id=identity.group_id,
+                channel_id=identity.channel_id,
+                is_superuser=identity.is_superuser,
+            )
+            if reason:
+                messages = {
+                    "global_disabled": "该功能在当前场景全局关闭...",
+                    "administrator_disabled": "超级管理员禁用了该群此功能...",
+                    "group_disabled": "该群未开启此功能...",
+                    "private_disabled": "当前账号未开启此私聊功能...",
+                    "account_disabled": "当前账号未开启此功能...",
+                    "not_loaded": "该功能尚未加载...",
+                }
+                sid = identity.group_id or user_id or session.user.id
+                should_tip = freq.is_send_limit_message(plugin, sid, is_poke(event))
+                raise SkipPluginException(
+                    f"插件策略禁止调用: {reason}",
+                    tip_message=messages.get(reason) if should_tip else None,
+                    tip_check_tag=sid if should_tip else None,
+                    tip_background=should_tip,
+                )
+            return
         is_poke_event = is_poke(event)
         user_check = PluginCheck(group, session, is_poke_event, user_id)
 

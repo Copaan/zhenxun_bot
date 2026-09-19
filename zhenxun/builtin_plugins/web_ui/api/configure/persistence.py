@@ -6,7 +6,6 @@ from io import StringIO
 import json
 import os
 from pathlib import Path
-import re
 import secrets
 import tempfile
 from typing import Any
@@ -14,6 +13,7 @@ from typing import Any
 from ruamel.yaml import YAML
 
 from zhenxun.configs.config import Config
+from zhenxun.configs.environment import environment_file, environment_target
 from zhenxun.services.log import logger
 
 from ...passwords import hash_password
@@ -33,11 +33,14 @@ _CREDENTIAL_HELP = {
 
 
 def _set_env_value(env_text: str, key: str, value: str | int) -> str:
-    replacement = f"{key} = {value}"
-    pattern = rf"(?m)^\s*#?\s*{re.escape(key)}\s*=.*$"
-    if re.search(pattern, env_text):
-        return re.sub(pattern, lambda _: replacement, env_text, count=1)
-    return f"{env_text.rstrip()}\n{replacement}\n"
+    from ..tabs.system.configuration import _update_env
+
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            pass
+    return _update_env(env_text, {key: value})
 
 
 def _quote_env(value: str) -> str:
@@ -205,7 +208,9 @@ def apply_configuration(setting: ApplyRequest) -> dict[str, Any]:
     simple_bytes, plugin_bytes = _credential_documents(
         setting.username.strip(), password_hash
     )
-    source = _ENV_CONFIG if _ENV_CONFIG.exists() else _ENV_TEMPLATE
+    source = environment_file(
+        template=True, preferred=_ENV_CONFIG, template_path=_ENV_TEMPLATE
+    )
     if not source.exists():
         raise FileNotFoundError("env_template_missing")
     env_text = source.read_text(encoding="utf-8")
@@ -235,7 +240,7 @@ def apply_configuration(setting: ApplyRequest) -> dict[str, Any]:
     _write_transaction(
         [
             (_PLUGIN_CONFIG, plugin_bytes),
-            (_ENV_CONFIG, env_text.encode("utf-8")),
+            (environment_target(source), env_text.encode("utf-8")),
             (_SIMPLE_CONFIG, simple_bytes),
         ]
     )

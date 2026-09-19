@@ -12,15 +12,15 @@ from zhenxun.models.mahiro_bank import MahiroBank
 from zhenxun.models.mahiro_bank_log import MahiroBankLog
 from zhenxun.models.sign_user import SignUser
 from zhenxun.models.user_console import UserConsole
-from zhenxun.services import avatar_service
 from zhenxun.services.asset_transaction import (
     account_write,
     asset_call,
     asset_transaction,
 )
+from zhenxun.services.avatar_service import avatar_service
+from zhenxun.services.business_identity import business_user_id
 from zhenxun.services.log import logger
 from zhenxun.utils.enum import BankHandleType, GoldHandle
-from zhenxun.utils.platform import PlatformUtils
 
 base_config = Config.get("mahiro_bank")
 
@@ -180,7 +180,7 @@ class BankManager:
         返回:
             dict: 用户银行数据字典
         """
-        user_id = session.user.id
+        user_id = await business_user_id(session)
         user = await cls.get_user(user_id=user_id)
         (
             rank,
@@ -221,8 +221,7 @@ class BankManager:
             }
             for deposit in user_today_deposit
         ]
-        platform = PlatformUtils.get_platform(session)
-        avatar_path = await avatar_service.get_avatar_path(platform, user_id)
+        avatar_path = await avatar_service.get_session_avatar_path(session)
         avatar_url = avatar_path.as_uri() if avatar_path else ""
         return {
             "name": uname,

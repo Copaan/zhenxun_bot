@@ -6,9 +6,8 @@ from nonebot.utils import is_coroutine_callable
 from nonebot_plugin_apscheduler import scheduler
 
 from zhenxun.configs.utils import PluginExtraData, Task
-from zhenxun.models.group_console import GroupConsole
 from zhenxun.models.task_info import TaskInfo
-from zhenxun.services.cache.runtime_cache import GroupMemoryCache, TaskInfoMemoryCache
+from zhenxun.services.cache.runtime_cache import TaskInfoMemoryCache
 from zhenxun.services.log import logger
 from zhenxun.services.startup_reconcile import (
     commit as commit_reconcile,
@@ -65,17 +64,9 @@ async def update_to_group(create_list: list[tuple[bool, TaskInfo]]):
         create_list: 被动技能创建列表
     """
     if blocks := [t[1].module for t in create_list if not t[0]]:
-        if group_list := await GroupConsole.all():
-            for group in group_list:
-                block_tasks = list(
-                    set(CommonUtils.convert_module_format(group.block_task) + blocks)
-                )
-                group.block_task = CommonUtils.convert_module_format(block_tasks)
-            # 使用逐条保存替代 bulk_update，避免 SQLite 兼容性问题
-            for group in group_list:
-                await group.save(update_fields=["block_task"])
-            for group in group_list:
-                await GroupMemoryCache.upsert_from_model(group)
+        from zhenxun.services.bot_group_policy import bot_group_policy_service
+
+        await bot_group_policy_service.initialize_created_tasks(blocks)
 
 
 async def to_db(
@@ -91,9 +82,12 @@ async def to_db(
         update_list: 被动技能更新列表
     """
     if create_list:
+        from zhenxun.services.plugin_policy import policy_transaction
+
         _create_list = [t[1] for t in create_list]
-        await TaskInfo.bulk_create(_create_list, 10)
-        await update_to_group(create_list)
+        async with policy_transaction():
+            await TaskInfo.bulk_create(_create_list, 10)
+            await update_to_group(create_list)
     if update_list:
         # 使用逐条保存替代 bulk_update，避免 SQLite 兼容性问题
         for task in update_list:

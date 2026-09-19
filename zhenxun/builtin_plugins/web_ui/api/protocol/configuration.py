@@ -10,7 +10,6 @@ from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit, urlunsplit
 
 from dotenv import dotenv_values
-from dotenv.parser import parse_stream
 from fastapi import APIRouter, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
 import httpx
@@ -115,11 +114,20 @@ class ProtocolConfigurationUpdate(BaseModel):
 
 
 def _source_path() -> Path:
-    if _ENV_FILE.exists():
-        return _ENV_FILE
-    if _ENV_TEMPLATE.exists():
-        return _ENV_TEMPLATE
+    from zhenxun.configs.environment import environment_file
+
+    source = environment_file(
+        template=True, preferred=_ENV_FILE, template_path=_ENV_TEMPLATE
+    )
+    if source.exists():
+        return source
     raise HTTPException(status_code=500, detail="环境配置文件不存在。")
+
+
+def _target_path() -> Path:
+    from zhenxun.configs.environment import environment_target
+
+    return environment_target(_source_path())
 
 
 def _revision(content: str) -> str:
@@ -137,30 +145,16 @@ def _validate_env(content: str) -> None:
 
 
 def _env_value(value: Any) -> str:
-    if isinstance(value, bool):
-        return "True" if value else "False"
-    if isinstance(value, int):
-        return str(value)
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    from ..tabs.system.configuration import _env_encode
+
+    return _env_encode(value)
 
 
 def _update_env(content: str, values: dict[str, Any]) -> str:
+    from ..tabs.system.configuration import _update_env as update_environment
+
     _validate_env(content)
-    remaining = {key.upper(): value for key, value in values.items()}
-    output: list[str] = []
-    for binding in parse_stream(StringIO(content)):
-        key = binding.key.upper() if binding.key else None
-        if key in remaining:
-            output.append(f"{key}={_env_value(remaining.pop(key))}\n")
-        else:
-            output.append(binding.original.string)
-    if remaining:
-        if output and not output[-1].endswith("\n"):
-            output.append("\n")
-        output.extend(
-            f"{key}={_env_value(value)}\n" for key, value in remaining.items()
-        )
-    result = "".join(output)
+    result = update_environment(content, values)
     _validate_env(result)
     return result
 
@@ -502,7 +496,7 @@ async def save_protocol_configuration(
     changed = _effective_protocol_changes(values, changed)
     updated = _update_env(current, changed)
     if updated != current:
-        _write_transaction([(_ENV_FILE, updated.encode("utf-8"))])
+        _write_transaction([(_target_path(), updated.encode("utf-8"))])
     changed_keys, pending_keys = env_change_impact(current, updated, _PROTOCOL_ENV_KEYS)
     restart_required = bool(set(changed_keys) & set(pending_keys))
     reasons = [f"environment:{key}" for key in pending_keys]
@@ -598,7 +592,7 @@ async def delete_qq_bot(
         },
     )
     try:
-        _write_transaction([(_ENV_FILE, updated.encode("utf-8"))])
+        _write_transaction([(_target_path(), updated.encode("utf-8"))])
     except Exception as exc:
         logger.error(
             "QQ Bot本地配置移除失败 code=qq_bot_delete_failed",

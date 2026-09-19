@@ -49,12 +49,38 @@ async def classify_plugin(
     sort_data = await sort_type()
     classify: dict[str, list] = {}
     group = await GroupConsole.get_group(group_id=group_id) if group_id else None
-    bot = await BotConsole.get_or_none(bot_id=session.self_id)
+    from zhenxun.services.plugin_policy import plugin_policy_service
+    from zhenxun.utils.platform import PlatformUtils
+
+    scope = PlatformUtils.get_platform_scope(session)
+    bot_id = f"qq_api:{session.self_id}" if scope == "qq_api" else str(session.self_id)
+    bot = await BotConsole.get_or_none(bot_id=bot_id)
+    channel_id = getattr(getattr(session, "channel", None), "id", None)
     for menu, value in sort_data.items():
         for plugin in value:
             if not classify.get(menu):
                 classify[menu] = []
-            classify[menu].append(handle(bot, plugin, group, is_detail))
+            item = handle(bot, plugin, group, is_detail)
+            reason = plugin_policy_service.availability(
+                plugin,
+                bot,
+                group,
+                bot_id=bot_id,
+                platform_scope=scope,
+                group_id=group_id,
+                channel_id=channel_id,
+            )
+            item["status"] = (
+                3
+                if reason == "global_disabled"
+                else 2
+                if reason in {"account_disabled", "administrator_disabled"}
+                else 1
+                if reason
+                else 0
+            )
+            item["blocked_by"] = reason
+            classify[menu].append(item)
     for value in classify.values():
         value.sort(key=lambda x: int(x["id"]))
     return classify

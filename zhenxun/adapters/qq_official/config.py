@@ -297,18 +297,24 @@ def validate_qq_config_data(config: QQOfficialConfig) -> None:
         raise QQOfficialConfigError("QQ_BOTS 存在重复 AppID")
 
     for index, item in enumerate(config.qq_bots):
-        if not item.intent.c2c_group_at_messages:
+        supported = {
+            "c2c_group_at_messages",
+            "at_messages",
+            "guild_messages",
+            "direct_message",
+        }
+        if not any(getattr(item.intent, name) for name in supported):
             raise QQOfficialConfigError(
-                f"QQ_BOTS.{index}.intent.c2c_group_at_messages 必须为 true"
+                f"QQ_BOTS.{index}.intent 必须启用至少一种受支持的消息类型"
             )
         unsupported_intents = [
             name
             for name, enabled in item.intent.dict().items()
-            if name != "c2c_group_at_messages" and enabled
+            if name not in supported and enabled
         ]
         if unsupported_intents:
             raise QQOfficialConfigError(
-                f"QQ_BOTS.{index}.intent 包含首期不支持的字段: "
+                f"QQ_BOTS.{index}.intent 包含不支持的字段: "
                 + ", ".join(unsupported_intents)
             )
 

@@ -12,7 +12,8 @@ from zhenxun.models.level_user import LevelUser
 from zhenxun.models.sign_user import SignUser
 from zhenxun.models.statistics import Statistics
 from zhenxun.models.user_console import UserConsole
-from zhenxun.services import avatar_service
+from zhenxun.services.avatar_service import avatar_service
+from zhenxun.services.business_identity import business_user_id
 from zhenxun.services.db_context import with_db_timeout
 from zhenxun.services.log import logger
 from zhenxun.services.message_load import is_db_unhealthy
@@ -121,7 +122,7 @@ def get_level(impression: float) -> int:
 
 
 async def get_chat_history(
-    user_id: str, group_id: str | None
+    user_id: str, group_id: str | None, *, bot_id: str | None = None
 ) -> tuple[list[str], list[int]]:
     """获取用户聊天记录
 
@@ -135,8 +136,10 @@ async def get_chat_history(
     """
     now = datetime.now()
     filter_date = now - timedelta(days=7)
+    filters = {"bot_id": bot_id} if bot_id else {}
     date_list = await _read_db(
         lambda: ChatHistory.filter(
+            **filters,
             user_id=user_id,
             group_id=group_id,
             create_time__gte=filter_date,
@@ -176,35 +179,52 @@ async def get_user_info(
         bytes: 图片数据
     """
     platform = PlatformUtils.get_platform(session) or "qq"
-    avatar_path = await avatar_service.get_avatar_path(platform, user_id)
+    official = PlatformUtils.get_platform_scope(session) == "qq_api"
+    account_key = (
+        await business_user_id(session) if user_id == session.user.id else user_id
+    )
+    history_filters = {"bot_id": PlatformUtils.get_storage_bot_id(session)}
+    avatar_path = (
+        await avatar_service.get_session_avatar_path(session)
+        if user_id == session.user.id
+        else await avatar_service.get_avatar_path(platform, user_id)
+    )
     avatar_url = avatar_path.as_uri() if avatar_path else ""
 
     user = await _read_db(
-        lambda: UserConsole.get_user(user_id, platform),
+        lambda: UserConsole.get_user(account_key, platform),
         "MyInfo.user_console",
         None,
     )
-    permission_level = await _read_db(
-        lambda: LevelUser.get_user_level(user_id, group_id),
-        "MyInfo.level_user",
-        0,
+    permission_level = (
+        0
+        if official
+        else await _read_db(
+            lambda: LevelUser.get_user_level(user_id, group_id),
+            "MyInfo.level_user",
+            0,
+        )
     )
 
     sign_level = 0
     if sign_user := await _read_db(
-        lambda: SignUser.get_or_none(user_id=user_id),
+        lambda: SignUser.get_or_none(user_id=account_key),
         "MyInfo.sign_user",
         None,
     ):
         sign_level = get_level(float(sign_user.impression))
 
     chat_count = await _read_db(
-        lambda: ChatHistory.filter(user_id=user_id, group_id=group_id).count(),
+        lambda: ChatHistory.filter(
+            user_id=user_id, group_id=group_id, **history_filters
+        ).count(),
         "MyInfo.chat_count",
         0,
     )
     stat_count = await _read_db(
-        lambda: Statistics.filter(user_id=user_id, group_id=group_id).count(),
+        lambda: Statistics.filter(
+            user_id=user_id, group_id=group_id, **history_filters
+        ).count(),
         "MyInfo.stat_count",
         0,
     )
@@ -218,7 +238,9 @@ async def get_user_info(
     now = datetime.now()
     weather_icon_name = "moon" if now.hour < 6 or now.hour > 19 else "sun"
 
-    chart_labels, chart_data = await get_chat_history(user_id, group_id)
+    chart_labels, chart_data = await get_chat_history(
+        user_id, group_id, **history_filters
+    )
 
     profile_data = {
         "page": {

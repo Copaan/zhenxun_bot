@@ -1233,6 +1233,9 @@ async def reserve_gold(
     session: Uninfo,
 ):
     """预扣金币，matcher 未实际完成时由 SideEffectCommit 回滚。"""
+    from zhenxun.services.business_identity import business_user_id
+
+    user_id = await business_user_id(session)
     try:
         reservation = await with_timeout(
             UserConsole.reserve_gold(
@@ -1515,19 +1518,19 @@ async def _resolve_cost_gold(
     if prep.profile.cost_gold <= 0:
         hook_recorder.set("cost_gold", "skipped")
         return 0
-    if prep.snapshot.context.platform_scope == "qq_api":
-        hook_recorder.set("cost_gold", "qq_api_unadapted")
-        raise SkipPluginException("该状态型功能尚未适配 QQ 官方身份")
     if is_db_unhealthy():
         hook_recorder.set("cost_gold", "db_unhealthy")
         raise SkipPluginException("数据库繁忙，金币功能暂不可用...")
     cost_start = time.time()
     try:
         if prep.user is None:
+            from zhenxun.services.business_identity import business_user_id
+
+            account_key = await business_user_id(session)
             user_start = time.time()
             prep.user = await with_timeout(
                 UserConsole.get_user(
-                    prep.permission_context.user_id,
+                    account_key,
                     PlatformUtils.get_platform(session),
                 ),
                 name="get_cost_user",

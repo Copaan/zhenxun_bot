@@ -30,6 +30,11 @@ class BotGroupPluginPolicy(Model):
     channel_id = fields.CharField(max_length=191, default="")
     block_plugins: list[str] = fields.JSONField(default=list)
     block_tasks: list[str] = fields.JSONField(default=list)
+    forced_plugins: list[str] = fields.JSONField(default=list, null=True)
+    forced_tasks: list[str] = fields.JSONField(default=list, null=True)
+    revision = fields.IntField(default=0)
+    migration_version = fields.IntField(default=0)
+    migration_snapshot: dict = fields.JSONField(default=dict, null=True)
     update_time = fields.DatetimeField(auto_now=True)
 
     class Meta:

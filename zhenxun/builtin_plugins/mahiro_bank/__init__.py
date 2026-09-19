@@ -8,6 +8,7 @@ from nonebot_plugin_waiter import prompt_until
 
 from zhenxun import ui
 from zhenxun.configs.utils import PluginExtraData, RegisterConfig
+from zhenxun.services.business_identity import business_user_id
 from zhenxun.services.log import logger
 from zhenxun.utils.depends import UserName
 from zhenxun.utils.manager.priority_manager import PriorityLifecycle
@@ -144,10 +145,14 @@ async def get_amount(handle_type: str) -> int:
 @_matcher.assign("deposit")
 async def _(session: Uninfo, arparma: Arparma, amount: Match[int]):
     amount_num = amount.result if amount.available else await get_amount("存款")
-    if result := await BankManager.deposit_check(session.user.id, amount_num):
+    if result := await BankManager.deposit_check(
+        await business_user_id(session), amount_num
+    ):
         await MessageUtils.build_message(result).finish(reply_to=True)
     try:
-        _, rate, event_rate = await BankManager.deposit(session.user.id, amount_num)
+        _, rate, event_rate = await BankManager.deposit(
+            await business_user_id(session), amount_num
+        )
     except ValueError as error:
         await MessageUtils.build_message(str(error)).finish(reply_to=True)
     result = (
@@ -169,10 +174,12 @@ async def _(session: Uninfo, arparma: Arparma, amount: Match[int]):
 @_matcher.assign("withdraw")
 async def _(session: Uninfo, arparma: Arparma, amount: Match[int]):
     amount_num = amount.result if amount.available else await get_amount("取款")
-    if result := await BankManager.withdraw_check(session.user.id, amount_num):
+    if result := await BankManager.withdraw_check(
+        await business_user_id(session), amount_num
+    ):
         await MessageUtils.build_message(result).finish(reply_to=True)
     try:
-        user = await BankManager.withdraw(session.user.id, amount_num)
+        user = await BankManager.withdraw(await business_user_id(session), amount_num)
         result = (
             f"取款成功！\n当前取款金额为: {amount_num}\n当前存款金额为: {user.amount}"
         )

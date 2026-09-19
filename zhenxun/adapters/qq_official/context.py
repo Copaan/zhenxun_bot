@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar, Token
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 import hashlib
@@ -13,9 +13,11 @@ from uuid import UUID
 from nonebot.adapters import Event
 from nonebot.adapters.qq.event import (
     C2CMessageCreateEvent,
+    DirectMessageCreateEvent,
     FriendRobotEvent,
     GroupMessageCreateEvent,
     GroupRobotEvent,
+    GuildMessageEvent,
 )
 from tortoise.exceptions import IntegrityError
 
@@ -30,7 +32,7 @@ from .cache import (
 )
 from .models import QQOfficialIdentity, QQOfficialPrincipal, QQWebhookReceipt
 
-OfficialScene = Literal["c2c", "group"]
+OfficialScene = Literal["c2c", "group", "guild"]
 _reply_state_creation_lock = asyncio.Lock()
 
 
@@ -54,9 +56,17 @@ class OfficialQQEventContext:
     received_at: datetime
     reply_deadline: datetime
     max_passive_replies: int
+    guild_id: str = ""
+    channel_id: str = ""
+    guild_direct: bool = False
+    guild_event: GuildMessageEvent | None = field(
+        default=None, repr=False, compare=False
+    )
 
     @property
     def reply_address(self) -> dict[str, str]:
+        if self.scene == "guild":
+            raise ValueError("Guild replies must use the adapter's channel/DM API")
         address = {
             "scene": self.scene,
             "openid": (self.actor_openid if self.scene == "c2c" else self.group_openid),
@@ -123,16 +133,20 @@ def with_official_event_context(
 
     @wraps(function)
     async def wrapped(*args, **kwargs):
+        from zhenxun.services.business_identity import business_event_scope
+
         event = kwargs.get("event")
         if event is None and len(args) > 1:
             event = args[1]
         context = event_official_context(event) if event is not None else None
-        if context is None:
-            return await function(*args, **kwargs)
         context_token = CURRENT_OFFICIAL_CONTEXT.set(context)
-        scope_token = CURRENT_PLATFORM_SCOPE.set("qq_api")
+        bot = kwargs.get("bot") or (args[0] if args else None)
+        from zhenxun.utils.platform import PlatformUtils
+
+        scope_token = CURRENT_PLATFORM_SCOPE.set(PlatformUtils.get_platform_scope(bot))
         try:
-            return await function(*args, **kwargs)
+            with business_event_scope():
+                return await function(*args, **kwargs)
         finally:
             CURRENT_OFFICIAL_CONTEXT.reset(context_token)
             CURRENT_PLATFORM_SCOPE.reset(scope_token)
@@ -145,6 +159,8 @@ def _event_address(event: Event) -> tuple[OfficialScene, str, str] | None:
         return "c2c", str(event.author.user_openid), ""
     if isinstance(event, GroupMessageCreateEvent):
         return "group", str(event.author.member_openid), str(event.group_openid)
+    if isinstance(event, GuildMessageEvent):
+        return "guild", str(event.author.id or ""), ""
     if isinstance(event, FriendRobotEvent):
         return "c2c", str(event.openid), ""
     if isinstance(event, GroupRobotEvent):
@@ -249,11 +265,19 @@ async def prepare_event_context(
         storage_bot_id=f"qq_api:{app_id}",
         storage_user_id=f"principal:{principal_id}",
         storage_group_id=(
-            f"qq_api:{app_id}:group:{group_openid}" if group_openid else None
+            f"qq_api:{app_id}:guild:{event.guild_id}"
+            if scene == "guild"
+            else f"qq_api:{app_id}:group:{group_openid}"
+            if group_openid
+            else None
         ),
         received_at=received_at,
         reply_deadline=received_at + window,
         max_passive_replies=4 if scene == "c2c" else 5,
+        guild_id=str(getattr(event, "guild_id", "") or ""),
+        channel_id=str(getattr(event, "channel_id", "") or ""),
+        guild_direct=isinstance(event, DirectMessageCreateEvent),
+        guild_event=event if isinstance(event, GuildMessageEvent) else None,
     )
     bind_event_official_context(event, context)
     return context
@@ -296,6 +320,8 @@ class OfficialReplyUnavailable(RuntimeError):
 async def allocate_reply_sequence(
     context: OfficialQQEventContext,
 ) -> tuple[ReplyState, int]:
+    if context.scene == "guild":
+        raise OfficialReplyUnavailable("Guild replies use channel/DM APIs")
     now = datetime.now(timezone.utc)
     if now >= context.reply_deadline:
         raise OfficialReplyUnavailable("QQ passive reply window expired")

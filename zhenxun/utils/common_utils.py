@@ -8,7 +8,6 @@ from nonebot_plugin_uninfo import Session, SupportScope, Uninfo, get_interface
 
 from zhenxun.configs.config import BotConfig
 from zhenxun.configs.path_config import THEMES_PATH
-from zhenxun.models.group_console import GroupConsole
 from zhenxun.services.cache.runtime_cache import (
     BanMemoryCache,
     BotMemoryCache,
@@ -55,14 +54,20 @@ class CommonUtils:
         if scope == "qq_api":
             bot_id = f"qq_api:{bot_id}"
         channel_id = getattr(getattr(session, "channel", None), "id", None)
+        await bot_group_policy_service.ensure_fresh(bot_id, scope, group_id, channel_id)
         if bot_group_policy_service.blocked(
-            bot_id, scope, group_id, module, task=True, channel_id=channel_id
+            bot_id,
+            scope if group_id else "private",
+            group_id or bot_group_policy_service.PRIVATE_KEY,
+            module,
+            task=True,
+            channel_id=channel_id,
         ):
             return True
         if await TaskInfoMemoryCache.is_runtime_disabled(module):
             """被动全局状态"""
             return True
-        bot_snapshot = await BotMemoryCache.get(session.self_id)
+        bot_snapshot = await BotMemoryCache.get(bot_id)
         if bot_snapshot and not bot_snapshot.status:
             """bot是否休眠"""
             return True
@@ -72,7 +77,27 @@ class CommonUtils:
                 """bot是否禁用被动"""
                 return True
         if group_id:
-            if await GroupConsole.is_block_task(group_id, module):
+            legacy = GroupMemoryCache.get_if_ready(group_id, channel_id)
+            parent = GroupMemoryCache.get_if_ready(group_id, None)
+            if not bot_group_policy_service.migrated(
+                bot_id, scope, group_id, channel_id
+            ) and (
+                (
+                    legacy
+                    and (
+                        module in legacy.block_task_set
+                        or module in legacy.superuser_block_task_set
+                    )
+                )
+                or (
+                    channel_id
+                    and parent
+                    and (
+                        module in parent.block_task_set
+                        or module in parent.superuser_block_task_set
+                    )
+                )
+            ):
                 """群组是否禁用被动"""
                 return True
             if g := GroupMemoryCache.get_if_ready(group_id, None):

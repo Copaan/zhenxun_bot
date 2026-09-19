@@ -31,7 +31,16 @@ def current_asset_connection():
     ORM's default connection can escape the transaction on pooled databases.
     """
     scope = _scope.get()
+    if scope is not None and scope.owner is not asyncio.current_task():
+        raise RuntimeError("asset_transaction_cross_task")
     return scope.connection if scope is not None else None
+
+
+def locked_asset_keys() -> frozenset[str]:
+    scope = _scope.get()
+    if scope is None or scope.owner is not asyncio.current_task():
+        return frozenset()
+    return frozenset(scope.users)
 
 
 @asynccontextmanager
@@ -51,6 +60,9 @@ async def asset_transactions(user_ids, platform: str | None = None):
     for identity in identities:
         await UserConsole._get_user_for_write(identity, platform)
     async with in_transaction() as connection:
+        from zhenxun.services.business_identity import validate_business_write
+
+        await validate_business_write(identities, connection)
         users = {}
         for identity in identities:
             users[identity] = (

@@ -9,6 +9,7 @@ from zhenxun.models.group_member_info import GroupInfoUser
 from zhenxun.services.log import logger
 from zhenxun.utils.depends import UserName
 from zhenxun.utils.message import MessageUtils
+from zhenxun.utils.platform import PlatformUtils
 
 from .my_info import InfoDataUnavailable, get_user_info
 
@@ -39,6 +40,10 @@ async def _(
 ):
     user_id = session.user.id
     if at_user.available and session.group:
+        if PlatformUtils.get_platform_scope(session) == "qq_api":
+            await MessageUtils.build_message(
+                "官方 QQ 暂仅支持查询自己的业务账号信息。"
+            ).finish()
         user_id = at_user.result.target
         if user := await GroupInfoUser.get_or_none(
             user_id=user_id, group_id=session.group.id

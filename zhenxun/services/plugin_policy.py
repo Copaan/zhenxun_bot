@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from functools import wraps
 import hashlib
 import json
 from typing import Any, Literal
@@ -71,7 +73,264 @@ def _revision(payload: dict[str, Any]) -> str:
     return hashlib.sha256(content.encode()).hexdigest()
 
 
+@asynccontextmanager
+async def policy_transaction():
+    from zhenxun.services.cache.write import current_connection, in_write_transaction
+
+    if in_write_transaction():
+        connection = current_connection()
+        try:
+            yield connection
+        except BaseException:
+            if not connection._finalized:
+                await connection.rollback()
+            raise
+    else:
+        async with in_transaction() as connection:
+            yield connection
+
+
+def _policy_transaction(method):
+    @wraps(method)
+    async def wrapped(self, *args, **kwargs):
+        # Management operations can affect shared templates and multiple bots.
+        # Lock in one order before checking revisions, including nested imports.
+        async with runtime_mutation_coordinator.operation("plugin_policy_write"):
+            async with policy_transaction() as connection:
+                await (
+                    PluginPolicy.all()
+                    .using_db(connection)
+                    .select_for_update()
+                    .order_by("id")
+                )
+                await (
+                    BotConsole.all()
+                    .using_db(connection)
+                    .select_for_update()
+                    .order_by("id")
+                )
+                result = await method(self, *args, **kwargs)
+            if isinstance(result, dict):
+                result["publication_pending"] = bool(BotMemoryCache._publication_failed)
+            return result
+
+    return wrapped
+
+
 class PluginPolicyService:
+    @staticmethod
+    def availability(
+        profile,
+        bot,
+        group,
+        *,
+        bot_id,
+        platform_scope,
+        group_id=None,
+        channel_id=None,
+        is_superuser=False,
+        task=False,
+    ):
+        from zhenxun.services.bot_group_policy import bot_group_policy_service as scoped
+
+        module = profile.module
+        kind = "tasks" if task else "plugins"
+        superuser_exempt = is_superuser and (
+            not getattr(profile, "limit_superuser", False)
+            or getattr(profile, "plugin_type", None) == PluginType.SUPERUSER
+        )
+        if not getattr(profile, "load_status", True):
+            return "not_loaded"
+        if bot is not None and module in _decode_modules(
+            getattr(bot, f"block_{kind}", "")
+        ):
+            return "account_disabled"
+        scope = platform_scope if group_id else "private"
+        scene = group_id or scoped.PRIVATE_KEY
+        if scoped.blocked(
+            bot_id,
+            scope,
+            scene,
+            module,
+            task=task,
+            channel_id=channel_id,
+            is_superuser=superuser_exempt,
+        ):
+            return "group_disabled" if group_id else "private_disabled"
+        if superuser_exempt and not task:
+            return None
+        block_type = getattr(profile, "block_type", None)
+        block_type = getattr(block_type, "value", block_type)
+        global_disabled = (
+            (not profile.status and block_type in {None, "ALL"})
+            or (group_id and block_type == "GROUP")
+            or (not group_id and block_type == "PRIVATE")
+        )
+        if global_disabled and not (
+            group is not None
+            and getattr(group, "is_super", False)
+            and block_type == "ALL"
+        ):
+            return "global_disabled"
+        if group is not None and not scoped.migrated(
+            bot_id, platform_scope, group_id, channel_id
+        ):
+            suffix = "task" if task else "plugin"
+            if module in _decode_modules(
+                getattr(group, f"superuser_block_{suffix}", "")
+            ):
+                return "administrator_disabled"
+            if module in _decode_modules(getattr(group, f"block_{suffix}", "")):
+                return "group_disabled"
+        return None
+
+    @staticmethod
+    def global_switch_values():
+        from zhenxun.services.cache.runtime_cache import (
+            PluginInfoMemoryCache,
+            RuntimeCacheMutation,
+        )
+
+        RuntimeCacheMutation.require_fresh(PluginInfoMemoryCache)
+        if not PluginInfoMemoryCache.is_loaded():
+            raise PluginPolicyError("插件策略尚未就绪")
+        return {
+            module: bool(
+                row.status
+                or getattr(row.block_type, "value", row.block_type)
+                in {"GROUP", "PRIVATE"}
+            )
+            for module, row in PluginInfoMemoryCache._by_module.items()
+        }
+
+    async def migrate_legacy_chat_switches(self):
+        from zhenxun.configs.config import Config
+        from zhenxun.models.plugin_policy import PluginPolicyMigration
+        from zhenxun.services.ai.chat_switch import module_identity
+        from zhenxun.utils.enum import BlockType
+
+        values = Config.get_config("AI", "CHAT_PLUGIN_ENABLED", {}) or {}
+        if not isinstance(values, dict):
+            return
+        async with policy_transaction() as connection:
+            plugins = (
+                await PluginInfo.all()
+                .using_db(connection)
+                .select_for_update()
+                .order_by("id")
+            )
+            for plugin in plugins:
+                relevant = {
+                    name: enabled
+                    for name, enabled in values.items()
+                    if module_identity(plugin.module_path).startswith(
+                        module_identity(name) + "."
+                    )
+                    or module_identity(name) == plugin.module
+                }
+                key = (
+                    "ai-chat:" + hashlib.sha256(plugin.module_path.encode()).hexdigest()
+                )
+                if (
+                    not relevant
+                    or await PluginPolicyMigration.filter(key=key)
+                    .using_db(connection)
+                    .exists()
+                ):
+                    continue
+                previous = {
+                    "status": plugin.status,
+                    "block_type": plugin.block_type,
+                    "file_rules": relevant,
+                }
+                if any(value is False for value in relevant.values()):
+                    plugin.status, plugin.block_type = False, BlockType.ALL
+                    await plugin.save(
+                        using_db=connection, update_fields=["status", "block_type"]
+                    )
+                await PluginPolicyMigration.create(
+                    key=key, previous=previous, using_db=connection
+                )
+
+    async def global_state(self, *, task=False):
+        model = TaskInfo if task else PluginInfo
+        rows = await model.all().order_by("module")
+        values = {
+            row.module: {
+                "status": row.status,
+                "block_type": getattr(row, "block_type", None),
+                "default_status": row.default_status,
+            }
+            for row in rows
+        }
+        return {
+            "revision": _revision(
+                {
+                    "values": values,
+                    "versions": {str(row.id): row.policy_revision for row in rows},
+                }
+            ),
+            "tasks" if task else "plugins": values,
+            "switches": {
+                key: bool(
+                    value["status"] or value["block_type"] in {"GROUP", "PRIVATE"}
+                )
+                for key, value in values.items()
+            },
+        }
+
+    async def set_global(
+        self,
+        module,
+        enabled,
+        *,
+        block_type=None,
+        expected_revision=None,
+        task=False,
+        default=False,
+    ):
+        from zhenxun.utils.enum import BlockType
+
+        model = TaskInfo if task else PluginInfo
+        async with runtime_mutation_coordinator.operation("plugin_policy_global"):
+            async with policy_transaction() as connection:
+                rows = (
+                    await model.all()
+                    .using_db(connection)
+                    .select_for_update()
+                    .order_by("id")
+                )
+                if expected_revision is not None:
+                    self._check_revision(
+                        expected_revision,
+                        (await self.global_state(task=task))["revision"],
+                    )
+                matches = [
+                    row for row in rows if module is None or row.module == module
+                ]
+                if not matches:
+                    raise PluginPolicyNotFound("插件不存在")
+                for row in matches:
+                    if default:
+                        row.default_status = enabled
+                        fields = ["default_status"]
+                    else:
+                        row.status = enabled
+                        fields = ["status"]
+                        if not task:
+                            row.block_type = (
+                                block_type
+                                if block_type is not None
+                                else None
+                                if enabled
+                                else BlockType.ALL
+                            )
+                            fields.append("block_type")
+                    row.policy_revision += 1
+                    fields.append("policy_revision")
+                    await row.save(using_db=connection, update_fields=fields)
+        return await self.global_state(task=task)
+
     async def catalog(self) -> dict[str, list[dict[str, Any]]]:
         plugins = await PluginInfo.get_plugins(load_status=None, filter_parent=False)
         tasks = await TaskInfo.get_tasks(status=None, load_status=None)
@@ -86,6 +345,7 @@ class PluginPolicyService:
                     "menu_type": plugin.menu_type or "",
                     "load_status": bool(plugin.load_status),
                     "global_status": bool(plugin.status),
+                    "block_type": plugin.block_type,
                 }
                 for plugin in plugins
                 if plugin.plugin_type in _MANAGED_PLUGIN_TYPES
@@ -102,6 +362,20 @@ class PluginPolicyService:
                 for task in tasks
             ],
         }
+
+    async def set_global_settings(
+        self, module, *, default_status, block_type, expected_revision=None
+    ):
+        async with runtime_mutation_coordinator.operation("plugin_policy_settings"):
+            async with policy_transaction():
+                await self.set_global(
+                    module,
+                    block_type != "ALL",
+                    block_type=block_type,
+                    expected_revision=expected_revision,
+                )
+                await self.set_global(module, default_status, default=True)
+        return await self.global_state()
 
     async def _catalog_modules(self) -> tuple[set[str], set[str]]:
         catalog = await self.catalog()
@@ -276,6 +550,7 @@ class PluginPolicyService:
         block_tasks = _decode_modules(bot.block_tasks if bot else "")
         payload = {
             "bot_id": bot_id,
+            "revision_number": int(bot.policy_revision) if bot else 0,
             "mode": "linked" if binding and policy else "independent",
             "policy_id": int(policy.id) if policy else None,
             "policy_revision": int(policy.revision) if policy else None,
@@ -313,13 +588,45 @@ class PluginPolicyService:
         bot_id = await self._resolve_bot_id(bot_id, known=known)
         bot, binding, policy = await self._state_for_bot(bot_id)
         state = self._account_payload(bot_id, bot, binding, policy)
-        plugin_modules, task_modules = await self._catalog_modules()
+        catalog = await self.catalog()
+        plugin_modules = {item["module"] for item in catalog["plugins"]}
+        task_modules = {item["module"] for item in catalog["tasks"]}
+        effective = {}
+        for kind in ("plugins", "tasks"):
+            effective[kind] = []
+            for item in catalog[kind]:
+                reasons = []
+                if not item["load_status"]:
+                    reasons.append("not_loaded")
+                if item["module"] in state[f"block_{kind}"]:
+                    reasons.append("account_disabled")
+                block_type = item.get("block_type")
+                if not item["global_status"] and block_type not in {"GROUP", "PRIVATE"}:
+                    reasons.append("global_disabled")
+                if block_type in {"GROUP", "PRIVATE"}:
+                    reasons.append(
+                        "global_group_disabled"
+                        if block_type == "GROUP"
+                        else "global_private_disabled"
+                    )
+                effective[kind].append(
+                    {
+                        "module": item["module"],
+                        "local_enabled": item["module"] not in state[f"block_{kind}"],
+                        "effective_enabled": not reasons,
+                        "blocked_by": reasons,
+                    }
+                )
         return {
             **known[bot_id],
             **state,
             "policy": self._policy_view(policy, [bot_id]) if policy else None,
             "missing_plugins": sorted(set(state["block_plugins"]) - plugin_modules),
             "missing_tasks": sorted(set(state["block_tasks"]) - task_modules),
+            "effective": effective,
+            "scope": "account",
+            "editable_scope": {"bot_id": bot_id},
+            "publication_pending": bool(BotMemoryCache._publication_failed),
         }
 
     async def _ensure_known(self, bot_ids: Iterable[str]) -> None:
@@ -340,6 +647,7 @@ class PluginPolicyService:
         blocked_plugins = _normalize_modules(block_plugins)
         blocked_tasks = _normalize_modules(block_tasks)
         defaults = {
+            "policy_revision": F("policy_revision") + 1,
             "block_plugins": _encode_modules(blocked_plugins),
             "block_tasks": _encode_modules(blocked_tasks),
             "available_plugins": _encode_modules(plugin_modules - set(blocked_plugins)),
@@ -347,6 +655,7 @@ class PluginPolicyService:
         }
         bot = await BotConsole.filter(bot_id=bot_id).using_db(connection).first()
         if bot is None:
+            defaults["policy_revision"] = 1
             bot = BotConsole(bot_id=bot_id, **defaults)
             await super(BotConsole, bot).save(
                 using_db=connection,
@@ -356,8 +665,15 @@ class PluginPolicyService:
             await BotConsole.filter(id=bot.id).using_db(connection).update(**defaults)
 
     async def _publish_accounts(self, bot_ids: Iterable[str]) -> None:
+        from zhenxun.services.cache.write import defer, require_publication
+
         for bot in await BotConsole.filter(bot_id__in=list(set(bot_ids))):
-            await BotMemoryCache.upsert_from_model(bot)
+
+            async def publish(record=bot):
+                require_publication(await BotMemoryCache.upsert_from_model(record))
+
+            if not defer(("runtime", "BotMemoryCache", bot.bot_id), publish):
+                await publish()
 
     @staticmethod
     def _check_revision(expected: str, actual: str) -> None:
@@ -367,6 +683,7 @@ class PluginPolicyService:
                 details={"current_revision": actual},
             )
 
+    @_policy_transaction
     async def update_account(
         self,
         bot_id: str,
@@ -388,7 +705,7 @@ class PluginPolicyService:
                 preserve_tasks=current["missing_tasks"],
             )
             catalog_modules = await self._catalog_modules()
-            async with in_transaction() as connection:
+            async with policy_transaction() as connection:
                 await (
                     BotPluginPolicyBinding.filter(bot_id=bot_id)
                     .using_db(connection)
@@ -404,6 +721,7 @@ class PluginPolicyService:
             await self._publish_accounts([bot_id])
         return await self.get_account(bot_id)
 
+    @_policy_transaction
     async def create_policy(
         self,
         *,
@@ -452,7 +770,7 @@ class PluginPolicyService:
             if name.casefold() in existing_names:
                 raise PluginPolicyError("策略名称已存在")
             catalog_modules = await self._catalog_modules()
-            async with in_transaction() as connection:
+            async with policy_transaction() as connection:
                 policy = await PluginPolicy.create(
                     using_db=connection,
                     name=name,
@@ -479,6 +797,7 @@ class PluginPolicyService:
             await self._publish_accounts(targets)
         return self._policy_view(policy, targets)
 
+    @_policy_transaction
     async def update_policy(
         self,
         policy_id: int,
@@ -523,7 +842,7 @@ class PluginPolicyService:
                     "包含不可配置或未知的模块",
                     details={"plugins": invalid_plugins, "tasks": invalid_tasks},
                 )
-            async with in_transaction() as connection:
+            async with policy_transaction() as connection:
                 await (
                     PluginPolicy.filter(id=policy_id)
                     .using_db(connection)
@@ -548,6 +867,7 @@ class PluginPolicyService:
             policy = await PluginPolicy.get(id=policy_id)
         return self._policy_view(policy, bot_ids)
 
+    @_policy_transaction
     async def delete_policy(self, policy_id: int, expected_revision: str) -> None:
         async with runtime_mutation_coordinator.operation("plugin_policy_delete"):
             policy = await PluginPolicy.get_or_none(id=policy_id)
@@ -565,6 +885,7 @@ class PluginPolicyService:
                 )
             await policy.delete()
 
+    @_policy_transaction
     async def bind_accounts(
         self,
         *,
@@ -604,7 +925,7 @@ class PluginPolicyService:
                     }
                 )
             catalog_modules = await self._catalog_modules()
-            async with in_transaction() as connection:
+            async with policy_transaction() as connection:
                 for bot_id in targets:
                     await (
                         BotPluginPolicyBinding.filter(bot_id=bot_id)
@@ -628,6 +949,7 @@ class PluginPolicyService:
             "changes": changes,
         }
 
+    @_policy_transaction
     async def copy_account(
         self,
         *,
@@ -649,7 +971,7 @@ class PluginPolicyService:
                     expected_revisions.get(bot_id, ""), current["revision"]
                 )
             catalog_modules = await self._catalog_modules()
-            async with in_transaction() as connection:
+            async with policy_transaction() as connection:
                 for bot_id in targets:
                     await (
                         BotPluginPolicyBinding.filter(bot_id=bot_id)
@@ -729,6 +1051,7 @@ class PluginPolicyService:
             return
         await self._mutate_all(kind, enabled=enabled, module=None)
 
+    @_policy_transaction
     async def _mutate_all(
         self,
         kind: FeatureKind,
@@ -767,7 +1090,7 @@ class PluginPolicyService:
                 binding.bot_id: int(binding.policy_id) for binding in bindings
             }
             affected = set(bots) | set(binding_by_bot)
-            async with in_transaction() as connection:
+            async with policy_transaction() as connection:
                 for policy_id, (plugins, tasks) in policy_updates.items():
                     await (
                         PluginPolicy.filter(id=policy_id)
@@ -797,12 +1120,13 @@ class PluginPolicyService:
             await self._publish_accounts(affected)
 
     async def reconcile(self) -> dict[str, int]:
+        await self.migrate_legacy_chat_switches()
         changed: list[str] = []
         async with runtime_mutation_coordinator.operation("plugin_policy_reconcile"):
             bindings = await BotPluginPolicyBinding.all()
             policies = {int(p.id): p for p in await PluginPolicy.all()}
             catalog_modules = await self._catalog_modules()
-            async with in_transaction() as connection:
+            async with policy_transaction() as connection:
                 bots = {
                     str(bot.bot_id): bot
                     for bot in await BotConsole.all().using_db(connection)

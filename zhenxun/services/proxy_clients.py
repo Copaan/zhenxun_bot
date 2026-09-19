@@ -109,13 +109,13 @@ def _requests():
                     if isinstance(error, requests.exceptions.InvalidSchema):
                         raise ProxyPolicyError(
                             "proxy_requests_transport_unavailable"
-                        ) from None
+                        ) from error
                     code = (
                         "proxy_timeout"
                         if isinstance(error, requests.Timeout)
                         else "proxy_request_failed"
                     )
-                    raise ProxyPolicyError(code) from None
+                    raise ProxyPolicyError.from_error(code, error) from error
                 raise
 
     _patch(requests.Session, "send", send)
@@ -175,9 +175,11 @@ def _httpx(client_type, transport_type, asynchronous):
         with request_scope():
             try:
                 return send(client, request, **kwargs)
-            except httpx.RequestError:
+            except httpx.RequestError as error:
                 if route(request.url)[1]:
-                    raise ProxyPolicyError("proxy_request_failed") from None
+                    raise ProxyPolicyError.from_error(
+                        "proxy_request_failed", error
+                    ) from error
                 raise
 
     @wraps(send)
@@ -185,9 +187,11 @@ def _httpx(client_type, transport_type, asynchronous):
         with request_scope():
             try:
                 return await send(client, request, **kwargs)
-            except httpx.RequestError:
+            except httpx.RequestError as error:
                 if route(request.url)[1]:
-                    raise ProxyPolicyError("proxy_request_failed") from None
+                    raise ProxyPolicyError.from_error(
+                        "proxy_request_failed", error
+                    ) from error
                 raise
 
     @wraps(close)
@@ -255,9 +259,11 @@ def _aiohttp():
                 _require_verified_context(client.connector._ssl)
             try:
                 return await request(client, method, url, **kwargs)
-            except aiohttp.ClientError:
+            except aiohttp.ClientError as error:
                 if managed and proxy:
-                    raise ProxyPolicyError("proxy_request_failed") from None
+                    raise ProxyPolicyError.from_error(
+                        "proxy_request_failed", error
+                    ) from error
                 raise
 
     _patch(aiohttp.ClientRequest, "__init__", initialize)

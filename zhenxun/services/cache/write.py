@@ -35,11 +35,35 @@ _stats = {
 }
 
 
-def _request_reconciliation() -> None:
+class CachePublicationError(RuntimeError):
+    pass
+
+
+def require_publication(result: Any) -> None:
+    if result is False:
+        raise CachePublicationError("cache_invalidation_returned_false")
+
+
+def _request_reconciliation(key: tuple | None = None) -> None:
+    if key and key[0] == "bot_group_policy":
+        policy = sys.modules.get("zhenxun.services.bot_group_policy")
+        if policy is not None:
+            policy.bot_group_policy_service._stale.add(tuple(key[1:]))
     runtime = sys.modules.get("zhenxun.services.cache.runtime_cache")
     if runtime is not None:
-        runtime.runtime_cache_refresh_coordinator.request_refresh_all()
+        runtime.RuntimeCacheMutation.publication_failed(key)
         _stats["reconciliation_requests"] += 1
+    if key and (
+        key[0] in {"group_settings", "group_settings_all"}
+        or key[:2] == ("bulk", "group_plugin_settings")
+    ):
+        settings = sys.modules.get("zhenxun.services.group_settings_service")
+        if settings is not None:
+            settings.group_settings_service.mark_stale()
+    if key and key[:2] == ("bulk", "group_info_users"):
+        hot = sys.modules.get("zhenxun.services.hot_query_cache")
+        if hot is not None:
+            hot.mark_members_stale()
 
 
 @dataclass
@@ -62,21 +86,24 @@ class WriteBatch:
             pending, self.effects = self.effects, {}
             for key, effect in tuple(pending.items()):
                 try:
-                    await effect()
+                    require_publication(await effect())
                     _stats["published"] += 1
                 except asyncio.CancelledError:
                     self.effects.update(pending)
                     _stats["failed"] += 1
-                    _request_reconciliation()
+                    for pending_key in pending:
+                        _request_reconciliation(pending_key)
                     raise
                 except Exception as error:
                     # The database is committed. A cache error must not make the
                     # ORM skip releasing its transaction/connection resources.
                     _stats["failed"] += 1
-                    _request_reconciliation()
+                    _request_reconciliation(key)
                     from zhenxun.services.log import logger
 
-                    logger.error("Committed cache publication failed", e=error)
+                    logger.error(
+                        f"Committed cache publication failed: {key[:2]}", e=error
+                    )
                 pending.pop(key)
         finally:
             _flushing.reset(token)
@@ -110,6 +137,9 @@ def _observe_transaction_exit() -> None:
                     if connections.get(context.connection_name) is context.connection:
                         await _recover_transaction_context(context, pooled)
                     batch = getattr(context.connection, "_zx_cache_batch", None)
+                    if batch is not None:
+                        for key in batch.effects:
+                            _request_reconciliation(key)
                     if batch is not None and batch.uncertain_invalidations:
                         invalidations = WriteBatch(
                             effects=batch.uncertain_invalidations
@@ -119,7 +149,8 @@ def _observe_transaction_exit() -> None:
                             await invalidations.flush()
                         except BaseException:
                             _stats["failed"] += 1
-                    _request_reconciliation()
+                    if batch is None:
+                        _request_reconciliation()
                     raise
                 finally:
                     _exiting.reset(token)
@@ -255,6 +286,8 @@ def _transaction_batch(connection) -> WriteBatch | None:
         except BaseException:
             # Evict stale reads even if a commit's result is unknown. Never
             # publish captured model values from an unconfirmed transaction.
+            for key in batch.effects:
+                _request_reconciliation(key)
             batch.uncertain_invalidations = {
                 key: effect
                 for key, effect in batch.effects.items()
@@ -354,7 +387,14 @@ def deferred_mutation(function):
                 lambda: function(cls, *copied_args, **copied_kwargs),
             ):
                 return
-        return await function(cls, *args, **kwargs)
+        try:
+            result = await function(cls, *args, **kwargs)
+            require_publication(result)
+            return result
+        except BaseException:
+            if not _flushing.get():
+                _request_reconciliation(("runtime", cls.__name__))
+            raise
 
     return wrapped
 
@@ -372,7 +412,7 @@ async def notify_bulk_write(model) -> None:
 
         cache_type = model.get_cache_type()
         if cache_type:
-            await CacheRoot.invalidate_cache(cache_type)
+            require_publication(await CacheRoot.invalidate_cache(cache_type))
         mapping = {
             "plugin_info": (runtime.PluginInfoMemoryCache, "plugin"),
             "bot_console": (runtime.BotMemoryCache, "bot"),
@@ -401,8 +441,13 @@ async def notify_bulk_write(model) -> None:
 
             await group_settings_service.invalidate_all()
 
-    if not defer(("bulk", table), reconcile):
-        await reconcile()
+    key = ("bulk", table)
+    if not defer(key, reconcile):
+        try:
+            require_publication(await reconcile())
+        except BaseException:
+            _request_reconciliation(key)
+            raise
 
 
 class WriteQuery:

@@ -12,7 +12,6 @@ from pathlib import Path
 import time
 from typing import Any
 
-import aiofiles
 import httpx
 
 from zhenxun.configs.path_config import DATA_PATH
@@ -225,21 +224,45 @@ class HealthStatePersister:
         if not self._is_dirty:
             return
         async with self._lock:
+            if not self._is_dirty:
+                return
             self._is_dirty = False
-
-            data_to_save = model_dump(self.state)
+            temp_path = self.file_path.with_suffix(".json.tmp")
             try:
+                data_to_save = model_dump(self.state)
                 self.file_path.parent.mkdir(parents=True, exist_ok=True)
-                temp_path = self.file_path.with_suffix(".json.tmp")
-                async with aiofiles.open(temp_path, "w", encoding="utf-8") as f:
-                    await f.write(
-                        json.dumps(data_to_save, ensure_ascii=False, indent=2)
-                    )
-                if self.file_path.exists():
-                    self.file_path.unlink()
-                os.rename(temp_path, self.file_path)
+                serialized = json.dumps(data_to_save, ensure_ascii=False, indent=2)
+
+                def write_snapshot():
+                    try:
+                        temp_path.write_text(serialized, encoding="utf-8")
+                        os.replace(temp_path, self.file_path)
+                    finally:
+                        temp_path.unlink(missing_ok=True)
+
+                writer = asyncio.create_task(asyncio.to_thread(write_snapshot))
+                cancelled = False
+                while not writer.done():
+                    try:
+                        await asyncio.shield(writer)
+                    except asyncio.CancelledError:
+                        # Join the file operation before releasing the lock; a
+                        # late executor write must not overwrite the next save.
+                        cancelled = True
+                writer.result()
+                if cancelled:
+                    raise asyncio.CancelledError
+            except asyncio.CancelledError:
+                self._is_dirty = True
+                raise
             except Exception as e:
+                self._is_dirty = True
                 logger.error(f"保存密钥状态到文件失败: {e}", e=e)
+            finally:
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except OSError as e:
+                    logger.warning(f"清理密钥状态临时文件失败: {e}")
 
     async def stop(self):
         """停止后台任务并保存所有脏状态"""

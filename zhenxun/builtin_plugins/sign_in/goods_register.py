@@ -4,7 +4,10 @@ import nonebot
 from nonebot_plugin_uninfo import Uninfo
 
 from zhenxun.models.sign_user import SignUser
-from zhenxun.models.user_console import UserConsole
+from zhenxun.services.asset_transaction import (
+    asset_transaction,
+    current_asset_connection,
+)
 from zhenxun.utils.decorator.shop import shop_register
 from zhenxun.utils.platform import PlatformUtils
 
@@ -31,15 +34,18 @@ driver = nonebot.get_driver()
         "好感度双倍加持卡Ⅲ_prob": 0.3,
     },  # type: ignore
 )
-async def _(session: Uninfo, user_id: int, prob: float):
+async def _(session: Uninfo, user_id: str, prob: float):
     platform = PlatformUtils.get_platform(session)
-    user_console = await UserConsole.get_user(session.user.id, platform)
-    user, _ = await SignUser.get_or_create(
-        user_id=user_id,
-        defaults={"platform": platform, "user_console": user_console},
-    )
-    user.add_probability = Decimal(prob)
-    await user.save(update_fields=["add_probability"])
+    async with asset_transaction(str(user_id), platform) as user_console:
+        user, _ = await SignUser.get_or_create(
+            using_db=current_asset_connection(),
+            user_id=str(user_id),
+            defaults={"platform": platform, "user_console": user_console},
+        )
+        user.add_probability = Decimal(prob)
+        await user.save(
+            using_db=current_asset_connection(), update_fields=["add_probability"]
+        )
 
 
 @shop_register(

@@ -21,6 +21,7 @@ from zhenxun.services.log import logger
 from zhenxun.services.message_load import is_db_unhealthy
 from zhenxun.utils.enum import (
     BlockType,
+    CacheType,
     LimitCheckType,
     LimitWatchType,
     PluginLimitType,
@@ -800,6 +801,62 @@ class RuntimeCacheMutation:
     _retry_after: ClassVar[dict[str, float]] = {}
 
     @classmethod
+    def publication_failed(cls, key: tuple | None) -> None:
+        from zhenxun.services.permission_revision import advance_revision
+
+        # Legacy/custom effects do not identify a cache. Preserve their existing
+        # conservative repair; known model/runtime effects stay targeted.
+        if key and key[0] not in {
+            "runtime",
+            "bulk",
+            "model_clear",
+            "model_invalidate",
+            "group_settings",
+            "group_settings_all",
+        }:
+            key = None
+        tables = {
+            "plugin": ("plugin_info", CacheType.PLUGINS),
+            "bot": ("bot_console", CacheType.BOT),
+            "group": ("group_console", CacheType.GROUPS),
+            "level": ("level_users", CacheType.LEVEL),
+            "task": ("task_info", None),
+            "plugin_limit": ("plugin_limit", CacheType.LIMIT),
+            "ban": ("ban_console", CacheType.BAN),
+        }
+        changed = False
+        for label, (cache_cls, _) in runtime_cache_refresh_coordinator._specs().items():
+            if key is not None and not (
+                (key[0] == "runtime" and key[1] == cache_cls.__name__)
+                or (key[0] == "bulk" and key[1] == tables[label][0])
+                or (
+                    key[0] in {"model_clear", "model_invalidate"}
+                    and key[1] == tables[label][1]
+                )
+            ):
+                continue
+            cache_cls._publication_failed = True
+            cls.mark_error(cache_cls, RuntimeError("cache_publication_failed"))
+            cache_cls._publication_generation = (
+                getattr(cache_cls, "_publication_generation", 0) + 1
+            )
+            cache_cls._loaded = False
+            cls._retry_after.pop(label, None)
+            runtime_cache_refresh_coordinator.request_refresh(cache_cls)
+            changed = True
+        if changed:
+            advance_revision()
+
+    @staticmethod
+    def require_fresh(cache_cls: type) -> None:
+        from .write import CachePublicationError
+
+        if getattr(cache_cls, "_publication_failed", False):
+            raise CachePublicationError(
+                f"runtime_cache_reconciliation_pending:{cache_cls.__name__}"
+            )
+
+    @classmethod
     async def ensure_loaded(cls, cache_cls: type, label: str) -> None:
         if is_db_unhealthy():
             cls.mark_error(cache_cls, RuntimeError("database unhealthy"))
@@ -845,13 +902,20 @@ class RuntimeCacheMutation:
             if inspect.iscoroutine(coro):
                 coro.close()
             return None
+        generation = getattr(cache_cls, "_publication_generation", 0)
         try:
-            return await with_db_timeout(
+            result = await with_db_timeout(
                 coro,
                 timeout=RUNTIME_CACHE_DB_TIMEOUT_SECONDS,
                 operation=operation,
                 source="runtime_cache",
             )
+            if generation != getattr(cache_cls, "_publication_generation", 0):
+                RuntimeCacheMutation.mark_error(
+                    cache_cls, RuntimeError("cache_invalidated_during_refresh")
+                )
+                return None
+            return result
         except Exception as exc:
             RuntimeCacheMutation.mark_error(cache_cls, exc)
             return None
@@ -864,6 +928,7 @@ class RuntimeCacheMutation:
         setattr(cache_cls, "_loaded", True)
         setattr(cache_cls, "_last_refresh", time.time())
         setattr(cache_cls, "_last_error", None)
+        setattr(cache_cls, "_publication_failed", False)
 
     @staticmethod
     def mark_error(cache_cls: type, exc: Exception) -> None:
@@ -957,6 +1022,7 @@ class PluginInfoMemoryCache:
         if cls._loaded:
             return
         await RuntimeCacheMutation.ensure_loaded(cls, "plugin")
+        RuntimeCacheMutation.require_fresh(cls)
 
     @classmethod
     def is_loaded(cls) -> bool:
@@ -970,6 +1036,7 @@ class PluginInfoMemoryCache:
 
     @classmethod
     def get_by_module_if_ready(cls, module: str) -> "PluginInfo | None":
+        RuntimeCacheMutation.require_fresh(cls)
         if not cls._loaded:
             return None
         return cls._to_model(cls._by_module.get(module))
@@ -984,6 +1051,7 @@ class PluginInfoMemoryCache:
 
     @classmethod
     def get_by_module_path(cls, module_path: str) -> "PluginInfo | None":
+        RuntimeCacheMutation.require_fresh(cls)
         return cls._to_model(cls._by_module_path.get(module_path))
 
     @classmethod
@@ -1119,6 +1187,7 @@ class BotMemoryCache:
         if cls._loaded:
             return
         await RuntimeCacheMutation.ensure_loaded(cls, "bot")
+        RuntimeCacheMutation.require_fresh(cls)
 
     @classmethod
     def is_loaded(cls) -> bool:
@@ -1141,6 +1210,7 @@ class BotMemoryCache:
 
     @classmethod
     def get_if_ready(cls, bot_id: str | None) -> BotSnapshot | None:
+        RuntimeCacheMutation.require_fresh(cls)
         bot_id = cls._normalize(bot_id)
         if not bot_id or not cls._loaded:
             return None
@@ -1304,6 +1374,7 @@ class GroupMemoryCache:
         if cls._loaded:
             return
         await RuntimeCacheMutation.ensure_loaded(cls, "group")
+        RuntimeCacheMutation.require_fresh(cls)
 
     @classmethod
     def is_loaded(cls) -> bool:
@@ -1330,6 +1401,7 @@ class GroupMemoryCache:
     def get_if_ready(
         cls, group_id: str | None, channel_id: str | None = None
     ) -> GroupSnapshot | None:
+        RuntimeCacheMutation.require_fresh(cls)
         key = cls._key(group_id, channel_id)
         if not key:
             return None
@@ -1476,6 +1548,7 @@ class LevelUserMemoryCache:
         if cls._loaded:
             return
         await RuntimeCacheMutation.ensure_loaded(cls, "level")
+        RuntimeCacheMutation.require_fresh(cls)
 
     @classmethod
     def is_loaded(cls) -> bool:
@@ -1530,6 +1603,7 @@ class LevelUserMemoryCache:
     def get_levels_if_ready(
         cls, user_id: str | None, group_id: str | None
     ) -> tuple[LevelUserSnapshot | None, LevelUserSnapshot | None] | None:
+        RuntimeCacheMutation.require_fresh(cls)
         if not cls._loaded:
             return None
         global_user = None
@@ -1703,6 +1777,7 @@ class TaskInfoMemoryCache:
         if cls._loaded:
             return
         await RuntimeCacheMutation.ensure_loaded(cls, "task")
+        RuntimeCacheMutation.require_fresh(cls)
 
     @classmethod
     async def get(cls, module: str | None) -> TaskInfoSnapshot | None:
@@ -1879,6 +1954,7 @@ class PluginLimitMemoryCache:
         if cls._loaded:
             return
         await RuntimeCacheMutation.ensure_loaded(cls, "plugin_limit")
+        RuntimeCacheMutation.require_fresh(cls)
 
     @classmethod
     def is_loaded(cls) -> bool:
@@ -1902,6 +1978,7 @@ class PluginLimitMemoryCache:
 
     @classmethod
     def get_limits_if_ready(cls, module: str) -> list[PluginLimitSnapshot] | None:
+        RuntimeCacheMutation.require_fresh(cls)
         normalized = cls._normalize(module)
         if not normalized:
             return []
@@ -1918,6 +1995,7 @@ class PluginLimitMemoryCache:
 
     @classmethod
     def get_all_limits(cls) -> list[PluginLimitSnapshot]:
+        RuntimeCacheMutation.require_fresh(cls)
         return list(cls._by_id.values())
 
     @classmethod
@@ -2110,6 +2188,7 @@ class BanMemoryCache:
         if cls._loaded:
             return
         await RuntimeCacheMutation.ensure_loaded(cls, "ban")
+        RuntimeCacheMutation.require_fresh(cls)
 
     @classmethod
     def is_loaded(cls) -> bool:
@@ -2172,6 +2251,7 @@ class BanMemoryCache:
 
     @classmethod
     def is_banned(cls, user_id: str | None, group_id: str | None) -> bool:
+        RuntimeCacheMutation.require_fresh(cls)
         if not cls._loaded:
             return False
         neg_key = cls._neg_key(user_id, group_id)

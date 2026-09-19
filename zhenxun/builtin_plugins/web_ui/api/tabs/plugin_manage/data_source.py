@@ -3,7 +3,6 @@ from pathlib import Path
 import re
 from urllib.parse import quote
 
-import cattrs
 from fastapi import Query
 import nonebot
 from tortoise.exceptions import DoesNotExist
@@ -14,6 +13,7 @@ from zhenxun.models.plugin_info import PluginInfo as DbPluginInfo
 from zhenxun.nonebot_store.storage import load_manifest as load_nonebot_manifest
 from zhenxun.services.cache.runtime_cache import PluginInfoMemoryCache
 from zhenxun.services.runtime_config_reload import reload_runtime_config
+from zhenxun.services.runtime_mutation import managed_mutation
 from zhenxun.services.runtime_reload import plugin_runtime_manager
 from zhenxun.services.runtime_reload.models import ApplyMode, RuntimeOperation
 from zhenxun.utils.enum import BlockType, PluginType
@@ -81,6 +81,9 @@ class ApiDataSource:
             for store_key, item in load_nonebot_manifest().get("plugins", {}).items()
             if isinstance(item, dict) and item.get("state") == "managed"
         }
+        from zhenxun.services.plugin_policy import plugin_policy_service
+
+        policy_revision = (await plugin_policy_service.global_state())["revision"]
         for plugin in plugins:
             runtime_module = str(plugin.module_path or plugin.module)
             store_key = next(
@@ -129,6 +132,7 @@ class ApiDataSource:
                 management_route = None
             plugin_info = PluginInfo(
                 id=plugin.id,
+                policy_revision=policy_revision,
                 store_key=store_key,
                 runtime_module=runtime_module,
                 uninstall_supported=bool(store_key) and not is_builtin,
@@ -164,6 +168,7 @@ class ApiDataSource:
         return plugin_list
 
     @classmethod
+    @managed_mutation("plugin_configuration")
     async def update_plugin(
         cls, param: UpdatePlugin
     ) -> tuple[DbPluginInfo, RuntimeOperation | None]:
@@ -192,25 +197,40 @@ class ApiDataSource:
         }
         runtime_snapshot = Config.snapshot_runtime_values()
         previous_simple = deepcopy(Config._simple_data)
+        simple_path = Path("data/config.yaml")
+        previous_file = simple_path.read_bytes() if simple_path.exists() else None
         operation: RuntimeOperation | None = None
+        from zhenxun.services.plugin_policy import plugin_policy_service
+
+        applied_policy = await plugin_policy_service.set_global_settings(
+            param.module,
+            default_status=param.default_status,
+            block_type=param.block_type,
+            expected_revision=param.expected_revision,
+        )
         try:
-            db_plugin.default_status = param.default_status
+            await db_plugin.refresh_from_db()
             db_plugin.limit_superuser = param.limit_superuser
             db_plugin.cost_gold = param.cost_gold
             db_plugin.level = param.level
             db_plugin.menu_type = param.menu_type
-            db_plugin.block_type = param.block_type
-            db_plugin.status = param.block_type != BlockType.ALL
-            await db_plugin.save()
-            if param.configs and (configs := Config.get(param.module)):
-                for key in param.configs:
-                    if c := configs.configs.get(key):
-                        value = param.configs[key]
-                        if c.type and value is not None:
-                            value = cattrs.structure(value, c.type)
-                        Config.set_config(param.module, key, value)
-                Config.save(save_simple_data=True)
-                plugin_runtime_manager.mark_content_processed(Path("data/config.yaml"))
+            await db_plugin.save(
+                update_fields=["limit_superuser", "cost_gold", "level", "menu_type"]
+            )
+            if param.configs:
+                from ..system.configuration import (
+                    _update_simple,
+                    _write_transaction,
+                    validate_simple_yaml,
+                )
+
+                content = _update_simple(
+                    (previous_file or b"").decode("utf-8"),
+                    {param.module: param.configs},
+                )
+                validate_simple_yaml(content)
+                _write_transaction([(simple_path, content.encode("utf-8"))])
+                plugin_runtime_manager.mark_content_processed(simple_path)
                 operation = await reload_runtime_config(
                     submit_restart=False,
                     previous_simple_data=previous_simple,
@@ -219,14 +239,30 @@ class ApiDataSource:
                     raise RuntimeError(
                         operation.reason or "config_consumer_reload_failed"
                     )
-        except Exception:
+        except BaseException:
+            # Restore the file even if a newer policy revision prevents compensation.
+            Config.restore_runtime_values(runtime_snapshot)
+            from ...configure.persistence import _write_transaction
+
+            if previous_file is None:
+                simple_path.unlink(missing_ok=True)
+            else:
+                _write_transaction([(simple_path, previous_file)])
+            plugin_runtime_manager.mark_content_processed(simple_path)
+            await plugin_policy_service.set_global_settings(
+                param.module,
+                default_status=previous_db["default_status"],
+                block_type=previous_db["block_type"],
+                expected_revision=applied_policy["revision"],
+            )
+            await db_plugin.refresh_from_db()
             for key, value in previous_db.items():
                 setattr(db_plugin, key, value)
-            await db_plugin.save()
-            Config.restore_runtime_values(runtime_snapshot)
-            Config.save(save_simple_data=True)
-            plugin_runtime_manager.mark_content_processed(Path("data/config.yaml"))
+            await db_plugin.save(
+                update_fields=["limit_superuser", "cost_gold", "level", "menu_type"]
+            )
             raise
+        await db_plugin.refresh_from_db()
         return db_plugin, operation
 
     @classmethod
@@ -273,13 +309,22 @@ class ApiDataSource:
                     item.default_status is not None
                     and db_plugin.default_status != item.default_status
                 ):
-                    db_plugin.default_status = item.default_status
-                    other_update_fields.add("default_status")
-                    plugin_changed_other = True
+                    from zhenxun.services.plugin_policy import plugin_policy_service
+
+                    await plugin_policy_service.set_global(
+                        item.module, item.default_status, default=True
+                    )
+                    updated_count += 1
 
                 if plugin_changed_block:
                     try:
-                        await db_plugin.save(update_fields=["block_type", "status"])
+                        from zhenxun.services.plugin_policy import plugin_policy_service
+
+                        await plugin_policy_service.set_global(
+                            item.module,
+                            db_plugin.status,
+                            block_type=db_plugin.block_type,
+                        )
                         updated_count += 1
                     except Exception as e_save:
                         errors.append(
@@ -306,6 +351,7 @@ class ApiDataSource:
                 )
                 bulk_updated_count = len(plugins_to_update_other_fields)
                 for plugin in plugins_to_update_other_fields:
+                    await plugin.refresh_from_db()
                     await PluginInfoMemoryCache.upsert_from_model(plugin)
             except Exception as e_bulk:
                 errors.append(
@@ -351,6 +397,8 @@ class ApiDataSource:
                 type_inner = [x.strip() for x in type_inner.split(",")]
         else:
             type_str = ct
+        from ....config_schema import schema_for_type
+
         return PluginConfig(
             module=module,
             key=cfg,
@@ -359,6 +407,7 @@ class ApiDataSource:
             default_value=config.configs[cfg].default_value,
             type=type_str,
             type_inner=type_inner,  # type: ignore
+            schema=schema_for_type(config.configs[cfg].type),
         )
 
     @classmethod
@@ -419,8 +468,11 @@ class ApiDataSource:
             config_list.extend(
                 cls.__build_plugin_config(module, cfg, config) for cfg in config.configs
             )
+        from zhenxun.services.plugin_policy import plugin_policy_service
+
         return PluginDetail(
             id=db_plugin.id,
+            policy_revision=(await plugin_policy_service.global_state())["revision"],
             module=module,
             plugin_name=db_plugin.name,
             default_status=db_plugin.default_status,

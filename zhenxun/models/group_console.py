@@ -433,6 +433,13 @@ class GroupConsole(Model):
 
     @classmethod
     async def is_superuser_block_plugin(cls, group_id: str, module: str) -> bool:
+        from zhenxun.services.bot_group_policy import bot_group_policy_service
+
+        scoped = await bot_group_policy_service.legacy_blocked(
+            group_id, module, forced=True
+        )
+        if scoped is not None:
+            return scoped
         if group := GroupMemoryCache.get_if_ready(group_id, None):
             return bool(
                 group.superuser_block_plugin_set
@@ -443,6 +450,11 @@ class GroupConsole(Model):
 
     @classmethod
     async def is_block_plugin(cls, group_id: str, module: str) -> bool:
+        from zhenxun.services.bot_group_policy import bot_group_policy_service
+
+        scoped = await bot_group_policy_service.legacy_blocked(group_id, module)
+        if scoped is not None:
+            return scoped
         if group := GroupMemoryCache.get_if_ready(group_id, None):
             return (
                 True
@@ -464,38 +476,17 @@ class GroupConsole(Model):
         platform: str | None = None,
         channel_id: str | None = None,
     ):
-        """禁用群组插件
+        from zhenxun.services.bot_group_policy import bot_group_policy_service
 
-        参数:
-            group_id: 群组id
-            task: 任务模块
-            is_superuser: 是否为超级用户
-            platform: 平台
-        """
-        group, _ = await cls._get_or_create_group_for_write(
-            group_id=group_id,
+        return await bot_group_policy_service.legacy_set_feature(
+            group_id,
+            module,
+            False,
+            task=False,
+            is_superuser=is_superuser,
+            platform=platform,
             channel_id=channel_id,
-            defaults={"platform": platform},
         )
-        update_fields = []
-        if is_superuser:
-            superuser_block_plugin = convert_module_format(group.superuser_block_plugin)
-            if module not in superuser_block_plugin:
-                superuser_block_plugin.append(module)
-                group.superuser_block_plugin = convert_module_format(
-                    superuser_block_plugin
-                )
-                update_fields.append("superuser_block_plugin")
-        elif add_disable_marker(module) not in group.block_plugin:
-            block_plugin = convert_module_format(group.block_plugin)
-            block_plugin.append(module)
-            group.block_plugin = convert_module_format(block_plugin)
-            update_fields.append("block_plugin")
-        if update_fields:
-            await group.save(update_fields=update_fields)
-
-        # 更新缓存
-        await cls._update_cache(group)
 
     @classmethod
     async def set_unblock_plugin(
@@ -506,43 +497,29 @@ class GroupConsole(Model):
         platform: str | None = None,
         channel_id: str | None = None,
     ):
-        """禁用群组插件
+        from zhenxun.services.bot_group_policy import bot_group_policy_service
 
-        参数:
-            group_id: 群组id
-            task: 任务模块
-            is_superuser: 是否为超级用户
-            platform: 平台
-        """
-        group, _ = await cls._get_or_create_group_for_write(
-            group_id=group_id,
+        return await bot_group_policy_service.legacy_set_feature(
+            group_id,
+            module,
+            True,
+            task=False,
+            is_superuser=is_superuser,
+            platform=platform,
             channel_id=channel_id,
-            defaults={"platform": platform},
         )
-        update_fields = []
-        if is_superuser:
-            superuser_block_plugin = convert_module_format(group.superuser_block_plugin)
-            if module in superuser_block_plugin:
-                superuser_block_plugin.remove(module)
-                group.superuser_block_plugin = convert_module_format(
-                    superuser_block_plugin
-                )
-                update_fields.append("superuser_block_plugin")
-        elif add_disable_marker(module) in group.block_plugin:
-            block_plugin = convert_module_format(group.block_plugin)
-            block_plugin.remove(module)
-            group.block_plugin = convert_module_format(block_plugin)
-            update_fields.append("block_plugin")
-        if update_fields:
-            await group.save(update_fields=update_fields)
-
-        # 更新缓存
-        await cls._update_cache(group)
 
     @classmethod
     async def is_normal_block_plugin(
         cls, group_id: str, module: str, channel_id: str | None = None
     ) -> bool:
+        from zhenxun.services.bot_group_policy import bot_group_policy_service
+
+        scoped = await bot_group_policy_service.legacy_blocked(
+            group_id, module, channel_id=channel_id, forced=False
+        )
+        if scoped is not None:
+            return scoped
         if group := GroupMemoryCache.get_if_ready(group_id, channel_id):
             return bool(group.block_plugin_set and module in group.block_plugin_set)
         else:
@@ -550,6 +527,13 @@ class GroupConsole(Model):
 
     @classmethod
     async def is_superuser_block_task(cls, group_id: str, task: str) -> bool:
+        from zhenxun.services.bot_group_policy import bot_group_policy_service
+
+        scoped = await bot_group_policy_service.legacy_blocked(
+            group_id, task, kind="tasks", forced=True
+        )
+        if scoped is not None:
+            return scoped
         if group := GroupMemoryCache.get_if_ready(group_id, None):
             return bool(
                 group.superuser_block_task_set
@@ -562,6 +546,13 @@ class GroupConsole(Model):
     async def is_block_task(
         cls, group_id: str, task: str, channel_id: str | None = None
     ) -> bool:
+        from zhenxun.services.bot_group_policy import bot_group_policy_service
+
+        scoped = await bot_group_policy_service.legacy_blocked(
+            group_id, task, channel_id=channel_id, kind="tasks"
+        )
+        if scoped is not None:
+            return scoped
         if not channel_id:
             group = GroupMemoryCache.get_if_ready(group_id, None)
             if not group:
@@ -591,36 +582,17 @@ class GroupConsole(Model):
         platform: str | None = None,
         channel_id: str | None = None,
     ):
-        """禁用群组插件
+        from zhenxun.services.bot_group_policy import bot_group_policy_service
 
-        参数:
-            group_id: 群组id
-            task: 任务模块
-            is_superuser: 是否为超级用户
-            platform: 平台
-        """
-        group, _ = await cls._get_or_create_group_for_write(
-            group_id=group_id,
+        return await bot_group_policy_service.legacy_set_feature(
+            group_id,
+            task,
+            False,
+            task=True,
+            is_superuser=is_superuser,
+            platform=platform,
             channel_id=channel_id,
-            defaults={"platform": platform},
         )
-        update_fields = []
-        if is_superuser:
-            superuser_block_task = convert_module_format(group.superuser_block_task)
-            if task not in superuser_block_task:
-                superuser_block_task.append(task)
-                group.superuser_block_task = convert_module_format(superuser_block_task)
-                update_fields.append("superuser_block_task")
-        elif add_disable_marker(task) not in group.block_task:
-            block_task = convert_module_format(group.block_task)
-            block_task.append(task)
-            group.block_task = convert_module_format(block_task)
-            update_fields.append("block_task")
-        if update_fields:
-            await group.save(update_fields=update_fields)
-
-        # 更新缓存
-        await cls._update_cache(group)
 
     @classmethod
     async def set_unblock_task(
@@ -631,36 +603,17 @@ class GroupConsole(Model):
         platform: str | None = None,
         channel_id: str | None = None,
     ):
-        """禁用群组插件
+        from zhenxun.services.bot_group_policy import bot_group_policy_service
 
-        参数:
-            group_id: 群组id
-            task: 任务模块
-            is_superuser: 是否为超级用户
-            platform: 平台
-        """
-        group, _ = await cls._get_or_create_group_for_write(
-            group_id=group_id,
+        return await bot_group_policy_service.legacy_set_feature(
+            group_id,
+            task,
+            True,
+            task=True,
+            is_superuser=is_superuser,
+            platform=platform,
             channel_id=channel_id,
-            defaults={"platform": platform},
         )
-        update_fields = []
-        if is_superuser:
-            superuser_block_task = convert_module_format(group.superuser_block_task)
-            if task in superuser_block_task:
-                superuser_block_task.remove(task)
-                group.superuser_block_task = convert_module_format(superuser_block_task)
-                update_fields.append("superuser_block_task")
-        elif add_disable_marker(task) in group.block_task:
-            block_task = convert_module_format(group.block_task)
-            block_task.remove(task)
-            group.block_task = convert_module_format(block_task)
-            update_fields.append("block_task")
-        if update_fields:
-            await group.save(update_fields=update_fields)
-
-        # 更新缓存
-        await cls._update_cache(group)
 
     @classmethod
     def _run_script(cls):

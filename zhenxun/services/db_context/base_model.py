@@ -17,7 +17,10 @@ from tortoise.transactions import in_transaction
 from zhenxun.services.cache import CacheRoot
 from zhenxun.services.cache.write import WriteQuery, notify_bulk_write, write_boundary
 from zhenxun.services.log import logger
-from zhenxun.services.platform_identity import guard_legacy_identity_write
+from zhenxun.services.platform_identity import (
+    CURRENT_PLATFORM_SCOPE,
+    guard_legacy_identity_write,
+)
 from zhenxun.utils.enum import DbLockType
 
 from .config import LOG_COMMAND, db_model
@@ -25,11 +28,35 @@ from .utils import with_db_timeout
 
 
 class _PlatformGuardedQuerySet(QuerySet):
-    def _guard_platform_write(self) -> None:
-        guard_legacy_identity_write(self.model._meta.db_table)
+    def _guard_platform_write(self, changed=None) -> None:
+        if CURRENT_PLATFORM_SCOPE.get() != "qq_api":
+            return
+
+        # Only a positive user_id constraint is an authorization boundary.
+        # OR/negated/raw predicates cannot prove which accounts are touched.
+        def keys_for(node):
+            if node._is_negated or node.join_type != "AND":
+                return None
+            values = node.filters
+            if "user_id" in values:
+                return {str(values["user_id"])}
+            if "user_id__in" in values:
+                return set(map(str, values["user_id__in"]))
+            for child in node.children:
+                if (keys := keys_for(child)) is not None:
+                    return keys
+            return None
+
+        keys = None
+        for node in self._q_objects:
+            if (keys := keys_for(node)) is not None:
+                break
+        if changed and "user_id" in changed:
+            keys = (keys | {str(changed["user_id"])}) if keys else None
+        guard_legacy_identity_write(self.model._meta.db_table, keys)
 
     def update(self, **kwargs: Any):
-        self._guard_platform_write()
+        self._guard_platform_write(kwargs)
         return WriteQuery(super().update(**kwargs), self.model)
 
     def delete(self):
@@ -61,7 +88,7 @@ class _PlatformGuardedQuerySet(QuerySet):
         return WriteQuery(super().bulk_update(objects, fields, batch_size), self.model)
 
     def raw(self, sql: str):
-        self._guard_platform_write()
+        guard_legacy_identity_write(self.model._meta.db_table)
         return super().raw(sql)
 
 
@@ -186,15 +213,17 @@ class Model(TortoiseModel):
             yield
 
     @classmethod
-    def _guard_platform_write(cls) -> None:
-        guard_legacy_identity_write(cls._meta.db_table)
+    def _guard_platform_write(cls, user_id=None) -> None:
+        guard_legacy_identity_write(
+            cls._meta.db_table, {str(user_id)} if user_id is not None else None
+        )
 
     @classmethod
     async def create(
         cls, using_db: BaseDBAsyncClient | None = None, **kwargs: Any
     ) -> Self:
         """创建数据（使用CREATE锁）"""
-        cls._guard_platform_write()
+        cls._guard_platform_write(kwargs.get("user_id"))
         async with cls._lock_context(DbLockType.CREATE):
             # 直接调用父类的_create方法避免触发save的锁
             result = await super().create(using_db=using_db, **kwargs)
@@ -210,7 +239,7 @@ class Model(TortoiseModel):
         **kwargs: Any,
     ) -> tuple[Self, bool]:
         """获取或创建数据（无锁版本，依赖数据库约束）"""
-        cls._guard_platform_write()
+        cls._guard_platform_write(kwargs.get("user_id"))
         from uuid import uuid4
 
         db = using_db or cls._choose_db(True)
@@ -264,7 +293,7 @@ class Model(TortoiseModel):
         **kwargs: Any,
     ) -> tuple[Self, bool]:
         """更新或创建数据（使用UPSERT锁）"""
-        cls._guard_platform_write()
+        cls._guard_platform_write(kwargs.get("user_id"))
         async with cls._lock_context(DbLockType.UPSERT):
             db = using_db or cls._choose_db(True)
             active = getattr(db, "_finalized", None) is False
@@ -299,7 +328,7 @@ class Model(TortoiseModel):
         force_update: bool = False,
     ):
         """保存数据（根据操作类型自动选择锁）"""
-        self._guard_platform_write()
+        self._guard_platform_write(getattr(self, "user_id", None))
         lock_type = (
             DbLockType.CREATE
             if getattr(self, "id", None) is None
@@ -320,7 +349,7 @@ class Model(TortoiseModel):
                 )
 
     async def delete(self, using_db: BaseDBAsyncClient | None = None):
-        self._guard_platform_write()
+        self._guard_platform_write(getattr(self, "user_id", None))
         cache_type = getattr(self, "cache_type", None)
         key = self.__class__.get_cache_key(self) if cache_type else None
         # 执行删除操作

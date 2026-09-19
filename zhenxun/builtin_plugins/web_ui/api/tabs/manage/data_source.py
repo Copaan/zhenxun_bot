@@ -8,6 +8,13 @@ from zhenxun.models.group_console import GroupConsole
 from zhenxun.models.plugin_info import PluginInfo
 from zhenxun.models.statistics import Statistics
 from zhenxun.models.task_info import TaskInfo
+from zhenxun.services.bot_group_policy import bot_group_policy_service
+from zhenxun.services.plugin_policy import (
+    PluginPolicyError,
+    plugin_policy_service,
+    policy_transaction,
+)
+from zhenxun.services.runtime_mutation import managed_mutation
 from zhenxun.utils.common_utils import CommonUtils
 from zhenxun.utils.enum import RequestType
 from zhenxun.utils.platform import PlatformUtils
@@ -27,31 +34,60 @@ from .model import (
 
 
 class ApiDataSource:
+    @staticmethod
+    async def _group_policy(group_id: str, bot_id: str | None):
+        from zhenxun.models.bot_group_policy import BotGroupMembership
+
+        if bot_id is None:
+            bot_id, scope = await bot_group_policy_service._legacy_identity(group_id)
+        else:
+            bot_id = await plugin_policy_service._resolve_bot_id(bot_id)
+            rows = await BotGroupMembership.filter(
+                bot_id=bot_id, group_id=group_id, channel_id=""
+            )
+            scopes = {row.platform_scope for row in rows}
+            if len(scopes) != 1:
+                raise PluginPolicyError(
+                    "缺少唯一群关联，请使用插件策略页面指定平台及账号"
+                )
+            scope = scopes.pop()
+        if scope != "qq_client":
+            raise PluginPolicyError("此旧群资料页面仅支持 OneBot，请使用插件策略页面")
+        return await bot_group_policy_service.get_group(bot_id, scope, group_id)
+
     @classmethod
+    @managed_mutation("group_configuration")
     async def update_group(cls, group: UpdateGroup):
         """更新群组数据
 
         参数:
             group: UpdateGroup
         """
-        db_group = await GroupConsole.get_group_db(group.group_id) or GroupConsole(
-            group_id=group.group_id
-        )
+        policy = await cls._group_policy(group.group_id, group.bot_id)
         task_list = await TaskInfo.get_modules(load_status=None)
-        db_group.level = group.level
-        db_group.status = group.status
-        if group.close_plugins:
-            db_group.block_plugin = CommonUtils.convert_module_format(
-                group.close_plugins
+        async with policy_transaction():
+            await bot_group_policy_service.update_group(
+                policy["bot_id"],
+                policy["platform_scope"],
+                group.group_id,
+                "",
+                expected_revision=group.expected_revision or policy["revision"],
+                block_plugins=[
+                    module
+                    for module in group.close_plugins
+                    if module not in policy["forced_plugins"]
+                ],
+                block_tasks=[
+                    module
+                    for module in task_list
+                    if module not in group.task and module not in policy["forced_tasks"]
+                ],
             )
-        else:
-            db_group.block_plugin = ""
-        if group.task:
-            if block_task := [t for t in task_list if t not in group.task]:
-                db_group.block_task = CommonUtils.convert_module_format(block_task)  # type: ignore
-        else:
-            db_group.block_task = CommonUtils.convert_module_format(task_list)  # type: ignore
-        await db_group.save()
+            db_group = await GroupConsole.get_group_db(group.group_id)
+            if db_group is None:
+                raise PluginPolicyError("群资料不存在")
+            db_group.level, db_group.status = group.level, group.status
+            await db_group.save(update_fields=["level", "status"])
 
     @classmethod
     async def get_request_list(cls) -> ReqResult:
@@ -260,7 +296,9 @@ class ApiDataSource:
         return task_list
 
     @classmethod
-    async def get_group_detail(cls, group_id: str) -> GroupDetail | None:
+    async def get_group_detail(
+        cls, group_id: str, bot_id: str | None = None
+    ) -> GroupDetail | None:
         """获取群组详情
 
         参数:
@@ -272,6 +310,15 @@ class ApiDataSource:
         group = await GroupConsole.get_group_db(group_id=group_id)
         if not group:
             return None
+        policy = await cls._group_policy(group_id, bot_id)
+        group.block_plugin = CommonUtils.convert_module_format(policy["block_plugins"])
+        group.block_task = CommonUtils.convert_module_format(policy["block_tasks"])
+        group.superuser_block_plugin = CommonUtils.convert_module_format(
+            policy["forced_plugins"]
+        )
+        group.superuser_block_task = CommonUtils.convert_module_format(
+            policy["forced_tasks"]
+        )
         like_plugin = await cls.__get_group_detail_like_plugin(group_id)
         disable_plugins: list[Plugin] = await cls.__get_group_detail_disable_plugin(
             group
@@ -279,6 +326,9 @@ class ApiDataSource:
         task_list = await cls.__get_group_detail_task(group)
         return GroupDetail(
             group_id=group_id,
+            bot_id=policy["bot_id"],
+            policy_revision=policy["revision"],
+            policy_effective=policy["effective"],
             ava_url=GROUP_AVA_URL.format(group_id, group_id),
             name=group.group_name,
             member_count=group.member_count,

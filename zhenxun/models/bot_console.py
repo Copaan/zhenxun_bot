@@ -27,6 +27,7 @@ class BotConsole(Model):
     """可用插件"""
     available_tasks = fields.TextField(default="", description="可用被动技能")
     """可用被动技能管理镜像，不作为运行白名单。"""
+    policy_revision = fields.IntField(default=0, description="账号策略修订")
 
     class Meta:  # pyright: ignore [reportIncompatibleVariableOverride]
         table = "bot_console"

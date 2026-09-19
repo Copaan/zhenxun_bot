@@ -21,6 +21,7 @@ from zhenxun.services.low_priority_writer import (
     register_low_priority_writer,
 )
 from zhenxun.utils.enum import PluginType
+from zhenxun.utils.platform import PlatformUtils
 from zhenxun.utils.utils import get_entity_ids
 
 __plugin_meta__ = PluginMetadata(
@@ -102,7 +103,7 @@ async def _(
                     group_id=entity.group_id,
                     plugin_name=matcher.plugin_name,
                     create_time=datetime.now(),
-                    bot_id=bot.self_id,
+                    bot_id=PlatformUtils.get_storage_bot_id(bot),
                 )
             )
 

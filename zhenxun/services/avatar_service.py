@@ -5,6 +5,7 @@
 """
 
 from collections import OrderedDict
+from hashlib import sha256
 import os
 from pathlib import Path
 import time
@@ -61,7 +62,26 @@ class AvatarService:
         例如: data/cache/avatars/qq/123456789.png
         """
         identifier = str(identifier)
+        if any(char in identifier for char in ':<>"/\\|?*'):
+            identifier = sha256(identifier.encode()).hexdigest()
         return self.cache_path / platform / f"{identifier}.png"
+
+    async def get_session_avatar_path(self, session) -> Path | None:
+        """Official avatars use protocol metadata, never the linked QQ account."""
+        if PlatformUtils.get_platform_scope(session) != "qq_api":
+            return await self.get_avatar_path(
+                PlatformUtils.get_platform(session), session.user.id
+            )
+        url = getattr(session.user, "avatar", None)
+        if not url or not Config.get_config("avatar_cache", "ENABLED"):
+            return None
+        key = sha256(f"{session.self_id}:{session.user.id}:{url}".encode()).hexdigest()
+        path = self._get_cache_path("qq_api", key)
+        ttl = Config.get_config("avatar_cache", "TTL_DAYS", 7) * 86400
+        if path.exists() and time.time() - path.stat().st_mtime < ttl:
+            return path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path if await AsyncHttpx.download_file(url, path) else None
 
     def clear_memory_cache(self) -> int:
         size = len(self._memory_cache)
@@ -83,6 +103,9 @@ class AvatarService:
             Path | None: 头像的本地文件路径，如果获取失败则返回None。
         """
         if not Config.get_config("avatar_cache", "ENABLED"):
+            return None
+
+        if str(identifier).startswith(("principal:", "identity:")):
             return None
 
         cache_key = f"{platform}-{identifier}"

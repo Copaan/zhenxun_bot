@@ -81,6 +81,8 @@ class UpdateGroup(BaseModel):
     """
 
     group_id: str
+    bot_id: str | None = None
+    expected_revision: str | None = None
     """群号"""
     status: bool
     """状态"""
@@ -207,6 +209,9 @@ class GroupDetail(BaseModel):
     """
 
     group_id: str
+    bot_id: str | None = None
+    policy_revision: str | None = None
+    policy_effective: dict = Field(default_factory=dict)
     """群组id"""
     ava_url: str
     """头像url"""

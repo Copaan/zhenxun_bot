@@ -39,3 +39,13 @@ class BotPluginPolicyBinding(Model):
         table = "bot_plugin_policy_binding"
         table_description = "机器人账号插件策略绑定"
         indexes: ClassVar = [("policy_id",)]
+
+
+class PluginPolicyMigration(Model):
+    key = fields.CharField(max_length=191, pk=True)
+    version = fields.IntField(default=1)
+    previous: dict = fields.JSONField(default=dict)
+    create_time = fields.DatetimeField(auto_now_add=True)
+
+    class Meta:
+        table = "plugin_policy_migration"

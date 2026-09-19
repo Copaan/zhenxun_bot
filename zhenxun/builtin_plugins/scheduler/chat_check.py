@@ -6,8 +6,8 @@ import pytz
 
 from zhenxun.configs.config import Config
 from zhenxun.models.chat_history import ChatHistory
-from zhenxun.models.group_console import GroupConsole
 from zhenxun.models.task_info import TaskInfo
+from zhenxun.services.bot_group_policy import bot_group_policy_service
 from zhenxun.services.log import logger
 from zhenxun.services.message_load import should_pause_tasks
 from zhenxun.utils.platform import PlatformUtils
@@ -37,14 +37,17 @@ async def _():
         logger.debug("未开启群组聊天时间检查，过滤群组发言检测...")
         return
     """检测群组发言时间并禁用全部被动"""
-    update_list = []
     if modules := await TaskInfo.get_modules(load_status=None):
         for bot in nonebot.get_bots().values():
             group_list, _ = await PlatformUtils.get_group_list(bot, True)
             for group in group_list:
                 try:
                     last_message = (
-                        await ChatHistory.filter(group_id=group.group_id)
+                        await ChatHistory.scoped_query(
+                            PlatformUtils.get_platform_scope(bot),
+                            group_id=group.group_id,
+                            bot_id=PlatformUtils.get_storage_bot_id(bot),
+                        )
                         .annotate()
                         .order_by("-create_time")
                         .first()
@@ -52,26 +55,20 @@ async def _():
                     if last_message:
                         now = datetime.now(pytz.timezone("Asia/Shanghai"))
                         if now - timedelta(days=2) > last_message.create_time:
-                            _group, _ = await GroupConsole.get_or_create_root_group(
-                                group.group_id
+                            await bot_group_policy_service.set_features(
+                                PlatformUtils.get_storage_bot_id(bot),
+                                PlatformUtils.get_platform_scope(bot),
+                                group.group_id,
+                                modules,
+                                False,
+                                task=True,
                             )
-                            modules = [f"<{module}" for module in modules]
-                            _group.block_task = ",".join(modules) + ","  # type: ignore
-                            update_list.append(_group)
                             logger.info(
                                 "群组两日内未发送任何消息，关闭该群全部被动",
                                 "Chat检测",
-                                target=_group.group_id,
+                                target=group.group_id,
                             )
                 except Exception:
                     logger.error(
                         "检测群组发言时间失败...", "Chat检测", target=group.group_id
                     )
-    if update_list:
-        # 使用逐条保存替代 bulk_update，避免 SQLite 兼容性问题
-        for group in update_list:
-            await group.save(update_fields=["block_task"])
-        from zhenxun.services.cache.runtime_cache import GroupMemoryCache
-
-        for group in update_list:
-            await GroupMemoryCache.upsert_from_model(group)

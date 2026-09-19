@@ -42,10 +42,11 @@ async def auth_bot(
             event = context.event
             if bot_group_policy_service.blocked(
                 bot_id,
-                event.platform_scope,
-                event.group_id,
+                event.platform_scope if event.group_id else "private",
+                event.group_id or bot_group_policy_service.PRIVATE_KEY,
                 plugin.module,
                 channel_id=event.channel_id,
+                is_superuser=event.is_superuser and not plugin.limit_superuser,
             ):
                 raise SkipPluginException("Bot独立群设置已禁用该插件")
         bot: BotConsole | BotSnapshot | None = bot_data

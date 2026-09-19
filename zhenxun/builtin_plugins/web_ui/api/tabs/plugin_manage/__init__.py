@@ -1,11 +1,12 @@
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import JSONResponse
 
 from zhenxun.models.plugin_info import PluginInfo as DbPluginInfo
 from zhenxun.services.log import logger
+from zhenxun.services.plugin_policy import PluginPolicyConflict
 from zhenxun.services.runtime_reload.models import ApplyMode
 from zhenxun.utils._restart_utils import issue_restart_ticket
-from zhenxun.utils.enum import BlockType, PluginType
+from zhenxun.utils.enum import PluginType
 from zhenxun.utils.manager.virtual_env_package_manager import VirtualEnvPackageManager
 
 from ....apply_result import (
@@ -124,6 +125,8 @@ async def _(param: UpdatePlugin) -> Result:
             else "插件设置已保存并生效。"
         )
         return Result.ok(data, info=info)
+    except PluginPolicyConflict as error:
+        raise HTTPException(409, detail=str(error)) from error
     except (ValueError, KeyError):
         return Result.fail("插件数据不存在...")
     except Exception as e:
@@ -143,14 +146,14 @@ async def _(param: PluginSwitch) -> Result:
         db_plugin = await DbPluginInfo.get_plugin(module=param.module)
         if not db_plugin:
             return Result.fail("插件不存在...")
-        if not param.status:
-            db_plugin.block_type = BlockType.ALL
-            db_plugin.status = False
-        else:
-            db_plugin.block_type = None
-            db_plugin.status = True
-        await db_plugin.save()
+        from zhenxun.services.plugin_policy import plugin_policy_service
+
+        await plugin_policy_service.set_global(
+            param.module, param.status, expected_revision=param.expected_revision
+        )
         return Result.ok(info="成功改变了开关状态!")
+    except PluginPolicyConflict as error:
+        raise HTTPException(409, detail=str(error)) from error
     except Exception as e:
         logger.error(f"{router.prefix}/change_switch 调用错误", "WebUi", e=e)
         return Result.fail(f"{type(e)}: {e}")

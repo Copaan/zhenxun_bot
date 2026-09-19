@@ -115,6 +115,12 @@ async def _drop_message_before_cache_ready(event: Event, bot: Bot):
             event,
             getattr(event, "group_openid", None) or getattr(event, "guild_id", None),
         )
+        await bot_group_policy_service.ensure_fresh(
+            PlatformUtils.get_storage_bot_id(bot),
+            PlatformUtils.get_platform_scope(bot),
+            group_id,
+            resolve_event_channel_id(event, None),
+        )
         bot_group_policy_service.observe(
             PlatformUtils.get_storage_bot_id(bot),
             PlatformUtils.get_platform_scope(bot),
@@ -161,6 +167,12 @@ async def _auth_preprocessor(
     _enforce_platform_contract(matcher, event_context)
     from zhenxun.services.bot_group_policy import bot_group_policy_service
 
+    await bot_group_policy_service.ensure_fresh(
+        event_context.bot_id,
+        event_context.platform_scope,
+        event_context.group_id,
+        event_context.channel_id,
+    )
     bot_group_policy_service.observe(
         event_context.bot_id,
         event_context.platform_scope,

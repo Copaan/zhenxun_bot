@@ -111,27 +111,34 @@ class PluginStrategy(SwitchStrategy):
         )
 
     async def set_default_status(self, entity: PluginInfo, status: bool) -> None:
-        entity.default_status = status
-        await entity.save(update_fields=["default_status"])
+        from zhenxun.services.plugin_policy import plugin_policy_service
+
+        await plugin_policy_service.set_global(
+            entity.module, status, task=False, default=True, block_type=None
+        )
 
     async def set_global_status(
         self, entity: PluginInfo, status: bool, block_type: BlockType | None = None
     ) -> None:
-        entity.block_type = block_type
-        entity.status = not bool(block_type)
-        await entity.save(update_fields=["status", "block_type"])
+        from zhenxun.services.plugin_policy import plugin_policy_service
+
+        await plugin_policy_service.set_global(
+            entity.module, status, task=False, default=False, block_type=block_type
+        )
 
     async def set_all_default_status(self, status: bool) -> None:
-        await PluginInfo.filter(plugin_type=PluginType.NORMAL).update(
-            default_status=status
+        from zhenxun.services.plugin_policy import plugin_policy_service
+
+        await plugin_policy_service.set_global(
+            None, status, task=False, default=True, block_type=None
         )
-        await self.refresh_cache()
 
     async def set_all_global_status(self, status: bool) -> None:
-        await PluginInfo.filter(plugin_type=PluginType.NORMAL).update(
-            status=status, block_type=None if status else BlockType.ALL
+        from zhenxun.services.plugin_policy import plugin_policy_service
+
+        await plugin_policy_service.set_global(
+            None, status, task=False, default=False, block_type=None
         )
-        await self.refresh_cache()
 
     async def refresh_cache(self) -> None:
         await PluginInfoMemoryCache.refresh()
@@ -162,24 +169,34 @@ class TaskStrategy(SwitchStrategy):
         return await TaskInfo.get_modules(load_status=None)
 
     async def set_default_status(self, entity: TaskInfo, status: bool) -> None:
-        entity.default_status = status
-        await entity.save(update_fields=["default_status"])
+        from zhenxun.services.plugin_policy import plugin_policy_service
+
+        await plugin_policy_service.set_global(
+            entity.module, status, task=True, default=True, block_type=None
+        )
 
     async def set_global_status(
         self, entity: TaskInfo, status: bool, block_type: BlockType | None = None
     ) -> None:
-        entity.status = status
-        await entity.save(update_fields=["status"])
+        from zhenxun.services.plugin_policy import plugin_policy_service
+
+        await plugin_policy_service.set_global(
+            entity.module, status, task=True, default=False, block_type=block_type
+        )
 
     async def set_all_default_status(self, status: bool) -> None:
-        await TaskInfo.all().update(default_status=status)
-        # Bulk updates bypass model save hooks; keep TaskInfoMemoryCache in sync.
-        await self.refresh_cache()
+        from zhenxun.services.plugin_policy import plugin_policy_service
+
+        await plugin_policy_service.set_global(
+            None, status, task=True, default=True, block_type=None
+        )
 
     async def set_all_global_status(self, status: bool) -> None:
-        await TaskInfo.all().update(status=status)
-        # Bulk updates bypass model save hooks; keep TaskInfoMemoryCache in sync.
-        await self.refresh_cache()
+        from zhenxun.services.plugin_policy import plugin_policy_service
+
+        await plugin_policy_service.set_global(
+            None, status, task=True, default=False, block_type=None
+        )
 
     async def refresh_cache(self) -> None:
         await TaskInfoMemoryCache.refresh()

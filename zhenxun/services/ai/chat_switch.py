@@ -17,10 +17,9 @@ def module_identity(owner: str) -> str:
 
 
 def switch_values() -> dict[str, bool]:
-    from zhenxun.configs.config import Config
+    from zhenxun.services.plugin_policy import plugin_policy_service
 
-    values = Config.get_config("AI", "CHAT_PLUGIN_ENABLED", {})
-    return values if isinstance(values, dict) else {}
+    return plugin_policy_service.global_switch_values()
 
 
 def chat_plugin_enabled(owner: str | None, values: dict | None = None) -> bool:

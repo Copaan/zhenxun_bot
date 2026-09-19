@@ -3,8 +3,9 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Iterator
 from contextlib import contextmanager
-from contextvars import Context, ContextVar
+from contextvars import Context, ContextVar, copy_context
 from dataclasses import dataclass, field
+import math
 import threading
 from typing import TYPE_CHECKING
 import weakref
@@ -60,6 +61,31 @@ def _execution_owner():
 
 
 @contextmanager
+def _initialization_budget():
+    from zhenxun.services.lifecycle.deadline import ShutdownBudget, current_budget
+
+    # Admission retains the operation deadline, but network/worker children must
+    # not inherit it as a shutdown deadline after the candidate is activated.
+    budget = current_budget.get() or ShutdownBudget(float("inf"))
+    token = current_budget.set(None)
+    try:
+        yield budget
+    finally:
+        current_budget.reset(token)
+
+
+def background_task_context():
+    from zhenxun.services.lifecycle.deadline import current_budget
+
+    context = copy_context()
+    work = _lifecycle_work.get()
+    if work is not None and work.phase in {"on_startup", "on_ready"}:
+        if context.get(current_budget) is work.budget:
+            context.run(current_budget.set, None)
+    return context
+
+
+@contextmanager
 def lifecycle_work_context(owner: str, incarnation_id: str, phase: str):
     if phase not in {"on_startup", "on_ready", "on_shutdown"}:
         # Connection hooks are business activities, not bounded initialization.
@@ -68,11 +94,16 @@ def lifecycle_work_context(owner: str, incarnation_id: str, phase: str):
     from zhenxun.services.lifecycle import lifecycle_kernel
     from zhenxun.services.lifecycle.deadline import shutdown_budget
 
-    maximum = (
-        lifecycle_kernel.shutdown_remaining(15.0) if phase == "on_shutdown" else 60.0
+    budget_context = (
+        shutdown_budget(lifecycle_kernel.shutdown_remaining(15.0))
+        if phase == "on_shutdown"
+        else _initialization_budget()
     )
-    with shutdown_budget(maximum) as budget:
-        budget.check()
+    with budget_context as budget:
+        if phase == "on_shutdown":
+            budget.check()
+        elif budget.remaining() <= 0:
+            raise TimeoutError("plugin_lifecycle_budget_exhausted")
         value = LifecycleWork(
             owner, incarnation_id, weakref.ref(_execution_owner()), phase, budget
         )
@@ -98,7 +129,7 @@ def lifecycle_work_context(owner: str, incarnation_id: str, phase: str):
                 timed_out = True
                 executor.cancel("plugin_lifecycle_deadline")
 
-        if isinstance(executor, asyncio.Task):
+        if isinstance(executor, asyncio.Task) and math.isfinite(budget.remaining()):
             # Deadline enforcement is infrastructure work, not a plugin timer.
             timeout_handle = Context().run(
                 asyncio.get_running_loop().call_later, budget.remaining(), expire
@@ -127,7 +158,7 @@ def lifecycle_work_context(owner: str, incarnation_id: str, phase: str):
                             child.cancel("plugin_initialization_budget_exhausted")
 
                 def schedule():
-                    if value.active:
+                    if value.active and math.isfinite(budget.remaining()):
                         value.deadline_handle = value.loop.call_later(
                             budget.remaining(), expire_retained
                         )

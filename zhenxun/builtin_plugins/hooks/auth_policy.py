@@ -122,10 +122,11 @@ class PolicyDecisionPoint:
         event = snapshot.context
         if bot_group_policy_service.blocked(
             event.bot_id,
-            event.platform_scope,
-            event.group_id,
+            event.platform_scope if event.group_id else "private",
+            event.group_id or bot_group_policy_service.PRIVATE_KEY,
             module,
             channel_id=event.channel_id,
+            is_superuser=snapshot.is_superuser and not snapshot.profile.limit_superuser,
         ):
             return PolicyDecision("deny", "bot_group_plugin_blocked")
         if module:
@@ -184,44 +185,28 @@ class PolicyDecisionPoint:
 
     def decide_plugin(self, context: PolicyContext) -> PolicyDecision:
         snapshot = context.snapshot
-        profile = snapshot.profile
-        group = snapshot.group
-        if snapshot.is_superuser:
-            return PolicyDecision("allow", "superuser")
-        if snapshot.group_id:
-            if group is None:
-                if self._missing(snapshot, "group"):
-                    return PolicyDecision("defer", "group_cache_unavailable")
-                return PolicyDecision("deny", "group_not_found")
-            if profile.status and not self._group_disabled(profile):
-                block_set, super_block_set = self._group_block_sets(group)
-                if not block_set and not super_block_set:
-                    return PolicyDecision("allow", "plugin_group_fast_allow")
-            block_set, super_block_set = self._group_block_sets(group)
-            if profile.module in super_block_set:
-                return PolicyDecision("deny", "plugin_superuser_blocked_in_group")
-            if profile.module in block_set:
-                return PolicyDecision("deny", "plugin_blocked_in_group")
-            if self._group_disabled(profile):
-                return PolicyDecision("deny", "plugin_disabled_in_group")
-        elif self._private_disabled(profile):
-            return PolicyDecision("deny", "plugin_disabled_in_private")
-        else:
-            from zhenxun.services.bot_group_policy import bot_group_policy_service
+        from zhenxun.services.plugin_policy import plugin_policy_service
 
-            if bot_group_policy_service.blocked(
-                snapshot.context.bot_id,
-                "private",
-                bot_group_policy_service.PRIVATE_KEY,
-                profile.module,
-                task=False,
-            ):
-                return PolicyDecision("deny", "plugin_blocked_in_private")
-        if self._globally_disabled(profile):
-            if group is not None and getattr(group, "is_super", False):
-                return PolicyDecision("allow", "super_group_bypass")
-            return PolicyDecision("deny", "plugin_global_disabled")
-        return PolicyDecision("allow", "plugin_allowed")
+        event = snapshot.context
+        if snapshot.group_id and snapshot.group is None:
+            if self._missing(snapshot, "group"):
+                return PolicyDecision("defer", "group_cache_unavailable")
+            return PolicyDecision("deny", "group_not_found")
+        reason = plugin_policy_service.availability(
+            snapshot.profile,
+            snapshot.bot_data,
+            snapshot.group,
+            bot_id=event.bot_id,
+            platform_scope=event.platform_scope,
+            group_id=event.group_id,
+            channel_id=event.channel_id,
+            is_superuser=snapshot.is_superuser,
+        )
+        return (
+            PolicyDecision("deny", reason)
+            if reason
+            else PolicyDecision("allow", "plugin_allowed")
+        )
 
     @staticmethod
     def _group_block_sets(group: object) -> tuple[frozenset[str], frozenset[str]]:

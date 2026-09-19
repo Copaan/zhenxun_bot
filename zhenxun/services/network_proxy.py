@@ -46,9 +46,38 @@ _AUTO_OWNER = object()
 
 
 class ProxyPolicyError(RuntimeError):
-    def __init__(self, code: str):
+    def __init__(self, code: str, *, category: str | None = None):
         self.code = code
+        self.category = category
         super().__init__(code)
+
+    @classmethod
+    def from_error(cls, code: str, error: BaseException):
+        current = error
+        seen = set()
+        category = "transport"
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            name = type(current).__name__.lower()
+            status = getattr(getattr(current, "response", None), "status_code", None)
+            status = status or getattr(current, "status", None)
+            if status in {401, 403, 407}:
+                category = "authentication"
+                break
+            if status is not None and status >= 400:
+                category = "upstream_rejected"
+            elif "ssl" in name or "tls" in name or "certificate" in name:
+                category = "tls"
+                break
+            elif "timeout" in name:
+                category = "timeout"
+                break
+            elif "connect" in name:
+                category = "connect"
+            current = current.__cause__ or current.__context__
+        result = cls(code, category=category)
+        result.exception_type = type(error).__name__
+        return result
 
 
 class ProxyRequestError(httpx.RequestError):

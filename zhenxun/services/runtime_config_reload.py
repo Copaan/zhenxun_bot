@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 import contextlib
 from copy import deepcopy
@@ -160,7 +161,7 @@ async def reload_runtime_config(
         operation.rollback_state = component_result.rollback_state
         plugin_runtime_manager.mark_content_processed(Path("data/config.yaml"))
         return operation
-    except Exception:
+    except (Exception, asyncio.CancelledError):
         try:
             if "component_result" in locals() and (
                 component_result.apply_effect == "component_restarted"

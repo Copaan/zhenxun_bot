@@ -217,9 +217,13 @@ class LifecycleContext:
         name: str | None = None,
         persistent: bool = False,
     ) -> asyncio.Task[Any]:
+        from zhenxun.services.runtime_reload.ownership import background_task_context
+
         child = self.create_child_scope(scope, scope_id)
         try:
-            task = child.spawn_task(coroutine, name=name, persistent=persistent)
+            task = background_task_context().run(
+                child.spawn_task, coroutine, name=name, persistent=persistent
+            )
         except BaseException:
             self._children.remove(child)
             raise
