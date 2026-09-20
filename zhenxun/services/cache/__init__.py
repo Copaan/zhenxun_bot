@@ -264,7 +264,12 @@ class CacheManager:
             bool: 是否成功
         """
         # 如果缓存被禁用或缓存模式为NONE，直接返回True
-        if not self.enabled or cache_config.cache_mode == CacheMode.NONE:
+        if not self.enabled or cache_config.cache_mode in {
+            CacheMode.NONE,
+            CacheMode.MEMORY,
+        }:
+            # MEMORY uses RuntimeCache for model snapshots; CacheRoot has no
+            # second remote value to invalidate in this mode.
             return True
 
         from .write import defer
@@ -349,8 +354,11 @@ class CacheManager:
 
         if in_write_transaction():
             return False
-        if not self.enabled or cache_config.cache_mode == CacheMode.NONE:
-            return False
+        if not self.enabled or cache_config.cache_mode in {
+            CacheMode.NONE,
+            CacheMode.MEMORY,
+        }:
+            return True
         try:
             cache_key = self._build_key(cache_type, key)
             fence = self._refill_fence
@@ -495,7 +503,10 @@ class CacheManager:
             bool: 是否成功
         """
         # 如果缓存被禁用或缓存模式为NONE，直接返回True（无需操作）
-        if not self.enabled or cache_config.cache_mode == CacheMode.NONE:
+        if not self.enabled or cache_config.cache_mode in {
+            CacheMode.NONE,
+            CacheMode.MEMORY,
+        }:
             return True
 
         from .write import defer
@@ -511,12 +522,23 @@ class CacheManager:
         self._refill_fence.epoch += 1
         try:
             if cache_type:
-                logger.warning(
-                    f"拒绝清除缓存类型 {cache_type}: "
-                    "当前后端不支持可靠的按类型清理，已避免清除整个 backend",
-                    LOG_COMMAND,
+                backend = self.cache_backend
+                client = getattr(backend, "client", None)
+                if client is None or not callable(getattr(client, "keys", None)):
+                    logger.warning(
+                        f"清除缓存类型 {cache_type} 失败：Redis 后端不支持按类型扫描",
+                        LOG_COMMAND,
+                    )
+                    return False
+                pattern = backend.build_key(f"{cache_type.upper()}:*")
+                keys = await client.keys(pattern)
+                if keys:
+                    await client.delete(*keys)
+                self._refill_fence.poisoned[:] = [False] * len(
+                    self._refill_fence.poisoned
                 )
-                return False
+                # Redis 删除 0 个键同样是成功的幂等结果。
+                return True
             await self.cache_backend.clear()  # type: ignore
             self._refill_fence.poisoned[:] = [False] * len(self._refill_fence.poisoned)
             return True

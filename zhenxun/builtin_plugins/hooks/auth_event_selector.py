@@ -4,6 +4,7 @@ from collections.abc import Awaitable, Callable
 import contextlib
 from dataclasses import dataclass
 import importlib
+import re
 from typing import Any
 
 from nonebot.adapters import Bot, Event
@@ -125,6 +126,38 @@ def _ensure_nonempty_qq_message(message: Any) -> None:
         message.append(MessageSegment.text(""))
 
 
+_ACCOUNT_BINDING_COMMAND = re.compile(
+    r"^\s*(?:绑定\s*(?:qq|状态)|解绑\s*qq)(?:\s|$)",
+    re.IGNORECASE,
+)
+
+
+def _is_account_binding_command(event: Event) -> bool:
+    """Reserve account commands from catch-all AI matchers.
+
+    Official QQ may deliver a leading mention segment and Alconna parsing can
+    vary by adapter.  The dedicated binding matcher remains responsible for
+    validation; this guard only prevents a generic ChatInter fallback from
+    claiming the command when parsing or matcher ordering is delayed.
+    """
+    candidates: list[str] = []
+    with contextlib.suppress(Exception):
+        candidates.append(str(event.get_plaintext() or ""))
+    with contextlib.suppress(Exception):
+        candidates.append(str(event.get_message() or ""))
+    return any(_ACCOUNT_BINDING_COMMAND.match(value) for value in candidates)
+
+
+def _is_chatinter_matcher(matcher: type[Matcher]) -> bool:
+    plugin = getattr(matcher, "plugin", None)
+    module = str(
+        getattr(plugin, "module_name", "") or getattr(plugin, "module", "") or ""
+    )
+    return module == "zhenxun.plugins.chatinter" or module.startswith(
+        "zhenxun.plugins.chatinter."
+    )
+
+
 def _normalize_qq_self_at_message(bot: Bot, event: Event) -> None:
     """Remove the leading bot mention left by QQ official @ events.
 
@@ -169,6 +202,7 @@ async def patched_handle_event(
     from zhenxun.services.pipeline_metrics import pipeline_metrics
 
     _normalize_qq_self_at_message(bot, event)
+    reserve_account_binding = _is_account_binding_command(event)
     show_log = True
     escape_tag = getattr(nb_message, "escape_tag")
     logger_ = getattr(nb_message, "logger")
@@ -299,6 +333,13 @@ async def patched_handle_event(
                         signal_overload(3.0)
                 else:
                     selected_matchers = priority_matchers
+
+                if reserve_account_binding:
+                    selected_matchers = [
+                        matcher
+                        for matcher in selected_matchers
+                        if not _is_chatinter_matcher(matcher)
+                    ]
 
                 leases = {}
 

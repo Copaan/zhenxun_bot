@@ -38,19 +38,21 @@ def execute(action: str) -> None:
     result = {"startup_id": os.environ["ZHENXUN_MAINTENANCE_STARTUP_ID"]}
     try:
         if action == "nonebot-apply":
-            from zhenxun.nonebot_store.runtime import apply_pending_transaction
+            from zhenxun.services.nonebot_store.runtime import apply_pending_transaction
 
             result["value"] = apply_pending_transaction()
         elif action == "source-apply":
-            from zhenxun.plugin_store_transaction import apply_pending_transaction
+            from zhenxun.services.plugin_store.plugin_store_transaction import (
+                apply_pending_transaction,
+            )
 
             result["value"] = apply_pending_transaction()
         elif action == "update-apply":
-            from zhenxun.update_service import apply_pending_update
+            from zhenxun.services.update.update_service import apply_pending_update
 
             result["value"] = apply_pending_update(Path.cwd())
         elif action == "sync-core":
-            from zhenxun.update_service import _sync_dependencies
+            from zhenxun.services.update.update_service import _sync_dependencies
 
             _sync_dependencies(preserve_extras=True)
             result["value"] = True

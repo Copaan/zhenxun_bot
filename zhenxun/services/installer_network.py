@@ -169,7 +169,7 @@ def resolver_failure(text):
         if any(needle in lowered for needle in needles):
             code = candidate
             break
-    from zhenxun.nonebot_store.dependencies import safe_process_error
+    from zhenxun.services.nonebot_store.dependencies import safe_process_error
 
     detail = re.sub(r"https?://[^\s<>]+", "<package-source>", text)
     return {

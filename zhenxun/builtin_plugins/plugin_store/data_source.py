@@ -12,11 +12,13 @@ import ujson as json
 
 from zhenxun.builtin_plugins.plugin_store.models import StorePluginInfo
 from zhenxun.models.plugin_info import PluginInfo
-from zhenxun.plugin_store_coordinator import coordinated_store_operation
 from zhenxun.services.cache.bounded_ttl import BoundedTTLCache
 from zhenxun.services.log import logger
 from zhenxun.services.network_proxy import core_network_operation
 from zhenxun.services.plugin_init import PluginInitManager
+from zhenxun.services.plugin_store.plugin_store_coordinator import (
+    coordinated_store_operation,
+)
 from zhenxun.utils.enum import PluginType
 from zhenxun.utils.image_utils import BuildImage, ImageTemplate, RowStyle
 from zhenxun.utils.manager.virtual_env_package_manager import VirtualEnvPackageManager
@@ -603,7 +605,7 @@ class StoreManager:
             }
             dependency_changes = False
             if requirement_files:
-                from zhenxun.nonebot_store.dependencies import (
+                from zhenxun.services.nonebot_store.dependencies import (
                     DependencyAnalysisError,
                     preflight_source_requirements,
                 )

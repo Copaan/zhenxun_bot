@@ -23,7 +23,7 @@ from zhenxun.utils.atomic_json import read_json_locked, write_json_locked
 from .startup import startup_coordinator
 
 _INDEX_PATH = Path("data/runtime/startup-load-index-v1.json")
-_RECORD_VERSION = 5
+_RECORD_VERSION = 6
 _CORE_BUILTINS = {"hooks", "init", "web_ui"}
 _PREBIND_HOOK_PREFIXES = (
     "nonebot_plugin_orm",
@@ -279,6 +279,17 @@ def _file_record(
         }
     visitor = _ImportBoundaryVisitor(module_name, is_package=path.name == "__init__.py")
     visitor.visit(tree)
+    direct_library_imports = {
+        imported.split(".", 1)[0]
+        for imported in visitor.imports
+        if imported in {"nonebot_plugin_localstore", "nonebot_plugin_orm"}
+    }
+    if direct_library_imports and not direct_library_imports.intersection(
+        visitor.requires
+    ):
+        # This is an audit marker. The core preloader handles the dependency;
+        # plugins remain unchanged and can be diagnosed before deployment.
+        visitor.reasons.add("nonebot_plugin_direct_import")
     runtime_reasons = set(visitor.reasons)
     return {
         "size": stat.st_size,
@@ -578,6 +589,20 @@ class StartupLoadPlanner:
                 self._load_entry(entry)
 
     def prepare_library_plugins(self) -> None:
+        # Some third-party plugins import localstore directly while ORM uses
+        # require() internally. Register both library plugins before any
+        # external module can execute, so import order does not decide whether
+        # NoneBot considers localstore a loaded plugin.
+        import nonebot
+
+        for library in ("nonebot_plugin_localstore", "nonebot_plugin_orm"):
+            try:
+                nonebot.require(library)
+            except Exception as error:
+                nonebot_logger.opt(exception=error).error(
+                    f"核心依赖插件预加载失败: {library} ({type(error).__name__})"
+                )
+
         needs_htmlrender = any(
             any(
                 imported == "nonebot_plugin_htmlrender"
@@ -590,7 +615,6 @@ class StartupLoadPlanner:
         )
         if not needs_htmlrender:
             return
-        import nonebot
 
         driver = nonebot.get_driver()
         before = set(driver._lifespan._startup_funcs)

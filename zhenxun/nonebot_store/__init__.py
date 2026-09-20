@@ -1,9 +1,13 @@
-"""Managed NoneBot Registry plugin support.
+"""Compatibility alias for the relocated NoneBot store services."""
 
-This package intentionally has no NoneBot or service-package imports so the launcher can
-use the generation and transaction helpers before ``nonebot.init()``.
-"""
+from zhenxun._compat import alias_module, install_module_aliases
 
-from .runtime import activate_current_generation, load_managed_plugins
+alias_module(__name__, "zhenxun.services.nonebot_store")
 
-__all__ = ["activate_current_generation", "load_managed_plugins"]
+install_module_aliases(
+    {
+        f"{__name__}.{name}": f"zhenxun.services.nonebot_store.{name}"
+        for name in ("dependencies", "orm_migration", "registry", "runtime", "storage")
+    },
+    entrypoints={f"{__name__}.orm_migration": "main"},
+)

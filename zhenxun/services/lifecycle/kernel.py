@@ -745,7 +745,7 @@ class LifecycleKernel:
                 resource_type="process",
                 owner_id=component_id,
                 reversible=False,
-                detail={"pid": pid},
+                detail={"pid": pid, "composite_handle": controller is not None},
             )
         ]
         if component_id not in self._start_order:

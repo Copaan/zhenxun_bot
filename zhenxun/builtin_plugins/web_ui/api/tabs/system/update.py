@@ -6,7 +6,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from zhenxun.update_service import (
+from zhenxun.services.update.update_service import (
     UpdateServiceError,
     check_updates,
     create_update_job,

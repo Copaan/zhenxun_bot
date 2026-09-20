@@ -10,8 +10,10 @@ from tortoise.exceptions import DoesNotExist
 from zhenxun.configs.config import Config
 from zhenxun.configs.utils import ConfigGroup
 from zhenxun.models.plugin_info import PluginInfo as DbPluginInfo
-from zhenxun.nonebot_store.storage import load_manifest as load_nonebot_manifest
 from zhenxun.services.cache.runtime_cache import PluginInfoMemoryCache
+from zhenxun.services.nonebot_store.storage import (
+    load_manifest as load_nonebot_manifest,
+)
 from zhenxun.services.runtime_config_reload import reload_runtime_config
 from zhenxun.services.runtime_mutation import managed_mutation
 from zhenxun.services.runtime_reload import plugin_runtime_manager

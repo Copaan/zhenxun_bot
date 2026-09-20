@@ -42,6 +42,10 @@ class PluginPolicyError(ValueError):
         self.details = details or {}
 
 
+class PluginPolicyNotReady(PluginPolicyError):
+    code = "plugin_policy_not_ready"
+
+
 class PluginPolicyConflict(PluginPolicyError):
     code = "plugin_policy_revision_conflict"
 
@@ -193,7 +197,7 @@ class PluginPolicyService:
 
         RuntimeCacheMutation.require_fresh(PluginInfoMemoryCache)
         if not PluginInfoMemoryCache.is_loaded():
-            raise PluginPolicyError("插件策略尚未就绪")
+            raise PluginPolicyNotReady("插件策略尚未就绪")
         return {
             module: bool(
                 row.status
@@ -1187,6 +1191,7 @@ __all__ = [
     "PluginPolicyError",
     "PluginPolicyInUse",
     "PluginPolicyNotFound",
+    "PluginPolicyNotReady",
     "PluginPolicyService",
     "plugin_policy_service",
 ]

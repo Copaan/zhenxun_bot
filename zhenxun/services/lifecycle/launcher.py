@@ -59,6 +59,9 @@ class ProcessHandle:
     completion_expected: bool = False
     _next_tree_discovery: float = 0.0
     _tree_scan_count: int = 0
+    _runtime_identity: tuple[int, float] | None = field(
+        default=None, init=False, repr=False
+    )
 
     def __post_init__(self) -> None:
         import psutil
@@ -129,12 +132,22 @@ class ProcessHandle:
         worker_boot_id: str | None,
         operating_mode: str | None,
     ) -> bool:
+        runtime_identity = None
         if runtime_pid is not None:
             live = self._live_processes(discover=runtime_pid not in self.identities)
             if runtime_pid not in {process.pid for process in live}:
                 return False
+            runtime_identity = (runtime_pid, self.identities[runtime_pid])
+        # Discovery may adopt a replacement descendant for shutdown ownership,
+        # but that process cannot inherit the accepted runtime's boot identity.
+        if (
+            self._runtime_identity is not None
+            and runtime_identity != self._runtime_identity
+        ):
+            return False
         if self.worker_boot_id and worker_boot_id != self.worker_boot_id:
             return False
+        self._runtime_identity = runtime_identity
         self.runtime_pid, self.worker_boot_id, self.operating_mode = (
             runtime_pid,
             worker_boot_id,
@@ -631,6 +644,8 @@ class LauncherSupervisor:
             return_code=process.poll(),
             reason=reason,
         )
+        if handle is not None:
+            self.kernel.clear_recovery(f"launcher:{handle.role}")
         self._publish_processes()
 
     def bind_worker_runtime(

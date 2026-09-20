@@ -143,7 +143,7 @@ def _run_worker() -> None:
     """启动 Bot worker（必须在项目目录下执行）"""
     worker_started = time.monotonic()
     project_root = _ensure_project_root()
-    from zhenxun.update_service import apply_pending_update
+    from zhenxun.services.update.update_service import apply_pending_update
 
     if not os.environ.get("ZHENXUN_LAUNCHER_PID") and apply_pending_update(
         project_root
@@ -152,7 +152,7 @@ def _run_worker() -> None:
     _sync_env_missing_items(project_root)
 
     from zhenxun.migration.validation import validation_gate
-    from zhenxun.nonebot_store.runtime import activate_current_generation
+    from zhenxun.services.nonebot_store.runtime import activate_current_generation
 
     if validation_gate.task_id:
         from zhenxun.migration.generation import activate_candidate
@@ -314,7 +314,7 @@ def _run_worker() -> None:
         (time.monotonic() - phase_started) * 1000,
     )
 
-    from zhenxun.nonebot_store.runtime import load_managed_plugins
+    from zhenxun.services.nonebot_store.runtime import load_managed_plugins
 
     phase_started = time.monotonic()
     managed_status = load_managed_plugins()
@@ -612,16 +612,17 @@ async def _wait_worker_ready_async(
         status = await asyncio.to_thread(
             _read_worker_runtime_status, settings, scheme=scheme
         )
-        if not _bind_worker_runtime_status(worker, status):
-            await asyncio.sleep(WORKER_READY_POLL_INTERVAL)
-            continue
-        if _runtime_status_is_ready(status, require_warmup=require_warmup):
-            return True
+        bound = _bind_worker_runtime_status(worker, status)
         if status and status.get("operating_mode") in {
             "management_only",
             "setup_only",
         }:
             return False
+        if not bound:
+            await asyncio.sleep(WORKER_READY_POLL_INTERVAL)
+            continue
+        if _runtime_status_is_ready(status, require_warmup=require_warmup):
+            return True
         await asyncio.sleep(WORKER_READY_POLL_INTERVAL)
     return False
 
@@ -1174,7 +1175,7 @@ async def _run_launcher_async() -> None:
     launcher_started_at = time.time()
     cwd = _ensure_project_root()
     from zhenxun.services.lifecycle.launcher import initialize_launcher_lifecycle
-    from zhenxun.update_service import (
+    from zhenxun.services.update.update_service import (
         applied_update_pending,
         finalize_applied_update,
         pending_job,
@@ -1275,30 +1276,34 @@ async def _run_launcher_async() -> None:
             await _terminate_named_process_async(http_sidecar, "WebUI HTTP sidecar")
             http_sidecar = None
             http_sidecar_signature = None
-        from zhenxun.nonebot_store.runtime import (
+        from zhenxun.services.nonebot_store.runtime import (
             finalize_pending_transaction as finalize_nonebot_transaction,
         )
-        from zhenxun.nonebot_store.runtime import (
+        from zhenxun.services.nonebot_store.runtime import (
             rollback_pending_transaction as rollback_nonebot_transaction,
         )
-        from zhenxun.nonebot_store.runtime import (
+        from zhenxun.services.nonebot_store.runtime import (
             startup_verification as verify_nonebot_startup,
         )
-        from zhenxun.nonebot_store.storage import load_manifest as load_nonebot_manifest
-        from zhenxun.nonebot_store.storage import (
+        from zhenxun.services.nonebot_store.storage import (
+            load_manifest as load_nonebot_manifest,
+        )
+        from zhenxun.services.nonebot_store.storage import (
             pending_transaction as pending_nonebot_transaction,
         )
-        from zhenxun.plugin_store_transaction import (
+        from zhenxun.services.plugin_store.plugin_store_transaction import (
             finalize_pending_transaction as finalize_source_transaction,
         )
-        from zhenxun.plugin_store_transaction import (
+        from zhenxun.services.plugin_store.plugin_store_transaction import (
             pending_transaction as pending_source_transaction,
         )
-        from zhenxun.plugin_store_transaction import prepare_dependency_transaction
-        from zhenxun.plugin_store_transaction import (
+        from zhenxun.services.plugin_store.plugin_store_transaction import (
+            prepare_dependency_transaction,
+        )
+        from zhenxun.services.plugin_store.plugin_store_transaction import (
             rollback_pending_transaction as rollback_source_transaction,
         )
-        from zhenxun.plugin_store_transaction import (
+        from zhenxun.services.plugin_store.plugin_store_transaction import (
             startup_verification as verify_source_startup,
         )
         from zhenxun.utils.restart_state import clear_pending_restart_state
@@ -2016,7 +2021,7 @@ async def _run_launcher_async() -> None:
             launcher_supervisor.shutdown_id = None
             if restart_action and restart_action[0] == "sync_dependencies_restart":
                 dependency_paths = restart_action[1]
-                from zhenxun.nonebot_store.storage import (
+                from zhenxun.services.nonebot_store.storage import (
                     save_dependency_sync_status,
                 )
 
@@ -2073,7 +2078,7 @@ def main() -> None:
 
     if not args or args[0] == "run":
         from zhenxun.migration.lease import InstanceLease
-        from zhenxun.startup_banner import show_startup_banner
+        from zhenxun.services.startup_banner import show_startup_banner
 
         show_startup_banner()
         with InstanceLease(_ensure_project_root(), role="launcher") as lease:
@@ -2113,7 +2118,7 @@ def main() -> None:
                 _record_process_crash(error, role="worker")
                 raise
         else:
-            from zhenxun.startup_banner import show_startup_banner
+            from zhenxun.services.startup_banner import show_startup_banner
 
             show_startup_banner(role="worker")
             try:

@@ -149,17 +149,17 @@ def _execute_restore_phase(project: Path, request: dict, *, lease) -> dict:
             raise MigrationError("migration_archive_changed", status=409)
 
         async def restore_dependencies():
-            from zhenxun.nonebot_store.dependencies import (
-                FORBIDDEN_LAYER_PACKAGES,
-                base_installed_inventory,
-                project_closure,
-            )
             from zhenxun.services.lifecycle.deadline import (
                 ShutdownBudget,
                 current_budget,
             )
             from zhenxun.services.lifecycle.kernel import LifecycleKernel
             from zhenxun.services.lifecycle.launcher import LauncherSupervisor
+            from zhenxun.services.nonebot_store.dependencies import (
+                FORBIDDEN_LAYER_PACKAGES,
+                base_installed_inventory,
+                project_closure,
+            )
 
             from .dependencies import DependencyRestorer
 

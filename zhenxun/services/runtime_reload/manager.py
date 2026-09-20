@@ -1284,12 +1284,11 @@ class PluginRuntimeManager:
                             ):
                                 return await func(*args, **kwargs)
                         except Exception as error:
-                            if manager._isolate_plugin_hook_error(
-                                root_owner,
-                                _hook_name,
-                                error,
-                                bot=kwargs.get("bot") or (args[0] if args else None),
-                            ):
+                            hook_bot = kwargs.get("bot") or (args[0] if args else None)
+                            isolated = manager._isolate_plugin_hook_error(
+                                root_owner, _hook_name, error, bot=hook_bot
+                            )
+                            if isolated:
                                 return None
                             raise
 
@@ -1316,12 +1315,11 @@ class PluginRuntimeManager:
                             ):
                                 return func(*args, **kwargs)
                         except Exception as error:
-                            if manager._isolate_plugin_hook_error(
-                                root_owner,
-                                _hook_name,
-                                error,
-                                bot=kwargs.get("bot") or (args[0] if args else None),
-                            ):
+                            hook_bot = kwargs.get("bot") or (args[0] if args else None)
+                            isolated = manager._isolate_plugin_hook_error(
+                                root_owner, _hook_name, error, bot=hook_bot
+                            )
+                            if isolated:
                                 return None
                             raise
 
@@ -1670,7 +1668,8 @@ class PluginRuntimeManager:
                         if not manager._work_lease_is_current(
                             owner, incarnation.incarnation_id, phase
                         ):
-                            raise RuntimeError("plugin_work_lease_revoked")
+                            manager._entry_diagnostics["plugin_work_lease_revoked"] += 1
+                            raise asyncio.CancelledError("plugin_work_lease_revoked")
                         with resource_context(owner):
                             return func(*args)
                     finally:
@@ -2404,10 +2403,23 @@ class PluginRuntimeManager:
                 if incarnation and not self._work_lease_is_current(
                     owner, incarnation.incarnation_id, phase
                 ):
-                    # Cancelling before the coroutine starts hides the rejection
-                    # from task groups (e.g. AnyIO's connection attempts).
+                    # A task factory must return a Task. Raising here is
+                    # observed by APScheduler as a failed job submission and
+                    # turns an expected unload race into an ERROR.
                     coro.close()
-                    raise RuntimeError("plugin_work_lease_revoked")
+                    self._entry_diagnostics["plugin_work_lease_revoked"] += 1
+
+                    async def discard_revoked_work():
+                        return None
+
+                    if self._original_task_factory:
+                        task = self._original_task_factory(
+                            loop, discard_revoked_work(), **kwargs
+                        )
+                    else:
+                        task = asyncio.Task(discard_revoked_work(), loop=loop, **kwargs)
+                    task.cancel()
+                    return task
             if self._original_task_factory:
                 task = self._original_task_factory(loop, coro, **kwargs)
             else:
@@ -2586,7 +2598,8 @@ class PluginRuntimeManager:
                     if not manager._work_lease_is_current(
                         owner, incarnation.incarnation_id, phase
                     ):
-                        raise RuntimeError("plugin_work_lease_revoked")
+                        manager._entry_diagnostics["plugin_work_lease_revoked"] += 1
+                        raise asyncio.CancelledError("plugin_work_lease_revoked")
                     with resource_context(owner):
                         return func(*args)
                 finally:
@@ -3021,12 +3034,14 @@ class PluginRuntimeManager:
             if reason := self._integrity_block({module_name}):
                 return self._failed_operation(module_name, reason)
             from nonebot.matcher import matchers
+            import nonebot.plugin as plugin_module
 
             previous_generation = self.generation
             runtime_mutation_coordinator.checkpoint()
             provider_snapshot = active_undo.get()
             incarnation = self._prepare_candidate(module_name)
             before_plugins = {plugin.id_ for plugin in get_loaded_plugins()}
+            before_managers = set(plugin_module._managers)
             before_matchers = {
                 matcher
                 for priority_matchers in matchers.values()
@@ -3037,7 +3052,21 @@ class PluginRuntimeManager:
                     owner_context(module_name),
                     provider_capture(module_name, incarnation.incarnation_id),
                 ):
-                    plugin = nonebot.load_plugin(module_name)
+                    # Directory discovery keeps declarations after hot unload.
+                    # Reuse that manager instead of registering the name twice.
+                    declared_manager = next(
+                        (
+                            manager
+                            for manager in plugin_module._managers
+                            if module_name in manager.controlled_modules.values()
+                        ),
+                        None,
+                    )
+                    plugin = (
+                        declared_manager.load_plugin(module_name)
+                        if declared_manager is not None
+                        else nonebot.load_plugin(module_name)
+                    )
                 if plugin is None:
                     raise RuntimeError("plugin_import_failed")
 
@@ -3054,7 +3083,11 @@ class PluginRuntimeManager:
                     reason = sorted(unit.reasons)[0]
                     unit.last_error = f"classification_miss:{reason}"
                     await self._rollback_new_plugin(
-                        module_name, before_plugins, before_matchers, provider_snapshot
+                        module_name,
+                        before_plugins,
+                        before_matchers,
+                        provider_snapshot,
+                        before_managers=before_managers,
                     )
                     self._revoke_incarnation(module_name)
                     return await self._request_restart_compat(
@@ -3074,7 +3107,11 @@ class PluginRuntimeManager:
                     reason = sorted(unit.reasons)[0]
                     unit.last_error = f"classification_miss:{reason}"
                     await self._rollback_new_plugin(
-                        module_name, before_plugins, before_matchers, provider_snapshot
+                        module_name,
+                        before_plugins,
+                        before_matchers,
+                        provider_snapshot,
+                        before_managers=before_managers,
                     )
                     self._revoke_incarnation(plugin_id)
                     return await self._request_restart_compat(
@@ -3100,7 +3137,11 @@ class PluginRuntimeManager:
             except MutationCancelled:
                 try:
                     await self._rollback_new_plugin(
-                        module_name, before_plugins, before_matchers, provider_snapshot
+                        module_name,
+                        before_plugins,
+                        before_matchers,
+                        provider_snapshot,
+                        before_managers=before_managers,
                     )
                     self.generation = previous_generation
                     self._revoke_incarnation(module_name)
@@ -3140,7 +3181,11 @@ class PluginRuntimeManager:
                 logger.error("新安装插件热加载失败，已隔离本次加载", e=e)
                 try:
                     await self._rollback_new_plugin(
-                        module_name, before_plugins, before_matchers, provider_snapshot
+                        module_name,
+                        before_plugins,
+                        before_matchers,
+                        provider_snapshot,
+                        before_managers=before_managers,
                     )
                 except BaseException as cleanup_error:
                     operation = await self._fail_integrity_operation(
@@ -3230,6 +3275,9 @@ class PluginRuntimeManager:
         from nonebot.matcher import matchers
 
         before_plugins = {plugin.id_ for plugin in get_loaded_plugins()}
+        import nonebot.plugin as plugin_module
+
+        before_managers = set(plugin_module._managers)
         before_matchers = {
             matcher
             for priority_matchers in matchers.values()
@@ -3261,7 +3309,7 @@ class PluginRuntimeManager:
         except Exception as error:
             for module, _ in candidates:
                 await self._cleanup_failed_new_plugin(
-                    module, before_plugins, before_matchers
+                    module, before_plugins, before_matchers, before_managers
                 )
             operation = RuntimeOperation(
                 ApplyMode.FAILED,
@@ -3277,7 +3325,13 @@ class PluginRuntimeManager:
         return operation
 
     async def _rollback_new_plugin(
-        self, module_name, before_plugins, before_matchers, provider_snapshot
+        self,
+        module_name,
+        before_plugins,
+        before_matchers,
+        provider_snapshot,
+        *,
+        before_managers,
     ) -> None:
         runtime_mutation_coordinator.set_phase("rolling_back")
         provider_snapshot.verify()
@@ -3292,7 +3346,7 @@ class PluginRuntimeManager:
                 await self._run_reload_shutdown_hooks({module_name})
                 budget.check()
                 await self._cleanup_failed_new_plugin(
-                    module_name, before_plugins, before_matchers
+                    module_name, before_plugins, before_matchers, before_managers
                 )
                 budget.check()
                 provider_snapshot.rollback()
@@ -3304,6 +3358,7 @@ class PluginRuntimeManager:
         module_name: str,
         before_plugins: set[str],
         before_matchers: set[type],
+        before_managers: set,
     ) -> None:
         from nonebot.matcher import matchers
         import nonebot.plugin as plugin_module
@@ -3385,7 +3440,9 @@ class PluginRuntimeManager:
         }
         for manager in list(plugin_module._managers):
             controlled = set(manager.controlled_modules.values())
-            if manager in failed_managers or module_name in controlled:
+            if manager not in before_managers and (
+                manager in failed_managers or module_name in controlled
+            ):
                 with contextlib.suppress(ValueError):
                     plugin_module._managers.remove(manager)
         for name in sorted(

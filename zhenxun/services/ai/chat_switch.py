@@ -16,13 +16,24 @@ def module_identity(owner: str) -> str:
     return value
 
 
-def switch_values() -> dict[str, bool]:
-    from zhenxun.services.plugin_policy import plugin_policy_service
+def switch_values() -> dict[str, bool] | None:
+    from zhenxun.services.plugin_policy import (
+        PluginPolicyNotReady,
+        plugin_policy_service,
+    )
 
-    return plugin_policy_service.global_switch_values()
+    try:
+        return plugin_policy_service.global_switch_values()
+    except PluginPolicyNotReady:
+        # Keep admission closed while startup is still loading policy.  The
+        # caller can skip work without logging a normal startup race as ERROR.
+        return None
 
 
 def chat_plugin_enabled(owner: str | None, values: dict | None = None) -> bool:
+    current_values = switch_values() if values is None else values
+    if current_values is None:
+        return False
     if not owner:
         return True
     identity = module_identity(owner)
@@ -32,7 +43,7 @@ def chat_plugin_enabled(owner: str | None, values: dict | None = None) -> bool:
             identity == module_identity(module)
             or identity.startswith(module_identity(module) + ".")
         )
-        for module, enabled in (switch_values() if values is None else values).items()
+        for module, enabled in current_values.items()
     )
 
 

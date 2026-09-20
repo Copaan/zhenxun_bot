@@ -161,7 +161,7 @@ async def _(context):
             if not public_ready:
                 return
             available = await startup_coordinator.wait_final_available()
-            from zhenxun.startup_banner import ready_summary
+            from zhenxun.services.startup_banner import ready_summary
 
             sys.stderr.write(ready_summary(startup_coordinator.snapshot()))
             sys.stderr.flush()
@@ -172,7 +172,9 @@ async def _(context):
                 if not connection_code:
                     return
                 if not os.getenv("ZHENXUN_LAUNCHER_PID"):
-                    from zhenxun.update_service import finalize_applied_update
+                    from zhenxun.services.update.update_service import (
+                        finalize_applied_update,
+                    )
 
                     finalize_applied_update()
                 from zhenxun.configs.webui_tls import runtime_webui_settings

@@ -6,14 +6,19 @@ from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
-from zhenxun import plugin_archive as service
-from zhenxun.plugin_archive_dependencies import ArchiveDependencyConflict
-from zhenxun.plugin_store_coordinator import (
+from zhenxun.services.plugin_store import plugin_archive as service
+from zhenxun.services.plugin_store.plugin_archive_dependencies import (
+    ArchiveDependencyConflict,
+)
+from zhenxun.services.plugin_store.plugin_store_coordinator import (
     StoreOperationBusyError,
     plugin_store_operation_coordinator,
 )
-from zhenxun.plugin_store_receipts import source_digest
-from zhenxun.plugin_store_transaction import ArchiveSourceBuildConflict, stage_operation
+from zhenxun.services.plugin_store.plugin_store_receipts import source_digest
+from zhenxun.services.plugin_store.plugin_store_transaction import (
+    ArchiveSourceBuildConflict,
+    stage_operation,
+)
 
 from ....apply_result import update_pending_restart
 from ....base_model import Result
@@ -62,13 +67,19 @@ def _http_error(error: Exception) -> HTTPException:
     if isinstance(error, ProxyPolicyError):
         return HTTPException(400, error.code)
     if isinstance(error, ArchiveDependencyConflict | ArchiveSourceBuildConflict):
-        return HTTPException(409, error.code)
+        detail = {"code": error.code}
+        if getattr(error, "details", None):
+            detail["details"] = error.details
+        return HTTPException(409, detail)
     if isinstance(error, service.ArchiveError):
+        if not error.candidates and not getattr(error, "details", None):
+            return HTTPException(error.status, error.code)
+        detail = {"code": error.code}
         if error.candidates:
-            return HTTPException(
-                error.status, {"code": error.code, "candidates": error.candidates}
-            )
-        return HTTPException(error.status, error.code)
+            detail["candidates"] = error.candidates
+        if getattr(error, "details", None):
+            detail["details"] = error.details
+        return HTTPException(error.status, detail)
     if isinstance(error, StoreOperationBusyError):
         return HTTPException(409, "plugin_operation_in_progress")
     return HTTPException(400, "archive_operation_failed")

@@ -80,14 +80,16 @@ def _current_access_urls() -> list[str]:
 def transaction_verification_status() -> dict[str, Any]:
     sources: list[str] = []
     try:
-        from zhenxun.nonebot_store.storage import load_manifest
+        from zhenxun.services.nonebot_store.storage import load_manifest
 
         if load_manifest().get("pending_verification"):
             sources.append("nonebot_store")
     except Exception:
         pass
     try:
-        from zhenxun.plugin_store_transaction import pending_transaction
+        from zhenxun.services.plugin_store.plugin_store_transaction import (
+            pending_transaction,
+        )
 
         transaction = pending_transaction() or {}
         if transaction.get("state") == "verification_pending":
@@ -192,7 +194,9 @@ def restart_status_data(*, access_urls: list[str] | None = None) -> dict[str, An
     pending_reasons = set(get_pending_restart_reasons())
     pending_items = get_pending_restart_items()
     try:
-        from zhenxun.nonebot_store.storage import pending_transaction as nonebot_pending
+        from zhenxun.services.nonebot_store.storage import (
+            pending_transaction as nonebot_pending,
+        )
 
         transaction = nonebot_pending() or {}
         operations = transaction.get("operations", [])
@@ -232,7 +236,9 @@ def restart_status_data(*, access_urls: list[str] | None = None) -> dict[str, An
     except Exception:
         pass
     try:
-        from zhenxun.plugin_store_transaction import public_transaction
+        from zhenxun.services.plugin_store.plugin_store_transaction import (
+            public_transaction,
+        )
 
         transaction = public_transaction() or {}
         existing_sources = {str(item.get("source")) for item in pending_items}

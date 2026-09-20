@@ -32,11 +32,14 @@ async def submit_restore(
 
     async def submit():
         from zhenxun.configs.config import Config
-        from zhenxun.nonebot_store.storage import pending_transaction
-        from zhenxun.plugin_store_transaction import (
+        from zhenxun.services.nonebot_store.storage import pending_transaction
+        from zhenxun.services.plugin_store.plugin_store_transaction import (
             pending_transaction as source_pending,
         )
-        from zhenxun.update_service import applied_update_pending, pending_job
+        from zhenxun.services.update.update_service import (
+            applied_update_pending,
+            pending_job,
+        )
 
         if (
             pending_transaction()
@@ -127,11 +130,14 @@ async def submit_export(
 
     async def submit():
         from zhenxun.configs.config import Config
-        from zhenxun.nonebot_store.storage import pending_transaction
-        from zhenxun.plugin_store_transaction import (
+        from zhenxun.services.nonebot_store.storage import pending_transaction
+        from zhenxun.services.plugin_store.plugin_store_transaction import (
             pending_transaction as source_pending,
         )
-        from zhenxun.update_service import applied_update_pending, pending_job
+        from zhenxun.services.update.update_service import (
+            applied_update_pending,
+            pending_job,
+        )
 
         from .maintenance_app import ManagementSnapshot
 

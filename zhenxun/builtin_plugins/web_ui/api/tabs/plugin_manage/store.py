@@ -15,12 +15,12 @@ from nonebot.compat import model_dump
 from nonebot.utils import path_to_module_name
 from packaging.version import InvalidVersion, Version
 
-from zhenxun.plugin_store_coordinator import (
+from zhenxun.services.log import logger
+from zhenxun.services.plugin_store.plugin_store_coordinator import (
     StoreOperationBusyError,
     plugin_store_operation_coordinator,
 )
-from zhenxun.plugin_store_transaction import stage_operation
-from zhenxun.services.log import logger
+from zhenxun.services.plugin_store.plugin_store_transaction import stage_operation
 from zhenxun.services.runtime_reload import plugin_runtime_manager
 from zhenxun.utils.repo_utils.utils import redact_git_output
 
@@ -619,7 +619,9 @@ async def _(refresh: bool = False) -> Result[dict]:
         )
         installed_plugins = await StoreManager.get_installed_plugins()
         receipts = StoreReceiptStore.load()
-        from zhenxun.plugin_store_transaction import public_transaction
+        from zhenxun.services.plugin_store.plugin_store_transaction import (
+            public_transaction,
+        )
 
         pending_transaction = public_transaction()
         pending_by_key = {
@@ -1082,7 +1084,7 @@ async def _(param: PluginIr) -> Result:
 
             request_value = _request_value(param)
             if param.store_key:
-                from zhenxun.plugin_store_transaction import (
+                from zhenxun.services.plugin_store.plugin_store_transaction import (
                     cancel_operation,
                     pending_transaction,
                 )
@@ -1368,8 +1370,12 @@ async def get_store_operation(operation_id: str) -> Result[dict]:
     response_class=JSONResponse,
 )
 async def get_unified_pending_transaction() -> Result[dict]:
-    from zhenxun.nonebot_store.storage import pending_transaction as nonebot_pending
-    from zhenxun.plugin_store_transaction import public_transaction
+    from zhenxun.services.nonebot_store.storage import (
+        pending_transaction as nonebot_pending,
+    )
+    from zhenxun.services.plugin_store.plugin_store_transaction import (
+        public_transaction,
+    )
 
     return Result.ok(
         {
@@ -1386,7 +1392,7 @@ async def get_unified_pending_transaction() -> Result[dict]:
     response_class=JSONResponse,
 )
 async def cancel_unified_pending_operation(operation_id: str) -> Result[dict]:
-    from zhenxun.plugin_store_transaction import (
+    from zhenxun.services.plugin_store.plugin_store_transaction import (
         cancel_operation,
         pending_transaction,
     )
@@ -1420,8 +1426,10 @@ async def cancel_unified_pending_operation(operation_id: str) -> Result[dict]:
     response_class=JSONResponse,
 )
 async def cancel_unified_transaction() -> Result[dict]:
-    from zhenxun.nonebot_store.storage import pending_transaction as nonebot_pending
-    from zhenxun.plugin_store_transaction import (
+    from zhenxun.services.nonebot_store.storage import (
+        pending_transaction as nonebot_pending,
+    )
+    from zhenxun.services.plugin_store.plugin_store_transaction import (
         cancel_operation,
         pending_transaction,
     )

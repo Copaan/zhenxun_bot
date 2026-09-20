@@ -15,7 +15,9 @@ from packaging.utils import canonicalize_name
 from packaging.version import InvalidVersion, Version
 from pydantic import BaseModel, Field
 
-from zhenxun.nonebot_store.dependencies import (
+from zhenxun.services.lifecycle.operations import operation_registry
+from zhenxun.services.log import logger
+from zhenxun.services.nonebot_store.dependencies import (
     DependencyAnalysisError,
     environment_fingerprint,
     environment_report,
@@ -28,8 +30,8 @@ from zhenxun.nonebot_store.dependencies import (
     solve_install,
     uninstall_plan,
 )
-from zhenxun.nonebot_store.registry import get_registry, get_registry_plugin
-from zhenxun.nonebot_store.runtime import (
+from zhenxun.services.nonebot_store.registry import get_registry, get_registry_plugin
+from zhenxun.services.nonebot_store.runtime import (
     LayerBuildError,
     activate_current_generation,
     build_generation,
@@ -41,7 +43,7 @@ from zhenxun.nonebot_store.runtime import (
     rollback_pending_transaction,
     stage_generation,
 )
-from zhenxun.nonebot_store.storage import (
+from zhenxun.services.nonebot_store.storage import (
     clear_pending_transaction,
     dependency_sync_status,
     load_manifest,
@@ -51,16 +53,14 @@ from zhenxun.nonebot_store.storage import (
     save_pending_transaction,
     utc_now,
 )
-from zhenxun.plugin_archive_dependencies import (
+from zhenxun.services.plugin_store.plugin_archive_dependencies import (
     ArchiveDependencyConflict,
     preserve_archive_dependencies,
 )
-from zhenxun.plugin_store_transaction import (
+from zhenxun.services.plugin_store.plugin_store_transaction import (
     ArchiveSourceBuildConflict,
     archive_dependency_policy,
 )
-from zhenxun.services.lifecycle.operations import operation_registry
-from zhenxun.services.log import logger
 from zhenxun.services.runtime_reload import plugin_runtime_manager
 
 from ....apply_result import update_pending_restart
