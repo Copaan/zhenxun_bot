@@ -94,9 +94,32 @@ def _card_cache_key(user, session) -> str:
     identity = current_business_identity()
     revision = identity.revision if identity else 0
     display = sha256(
-        f"{session.scope}:{session.self_id}:{session.user.id}:{revision}".encode()
+        f"identity-v2:{session.scope}:{session.self_id}:{session.user.id}:{revision}".encode()
     ).hexdigest()[:20]
     return f"{user.user_console_id}_{display}"
+
+
+def _identity_display(session) -> dict[str, str | None]:
+    from zhenxun.services.business_identity import current_business_identity
+
+    identity = current_business_identity()
+    label = "平台 ID"
+    bound_qq = None
+    raw = str(session.user.id)
+    if identity:
+        protocol = identity.protocol
+        raw = protocol.raw_user_id
+        if protocol.domain == "qq_api":
+            label = (
+                "平台 ID（OpenID）"
+                if protocol.scene in {"c2c", "group"}
+                else "平台 ID（频道用户 ID）"
+            )
+            if identity.storage_key != protocol.original_key:
+                bound_qq = identity.storage_key
+        elif protocol.domain == "qq_client":
+            label = "平台 ID（QQ）"
+    return {"platform_id": raw, "platform_id_label": label, "bound_qq": bound_qq}
 
 
 async def get_card(
@@ -271,6 +294,7 @@ async def _generate_html_card(
         "avatar_url": avatar_path.as_uri() if avatar_path else "",
         "sign_count": user.sign_count,
         "font_size": font_size,
+        **_identity_display(session),
     }
 
     favorability_info = {

@@ -4,7 +4,6 @@ from collections.abc import Awaitable, Callable
 import contextlib
 from dataclasses import dataclass
 import importlib
-import re
 from typing import Any
 
 from nonebot.adapters import Bot, Event
@@ -16,7 +15,11 @@ from zhenxun.services.log import logger
 from zhenxun.services.message_load import signal_overload
 
 from .auth.config import LOGGER_COMMAND
-from .auth_activation import HandlerActivationIndex
+from .auth_activation import (
+    HandlerActivationIndex,
+    adapter_contract_matches,
+    matcher_supported_adapters,
+)
 from .auth_patch_guard import validate_handle_event_patch
 from .auth_types import EventDispatchContext
 
@@ -126,13 +129,7 @@ def _ensure_nonempty_qq_message(message: Any) -> None:
         message.append(MessageSegment.text(""))
 
 
-_ACCOUNT_BINDING_COMMAND = re.compile(
-    r"^\s*(?:绑定\s*(?:qq|状态)|解绑\s*qq)(?:\s|$)",
-    re.IGNORECASE,
-)
-
-
-def _is_account_binding_command(event: Event) -> bool:
+def _is_account_binding_command(event: Event, bot: Bot | None = None) -> bool:
     """Reserve account commands from catch-all AI matchers.
 
     Official QQ may deliver a leading mention segment and Alconna parsing can
@@ -140,12 +137,14 @@ def _is_account_binding_command(event: Event) -> bool:
     validation; this guard only prevents a generic ChatInter fallback from
     claiming the command when parsing or matcher ordering is delayed.
     """
-    candidates: list[str] = []
-    with contextlib.suppress(Exception):
-        candidates.append(str(event.get_plaintext() or ""))
-    with contextlib.suppress(Exception):
-        candidates.append(str(event.get_message() or ""))
-    return any(_ACCOUNT_BINDING_COMMAND.match(value) for value in candidates)
+    from zhenxun.services.account_binding_routing import (
+        bare_binding_code,
+        binding_command,
+    )
+
+    return binding_command(event) is not None or (
+        bot is not None and bare_binding_code(bot, event) is not None
+    )
 
 
 def _is_chatinter_matcher(matcher: type[Matcher]) -> bool:
@@ -202,7 +201,7 @@ async def patched_handle_event(
     from zhenxun.services.pipeline_metrics import pipeline_metrics
 
     _normalize_qq_self_at_message(bot, event)
-    reserve_account_binding = _is_account_binding_command(event)
+    reserve_account_binding = _is_account_binding_command(event, bot)
     show_log = True
     escape_tag = getattr(nb_message, "escape_tag")
     logger_ = getattr(nb_message, "logger")
@@ -263,6 +262,7 @@ async def patched_handle_event(
                 dispatch_context,
                 event,
             )
+            activation_context.adapter = bot.adapter
             pipeline_metrics.observe(
                 "route_select_ms", time.perf_counter() - route_started
             )
@@ -332,7 +332,13 @@ async def patched_handle_event(
                     ):
                         signal_overload(3.0)
                 else:
-                    selected_matchers = priority_matchers
+                    selected_matchers = [
+                        matcher
+                        for matcher in priority_matchers
+                        if adapter_contract_matches(
+                            matcher_supported_adapters(matcher), bot.adapter
+                        )
+                    ]
 
                 if reserve_account_binding:
                     selected_matchers = [

@@ -26,6 +26,7 @@ from .auth.context import (
     resolve_event_group_id,
     set_route_modules,
 )
+from .auth_activation import adapter_contract_matches, matcher_supported_adapters
 from .auth_checker import (
     LimitManager,
     _get_route_context,
@@ -49,9 +50,11 @@ async def _mark_bot_connected(bot: Bot):
 
 @driver.on_bot_disconnect
 async def _mark_bot_disconnected(bot: Bot):
+    from zhenxun.services.uninfo_patch import clear_uninfo_sessions
     from zhenxun.utils.platform import PlatformUtils
 
     connection_epochs.disconnect(bot, PlatformUtils.get_platform_scope(bot))
+    await clear_uninfo_sessions(bot)
 
 
 @PriorityLifecycle.on_startup(
@@ -66,10 +69,13 @@ async def _start_auth_runtime_tasks(context):
 
 @PriorityLifecycle.on_shutdown(priority=7, component_id="runtime:auth_tasks")
 async def _stop_auth_runtime_tasks():
+    from zhenxun.services.uninfo_patch import clear_uninfo_sessions
+
     try:
         await stop_auth_runtime_tasks()
     finally:
         connection_epochs.clear()
+        await clear_uninfo_sessions()
 
 
 def _skip_auth_for_plugin(matcher: Matcher) -> bool:
@@ -82,7 +88,9 @@ def _skip_auth_for_plugin(matcher: Matcher) -> bool:
     return "chat_history" in module_name
 
 
-def _enforce_platform_contract(matcher: Matcher, event_context) -> None:
+def _enforce_platform_contract(
+    matcher: Matcher, event_context, bot, event, session
+) -> None:
     if matcher.plugin is None:
         return
     metadata = getattr(matcher.plugin, "metadata", None)
@@ -95,12 +103,10 @@ def _enforce_platform_contract(matcher: Matcher, event_context) -> None:
     required = set(extra.get("required_platform_capabilities") or ())
     if not required:
         return
-    available = {"uni_message", "passive_reply"}
-    if event_context.group_id:
-        available.add("group")
-    else:
-        available.add("c2c")
-    if not required.issubset(available):
+    from zhenxun.services.platform_capabilities import event_capabilities
+
+    capabilities = event_capabilities(bot, event, session)
+    if not required.issubset(capabilities.available):
         raise IgnoredException("plugin platform capability unavailable")
 
 
@@ -152,6 +158,9 @@ async def _auth_preprocessor(
     if event.get_type() == "message" and not is_cache_ready():
         raise IgnoredException("cache not ready ignore")
 
+    if not adapter_contract_matches(matcher_supported_adapters(matcher), bot.adapter):
+        raise IgnoredException("plugin adapter unsupported")
+
     # 提前判断是否跳过权限检查
     if _skip_auth_for_plugin(matcher):
         return
@@ -164,7 +173,7 @@ async def _auth_preprocessor(
         state,
         message=message,
     )
-    _enforce_platform_contract(matcher, event_context)
+    _enforce_platform_contract(matcher, event_context, bot, event, session)
     from zhenxun.services.bot_group_policy import bot_group_policy_service
 
     await bot_group_policy_service.ensure_fresh(

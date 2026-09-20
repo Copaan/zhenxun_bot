@@ -15,9 +15,11 @@ from nonebot.adapters.qq.event import (
     C2CMessageCreateEvent,
     DirectMessageCreateEvent,
     FriendRobotEvent,
+    GroupMemberEvent,
     GroupMessageCreateEvent,
     GroupRobotEvent,
     GuildMessageEvent,
+    InteractionCreateEvent,
 )
 from tortoise.exceptions import IntegrityError
 
@@ -59,9 +61,12 @@ class OfficialQQEventContext:
     guild_id: str = ""
     channel_id: str = ""
     guild_direct: bool = False
+    interaction_id: str = ""
+    message_id: str = ""
     guild_event: GuildMessageEvent | None = field(
         default=None, repr=False, compare=False
     )
+    reply_event: Event | None = field(default=None, repr=False, compare=False)
 
     @property
     def reply_address(self) -> dict[str, str]:
@@ -155,10 +160,20 @@ def with_official_event_context(
 
 
 def _event_address(event: Event) -> tuple[OfficialScene, str, str] | None:
+    if isinstance(event, InteractionCreateEvent):
+        if event.type != 11:
+            return None
+        if event.chat_type == 1:
+            return "group", str(event.group_member_openid), str(event.group_openid)
+        if event.chat_type == 2:
+            return "c2c", str(event.user_openid), ""
+        return "guild", str(event.data.resolved.user_id), ""
     if isinstance(event, C2CMessageCreateEvent):
         return "c2c", str(event.author.user_openid), ""
     if isinstance(event, GroupMessageCreateEvent):
         return "group", str(event.author.member_openid), str(event.group_openid)
+    if isinstance(event, GroupMemberEvent):
+        return "group", str(event.member_openid), str(event.group_openid)
     if isinstance(event, GuildMessageEvent):
         return "guild", str(event.author.id or ""), ""
     if isinstance(event, FriendRobotEvent):
@@ -171,6 +186,42 @@ def _event_address(event: Event) -> tuple[OfficialScene, str, str] | None:
         )
         return "group", actor, str(event.group_openid)
     return None
+
+
+def validate_button_interaction(app_id: str, event: Event) -> None:
+    """Validate addresses before either identity creation or transport receipts."""
+    if not isinstance(event, InteractionCreateEvent) or event.type != 11:
+        return
+    if str(event.application_id) != str(app_id):
+        raise ValueError("interaction application_id mismatch")
+    if not event.id or not event.event_id:
+        raise ValueError("interaction ID or reply event ID missing")
+    if event.chat_type == 1:
+        required = (event.group_openid, event.group_member_openid)
+        forbidden = (event.guild_id, event.channel_id, event.user_openid)
+    elif event.chat_type == 2:
+        required = (event.user_openid,)
+        forbidden = (
+            event.group_openid,
+            event.group_member_openid,
+            event.guild_id,
+            event.channel_id,
+        )
+    elif event.chat_type == 0:
+        required = (event.guild_id, event.channel_id, event.data.resolved.user_id)
+        forbidden = (event.group_openid, event.group_member_openid, event.user_openid)
+    else:
+        raise ValueError("unsupported button chat_type")
+    if any(not str(value or "").strip() for value in required) or any(forbidden):
+        raise ValueError("interaction actor or scene address invalid")
+
+
+def validate_official_event(app_id: str, event: Event) -> None:
+    validate_button_interaction(app_id, event)
+    if isinstance(event, GroupMemberEvent) and (
+        not event.member_openid.strip() or not event.group_openid.strip()
+    ):
+        raise ValueError("group member event address missing")
 
 
 def _union_openid(event: Event) -> str:
@@ -233,6 +284,11 @@ async def _resolve_principal(
 async def prepare_event_context(
     app_id: str, event: Event, *, received_at: datetime | None = None
 ) -> OfficialQQEventContext | None:
+    validate_official_event(app_id, event)
+    if isinstance(event, GroupMemberEvent):
+        from zhenxun.services.uninfo_patch import invalidate_qq_member_cache
+
+        invalidate_qq_member_cache(app_id, event.group_openid, event.member_openid)
     address = _event_address(event)
     if address is None:
         return None
@@ -251,6 +307,9 @@ async def prepare_event_context(
     source_kind: Literal["msg_id", "event_id"] = (
         "msg_id" if getattr(event, "id", None) else "event_id"
     )
+    interaction = isinstance(event, InteractionCreateEvent)
+    if interaction:
+        source_id, source_kind = str(event.event_id), "event_id"
     received_at = received_at or datetime.now(timezone.utc)
     window = timedelta(minutes=60 if scene == "c2c" else 5)
     context = OfficialQQEventContext(
@@ -273,11 +332,14 @@ async def prepare_event_context(
         ),
         received_at=received_at,
         reply_deadline=received_at + window,
-        max_passive_replies=4 if scene == "c2c" else 5,
+        max_passive_replies=0 if interaction else 4 if scene == "c2c" else 5,
+        interaction_id=str(event.id) if interaction else "",
+        message_id=str(event.data.resolved.message_id or "") if interaction else "",
         guild_id=str(getattr(event, "guild_id", "") or ""),
         channel_id=str(getattr(event, "channel_id", "") or ""),
         guild_direct=isinstance(event, DirectMessageCreateEvent),
         guild_event=event if isinstance(event, GuildMessageEvent) else None,
+        reply_event=event if interaction else None,
     )
     bind_event_official_context(event, context)
     return context
@@ -320,6 +382,8 @@ class OfficialReplyUnavailable(RuntimeError):
 async def allocate_reply_sequence(
     context: OfficialQQEventContext,
 ) -> tuple[ReplyState, int]:
+    if context.interaction_id:
+        raise OfficialReplyUnavailable("Button replies use the adapter's native API")
     if context.scene == "guild":
         raise OfficialReplyUnavailable("Guild replies use channel/DM APIs")
     now = datetime.now(timezone.utc)

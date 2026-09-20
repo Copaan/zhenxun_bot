@@ -14,6 +14,16 @@ tests/
 .pre-commit-config.yaml
 .prettier*
 .env.dev
+/.env
+/data/
+/log/
+/temp/
+/migration/
+*.log
+*.coverage
+.coverage
+coverage.xml
+__pycache__/
 docker-compose.yml
 Dockerfile
 LICENSE

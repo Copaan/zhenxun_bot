@@ -27,8 +27,15 @@ from zhenxun.services.ai.core.models import LLMContext
 from zhenxun.services.ai.run.context import RunContext
 from zhenxun.services.ai.utils import PermissionUtils
 from zhenxun.services.ai.utils.logger import log_capability as logger
+from zhenxun.services.business_identity import (
+    business_account_scope,
+    current_business_identity,
+    resolve_business_identity,
+)
+from zhenxun.services.platform_identity import CURRENT_PLATFORM_SCOPE
 from zhenxun.utils.enum import GoldHandle
 from zhenxun.utils.exception import InsufficientGold
+from zhenxun.utils.platform import PlatformUtils
 
 from .base import (
     AbstractCapability,
@@ -201,8 +208,31 @@ class BillingCapability(AbstractCapability):
         if cost_gold > 0:
             user_id = context.get_user_id()
             platform = context.get_platform()
-            if user_id:
-                try:
+            bot, event = context.get_bot(), context.get_event()
+            official = (
+                PlatformUtils.get_platform_scope(bot) == "qq_api"
+                if bot is not None
+                else platform == "qq_api" or CURRENT_PLATFORM_SCOPE.get() == "qq_api"
+            )
+            if (bot is None or event is None) and (official or event is not None):
+                raise ToolFatalError("收费工具缺少可核验的消息身份")
+            try:
+                # Resolve before opening an asset transaction. Do not replace
+                # protocol IDs in the agent's permission/session context.
+                with business_account_scope(None):
+                    if bot is not None and event is not None:
+                        from nonebot_plugin_uninfo import get_session
+
+                        session = await get_session(bot, event)
+                        if session is None:
+                            raise ToolFatalError("收费工具无法解析消息会话")
+                        identity = await resolve_business_identity(bot, event, session)
+                        if current_business_identity() is None:
+                            raise ToolFatalError("收费工具缺少有效的官方身份上下文")
+                        user_id = identity.storage_key
+                        platform = identity.protocol.domain
+                    if not user_id:
+                        raise ToolFatalError("收费工具缺少业务账号")
                     await UserConsole.reduce_gold(
                         user_id,
                         cost_gold,
@@ -210,18 +240,18 @@ class BillingCapability(AbstractCapability):
                         f"agent_tool:{getattr(tool, 'name', 'unknown')}",
                         platform,
                     )
-                except InsufficientGold:
-                    msg = (
-                        f"系统警告：用户金币不足（需要 {cost_gold} 金币，但余额不够）。"
-                        "请向用户解释金币不足，提醒可通过签到赚取，并拒绝执行。"
-                    )
-                    logger.warning(
-                        f"💰 [Capability] 金币拦截: 用户 {user_id} 尝试调用 "
-                        f"{getattr(tool, 'name', 'unknown')}"
-                    )
-                    raise ToolFatalError(
-                        msg, display_content=f"❌ 余额不足: 需要 {cost_gold} 金币"
-                    )
+            except InsufficientGold:
+                msg = (
+                    f"系统警告：用户金币不足（需要 {cost_gold} 金币，但余额不够）。"
+                    "请向用户解释金币不足，提醒可通过签到赚取，并拒绝执行。"
+                )
+                logger.warning(
+                    f"💰 [Capability] 金币拦截: 用户 {user_id} 尝试调用 "
+                    f"{getattr(tool, 'name', 'unknown')}"
+                )
+                raise ToolFatalError(
+                    msg, display_content=f"❌ 余额不足: 需要 {cost_gold} 金币"
+                )
         return await handler(arguments)
 
 

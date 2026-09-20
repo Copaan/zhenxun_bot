@@ -156,12 +156,15 @@ class QQWebhookDispatcher:
 def dispatch_routing_key(app_id: str, event_type: str, data: object) -> str:
     payload = data if isinstance(data, dict) else {}
     group = str(payload.get("group_openid") or "")
+    if payload.get("guild_id") and payload.get("channel_id"):
+        return f"{app_id}\0guild\0{payload['guild_id']}\0{payload['channel_id']}"
     author = payload.get("author")
     author_data = author if isinstance(author, dict) else {}
     actor = str(
         payload.get("openid")
         or payload.get("user_openid")
         or payload.get("op_member_openid")
+        or payload.get("group_member_openid")
         or author_data.get("member_openid")
         or author_data.get("user_openid")
         or ""

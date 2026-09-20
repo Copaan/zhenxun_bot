@@ -200,8 +200,10 @@ def _run_worker() -> None:
     from zhenxun.services import proxy_clients
 
     proxy_clients.install()
+    from zhenxun.configs.environment import environment_file
+
     nonebot.init(
-        _env_file=ENV_DEV_FILE,
+        _env_file=environment_file(),
         htmlrender_browser_channel=htmlrender_browser_channel,
         render_backend="playwright",
         render_playwright={"channel": htmlrender_browser_channel},

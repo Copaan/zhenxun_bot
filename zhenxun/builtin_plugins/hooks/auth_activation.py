@@ -9,6 +9,7 @@ from typing import Any, Literal
 import weakref
 
 from loguru import logger
+from nonebot.adapters import Adapter
 from nonebot.matcher import Matcher
 
 ActivationDecision = Literal["match", "miss", "unknown"]
@@ -65,6 +66,7 @@ class HandlerDescriptor:
     shortcuts: tuple[str, ...] | None = None
     alconna: tuple[AlconnaDescriptor, ...] = ()
     rules: tuple[ActivationRuleDescriptor, ...] = ()
+    supported_adapters: tuple[type[Adapter], ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,6 +169,7 @@ class ActivationContext:
     route_modules: set[str] = field(default_factory=set)
     ai_route_modules: set[str] = field(default_factory=set)
     ai_route_heads: set[str] = field(default_factory=set)
+    adapter: Adapter | None = None
 
 
 @dataclass(slots=True)
@@ -255,6 +258,11 @@ class HandlerActivationIndex:
             for matcher in priority_matchers
         ]
         for descriptor in descriptors:
+            if context.adapter is not None and not adapter_contract_matches(
+                descriptor.supported_adapters, context.adapter
+            ):
+                logger.debug("plugin adapter unsupported: {}", descriptor.module)
+                continue
             decision = self._select_descriptor(descriptor, context)
             if decision == "miss":
                 continue
@@ -413,7 +421,21 @@ class HandlerActivationIndex:
             shortcuts=shortcuts,
             alconna=alconna_descriptors,
             rules=rules,
+            supported_adapters=matcher_supported_adapters(matcher),
         )
+
+
+def matcher_supported_adapters(matcher) -> tuple[type[Adapter], ...] | None:
+    metadata = getattr(getattr(matcher, "plugin", None), "metadata", None)
+    if metadata is None or getattr(metadata, "supported_adapters", None) is None:
+        return None
+    return tuple(metadata.get_supported_adapters() or ())
+
+
+def adapter_contract_matches(
+    supported: tuple[type[Adapter], ...] | None, adapter: Adapter
+) -> bool:
+    return supported is None or isinstance(adapter, supported)
 
 
 def matcher_module_name(matcher_cls: type[Matcher]) -> str:

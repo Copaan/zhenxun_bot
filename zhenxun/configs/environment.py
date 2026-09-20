@@ -8,12 +8,16 @@ def environment_file(
     template: bool = False,
     preferred: Path = Path(".env.dev"),
     template_path: Path = Path(".env.example"),
+    root: Path | None = None,
 ) -> Path:
-    # The supported launcher explicitly initializes NoneBot with .env.dev.
+    if root is not None:
+        preferred = root / preferred
+        template_path = root / template_path
+    # Launcher and editors prefer .env.dev and share the same .env fallback.
     target = (
         preferred
-        if preferred.exists() or preferred != Path(".env.dev")
-        else Path(".env")
+        if preferred.exists() or preferred != (root or Path()) / ".env.dev"
+        else (root or Path()) / ".env"
     )
     if template and not target.exists():
         return template_path

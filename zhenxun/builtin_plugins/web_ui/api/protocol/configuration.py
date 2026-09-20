@@ -21,6 +21,7 @@ from zhenxun.adapters.qq_official.config import (
     QQOfficialConfig,
     QQOfficialConfigError,
     QQOfficialIntent,
+    merge_qq_bot_config,
     validate_builtin_ingress,
     validate_qq_config_data,
 )
@@ -96,6 +97,8 @@ class QQBotForm(BaseModel):
     token: str | None = Field(default=None, max_length=512)
     secret: str | None = Field(default=None, max_length=512)
     use_websocket: bool = False
+    intent: QQOfficialIntent | None = None
+    shard: tuple[int, int] | None = None
 
 
 class ProtocolConfigurationUpdate(BaseModel):
@@ -231,6 +234,8 @@ def _masked_configuration(content: str) -> dict[str, Any]:
                 "id": str(item.get("id") or ""),
                 "has_token": bool(str(item.get("token") or "").strip()),
                 "has_secret": bool(str(item.get("secret") or "").strip()),
+                "intent": item.get("intent", {}),
+                "shard": item.get("shard"),
             }
         )
     bot_modes = {
@@ -285,15 +290,14 @@ def _resolve_bots(
                 status_code=422,
                 detail=f"QQ Bot第{index + 1}项缺少Secret。",
             )
-        result.append(
-            QQOfficialBotConfig(
-                id=app_id,
-                token=token,
-                secret=secret,
-                use_websocket=form.use_websocket,
-                intent=QQOfficialIntent(c2c_group_at_messages=True),
-            )
-        )
+        changes = model_dump(form, exclude_unset=True)
+        changes.update(id=app_id, token=token, secret=secret)
+        try:
+            result.append(merge_qq_bot_config(old, changes))
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422, detail=f"QQ Bot第{index + 1}项配置无效。"
+            ) from exc
     return result
 
 

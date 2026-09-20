@@ -1,6 +1,5 @@
 import asyncio
-from collections.abc import Awaitable, Callable
-import contextlib
+from collections.abc import AsyncIterator, Awaitable, Callable
 import random
 from typing import cast
 
@@ -10,7 +9,6 @@ from nonebot.utils import is_coroutine_callable
 from nonebot_plugin_alconna import SupportScope
 from nonebot_plugin_alconna.uniseg import Receipt, Target, UniMessage
 from nonebot_plugin_uninfo import SceneType, Uninfo, get_interface
-from nonebot_plugin_uninfo.model import Member
 from pydantic import BaseModel
 
 from zhenxun.configs.config import BotConfig
@@ -48,9 +46,9 @@ def _scope_name(scope: object) -> str:
         text = str(getattr(scope, "name", "") or "").strip().lower()
     text = text.replace("-", "_").replace(" ", "_")
     compact = "".join(ch for ch in text if ch.isalnum())
-    if compact.endswith("qqclient"):
+    if compact == "qqclient":
         return "qq_client"
-    if compact.endswith("qqapi"):
+    if compact == "qqapi":
         return "qq_api"
     return text
 
@@ -238,35 +236,121 @@ class PlatformUtils:
         return result
 
     @classmethod
-    async def get_group_member_list(cls, bot: Bot, group_id: str) -> list[UserData]:
-        """获取群组/频道成员列表
+    async def iter_group_members(
+        cls,
+        bot: Bot,
+        group_id: str,
+        *,
+        scene: SceneType = SceneType.GROUP,
+        parent_scene_id: str | None = None,
+    ) -> AsyncIterator[UserData]:
+        """Enumerate only on demand; errors never masquerade as an empty roster."""
+        from nonebot.adapters.onebot.v11 import Bot as OneBotBot
+        from nonebot.adapters.qq import Bot as QQBot
 
-        参数:
-            bot: Bot
-            group_id: 群组/频道id
-
-        返回:
-            list[UserData]: 用户数据列表
-        """
-        if interface := get_interface(bot):
-            members: list[Member] = await interface.get_members(
-                SceneType.GROUP, group_id
-            )
-            return [
-                UserData(
-                    name=member.user.name or "",
-                    card=member.nick,
-                    user_id=member.user.id,
+        if isinstance(bot, QQBot):
+            if scene == SceneType.GROUP:
+                cursor = None
+                seen = set()
+                while True:
+                    page = await bot.post_group_members(
+                        group_id=str(group_id), limit=100, start_index=cursor
+                    )
+                    next_cursor = page.next_index
+                    if next_cursor is not None and (
+                        next_cursor == cursor or next_cursor in seen
+                    ):
+                        raise RuntimeError("qq member pagination cursor repeated")
+                    for member in page.members:
+                        yield UserData(
+                            name="",
+                            user_id=member.member_openid,
+                            group_id=group_id,
+                            join_time=int(member.join_timestamp.timestamp()),
+                        )
+                    if next_cursor is None:
+                        return
+                    seen.add(next_cursor)
+                    cursor = next_cursor
+            elif scene == SceneType.GUILD or scene >= SceneType.CHANNEL_TEXT:
+                guild_id = group_id if scene == SceneType.GUILD else parent_scene_id
+                if not guild_id:
+                    raise ValueError("channel member query requires parent_scene_id")
+                after = None
+                seen = set()
+                while True:
+                    members = await bot.get_members(
+                        guild_id=guild_id, after=after, limit=100
+                    )
+                    if not members:
+                        return
+                    cursor = members[-1].user.id
+                    if not cursor or cursor == after or cursor in seen:
+                        raise RuntimeError("qq guild member pagination cursor repeated")
+                    for member in members:
+                        yield UserData(
+                            name=member.user.username or "",
+                            card=member.nick,
+                            user_id=member.user.id,
+                            group_id=guild_id,
+                            channel_id=group_id if parent_scene_id else None,
+                            avatar_url=member.user.avatar,
+                            join_time=int(member.joined_at.timestamp())
+                            if member.joined_at
+                            else None,
+                        )
+                    seen.add(cursor)
+                    after = cursor
+            else:
+                raise ValueError("private scenes do not have a member roster")
+            return
+        if isinstance(bot, OneBotBot) and scene == SceneType.GROUP:
+            for member in await bot.get_group_member_list(group_id=int(group_id)):
+                yield UserData(
+                    name=member.get("nickname") or "",
+                    card=member.get("card"),
+                    user_id=str(member["user_id"]),
                     group_id=group_id,
-                    role=member.role.id if member.role else "",
-                    avatar_url=member.user.avatar,
-                    join_time=int(member.joined_at.timestamp())
-                    if member.joined_at
-                    else None,
+                    role=member.get("role"),
+                    join_time=member.get("join_time"),
                 )
-                for member in members
-            ]
-        return []
+            return
+        interface = get_interface(bot)
+        if interface is None:
+            raise NotImplementedError("member query unsupported by adapter")
+        # The Interface list wrapper has no parent_scene_id argument and hides
+        # NotImplementedError. Use the registered iterator to preserve failures.
+        async for member in interface.fetcher.query_members(
+            bot, scene, parent_scene_id or group_id
+        ):
+            yield UserData(
+                name=member.user.name or "",
+                card=member.nick,
+                user_id=member.user.id,
+                group_id=parent_scene_id or group_id,
+                channel_id=group_id if parent_scene_id else None,
+                role=member.role.id if member.role else None,
+                avatar_url=member.user.avatar,
+                join_time=int(member.joined_at.timestamp())
+                if member.joined_at
+                else None,
+            )
+
+    @classmethod
+    async def get_group_member_list(
+        cls,
+        bot: Bot,
+        group_id: str,
+        *,
+        scene: SceneType = SceneType.GROUP,
+        parent_scene_id: str | None = None,
+    ) -> list[UserData]:
+        return [
+            member
+            async for member in cls.iter_group_members(
+                bot, group_id, scene=scene, parent_scene_id=parent_scene_id
+            )
+        ]
 
     @classmethod
     async def get_user(
@@ -420,6 +504,12 @@ class PlatformUtils:
                 )
             if context.app_id != str(bot.self_id):
                 raise OfficialReplyUnavailable("QQ official reply context bot mismatch")
+            if context.interaction_id:
+                if context.reply_event is None:
+                    raise OfficialReplyUnavailable(
+                        "QQ interaction reply event is missing"
+                    )
+                return await send_message.send(target=context.reply_event, bot=bot)
             if context.scene == "guild":
                 if context.guild_event is None:
                     raise OfficialReplyUnavailable("QQ guild reply event is missing")
@@ -543,45 +633,25 @@ class PlatformUtils:
 
     @classmethod
     def get_platform_scope(cls, t: Bot | Uninfo | object) -> str:
-        """获取细粒度平台作用域，不改变旧 get_platform 返回值。"""
+        """Resolve a verified protocol domain, never infer QQ from a name fragment."""
+        from nonebot.adapters.onebot.v11 import Bot as OneBotBot
+        from nonebot.adapters.qq import Bot as QQBot
+
+        if isinstance(t, QQBot):
+            return "qq_api"
+        if isinstance(t, OneBotBot):
+            return "qq_client"
         if isinstance(t, Bot):
             if interface := get_interface(t):
-                with contextlib.suppress(Exception):
-                    scope = _scope_name(interface.basic_info().get("scope"))
-                    if scope:
-                        return scope
-            adapter_name = _adapter_name(t)
-            if "onebot" in adapter_name:
-                return "qq_client"
-            if adapter_name == "qq" or "qq" in adapter_name:
-                return "qq_api"
-            if BotConfig.get_qbot_uid(t.self_id):
-                return "qq_api"
-            return adapter_name or cls.get_platform(t)
-
+                scope = _scope_name(interface.basic_info().get("scope"))
+                if scope:
+                    return scope
+            return "unknown"
         scope = _scope_name(getattr(t, "scope", "") or "")
-        if not scope:
-            basic = getattr(t, "basic", None)
-            if isinstance(basic, dict):
-                scope = _scope_name(basic.get("scope"))
-        if scope:
-            return scope
-
-        adapter = getattr(t, "adapter", None)
-        if adapter is not None:
-            name = (
-                adapter.get_name().lower()
-                if callable(getattr(adapter, "get_name", None))
-                else adapter.__class__.__name__.lower()
-            )
-            if "onebot" in name:
-                return "qq_client"
-            if name == "qq" or "qq" in name:
-                return "qq_api"
-            return name
-
-        platform = str(getattr(t, "platform", "") or "").lower()
-        return "qq_client" if platform == "qq" else platform or "unknown"
+        basic = getattr(t, "basic", None)
+        if not scope and isinstance(basic, dict):
+            scope = _scope_name(basic.get("scope"))
+        return scope or "unknown"
 
     @classmethod
     def is_forward_merge_supported(cls, t: Bot | Uninfo) -> bool:

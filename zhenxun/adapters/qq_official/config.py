@@ -21,6 +21,7 @@ QQWebhookMode = Literal["external", "builtin_https"]
 class QQOfficialIntent(BaseModel):
     guilds: bool = False
     guild_members: bool = False
+    group_members: bool = False
     guild_messages: bool = False
     guild_message_reactions: bool = False
     direct_message: bool = False
@@ -43,6 +44,13 @@ class QQOfficialBotConfig(BaseModel):
     secret: str
     use_websocket: bool = False
     intent: QQOfficialIntent = Field(default_factory=QQOfficialIntent)
+    shard: tuple[int, int] | None = None
+
+    @validator("shard")
+    def _valid_shard(cls, value):
+        if value is not None and not 0 <= value[0] < value[1]:
+            raise ValueError("shard requires 0 <= index < total")
+        return value
 
     @validator("id", "secret")
     def _not_blank(cls, value: str) -> str:
@@ -76,6 +84,20 @@ class QQOfficialConfig(BaseModel):
     @property
     def has_websocket_bots(self) -> bool:
         return any(bot.use_websocket for bot in self.qq_bots)
+
+
+def merge_qq_bot_config(existing: dict, changes: dict) -> QQOfficialBotConfig:
+    """Merge an explicit edit without resetting transport subscriptions."""
+    values = dict(existing)
+    if not existing:
+        values["intent"] = {"c2c_group_at_messages": True}
+    changes = dict(changes)
+    if "intent" in changes:
+        if changes["intent"] is None:
+            raise ValueError("intent must be an object")
+        values["intent"] = {**values.get("intent", {}), **changes.pop("intent")}
+    values.update(changes)
+    return QQOfficialBotConfig(**values)
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,9 +139,11 @@ def _parse_port(value: object, *, field: str) -> int:
 
 def load_qq_launcher_settings(project_root: Path) -> QQLauncherSettings:
     """Read launcher-facing settings without importing NoneBot or adapter secrets."""
+    from zhenxun.configs.environment import environment_file
+
     values = {
         str(key).upper(): value
-        for key, value in dotenv_values(project_root / ".env.dev").items()
+        for key, value in dotenv_values(environment_file(root=project_root)).items()
         if key
     }
     import os
@@ -297,15 +321,20 @@ def validate_qq_config_data(config: QQOfficialConfig) -> None:
         raise QQOfficialConfigError("QQ_BOTS 存在重复 AppID")
 
     for index, item in enumerate(config.qq_bots):
+        if not item.use_websocket:
+            # Webhook subscriptions are managed on the QQ developer platform.
+            continue
         supported = {
             "c2c_group_at_messages",
             "at_messages",
             "guild_messages",
             "direct_message",
+            "interaction",
+            "group_members",
         }
         if not any(getattr(item.intent, name) for name in supported):
             raise QQOfficialConfigError(
-                f"QQ_BOTS.{index}.intent 必须启用至少一种受支持的消息类型"
+                f"QQ_BOTS.{index}.intent 必须启用至少一种受支持的事件类型"
             )
         unsupported_intents = [
             name

@@ -21,6 +21,7 @@ from zhenxun.adapters.qq_official.config import (
     QQOfficialBotConfig,
     QQOfficialConfig,
     QQOfficialIntent,
+    merge_qq_bot_config,
     validate_qq_config_data,
 )
 from zhenxun.configs.environment import environment_target
@@ -261,13 +262,11 @@ async def _save_websocket_bot(app_id: str, secret: str) -> dict[str, Any]:
             if not isinstance(item, dict):
                 continue
             if str(item.get("id") or "").strip() == app_id:
-                item = {
-                    "id": app_id,
-                    "token": str(item.get("token") or "").strip(),
-                    "secret": secret,
-                    "use_websocket": True,
-                    "intent": model_dump(QQOfficialIntent(c2c_group_at_messages=True)),
-                }
+                item = model_dump(
+                    merge_qq_bot_config(
+                        item, {"id": app_id, "secret": secret, "use_websocket": True}
+                    )
+                )
                 replaced = True
             merged.append(item)
         if not replaced:

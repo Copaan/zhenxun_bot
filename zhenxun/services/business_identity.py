@@ -177,15 +177,60 @@ async def acquire_sqlite_identity_write(db, keys) -> None:
         )
 
 
-async def _ensure_link(protocol: ProtocolIdentity):
+async def _verify_observed_onebot(db, link, protocol, evidence) -> None:
+    """Promote legacy QQ provenance only after validating an inbound actor."""
+    if link.verified or protocol.domain != "qq_client" or evidence is None:
+        return
+    account = (
+        await UserConsole.filter(id=link.original_account_id)
+        .using_db(db)
+        .select_for_update()
+        .get()
+    )
+    if account.platform not in {None, "qq", "qq_client"}:
+        raise BusinessIdentityError("历史账号明确属于其他平台，需核对归属后绑定")
+    if (
+        account.user_id != protocol.raw_user_id
+        or link.account_id != link.original_account_id
+        or link.domain != protocol.domain
+        or link.subject_digest != protocol.subject_digest
+        or link.app_id
+        or link.group_scope
+        or link.scene != "user"
+        or link.principal_id
+    ):
+        raise BusinessIdentityError("历史账号映射与当前 QQ 身份不一致，需核对归属")
+    if (
+        await BusinessIdentityLink.filter(original_account_id=account.id)
+        .exclude(id=link.id)
+        .using_db(db)
+        .exists()
+    ):
+        raise BusinessIdentityError("历史账号存在其他原始身份映射，需核对归属")
+    link.verified = True
+    await link.save(using_db=db, update_fields=["verified"])
+    await AccountBindingChange.create(
+        using_db=db,
+        id=identity_digest("event-verify", link.id),
+        identity_id=link.id,
+        action="verify",
+        previous_account_id=link.account_id,
+        account_id=link.account_id,
+        revision=link.revision,
+        evidence={"provenance": "onebot_inbound", **evidence},
+    )
+
+
+async def _ensure_link(protocol: ProtocolIdentity, evidence=None):
     cached = await _links.get(protocol.key)
-    if cached is not None:
+    if cached is not None and cached.verified:
         return cached
     async with in_transaction() as db:
         await acquire_sqlite_identity_write(db, [protocol.key])
         link = (
             await BusinessIdentityLink.filter(id=protocol.key)
             .using_db(db)
+            .select_for_update()
             .get_or_none()
         )
         if link is None:
@@ -198,7 +243,11 @@ async def _ensure_link(protocol: ProtocolIdentity):
             verified = (
                 account_created
                 or (protocol.domain == "qq_api" and user.platform != "qq_client")
-                or (protocol.domain == "qq_client" and user.platform == "qq_client")
+                or (
+                    protocol.domain == "qq_client"
+                    and user.platform == "qq_client"
+                    and evidence is None
+                )
             )
             link, created = await BusinessIdentityLink.get_or_create(
                 using_db=db,
@@ -230,6 +279,15 @@ async def _ensure_link(protocol: ProtocolIdentity):
                         "existing_account": not account_created,
                     },
                 )
+            # A concurrent creator may have won get_or_create. Lock the winner
+            # before promoting provenance, just as for an existing mapping.
+            link = (
+                await BusinessIdentityLink.filter(id=protocol.key)
+                .using_db(db)
+                .select_for_update()
+                .get()
+            )
+        await _verify_observed_onebot(db, link, protocol, evidence)
         account = await UserConsole.filter(id=link.account_id).using_db(db).get()
         result = BusinessIdentity(
             protocol, account.id, account.user_id, link.revision, link.verified
@@ -245,8 +303,8 @@ def _finished(key, task):
         task.exception()
 
 
-async def _load_current(protocol: ProtocolIdentity) -> BusinessIdentity:
-    await _ensure_link(protocol)
+async def _load_current(protocol: ProtocolIdentity, evidence=None) -> BusinessIdentity:
+    await _ensure_link(protocol, evidence)
     # Coalesce concurrent events too, while re-reading once for a later event
     # so another process's committed binding cannot be hidden by the TTL cache.
     link = (
@@ -261,6 +319,15 @@ async def _load_current(protocol: ProtocolIdentity) -> BusinessIdentity:
 
 async def resolve_business_identity(bot, event, session) -> BusinessIdentity:
     protocol = protocol_identity(bot, event, session)
+    evidence = (
+        {
+            "bot_id": str(bot.self_id),
+            "event_id": str(event.message_id),
+            "subject_digest": protocol.subject_digest,
+        }
+        if protocol.domain == "qq_client"
+        else None
+    )
     execution = current_execution.get()
     # The shared execution belongs to one durable event, unlike a ContextVar
     # copied into each matcher task. Its lock coalesces their first resolution.
@@ -284,7 +351,9 @@ async def resolve_business_identity(bot, event, session) -> BusinessIdentity:
             task = _inflight.get(flight_key)
             if task is None:
                 task = asyncio.create_task(
-                    _ensure_link(protocol) if execution else _load_current(protocol)
+                    _ensure_link(protocol, evidence)
+                    if execution
+                    else _load_current(protocol, evidence)
                 )
                 _inflight[flight_key] = task
                 task.add_done_callback(lambda done: _finished(flight_key, done))

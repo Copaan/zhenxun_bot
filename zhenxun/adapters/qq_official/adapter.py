@@ -27,6 +27,7 @@ from .context import (
     receipt_seen,
     release_webhook_receipt,
     reserve_webhook_receipt,
+    validate_official_event,
 )
 from .diagnostics import (
     QQPublicError,
@@ -514,7 +515,10 @@ class ZhenxunQQAdapter(QQAdapter):
 
         async def _handle() -> None:
             try:
-                await prepare_event_context(bot.self_id, event)
+                context = await prepare_event_context(bot.self_id, event)
+                if context is None:
+                    self._record("unsupported_event")
+                    return
                 await bot.handle_event(event)
             except Exception as exc:
                 logger.error(
@@ -639,7 +643,17 @@ class ZhenxunQQAdapter(QQAdapter):
 
         try:
             message_event = self.payload_to_event(payload)
-        except Exception:
+            validate_official_event(app_id, message_event)
+        except Exception as exc:
+            self._record("event_schema_rejected")
+            paths = []
+            if callable(getattr(exc, "errors", None)):
+                paths = [".".join(map(str, item["loc"])) for item in exc.errors()[:16]]
+            logger.warning(
+                f"QQ event schema rejected: {payload.type} ({type(exc).__name__})"
+                f" fields={paths}",
+                "QQOfficialWebhook",
+            )
             return Response(400, content="Invalid event payload")
         if message_event is not None and message_event.get_type() == "message":
             # The inbox commit is the sole message receipt. Reserving the old
@@ -710,7 +724,7 @@ class ZhenxunQQAdapter(QQAdapter):
                 return self._ack()
 
             try:
-                event = self.payload_to_event(payload)
+                event = message_event
                 context = await asyncio.wait_for(
                     prepare_event_context(app_id, event), timeout=DB_TIMEOUT_SECONDS
                 )

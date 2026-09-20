@@ -1,5 +1,8 @@
+from nonebot import on_message
 from nonebot.adapters import Bot, Event
 from nonebot.plugin import PluginMetadata
+from nonebot.rule import Rule
+from nonebot.typing import T_State
 from nonebot_plugin_alconna import Alconna, Args, Match, on_alconna
 from nonebot_plugin_uninfo import Uninfo
 
@@ -11,6 +14,7 @@ from zhenxun.services.account_binding import (
     issue_unbind,
     redeem_binding,
 )
+from zhenxun.services.account_binding_routing import binding_argument
 from zhenxun.services.business_identity import (
     BusinessIdentityError,
     resolve_business_identity,
@@ -21,7 +25,10 @@ from zhenxun.utils.message import MessageUtils
 __plugin_meta__ = PluginMetadata(
     name="QQ账号绑定",
     description="将官方 QQ / 频道身份关联到已验证的 QQ 业务账号",
-    usage="官方侧：绑定QQ 目标QQ；OneBot侧：绑定QQ ZX-绑定码；绑定状态；解绑QQ",
+    usage=(
+        "官方侧：绑定QQ 目标QQ；OneBot 私聊直接发码，群聊 @Bot 发码；"
+        "绑定状态；解绑QQ"
+    ),
     extra=PluginExtraData(
         author="zhenxun",
         version="1.0",
@@ -33,16 +40,25 @@ __plugin_meta__ = PluginMetadata(
     ).to_dict(),
 )
 
-bind = on_alconna(Alconna("绑定QQ", Args["value?", str]), priority=5, block=True)
+
+async def _binding_rule(bot: Bot, event: Event, state: T_State) -> bool:
+    argument = binding_argument(bot, event)
+    if argument is None:
+        return False
+    state["binding_argument"] = argument
+    return True
+
+
+bind = on_message(rule=Rule(_binding_rule), priority=5, block=True)
 status = on_alconna(Alconna("绑定状态"), priority=5, block=True)
 unbind = on_alconna(Alconna("解绑QQ", Args["value?", str]), priority=5, block=True)
 
 
 @bind.handle()
-async def bind_account(bot: Bot, event: Event, session: Uninfo, value: Match[str]):
+async def bind_account(bot: Bot, event: Event, session: Uninfo, state: T_State):
     try:
         actor = await resolve_business_identity(bot, event, session)
-        argument = value.result.strip() if value.available else ""
+        argument = state["binding_argument"]
         if argument.upper().startswith("ZX-"):
             result = await redeem_binding(actor, argument)
             message = (
@@ -57,7 +73,8 @@ async def bind_account(bot: Bot, event: Event, session: Uninfo, value: Match[str
                 actor, argument, operation_id=execution.identity if execution else None
             )
             message = (
-                f"请使用 QQ {argument} 在 OneBot 私聊或群聊发送：\n绑定QQ {code}\n"
+                f"请使用 QQ {argument} 在 OneBot 私聊直接发送：\n{code}\n"
+                "群聊请 @当前 Bot 后发送同一绑定码，无需命令头。\n"
                 "5 分钟内有效。绑定后共用该 QQ 的签到、金币、银行和道具；"
                 "原账号资产保留。"
             )
