@@ -6,9 +6,58 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
+import subprocess
 from urllib.parse import urlsplit
 
 from .network_proxy import ProxyPolicyError, proxy_runtime
+
+UV_BINARY_POLICY_VERSION = 1
+
+
+def uv_binary_options(
+    *, wheels_only: bool, restricted_packages: tuple[str, ...] = ()
+) -> list[str]:
+    """Return mutually compatible uv binary/source policy arguments."""
+    if wheels_only:
+        # --only-binary already disables source builds. Combining it with
+        # --no-build is rejected by current uv releases.
+        return ["--only-binary=:all:"]
+    return [
+        argument
+        for package in sorted(set(restricted_packages))
+        for argument in ("--only-binary", package)
+    ]
+
+
+def uv_version() -> str:
+    executable = shutil.which("uv")
+    if executable is None:
+        return "unavailable"
+    try:
+        result = subprocess.run(
+            [executable, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+    return " ".join((result.stdout or result.stderr).split()) or "unknown"
+
+
+def resolver_configuration_error(text: str) -> bool:
+    lowered = text.casefold()
+    return any(
+        marker in lowered
+        for marker in (
+            "cannot be used with",
+            "unexpected argument",
+            "unrecognized option",
+            "unknown option",
+        )
+    )
 
 
 def source_environment():
@@ -132,6 +181,15 @@ def resolver_failure(text):
     lowered = text.lower()
     code = "archive_dependency_resolution_failed"
     for needles, candidate in (
+        (
+            (
+                "cannot be used with",
+                "unexpected argument",
+                "unrecognized option",
+                "unknown option",
+            ),
+            "archive_dependency_resolver_configuration",
+        ),
         (("no space left", "disk full"), "archive_dependency_disk_full"),
         (("407", "proxy authentication"), "archive_dependency_proxy_auth"),
         (("401", "403", "unauthorized", "forbidden"), "archive_dependency_index_auth"),

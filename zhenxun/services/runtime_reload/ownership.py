@@ -85,6 +85,27 @@ def background_task_context():
     return context
 
 
+def scheduler_context():
+    """Keep request diagnostics, but not a plugin lease, on shared scheduler work."""
+    from nonebot.plugin import _current_plugin
+
+    from zhenxun.services.lifecycle.deadline import current_budget
+
+    context = copy_context()
+    for variable in (
+        operation_owner,
+        callback_owner,
+        resource_owner,
+        _lifecycle_work,
+        _callback_work,
+        initialization_retainer,
+        current_budget,
+        _current_plugin,
+    ):
+        context.run(variable.set, None)
+    return context
+
+
 @contextmanager
 def lifecycle_work_context(owner: str, incarnation_id: str, phase: str):
     if phase not in {"on_startup", "on_ready", "on_shutdown"}:

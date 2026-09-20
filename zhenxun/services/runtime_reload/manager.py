@@ -77,6 +77,7 @@ from .ownership import (
     lifecycle_work_phase,
     owner_context,
     resource_context,
+    scheduler_context,
     shared_executor_submission,
 )
 from .signatures import async_callable, typed_wraps
@@ -226,6 +227,7 @@ class PluginRuntimeManager:
         self._original_trie_add_prefix: Callable[..., Any] | None = None
         self._job_owners: dict[str, str] = {}
         self._original_scheduler_add_job: Callable[..., Any] | None = None
+        self._scheduler_boundary = None
         self._pending_dependencies: dict[str, set[str]] = defaultdict(set)
         self._content_digests: dict[Path, str] = {}
         self._content_change_holds: dict[Path, int] = defaultdict(int)
@@ -1121,6 +1123,8 @@ class PluginRuntimeManager:
         TrieRule.add_prefix = classmethod(tracked_add_prefix)
 
     def _install_scheduler_tracking(self) -> None:
+        from .scheduler import JobLeaseRevoked, SchedulerBoundary
+
         scheduler_module = sys.modules.get("nonebot_plugin_apscheduler")
         scheduler = getattr(scheduler_module, "scheduler", None)
         if scheduler is None:
@@ -1130,6 +1134,7 @@ class PluginRuntimeManager:
         original = scheduler.add_job
         self._original_scheduler_add_job = original
         manager = self
+        self._scheduler_boundary = SchedulerBoundary(scheduler, self)
 
         def tracked_add_job(_scheduler, func, *args, **kwargs):
             owner = current_owner() or manager.owner_for_module(
@@ -1137,51 +1142,84 @@ class PluginRuntimeManager:
             )
             wrapped = func
             incarnation = manager._ensure_incarnation(owner) if owner else None
+            job_id = kwargs.get("id", "pending")
             if owner:
                 if async_callable(func):
 
                     @wraps(func)
                     async def async_job(*job_args, **job_kwargs):
-                        if incarnation and not manager._lease_is_current(
-                            owner, incarnation.incarnation_id
+                        if manager._scheduler_job_refused(
+                            job_id, owner, incarnation.incarnation_id
                         ):
-                            return None
+                            raise JobLeaseRevoked()
                         root_owner = manager._root_owner(owner) or owner
-                        unit = manager.units.get(root_owner)
-                        if unit and unit.draining:
-                            return None
-                        if unit:
-                            unit.in_flight += 1
-                            manager._drained_event(root_owner).clear()
+                        task = asyncio.current_task()
+                        tasks = manager._entry_tasks[root_owner]
+                        tasks[task] = tasks.get(task, 0) + 1
+                        release = manager._retain_activity(root_owner)
                         try:
-                            with owner_context(root_owner):
+                            with (
+                                resource_context(root_owner),
+                                owner_context(root_owner),
+                            ):
                                 return await func(*job_args, **job_kwargs)
+                        except asyncio.CancelledError:
+                            if manager._scheduler_job_refused(
+                                job_id, owner, incarnation.incarnation_id
+                            ):
+                                raise JobLeaseRevoked() from None
+                            raise
                         finally:
-                            if unit:
-                                unit.in_flight = max(0, unit.in_flight - 1)
-                                if not unit.in_flight:
-                                    manager._drained_event(root_owner).set()
+                            tasks[task] -= 1
+                            if not tasks[task]:
+                                del tasks[task]
+                            if not tasks:
+                                manager._entry_tasks.pop(root_owner, None)
+                            release()
 
                     wrapped = async_job
                 else:
 
                     @wraps(func)
                     def sync_job(*job_args, **job_kwargs):
-                        if incarnation and not manager._lease_is_current(
-                            owner, incarnation.incarnation_id
+                        if manager._scheduler_job_refused(
+                            job_id, owner, incarnation.incarnation_id
                         ):
-                            return None
-                        with owner_context(manager._root_owner(owner) or owner):
+                            raise JobLeaseRevoked()
+                        root = manager._root_owner(owner) or owner
+                        with resource_context(root), owner_context(root):
                             return func(*job_args, **job_kwargs)
 
                     wrapped = sync_job
-            job = original(wrapped, *args, **kwargs)
+                wrapped.__zhenxun_job_lease__ = (owner, incarnation.incarnation_id)
+            job = scheduler_context().run(original, wrapped, *args, **kwargs)
+            job_id = job.id
             if owner and getattr(job, "id", None):
                 manager._job_owners[job.id] = owner
             return job
 
         tracked_add_job.__zhenxun_runtime_owner__ = self
         scheduler.add_job = MethodType(tracked_add_job, scheduler)
+
+    def _scheduler_job_refused(self, job_id, owner, incarnation_id) -> bool:
+        root = self._root_owner(owner) or owner
+        unit = self.units.get(root)
+        reason = (
+            "plugin_work_lease_revoked"
+            if not self._lease_is_current(owner, incarnation_id)
+            else "plugin_draining"
+            if unit and unit.draining
+            else None
+        )
+        if reason is None:
+            return False
+        self._entry_diagnostics[reason] += 1
+        logger.debug(
+            f"Scheduler job skipped: job={job_id} owner={owner} "
+            f"generation={incarnation_id} reason={reason} "
+            f"operation={runtime_mutation_coordinator.current_operation_id or '-'}"
+        )
+        return True
 
     def _install_processor_tracking(self) -> None:
         import nonebot.message as message
@@ -1806,6 +1844,9 @@ class PluginRuntimeManager:
         self._original_popen_init = None
 
     def _restore_global_hooks(self) -> None:
+        if self._scheduler_boundary is not None:
+            self._scheduler_boundary.restore()
+            self._scheduler_boundary = None
         from fastapi.routing import APIRouter
         from nonebot.internal.adapter import Bot
         from nonebot.matcher import Matcher

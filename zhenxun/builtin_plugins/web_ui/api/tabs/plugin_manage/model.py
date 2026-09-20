@@ -70,6 +70,8 @@ class UpdatePlugin(BaseModel):
     """禁用类型"""
     configs: dict[str, Any] | None = None
     """设置项"""
+    unset_configs: list[str] = Field(default_factory=list)
+    """恢复为未设置的配置项，不等同于 null。"""
 
 
 class PluginInfo(BaseModel):

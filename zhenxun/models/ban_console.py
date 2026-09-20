@@ -39,6 +39,11 @@ class BanConsole(Model):
     enable_lock: ClassVar[list[DbLockType]] = [DbLockType.CREATE, DbLockType.UPSERT]
     """开启锁"""
 
+    @staticmethod
+    def _target_label(user_id: str | None, group_id: str | None) -> str:
+        """使用字段名记录目标，避免把官方 OpenID 误读为数字 QQ 号。"""
+        return f"group_id={group_id!r}, user_id={user_id!r}"
+
     @classmethod
     async def create(cls, *args, **kwargs) -> Self:
         result = await super().create(*args, **kwargs)
@@ -137,7 +142,7 @@ class BanConsole(Model):
         返回:
             bool: 权限判断，能否unban
         """
-        logger.debug("检测用户被ban等级", target=f"{group_id}:{user_id}")
+        logger.debug("检测用户被ban等级", target=cls._target_label(user_id, group_id))
         if await cls._ensure_ban_cache():
             return BanMemoryCache.check_ban_level(user_id, group_id, level)
         # 缓存不可用不代表没有 ban 记录，回落到权威数据。
@@ -162,7 +167,14 @@ class BanConsole(Model):
         返回:
             int: ban剩余时长，-1时为永久ban，0表示未被ban
         """
-        logger.debug("获取用户ban时长", target=f"{group_id}:{user_id}")
+        logger.debug("获取用户ban时长", target=cls._target_label(user_id, group_id))
+        return await cls._get_ban_remaining_time(user_id, group_id)
+
+    @classmethod
+    async def _get_ban_remaining_time(
+        cls, user_id: str | None, group_id: str | None = None
+    ) -> int:
+        """读取 ban 剩余时间，不额外记录公共 API 日志。"""
         if await cls._ensure_ban_cache():
             return BanMemoryCache.remaining_time(user_id, group_id)
         # 缓存未就绪（启动加载失败 / 退避窗口 / DB 降级）时不能当作未被 ban，
@@ -184,8 +196,8 @@ class BanConsole(Model):
         返回:
             bool: 是否被ban
         """
-        logger.debug("检测是否被ban", target=f"{group_id}:{user_id}")
-        return (await cls.check_ban_time(user_id, group_id)) != 0
+        logger.debug("检测是否被ban", target=cls._target_label(user_id, group_id))
+        return (await cls._get_ban_remaining_time(user_id, group_id)) != 0
 
     @classmethod
     async def ban(
@@ -208,7 +220,7 @@ class BanConsole(Model):
         """
         logger.debug(
             f"封禁用户/群组，等级:{ban_level}，时长: {duration}",
-            target=f"{group_id}:{user_id}",
+            target=cls._target_label(user_id, group_id),
         )
         if not user_id and not group_id:
             raise UserAndGroupIsNone()
@@ -238,7 +250,7 @@ class BanConsole(Model):
         """
         user = await cls._get_data(user_id, group_id)
         if user:
-            logger.debug("解除封禁", target=f"{group_id}:{user_id}")
+            logger.debug("解除封禁", target=cls._target_label(user_id, group_id))
             await user.delete()
             return True
         return False

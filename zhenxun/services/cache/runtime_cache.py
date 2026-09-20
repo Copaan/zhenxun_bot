@@ -2274,6 +2274,18 @@ class BanMemoryCache:
         return True
 
     @classmethod
+    def is_banned_for_event(cls, user_id: str | None, group_id: str | None) -> bool:
+        """检查当前事件涉及的所有 ban 作用域。
+
+        ``is_banned(user_id, group_id)`` 保持原语义，只查群内用户记录和
+        全局用户记录。事件权限还必须独立检查群整体记录，因此这里先查
+        群作用域，再查用户作用域，避免把两种限制错误合并成一个键。
+        """
+        if group_id and cls.is_banned(None, group_id):
+            return True
+        return bool(user_id and cls.is_banned(user_id, group_id))
+
+    @classmethod
     def remaining_time(cls, user_id: str | None, group_id: str | None) -> int:
         if not cls._loaded:
             return 0

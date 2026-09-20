@@ -21,7 +21,12 @@ import httpx
 from packaging.markers import InvalidMarker, Marker, default_environment
 from packaging.requirements import InvalidRequirement, Requirement
 from packaging.specifiers import SpecifierSet
-from packaging.utils import canonicalize_name
+from packaging.tags import sys_tags
+from packaging.utils import (
+    InvalidWheelFilename,
+    canonicalize_name,
+    parse_wheel_filename,
+)
 from packaging.version import InvalidVersion, Version
 
 try:
@@ -31,7 +36,7 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10
 
 from .storage import LAYER_ROOT, generation_path, load_manifest
 
-SOLVER_POLICY_VERSION = 2
+SOLVER_POLICY_VERSION = 3
 LOCK_FILE = Path("uv.lock")
 _REQ_LINE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)==([^\s;]+)")
 _SENSITIVE = re.compile(r"(?i)(authorization|token|password|secret)=?[^\s]*")
@@ -561,7 +566,13 @@ def _parse_compiled(path: Path) -> dict[str, str]:
 async def _compile(
     requirements: list[str], constraints: dict[str, str], *, wheels_only: bool
 ) -> tuple[dict[str, str] | None, str]:
-    from zhenxun.services.installer_network import installer_environment
+    from zhenxun.services.installer_network import (
+        UV_BINARY_POLICY_VERSION,
+        installer_environment,
+        resolver_configuration_error,
+        uv_binary_options,
+        uv_version,
+    )
 
     with tempfile.TemporaryDirectory(prefix="zhenxun_nb_analyze_") as root:
         directory = Path(root)
@@ -584,9 +595,7 @@ async def _compile(
             "--python",
             sys.executable,
         ]
-        if wheels_only:
-            command.append("--only-binary=:all:")
-            command.append("--no-build")
+        command.extend(uv_binary_options(wheels_only=wheels_only))
         process = await asyncio.create_subprocess_exec(
             *command,
             cwd=str(Path.cwd()),
@@ -596,6 +605,17 @@ async def _compile(
         )
         stdout, stderr = await process.communicate()
         details = safe_process_error((stderr or stdout).decode(errors="replace"))
+        if resolver_configuration_error(details):
+            raise DependencyAnalysisError(
+                "dependency_resolver_configuration",
+                details,
+                details={
+                    "uv_version": uv_version(),
+                    "binary_policy_version": UV_BINARY_POLICY_VERSION,
+                    "wheels_only": wheels_only,
+                    "diagnostic": details,
+                },
+            )
         if process.returncode != 0 or not output.exists():
             return None, details
         return _parse_compiled(output), details
@@ -630,6 +650,31 @@ def _active_metadata_requirements(metadata: dict[str, Any]) -> list[Requirement]
             continue
         result.append(requirement)
     return result
+
+
+def _wheel_availability(metadata: dict[str, Any]) -> dict[str, Any]:
+    supported_tags = set(sys_tags())
+    wheels: list[str] = []
+    compatible: list[str] = []
+    for item in metadata.get("urls") or []:
+        if not isinstance(item, dict):
+            continue
+        filename = str(item.get("filename") or "")
+        if not filename.endswith(".whl"):
+            continue
+        wheels.append(filename)
+        try:
+            _, _, _, tags = parse_wheel_filename(filename)
+        except InvalidWheelFilename:
+            continue
+        if supported_tags.intersection(tags):
+            compatible.append(filename)
+    return {
+        "wheel_present": bool(wheels),
+        "compatible": bool(compatible),
+        "wheel_files": wheels,
+        "compatible_wheel_files": compatible,
+    }
 
 
 def _soft_upper_mismatch(specifier: SpecifierSet, current: Version) -> bool:
@@ -939,17 +984,11 @@ async def solve_install(
         if item["name"] in private_packages
     ]
     dependency_source_build_required = source_required
-    root_files = metadata.get("urls") or []
-    root_wheel_available = any(
-        str(item.get("filename", "")).endswith(".whl")
-        for item in root_files
-        if isinstance(item, dict)
-    )
+    wheel_status = _wheel_availability(metadata)
+    root_wheel_available = bool(wheel_status["compatible"])
     pure_root_wheel = any(
-        str(item.get("filename", "")).endswith("-py3-none-any.whl")
-        or str(item.get("filename", "")).endswith("-py2.py3-none-any.whl")
-        for item in root_files
-        if isinstance(item, dict)
+        filename.endswith(("-py3-none-any.whl", "-py2.py3-none-any.whl"))
+        for filename in wheel_status["compatible_wheel_files"]
     )
     plugin_source_build_required = not root_wheel_available
     source_required = dependency_source_build_required or plugin_source_build_required
@@ -1001,7 +1040,15 @@ async def solve_install(
                 if dependency_source_build_required
                 else []
             ),
-            *(["plugin_wheel_unavailable"] if plugin_source_build_required else []),
+            *(
+                [
+                    "plugin_wheel_incompatible"
+                    if wheel_status["wheel_present"]
+                    else "plugin_wheel_unavailable"
+                ]
+                if plugin_source_build_required
+                else []
+            ),
         ],
         "pure_python_candidate": (
             pure_root_wheel and not source_required and not overrides
@@ -1011,6 +1058,7 @@ async def solve_install(
         "solver_policy_version": SOLVER_POLICY_VERSION,
         "candidate_inputs": candidate_inputs,
         "dependency_details": dependency_details,
+        "plugin_wheel": wheel_status,
         "database_migration_possible": database_migration_possible,
         "database_type": database_type,
     }

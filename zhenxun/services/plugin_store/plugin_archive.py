@@ -688,8 +688,12 @@ async def _compile_wheels(
     requirements: list[str], constraints: dict[str, str], *, source_build=False
 ):
     from zhenxun.services.installer_network import (
+        UV_BINARY_POLICY_VERSION,
         installer_environment,
+        resolver_configuration_error,
         resolver_failure,
+        uv_binary_options,
+        uv_version,
     )
     from zhenxun.services.nonebot_store import dependencies as deps
 
@@ -728,7 +732,7 @@ async def _compile_wheels(
             "--no-annotate",
             "--python",
             sys.executable,
-            *([] if source_build else ["--only-binary=:all:", "--no-build"]),
+            *([] if source_build else uv_binary_options(wheels_only=True)),
             *build_restrictions,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
@@ -737,9 +741,17 @@ async def _compile_wheels(
         try:
             process = await _wait_process(job)
             if process.returncode or not output.exists():
-                return {
-                    "failure": resolver_failure(job.diagnostic.decode(errors="replace"))
-                }
+                diagnostic = job.diagnostic.decode(errors="replace")
+                if resolver_configuration_error(diagnostic):
+                    raise ArchiveError(
+                        "archive_dependency_resolver_configuration",
+                        details={
+                            "uv_version": uv_version(),
+                            "binary_policy_version": UV_BINARY_POLICY_VERSION,
+                            "diagnostic": resolver_failure(diagnostic),
+                        },
+                    )
+                return {"failure": resolver_failure(diagnostic)}
             if output.stat().st_size > 2 * 1024 * 1024:
                 raise ArchiveError("archive_dependency_metadata_limit")
             return deps._parse_compiled(output)

@@ -193,7 +193,13 @@ def build_generation(transaction: dict[str, Any]) -> dict[str, Any]:
 
 
 def _build_generation(transaction: dict[str, Any]) -> dict[str, Any]:
-    from zhenxun.services.installer_network import installer_environment
+    from zhenxun.services.installer_network import (
+        UV_BINARY_POLICY_VERSION,
+        installer_environment,
+        resolver_configuration_error,
+        uv_binary_options,
+        uv_version,
+    )
     from zhenxun.services.plugin_store.plugin_archive_dependencies import (
         archive_dependency_contract,
     )
@@ -241,8 +247,7 @@ def _build_generation(transaction: dict[str, Any]) -> dict[str, Any]:
             if transaction.get("archive_wheels_only") or not transaction.get(
                 "source_build_confirmed"
             ):
-                command.append("--only-binary=:all:")
-                command.append("--no-build")
+                command.extend(uv_binary_options(wheels_only=True))
             else:
                 forbidden_builds = set(
                     archive_dependency_contract().get("wheels_only_packages", [])
@@ -251,8 +256,12 @@ def _build_generation(transaction: dict[str, Any]) -> dict[str, Any]:
                     forbidden_builds.update(
                         set(packages) - set(transaction["archive_build_allowlist"])
                     )
-                for name in sorted(forbidden_builds):
-                    command.extend(["--only-binary", name])
+                command.extend(
+                    uv_binary_options(
+                        wheels_only=False,
+                        restricted_packages=tuple(forbidden_builds),
+                    )
+                )
             completed = subprocess.run(
                 command,
                 cwd=str(Path.cwd()),
@@ -266,9 +275,18 @@ def _build_generation(transaction: dict[str, Any]) -> dict[str, Any]:
             )
             requirements.unlink(missing_ok=True)
             if completed.returncode:
+                detail = safe_process_error(completed.stderr or completed.stdout)
+                if resolver_configuration_error(detail):
+                    raise LayerBuildError(
+                        "dependency_resolver_configuration",
+                        (
+                            f"uv={uv_version()} "
+                            f"binary_policy={UV_BINARY_POLICY_VERSION}: {detail}"
+                        ),
+                    )
                 raise LayerBuildError(
                     "dependency_layer_build_failed",
-                    safe_process_error(completed.stderr or completed.stdout),
+                    detail,
                 )
         native_files = _scan_native_extensions(staging)
         package_details = _package_runtime_details(staging, packages)

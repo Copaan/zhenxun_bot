@@ -5,7 +5,6 @@ from nonebot_plugin_session import EventSession
 from nonebot_plugin_uninfo import Uninfo
 
 from zhenxun.configs.config import Config
-from zhenxun.models.ban_console import BanConsole
 from zhenxun.models.group_console import GroupConsole
 from zhenxun.models.level_user import LevelUser
 from zhenxun.utils.platform import PlatformUtils
@@ -97,12 +96,16 @@ def is_allowed_call() -> Rule:
     """是否允许调用插件"""
 
     async def _rule(session: Uninfo) -> bool:
+        from zhenxun.builtin_plugins.hooks.auth.data_provider import (
+            DEFAULT_PERMISSION_DATA_PROVIDER,
+        )
+
         group_id = session.group.id if session.group else None
-        if await BanConsole.is_ban(session.user.id, group_id):
+        if await DEFAULT_PERMISSION_DATA_PROVIDER.is_banned_authoritative(
+            session.user.id, group_id
+        ):
             return False
         if group_id:
-            if await BanConsole.is_ban(None, group_id):
-                return False
             if g := await GroupConsole.get_group(group_id):
                 if g.level < 0:
                     return False

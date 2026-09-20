@@ -285,26 +285,63 @@ def _registered_groups() -> list[dict[str, Any]]:
     return groups
 
 
-def _environment_fields(values: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    from nonebot import get_driver
+def _environment_models():
+    from nonebot import get_loaded_plugins
     from nonebot.config import Config as NoneBotConfig
 
     from zhenxun.adapters.qq_official.config import QQOfficialConfig
     from zhenxun.configs.config import BotSetting
     from zhenxun.services.cache import Config as CacheConfig
+
+    models = [NoneBotConfig, BotSetting, QQOfficialConfig, CacheConfig]
+    for plugin in sorted(get_loaded_plugins(), key=lambda item: item.id_):
+        model = getattr(getattr(plugin, "metadata", None), "config", None)
+        if model is not None and model not in models:
+            models.append(model)
+    return models
+
+
+def _environment_fields(values: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    from nonebot import get_driver
+
     from zhenxun.utils.pydantic_compat import model_json_schema
 
     values = {key.upper(): value for key, value in values.items()}
     schemas = {}
-    for model in (NoneBotConfig, BotSetting, QQOfficialConfig, CacheConfig):
+    declarations = {}
+    conflicts = {}
+    for model in _environment_models():
         root = model_json_schema(model)
         for name, schema in root.get("properties", {}).items():
-            schemas[name.upper()] = {**schema, "x-root-schema": root}
+            key = name.upper()
+            source = f"{model.__module__}.{model.__name__}"
+            declarations.setdefault(key, []).append(source)
+            # Ignore presentation/default differences; retain definitions when
+            # comparing referenced types so equal names cannot hide conflicts.
+            signature = {
+                k: v
+                for k, v in schema.items()
+                if k not in {"title", "description", "default", "examples"}
+            }
+            if "$ref" in json.dumps(signature):
+                signature["definitions"] = root.get(
+                    "$defs", root.get("definitions", {})
+                )
+            if key in schemas and schemas[key]["signature"] != signature:
+                conflicts[key] = True
+            else:
+                schemas.setdefault(
+                    key,
+                    {
+                        "schema": {**schema, "x-root-schema": root},
+                        "signature": signature,
+                    },
+                )
     keys = set(KNOWN_ENV_KEYS) | set(_ENV_FORM_KEYS) | set(schemas) | set(values)
     runtime = get_driver().config
     result = {}
     for key in sorted(keys):
-        schema = schemas.get(key, {})
+        schema = {} if key in conflicts else schemas.get(key, {}).get("schema", {})
         raw = values.get(key)
         default = schema.get("default")
         parsed = raw
@@ -328,6 +365,12 @@ def _environment_fields(values: dict[str, Any]) -> dict[str, dict[str, Any]]:
         result[key] = {
             "key": key,
             "schema": schema,
+            "schema_sources": declarations.get(key, []),
+            "readonly_reason": (
+                "字段类型声明冲突：" + "、".join(declarations[key])
+                if key in conflicts
+                else None
+            ),
             "sensitive": secret,
             "value": None if secret else jsonable_encoder(parsed),
             "default_value": None if secret else default,
@@ -342,11 +385,6 @@ def _environment_fields(values: dict[str, Any]) -> dict[str, dict[str, Any]]:
 def _validate_environment_types(
     content: str, changed_keys: set[str] | None = None
 ) -> None:
-    from nonebot.config import Config as NoneBotConfig
-
-    from zhenxun.adapters.qq_official.config import QQOfficialConfig
-    from zhenxun.configs.config import BotSetting
-    from zhenxun.services.cache import Config as CacheConfig
     from zhenxun.utils.pydantic_compat import parse_as
 
     values = {
@@ -354,8 +392,20 @@ def _validate_environment_types(
         for key, value in dotenv_values(stream=StringIO(content)).items()
     }
     descriptors = _environment_fields(values)
-    issues = []
-    for model in (NoneBotConfig, BotSetting, QQOfficialConfig, CacheConfig):
+    issues = [
+        {
+            "code": "env_schema_conflict",
+            "file": str(_path("env")),
+            "path": key,
+            "message": field["readonly_reason"],
+            "severity": "error",
+        }
+        for key, field in descriptors.items()
+        if key in values
+        and field["readonly_reason"]
+        and (changed_keys is None or key in changed_keys)
+    ]
+    for model in _environment_models():
         fields = getattr(model, "model_fields", None) or getattr(
             model, "__fields__", {}
         )

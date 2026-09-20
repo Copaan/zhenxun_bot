@@ -130,7 +130,25 @@ class PermissionDataProvider:
 
     @staticmethod
     def is_banned(user_id: str | None, group_id: str | None) -> bool:
-        return BanMemoryCache.is_banned(user_id, group_id)
+        return BanMemoryCache.is_banned_for_event(user_id, group_id)
+
+    @staticmethod
+    async def is_banned_authoritative(
+        user_id: str | None, group_id: str | None
+    ) -> bool:
+        """检查事件涉及的群和用户 ban，缓存未就绪时回退到模型层。
+
+        缓存可用时只读取一份运行态快照；冷启动或刷新失败时，分别检查
+        群整体和用户作用域，避免把两种限制合并成一个键。
+        """
+        if BanMemoryCache.is_loaded():
+            return BanMemoryCache.is_banned_for_event(user_id, group_id)
+
+        from zhenxun.models.ban_console import BanConsole
+
+        if group_id and await BanConsole.is_ban(None, group_id):
+            return True
+        return bool(user_id and await BanConsole.is_ban(user_id, group_id))
 
     @staticmethod
     def get_ban_remaining_time(user_id: str | None, group_id: str | None) -> int:

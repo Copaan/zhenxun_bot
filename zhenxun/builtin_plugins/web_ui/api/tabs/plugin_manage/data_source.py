@@ -219,8 +219,9 @@ class ApiDataSource:
             await db_plugin.save(
                 update_fields=["limit_superuser", "cost_gold", "level", "menu_type"]
             )
-            if param.configs:
+            if param.configs or param.unset_configs:
                 from ..system.configuration import (
+                    _unset_fields,
                     _update_simple,
                     _write_transaction,
                     validate_simple_yaml,
@@ -228,7 +229,12 @@ class ApiDataSource:
 
                 content = _update_simple(
                     (previous_file or b"").decode("utf-8"),
-                    {param.module: param.configs},
+                    {param.module: param.configs or {}},
+                )
+                content = _unset_fields(
+                    content,
+                    "simple",
+                    [[param.module, key] for key in param.unset_configs],
                 )
                 validate_simple_yaml(content)
                 _write_transaction([(simple_path, content.encode("utf-8"))])
