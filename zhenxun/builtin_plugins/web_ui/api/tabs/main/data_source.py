@@ -5,6 +5,7 @@ import time
 import nonebot
 from nonebot.adapters import Bot
 from nonebot.drivers import Driver
+from tortoise.expressions import Q
 from tortoise.functions import Count
 
 from zhenxun.adapters.qq_official.diagnostics import public_identity, safe_avatar_url
@@ -29,6 +30,45 @@ from .model import (
 )
 
 driver: Driver = nonebot.get_driver()
+
+
+async def get_statistics_counts(bot_id: str | None, operation: str) -> dict[str, int]:
+    """Return all call-count windows with one database aggregate query."""
+    now = datetime.now()
+    query = Statistics
+    if bot_id:
+        query = query.filter(bot_id=bot_id)
+    day_start = now - timedelta(hours=now.hour, minutes=now.minute)
+    week_start = now - timedelta(days=7, hours=now.hour, minutes=now.minute)
+    month_start = now - timedelta(days=30, hours=now.hour, minutes=now.minute)
+    year_start = now - timedelta(days=365, hours=now.hour, minutes=now.minute)
+    result = await webui_db_call(
+        query.annotate(
+            total_count=Count("id"),
+            day_count=Count("id", _filter=Q(create_time__gte=day_start)),
+            week_count=Count("id", _filter=Q(create_time__gte=week_start)),
+            month_count=Count("id", _filter=Q(create_time__gte=month_start)),
+            year_count=Count("id", _filter=Q(create_time__gte=year_start)),
+        )
+        .limit(1)
+        .values(
+            "total_count",
+            "day_count",
+            "week_count",
+            "month_count",
+            "year_count",
+        ),
+        operation,
+    )
+    result = result[0] if isinstance(result, list) and result else result
+    result = result or {}
+    return {
+        "total": int(result.get("total_count") or 0),
+        "day": int(result.get("day_count") or 0),
+        "week": int(result.get("week_count") or 0),
+        "month": int(result.get("month_count") or 0),
+        "year": int(result.get("year_count") or 0),
+    }
 
 
 class BotLive:
@@ -290,47 +330,13 @@ class ApiDataSource:
         返回:
             QueryCount: 数据内容
         """
-        now = datetime.now()
-        query = Statistics
-        if bot_id:
-            query = query.filter(bot_id=bot_id)
-        all_count = await webui_db_call(
-            query.annotate().count(),
-            "Main.call_all_count",
-        )
-        day_count = await webui_db_call(
-            query.filter(
-                create_time__gte=now - timedelta(hours=now.hour, minutes=now.minute)
-            ).count(),
-            "Main.call_day_count",
-        )
-        week_count = await webui_db_call(
-            query.filter(
-                create_time__gte=now
-                - timedelta(days=7, hours=now.hour, minutes=now.minute)
-            ).count(),
-            "Main.call_week_count",
-        )
-        month_count = await webui_db_call(
-            query.filter(
-                create_time__gte=now
-                - timedelta(days=30, hours=now.hour, minutes=now.minute)
-            ).count(),
-            "Main.call_month_count",
-        )
-        year_count = await webui_db_call(
-            query.filter(
-                create_time__gte=now
-                - timedelta(days=365, hours=now.hour, minutes=now.minute)
-            ).count(),
-            "Main.call_year_count",
-        )
+        counts = await get_statistics_counts(bot_id, "Main.call_counts")
         return QueryCount(
-            num=all_count,
-            day=day_count,
-            week=week_count,
-            month=month_count,
-            year=year_count,
+            num=counts["total"],
+            day=counts["day"],
+            week=counts["week"],
+            month=counts["month"],
+            year=counts["year"],
         )
 
     @classmethod

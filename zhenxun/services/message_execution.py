@@ -14,6 +14,34 @@ class MessageExecution:
     deliveries: dict = field(default_factory=dict)
     handlers_started: int = 0
     business_identities: dict = field(default_factory=dict)
+    deferred_reason: str | None = None
+    retry_blocked: bool = False
+    preconditions: list = field(default_factory=list)
+
+    @property
+    def can_retry(self) -> bool:
+        return bool(
+            self.deferred_reason
+            and not self.handlers_started
+            and not self.operations
+            and not self.deliveries
+            and not self.errors
+            and not self.retry_blocked
+            and all(item.retry_safe for item in self.preconditions)
+        )
+
+
+class MessageExecutionDeferred(RuntimeError):
+    """A temporary dependency failure; never an authorization exemption."""
+
+
+def defer_execution(reason: str) -> None:
+    from .cache.diagnostics import record_availability_fallback
+
+    record_availability_fallback("permission_deferred")
+    execution = current_execution.get()
+    if execution is not None and execution.deferred_reason is None:
+        execution.deferred_reason = reason
 
 
 class MessageExecutionUnavailable(RuntimeError):

@@ -28,6 +28,8 @@ class Statistics(Model):
             ("group_id", "plugin_name"),
             ("plugin_name", "create_time"),
             ("user_id", "create_time"),
+            ("create_time",),
+            ("bot_id", "create_time"),
         ]
 
     @classmethod

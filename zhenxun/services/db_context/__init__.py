@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import asynccontextmanager
 import hashlib
 import json
 import os
@@ -128,6 +129,167 @@ def _db_script_hash_file(script_fingerprint: str) -> Path:
     return _SCRIPT_HASH_DIR / f"{db_hash}.json"
 
 
+def _migration_lock_path() -> Path:
+    identity = hashlib.md5((BotConfig.db_url or "").encode()).hexdigest()
+    return _SCRIPT_HASH_DIR / f"{identity}.lock"
+
+
+def _acquire_file_lock(handle) -> None:
+    handle.seek(0)
+    handle.write("0")
+    handle.flush()
+    handle.seek(0)
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+
+
+def _release_file_lock(handle) -> None:
+    handle.seek(0)
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+@asynccontextmanager
+async def _schema_migration_lock():
+    _SCRIPT_HASH_DIR.mkdir(parents=True, exist_ok=True)
+    handle = await asyncio.to_thread(_migration_lock_path().open, "a+")
+    try:
+        await asyncio.to_thread(_acquire_file_lock, handle)
+        yield
+    finally:
+        try:
+            await asyncio.to_thread(_release_file_lock, handle)
+        finally:
+            handle.close()
+
+
+async def _run_script_migrations(sql_list: list[str], fingerprint: str) -> None:
+    """Run additive scripts once per database, with a cross-process lock."""
+    script_hash_file = _db_script_hash_file(fingerprint)
+    async with _schema_migration_lock():
+        try:
+            previous = json.loads(script_hash_file.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            previous = {}
+        if previous.get("script_fingerprint") == fingerprint:
+            logger.debug("迁移脚本无变化，跳过执行")
+            return
+
+        db = Tortoise.get_connection("default")
+
+        async def table_exists(table_name: str) -> bool:
+            try:
+                result = await db.execute_query_dict(
+                    "SELECT to_regclass($1) IS NOT NULL as exists", [table_name]
+                )
+                if result:
+                    return bool(result[0]["exists"])
+            except Exception:
+                pass
+            try:
+                result = await db.execute_query_dict(
+                    "SELECT COUNT(*) as count FROM information_schema.tables "
+                    "WHERE table_name = %s",
+                    [table_name],
+                )
+                if result:
+                    return bool(result[0]["count"])
+            except Exception:
+                pass
+            try:
+                result = await db.execute_query_dict(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+                    [table_name],
+                )
+                return bool(result)
+            except Exception:
+                return True
+
+        failed: list[tuple[str, Exception]] = []
+        for sql in sql_list:
+            sql_upper = sql.strip().upper()
+            if sql_upper.startswith("ALTER TABLE"):
+                table_name = _extract_alter_table_name(sql)
+                if table_name and not await table_exists(table_name):
+                    logger.debug(f"跳过SQL（表不存在）: {sql}")
+                    continue
+            elif sql_upper.startswith("CREATE INDEX"):
+                table_name = _extract_create_index_table_name(sql)
+                if table_name and not await table_exists(table_name):
+                    logger.debug(f"跳过SQL（表不存在）: {sql}")
+                    continue
+
+            logger.debug(f"执行SQL: {sql}")
+            try:
+                await asyncio.wait_for(
+                    db.execute_query_dict(sql), timeout=DB_TIMEOUT_SECONDS
+                )
+            except OperationalError as error:
+                error_text = str(error).lower()
+                sql_lower = sql.lower()
+                if any(
+                    marker in error_text
+                    for marker in (
+                        "already exists",
+                        "duplicate column",
+                        "已经存在",
+                        "已存在",
+                    )
+                ):
+                    continue
+                if any(
+                    marker in error_text
+                    for marker in (
+                        "does not exist",
+                        "check that",
+                        "不存在",
+                        "no such column",
+                    )
+                ) and ("drop" in sql_lower or "rename" in sql_lower):
+                    continue
+                if "syntax error" in error_text and (
+                    "alter column" in sql_lower or "drop not null" in sql_lower
+                ):
+                    continue
+                failed.append((sql, error))
+            except Exception as error:
+                failed.append((sql, error))
+
+        if failed:
+            details = "; ".join(f"{sql}: {error}" for sql, error in failed[:3])
+            raise RuntimeError(f"数据库迁移未完成，未写入脚本指纹: {details}")
+
+        payload = json.dumps(
+            {
+                "dialect": urlparse(BotConfig.db_url or "").scheme,
+                "db_url_hash": hashlib.md5(
+                    (BotConfig.db_url or "").encode()
+                ).hexdigest(),
+                "script_fingerprint": fingerprint,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        temporary = script_hash_file.with_suffix(
+            f".tmp.{os.getpid()}.{os.urandom(4).hex()}"
+        )
+        temporary.write_text(payload, encoding="utf-8")
+        os.replace(temporary, script_hash_file)
+        logger.debug("SCRIPT_METHOD方法执行完毕!")
+
+
 def get_config() -> dict:
     """获取数据库配置"""
     if not BotConfig.db_url:
@@ -254,124 +416,7 @@ async def init():
                 fingerprint = hashlib.md5(
                     json.dumps(sorted(sql_list), ensure_ascii=False).encode()
                 ).hexdigest()
-                script_hash_file = _db_script_hash_file(fingerprint)
-                need_run = not (
-                    script_hash_file.exists()
-                    and json.loads(script_hash_file.read_text(encoding="utf-8")).get(
-                        "script_fingerprint"
-                    )
-                    == fingerprint
-                )
-                if need_run:
-                    db = Tortoise.get_connection("default")
-
-                    async def table_exists(table_name: str) -> bool:
-                        """检查表是否存在"""
-                        try:
-                            # PostgreSQL
-                            result = await db.execute_query_dict(
-                                "SELECT to_regclass($1) IS NOT NULL as exists",
-                                [table_name],
-                            )
-                            if result:
-                                return result[0]["exists"]
-                        except Exception:
-                            pass
-                        try:
-                            # MySQL
-                            result = await db.execute_query_dict(
-                                "SELECT COUNT(*) as count FROM information_schema.tables "  # noqa: E501
-                                "WHERE table_name = %s",
-                                [table_name],
-                            )
-                            if result:
-                                return result[0]["count"] > 0
-                        except Exception:
-                            pass
-                        try:
-                            # SQLite
-                            result = await db.execute_query_dict(
-                                "SELECT name FROM sqlite_master WHERE type='table' AND name=?",  # noqa: E501
-                                [table_name],
-                            )
-                            return len(result) > 0
-                        except Exception:
-                            pass
-                        return True  # 如果检查失败，假设表存在，让SQL自己报错
-
-                    for sql in sql_list:
-                        # 对于 ALTER TABLE 操作，先检查表是否存在
-                        sql_upper = sql.strip().upper()
-                        if sql_upper.startswith("ALTER TABLE"):
-                            table_name = _extract_alter_table_name(sql)
-                            if table_name:
-                                if not await table_exists(table_name):
-                                    logger.debug(f"跳过SQL（表不存在）: {sql}")
-                                    continue
-                        elif sql_upper.startswith("CREATE INDEX"):
-                            table_name = _extract_create_index_table_name(sql)
-                            if table_name:
-                                if not await table_exists(table_name):
-                                    logger.debug(f"跳过SQL（表不存在）: {sql}")
-                                    continue
-
-                        logger.debug(f"执行SQL: {sql}")
-                        try:
-                            await asyncio.wait_for(
-                                db.execute_query_dict(sql),
-                                timeout=DB_TIMEOUT_SECONDS,
-                            )
-                        except OperationalError as e:
-                            err_str = str(e).lower()
-                            sql_lower = sql.lower()
-                            if any(
-                                x in err_str
-                                for x in [
-                                    "already exists",
-                                    "duplicate column",
-                                    "已经存在",
-                                    "已存在",
-                                ]
-                            ):
-                                pass
-                            elif any(
-                                x in err_str
-                                for x in [
-                                    "does not exist",
-                                    "check that",
-                                    "不存在",
-                                    "no such column",
-                                ]
-                            ) and ("drop" in sql_lower or "rename" in sql_lower):
-                                pass
-                            elif "syntax error" in err_str and (
-                                "alter column" in sql_lower
-                                or "drop not null" in sql_lower
-                            ):
-                                # SQLite 不支持 PostgreSQL 的 ALTER COLUMN 语法
-                                pass
-                            else:
-                                logger.warning(f"执行SQL警告: {sql} || {e}")
-                        except Exception as e:
-                            logger.debug(f"执行SQL: {sql} 错误...", e=e)
-                    logger.debug("SCRIPT_METHOD方法执行完毕!")
-                    script_hash_file.parent.mkdir(parents=True, exist_ok=True)
-                    script_hash_file.write_text(
-                        json.dumps(
-                            {
-                                "dialect": urlparse(BotConfig.db_url or "").scheme,
-                                "db_url_hash": hashlib.md5(
-                                    (BotConfig.db_url or "").encode()
-                                ).hexdigest(),
-                                "script_fingerprint": fingerprint,
-                            },
-                            ensure_ascii=False,
-                            indent=2,
-                        ),
-                        encoding="utf-8",
-                    )
-                else:
-                    logger.debug("迁移脚本无变化，跳过执行")
+                await _run_script_migrations(sql_list, fingerprint)
         # Tortoise may emit column comments/index SQL during generate_schemas().
         # On existing databases with newly added nullable fields, PostgreSQL can
         # fail before the post-generate SchemaGuard gets a chance to repair drift.
@@ -379,6 +424,12 @@ async def init():
         logger.debug("开始生成数据库表结构...")
         await Tortoise.generate_schemas()
         logger.debug("数据库表结构生成完毕!")
+        from zhenxun.models.group_plugin_setting import (
+            ensure_group_plugin_scope_constraint,
+        )
+
+        async with _schema_migration_lock():
+            await ensure_group_plugin_scope_constraint()
         await repair_safe_schema_drift()
         _database_ready = True
         logger.info("Database loaded successfully!")

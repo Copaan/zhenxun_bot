@@ -336,11 +336,10 @@ class CacheManager:
             if model.result_type:
                 return self._deserialize_value(data, model.result_type)
             return self._deserialize_value(data)
-        except asyncio.TimeoutError:
-            logger.error(f"获取缓存 {cache_type}:{cache_key} 超时", LOG_COMMAND)
-            return default
-        except Exception as e:
-            logger.error(f"获取缓存 {cache_type} 失败", LOG_COMMAND, e=e)
+        except Exception as error:
+            from .diagnostics import record_cache_read_failure
+
+            record_cache_read_failure(cache_type, error)
             return default
 
     async def set(
@@ -400,9 +399,13 @@ class CacheManager:
         if in_write_transaction():
             return False
 
-        # 如果缓存被禁用或缓存模式为NONE，直接返回False
-        if not self.enabled or cache_config.cache_mode == CacheMode.NONE:
-            return False
+        # MEMORY/NONE 模式没有远端模型缓存；删除不存在的缓存是幂等成功，
+        # 避免调用方把“没有缓存可删”误判为业务失败。
+        if not self.enabled or cache_config.cache_mode in {
+            CacheMode.NONE,
+            CacheMode.MEMORY,
+        }:
+            return True
         cache_key = None
         try:
             cache_key = self._build_key(cache_type, key)

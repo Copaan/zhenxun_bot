@@ -142,6 +142,11 @@ class BotGroupPolicyService:
             channel_id,
         )
         initialize = bool(group_id and self.loaded and key not in self._memberships)
+        if initialize:
+            from zhenxun.services.message_execution import current_execution
+
+            if execution := current_execution.get():
+                execution.retry_blocked = True
         if key not in self._stale and not initialize:
             return
         task = self._refresh_tasks.get(key)

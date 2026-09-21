@@ -37,6 +37,8 @@ class Result(BaseModel, Generic[RT]):
     """info"""
     warning: str | None = None
     """警告信息"""
+    details: dict[str, Any] | None = None
+    """可选的结构化诊断信息"""
     data: RT | None = None
     """返回数据"""
 
@@ -45,8 +47,13 @@ class Result(BaseModel, Generic[RT]):
         return cls(suc=True, warning=info, code=code)
 
     @classmethod
-    def fail(cls, info: str = "异常错误", code: int = 500) -> "Result[RT]":
-        return cls(suc=False, info=info, code=code)
+    def fail(
+        cls,
+        info: str = "异常错误",
+        code: int = 500,
+        details: dict[str, Any] | None = None,
+    ) -> "Result[RT]":
+        return cls(suc=False, info=info, code=code, details=details)
 
     @classmethod
     def ok(

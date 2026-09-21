@@ -982,6 +982,31 @@ async def apply_analysis(payload: ApplyPayload) -> Result[dict]:
                 "database_migration_possible": bool(
                     plan.get("database_migration_possible")
                 ),
+                "dependency_inputs": sorted(
+                    {
+                        str(value)
+                        for value in [
+                            *(plan.get("candidate_inputs") or []),
+                            *(
+                                (analysis.get("metadata") or {})
+                                .get("info", {})
+                                .get("requires_dist")
+                                or []
+                            ),
+                        ]
+                    }
+                ),
+                "dependency_packages": {
+                    str(item.get("name")): str(
+                        item.get("to") or item.get("version") or ""
+                    )
+                    for item in [
+                        *(plan.get("package_changes", {}).get("added") or []),
+                        *(plan.get("package_changes", {}).get("changed") or []),
+                        *(plan.get("shared_changes") or []),
+                    ]
+                    if item.get("name") and (item.get("to") or item.get("version"))
+                },
                 "created_at": utc_now(),
                 "target_manifest": deepcopy(target),
             }
@@ -1177,7 +1202,9 @@ async def apply_analysis(payload: ApplyPayload) -> Result[dict]:
         return Result.fail("plugin_operation_in_progress", code=409)
     except (ArchiveSourceBuildConflict, ArchiveDependencyConflict) as error:
         record_failure(error.code)
-        return Result.fail(error.code, code=409)
+        return Result.fail(
+            error.code, code=409, details=getattr(error, "details", None)
+        )
     except LayerBuildError as error:
         if new_generation is not None:
             remove_generation(new_generation)
@@ -1185,7 +1212,11 @@ async def apply_analysis(payload: ApplyPayload) -> Result[dict]:
             save_pending_transaction(previous_pending)
         logger.error(f"NoneBot 依赖层构建失败: {error.code}", "WebUi")
         record_failure(error.code)
-        return Result.fail(error.code, code=400)
+        return Result.fail(
+            error.code,
+            code=400,
+            details=getattr(error, "details", None),
+        )
     except Exception as error:
         if new_generation is not None:
             remove_generation(new_generation)

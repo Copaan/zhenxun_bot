@@ -1,3 +1,5 @@
+from typing import ClassVar
+
 from tortoise import fields
 
 from zhenxun.services.db_context import Model
@@ -54,3 +56,4 @@ class ScheduledJob(Model):
     class Meta:  # type: ignore
         table = "scheduled_tasks"
         table_description = "通用定时任务定义表"
+        indexes: ClassVar = [("is_enabled", "plugin_name"), ("bot_id", "is_enabled")]

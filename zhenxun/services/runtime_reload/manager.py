@@ -743,11 +743,21 @@ class PluginRuntimeManager:
         async def run_with_owner(matcher, *args, **kwargs):
             with manager._matcher_admission(type(matcher)) as admitted:
                 if admitted:
-                    from zhenxun.services.message_execution import current_execution
+                    from zhenxun.services.message_execution import (
+                        MessageExecutionDeferred,
+                        current_execution,
+                    )
                     from zhenxun.services.pipeline_metrics import pipeline_metrics
 
                     execution = current_execution.get()
                     if execution is not None:
+                        if execution.deferred_reason:
+                            for commit in execution.preconditions:
+                                if commit.owner_matcher_id == id(matcher):
+                                    await commit.rollback_all("message_deferred")
+                            raise asyncio.CancelledError(
+                                "message_deferred_before_handler"
+                            )
                         execution.handlers_started += 1
                         if execution.received_at is not None:
                             pipeline_metrics.observe(
@@ -756,6 +766,18 @@ class PluginRuntimeManager:
                     started = time.monotonic()
                     try:
                         return await original(matcher, *args, **kwargs)
+                    except MessageExecutionDeferred as error:
+                        if execution is not None:
+                            execution.deferred_reason = str(error)
+                        for commit in execution.preconditions if execution else ():
+                            if commit.owner_matcher_id == id(matcher):
+                                await commit.rollback_all(
+                                    "handler_dependency_unavailable"
+                                )
+                        logger.debug(f"Matcher deferred: {error}")
+                        raise asyncio.CancelledError(
+                            "matcher_dependency_unavailable"
+                        ) from None
                     finally:
                         pipeline_metrics.observe(
                             "handler_execution_ms", time.monotonic() - started

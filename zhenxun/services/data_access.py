@@ -60,31 +60,6 @@ class DataAccess(Generic[T]):
     _refill_owner: ClassVar[ContextVar[asyncio.Task | None]] = ContextVar(
         "data_access_refill_owner", default=None
     )
-    # 空结果标记
-    _NULL_RESULT = "__NULL_RESULT_PLACEHOLDER__"
-    # 默认空结果缓存时间（秒）- 设置为5分钟，避免频繁查询数据库
-    _NULL_RESULT_TTL = 300
-
-    @classmethod
-    def set_null_result_ttl(cls, seconds: int) -> None:
-        """设置空结果缓存时间
-
-        参数:
-            seconds: 缓存时间（秒）
-        """
-        if seconds < 0:
-            raise ValueError("缓存时间不能为负数")
-        cls._NULL_RESULT_TTL = seconds
-        logger.info(f"已设置DataAccess空结果缓存时间为 {seconds} 秒")
-
-    @classmethod
-    def get_null_result_ttl(cls) -> int:
-        """获取空结果缓存时间
-
-        返回:
-            int: 缓存时间（秒）
-        """
-        return cls._NULL_RESULT_TTL
 
     def __init__(
         self, model_cls: type[T], key_field: str = "id", cache_type: str | None = None
@@ -223,15 +198,7 @@ class DataAccess(Generic[T]):
             if cache_key is not None:
                 refill_token = CacheRoot.refill_token(self.cache_type, cache_key)
                 data = await self.cache.get(cache_key) if self.cache else None
-                if data == self._NULL_RESULT:
-                    # 空结果缓存命中
-                    self._bump_cache_stat(self.cache_type, "null_hits")
-                    if allow_not_exist:
-                        logger.debug(
-                            f"{self.model_cls.__name__} 缓存负命中: {cache_key}"
-                        )
-                        return None
-                elif data:
+                if data is not None:
                     # 缓存命中
                     self._bump_cache_stat(self.cache_type, "hits")
                     logger.debug(f"{self.model_cls.__name__} 缓存命中: {cache_key}")
@@ -241,7 +208,9 @@ class DataAccess(Generic[T]):
                     self._bump_cache_stat(self.cache_type, "misses")
                     logger.debug(f"{self.model_cls.__name__} 缓存未命中: {cache_key}")
         except Exception as e:
-            logger.error(f"{self.model_cls.__name__} 从缓存获取数据失败: {kwargs}", e=e)
+            from .cache.diagnostics import record_cache_read_failure
+
+            record_cache_read_failure(str(self.cache_type), e)
             cache_key = None
             refill_token = None
 
@@ -284,11 +253,14 @@ class DataAccess(Generic[T]):
                     hit = False
                     if cache_key is not None and self.cache is not None:
                         # Recheck after waiting, with a new invalidation fence.
-                        data = await self.cache.get(cache_key)
-                        hit = data is not None
-                        if data == self._NULL_RESULT:
-                            hit = allow_not_exist
+                        try:
+                            data = await self.cache.get(cache_key)
+                        except Exception as error:
+                            from .cache.diagnostics import record_cache_read_failure
+
+                            record_cache_read_failure(str(self.cache_type), error)
                             data = None
+                        hit = data is not None
                         token = CacheRoot.refill_token(self.cache_type, cache_key)
                     if not hit:
                         owner_token = self._refill_owner.set(asyncio.current_task())

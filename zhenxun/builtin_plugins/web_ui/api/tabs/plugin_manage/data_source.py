@@ -20,6 +20,7 @@ from zhenxun.services.runtime_reload import plugin_runtime_manager
 from zhenxun.services.runtime_reload.models import ApplyMode, RuntimeOperation
 from zhenxun.utils.enum import BlockType, PluginType
 
+from ....config_schema import configuration_value
 from .model import (
     BatchUpdatePlugins,
     PluginConfig,
@@ -55,7 +56,11 @@ def _loaded_metadata(runtime_module: str, module: str) -> tuple[str, str | None]
 class ApiDataSource:
     @classmethod
     async def get_plugin_list(
-        cls, plugin_type: list[PluginType] = Query(None), menu_type: str | None = None
+        cls,
+        plugin_type: list[PluginType] = Query(None),
+        menu_type: str | None = None,
+        *,
+        module: str | None = None,
     ) -> list[PluginInfo]:
         """获取插件列表
 
@@ -72,8 +77,10 @@ class ApiDataSource:
             filters["plugin_type__in"] = plugin_type
         if menu_type:
             filters["menu_type"] = menu_type
+        if module:
+            filters["module"] = module
         plugins = await DbPluginInfo.get_plugins(
-            load_status=True,
+            load_status=None if module else True,
             filter_parent=False,
             **filters,
         )
@@ -132,25 +139,28 @@ class ApiDataSource:
             else:
                 management_source = "manual"
                 management_route = None
+            management_key = store_key or (
+                nonebot_managed[0] if nonebot_managed else None
+            )
             plugin_info = PluginInfo(
                 id=plugin.id,
                 policy_revision=policy_revision,
                 store_key=store_key,
                 runtime_module=runtime_module,
-                uninstall_supported=bool(store_key) and not is_builtin,
+                uninstall_supported=bool(store_key or nonebot_managed)
+                and not is_builtin,
                 uninstall_reason=(
                     "系统内置插件不可卸载"
                     if is_builtin
-                    else "请前往 NoneBot 商店管理或卸载该插件"
-                    if nonebot_managed
                     else None
-                    if store_key
+                    if store_key or nonebot_managed
                     else "该插件不由插件商店管理，请手动维护插件文件"
                 ),
                 usage=usage,
                 homepage=homepage,
                 management_source=management_source,
                 management_route=management_route,
+                management_key=management_key,
                 module=plugin.module,
                 plugin_name=plugin.name,
                 default_status=plugin.default_status,
@@ -410,9 +420,9 @@ class ApiDataSource:
         return PluginConfig(
             module=module,
             key=cfg,
-            value=config.configs[cfg].value,
+            value=configuration_value(config.configs[cfg].value),
             help=config.configs[cfg].help,
-            default_value=config.configs[cfg].default_value,
+            default_value=configuration_value(config.configs[cfg].default_value),
             type=type_str,
             type_inner=type_inner,  # type: ignore
             schema=schema_for_type(config.configs[cfg].type),
@@ -476,21 +486,14 @@ class ApiDataSource:
             config_list.extend(
                 cls.__build_plugin_config(module, cfg, config) for cfg in config.configs
             )
-        from zhenxun.services.plugin_policy import plugin_policy_service
-
-        return PluginDetail(
-            id=db_plugin.id,
-            policy_revision=(await plugin_policy_service.global_state())["revision"],
-            module=module,
-            plugin_name=db_plugin.name,
-            default_status=db_plugin.default_status,
-            limit_superuser=db_plugin.limit_superuser,
-            cost_gold=db_plugin.cost_gold,
-            menu_type=db_plugin.menu_type,
-            version=db_plugin.version or "0",
-            level=db_plugin.level,
-            status=db_plugin.status,
-            author=db_plugin.author,
-            config_list=config_list,
-            block_type=db_plugin.block_type,
+        summary = next(
+            iter(await cls.get_plugin_list(plugin_type=None, module=module)),
+            None,
         )
+        if summary is None:
+            raise ValueError("插件不存在")
+        data = (
+            summary.model_dump() if hasattr(summary, "model_dump") else summary.dict()
+        )
+        data["config_list"] = config_list
+        return PluginDetail(**data)

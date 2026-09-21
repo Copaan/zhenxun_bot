@@ -194,8 +194,12 @@ class PluginPolicyService:
             PluginInfoMemoryCache,
             RuntimeCacheMutation,
         )
+        from zhenxun.services.cache.write import CacheUnavailable
 
-        RuntimeCacheMutation.require_fresh(PluginInfoMemoryCache)
+        try:
+            RuntimeCacheMutation.require_fresh(PluginInfoMemoryCache)
+        except CacheUnavailable as error:
+            raise PluginPolicyNotReady("插件策略尚未就绪") from error
         if not PluginInfoMemoryCache.is_loaded():
             raise PluginPolicyNotReady("插件策略尚未就绪")
         return {

@@ -15,6 +15,7 @@ from .lifecycle.diagnostics import DiagnosticWorker
 from .message_buffer import PayloadCapacityError, PayloadQueue
 from .message_execution import (
     MessageExecution,
+    MessageExecutionDeferred,
     MessageExecutionUnavailable,
     current_execution,
 )
@@ -635,14 +636,26 @@ class MessageInbox:
             await dispatch(event)
             if execution.errors:
                 state, reason = "failed", "matcher_failed"
+            if execution.deferred_reason:
+                state, reason = "held", execution.deferred_reason
+            if "reply_unconfirmed" in execution.deliveries.values():
+                state, reason = "unresolved", "reply_unconfirmed"
+        except MessageExecutionDeferred as error:
+            execution.deferred_reason = str(error)
+            state, reason = "held", str(error)
         except MessageExecutionUnavailable as error:
             state, reason = "held", str(error)
         except asyncio.CancelledError:
             state, reason = "unresolved", "execution_interrupted"
             raise
-        except Exception:
+        except Exception as error:
+            from .log import logger
+
+            logger.error("message execution failed", "MessageInbox", e=error)
+            execution.errors.append(type(error).__name__)
             state, reason = "unresolved", "execution_failed_or_reply_unconfirmed"
         finally:
+            retry_safe = state == "held" and execution.can_retry
             current_execution.reset(token)
             handler_ms = (time.monotonic() - handler_started) * 1000
             pipeline_metrics.observe("business_dispatch_ms", handler_ms / 1000)
@@ -678,10 +691,9 @@ class MessageInbox:
                     )
                 else:
                     await self.mutate(
-                        self.store.finish,
+                        self.store.defer if retry_safe else self.store.finish,
                         row["id"],
-                        state,
-                        reason,
+                        *([reason] if retry_safe else [state, reason]),
                         {
                             "errors": execution.errors,
                             "deliveries": execution.deliveries,

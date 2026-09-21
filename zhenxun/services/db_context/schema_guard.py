@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from datetime import datetime
 import json
+import os
 from pathlib import Path
 from typing import Any, Literal
 
@@ -28,6 +30,8 @@ class SchemaGuardResult:
     type_mismatches: int = 0
     warnings: int = 0
     drift: list[dict[str, Any]] | None = None
+    failures: list[dict[str, Any]] = dataclass_field(default_factory=list)
+    dialect: Dialect = "unknown"
 
 
 @dataclass(slots=True)
@@ -339,9 +343,7 @@ def _index_sql(table: str, columns: tuple[str, ...], dialect: Dialect) -> str | 
     index_sql = _quote_identifier(_index_name(table, columns), dialect)
     columns_sql = ", ".join(_quote_identifier(column, dialect) for column in columns)
     if dialect in {"sqlite", "postgres"}:
-        return (
-            f"CREATE INDEX IF NOT EXISTS {index_sql} " f"ON {table_sql}({columns_sql})"
-        )
+        return f"CREATE INDEX IF NOT EXISTS {index_sql} ON {table_sql}({columns_sql})"
     if dialect == "mysql":
         return f"CREATE INDEX {index_sql} ON {table_sql}({columns_sql})"
     return None
@@ -380,16 +382,18 @@ async def _write_schema_report(result: SchemaGuardResult) -> None:
             "skipped_indexes": result.skipped_indexes,
             "type_mismatches": result.type_mismatches,
             "warnings": result.warnings,
+            "failures": len(result.failures),
+            "dialect": result.dialect,
         },
         "tables": result.drift or [],
+        "failures": result.failures,
     }
     path = Path() / "data" / "db" / "schema_report.json"
     path.parent.mkdir(parents=True, exist_ok=True)
-    await asyncio.to_thread(
-        path.write_text,
-        json.dumps(report, ensure_ascii=False, indent=2),
-        "utf-8",
-    )
+    payload = json.dumps(report, ensure_ascii=False, indent=2)
+    temporary = path.with_suffix(f".tmp.{os.getpid()}.json")
+    await asyncio.to_thread(temporary.write_text, payload, "utf-8")
+    await asyncio.to_thread(temporary.replace, path)
 
 
 async def repair_safe_schema_drift() -> SchemaGuardResult:
@@ -403,6 +407,7 @@ async def repair_safe_schema_drift() -> SchemaGuardResult:
     result.drift = []
     connection = Tortoise.get_connection("default")
     dialect = _connection_dialect(connection)
+    result.dialect = dialect
     if dialect == "unknown":
         logger.debug("SchemaGuard 跳过未知数据库方言", LOG_COMMAND)
         return result
@@ -417,6 +422,14 @@ async def repair_safe_schema_drift() -> SchemaGuardResult:
             columns = await _table_columns(connection, table, dialect)
         except Exception as exc:
             result.warnings += 1
+            result.failures.append(
+                {
+                    "kind": "inspect_table",
+                    "table": table,
+                    "error": str(exc),
+                    "dialect": dialect,
+                }
+            )
             logger.debug(f"SchemaGuard 检查表 {table} 失败", LOG_COMMAND, e=exc)
             continue
         if columns is None:
@@ -480,6 +493,16 @@ async def repair_safe_schema_drift() -> SchemaGuardResult:
                     columns[source] = ColumnInfo(name=source, data_type="")
                     continue
                 result.warnings += 1
+                result.failures.append(
+                    {
+                        "kind": "add_column",
+                        "table": table,
+                        "column": source,
+                        "operation": sql,
+                        "error": str(exc),
+                        "dialect": dialect,
+                    }
+                )
                 logger.warning(
                     f"SchemaGuard 补齐字段失败: {table}.{source}",
                     LOG_COMMAND,
@@ -487,6 +510,16 @@ async def repair_safe_schema_drift() -> SchemaGuardResult:
                 )
             except Exception as exc:
                 result.warnings += 1
+                result.failures.append(
+                    {
+                        "kind": "add_column",
+                        "table": table,
+                        "column": source,
+                        "operation": sql,
+                        "error": str(exc),
+                        "dialect": dialect,
+                    }
+                )
                 logger.warning(
                     f"SchemaGuard 补齐字段失败: {table}.{source}",
                     LOG_COMMAND,
@@ -499,6 +532,14 @@ async def repair_safe_schema_drift() -> SchemaGuardResult:
             existing_indexes = await _table_indexes(connection, table, dialect)
         except Exception as exc:
             result.warnings += 1
+            result.failures.append(
+                {
+                    "kind": "inspect_indexes",
+                    "table": table,
+                    "error": str(exc),
+                    "dialect": dialect,
+                }
+            )
             logger.debug(f"SchemaGuard 检查索引 {table} 失败", LOG_COMMAND, e=exc)
             existing_indexes = set()
         indexes = getattr(meta, "indexes", ()) or ()
@@ -532,6 +573,16 @@ async def repair_safe_schema_drift() -> SchemaGuardResult:
             except TimeoutError as exc:
                 result.warnings += 1
                 result.skipped_indexes += 1
+                result.failures.append(
+                    {
+                        "kind": "create_index_timeout",
+                        "table": table,
+                        "columns": list(index_columns),
+                        "operation": sql,
+                        "error": str(exc),
+                        "dialect": dialect,
+                    }
+                )
                 logger.warning(
                     "SchemaGuard 补齐索引超时，已跳过: "
                     f"{table}.{index_columns} "
@@ -547,6 +598,16 @@ async def repair_safe_schema_drift() -> SchemaGuardResult:
                     existing_indexes.add(index_columns)
                     continue
                 result.warnings += 1
+                result.failures.append(
+                    {
+                        "kind": "create_index",
+                        "table": table,
+                        "columns": list(index_columns),
+                        "operation": sql,
+                        "error": str(exc),
+                        "dialect": dialect,
+                    }
+                )
                 logger.warning(
                     f"SchemaGuard 补齐索引失败: {table}.{index_columns}",
                     LOG_COMMAND,

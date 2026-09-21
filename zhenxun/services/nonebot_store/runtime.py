@@ -43,9 +43,16 @@ from .storage import (
 
 
 class LayerBuildError(RuntimeError):
-    def __init__(self, code: str, detail: str | None = None):
+    def __init__(
+        self,
+        code: str,
+        detail: str | None = None,
+        *,
+        details: dict[str, Any] | None = None,
+    ):
         super().__init__(detail or code)
         self.code = code
+        self.details = details
 
 
 def _active_path(manifest: dict[str, Any] | None = None) -> Path | None:
@@ -189,7 +196,10 @@ def build_generation(transaction: dict[str, Any]) -> dict[str, Any]:
         with archive_dependency_policy(transaction):
             return _build_generation(transaction)
     except (ArchiveSourceBuildConflict, ArchiveDependencyConflict) as error:
-        raise LayerBuildError(error.code) from error
+        raise LayerBuildError(
+            error.code,
+            details=getattr(error, "details", None),
+        ) from error
 
 
 def _build_generation(transaction: dict[str, Any]) -> dict[str, Any]:

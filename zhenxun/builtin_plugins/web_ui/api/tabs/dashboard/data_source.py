@@ -18,7 +18,7 @@ from zhenxun.utils.platform import PlatformUtils
 
 from ....base_model import BaseResultModel, QueryModel
 from ....utils import webui_db_call
-from ..main.data_source import bot_live
+from ..main.data_source import bot_live, get_statistics_counts
 from .model import (
     AllChatAndCallCount,
     BotConnectLogInfo,
@@ -134,24 +134,12 @@ class ApiDataSource:
             ).count(),
             "Dashboard.chat_day_count",
         )
-        query = Statistics
-        if bot_id:
-            query = query.filter(bot_id=bot_id)
-        call_all_count = await webui_db_call(
-            query.annotate().count(),
-            "Dashboard.call_all_count",
-        )
-        call_day_count = await webui_db_call(
-            query.filter(
-                create_time__gte=now - timedelta(hours=now.hour, minutes=now.minute)
-            ).count(),
-            "Dashboard.call_day_count",
-        )
+        call_counts = await get_statistics_counts(bot_id, "Dashboard.call_counts")
         return QueryChatCallCount(
             chat_num=chat_all_count,
             chat_day=chat_day_count,
-            call_num=call_all_count,
-            call_day=call_day_count,
+            call_num=call_counts["total"],
+            call_day=call_counts["day"],
         )
 
     @classmethod
@@ -191,37 +179,14 @@ class ApiDataSource:
             ).count(),
             "Dashboard.chat_year_count",
         )
-        query = Statistics
-        if bot_id:
-            query = query.filter(bot_id=bot_id)
-        call_week_count = await webui_db_call(
-            query.filter(
-                create_time__gte=now
-                - timedelta(days=7, hours=now.hour, minutes=now.minute)
-            ).count(),
-            "Dashboard.call_week_count",
-        )
-        call_month_count = await webui_db_call(
-            query.filter(
-                create_time__gte=now
-                - timedelta(days=30, hours=now.hour, minutes=now.minute)
-            ).count(),
-            "Dashboard.call_month_count",
-        )
-        call_year_count = await webui_db_call(
-            query.filter(
-                create_time__gte=now
-                - timedelta(days=365, hours=now.hour, minutes=now.minute)
-            ).count(),
-            "Dashboard.call_year_count",
-        )
+        call_counts = await get_statistics_counts(bot_id, "Dashboard.call_counts")
         return AllChatAndCallCount(
             chat_week=chat_week_count,
             chat_month=chat_month_count,
             chat_year=chat_year_count,
-            call_week=call_week_count,
-            call_month=call_month_count,
-            call_year=call_year_count,
+            call_week=call_counts["week"],
+            call_month=call_counts["month"],
+            call_year=call_counts["year"],
         )
 
     @classmethod

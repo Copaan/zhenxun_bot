@@ -3,8 +3,6 @@
 from dataclasses import dataclass
 
 from nonebot.adapters import Bot, Event
-from nonebot.adapters.onebot.v11 import Bot as OneBotBot
-from nonebot.adapters.qq import Bot as QQBot
 from nonebot.adapters.qq.event import DirectMessageCreateEvent, InteractionCreateEvent
 
 
@@ -34,7 +32,13 @@ def event_capabilities(bot: Bot, event: Event, session) -> PlatformCapabilities:
         available.add("interaction_response")
         if event.event_id:
             available.add("passive_reply")
-    if isinstance(bot, QQBot | OneBotBot) and available & {"group", "guild"}:
+    from zhenxun.utils.platform import PlatformUtils
+
+    scope = PlatformUtils.get_platform_scope(bot) if isinstance(bot, Bot) else "unknown"
+    supports_members = (scope == "qq_api" and bool(available & {"group", "guild"})) or (
+        scope == "qq_client" and "group" in available
+    )
+    if supports_members:
         available.add("members_query")
         # SDK support cannot establish server-side authorization for this Bot.
         remote.add("members_query")

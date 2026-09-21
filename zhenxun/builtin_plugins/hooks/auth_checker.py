@@ -18,6 +18,11 @@ from zhenxun.models.plugin_info import PluginInfo
 from zhenxun.models.user_console import UserConsole
 from zhenxun.services.cache.cache_containers import CacheDict
 from zhenxun.services.log import logger
+from zhenxun.services.message_execution import (
+    MessageExecutionDeferred,
+    current_execution,
+    defer_execution,
+)
 from zhenxun.services.message_load import is_db_unhealthy, signal_overload
 from zhenxun.utils.enum import GoldHandle, PluginType
 from zhenxun.utils.exception import InsufficientGold
@@ -57,7 +62,6 @@ from .auth_event_selector import (
     install_handle_event_selector,
     uninstall_handle_event_selector,
 )
-from .auth_legacy_fallback import legacy_pure_auth_fallback
 from .auth_pipeline import (
     AuthPipelineContext,
     AuthPipelineDependencies,
@@ -1040,10 +1044,7 @@ async def _has_limits_cached(
             event_cache.setdefault("module_limits_ready", {})[module] = True
         return has_limits
     if is_db_unhealthy():
-        module_limit_cache[module] = False
-        if event_cache is not None:
-            event_cache.setdefault("module_limits_ready", {})[module] = False
-        return False
+        raise MessageExecutionDeferred("module_limits_unavailable")
     limits = await LimitManager.get_module_limits(module)
     has_limits = bool(limits)
     module_limit_cache[module] = has_limits
@@ -1059,10 +1060,10 @@ async def _db_section():
     global DB_ACTIVE_COUNT
     if DB_SEMAPHORE.locked():
         logger.warning(
-            "db semaphore saturated, allowing permission check to continue",
+            "db semaphore saturated, deferring permission check",
             LOGGER_COMMAND,
         )
-        raise PermissionExemption("db semaphore saturated, allow pass")
+        raise MessageExecutionDeferred("permission_database_saturated")
     await DB_SEMAPHORE.acquire()
     DB_ACTIVE_COUNT += 1
     try:
@@ -1347,16 +1348,14 @@ async def _prepare_auth_state(
         if plugin is None:
             if not allow_cache_load and plugin_cache_miss:
                 return None
-            raise PermissionExemption(
-                f"plugin:{module} not found, skip permission check"
-            )
+            raise SkipPluginException(f"plugin:{module} not registered")
         if plugin.plugin_type == PluginType.HIDDEN:
             raise PermissionExemption(
                 f"plugin {plugin.name}:{plugin.module} hidden, skip"
             )
         hook_recorder.set("get_plugin_user", f"{time.time() - plugin_user_start:.3f}s")
     except asyncio.TimeoutError:
-        logger.error(
+        logger.debug(
             f"获取插件和用户数据超时，模块: {module}",
             LOGGER_COMMAND,
             session=session,
@@ -1520,10 +1519,12 @@ async def _resolve_cost_gold(
         return 0
     if is_db_unhealthy():
         hook_recorder.set("cost_gold", "db_unhealthy")
-        raise SkipPluginException("数据库繁忙，金币功能暂不可用...")
+        raise MessageExecutionDeferred("cost_database_unavailable")
     cost_start = time.time()
     try:
         if prep.user is None:
+            if execution := current_execution.get():
+                execution.retry_blocked = True
             from zhenxun.services.business_identity import business_user_id
 
             account_key = await business_user_id(session)
@@ -1548,17 +1549,8 @@ async def _resolve_cost_gold(
         )
         hook_recorder.set("cost_gold", f"{time.time() - cost_start:.3f}s")
         return cost_gold
-    except asyncio.TimeoutError:
-        logger.error(
-            f"获取插件费用超时，模块: {prep.profile.module}",
-            LOGGER_COMMAND,
-            session=session,
-        )
-        from zhenxun.services.cache.diagnostics import record_availability_fallback
-
-        record_availability_fallback("cost_timeout_zero")
-        hook_recorder.set("cost_gold", "timeout_zero_cost")
-        return 0
+    except (asyncio.TimeoutError, TimeoutError):
+        raise MessageExecutionDeferred("cost_query_timeout") from None
 
 
 async def _run_auth_hooks(
@@ -1626,7 +1618,6 @@ _AUTH_PIPELINE_DEPS = AuthPipelineDependencies(
     prepare_auth_state=_prepare_auth_state,
     policy_decision_point=_AUTH_PDP,
     policy_skip_message=_policy_skip_message,
-    legacy_pure_auth_fallback=legacy_pure_auth_fallback,
     check_ban_from_snapshot=_check_ban_from_snapshot,
     resolve_cost_gold=_resolve_cost_gold,
     run_auth_hooks=_run_auth_hooks,
@@ -1702,8 +1693,24 @@ async def auth(
     )
 
     try:
+        if execution := current_execution.get():
+            if execution.deferred_reason:
+                raise MessageExecutionDeferred(execution.deferred_reason)
         await _AUTH_PIPELINE.run(pipeline_context)
 
+    except (MessageExecutionDeferred, TimeoutError, asyncio.TimeoutError) as error:
+        reason = (
+            str(error)
+            if isinstance(error, MessageExecutionDeferred)
+            else "permission_timeout"
+        )
+        defer_execution(reason)
+        await side_effect_commit.rollback_all("auth_deferred")
+        pipeline_context.ignore_flag = True
+        pipeline_context.auth_allowed = False
+        pipeline_context.decision_effect = "defer"
+        pipeline_context.decision_reason = reason
+        logger.debug(reason, LOGGER_COMMAND, session=session)
     except SkipPluginException as e:
         LimitManager.unblock(
             module,

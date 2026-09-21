@@ -34,6 +34,8 @@ class ChatHistory(Model):
             ("user_id", "create_time"),
             ("group_id", "create_time"),
             ("user_id", "group_id"),
+            ("bot_id", "group_id", "create_time"),
+            ("bot_id", "create_time"),
         ]
 
     @classmethod

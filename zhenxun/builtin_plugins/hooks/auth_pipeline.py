@@ -10,6 +10,7 @@ from nonebot.adapters import Bot, Event
 from nonebot.matcher import Matcher
 from nonebot_plugin_uninfo import Uninfo
 
+from zhenxun.services.message_execution import MessageExecutionDeferred
 from zhenxun.services.message_load import is_db_unhealthy
 from zhenxun.utils.utils import EntityIDs
 
@@ -18,7 +19,7 @@ from .auth.context import (
     PermissionSideEffectCache,
     set_route_modules,
 )
-from .auth.exception import PermissionExemption, SkipPluginException
+from .auth.exception import SkipPluginException
 from .auth_policy import (
     action_from_snapshot,
     principal_from_snapshot,
@@ -157,7 +158,6 @@ class AuthPipelineDependencies:
     prepare_auth_state: Callable[..., Awaitable[Any]]
     policy_decision_point: Any
     policy_skip_message: Callable[[str], str]
-    legacy_pure_auth_fallback: Callable[..., Awaitable[None]]
     check_ban_from_snapshot: Callable[..., Awaitable[None]]
     resolve_cost_gold: Callable[..., Awaitable[int]]
     run_auth_hooks: Callable[..., Awaitable[float]]
@@ -196,7 +196,7 @@ def apply_policy_precheck(
     elif bot_decision.denied:
         raise_for_policy(bot_decision, deps.policy_skip_message(bot_decision.reason))
     elif bot_decision.deferred:
-        raise PermissionExemption(f"auth_bot deferred: {bot_decision.reason}")
+        raise MessageExecutionDeferred(f"auth_bot deferred: {bot_decision.reason}")
 
     group_decision = deps.policy_decision_point.decide_group(prep.policy_context)
     if group_decision.allowed or group_decision.skipped:
@@ -207,7 +207,7 @@ def apply_policy_precheck(
             deps.policy_skip_message(group_decision.reason),
         )
     elif group_decision.deferred:
-        raise PermissionExemption(f"auth_group deferred: {group_decision.reason}")
+        raise MessageExecutionDeferred(f"auth_group deferred: {group_decision.reason}")
 
     plugin_decision = deps.policy_decision_point.decide_plugin(prep.policy_context)
     if plugin_decision.allowed or plugin_decision.skipped:
@@ -218,7 +218,9 @@ def apply_policy_precheck(
             deps.policy_skip_message(plugin_decision.reason),
         )
     else:
-        raise PermissionExemption(f"auth_plugin deferred: {plugin_decision.reason}")
+        raise MessageExecutionDeferred(
+            f"auth_plugin deferred: {plugin_decision.reason}"
+        )
 
     admin_decision = deps.policy_decision_point.decide_admin(prep.policy_context)
     if admin_decision.allowed or admin_decision.skipped:
@@ -229,7 +231,7 @@ def apply_policy_precheck(
             deps.policy_skip_message(admin_decision.reason),
         )
     else:
-        raise PermissionExemption(f"auth_admin deferred: {admin_decision.reason}")
+        raise MessageExecutionDeferred(f"auth_admin deferred: {admin_decision.reason}")
 
     return flags
 
@@ -308,7 +310,7 @@ async def prepare_snapshot_stage(
         session=ctx.session,
     )
     if ctx.prep is None:
-        ctx.stop(allowed=True, effect="allow", reason="prepare_timeout_allow")
+        raise MessageExecutionDeferred("permission_snapshot_unavailable")
 
 
 async def policy_precheck_stage(
@@ -317,11 +319,10 @@ async def policy_precheck_stage(
 ) -> None:
     try:
         ctx.flags = apply_policy_precheck(ctx, deps)
-    except PermissionExemption as exc:
+    except MessageExecutionDeferred as exc:
         _recorder(ctx).set("policy_fallback", str(exc))
         if is_db_unhealthy():
-            ctx.stop(allowed=True, effect="allow", reason="db_unhealthy_cache_miss")
-            return
+            raise MessageExecutionDeferred("permission_database_unavailable") from exc
         ctx.prep = await deps.prepare_auth_state(
             module=ctx.module,
             context=ctx.event_context,
@@ -334,19 +335,8 @@ async def policy_precheck_stage(
             allow_cache_load=True,
         )
         if ctx.prep is None:
-            ctx.stop(allowed=True, effect="allow", reason="policy_fallback_timeout")
-            return
-        try:
-            ctx.flags = apply_policy_precheck(ctx, deps)
-        except PermissionExemption as fallback_exc:
-            _recorder(ctx).set("legacy_pure_auth", str(fallback_exc))
-            await deps.legacy_pure_auth_fallback(
-                prep=ctx.prep,
-                event=ctx.event,
-                session=ctx.session,
-                text=ctx.text,
-            )
-            ctx.flags = AuthPolicyFlags()
+            raise MessageExecutionDeferred("permission_fallback_unavailable")
+        ctx.flags = apply_policy_precheck(ctx, deps)
     flags = _require(ctx.flags, "flags")
     if flags.should_return_allowed:
         ctx.stop(allowed=True, effect="allow", reason="policy_precheck_allow")
@@ -440,6 +430,7 @@ async def decision_log_stage(
     if (
         ctx.auth_result_cache is not None
         and ctx.auth_allowed is not None
+        and ctx.decision_effect != "defer"
         and not has_deferred_commit
         and ctx.permission_revision == current_revision()
     ):

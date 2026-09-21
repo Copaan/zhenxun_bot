@@ -274,8 +274,12 @@ def decorate_archive_plugin(plugin):
         receipt = service.StoreReceiptStore.load().get(key, {})
         plugin.management_source = "local_archive"
         plugin.management_route = "/plugin?archives=1"
+        plugin.management_key = key
         plugin.archive_digest = receipt.get("archive_digest")
-        # The legacy list's uninstall button is wired to the catalog-only endpoint.
-        plugin.uninstall_supported = False
-        plugin.uninstall_reason = "请在外部归档管理中卸载"
+        if receipt.get("archive_digest") and receipt.get("runtime_module"):
+            plugin.uninstall_supported = True
+            plugin.uninstall_reason = None
+        else:
+            plugin.uninstall_supported = False
+            plugin.uninstall_reason = "归档安装记录不完整，请先在外部归档管理中核对"
     return plugin

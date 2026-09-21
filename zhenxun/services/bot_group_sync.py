@@ -20,6 +20,7 @@ class BotGroupSync:
         self.context = None
         self.connections = {}
         self.status = {}
+        self.final_logs = set()
 
     def start(self, context):
         self.context = context
@@ -33,14 +34,18 @@ class BotGroupSync:
             task.cancel()
         self.connections.clear()
         self.status.clear()
+        self.final_logs.clear()
 
     def connect(self, bot):
         if not self.context or not self.context.accepting:
             return
         key = PlatformUtils.get_storage_bot_id(bot)
         previous = self.connections.get(key)
+        if previous and previous[0] is bot:
+            return
         if previous:
             previous[1].cancel()
+        self.final_logs.discard(key)
         task = self.context.spawn_task(
             self._sync(bot, key), name="bot-group-sync", persistent=False
         )
@@ -53,6 +58,7 @@ class BotGroupSync:
             current[1].cancel()
             self.connections.pop(key, None)
             self.status.pop(key, None)
+            self.final_logs.discard(key)
 
     def _current(self, bot, key):
         current = self.connections.get(key)
@@ -67,6 +73,23 @@ class BotGroupSync:
     async def _sync(self, bot, key):
         started = time.monotonic()
         scope = PlatformUtils.get_platform_scope(bot)
+        if not self._current(bot, key):
+            return
+        if scope == "qq_api":
+            self.status[key] = {
+                "source": "uninfo",
+                "attempt": 1,
+                "code": "group_query_unsupported",
+            }
+            if key not in self.final_logs:
+                logger.info(
+                    "官方 QQ 未提供可用于群认证的群目录，保留已有群认证 | "
+                    f"bot={key} | scope={scope} | "
+                    "source=uninfo | attempt=1 | code=group_query_unsupported",
+                    "群认证同步",
+                )
+                self.final_logs.add(key)
+            return
         for attempt, offset in enumerate((0, 1, 4, 14, 44), 1):
             await asyncio.sleep(max(0, started + offset - time.monotonic()))
             if not self._current(bot, key):
@@ -147,11 +170,13 @@ class BotGroupSync:
                 return
             if code == "group_query_unsupported":
                 break
-        logger.info(
-            "群同步未取得数据，保留已有群认证 | source=uninfo | "
-            f"attempt={attempt} | code={code}",
-            "群认证同步",
-        )
+        if key not in self.final_logs:
+            logger.info(
+                "群同步未取得数据，保留已有群认证 | source=uninfo | "
+                f"bot={key} | scope={scope} | attempt={attempt} | code={code}",
+                "群认证同步",
+            )
+            self.final_logs.add(key)
 
 
 bot_group_sync = BotGroupSync()

@@ -89,6 +89,7 @@ class PluginInfo(BaseModel):
     homepage: str | None = None
     management_source: str = "manual"
     management_route: str | None = None
+    management_key: str | None = None
     archive_digest: str | None = None
     """插件id"""
     module: str

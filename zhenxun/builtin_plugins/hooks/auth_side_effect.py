@@ -86,6 +86,21 @@ class SideEffectCommit:
         default_factory=dict
     )
     committed: bool = False
+    _commit_attempted: bool = False
+
+    def __post_init__(self) -> None:
+        from zhenxun.services.message_execution import current_execution
+
+        if execution := current_execution.get():
+            execution.preconditions.append(self)
+
+    @property
+    def retry_safe(self) -> bool:
+        return not self._commit_attempted and all(
+            record.state == "released"
+            and callable(getattr(record.reservation, "release", None))
+            for record in self._reservations.values()
+        )
 
     @property
     def limit_should_auto_unblock(self) -> bool:
@@ -169,6 +184,7 @@ class SideEffectCommit:
         record = self._reservations.get(kind)
         if record is None or record.state != "reserved":
             return
+        self._commit_attempted = True
         try:
             await _commit_reservation(record.reservation)
         except Exception:

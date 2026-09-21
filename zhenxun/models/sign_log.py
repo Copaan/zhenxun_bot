@@ -1,3 +1,5 @@
+from typing import ClassVar
+
 from tortoise import fields
 
 from zhenxun.services.db_context import Model
@@ -20,3 +22,4 @@ class SignLog(Model):
     class Meta:  # pyright: ignore [reportIncompatibleVariableOverride]
         table = "sign_log"
         table_description = "用户签到记录表"
+        indexes: ClassVar = [("user_id", "create_time")]

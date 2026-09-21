@@ -16,6 +16,7 @@ from typing import Any
 
 from tortoise.connection import connections
 
+from zhenxun.services.message_execution import MessageExecutionDeferred
 from zhenxun.services.pipeline_metrics import pipeline_metrics
 
 Effect = Callable[[], Awaitable[Any]]
@@ -35,7 +36,11 @@ _stats = {
 }
 
 
-class CachePublicationError(RuntimeError):
+class CacheUnavailable(MessageExecutionDeferred):
+    """No authoritative value is available; this is not a cache miss."""
+
+
+class CachePublicationError(CacheUnavailable):
     pass
 
 
@@ -72,6 +77,9 @@ class WriteBatch:
     effects: dict[tuple, Effect] = field(default_factory=dict)
     committed: bool = False
     uncertain_invalidations: dict[tuple, Effect] = field(default_factory=dict)
+    connection: Any = None
+    original_commit: Any = None
+    original_rollback: Any = None
 
     def add(self, key: tuple, effect: Effect) -> None:
         _stats["queued"] += 1
@@ -128,6 +136,7 @@ def _observe_transaction_exit() -> None:
             @wraps(exit_method)
             async def exit_with_publication(context, *args):
                 token = _exiting.set(True)
+                batch = getattr(context.connection, "_zx_cache_batch", None)
                 try:
                     await exit_method(context, *args)
                 except BaseException:
@@ -136,7 +145,6 @@ def _observe_transaction_exit() -> None:
                     # release its connection when commit/rollback raises.
                     if connections.get(context.connection_name) is context.connection:
                         await _recover_transaction_context(context, pooled)
-                    batch = getattr(context.connection, "_zx_cache_batch", None)
                     if batch is not None:
                         for key in batch.effects:
                             _request_reconciliation(key)
@@ -151,14 +159,20 @@ def _observe_transaction_exit() -> None:
                             _stats["failed"] += 1
                     if batch is None:
                         _request_reconciliation()
+                    if batch is not None:
+                        _clear_connection_batch(batch)
                     raise
                 finally:
                     _exiting.reset(token)
-                batch = getattr(context.connection, "_zx_cache_batch", None)
                 if batch is not None and batch.committed:
                     # Publish after ORM connection reset/pool release, so reads
                     # cannot reuse a finalized transaction or deadlock its lock.
-                    await batch.flush()
+                    try:
+                        await batch.flush()
+                    finally:
+                        _clear_connection_batch(batch)
+                elif batch is not None:
+                    _clear_connection_batch(batch)
 
             exit_with_publication._zx_cache_exit = True
             return exit_with_publication
@@ -254,6 +268,22 @@ def _quarantine_connection_parent(parent):
     parent.acquire_connection = reject_acquisition
 
 
+def _clear_connection_batch(batch: WriteBatch) -> None:
+    """Restore a wrapped connection before it can return to a pool."""
+    connection = batch.connection
+    if connection is None:
+        return
+    try:
+        if batch.original_commit is not None:
+            connection.commit = batch.original_commit
+        if batch.original_rollback is not None:
+            connection.rollback = batch.original_rollback
+        if getattr(connection, "_zx_cache_batch", None) is batch:
+            delattr(connection, "_zx_cache_batch")
+    except Exception:
+        _stats["transaction_cleanup_failures"] += 1
+
+
 def current_connection():
     explicit = _connection.get()
     if explicit is not None:
@@ -277,6 +307,9 @@ def _transaction_batch(connection) -> WriteBatch | None:
     _observe_transaction_exit()
     batch = WriteBatch()
     original_commit, original_rollback = connection.commit, connection.rollback
+    batch.connection = connection
+    batch.original_commit = original_commit
+    batch.original_rollback = original_rollback
     client_timed = bool(getattr(connection, "_zx_pipeline_timing", False))
 
     async def commit():

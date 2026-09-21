@@ -13,6 +13,8 @@ from typing import Any
 import uuid
 
 from filelock import FileLock, Timeout
+from packaging.requirements import InvalidRequirement, Requirement
+from packaging.utils import canonicalize_name
 
 from zhenxun.services.plugin_store.plugin_archive_dependencies import (
     ArchiveDependencyConflict,
@@ -33,8 +35,14 @@ _TRANSACTION_LOCK = ROOT / ".transaction.lock"
 class ArchiveSourceBuildConflict(RuntimeError):
     code = "archive_source_build_transaction_conflict"
 
-    def __init__(self) -> None:
-        super().__init__(self.code)
+    def __init__(self, *, details: dict[str, Any] | None = None) -> None:
+        self.details = details or {}
+        message = self.code
+        if self.details:
+            import json
+
+            message = f"{self.code}: {json.dumps(self.details, sort_keys=True)}"
+        super().__init__(message)
 
 
 def _archive_wheels_only(transaction: dict[str, Any] | None) -> bool:
@@ -60,22 +68,124 @@ def _nonebot_pending() -> dict[str, Any] | None:
     return storage.pending_transaction() if storage.PENDING_FILE.exists() else None
 
 
+def _transaction_packages(
+    transaction: dict[str, Any] | None,
+) -> set[str]:
+    if not transaction:
+        return set()
+    names: set[str] = set()
+    operations = transaction.get("operations", [])
+    if not isinstance(operations, list):
+        operations = []
+    for operation in operations:
+        if not isinstance(operation, dict):
+            continue
+        packages = operation.get("dependency_packages")
+        if isinstance(packages, dict):
+            for name in packages:
+                names.add(canonicalize_name(str(name)))
+        roots = operation.get("dependency_inputs")
+        if roots is None:
+            manifest = operation.get("target_manifest") or {}
+            record = manifest.get("plugins", {}).get(
+                f"nonebot:{operation.get('project_link')}", {}
+            )
+            roots = record.get("resolution_inputs")
+        if isinstance(roots, list):
+            for raw in roots:
+                try:
+                    names.add(canonicalize_name(Requirement(str(raw)).name))
+                except (InvalidRequirement, TypeError, ValueError):
+                    continue
+    # Old transactions may not carry per-operation dependency evidence.
+    base = (transaction.get("base_manifest") or {}).get("packages", {})
+    target = (transaction.get("target_manifest") or {}).get("packages", {})
+    for name in set(base) | set(target):
+        if base.get(name) != target.get(name):
+            names.add(canonicalize_name(str(name)))
+    return names
+
+
+def _is_archive_transaction(transaction: dict[str, Any] | None) -> bool:
+    if not transaction:
+        return False
+    if _archive_wheels_only(transaction):
+        return True
+    operations = transaction.get("operations", [])
+    return any(
+        str(operation.get("store_key") or "").startswith("local_archive:")
+        or (operation.get("receipt") or {}).get("source") == "local_archive"
+        for operation in operations
+        if isinstance(operation, dict)
+    )
+
+
+def _archive_conflict_details(
+    contract: dict[str, Any], packages: set[str]
+) -> dict[str, Any]:
+    owners = contract.get("package_owners", {})
+    from zhenxun.services.nonebot_store.storage import load_manifest
+
+    return {
+        "packages": sorted(packages),
+        "archive_owners": sorted(
+            {owner for package in packages for owner in owners.get(package, [])}
+        ),
+        "source_build_packages": sorted(contract.get("source_build_packages", [])),
+        "source_revisions": sorted(contract.get("source_revisions", [])),
+        "versions": {
+            name: contract.get("packages", {}).get(name) for name in sorted(packages)
+        },
+        "active_generation": load_manifest().get("active_generation"),
+        "conflict_source": "shared_dependency_scope",
+    }
+
+
+def _relevant_archive_packages(
+    contract: dict[str, Any], transactions: tuple[dict[str, Any] | None, ...]
+) -> set[str]:
+    candidate_packages = set().union(
+        *(_transaction_packages(item) for item in transactions)
+    )
+    archive_packages = set(contract.get("packages", {}))
+    relevant_packages = candidate_packages & archive_packages
+    if (
+        any(_is_archive_transaction(item) for item in transactions)
+        and not relevant_packages
+    ):
+        relevant_packages = set(contract.get("source_build_packages", [])) | set(
+            contract.get("wheels_only_packages", [])
+        )
+    return relevant_packages
+
+
 def _validate_archive_build_policy(*transactions: dict[str, Any] | None) -> bool:
     from zhenxun.services.plugin_store.plugin_archive_dependencies import (
         archive_dependency_contract,
     )
 
     contract = archive_dependency_contract()
-    wheels_only = bool(contract["store_keys"]) or any(
-        _archive_wheels_only(item) for item in transactions
+    relevant_packages = _relevant_archive_packages(contract, transactions)
+    relevant = bool(relevant_packages)
+    wheels_only = relevant and (
+        bool(contract.get("store_keys"))
+        or any(_archive_wheels_only(item) for item in transactions)
     )
-    if contract.get("source_build_packages"):
+    related_source = relevant_packages & set(contract.get("source_build_packages", []))
+    if related_source:
         from zhenxun.services.installer_network import source_revision
 
-        if any(
-            revision != source_revision() for revision in contract["source_revisions"]
-        ):
-            raise ArchiveSourceBuildConflict()
+        revisions = {
+            revision
+            for package in related_source
+            for revision in contract.get("package_source_revisions", {}).get(
+                package, contract.get("source_revisions", [])
+            )
+        }
+        if any(revision != source_revision() for revision in revisions):
+            raise ArchiveSourceBuildConflict(
+                details=_archive_conflict_details(contract, relevant_packages)
+            )
         return False
     if wheels_only and any(_source_build_enabled(item) for item in transactions):
         approved = [
@@ -87,14 +197,18 @@ def _validate_archive_build_policy(*transactions: dict[str, Any] | None) -> bool
             and operation.get("source_build_confirmed") is True
         ]
         if not approved:
-            raise ArchiveSourceBuildConflict()
+            raise ArchiveSourceBuildConflict(
+                details=_archive_conflict_details(contract, relevant_packages)
+            )
         from zhenxun.services.installer_network import source_revision
 
         if any(
             operation["receipt"].get("dependency_source_revision") != source_revision()
             for operation in approved
         ):
-            raise ArchiveSourceBuildConflict()
+            raise ArchiveSourceBuildConflict(
+                details=_archive_conflict_details(contract, relevant_packages)
+            )
         # Legacy archive dependencies remain wheel-only individually; consent
         # for this operation does not grant build rights to their packages.
         return False
@@ -110,16 +224,19 @@ def archive_dependency_policy(transaction: dict[str, Any]) -> Iterator[None]:
     )
 
     with _locked_transaction():
-        if _validate_archive_build_policy(
-            _read_pending(), _nonebot_pending(), transaction
-        ):
+        pending = _read_pending()
+        nonebot_pending = _nonebot_pending()
+        policy_transactions = (pending, nonebot_pending, transaction)
+        if _validate_archive_build_policy(*policy_transactions):
             # Keep the constraint after source cancellation: the layer may still
             # contain dependencies already merged from that archive operation.
             transaction["archive_wheels_only"] = True
             transaction["source_build_confirmed"] = False
         else:
             contract = archive_dependency_contract()
-            if contract.get("source_build_packages"):
+            if contract.get("source_build_packages") and _relevant_archive_packages(
+                contract, policy_transactions
+            ):
                 transaction.pop("archive_wheels_only", None)
                 transaction["source_build_confirmed"] = True
                 transaction["archive_build_allowlist"] = contract[
@@ -359,6 +476,8 @@ def stage_operation(
                     {
                         "store_key": store_key,
                         "receipt": receipt,
+                        "dependency_inputs": dependency_inputs or [],
+                        "dependency_packages": dependency_packages or {},
                         "source_build_confirmed": source_build_confirmed,
                     }
                 ],

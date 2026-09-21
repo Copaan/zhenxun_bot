@@ -1,4 +1,5 @@
 import asyncio
+from typing import ClassVar
 from typing_extensions import Self
 
 from nonebot.adapters import Bot
@@ -46,6 +47,7 @@ class FgRequest(Model):
     class Meta:  # pyright: ignore [reportIncompatibleVariableOverride]
         table = "fg_request"
         table_description = "好友群组请求"
+        indexes: ClassVar = [("handle_type", "request_type"), ("bot_id", "handle_type")]
 
     @classmethod
     async def approve(cls, bot: Bot, id: int) -> Self:

@@ -9,8 +9,10 @@ from typing import Any, ClassVar, cast
 from nonebot.adapters import Bot
 from nonebot.adapters.onebot.v11 import Adapter as OneBotV11Adapter
 from nonebot.adapters.onebot.v11 import Bot as OneBotV11Bot
+from nonebot.adapters.onebot.v11.exception import ActionFailed
 
 from zhenxun.services.log import logger
+from zhenxun.services.message_execution import MessageExecutionDeferred
 
 _SEND_APIS = {"send_msg", "send_group_msg", "send_private_msg", "send_like"}
 _OBSERVED_SEND_APIS = {"send_msg", "send_group_msg", "send_private_msg"}
@@ -20,7 +22,7 @@ _QUEUE_MAXSIZE = 2000
 _SHUTDOWN_DRAIN_TIMEOUT_SECONDS = 3.0
 _QUEUE_PRESSURE_LOG_INTERVAL = 10.0
 _QUEUE: asyncio.Queue[
-    tuple[Bot, str, dict[str, Any], asyncio.Future[Any], str | None]
+    tuple[Bot, str, dict[str, Any], asyncio.Future[Any], str | None, "_SendAttempt"]
 ] = asyncio.Queue(maxsize=_QUEUE_MAXSIZE)
 _SEND_LOCK = asyncio.Lock()
 _LAST_SEND_TS = 0.0
@@ -38,6 +40,21 @@ _CURRENT_SEND_TRACE_ID: ContextVar[str | None] = ContextVar(
 )
 _MAX_OBSERVED_RECORDS_PER_TRACE = 12
 _MAX_OBSERVED_TEXT_LEN = 900
+
+
+class SendRejected(MessageExecutionDeferred):
+    """The adapter was not called; the caller must not report success."""
+
+
+@dataclass
+class _SendAttempt:
+    state: str = "queued"
+    future: asyncio.Future | None = None
+
+
+_CURRENT_ATTEMPT: ContextVar[_SendAttempt | None] = ContextVar(
+    "send_attempt", default=None
+)
 
 
 def send_queue_healthy(_value=None) -> bool:
@@ -166,9 +183,15 @@ async def _direct_call_api(
     api: str,
     data: dict[str, Any],
     trace_id: str | None = None,
+    attempt: _SendAttempt | None = None,
 ) -> Any:
     await _rate_limit()
     async with _API_SEMAPHORE:
+        if attempt is not None:
+            if attempt.future is not None and attempt.future.cancelled():
+                attempt.state = "not_sent"
+                return None
+            attempt.state = "submitted"
         try:
             result = await _invoke_adapter_api(
                 adapter,
@@ -176,7 +199,11 @@ async def _direct_call_api(
                 api,
                 **data,
             )
-        except Exception as exc:
+        except BaseException as exc:
+            if attempt is not None:
+                attempt.state = (
+                    "failed" if isinstance(exc, ActionFailed) else "reply_unconfirmed"
+                )
             SendObserver.record(
                 trace_id=trace_id,
                 api=api,
@@ -184,26 +211,32 @@ async def _direct_call_api(
                 result={"ok": False, "error": str(exc)},
             )
             raise
+        if attempt is not None:
+            attempt.state = "reply_delivered"
         SendObserver.record(trace_id=trace_id, api=api, data=data, result=result)
         return result
 
 
 async def _worker(worker_id: int):
     while True:
-        bot, api, data, future, trace_id = await _QUEUE.get()
+        bot, api, data, future, trace_id, attempt = await _QUEUE.get()
         try:
+            if future.cancelled():
+                attempt.state = "not_sent"
+                continue
             result = await _direct_call_api(
                 cast(OneBotV11Adapter, bot.adapter),
                 bot,
                 api,
                 data,
                 trace_id=trace_id,
+                attempt=attempt,
             )
             if not future.done():
                 future.set_result(result)
         except asyncio.CancelledError:
             if not future.done():
-                future.set_exception(RuntimeError("send queue worker cancelled"))
+                future.cancel("send_queue_worker_cancelled")
             raise
         except Exception as exc:
             if not future.done():
@@ -227,23 +260,32 @@ async def _queued_call_api(
     from .message_execution import current_execution, operation_key
 
     execution = current_execution.get()
-    if execution is None or api not in _OBSERVED_SEND_APIS:
+    if api not in _SEND_APIS or _send_platform_scope(adapter) != "qq_client":
         return await _queued_call_api_impl(adapter, bot, api, **data)
     identity = operation_key(f"reply:{api}", str(bot.self_id))
-    execution.deliveries[identity] = "sending"
+    attempt = _SendAttempt()
+    token = _CURRENT_ATTEMPT.set(attempt)
+    if execution is not None:
+        execution.deliveries[identity] = "queued"
     from .pipeline_metrics import pipeline_metrics
 
     started = time.monotonic()
     try:
         result = await _queued_call_api_impl(adapter, bot, api, **data)
+        return result
     except BaseException:
-        execution.deliveries[identity] = "reply_unconfirmed"
-        execution.errors.append("reply_unconfirmed")
+        if attempt.state == "queued":
+            attempt.state = "not_sent"
+        elif attempt.state == "submitted":
+            attempt.state = "reply_unconfirmed"
         raise
     finally:
+        if execution is not None:
+            execution.deliveries[identity] = attempt.state
+            if attempt.state != "reply_delivered":
+                execution.errors.append(attempt.state)
+        _CURRENT_ATTEMPT.reset(token)
         pipeline_metrics.observe("reply_wait_ms", time.monotonic() - started)
-    execution.deliveries[identity] = "reply_delivered"
-    return result
 
 
 async def _queued_call_api_impl(
@@ -257,35 +299,23 @@ async def _queued_call_api_impl(
     if api not in _SEND_APIS:
         return await _invoke_adapter_api(adapter, cast(OneBotV11Bot, bot), api, **data)
     if _STOPPING:
-        return await _direct_call_api(
-            adapter,
-            bot,
-            api,
-            data,
-            trace_id=_CURRENT_SEND_TRACE_ID.get(),
-        )
+        raise SendRejected("send_queue_stopping")
 
     loop = asyncio.get_running_loop()
     future: asyncio.Future[Any] = loop.create_future()
-    queue_item = (bot, api, data, future, _CURRENT_SEND_TRACE_ID.get())
+    attempt = _CURRENT_ATTEMPT.get() or _SendAttempt()
+    attempt.future = future
+    queue_item = (bot, api, data, future, _CURRENT_SEND_TRACE_ID.get(), attempt)
     try:
         _QUEUE.put_nowait(queue_item)
     except asyncio.QueueFull:
-        if api == "send_like":
-            global _SEND_LIKE_DROP_COUNT
-            _SEND_LIKE_DROP_COUNT += 1
-            _log_queue_pressure("send_like dropped because send queue is full")
-            return None
-        global _QUEUE_TIMEOUT_COUNT
+        global _QUEUE_TIMEOUT_COUNT, _SEND_LIKE_DROP_COUNT
         _QUEUE_TIMEOUT_COUNT += 1
-        _log_queue_pressure(f"{api} fallback to direct send because queue is full")
-        return await _direct_call_api(
-            adapter,
-            bot,
-            api,
-            data,
-            trace_id=_CURRENT_SEND_TRACE_ID.get(),
-        )
+        if api == "send_like":
+            _SEND_LIKE_DROP_COUNT += 1
+        _log_queue_pressure(f"{api} rejected because send queue is full")
+        attempt.state = "not_sent"
+        raise SendRejected("send_queue_full") from None
     return await future
 
 
@@ -293,11 +323,12 @@ def _drain_pending_futures(reason: str) -> int:
     drained = 0
     while True:
         try:
-            _, _, _, future, _ = _QUEUE.get_nowait()
+            _, _, _, future, _, attempt = _QUEUE.get_nowait()
         except asyncio.QueueEmpty:
             break
         if not future.done():
-            future.set_exception(RuntimeError(reason))
+            attempt.state = "not_sent"
+            future.set_exception(SendRejected(reason))
         _QUEUE.task_done()
         drained += 1
     return drained

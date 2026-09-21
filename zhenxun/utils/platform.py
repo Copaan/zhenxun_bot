@@ -3,6 +3,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 import random
 from typing import cast
 
+import httpx
 import nonebot
 from nonebot.adapters import Bot
 from nonebot.utils import is_coroutine_callable
@@ -16,7 +17,7 @@ from zhenxun.models.friend_user import FriendUser
 from zhenxun.models.group_console import GroupConsole
 from zhenxun.services.log import logger
 from zhenxun.services.network_proxy import ManagedAsyncClient
-from zhenxun.utils.exception import NotFindSuperuser
+from zhenxun.utils.exception import AllURIsFailedError, NotFindSuperuser
 from zhenxun.utils.http_utils import AsyncHttpx
 from zhenxun.utils.message import MessageUtils
 
@@ -426,7 +427,18 @@ class PlatformUtils:
                 url = f"http://q1.qlogo.cn/g?b=qq&nk={user_id}&s=640"
             else:
                 url = f"https://q.qlogo.cn/qqapp/{appid}/{user_id}/640"
-        return await AsyncHttpx.get_content(url) if url else None
+        if not url:
+            return None
+        try:
+            return await AsyncHttpx.get_content(url)
+        except (
+            httpx.HTTPError,
+            AllURIsFailedError,
+            TimeoutError,
+            asyncio.TimeoutError,
+        ):
+            logger.debug("头像暂不可用，使用展示占位", "Util", target=user_id)
+            return None
 
     @classmethod
     def get_user_avatar_url(
@@ -458,10 +470,12 @@ class PlatformUtils:
             async with ManagedAsyncClient() as client:
                 for _ in range(3):
                     try:
-                        return (await client.get(url)).content
-                    except Exception:
-                        logger.error(
-                            "获取群头像错误", "Util", target=gid, platform=platform
+                        response = await client.get(url)
+                        response.raise_for_status()
+                        return response.content
+                    except (httpx.HTTPError, TimeoutError, asyncio.TimeoutError):
+                        logger.debug(
+                            "群头像暂不可用", "Util", target=gid, platform=platform
                         )
         return None
 
@@ -485,6 +499,11 @@ class PlatformUtils:
         返回:
             Receipt | None: 是否发送成功
         """
+        from zhenxun.services.message_execution import current_execution
+
+        # Protocol-independent fence, including sends from custom auth hooks.
+        if execution := current_execution.get():
+            execution.retry_blocked = True
         send_message = (
             MessageUtils.build_message(message) if isinstance(message, str) else message
         )

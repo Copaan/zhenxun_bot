@@ -1,3 +1,5 @@
+import asyncio
+from functools import wraps
 import time
 
 from nonebot import get_driver
@@ -12,6 +14,11 @@ from nonebot_plugin_uninfo import Uninfo
 from zhenxun.services.cache.runtime_cache import is_cache_ready
 from zhenxun.services.log import logger
 from zhenxun.services.message_admission import connection_epochs
+from zhenxun.services.message_execution import (
+    MessageExecutionDeferred,
+    current_execution,
+    defer_execution,
+)
 from zhenxun.services.message_load import is_overloaded, mark_activity
 from zhenxun.services.runtime_bootstrap import register_runtime_bootstrap
 from zhenxun.utils.manager.priority_manager import PriorityLifecycle
@@ -110,7 +117,22 @@ def _enforce_platform_contract(
         raise IgnoredException("plugin platform capability unavailable")
 
 
+def _defer_unavailable(function):
+    @wraps(function)
+    async def wrapped(*args, **kwargs):
+        try:
+            return await function(*args, **kwargs)
+        except (MessageExecutionDeferred, TimeoutError, asyncio.TimeoutError) as error:
+            reason = str(error) or "permission_dependency_timeout"
+            defer_execution(reason)
+            logger.debug(reason, LOGGER_COMMAND)
+            raise IgnoredException("permission_deferred") from None
+
+    return wrapped
+
+
 @event_preprocessor
+@_defer_unavailable
 async def _drop_message_before_cache_ready(event: Event, bot: Bot):
     mark_activity()
     if is_cache_ready():
@@ -136,6 +158,7 @@ async def _drop_message_before_cache_ready(event: Event, bot: Bot):
     if event.get_type() != "message":
         return
     if not is_cache_ready():
+        defer_execution("cache_starting")
         raise IgnoredException("cache not ready ignore")
     from zhenxun.services.message_execution import current_execution
     from zhenxun.utils.platform import PlatformUtils
@@ -147,6 +170,7 @@ async def _drop_message_before_cache_ready(event: Event, bot: Bot):
 
 
 @run_preprocessor
+@_defer_unavailable
 async def _auth_preprocessor(
     matcher: Matcher,
     event: Event,
@@ -156,7 +180,11 @@ async def _auth_preprocessor(
     message: UniMsg | None = None,
 ):
     if event.get_type() == "message" and not is_cache_ready():
+        defer_execution("cache_starting")
         raise IgnoredException("cache not ready ignore")
+    if execution := current_execution.get():
+        if execution.deferred_reason:
+            raise IgnoredException("message_deferred")
 
     if not adapter_contract_matches(matcher_supported_adapters(matcher), bot.adapter):
         raise IgnoredException("plugin adapter unsupported")
@@ -207,6 +235,8 @@ async def _auth_preprocessor(
             state=state,
         )
     except IgnoredException:
+        raise
+    except (MessageExecutionDeferred, TimeoutError, asyncio.TimeoutError):
         raise
     except Exception as exc:
         logger.error("auth check failed", LOGGER_COMMAND, e=exc)

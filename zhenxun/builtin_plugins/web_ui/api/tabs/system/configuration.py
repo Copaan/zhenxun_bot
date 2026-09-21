@@ -45,7 +45,7 @@ from ....apply_result import (
     update_pending_restart,
 )
 from ....base_model import Result
-from ....config_schema import inferred_schema, schema_for_type
+from ....config_schema import configuration_value, inferred_schema, schema_for_type
 from ....config_validation import (
     ConfigurationValidationError,
     validate_dotenv,
@@ -182,6 +182,24 @@ def _schema_for_type(value_type: Any) -> dict[str, Any]:
     return schema_for_type(value_type)
 
 
+def _model_field_descriptors(model: type[BaseModel]) -> dict[str, dict[str, Any]]:
+    fields = getattr(model, "model_fields", None) or getattr(model, "__fields__", {})
+    result = {}
+    for name, field in fields.items():
+        annotation = getattr(field, "outer_type_", None) or getattr(
+            field, "annotation", Any
+        )
+        schema = _schema_for_type(annotation)
+        default = getattr(field, "default", None)
+        if default is not None and "default" not in schema:
+            try:
+                schema["default"] = configuration_value(default)
+            except (TypeError, ValueError):
+                pass
+        result[str(name)] = schema
+    return result
+
+
 def _registered_groups() -> list[dict[str, Any]]:
     groups = []
     for module, group in Config.get_data().items():
@@ -198,12 +216,12 @@ def _registered_groups() -> list[dict[str, Any]]:
                     "help": config.help or "",
                     "type": type_name,
                     "type_inner": type_inner,
-                    "value": None if sensitive else jsonable_encoder(config.value),
+                    "value": None if sensitive else configuration_value(config.value),
                     "effective_value": None
                     if sensitive
-                    else jsonable_encoder(config.value),
+                    else configuration_value(config.value),
                     "default_value": (
-                        None if sensitive else jsonable_encoder(config.default_value)
+                        None if sensitive else configuration_value(config.default_value)
                     ),
                     "sensitive": sensitive,
                     "has_value": bool(config.value) if sensitive else None,
@@ -256,15 +274,15 @@ def _registered_groups() -> list[dict[str, Any]]:
                     descriptor = existing[str(key).upper()]
                     descriptor["configured"] = True
                     if not descriptor["sensitive"]:
-                        descriptor["file_value"] = jsonable_encoder(value)
-                        descriptor["value"] = jsonable_encoder(value)
+                        descriptor["file_value"] = configuration_value(value)
+                        descriptor["value"] = configuration_value(value)
                     continue
                 group["fields"].append(
                     {
                         "key": str(key),
                         "help": "未注册配置，保存后需确认对应插件已加载。",
                         "type": type(value).__name__,
-                        "value": jsonable_encoder(value),
+                        "value": configuration_value(value),
                         "default_value": None,
                         "schema": inferred_schema(value),
                         "ui": {},
@@ -310,11 +328,19 @@ def _environment_fields(values: dict[str, Any]) -> dict[str, dict[str, Any]]:
     schemas = {}
     declarations = {}
     conflicts = {}
+    schema_errors = {}
     for model in _environment_models():
-        root = model_json_schema(model)
+        source = f"{model.__module__}.{model.__name__}"
+        try:
+            root = model_json_schema(model)
+        except Exception as error:
+            root = {
+                "properties": _model_field_descriptors(model),
+                "x-schema-error": type(error).__name__,
+            }
+            schema_errors[source] = type(error).__name__
         for name, schema in root.get("properties", {}).items():
             key = name.upper()
-            source = f"{model.__module__}.{model.__name__}"
             declarations.setdefault(key, []).append(source)
             # Ignore presentation/default differences; retain definitions when
             # comparing referenced types so equal names cannot hide conflicts.
@@ -366,6 +392,16 @@ def _environment_fields(values: dict[str, Any]) -> dict[str, dict[str, Any]]:
             "key": key,
             "schema": schema,
             "schema_sources": declarations.get(key, []),
+            "schema_errors": [
+                schema_errors[source]
+                for source in declarations.get(key, [])
+                if source in schema_errors
+            ],
+            "schema_notice": (
+                "字段类型声明无法完整生成，保存时由后端校验。"
+                if any(source in schema_errors for source in declarations.get(key, []))
+                else None
+            ),
             "readonly_reason": (
                 "字段类型声明冲突：" + "、".join(declarations[key])
                 if key in conflicts
@@ -375,7 +411,7 @@ def _environment_fields(values: dict[str, Any]) -> dict[str, dict[str, Any]]:
             "value": None if secret else jsonable_encoder(parsed),
             "default_value": None if secret else default,
             "configured": key in values,
-            "effective_value": None if secret else jsonable_encoder(effective),
+            "effective_value": None if secret else configuration_value(effective),
             "overridden": key in os.environ,
             "apply_effect": environment_effect(key),
         }

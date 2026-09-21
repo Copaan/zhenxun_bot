@@ -149,6 +149,13 @@ class MessageStore:
                     ON deliveries(state, created, id);
             """)
             columns = {row[1] for row in db.execute("PRAGMA table_info(inbox)")}
+            for name, definition in (
+                ("retry_count", "INTEGER NOT NULL DEFAULT 0"),
+                ("retry_at", "REAL NOT NULL DEFAULT 0"),
+                ("deferred_at", "REAL"),
+            ):
+                if name not in columns:
+                    db.execute(f"ALTER TABLE inbox ADD COLUMN {name} {definition}")
             delivery_columns = {
                 row[1] for row in db.execute("PRAGMA table_info(deliveries)")
             }
@@ -415,13 +422,14 @@ class MessageStore:
             marks = ",".join("?" for _ in bots)
             rows = db.execute(
                 f"SELECT i.* FROM inbox i WHERE state='pending' AND bot IN ({marks}) "
+                "AND (retry_at<=? OR received<=? OR generation!=?) "
                 "AND NOT EXISTS(SELECT 1 FROM inbox running WHERE "
                 "running.conversation=i.conversation AND running.state='executing') "
                 "AND NOT EXISTS(SELECT 1 FROM inbox earlier WHERE "
                 "earlier.conversation=i.conversation AND earlier.state='pending' "
                 "AND earlier.sequence<i.sequence) "
                 "ORDER BY sequence LIMIT ?",
-                (*bots, limit),
+                (*bots, now, now - ttl, generation, limit),
             ).fetchall()
             claimed = []
             for row in rows:
@@ -430,6 +438,8 @@ class MessageStore:
                     reason = "plugin_generation_changed"
                 elif now - row["received"] >= ttl:
                     reason = "waiting_expired"
+                elif row["deferred_at"] is not None and now - row["deferred_at"] >= 30:
+                    reason = "recovery_window_expired"
                 state = "held" if reason else "executing"
                 db.execute(
                     "UPDATE inbox SET state=?,reason=?,updated=?,revision=revision+1 "
@@ -448,6 +458,48 @@ class MessageStore:
                 item["payload"] = json.loads(item["payload"])
                 claimed.append(item)
             return claimed
+
+    def defer(self, identity, reason, result=None, ttl=300):
+        """Reschedule only an execution whose caller proved replay is safe."""
+        now = time.time()
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT * FROM inbox WHERE id=? AND state='executing'", (identity,)
+            ).fetchone()
+            if row is None:
+                return False
+            first = row["deferred_at"] if row["deferred_at"] is not None else now
+            delays = (1, 3, 10)
+            count = row["retry_count"]
+            deadline = min(first + 30, row["received"] + ttl)
+            if count >= len(delays) or now + delays[count] >= deadline:
+                db.execute(
+                    "UPDATE inbox SET state='held',reason=?,result=?,updated=?,"
+                    "revision=revision+1 WHERE id=?",
+                    (
+                        "recovery_exhausted:" + reason,
+                        json.dumps(result or {}),
+                        now,
+                        identity,
+                    ),
+                )
+                self.count(db, "terminal_held")
+                return False
+            db.execute(
+                "UPDATE inbox SET state='pending',reason=?,result=?,retry_count=?,"
+                "retry_at=?,deferred_at=?,updated=?,revision=revision+1 WHERE id=?",
+                (
+                    reason,
+                    json.dumps(result or {}),
+                    count + 1,
+                    now + delays[count],
+                    first,
+                    now,
+                    identity,
+                ),
+            )
+            self.count(db, "deferred")
+            return True
 
     def finish(self, identity, state, reason="", result=None):
         if state not in {"completed", "failed", "unresolved", "held"}:
@@ -481,7 +533,7 @@ class MessageStore:
             rows = db.execute(
                 "SELECT "
                 "sequence,id,bot,adapter,revision,received,updated,state,reason,"
-                "result,history_state,payload "
+                "result,history_state,payload,retry_count,retry_at,deferred_at "
                 "FROM inbox WHERE sequence>? "
                 + ("AND state=? " if state else "")
                 + "ORDER BY sequence LIMIT ?",

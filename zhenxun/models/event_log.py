@@ -1,3 +1,5 @@
+from typing import ClassVar
+
 from tortoise import fields
 
 from zhenxun.services.db_context import Model
@@ -19,3 +21,4 @@ class EventLog(Model):
     class Meta:  # pyright: ignore [reportIncompatibleVariableOverride]
         table = "event_log"
         table_description = "各种请求通知记录表"
+        indexes: ClassVar = [("group_id", "event_type", "create_time")]

@@ -1,3 +1,5 @@
+from typing import ClassVar
+
 from tortoise import fields
 
 from zhenxun.services.db_context import Model
@@ -29,3 +31,7 @@ class MahiroBankLog(Model):
     class Meta:  # pyright: ignore [reportIncompatibleVariableOverride]
         table = "mahiro_bank_log"
         table_description = "小真寻银行日志"
+        indexes: ClassVar = [
+            ("user_id", "is_completed", "create_time"),
+            ("user_id", "create_time"),
+        ]

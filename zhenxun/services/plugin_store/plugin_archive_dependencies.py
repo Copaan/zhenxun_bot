@@ -91,6 +91,9 @@ def archive_dependency_contract() -> dict[str, Any]:
     wheels_only_packages: set[str] = set()
     source_build_packages: set[str] = set()
     source_revisions: set[str] = set()
+    package_owners: dict[str, list[str]] = {}
+    source_build_owners: dict[str, list[str]] = {}
+    package_source_revisions: dict[str, list[str]] = {}
     legacy_receipts: list[str] = []
     resolved_records: list[str] = []
     current_fingerprint = archive_environment_fingerprint()
@@ -161,6 +164,7 @@ def archive_dependency_contract() -> dict[str, Any]:
                     }
                 )
             local_pins[name] = version
+            package_owners.setdefault(name, []).append(key)
             if receipt.get("dependency_source_build") is not True:
                 wheels_only_packages.add(name)
             else:
@@ -174,7 +178,9 @@ def archive_dependency_contract() -> dict[str, Any]:
                         },
                     )
                 source_revisions.add(revision)
+                package_source_revisions.setdefault(name, []).append(revision)
                 source_build_packages.add(name)
+                source_build_owners.setdefault(name, []).append(key)
         # One receipt cannot borrow missing evidence from another archive.
         for requirement in parsed:
             if requirement.marker and not requirement.marker.evaluate():
@@ -218,6 +224,16 @@ def archive_dependency_contract() -> dict[str, Any]:
         "wheels_only_packages": sorted(wheels_only_packages),
         "source_build_packages": sorted(source_build_packages),
         "source_revisions": sorted(source_revisions),
+        "package_source_revisions": {
+            name: sorted(set(revisions))
+            for name, revisions in package_source_revisions.items()
+        },
+        "package_owners": {
+            name: sorted(set(owners)) for name, owners in package_owners.items()
+        },
+        "source_build_owners": {
+            name: sorted(set(owners)) for name, owners in source_build_owners.items()
+        },
         "legacy_receipts": sorted(set(legacy_receipts)),
         "resolved_records": sorted(set(resolved_records)),
         "requires_wheels": bool(wheels_only_packages),

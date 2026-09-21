@@ -14,6 +14,8 @@ _KEYS = (
     "admin_levels",
     "admin_cache_ready",
     "ban_state",
+    "plugin_auth_profiles",
+    "module_limits",
     "module_limits_ready",
     "module_limit_entries",
 )

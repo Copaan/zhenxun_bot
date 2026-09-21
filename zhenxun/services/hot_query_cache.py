@@ -9,11 +9,12 @@ from datetime import datetime
 from functools import wraps
 from typing import Any, Literal, TypeVar
 
+from tortoise.exceptions import DBConnectionError, OperationalError
 from tortoise.functions import Count
 
 from zhenxun.services.cache.bounded_ttl import BoundedTTLCache
 from zhenxun.services.cache.keyed import KeyedLocks
-from zhenxun.services.cache.write import in_write_transaction
+from zhenxun.services.cache.write import CacheUnavailable, in_write_transaction
 from zhenxun.services.db_context import with_db_timeout
 from zhenxun.services.message_load import is_db_unhealthy
 
@@ -171,12 +172,11 @@ _MEMBER_DB_TIMEOUT = 2.0
 _AGGREGATE_DB_TIMEOUT = 3.0
 
 
-async def _read_or_default(
+async def _read_authoritative(
     coro,
     *,
     timeout: float,
     operation: str,
-    default,
 ):
     try:
         return await with_db_timeout(
@@ -185,12 +185,17 @@ async def _read_or_default(
             operation=operation,
             source="hot_query_cache",
         )
-    except (TimeoutError, asyncio.TimeoutError):
+    except (
+        TimeoutError,
+        asyncio.TimeoutError,
+        DBConnectionError,
+        OperationalError,
+    ) as error:
         attempt = _attempt.get()
         if attempt is not None:
             attempt.failed = True
         _diagnostics["query_failures"] += 1
-        return default
+        raise CacheUnavailable(f"query_unavailable:{operation}") from error
 
 
 def _get_lock(pool, key):
@@ -231,8 +236,8 @@ async def get_group_members(
         from zhenxun.models.group_member_info import GroupInfoUser
 
         if is_db_unhealthy():
-            return ()
-        rows = await _read_or_default(
+            raise CacheUnavailable("hot_query_database_unavailable")
+        rows = await _read_authoritative(
             GroupInfoUser.filter(group_id=group_key).values_list(
                 "id",
                 "user_id",
@@ -243,7 +248,6 @@ async def get_group_members(
             ),
             timeout=_MEMBER_DB_TIMEOUT,
             operation="hot_query_cache.get_group_members",
-            default=(),
         )
         members = tuple(
             GroupMemberSnapshot(
@@ -258,6 +262,11 @@ async def get_group_members(
             for row in rows
             if row[1]
         )
+        for member in members:
+            if member.user_name:
+                await _DISPLAY_NAME_CACHE.set(
+                    (group_key, member.user_id), member.user_name
+                )
         await _GROUP_MEMBER_CACHE.set(group_key, members)
         await _GROUP_USER_IDS_CACHE.set(
             group_key, tuple(member.user_id for member in members)
@@ -305,8 +314,8 @@ async def get_group_member_map(
         from zhenxun.models.group_member_info import GroupInfoUser
 
         if is_db_unhealthy():
-            return result
-        rows = await _read_or_default(
+            raise CacheUnavailable("hot_query_database_unavailable")
+        rows = await _read_authoritative(
             GroupInfoUser.filter(group_id=group_key, user_id__in=missing).values_list(
                 "id",
                 "user_id",
@@ -317,7 +326,6 @@ async def get_group_member_map(
             ),
             timeout=_MEMBER_DB_TIMEOUT,
             operation="hot_query_cache.get_group_member_map",
-            default=(),
         )
         found: set[str] = set()
         for row in rows:
@@ -332,6 +340,10 @@ async def get_group_member_map(
                 uid=int(row[4]) if row[4] is not None else None,
                 platform=str(row[5]) if row[5] else None,
             )
+            if member.user_name:
+                await _DISPLAY_NAME_CACHE.set(
+                    (group_key, member.user_id), member.user_name
+                )
             result[member.user_id] = member
             found.add(member.user_id)
             await _GROUP_MEMBER_BY_ID_CACHE.set(
@@ -378,12 +390,11 @@ async def get_group_user_ids(group_id: str | int | None) -> set[str]:
         from zhenxun.models.group_member_info import GroupInfoUser
 
         if is_db_unhealthy():
-            return set()
-        rows = await _read_or_default(
+            raise CacheUnavailable("hot_query_database_unavailable")
+        rows = await _read_authoritative(
             GroupInfoUser.filter(group_id=group_key).values_list("user_id", flat=True),
             timeout=_MEMBER_DB_TIMEOUT,
             operation="hot_query_cache.get_group_user_ids",
-            default=(),
         )
         user_ids = tuple(str(user_id) for user_id in rows if user_id)
         await _GROUP_USER_IDS_CACHE.set(group_key, user_ids)
@@ -409,12 +420,11 @@ async def get_user_group_ids(user_id: str | int | None) -> list[str]:
         from zhenxun.models.group_member_info import GroupInfoUser
 
         if is_db_unhealthy():
-            return []
-        rows = await _read_or_default(
+            raise CacheUnavailable("hot_query_database_unavailable")
+        rows = await _read_authoritative(
             GroupInfoUser.filter(user_id=user_key).values_list("group_id", flat=True),
             timeout=_MEMBER_DB_TIMEOUT,
             operation="hot_query_cache.get_user_group_ids",
-            default=(),
         )
         group_ids = tuple(str(group_id) for group_id in rows if group_id)
         await _USER_GROUP_CACHE.set(user_key, group_ids)
@@ -422,7 +432,7 @@ async def get_user_group_ids(user_id: str | int | None) -> list[str]:
 
 
 @guarded_read
-async def get_member_names(
+async def _load_member_names(
     user_ids: Iterable[object],
     group_id: str | int | None = None,
 ) -> dict[str, str]:
@@ -446,14 +456,13 @@ async def get_member_names(
         from zhenxun.models.group_member_info import GroupInfoUser
 
         if is_db_unhealthy():
-            return result
-        rows = await _read_or_default(
+            raise CacheUnavailable("hot_query_database_unavailable")
+        rows = await _read_authoritative(
             GroupInfoUser.filter(user_id__in=missing).values_list(
                 "user_id", "user_name"
             ),
             timeout=_MEMBER_DB_TIMEOUT,
             operation="hot_query_cache.get_member_names",
-            default=(),
         )
         for user_id, user_name in rows:
             user_key = str(user_id)
@@ -461,7 +470,29 @@ async def get_member_names(
                 result[user_key] = str(user_name or "")
         for user_id in missing:
             await _USER_NAME_CACHE.set(user_id, result.get(user_id, ""))
+            if result.get(user_id):
+                await _DISPLAY_NAME_CACHE.set(("", user_id), result[user_id])
     return result
+
+
+# Display-only strings; never store roles, identity mappings or complete sessions.
+_DISPLAY_NAME_CACHE = HotCache[tuple[str, str], str](
+    "hot_display_names", ttl_seconds=90, max_items=20000
+)
+
+
+@guarded_read
+async def get_member_names(
+    user_ids: Iterable[object],
+    group_id: str | int | None = None,
+) -> dict[str, str]:
+    keys = _normalize_ids(user_ids) or ()
+    scope = _normalize_id(group_id)
+    try:
+        names = await _load_member_names(keys, group_id)
+    except CacheUnavailable:
+        return {key: await _DISPLAY_NAME_CACHE.get((scope, key)) or key for key in keys}
+    return {key: names.get(key) or key for key in keys}
 
 
 @guarded_read
@@ -481,6 +512,7 @@ async def invalidate_group_members(
 ) -> None:
     global _revision
     _revision += 1
+    await _DISPLAY_NAME_CACHE.clear()
 
     if group_id is None:
         await _GROUP_MEMBER_CACHE.clear()
@@ -501,6 +533,7 @@ async def invalidate_group_members(
 def mark_members_stale() -> None:
     global _revision
     _revision += 1
+    _DISPLAY_NAME_CACHE._publication_failed = True
     for cache in (
         _GROUP_MEMBER_CACHE,
         _GROUP_USER_IDS_CACHE,
@@ -514,6 +547,7 @@ def mark_members_stale() -> None:
 async def invalidate_member_names(user_ids: Iterable[object] | None = None) -> None:
     global _revision
     _revision += 1
+    await _DISPLAY_NAME_CACHE.clear()
 
     if user_ids is None:
         await _USER_NAME_CACHE.clear()
@@ -555,7 +589,7 @@ async def get_chat_history_rank_cached(
             return list(cached)
 
         if is_db_unhealthy():
-            return []
+            raise CacheUnavailable("hot_query_database_unavailable")
         order_prefix = "-" if order == "DESC" else ""
         query: Any = model.filter(group_id=gid) if gid else model
         if date_scope:
@@ -564,7 +598,7 @@ async def get_chat_history_rank_cached(
                 date_scope[1].isoformat(" "),
             )
             query = query.filter(create_time__range=filter_scope)
-        rows = await _read_or_default(
+        rows = await _read_authoritative(
             query.annotate(count=Count("user_id"))
             .order_by(f"{order_prefix}count")
             .group_by("user_id")
@@ -572,7 +606,6 @@ async def get_chat_history_rank_cached(
             .values_list("user_id", "count"),
             timeout=_AGGREGATE_DB_TIMEOUT,
             operation="hot_query_cache.get_chat_history_rank",
-            default=(),
         )
         result = tuple((str(user_id), int(count)) for user_id, count in rows)
         await _CHAT_RANK_CACHE.set(key, result)
@@ -596,13 +629,12 @@ async def get_chat_history_first_msg_datetime_cached(
             return cached[0]
 
         if is_db_unhealthy():
-            return None
+            raise CacheUnavailable("hot_query_database_unavailable")
         query: Any = model.filter(group_id=group_id) if group_id else model.all()
-        message = await _read_or_default(
+        message = await _read_authoritative(
             query.order_by("create_time").first(),
             timeout=_AGGREGATE_DB_TIMEOUT,
             operation="hot_query_cache.get_chat_history_first_msg",
-            default=None,
         )
         result = getattr(message, "create_time", None) if message else None
         await _CHAT_FIRST_MSG_CACHE.set(key, (result,))
@@ -633,7 +665,7 @@ async def get_statistics_plugin_counts_cached(
             return list(cached)
 
         if is_db_unhealthy():
-            return []
+            raise CacheUnavailable("hot_query_database_unavailable")
         from zhenxun.models.statistics import Statistics
 
         query: Any = Statistics
@@ -647,13 +679,12 @@ async def get_statistics_plugin_counts_cached(
             query = query.filter(plugin_name=plugin_name)
         if start_time:
             query = query.filter(create_time__gte=start_time)
-        rows = await _read_or_default(
+        rows = await _read_authoritative(
             query.annotate(count=Count("id"))
             .group_by("plugin_name")
             .values_list("plugin_name", "count"),
             timeout=_AGGREGATE_DB_TIMEOUT,
             operation="hot_query_cache.get_statistics_plugin_counts",
-            default=(),
         )
         result = tuple((str(plugin), int(count)) for plugin, count in rows)
         await _STATISTICS_COUNT_CACHE.set(key, result)

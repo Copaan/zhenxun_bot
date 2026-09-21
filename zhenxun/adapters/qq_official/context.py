@@ -23,6 +23,7 @@ from nonebot.adapters.qq.event import (
 )
 from tortoise.exceptions import IntegrityError
 
+from zhenxun.services.message_execution import MessageExecutionDeferred
 from zhenxun.services.platform_identity import CURRENT_PLATFORM_SCOPE
 
 from .cache import (
@@ -379,6 +380,10 @@ class OfficialReplyUnavailable(RuntimeError):
     pass
 
 
+class OfficialReplyExpired(OfficialReplyUnavailable, MessageExecutionDeferred):
+    """The passive reply capability expired; no protocol request was sent."""
+
+
 async def allocate_reply_sequence(
     context: OfficialQQEventContext,
 ) -> tuple[ReplyState, int]:
@@ -388,7 +393,7 @@ async def allocate_reply_sequence(
         raise OfficialReplyUnavailable("Guild replies use channel/DM APIs")
     now = datetime.now(timezone.utc)
     if now >= context.reply_deadline:
-        raise OfficialReplyUnavailable("QQ passive reply window expired")
+        raise OfficialReplyExpired("QQ passive reply window expired")
     key = (
         context.app_id,
         context.scene,
@@ -406,7 +411,7 @@ async def allocate_reply_sequence(
                 await REPLY_STATE_CACHE.set(key, state)
     async with state.lock:
         if datetime.now(timezone.utc) >= state.deadline:
-            raise OfficialReplyUnavailable("QQ passive reply window expired")
+            raise OfficialReplyExpired("QQ passive reply window expired")
         if state.successful + state.in_flight >= state.max_successful:
             raise OfficialReplyUnavailable("QQ passive reply limit reached")
         sequence = state.next_sequence
@@ -443,6 +448,7 @@ async def invalidate_principal(principal_id: UUID) -> None:
 
 __all__ = [
     "OfficialQQEventContext",
+    "OfficialReplyExpired",
     "OfficialReplyUnavailable",
     "activate_event_official_context",
     "allocate_reply_sequence",

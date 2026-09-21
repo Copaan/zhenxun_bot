@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 import inspect
@@ -64,6 +65,7 @@ LIMIT_MEM_REFRESH_INTERVAL = 900  # 15分钟
 LIMIT_MEM_NEGATIVE_TTL = 30
 RUNTIME_CACHE_SYNC_ENABLED = True
 RUNTIME_CACHE_SYNC_CHANNEL = "ZHENXUN_RUNTIME_CACHE_SYNC"
+RUNTIME_CACHE_REVISION_PREFIX = f"{RUNTIME_CACHE_SYNC_CHANNEL}:REVISION"
 RUNTIME_CACHE_LOAD_RETRY_SECONDS = 1.0
 RUNTIME_CACHE_STARTUP_REFRESH_SKIP_SECONDS = 5.0
 RUNTIME_CACHE_DB_TIMEOUT_SECONDS = 3.0
@@ -610,6 +612,10 @@ class RuntimeCacheSync:
     _publish_tasks: ClassVar[set[asyncio.Task]] = set()
     _ready: ClassVar[bool] = False
     _channel: ClassVar[str] = ""
+    _publish_lock: ClassVar[asyncio.Lock] = asyncio.Lock()
+    _last_revision: ClassVar[dict[str, int]] = {}
+    _local_mutation: ClassVar[dict[str, int]] = {}
+    _revision_reconcile: ClassVar[set[str]] = set()
 
     @classmethod
     def _sync_enabled(cls) -> bool:
@@ -647,6 +653,32 @@ class RuntimeCacheSync:
             if cls._pubsub is None:
                 return
             await cls._pubsub.subscribe(cls._channel)
+            # Seed the watermark before consuming deltas. A worker joining an
+            # active cluster must not mistake its first event for full history.
+            for cache_type in (
+                "bot",
+                "group",
+                "ban",
+                "level",
+                "task",
+                "plugin_limit",
+                "plugin",
+                "permission",
+            ):
+                try:
+                    value = await cls._redis.get(
+                        f"{RUNTIME_CACHE_REVISION_PREFIX}:{cache_type}"
+                    )
+                except Exception as error:
+                    logger.warning(
+                        f"runtime cache revision seed failed: {cache_type}",
+                        LOG_COMMAND,
+                        e=error,
+                    )
+                    continue
+                if value is not None:
+                    with suppress(TypeError, ValueError):
+                        cls._last_revision[cache_type] = int(value)
             cls._task = _spawn_runtime_task(
                 cls._listen_loop(), name="runtime-cache-sync"
             )
@@ -687,31 +719,122 @@ class RuntimeCacheSync:
         except Exception:
             pass
         cls._redis = None
+        cls._last_revision.clear()
+        cls._local_mutation.clear()
+        cls._revision_reconcile.clear()
+
+    @classmethod
+    def refresh_revision(cls, cache_type: str) -> tuple[int | None, int]:
+        return cls._last_revision.get(cache_type), cls._local_mutation.get(
+            cache_type, 0
+        )
+
+    @classmethod
+    def note_local_mutation(cls, cache_type: str) -> None:
+        cls._local_mutation[cache_type] = cls._local_mutation.get(cache_type, 0) + 1
+
+    @classmethod
+    def refresh_is_stable(
+        cls, cache_type: str, revision: tuple[int | None, int]
+    ) -> bool:
+        """Finish a DB refresh only if no cache mutation arrived during it."""
+        current = cls.refresh_revision(cache_type)
+        if revision != current:
+            cls._revision_reconcile.add(cache_type)
+            return False
+        cls._revision_reconcile.discard(cache_type)
+        return True
 
     @classmethod
     def publish_event(cls, cache_type: str, action: str, data: dict[str, Any]) -> None:
         if not cls._ready:
             return
-        payload = {
-            "source": INSTANCE_ID,
-            "type": cache_type,
-            "action": action,
-            "data": data,
-        }
         task = _spawn_runtime_task(
-            cls._publish(payload), name="runtime-cache-publish", persistent=False
+            cls._publish(cache_type, action, data),
+            name="runtime-cache-publish",
+            persistent=False,
         )
         cls._publish_tasks.add(task)
         task.add_done_callback(cls._publish_tasks.discard)
 
     @classmethod
-    async def _publish(cls, payload: dict[str, Any]) -> None:
+    async def _publish(cls, cache_type: str, action: str, data: dict[str, Any]) -> None:
         if not cls._ready or cls._redis is None:
             return
         try:
-            await cls._redis.publish(cls._channel, json.dumps(payload))
+            # Redis Pub/Sub is unordered across concurrent publish tasks. Keep
+            # revision assignment and publication in one critical section so a
+            # receiver can detect both reordering and dropped messages.
+            async with cls._publish_lock:
+                revision = await cls._redis.incr(
+                    f"{RUNTIME_CACHE_REVISION_PREFIX}:{cache_type}"
+                )
+                payload = {
+                    "source": INSTANCE_ID,
+                    "type": cache_type,
+                    "action": action,
+                    "revision": int(revision),
+                    "data": data,
+                }
+                await cls._redis.publish(cls._channel, json.dumps(payload))
         except Exception as exc:
             logger.error("runtime cache sync publish failed", LOG_COMMAND, e=exc)
+
+    @classmethod
+    def _cache_class(cls, cache_type: str):
+        return {
+            "bot": BotMemoryCache,
+            "group": GroupMemoryCache,
+            "ban": BanMemoryCache,
+            "level": LevelUserMemoryCache,
+            "task": TaskInfoMemoryCache,
+            "plugin_limit": PluginLimitMemoryCache,
+            "plugin": PluginInfoMemoryCache,
+        }.get(cache_type)
+
+    @classmethod
+    async def _accept_revision(cls, cache_type: str, revision: Any) -> bool:
+        """Reject stale events and reconcile a detected Pub/Sub gap."""
+        cache_cls = cls._cache_class(cache_type)
+        try:
+            current = int(revision)
+        except (TypeError, ValueError):
+            # Older workers did not publish revisions. A refresh is safer than
+            # applying an unversioned snapshot over a versioned one.
+            if cache_cls is not None:
+                cls._revision_reconcile.add(cache_type)
+                RuntimeCacheMutation.mark_error(
+                    cache_cls, RuntimeError("runtime_cache_legacy_event")
+                )
+                runtime_cache_refresh_coordinator.request_refresh(cache_cls)
+            return False
+        if current <= 0:
+            return False
+        previous = cls._last_revision.get(cache_type)
+        if previous is not None and current <= previous:
+            return False
+        cls._last_revision[cache_type] = current
+        if cache_type in cls._revision_reconcile:
+            if cache_cls is not None:
+                runtime_cache_refresh_coordinator.request_refresh(cache_cls)
+            return False
+        # A worker that has not completed its authoritative initial load must
+        # not apply a single Pub/Sub delta as if it had seen the preceding
+        # history. The refresh will establish a complete snapshot first.
+        if cache_cls is not None and not getattr(cache_cls, "_loaded", False):
+            cls._revision_reconcile.add(cache_type)
+            runtime_cache_refresh_coordinator.request_refresh(cache_cls)
+            return False
+        if previous is not None and current > previous + 1:
+            if cache_cls is not None:
+                cls._revision_reconcile.add(cache_type)
+                RuntimeCacheMutation.mark_error(
+                    cache_cls,
+                    RuntimeError(f"runtime_cache_revision_gap:{previous}->{current}"),
+                )
+                runtime_cache_refresh_coordinator.request_refresh(cache_cls)
+            return False
+        return True
 
     @classmethod
     async def _listen_loop(cls) -> None:
@@ -751,6 +874,10 @@ class RuntimeCacheSync:
         cache_type = payload.get("type")
         action = payload.get("action")
         data = payload.get("data") or {}
+        if not isinstance(cache_type, str) or not await cls._accept_revision(
+            cache_type, payload.get("revision")
+        ):
+            return
         token = _APPLYING_REMOTE_CACHE_EVENT.set(True)
         try:
             if cache_type == "bot":
@@ -848,13 +975,16 @@ class RuntimeCacheMutation:
             advance_revision()
 
     @staticmethod
-    def require_fresh(cache_cls: type) -> None:
-        from .write import CachePublicationError
+    def require_fresh(cache_cls: type, *, allow_unloaded: bool = False) -> None:
+        from .write import CachePublicationError, CacheUnavailable
 
         if getattr(cache_cls, "_publication_failed", False):
             raise CachePublicationError(
                 f"runtime_cache_reconciliation_pending:{cache_cls.__name__}"
             )
+
+        if not allow_unloaded and not getattr(cache_cls, "_loaded", False):
+            raise CacheUnavailable(f"runtime_cache_unavailable:{cache_cls.__name__}")
 
     @classmethod
     async def ensure_loaded(cls, cache_cls: type, label: str) -> None:
@@ -932,7 +1062,12 @@ class RuntimeCacheMutation:
 
     @staticmethod
     def mark_error(cache_cls: type, exc: Exception) -> None:
+        if getattr(cache_cls, "_loaded", False):
+            from zhenxun.services.permission_revision import advance_revision
+
+            advance_revision()
         setattr(cache_cls, "_last_error", f"{type(exc).__name__}: {exc}")
+        setattr(cache_cls, "_loaded", False)
 
     @staticmethod
     def clear_negative_key(cache_cls: type, key: object) -> None:
@@ -953,6 +1088,7 @@ class RuntimeCacheMutation:
         advance_revision()
         if _APPLYING_REMOTE_CACHE_EVENT.get():
             return
+        RuntimeCacheSync.note_local_mutation(cache_type)
         RuntimeCacheSync.publish_event(cache_type, action, data)
 
 
@@ -1036,7 +1172,7 @@ class PluginInfoMemoryCache:
 
     @classmethod
     def get_by_module_if_ready(cls, module: str) -> "PluginInfo | None":
-        RuntimeCacheMutation.require_fresh(cls)
+        RuntimeCacheMutation.require_fresh(cls, allow_unloaded=True)
         if not cls._loaded:
             return None
         return cls._to_model(cls._by_module.get(module))
@@ -1210,7 +1346,7 @@ class BotMemoryCache:
 
     @classmethod
     def get_if_ready(cls, bot_id: str | None) -> BotSnapshot | None:
-        RuntimeCacheMutation.require_fresh(cls)
+        RuntimeCacheMutation.require_fresh(cls, allow_unloaded=True)
         bot_id = cls._normalize(bot_id)
         if not bot_id or not cls._loaded:
             return None
@@ -1401,7 +1537,7 @@ class GroupMemoryCache:
     def get_if_ready(
         cls, group_id: str | None, channel_id: str | None = None
     ) -> GroupSnapshot | None:
-        RuntimeCacheMutation.require_fresh(cls)
+        RuntimeCacheMutation.require_fresh(cls, allow_unloaded=True)
         key = cls._key(group_id, channel_id)
         if not key:
             return None
@@ -1603,7 +1739,7 @@ class LevelUserMemoryCache:
     def get_levels_if_ready(
         cls, user_id: str | None, group_id: str | None
     ) -> tuple[LevelUserSnapshot | None, LevelUserSnapshot | None] | None:
-        RuntimeCacheMutation.require_fresh(cls)
+        RuntimeCacheMutation.require_fresh(cls, allow_unloaded=True)
         if not cls._loaded:
             return None
         global_user = None
@@ -1978,7 +2114,7 @@ class PluginLimitMemoryCache:
 
     @classmethod
     def get_limits_if_ready(cls, module: str) -> list[PluginLimitSnapshot] | None:
-        RuntimeCacheMutation.require_fresh(cls)
+        RuntimeCacheMutation.require_fresh(cls, allow_unloaded=True)
         normalized = cls._normalize(module)
         if not normalized:
             return []
@@ -2287,6 +2423,7 @@ class BanMemoryCache:
 
     @classmethod
     def remaining_time(cls, user_id: str | None, group_id: str | None) -> int:
+        RuntimeCacheMutation.require_fresh(cls)
         if not cls._loaded:
             return 0
         neg_key = cls._neg_key(user_id, group_id)
@@ -2523,8 +2660,15 @@ class RuntimeCacheRefreshCoordinator:
                 return name, True
         self._current_cache = name
         previous_refresh = float(getattr(cache_cls, "_last_refresh", 0.0) or 0.0)
+        revision_before = RuntimeCacheSync.refresh_revision(name)
         try:
             await cache_cls.refresh()
+            if not RuntimeCacheSync.refresh_is_stable(name, revision_before):
+                RuntimeCacheMutation.mark_error(
+                    cache_cls, RuntimeError("cache_refresh_revision_changed")
+                )
+                self.request_refresh(cache_cls)
+                return name, False
             current_refresh = float(getattr(cache_cls, "_last_refresh", 0.0) or 0.0)
             current_error = getattr(cache_cls, "_last_error", None)
             if current_error and current_refresh <= previous_refresh:

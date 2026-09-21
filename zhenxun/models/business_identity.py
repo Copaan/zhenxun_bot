@@ -30,6 +30,11 @@ class BusinessIdentityLink(Model):
 
     class Meta:
         table = "business_identity_links"
+        indexes = (
+            ("original_account_id",),
+            ("account_id",),
+            ("domain", "app_id", "scene", "group_scope"),
+        )
 
 
 class AccountBindingRequest(Model):
@@ -68,6 +73,7 @@ class AccountBindingChange(Model):
 
     class Meta:
         table = "account_binding_changes"
+        indexes = (("identity_id", "created_at"),)
 
 
 class BusinessEventAccount(Model):
@@ -86,6 +92,7 @@ class BusinessEventAccount(Model):
 
     class Meta:
         table = "business_event_accounts"
+        indexes = (("identity_id", "created_at"),)
 
 
 class BusinessDailyClaim(Model):
