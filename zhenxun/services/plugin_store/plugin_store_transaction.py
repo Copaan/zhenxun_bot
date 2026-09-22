@@ -80,6 +80,9 @@ def _transaction_packages(
     for operation in operations:
         if not isinstance(operation, dict):
             continue
+        scope = operation.get("candidate_packages")
+        if isinstance(scope, list):
+            names.update(canonicalize_name(str(name)) for name in scope)
         packages = operation.get("dependency_packages")
         if isinstance(packages, dict):
             for name in packages:
@@ -159,6 +162,26 @@ def _relevant_archive_packages(
     return relevant_packages
 
 
+def _archive_binary_packages(
+    contract: dict[str, Any], transactions: tuple[dict[str, Any] | None, ...]
+) -> set[str]:
+    from zhenxun.services.nonebot_store.dependencies import protected_core
+
+    # Core packages never enter the rebuilt layer. Other exemptions are promises
+    # enforced as --only-binary at build time, not permission to execute source.
+    binary = set(protected_core())
+    for transaction in transactions:
+        for operation in (transaction or {}).get("operations", []):
+            evidence = operation.get("archive_binary_packages", {})
+            if isinstance(evidence, dict):
+                binary.update(
+                    name
+                    for name, version in evidence.items()
+                    if contract.get("packages", {}).get(name) == version
+                )
+    return binary
+
+
 def _validate_archive_build_policy(*transactions: dict[str, Any] | None) -> bool:
     from zhenxun.services.plugin_store.plugin_archive_dependencies import (
         archive_dependency_contract,
@@ -171,7 +194,9 @@ def _validate_archive_build_policy(*transactions: dict[str, Any] | None) -> bool
         bool(contract.get("store_keys"))
         or any(_archive_wheels_only(item) for item in transactions)
     )
-    related_source = relevant_packages & set(contract.get("source_build_packages", []))
+    related_source = (
+        relevant_packages & set(contract.get("source_build_packages", []))
+    ) - _archive_binary_packages(contract, transactions)
     if related_source:
         from zhenxun.services.installer_network import source_revision
 
@@ -196,7 +221,16 @@ def _validate_archive_build_policy(*transactions: dict[str, Any] | None) -> bool
             if (operation.get("receipt") or {}).get("dependency_source_build") is True
             and operation.get("source_build_confirmed") is True
         ]
-        if not approved:
+        candidate_approved = any(
+            operation.get("source_build_confirmed") is True
+            and bool(operation.get("candidate_packages"))
+            and not str(operation.get("store_key") or "").startswith("local_archive:")
+            and (operation.get("receipt") or {}).get("source") != "local_archive"
+            for item in transactions
+            if item
+            for operation in item.get("operations", [])
+        )
+        if not approved and not candidate_approved:
             raise ArchiveSourceBuildConflict(
                 details=_archive_conflict_details(contract, relevant_packages)
             )
@@ -239,13 +273,37 @@ def archive_dependency_policy(transaction: dict[str, Any]) -> Iterator[None]:
             ):
                 transaction.pop("archive_wheels_only", None)
                 transaction["source_build_confirmed"] = True
-                transaction["archive_build_allowlist"] = contract[
-                    "source_build_packages"
-                ]
+                allowed = set(
+                    contract["source_build_packages"]
+                ) & _relevant_archive_packages(contract, policy_transactions)
+                allowed -= _archive_binary_packages(contract, policy_transactions)
+                for item in policy_transactions:
+                    for operation in (item or {}).get("operations", []):
+                        if operation.get("source_build_confirmed"):
+                            allowed.update(operation.get("candidate_packages") or [])
+                transaction["archive_build_allowlist"] = sorted(allowed)
+        contract = archive_dependency_contract()
+        # Consent for a new plugin never authorizes rebuilding unrelated archives.
+        transaction["archive_binary_only_packages"] = sorted(
+            _archive_binary_packages(contract, policy_transactions)
+            | (
+                set(contract.get("packages", {}))
+                - (
+                    set(contract.get("source_build_packages", []))
+                    & _relevant_archive_packages(contract, policy_transactions)
+                )
+            )
+        )
         target = transaction.get("target_manifest")
         if isinstance(target, dict):
             preserve_archive_dependencies(target)
         yield
+
+
+def preflight_archive_dependency_policy(transaction: dict[str, Any]) -> None:
+    """Run the apply gate on a disposable proposal; never persist approval."""
+    with archive_dependency_policy(deepcopy(transaction)):
+        pass
 
 
 def _now() -> str:
@@ -855,6 +913,7 @@ __all__ = [
     "dependency_packages",
     "finalize_pending_transaction",
     "pending_transaction",
+    "preflight_archive_dependency_policy",
     "prepare_dependency_transaction",
     "public_transaction",
     "rollback_pending_transaction",

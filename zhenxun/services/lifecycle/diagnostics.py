@@ -20,6 +20,28 @@ from .deadline import remaining_timeout
 _logger = logging.getLogger(__name__)
 
 
+def task_wait_summary(task: asyncio.Task) -> dict:
+    """Bounded code locations only: never serialize frame locals or arguments."""
+    awaited = task.get_coro()
+    frames = []
+    seen = set()
+    while awaited is not None and id(awaited) not in seen and len(frames) < 8:
+        seen.add(id(awaited))
+        frame = getattr(awaited, "cr_frame", None) or getattr(awaited, "gi_frame", None)
+        if frame is not None:
+            frames.append(
+                {
+                    "module": str(frame.f_globals.get("__name__", ""))[:160],
+                    "function": frame.f_code.co_name[:120],
+                    "line": frame.f_lineno,
+                }
+            )
+        awaited = getattr(awaited, "cr_await", None) or getattr(
+            awaited, "gi_yieldfrom", None
+        )
+    return {"frames": frames, "cancelling": getattr(task, "cancelling", lambda: 0)()}
+
+
 def terminal_path(path: Path) -> Path:
     return path.with_suffix(".terminal.json")
 

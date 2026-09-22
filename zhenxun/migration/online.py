@@ -70,6 +70,7 @@ class OnlineExport:
         return True
 
     async def snapshot_after_shutdown(self, shutdown: dict, *, network=None) -> None:
+        self.store.record_shutdown(self.identity, shutdown)
         if (
             shutdown.get("result") != "confirmed"
             or shutdown.get("forced")

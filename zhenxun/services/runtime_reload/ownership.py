@@ -37,6 +37,7 @@ class LifecycleWork:
     budget: ShutdownBudget
     active: bool = True
     children: weakref.WeakSet = field(default_factory=weakref.WeakSet)
+    cancellation_tasks: set | None = None
     supervisor: weakref.ReferenceType | None = None
     retained: bool = False
     expired: bool = False

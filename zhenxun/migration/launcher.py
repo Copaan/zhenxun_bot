@@ -654,6 +654,7 @@ class LauncherMigrationService:
             self.store.transition(identity, "quiescing")
             quiesce_started = True
             shutdown = await self._wait(quiesce, budget.phase(15))
+            self.store.record_shutdown(identity, shutdown)
             if (
                 shutdown.get("result") != "confirmed"
                 or shutdown.get("forced")
@@ -820,6 +821,17 @@ async def stop_worker_for_snapshot(worker, supervisor) -> dict:
         if item._live_processes(discover=True)
     )
     return {
+        **{
+            key: receipt[key]
+            for key in (
+                "budget_remaining_ms",
+                "budget_exhausted",
+                "recovery_required",
+                "unresolved_resources",
+                "failed_components",
+            )
+            if receipt and key in receipt
+        },
         "result": receipt.get("result", "unconfirmed") if receipt else "unconfirmed",
         "identity": receipt.get("identity", {}) if receipt else {},
         "forced": any(

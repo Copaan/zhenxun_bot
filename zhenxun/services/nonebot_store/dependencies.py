@@ -36,7 +36,7 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10
 
 from .storage import LAYER_ROOT, generation_path, load_manifest
 
-SOLVER_POLICY_VERSION = 4
+SOLVER_POLICY_VERSION = 5
 LOCK_FILE = Path("uv.lock")
 _REQ_LINE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)==([^\s;]+)")
 _SENSITIVE = re.compile(r"(?i)(authorization|token|password|secret)=?[^\s]*")
@@ -569,6 +569,8 @@ async def _compile(
     *,
     wheels_only: bool,
     restricted_packages: tuple[str, ...] = (),
+    preferences: dict[str, str] | None = None,
+    no_dependencies: bool = False,
 ) -> tuple[dict[str, str] | None, str]:
     from zhenxun.services.installer_network import (
         UV_BINARY_POLICY_VERSION,
@@ -585,6 +587,9 @@ async def _compile(
         output = directory / "requirements.txt"
         source.write_text("\n".join(requirements) + "\n", encoding="utf-8")
         _write_constraints(constraint_file, constraints)
+        if preferences:
+            # uv reuses existing output pins as preferences, not hard constraints.
+            _write_constraints(output, preferences)
         command = [
             "uv",
             "pip",
@@ -605,6 +610,8 @@ async def _compile(
                 restricted_packages=restricted_packages,
             )
         )
+        if no_dependencies:
+            command.append("--no-deps")
         process = await asyncio.create_subprocess_exec(
             *command,
             cwd=str(Path.cwd()),
@@ -626,8 +633,23 @@ async def _compile(
                 },
             )
         if process.returncode != 0 or not output.exists():
+            _check_resolution_failure(details)
             return None, details
         return _parse_compiled(output), details
+
+
+def _check_resolution_failure(details: str) -> None:
+    from zhenxun.services.installer_network import resolver_failure
+
+    failure = resolver_failure(details)
+    if failure["code"] not in {
+        "archive_dependency_conflict",
+        "archive_dependency_source_required",
+    }:
+        raise DependencyAnalysisError(
+            failure["code"].replace("archive_dependency_", "dependency_", 1),
+            details,
+        )
 
 
 def _requirement_names(requirements: list[str]) -> set[str]:
@@ -896,41 +918,35 @@ async def solve_install(
         current=current,
     )
     candidate_inputs = candidate_dependencies if overrides else [candidate]
-    project_locked = project_closure()
+    candidate_name = canonicalize_name(str(plugin["project_link"]))
+    baseline = {
+        name: version for name, version in current.items() if name != candidate_name
+    }
+    baseline.update(
+        {
+            name: str(info["version"])
+            for name, info in manifest.get("packages", {}).items()
+            if name != candidate_name
+        }
+    )
+    baseline.update(immutable)
 
-    # Resolve the candidate scope without archive receipts first.  Archive
-    # pins only constrain this transaction when the candidate actually uses
-    # the same distribution; unrelated archive packages remain protected by
-    # their own receipt and are not allowed to poison this resolution.
+    # Discover only the requested plugin's closure. Other installed plugins
+    # participate in compatibility checks, never in the scope allowed to move.
     archive_packages = set(archive.get("packages", {})) | _requirement_names(
         archive.get("requirements", [])
     )
-    candidate_scope_inputs = [
-        *project_requirements(),
-        *managed_requirements,
-        *candidate_inputs,
-    ]
-    candidate_scope = _requirement_names(candidate_scope_inputs)
-    candidate_scope.add(canonicalize_name(str(plugin["project_link"])))
-    candidate_probe: dict[str, str] | None = None
-    if archive_packages:
-        candidate_probe, _ = await _compile(
-            candidate_scope_inputs,
-            project_locked,
-            wheels_only=False,
-        )
-        if candidate_probe is None:
-            candidate_probe, _ = await _compile(
-                candidate_scope_inputs,
-                immutable,
-                wheels_only=False,
-            )
-        candidate_scope.update(candidate_probe or {})
-    relevant_archive_packages = (
-        set(archive_packages)
-        if archive_packages and candidate_probe is None
-        else candidate_scope & archive_packages
+    candidate_probe, candidate_error = await _compile(
+        candidate_inputs, baseline, wheels_only=False, preferences=baseline
     )
+    if candidate_probe is None:
+        candidate_probe, candidate_error = await _compile(
+            candidate_inputs, immutable, wheels_only=False, preferences=baseline
+        )
+    if candidate_probe is None:
+        raise DependencyAnalysisError("plugin_dependency_invalid", candidate_error)
+    candidate_scope = set(candidate_probe) | {candidate_name}
+    relevant_archive_packages = candidate_scope & archive_packages
     pinned_archive_packages = relevant_archive_packages & set(
         archive.get("packages", {})
     )
@@ -946,21 +962,34 @@ async def solve_install(
     ]
     active_requirements = [*managed_requirements, *archive_inputs]
     requirements = [*project_requirements(), *active_requirements, *candidate_inputs]
+    archive_pins = archive.get("packages", {})
+    strict_constraints = {**baseline, **archive_pins, **immutable}
+    scoped_constraints = {
+        **{
+            name: version
+            for name, version in baseline.items()
+            if name not in candidate_scope
+        },
+        **archive_pins,
+        **immutable,
+    }
 
     resolved, strict_error = await _compile(
         requirements,
-        project_locked,
+        strict_constraints,
         wheels_only=False,
         restricted_packages=tuple(sorted(archive_wheel_packages)),
+        preferences=baseline,
     )
     relaxed = False
     if resolved is None:
         relaxed = True
         resolved, relaxed_error = await _compile(
             requirements,
-            immutable,
+            scoped_constraints,
             wheels_only=False,
             restricted_packages=tuple(sorted(archive_wheel_packages)),
+            preferences=baseline,
         )
         if resolved is None:
             if archive_wheel_packages:
@@ -1041,6 +1070,69 @@ async def solve_install(
     ]
     if core_changes:
         raise DependencyAnalysisError("core_dependency_conflict", details=core_changes)
+    unrelated_changes = [
+        {"name": name, "from": baseline[name], "to": version}
+        for name, version in resolved.items()
+        if name in baseline
+        and name not in candidate_scope
+        and version != baseline[name]
+    ]
+    if unrelated_changes:
+        raise DependencyAnalysisError(
+            "third_party_dependency_conflict", details=unrelated_changes
+        )
+
+    final_candidate, final_error = await _compile(
+        candidate_inputs, resolved, wheels_only=False
+    )
+    if final_candidate is None:
+        raise DependencyAnalysisError("dependency_resolution_failed", final_error)
+    candidate_scope = set(final_candidate) | {candidate_name}
+    relevant_archive_packages = candidate_scope & archive_packages
+    archive_wheel_packages = relevant_archive_packages & set(
+        archive.get("wheels_only_packages", [])
+    )
+    archive_source_packages = relevant_archive_packages & set(
+        archive.get("source_build_packages", [])
+    )
+    for raw in _archive_requirement_inputs(archive, relevant_archive_packages):
+        requirement = Requirement(raw)
+        if requirement.marker and not requirement.marker.evaluate():
+            continue
+        version = resolved.get(canonicalize_name(requirement.name))
+        if version is None or not requirement.specifier.contains(
+            version, prereleases=True
+        ):
+            raise archive_conflict(
+                "archive_dependency_conflict",
+                failure_stage="archive_validation",
+                requirement=str(requirement),
+                actual=version,
+            )
+
+    archive_binary_packages: dict[str, str] = {}
+    binary_candidates = {
+        name: resolved[name]
+        for name in archive_source_packages - set(immutable)
+        if name in resolved
+    }
+    if binary_candidates:
+        binaries, _ = await _compile(
+            [f"{name}=={version}" for name, version in binary_candidates.items()],
+            {},
+            wheels_only=True,
+            no_dependencies=True,
+        )
+        if binaries is not None:
+            archive_binary_packages.update(binaries)
+        else:
+            for name, version in binary_candidates.items():
+                binary, _ = await _compile(
+                    [f"{name}=={version}"], {}, wheels_only=True, no_dependencies=True
+                )
+                if binary is not None:
+                    archive_binary_packages.update(binary)
+    archive_source_packages -= set(immutable) | set(archive_binary_packages)
 
     plugin_inputs = [*active_requirements, *candidate_inputs]
     wheel_probe_packages = set(resolved) - archive_source_packages
@@ -1096,9 +1188,9 @@ async def solve_install(
                 str(managed_plugin["version"])
             )
     shared_changes = [
-        {"name": name, "from": base.get(name), "to": version}
+        {"name": name, "from": current.get(name), "to": version}
         for name, version in sorted(resolved.items())
-        if name in shared and base.get(name) != version
+        if name in shared and current.get(name) != version
     ]
     layer_packages = {
         name: version
@@ -1107,6 +1199,14 @@ async def solve_install(
         and name not in FORBIDDEN_LAYER_PACKAGES
         and (name not in shared or base.get(name) != version)
     }
+    # A new install must not silently remove packages retained in the active layer.
+    for name, info in manifest.get("packages", {}).items():
+        if (
+            name not in layer_packages
+            and name not in immutable
+            and name not in FORBIDDEN_LAYER_PACKAGES
+        ):
+            layer_packages[name] = resolved.get(name, str(info["version"]))
     private_packages = {
         name: version for name, version in layer_packages.items() if name not in shared
     }
@@ -1122,6 +1222,19 @@ async def solve_install(
         for name, version in sorted(layer_packages.items())
     }
     changes = _package_changes(layer_packages, current)
+    change_sources = {
+        item["name"]: {
+            "kind": (
+                "requested_plugin"
+                if item["name"] == candidate_name
+                else "candidate_dependency"
+                if item["name"] in candidate_scope
+                else "pending_transaction"
+            ),
+            "required_by": candidate_name if item["name"] in candidate_scope else None,
+        }
+        for item in [*changes["added"], *changes["changed"], *shared_changes]
+    }
     private_changes = [
         item
         for item in [*changes["added"], *changes["changed"]]
@@ -1157,6 +1270,10 @@ async def solve_install(
         "requirements": requirements,
         "resolved_packages": layer_packages,
         "package_changes": changes,
+        "change_sources": change_sources,
+        "candidate_packages": sorted(candidate_scope),
+        "archive_binary_packages": archive_binary_packages,
+        "version_policy": "preserve_existing_scoped_changes",
         "core_changes": core_changes,
         "immutable_conflicts": core_changes,
         "shared_changes": shared_changes,

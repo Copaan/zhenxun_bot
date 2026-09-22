@@ -60,6 +60,7 @@ from zhenxun.services.plugin_store.plugin_archive_dependencies import (
 from zhenxun.services.plugin_store.plugin_store_transaction import (
     ArchiveSourceBuildConflict,
     archive_dependency_policy,
+    preflight_archive_dependency_policy,
 )
 from zhenxun.services.runtime_reload import plugin_runtime_manager
 
@@ -473,7 +474,27 @@ async def _analyze(analysis_id: str) -> None:
                 "plugin": _catalog_item(plugin, manifest=manifest, inventory=inventory),
             }
         )
-    except (DependencyAnalysisError, ArchiveDependencyConflict) as error:
+        preflight_archive_dependency_policy(
+            {
+                "base_manifest": manifest,
+                "target_manifest": _target_manifest(analysis),
+                "operations": [
+                    {
+                        "project_link": plugin["project_link"],
+                        "source_build_confirmed": bool(
+                            plan.get("source_build_required")
+                        ),
+                        **_dependency_evidence(plan),
+                    }
+                ],
+                "source_build_confirmed": bool(plan.get("source_build_required")),
+            }
+        )
+    except (
+        DependencyAnalysisError,
+        ArchiveDependencyConflict,
+        ArchiveSourceBuildConflict,
+    ) as error:
         reason: dict[str, Any] = {
             "code": error.code,
             "message": safe_process_error(str(error)),
@@ -548,6 +569,22 @@ def _recover_analysis(record: dict[str, Any]):
 operation_registry.register_recovery_handler(
     "nonebot_store_analysis", _recover_analysis
 )
+
+
+def _dependency_evidence(plan: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "dependency_inputs": list(plan.get("candidate_inputs") or []),
+        "candidate_packages": list(plan.get("candidate_packages") or []),
+        "archive_binary_packages": dict(plan.get("archive_binary_packages") or {}),
+        "dependency_packages": {
+            str(item["name"]): str(item.get("to") or item.get("version"))
+            for item in [
+                *(plan.get("package_changes", {}).get("added") or []),
+                *(plan.get("package_changes", {}).get("changed") or []),
+                *(plan.get("shared_changes") or []),
+            ]
+        },
+    }
 
 
 def _target_manifest(analysis: dict[str, Any]) -> dict[str, Any]:
@@ -982,31 +1019,8 @@ async def apply_analysis(payload: ApplyPayload) -> Result[dict]:
                 "database_migration_possible": bool(
                     plan.get("database_migration_possible")
                 ),
-                "dependency_inputs": sorted(
-                    {
-                        str(value)
-                        for value in [
-                            *(plan.get("candidate_inputs") or []),
-                            *(
-                                (analysis.get("metadata") or {})
-                                .get("info", {})
-                                .get("requires_dist")
-                                or []
-                            ),
-                        ]
-                    }
-                ),
-                "dependency_packages": {
-                    str(item.get("name")): str(
-                        item.get("to") or item.get("version") or ""
-                    )
-                    for item in [
-                        *(plan.get("package_changes", {}).get("added") or []),
-                        *(plan.get("package_changes", {}).get("changed") or []),
-                        *(plan.get("shared_changes") or []),
-                    ]
-                    if item.get("name") and (item.get("to") or item.get("version"))
-                },
+                **_dependency_evidence(plan),
+                "source_build_confirmed": bool(payload.confirm_source_build),
                 "created_at": utc_now(),
                 "target_manifest": deepcopy(target),
             }

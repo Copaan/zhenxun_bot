@@ -93,6 +93,7 @@ class LifecycleContext:
         self._parent: LifecycleContext | None = None
         self._parent_receipt: ResourceReceipt | None = None
         self._close_task: asyncio.Task[None] | None = None
+        self._close_recheck_safe = True
 
     def _check_accepting(self) -> None:
         if not self.accepting or self.closed:
@@ -281,11 +282,13 @@ class LifecycleContext:
                     await self.quiesce()
                 except BaseException as caught:
                     error = caught
+                    self._close_recheck_safe = False
             for child in reversed(tuple(self._children)):
                 try:
                     await child.close()
                 except BaseException as caught:
                     error = error or caught
+                    self._close_recheck_safe = False
             current_task = asyncio.current_task()
             tasks = [
                 task
@@ -293,6 +296,8 @@ class LifecycleContext:
                 if not task.done() and task is not current_task
             ]
             for task in tasks:
+                if getattr(task, "cancelling", lambda: 0)():
+                    continue
                 cancel = self._task_cancel_callbacks.get(task)
                 if cancel is not None:
                     cancel()
@@ -324,6 +329,7 @@ class LifecycleContext:
                         )
                 except BaseException as caught:
                     finalizer_errors.append(caught)
+                    self._close_recheck_safe = False
             self._finalizers.clear()
             try:
                 await self.kernel._run_cleanup(
@@ -335,6 +341,7 @@ class LifecycleContext:
                 )
             except BaseException as caught:
                 error = error or caught
+                self._close_recheck_safe = False
             if finalizer_errors:
                 error = error or finalizer_errors[0]
         finally:
@@ -395,6 +402,8 @@ class _Registration:
         self.value: Any = None
         self.controller: CompositeHandle | None = None
         self.stop_after: set[str] = set()
+        self.reconcile_stop: Callable[[], bool] | None = None
+        self.pending_tasks: Callable[[], list[dict]] | None = None
 
 
 class LifecycleKernel:
@@ -440,7 +449,12 @@ class LifecycleKernel:
             if inspect.iscoroutine(awaitable):
                 awaitable.close()
                 raise LifecycleError("shutdown_budget_exhausted")
-        task = asyncio.ensure_future(awaitable)
+
+        async def bounded_cleanup():
+            with shutdown_budget(timeout):
+                return await awaitable
+
+        task = asyncio.ensure_future(bounded_cleanup())
         detail = {"owner": owner, "stage": stage, "state": "running"}
         self._cleanup_tasks[task] = detail
 
@@ -458,11 +472,10 @@ class LifecycleKernel:
                 return task.result()
             raise LifecycleError("component_finalizer_timeout")
         except BaseException:
-            task.cancel()
-            _, pending = await asyncio.wait(
-                {task}, timeout=remaining_timeout(min(grace, 0.05))
-            )
-            if pending:
+            if not task.done():
+                task.cancel()
+                await asyncio.wait({task}, timeout=remaining_timeout(min(grace, 0.05)))
+            if not task.done():
                 detail["state"] = "leaked"
                 self._recovery_required.add(owner)
             raise
@@ -620,7 +633,7 @@ class LifecycleKernel:
                 context._parent = None
                 context._parent_receipt = None
         else:
-            self._recovery_required.add(context.spec.component_id)
+            self._recovery_required.add(self._scope_recovery_owner(context))
         self._emit("scope_failed" if error else "scope_closed", record.scope_id)
         self._prune_scopes()
         self._persist()
@@ -636,6 +649,13 @@ class LifecycleKernel:
             lambda completed: self._scope_cleanup_done(context, completed)
         )
 
+    @staticmethod
+    def _scope_recovery_owner(context: LifecycleContext) -> str:
+        record = context.scope_record
+        if record is not None and record.metadata.get("plugin_id"):
+            return f"plugin:{record.metadata['plugin_id']}"
+        return context.spec.component_id
+
     def _scope_cleanup_done(
         self,
         context: LifecycleContext,
@@ -650,7 +670,7 @@ class LifecycleKernel:
             return
         error_code = _error_code(error)
         if error_code in _WORKER_RECOVERY_ERRORS or "timeout" in error_code:
-            self._recovery_required.add(context.spec.component_id)
+            self._recovery_required.add(self._scope_recovery_owner(context))
         self._persist()
 
     async def drain_scope_cleanups(self) -> None:
@@ -791,6 +811,8 @@ class LifecycleKernel:
         stop: StopCallback | None = None,
         release_checks: dict[str, Callable[[], bool]] | None = None,
         stop_after: set[str] | None = None,
+        reconcile_stop: Callable[[], bool] | None = None,
+        pending_tasks: Callable[[], list[dict]] | None = None,
     ) -> None:
         component_id = f"plugin:{plugin_id}"
         registration = self._registrations.get(component_id)
@@ -812,6 +834,8 @@ class LifecycleKernel:
         runtime = registration.runtime
         if stop is not None:
             registration.stop = stop
+        registration.reconcile_stop = reconcile_stop
+        registration.pending_tasks = pending_tasks
         if stop_after is not None:
             registration.stop_after = stop_after - {component_id, "runtime:plugin_host"}
         plugin_scope = self._plugin_scope_contexts.get(plugin_id)
@@ -1407,6 +1431,17 @@ class LifecycleKernel:
                 "recovery_required": state["recovery_required"],
                 "component_state_counts": state["state_counts"],
                 "unresolved_resources": state["unresolved_resources"],
+                "failed_components": [
+                    {
+                        "component_id": item["component_id"],
+                        "error_code": item["error_code"],
+                        "diagnostic": item.get("metadata", {}).get(
+                            "stop_diagnostic", {}
+                        ),
+                    }
+                    for item in state["components"]
+                    if item["state"] == "failed"
+                ][:16],
             }
         )
         try:
@@ -1443,11 +1478,88 @@ class LifecycleKernel:
                 if context is not None:
                     context.accepting = False
             for component_id in ordered:
+                if component_id == "runtime:plugin_host":
+                    await asyncio.sleep(0)
+                    self._reconcile_plugin_stops()
                 await self._stop_one(component_id, suppress_errors=True)
             try:
                 await self.drain_scope_cleanups()
             except LifecycleError:
                 self._recovery_required.update(ordered)
+
+    def _reconcile_plugin_stops(self) -> None:
+        """Verify late release without re-executing a hook or finalizer."""
+        for component_id, registration in self._registrations.items():
+            runtime = registration.runtime
+            context = registration.context
+            errors = runtime.metadata.get("stop_errors", [])
+            if (
+                registration.spec.source != "plugin_runtime"
+                or runtime.state is not ComponentState.FAILED
+                or registration.reconcile_stop is None
+                or context is None
+                or not context.closed
+                or not context._close_recheck_safe
+                or context._in_flight
+                or context._children
+                or any(r.state == "failed" for r in context.resources)
+                or registration.controller is not None
+                or not errors
+                or not any(
+                    e["error_code"] == "plugin_task_cancel_timeout" for e in errors
+                )
+                or any(
+                    e["error_code"]
+                    not in {
+                        "plugin_task_cancel_timeout",
+                        "resource_release_unconfirmed",
+                    }
+                    for e in errors
+                )
+            ):
+                continue
+            record = context.scope_record
+            if record is not None and (
+                record.metadata.get("incarnation_id")
+                != runtime.metadata.get("incarnation_id")
+                or self._plugin_scope_contexts.get(runtime.metadata["plugin_id"])
+                is not context
+            ):
+                continue
+            if context._close_task is not None and not context._close_task.done():
+                continue
+            if any(d["owner"] == component_id for d in self._cleanup_tasks.values()):
+                continue
+            try:
+                if not registration.reconcile_stop():
+                    continue
+                unresolved = [
+                    r
+                    for r in context.resources
+                    if r.state in {"active", "unresolved", "leaked"}
+                ]
+                if any(
+                    r.error_code not in {None, "resource_release_unconfirmed"}
+                    or r.receipt_id not in context._release_checks
+                    or context._release_checks[r.receipt_id]() is not True
+                    for r in unresolved
+                ):
+                    continue
+            except BaseException:
+                continue
+            for receipt in unresolved:
+                self._verify_observed_receipt(context, receipt)
+            self._scope_closed(context, None)
+            runtime.state = ComponentState.STOPPED
+            runtime.health = "stopped"
+            runtime.error_code = None
+            runtime.metadata["late_release_confirmed_at"] = datetime.now(
+                timezone.utc
+            ).isoformat()
+            self._recovery_required.discard(component_id)
+            registration.context = None
+            self._emit("stopped", component_id)
+            self._persist()
 
     def _component_stop_order(self, selected: set[str]) -> list[str]:
         remaining = {
@@ -1620,6 +1732,9 @@ class LifecycleKernel:
                 "operation_id": self._current_operations[component_id]["operation_id"],
                 "stages": list(stop_errors),
                 "resources": dict(resources),
+                "pending_tasks": registration.pending_tasks()
+                if registration.pending_tasks is not None
+                else [],
             }
             if stop_error in _WORKER_RECOVERY_ERRORS or "timeout" in stop_error:
                 self._recovery_required.add(component_id)

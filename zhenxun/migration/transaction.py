@@ -85,6 +85,7 @@ class RestoreTransaction:
                         ),
                         self.budget.phase(15),
                     )
+                self.store.record_shutdown(self.identity, shutdown)
                 if (
                     shutdown.get("result") != "confirmed"
                     or shutdown.get("forced")

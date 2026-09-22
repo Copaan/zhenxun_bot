@@ -262,6 +262,9 @@ def _build_generation(transaction: dict[str, Any]) -> dict[str, Any]:
                 forbidden_builds = set(
                     archive_dependency_contract().get("wheels_only_packages", [])
                 )
+                forbidden_builds.update(
+                    transaction.get("archive_binary_only_packages", [])
+                )
                 if "archive_build_allowlist" in transaction:
                     forbidden_builds.update(
                         set(packages) - set(transaction["archive_build_allowlist"])

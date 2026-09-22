@@ -636,6 +636,38 @@ class TaskStore:
                 "offset",
                 "sha256",
                 "target_revision",
+                "shutdown_diagnostic",
             )
             if key in value
         }
+
+    def record_shutdown(self, identity: str, shutdown: dict) -> None:
+        """Keep the original worker's evidence even after recovery replaces it."""
+        allowed = (
+            "result",
+            "identity",
+            "forced",
+            "process_tree_released",
+            "unresolved_roles",
+            "budget_remaining_ms",
+            "budget_exhausted",
+            "recovery_required",
+            "unresolved_resources",
+            "failed_components",
+        )
+        evidence = {key: shutdown[key] for key in allowed if key in shutdown}
+        _public_payload(evidence)
+        record = {"job_id": identity, "recorded_at": self.clock(), **evidence}
+        write_json_locked(
+            self.path("jobs", identity).parent / "shutdown-attempt.json", record
+        )
+
+        def update(job):
+            if not isinstance(job, dict) or job.get("id") != identity:
+                raise MigrationError("migration_record_not_found", status=404)
+            job["shutdown_diagnostic"] = record
+            job["revision"] += 1
+            job["updated_at"] = self.clock()
+            return job
+
+        mutate_json_locked(self.path("jobs", identity), None, update)

@@ -2493,6 +2493,8 @@ class PluginRuntimeManager:
                     if phase.phase == "on_shutdown" and any(
                         phase is value for value in self._cancellation_work.values()
                     ):
+                        if phase.cancellation_tasks is not None:
+                            phase.cancellation_tasks.add(task)
                         self._cancellation_work[
                             (task, owner, incarnation.incarnation_id)
                         ] = LifecycleWork(
@@ -2501,6 +2503,7 @@ class PluginRuntimeManager:
                             weakref.ref(task),
                             "on_shutdown",
                             phase.budget,
+                            cancellation_tasks=phase.cancellation_tasks,
                         )
                         task.add_done_callback(self._forget_cancellation_task)
                 self._owned_tasks[owner].add(task)
@@ -4646,7 +4649,9 @@ class PluginRuntimeManager:
             self._persist_index()
         return operation
 
-    async def _cancel_plugin_tasks(self, owners: set[str], *, only_tasks=None) -> None:
+    async def _cancel_plugin_tasks(
+        self, owners: set[str], *, only_tasks=None, observed_tasks=None
+    ) -> None:
         from zhenxun.services.lifecycle import lifecycle_kernel
 
         cleanup_tasks = lifecycle_kernel.owned_cleanup_task_ids()
@@ -4667,8 +4672,15 @@ class PluginRuntimeManager:
         if asyncio.current_task() in tasks:
             raise PluginRecoveryRequired("plugin_cleanup_owns_current_task")
         # Cancellation continuations keep only a task-bound, bounded cleanup lease.
-        with shutdown_budget(_TASK_CANCEL_TIMEOUT) as budget:
+        inherited = current_budget.get()
+        budget_context = (
+            contextlib.nullcontext(inherited)
+            if inherited is not None
+            else shutdown_budget(_TASK_CANCEL_TIMEOUT)
+        )
+        with budget_context as budget:
             works = []
+            cancellation_tasks = set(tasks)
             for owner in owners:
                 incarnation = self._incarnations.get(owner) or self._incarnations.get(
                     self._root_owner(owner)
@@ -4687,6 +4699,7 @@ class PluginRuntimeManager:
                         weakref.ref(task),
                         "on_shutdown",
                         budget,
+                        cancellation_tasks=cancellation_tasks,
                     )
                     self._cancellation_work[
                         (task, owner, incarnation.incarnation_id)
@@ -4696,52 +4709,68 @@ class PluginRuntimeManager:
             try:
                 for task in tasks:
                     task.add_done_callback(self._consume_cleanup_task)
-                    if not task.done():
+                    if (
+                        not task.done()
+                        and task not in self._cancellation_requests
+                        and not getattr(task, "cancelling", lambda: 0)()
+                    ):
                         marker = f"plugin_cleanup_cancel:{uuid4().hex}"
                         self._cancellation_requests[task] = (
                             marker,
                             task.cancelling() if hasattr(task, "cancelling") else 0,
                         )
                         task.cancel(marker)
-                if tasks:
-                    done, pending = await asyncio.wait(
-                        tasks, timeout=budget.remaining()
-                    )
-                else:
-                    done, pending = set(), set()
                 observed = set(tasks)
+                if observed_tasks is not None:
+                    observed_tasks.update(observed)
+                pending = {task for task in tasks if not task.done()}
+                if pending:
+                    await asyncio.wait(pending, timeout=budget.remaining())
                 while True:
-                    children = {
-                        key[0]
-                        for key, work in self._cancellation_work.items()
-                        if work.budget is budget
-                    } - observed
+                    children = cancellation_tasks - observed
                     if not children:
                         break
                     observed.update(children)
+                    if observed_tasks is not None:
+                        observed_tasks.update(children)
                     for child in children:
                         child.add_done_callback(self._consume_cleanup_task)
-                        if not child.done():
-                            child.cancel()
-                    child_done, child_pending = await asyncio.wait(
-                        children, timeout=budget.remaining()
-                    )
-                    done.update(child_done)
-                    pending.update(child_pending)
+                        if (
+                            not child.done()
+                            and child not in self._cancellation_requests
+                            and not getattr(child, "cancelling", lambda: 0)()
+                        ):
+                            marker = f"plugin_cleanup_cancel:{uuid4().hex}"
+                            self._cancellation_requests[child] = (marker, 0)
+                            child.add_done_callback(self._forget_cancellation_task)
+                            child.cancel(marker)
+                    pending = {child for child in children if not child.done()}
+                    if pending:
+                        await asyncio.wait(pending, timeout=budget.remaining())
                     if not budget.remaining():
                         break
             finally:
+                observed.update(cancellation_tasks)
+                if observed_tasks is not None:
+                    observed_tasks.update(cancellation_tasks)
                 for work in self._cancellation_work.values():
-                    if work.budget is budget:
+                    if work.cancellation_tasks is cancellation_tasks:
                         work.active = False
+        done = {task for task in observed if task.done()}
+        pending = observed - done
+        cleanup_error = None
         for task in done:
             if not task.cancelled():
-                task.exception()
+                cleanup_error = cleanup_error or task.exception()
         for owner in owners:
             # Keep the existing set: task callbacks may still reference it.
             owned = self._owned_tasks.get(owner)
             if owned is not None:
                 owned.difference_update(done)
+        if cleanup_error is not None:
+            raise PluginRecoveryRequired(
+                "plugin_task_cleanup_failed"
+            ) from cleanup_error
         if pending:
             raise PluginRecoveryRequired("plugin_task_cancel_timeout")
 
@@ -4982,6 +5011,32 @@ class PluginRuntimeManager:
             *self._scope_resource_receipts(unit, owners=owners),
         ]
         checks = self._scope_release_checks(unit, receipts, owners=owners)
+        shutdown_tasks: set[asyncio.Task] = set()
+
+        def reconciled() -> bool:
+            incarnation = self._incarnations.get(unit.plugin_id)
+            return bool(
+                self.units.get(unit.plugin_id) is unit
+                and unit.incarnation_id == incarnation_id
+                and incarnation is not None
+                and incarnation.incarnation_id == incarnation_id
+                and not incarnation.accepts_work
+                and not unit.in_flight
+                and shutdown_tasks
+                and all(
+                    task.done() and (task.cancelled() or task.exception() is None)
+                    for task in shutdown_tasks
+                )
+            )
+
+        def pending_details() -> list[dict]:
+            from zhenxun.services.lifecycle.diagnostics import task_wait_summary
+
+            return [
+                task_wait_summary(task)
+                for task in sorted(shutdown_tasks, key=id)
+                if not task.done()
+            ][:8]
 
         async def stop() -> None:
             if (
@@ -4991,11 +5046,14 @@ class PluginRuntimeManager:
                 raise PluginRecoveryRequired("plugin_stop_incarnation_changed")
             unit.draining = True
             owners = self._owned_keys_for_unit(unit.plugin_id)
+            self._revoke_incarnation(unit.plugin_id)
             try:
                 drain_error = None
                 try:
                     await self._cancel_plugin_tasks(
-                        owners, only_tasks=self._connection_tasks
+                        owners,
+                        only_tasks=self._connection_tasks,
+                        observed_tasks=shutdown_tasks,
                     )
                     if unit.in_flight:
                         timeout = remaining_timeout(2.0)
@@ -5006,9 +5064,12 @@ class PluginRuntimeManager:
                         )
                 except (TimeoutError, PluginRecoveryRequired) as error:
                     drain_error = error
-                self._revoke_incarnation(unit.plugin_id)
-                await self._cancel_plugin_tasks(owners)
-                if drain_error is not None:
+                await self._cancel_plugin_tasks(owners, observed_tasks=shutdown_tasks)
+                if drain_error is not None and not (
+                    str(drain_error) == "plugin_task_cancel_timeout" and reconciled()
+                ):
+                    if isinstance(drain_error, PluginRecoveryRequired):
+                        raise drain_error
                     raise PluginRecoveryRequired(
                         "plugin_drain_timeout"
                     ) from drain_error
@@ -5023,6 +5084,8 @@ class PluginRuntimeManager:
             classification=unit.classification.value,
             stop=stop,
             release_checks=checks,
+            reconcile_stop=reconciled,
+            pending_tasks=pending_details,
             stop_after=lifecycle_component_ids(
                 unit.module_names,
                 index=observation[1] if observation is not None else None,
