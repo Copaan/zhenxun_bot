@@ -168,6 +168,27 @@ def _execute_restore_phase(project: Path, request: dict, *, lease) -> dict:
             if not core:
                 raise MigrationError("migration_core_constraints_unavailable")
             installed = base_installed_inventory()
+            core = {
+                name: installed.get(name, version) for name, version in core.items()
+            }
+            dependency_source = manifest["source"]
+            categories = (
+                job["options"]
+                .get("selection", {})
+                .get("categories", job["options"].get("categories", ["plugins"]))
+            )
+            if "plugins" not in categories:
+                from .inventory import environment_inventory
+
+                # A data/config-only restore must not replace unrelated target
+                # plugin dependencies with the source machine's environment.
+                dependency_source = environment_inventory(project=project)
+                dependency_source["distributions"] = [
+                    item
+                    for item in dependency_source["distributions"]
+                    if item.get("layer") == "managed_plugins"
+                ]
+                core.update(installed)
             core.update(
                 {
                     name: installed[name]
@@ -189,8 +210,11 @@ def _execute_restore_phase(project: Path, request: dict, *, lease) -> dict:
                     declarations=tuple(private.get("declarations", ())),
                 )
                 result = await restorer.restore(
-                    manifest["source"], budget=budget, checkpoint=check
+                    dependency_source, budget=budget, checkpoint=check
                 )
+                if result["state"] != "prepared":
+                    write_json_locked(directory / "dependency-result.json", result)
+                    raise MigrationError("migration_dependencies_incomplete")
                 candidate = contained_path(restorer.directory, result["candidate"])
                 generation = stage_generation(
                     project,
@@ -472,6 +496,14 @@ def _execute_restore_phase(project: Path, request: dict, *, lease) -> dict:
                 "state": "applied_unverified",
             },
         )
+        from .verification import verify_file_plan
+
+        verify_file_plan(project, plan["files"])
+        if plan["database"] and plan["database"].get("engine") not in {
+            "mysql",
+            "postgres",
+        }:
+            verify_file_plan(project, plan["database"])
         return {"state": "applied_unverified", "revision": digest}
     if phase == "restore_rollback":
         if (directory / "restore-commit.json").exists():

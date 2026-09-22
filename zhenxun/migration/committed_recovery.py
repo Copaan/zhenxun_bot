@@ -58,6 +58,7 @@ def recovered_decision(service, identity, authorization, validation):
         "plugins",
         "dependencies",
         "listener",
+        "files",
     }
     if (
         validation.get("job_id") != identity

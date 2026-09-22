@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from contextlib import closing
+from contextlib import closing, contextmanager
+import hashlib
+import json
 from pathlib import Path
+import re
 import shutil
 import sqlite3
+import tempfile
 import time
 
 from .archive import require_space
@@ -28,7 +32,8 @@ BUSINESS_KEYS: dict[str, tuple[str, ...]] = {
     "user_props": ("user_id",),
     "level_users": ("user_id", "group_id"),
     "group_info_users": ("user_id", "group_id"),
-    "group_plugin_settings": ("group_id", "plugin_name"),
+    # Recomputed on both copies from Bot/platform/group/channel/plugin below.
+    "group_plugin_settings": ("scope_key",),
     "goods_info": ("goods_name",),
     "ban_console": ("user_id", "group_id"),
 }
@@ -152,6 +157,123 @@ def _unique_keys(connection: sqlite3.Connection, table: str) -> list[tuple]:
     return sorted(result, key=str)
 
 
+def _upgrade_group_scope(
+    connection: sqlite3.Connection,
+    *,
+    deadline: float | None = None,
+    max_rows: int = 5_000_000,
+) -> None:
+    table = "group_plugin_settings"
+    if table not in _tables(connection):
+        return
+    if deadline is not None:
+        connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+    connection.execute("PRAGMA foreign_keys=OFF")
+    with connection:
+        columns = {row[1] for row in _columns(connection, table)}
+        for name, kind in (
+            ("bot_id", "VARCHAR(255)"),
+            ("platform_scope", "VARCHAR(64)"),
+            ("channel_id", "VARCHAR(255)"),
+            ("scope_key", "VARCHAR(64)"),
+        ):
+            if name not in columns:
+                connection.execute(f'ALTER TABLE "{table}" ADD COLUMN "{name}" {kind}')
+        rows = connection.execute(
+            "SELECT id, bot_id, platform_scope, group_id, channel_id, plugin_name "
+            f'FROM "{table}"'
+        )
+        for count, row in enumerate(rows, 1):
+            if count > max_rows:
+                raise MigrationError("migration_database_row_limit")
+            if deadline is not None:
+                _check_deadline(deadline)
+            payload = json.dumps(
+                ["v1", *(str(value or "") for value in row[1:])],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            connection.execute(
+                f'UPDATE "{table}" SET scope_key=? WHERE id=?',
+                (hashlib.sha256(payload.encode()).hexdigest(), row[0]),
+            )
+        schema = _tables(connection)[table]
+        legacy = {
+            ("group_id", "plugin_name"),
+            ("bot_id", "platform_scope", "group_id", "channel_id", "plugin_name"),
+        }
+        objects = list(
+            connection.execute(
+                "SELECT type, name, sql FROM sqlite_master "
+                "WHERE tbl_name=? AND sql IS NOT NULL AND type != 'table'",
+                (table,),
+            )
+        )
+        obsolete = []
+        inline = False
+        for index in connection.execute(f'PRAGMA index_list("{table}")'):
+            names = tuple(
+                row[2]
+                for row in connection.execute(f"PRAGMA index_info({_quote(index[1])})")
+            )
+            if index[2] and not index[4] and names in legacy:
+                obsolete.append(index[1])
+                inline |= index[3] == "u"
+        if inline:
+            # Rewrite only recognized table-level UNIQUE clauses; preserve the rest
+            # of the original DDL, including checks, defaults and foreign keys.
+            pattern = r",\s*(?:CONSTRAINT\s+\S+\s+)?UNIQUE\s*\(([^)]+)\)"
+
+            def remove_legacy(match):
+                names = tuple(
+                    part.strip().strip('"`[]') for part in match[1].split(",")
+                )
+                return "" if names in legacy else match[0]
+
+            rebuilt = re.sub(pattern, remove_legacy, schema, flags=re.I)
+            if rebuilt == schema:
+                raise MigrationError("migration_group_scope_rebuild_unsupported")
+            temporary = table + "__migration_scope"
+            rebuilt = re.sub(
+                r"^(CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?)\S+(\s*\()",
+                lambda match: match[1] + _quote(temporary) + match[2],
+                rebuilt,
+                count=1,
+                flags=re.I,
+            )
+            connection.execute(rebuilt)
+            names = ",".join(_quote(row[1]) for row in _columns(connection, table))
+            connection.execute(
+                f'INSERT INTO "{temporary}" ({names}) ' f'SELECT {names} FROM "{table}"'
+            )
+            connection.execute(f'DROP TABLE "{table}"')
+            connection.execute(f'ALTER TABLE "{temporary}" RENAME TO "{table}"')
+            for _, name, sql in objects:
+                if name not in obsolete:
+                    connection.execute(sql)
+        else:
+            for name in obsolete:
+                connection.execute(f"DROP INDEX {_quote(name)}")
+        if (("scope_key",), 0) not in _unique_keys(connection, table):
+            connection.execute(
+                f"CREATE UNIQUE INDEX IF NOT EXISTS uid_group_plugi_scope_key "
+                f'ON "{table}" (scope_key)'
+            )
+    connection.execute("PRAGMA foreign_keys=ON")
+
+
+@contextmanager
+def _upgraded_source(source: Path, candidate: Path, deadline: float, cancel, max_rows):
+    with tempfile.TemporaryDirectory(
+        prefix="migration-source-", dir=candidate.parent
+    ) as directory:
+        copied = Path(directory) / "source.sqlite3"
+        snapshot_sqlite(source, copied, deadline=deadline, cancel=cancel)
+        with closing(sqlite3.connect(copied)) as connection:
+            _upgrade_group_scope(connection, deadline=deadline, max_rows=max_rows)
+            yield connection
+
+
 def prepare_sqlite_incremental(
     source: Path,
     target: Path,
@@ -175,9 +297,10 @@ def prepare_sqlite_incremental(
         "conflicts": conflicts,
     }
     with (
-        closing(_readonly(source)) as incoming,
+        _upgraded_source(source, candidate, deadline, cancel, max_rows) as incoming,
         closing(sqlite3.connect(candidate)) as current,
     ):
+        _upgrade_group_scope(current, deadline=deadline, max_rows=max_rows)
         incoming.row_factory = sqlite3.Row
         current.row_factory = sqlite3.Row
         current.execute("PRAGMA foreign_keys=ON")
@@ -228,7 +351,10 @@ def prepare_sqlite_incremental(
                         raise MigrationError("migration_database_column_limit")
                     if (
                         table not in dst_tables
-                        or columns != _columns(current, table)
+                        or (
+                            sorted(tuple(c)[1:] for c in columns)
+                            != sorted(tuple(c)[1:] for c in _columns(current, table))
+                        )
                         or foreign != _foreign_keys(current, table)
                         or _unique_keys(incoming, table) != _unique_keys(current, table)
                         or "virtual" in (src_tables[table] or "").lower()
@@ -323,6 +449,22 @@ def prepare_sqlite_incremental(
                             rejected += 1
                             continue
                         if matches:
+                            if table == "group_plugin_settings":
+                                same = current.execute(
+                                    f"SELECT settings FROM {qtable} WHERE {where}",
+                                    tuple(row[key] for key in keys),
+                                ).fetchone()
+                                values = [same[0], row["settings"]]
+                                try:
+                                    values = [
+                                        json.dumps(json.loads(value), sort_keys=True)
+                                        for value in values
+                                    ]
+                                except (TypeError, ValueError):
+                                    pass
+                                if values[0] != values[1]:
+                                    rejected += 1
+                                    continue
                             if stable_unknown:
                                 same = current.execute(
                                     f"SELECT * FROM {qtable} WHERE {where}",

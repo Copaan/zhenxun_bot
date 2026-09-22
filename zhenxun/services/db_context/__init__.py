@@ -202,7 +202,7 @@ async def _schema_migration_lock():
 
 async def _run_script_migrations(
     statements: list[MigrationStatement | str], fingerprint: str
-) -> None:
+) -> dict:
     """Run legacy scripts once; deferred declarations are not completed DDL."""
     normalized = [
         item
@@ -238,7 +238,7 @@ async def _run_script_migrations(
             if isinstance(saved, dict) and saved.get("script_fingerprint") == candidate:
                 if saved.get("status") in {None, "completed", "legacy_deferred"}:
                     logger.debug("迁移脚本无变化，跳过执行")
-                    return
+                    return saved
                 # Ordinals are meaningful only for the exact ordered input.
                 if saved.get("status") == "pending_tables":
                     if saved.get("statements") != [item.sql for item in normalized]:
@@ -333,6 +333,7 @@ async def _run_script_migrations(
         temporary.write_text(payload, encoding="utf-8")
         os.replace(temporary, script_hash_file)
         logger.debug("SCRIPT_METHOD方法执行完毕!")
+        return json.loads(payload)
 
 
 def get_config() -> dict:
@@ -462,7 +463,10 @@ async def init():
                             )
                         )
                 except Exception as e:
-                    logger.debug(f"{module} 执行SCRIPT_METHOD方法出错...", e=e)
+                    raise RuntimeError(
+                        f"迁移脚本生成失败: {module}:"
+                        f"{getattr(func, '__qualname__', 'script')}"
+                    ) from e
             if migration_statements:
                 fingerprint = hashlib.md5(
                     json.dumps(
@@ -478,7 +482,17 @@ async def init():
         logger.debug("开始生成数据库表结构...")
         await Tortoise.generate_schemas()
         if migration_statements:
-            await _run_script_migrations(migration_statements, fingerprint)
+            migration_result = await _run_script_migrations(
+                migration_statements, fingerprint
+            )
+            if migration_result.get("pending"):
+                pending = [
+                    migration_statements[index].owner
+                    for index in migration_result["pending"]
+                ]
+                raise RuntimeError(
+                    f"建表后仍有未完成迁移: {', '.join(sorted(set(pending)))}"
+                )
         logger.debug("数据库表结构生成完毕!")
         from zhenxun.models.chat_history import ensure_chat_history_nullable_columns
         from zhenxun.models.group_plugin_setting import (

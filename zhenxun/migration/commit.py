@@ -64,6 +64,7 @@ def decide_restore(
         "plugins",
         "dependencies",
         "listener",
+        "files",
     }
     if (
         validation.get("job_id") != identity
@@ -112,6 +113,10 @@ def decide_restore(
                 raise MigrationError("migration_commit_stage_invalid")
             if job["cancel_requested"]:
                 raise MigrationError("migration_cancelled")
+            from .verification import verify_restore
+
+            if validation.get("evidence") != verify_restore(store.project, identity):
+                raise MigrationError("migration_validation_evidence_changed")
             receipt = {
                 "schema": 1,
                 "job_id": identity,

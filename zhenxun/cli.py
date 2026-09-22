@@ -335,7 +335,7 @@ def _run_worker() -> None:
 
     from zhenxun.migration.validation_worker import register as register_validation
 
-    register_validation(driver)
+    register_validation(driver, managed_status=managed_status)
     startup_load_planner.instrument_prebind_hooks(driver)
 
     from zhenxun.configs.webui_tls import (

@@ -47,7 +47,7 @@ def install(driver) -> None:
     validation_gate.install(driver)
 
 
-def register(driver) -> None:
+def register(driver, *, managed_status: dict | None = None) -> None:
     if _request is None:
         return
     import nonebot
@@ -79,7 +79,7 @@ def register(driver) -> None:
     nonebot.get_app().add_middleware(ValidationIngress, management=management)
     deadline = time.monotonic() + request["remaining_seconds"]
 
-    def check_validation() -> dict:
+    async def check_validation() -> dict:
         status = startup_coordinator.snapshot()
         base = {**identity, "business_opened": validation_gate.business_allowed}
         if status["state"] == "failed" or status.get("setup_required"):
@@ -96,29 +96,42 @@ def register(driver) -> None:
         if lifecycle_kernel.status()["recovery_required"]:
             raise MigrationError("migration_validation_resources_unresolved")
         failed = sorted(startup_load_planner.failed_plugins)
-        if any(startup_load_planner.is_core_plugin(p) for p in failed):
-            raise MigrationError("migration_core_initialization_failed")
+        if failed or (managed_status or {}).get("failed"):
+            raise MigrationError("migration_selected_plugin_initialization_failed")
         job = TaskStore(project).read("jobs", request["job_id"])
         if mapping := job["options"].get("database"):
             require_target_connection(
                 project, mapping, request.get("private", {}).get("database") or {}
             )
         generation = activated_generation(request["job_id"])
+        from .verification import (
+            verify_restore,
+            verify_runtime_configuration,
+            verify_runtime_database,
+            verify_runtime_dependencies,
+        )
+
+        verify_runtime_configuration(project)
+        evidence = await asyncio.to_thread(verify_restore, project, request["job_id"])
+        if generation["generation"] != evidence["generation"]:
+            raise MigrationError("migration_dependency_generation_changed")
+        database = await verify_runtime_database()
+        await asyncio.to_thread(verify_runtime_dependencies, project, request["job_id"])
         return {
             **base,
             "state": "validated",
             "generation": generation["generation"],
             "failed_plugins": failed,
+            "evidence": evidence,
+            "database_evidence": database,
             "checks": {
-                key: True
-                for key in (
-                    "configuration",
-                    "database",
-                    "core",
-                    "plugins",
-                    "dependencies",
-                    "listener",
-                )
+                "configuration": not status.get("setup_required", False),
+                "database": database["ready"],
+                "core": status["state"] in {"warmup_ready", "degraded"},
+                "plugins": not failed and not (managed_status or {}).get("failed"),
+                "dependencies": evidence["generation"] == generation["generation"],
+                "listener": status["server_bound"],
+                "files": evidence["schema"] == 2,
             },
         }
 
@@ -129,7 +142,7 @@ def register(driver) -> None:
             while time.monotonic() < deadline:
                 if report is None or report["state"] == "starting":
                     try:
-                        report = check_validation()
+                        report = await check_validation()
                     except MigrationError as error:
                         report = {
                             **identity,

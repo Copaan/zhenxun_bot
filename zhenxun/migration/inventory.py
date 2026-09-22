@@ -7,6 +7,7 @@ import platform
 import re
 import sys
 
+from packaging.requirements import InvalidRequirement, Requirement
 from packaging.utils import canonicalize_name
 
 from .errors import MigrationError
@@ -42,6 +43,19 @@ def _safe_text(value) -> str | None:
     ):
         return value
     return None
+
+
+def _portable_requirements(distribution) -> list[str]:
+    result = []
+    for raw in distribution.requires or []:
+        try:
+            requirement = Requirement(raw)
+        except InvalidRequirement:
+            continue
+        # Never export credentials embedded in a direct dependency URL.
+        if not requirement.url and len(str(requirement)) <= 2048:
+            result.append(str(requirement))
+    return result
 
 
 def distributions(
@@ -86,6 +100,8 @@ def distributions(
                 "priority": priority,
                 "layer": layer,
                 "requires_python": _safe_text(item.metadata.get("Requires-Python")),
+                "requires_dist": _portable_requirements(item),
+                "requested": item.read_text("REQUESTED") is not None,
                 "source_mapping_required": origin in {"editable", "local_directory"},
             }
         )

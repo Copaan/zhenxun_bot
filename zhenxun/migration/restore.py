@@ -244,10 +244,27 @@ def prepare_files(
                 raise MigrationError("migration_python_binary_incompatible", path=path)
             fingerprint = _fingerprint(target, checkpoint)
             if is_config and options.configuration == "keep":
-                skipped.append({"path": path, "reason": "configuration_keep"})
+                baseline = {}
+                if (
+                    path in {"data/config.yaml", "data/configs/plugins2config.yaml"}
+                    and fingerprint is not None
+                ):
+                    retained = prepared / ("preserved-" + Path(path).name)
+                    _atomic_copy(target, retained, checkpoint=checkpoint)
+                    baseline["baseline"] = retained.relative_to(staging).as_posix()
+                skipped.append(
+                    {
+                        "path": path,
+                        "reason": "configuration_keep",
+                        "sha256": fingerprint,
+                        **baseline,
+                    }
+                )
                 continue
             if not is_config and options.files == "missing" and fingerprint is not None:
-                skipped.append({"path": path, "reason": "existing_file"})
+                skipped.append(
+                    {"path": path, "reason": "existing_file", "sha256": fingerprint}
+                )
                 continue
             candidate = prepared / f"{len(actions):08d}"
             if is_config:
@@ -268,8 +285,16 @@ def prepare_files(
                 _atomic_copy(incoming, candidate, checkpoint=checkpoint)
             digest = file_hash(candidate, checkpoint)
             if fingerprint == digest:
-                candidate.unlink()
-                skipped.append({"path": path, "reason": "unchanged"})
+                baseline = {}
+                if path in {"data/config.yaml", "data/configs/plugins2config.yaml"}:
+                    retained = prepared / ("preserved-" + Path(path).name)
+                    candidate.rename(retained)
+                    baseline["baseline"] = retained.relative_to(staging).as_posix()
+                else:
+                    candidate.unlink()
+                skipped.append(
+                    {"path": path, "reason": "unchanged", "sha256": digest, **baseline}
+                )
                 continue
             actions.append(
                 {

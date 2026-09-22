@@ -13,6 +13,7 @@ from urllib.parse import urlsplit
 import uuid
 
 from packaging.requirements import InvalidRequirement, Requirement
+from packaging.specifiers import SpecifierSet
 from packaging.utils import canonicalize_name
 from packaging.version import InvalidVersion, Version
 
@@ -29,6 +30,30 @@ def effective_requests(
     if not isinstance(records, list) or len(records) > 20_000:
         raise MigrationError("migration_dependency_inventory_limit")
     selected, issues = {}, []
+    disabled = {
+        canonicalize_name(item["distribution"])
+        for item in source.get("plugin_installations", [])
+        if isinstance(item, dict)
+        and item.get("enabled") is False
+        and isinstance(item.get("distribution"), str)
+    }
+    references: dict[str, list[bool]] = {}
+    for item in records:
+        if not isinstance(item, dict) or not item.get("effective"):
+            continue
+        for raw in item.get("requires_dist", []):
+            try:
+                requirement = Requirement(raw)
+            except (InvalidRequirement, TypeError):
+                raise MigrationError("migration_dependency_inventory_invalid") from None
+            active = (
+                not requirement.marker
+                or "extra" in str(requirement.marker)
+                or requirement.marker.evaluate()
+            )
+            references.setdefault(canonicalize_name(requirement.name), []).append(
+                bool(active)
+            )
     for item in records:
         if not isinstance(item, dict) or type(item.get("effective")) is not bool:
             raise MigrationError("migration_dependency_inventory_invalid")
@@ -42,6 +67,16 @@ def effective_requests(
         if name in selected:
             raise MigrationError("migration_dependency_effective_conflict")
         selected[name] = {"name": name, "version": version}
+        if name in disabled and not any(references.get(name, [])):
+            selected[name]["skip"] = "plugin_explicitly_disabled"
+            continue
+        if (
+            item.get("requested") is False
+            and references.get(name)
+            and not any(references[name])
+        ):
+            selected[name]["skip"] = "target_platform_not_applicable"
+            continue
         if name in core:
             selected[name]["skip"] = "target_core_preserved"
         elif item.get("source_mapping_required") or item.get("source_type") in {
@@ -93,15 +128,62 @@ def _installed(path: Path) -> dict[str, str]:
     return result
 
 
-def _consistency(candidate: Path, core: dict[str, str]) -> list[dict]:
+def _consistency(
+    candidate: Path,
+    core: dict[str, str],
+    declarations: tuple[str, ...] = (),
+    *,
+    include_core: bool = False,
+) -> list[dict]:
     versions = {**core, **_installed(candidate)}
     issues = []
-    for distribution in importlib.metadata.distributions(path=[str(candidate)]):
+    extras: dict[str, set[str]] = {}
+    for raw in declarations:
+        declaration = Requirement(raw)
+        extras.setdefault(canonicalize_name(declaration.name), set()).update(
+            declaration.extras
+        )
+    distributions = list(importlib.metadata.distributions(path=[str(candidate)]))
+    if include_core:
+        for name in core:
+            try:
+                distributions.append(importlib.metadata.distribution(name))
+            except importlib.metadata.PackageNotFoundError:
+                issues.append(
+                    {"name": name, "code": "migration_core_dependency_missing"}
+                )
+    # Propagate requested extras through the closure before checking markers.
+    changed = True
+    while changed:
+        changed = False
+        for distribution in distributions:
+            owner = canonicalize_name(distribution.metadata["Name"])
+            for raw in distribution.requires or []:
+                requirement = Requirement(raw)
+                if requirement.marker and not any(
+                    requirement.marker.evaluate({"extra": extra})
+                    for extra in {"", *extras.get(owner, set())}
+                ):
+                    continue
+                selected = extras.setdefault(canonicalize_name(requirement.name), set())
+                before = len(selected)
+                selected.update(requirement.extras)
+                changed |= len(selected) != before
+    for distribution in distributions:
+        owner = canonicalize_name(distribution.metadata["Name"])
+        python = distribution.metadata.get("Requires-Python")
+        if python and not SpecifierSet(python).contains(
+            ".".join(map(str, sys.version_info[:3])), prereleases=True
+        ):
+            issues.append(
+                {"name": owner, "code": "migration_dependency_python_incompatible"}
+            )
         for raw in distribution.requires or []:
             try:
                 requirement = Requirement(raw)
-                if requirement.marker and not requirement.marker.evaluate(
-                    {"extra": ""}
+                if requirement.marker and not any(
+                    requirement.marker.evaluate({"extra": extra})
+                    for extra in {"", *extras.get(owner, set())}
                 ):
                     continue
                 name = canonicalize_name(requirement.name)
@@ -223,6 +305,26 @@ class DependencyRestorer:
                 )
             ):
                 raise MigrationError("migration_dependency_disk_exhausted")
+            if process.returncode:
+                # Only a solver proof permits relaxing source version pins.
+                if b"no solution found" not in raw:
+                    raise MigrationError("migration_dependency_execution_failed")
+                if any(
+                    token in raw
+                    for token in (
+                        b"failed to fetch",
+                        b"failed to download",
+                        b"connection",
+                        b"timed out",
+                        b"unauthorized",
+                        b"forbidden",
+                        b"certificate",
+                        b"proxy",
+                        b"401",
+                        b"403",
+                    )
+                ):
+                    raise MigrationError("migration_dependency_index_unavailable")
             return process.returncode == 0
         finally:
             if process is not None:
@@ -247,13 +349,34 @@ class DependencyRestorer:
         self, source: dict, *, budget: MigrationBudget, checkpoint=lambda: None
     ) -> dict:
         requests, missing = effective_requests(source, self.core)
+        requested_names = {item["name"] for item in requests}
+        unavailable_names = {item["name"] for item in missing}
+        disabled_names = {
+            canonicalize_name(item["distribution"])
+            for item in source.get("plugin_installations", [])
+            if isinstance(item, dict)
+            and item.get("enabled") is False
+            and isinstance(item.get("distribution"), str)
+        }
+        excluded = [
+            {
+                "name": canonicalize_name(item["name"]),
+                "reason": "plugin_explicitly_disabled"
+                if canonicalize_name(item["name"]) in disabled_names
+                else "target_platform_not_applicable",
+            }
+            for item in source.get("distributions", [])
+            if item["effective"]
+            and canonicalize_name(item["name"])
+            not in requested_names | unavailable_names | self.core.keys()
+        ]
         accepted: dict[str, str] = {}
         attempts, relaxed = [], []
         current = private_directory(self.directory / "candidate-empty")
-        for request in requests:
+        for batch in [requests] if requests or self.declarations else []:
             budget.checkpoint()
             checkpoint()
-            name = request["name"]
+            name = "migration_dependency_set"
             for exact in (True, False):
                 attempt_budget = budget.phase(900)
                 directory = private_directory(self.directory / uuid.uuid4().hex)
@@ -272,11 +395,9 @@ class DependencyRestorer:
                 constraints = directory / "constraints.txt"
                 constraints.write_text(
                     "\n".join(
-                        f"{key}=={value}"
-                        for key, value in sorted({**self.core, **accepted}.items())
+                        f"{key}=={value}" for key, value in sorted(self.core.items())
                     )
-                    + "\n"
-                    + "\n".join(self.declarations),
+                    + "\n",
                     encoding="utf-8",
                 )
                 roots = directory / "requirements.in"
@@ -284,10 +405,12 @@ class DependencyRestorer:
                     "\n".join(
                         [
                             *(
-                                f"{key}=={value}"
-                                for key, value in sorted(accepted.items())
+                                f"{item['name']}=={item['version']}"
+                                if exact
+                                else item["name"]
+                                for item in batch
                             ),
-                            f"{name}=={request['version']}" if exact else name,
+                            *self.declarations,
                         ]
                     )
                     + "\n",
@@ -366,7 +489,9 @@ class DependencyRestorer:
                     attempts.append(
                         {
                             "name": name,
-                            "requested_version": request["version"],
+                            "requested_versions": {
+                                item["name"]: item["version"] for item in batch
+                            },
                             "exact": exact,
                             "state": "completed" if success else "failed",
                             "error_code": None
@@ -383,14 +508,17 @@ class DependencyRestorer:
                         current, accepted = candidate, selected
                         keep = True
                         self._remove(previous)
-                        if not exact:
-                            relaxed.append(
-                                {
-                                    "name": name,
-                                    "requested_version": request["version"],
-                                    "actual_version": accepted[name],
-                                }
-                            )
+                        for item in batch:
+                            actual = accepted.get(item["name"])
+                            if actual != item["version"]:
+                                relaxed.append(
+                                    {
+                                        "name": item["name"],
+                                        "requested_version": item["version"],
+                                        "actual_version": actual,
+                                        "reason": "target_compatible_resolution",
+                                    }
+                                )
                         break
                 finally:
                     try:
@@ -402,15 +530,32 @@ class DependencyRestorer:
                     if not keep:
                         self._remove(directory)
             else:
-                missing.append(
-                    {"name": name, "code": "migration_dependency_install_failed"}
+                missing.extend(
+                    {
+                        "name": item["name"],
+                        "code": "migration_dependency_install_failed",
+                    }
+                    for item in batch
                 )
-        consistency = _consistency(current, self.core)
+                if not batch:
+                    missing.append(
+                        {"name": name, "code": "migration_dependency_install_failed"}
+                    )
+        consistency = _consistency(current, self.core, tuple(self.declarations))
         return {
+            "core": self.core,
+            "declarations": self.declarations,
+            "source_versions": {item["name"]: item["version"] for item in requests},
+            "target_environment": {
+                "python": ".".join(map(str, sys.version_info[:3])),
+                "platform": sys.platform,
+                "abi": sys.implementation.cache_tag,
+            },
             "candidate": current.relative_to(self.directory).as_posix(),
             "installed": accepted,
             "attempts": attempts,
             "relaxed": relaxed,
+            "excluded": excluded,
             "missing": missing,
             "consistency": consistency,
             "state": "partial" if missing or consistency else "prepared",
