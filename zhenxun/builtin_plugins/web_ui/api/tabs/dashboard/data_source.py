@@ -18,7 +18,11 @@ from zhenxun.utils.platform import PlatformUtils
 
 from ....base_model import BaseResultModel, QueryModel
 from ....utils import webui_db_call
-from ..main.data_source import bot_live, get_statistics_counts
+from ..main.data_source import (
+    bot_live,
+    get_chat_history_counts,
+    get_statistics_counts,
+)
 from .model import (
     AllChatAndCallCount,
     BotConnectLogInfo,
@@ -40,6 +44,22 @@ async def _():
 
 
 class ApiDataSource:
+    _REMOTE_TIMEOUT_SECONDS = 5.0
+
+    @staticmethod
+    async def __remote_call(coro, operation: str, default):
+        try:
+            return await asyncio.wait_for(coro, ApiDataSource._REMOTE_TIMEOUT_SECONDS)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            logger.warning(
+                f"Dashboard 远端查询失败，已使用降级值: {operation}",
+                "WebUi",
+                e=error,
+            )
+            return default
+
     @classmethod
     async def __build_bot_info(cls, bot: Bot) -> BotInfo:
         """构建Bot信息
@@ -53,8 +73,10 @@ class ApiDataSource:
         now = datetime.now()
         platform = PlatformUtils.get_platform(bot) or ""
         if platform == "qq":
-            login_info = await bot.get_login_info()
-            nickname = login_info["nickname"]
+            login_info = await cls.__remote_call(
+                bot.get_login_info(), "bot.login_info", {}
+            )
+            nickname = login_info.get("nickname") or bot.self_id
             ava_url = (
                 PlatformUtils.get_user_avatar_url(
                     bot.self_id, "qq", BotConfig.get_qbot_uid(bot.self_id)
@@ -67,30 +89,32 @@ class ApiDataSource:
         bot_info = BotInfo(
             self_id=bot.self_id, nickname=nickname, ava_url=ava_url, platform=platform
         )
-        try:
-            group, friend = await asyncio.gather(
-                PlatformUtils.get_group_list(bot, True),
-                PlatformUtils.get_friend_list(bot),
-            )
-            bot_info.group_count = len(group[0])
-            bot_info.friend_count = len(friend[0])
-        except Exception as e:
-            logger.warning("获取bot好友/群组信息失败...", "WebUi", e=e)
-            bot_info.group_count = 0
-            bot_info.friend_count = 0
-        bot_info.day_call = await webui_db_call(
-            Statistics.filter(
-                create_time__gte=now - timedelta(hours=now.hour, minutes=now.minute),
-                bot_id=bot.self_id,
-            ).count(),
-            "Dashboard.bot_day_call",
+        group, friend = await asyncio.gather(
+            cls.__remote_call(
+                PlatformUtils.get_group_list(bot, True), "bot.group_list", ([], None)
+            ),
+            cls.__remote_call(
+                PlatformUtils.get_friend_list(bot), "bot.friend_list", ([], None)
+            ),
         )
-        bot_info.received_messages = await webui_db_call(
-            ChatHistory.filter(
-                bot_id=bot_info.self_id,
-                create_time__gte=now - timedelta(hours=now.hour, minutes=now.minute),
-            ).count(),
-            "Dashboard.bot_received_messages",
+        bot_info.group_count = len(group[0]) if group and group[0] else 0
+        bot_info.friend_count = len(friend[0]) if friend and friend[0] else 0
+        day_start = now - timedelta(hours=now.hour, minutes=now.minute)
+        bot_info.day_call, bot_info.received_messages = await asyncio.gather(
+            webui_db_call(
+                Statistics.filter(
+                    create_time__gte=day_start,
+                    bot_id=bot.self_id,
+                ).count(),
+                "Dashboard.bot_day_call",
+            ),
+            webui_db_call(
+                ChatHistory.filter(
+                    bot_id=bot_info.self_id,
+                    create_time__gte=day_start,
+                ).count(),
+                "Dashboard.bot_received_messages",
+            ),
         )
         bot_info.connect_time = bot_live.get(bot.self_id) or 0
         if bot_info.connect_time:
@@ -105,10 +129,11 @@ class ApiDataSource:
         返回:
             list[BotInfo]: Bot列表
         """
-        bot_list: list[BotInfo] = []
-        for _, bot in nonebot.get_bots().items():
-            bot_list.append(await cls.__build_bot_info(bot))
-        return bot_list
+        return list(
+            await asyncio.gather(
+                *(cls.__build_bot_info(bot) for bot in nonebot.get_bots().values())
+            )
+        )
 
     @classmethod
     async def get_chat_and_call_count(cls, bot_id: str | None) -> QueryChatCallCount:
@@ -120,24 +145,13 @@ class ApiDataSource:
         返回:
             QueryChatCallCount: 数据内容
         """
-        now = datetime.now()
-        query = ChatHistory
-        if bot_id:
-            query = query.filter(bot_id=bot_id)
-        chat_all_count = await webui_db_call(
-            query.annotate().count(),
-            "Dashboard.chat_all_count",
+        chat_counts, call_counts = await asyncio.gather(
+            get_chat_history_counts(bot_id, "Dashboard.chat_counts"),
+            get_statistics_counts(bot_id, "Dashboard.call_counts"),
         )
-        chat_day_count = await webui_db_call(
-            query.filter(
-                create_time__gte=now - timedelta(hours=now.hour, minutes=now.minute)
-            ).count(),
-            "Dashboard.chat_day_count",
-        )
-        call_counts = await get_statistics_counts(bot_id, "Dashboard.call_counts")
         return QueryChatCallCount(
-            chat_num=chat_all_count,
-            chat_day=chat_day_count,
+            chat_num=chat_counts["total"],
+            chat_day=chat_counts["day"],
             call_num=call_counts["total"],
             call_day=call_counts["day"],
         )
@@ -154,36 +168,14 @@ class ApiDataSource:
         返回:
             AllChatAndCallCount: 数据内容
         """
-        now = datetime.now()
-        query = ChatHistory
-        if bot_id:
-            query = query.filter(bot_id=bot_id)
-        chat_week_count = await webui_db_call(
-            query.filter(
-                create_time__gte=now
-                - timedelta(days=7, hours=now.hour, minutes=now.minute)
-            ).count(),
-            "Dashboard.chat_week_count",
+        chat_counts, call_counts = await asyncio.gather(
+            get_chat_history_counts(bot_id, "Dashboard.chat_counts"),
+            get_statistics_counts(bot_id, "Dashboard.call_counts"),
         )
-        chat_month_count = await webui_db_call(
-            query.filter(
-                create_time__gte=now
-                - timedelta(days=30, hours=now.hour, minutes=now.minute)
-            ).count(),
-            "Dashboard.chat_month_count",
-        )
-        chat_year_count = await webui_db_call(
-            query.filter(
-                create_time__gte=now
-                - timedelta(days=365, hours=now.hour, minutes=now.minute)
-            ).count(),
-            "Dashboard.chat_year_count",
-        )
-        call_counts = await get_statistics_counts(bot_id, "Dashboard.call_counts")
         return AllChatAndCallCount(
-            chat_week=chat_week_count,
-            chat_month=chat_month_count,
-            chat_year=chat_year_count,
+            chat_week=chat_counts["week"],
+            chat_month=chat_counts["month"],
+            chat_year=chat_counts["year"],
             call_week=call_counts["week"],
             call_month=call_counts["month"],
             call_year=call_counts["year"],

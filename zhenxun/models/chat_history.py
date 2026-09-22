@@ -1,12 +1,106 @@
+from contextlib import suppress
 from datetime import datetime, timedelta
+import os
 from typing import Any, ClassVar, Literal
 from typing_extensions import Self
 
-from tortoise import fields
+from tortoise import Tortoise, fields
 from tortoise.expressions import Q
+from tortoise.transactions import in_transaction
 
 from zhenxun.services.db_context import Model
-from zhenxun.services.db_context.schema_ops import AlterColumnType, RenameColumn
+from zhenxun.services.db_context.schema_ops import (
+    AlterColumnType,
+    RenameColumn,
+    SetColumnNullable,
+)
+
+
+async def ensure_chat_history_nullable_columns() -> None:
+    """Rebuild legacy SQLite chat history tables with nullable text columns."""
+    connection = Tortoise.get_connection("default")
+    raw_dialect = str(
+        getattr(getattr(connection, "capabilities", None), "dialect", "") or ""
+    ).lower()
+    if not raw_dialect.startswith("sqlite"):
+        return
+
+    columns = await connection.execute_query_dict("PRAGMA table_info(chat_history)")
+    if not columns:
+        return
+    nullable_columns = {"group_id", "text", "plain_text"}
+    if not any(
+        str(row.get("name")) in nullable_columns and int(row.get("notnull") or 0)
+        for row in columns
+    ):
+        return
+
+    column_names = [str(row["name"]) for row in columns if row.get("name")]
+    definitions: list[str] = []
+    for row in columns:
+        name = str(row["name"])
+        sql_type = str(row.get("type") or "TEXT")
+        definition = f'"{name.replace(chr(34), chr(34) + chr(34))}" {sql_type}'
+        if int(row.get("pk") or 0) == 1:
+            definition += " PRIMARY KEY"
+            if name == "id" and sql_type.upper() == "INTEGER":
+                definition += " AUTOINCREMENT"
+        elif int(row.get("notnull") or 0) and name not in nullable_columns:
+            definition += " NOT NULL"
+        if row.get("dflt_value") is not None:
+            definition += f" DEFAULT {row['dflt_value']}"
+        definitions.append(definition)
+
+    indexes = await connection.execute_query_dict("PRAGMA index_list(chat_history)")
+    index_definitions: list[tuple[str, tuple[str, ...], bool]] = []
+    for index in indexes:
+        name = str(index.get("name") or "")
+        if not name or name.startswith("sqlite_autoindex"):
+            continue
+        info = await connection.execute_query_dict(
+            f'PRAGMA index_info("{name.replace(chr(34), chr(34) + chr(34))}")'
+        )
+        index_columns = tuple(
+            str(item["name"])
+            for item in sorted(info, key=lambda item: int(item.get("seqno") or 0))
+            if item.get("name")
+        )
+        if index_columns:
+            index_definitions.append((name, index_columns, bool(index.get("unique"))))
+
+    temporary_table = f"chat_history__nullable_{os.getpid()}"
+
+    def quote(value: str) -> str:
+        return f'"{value.replace(chr(34), chr(34) + chr(34))}"'
+
+    table_sql = quote("chat_history")
+    temporary_sql = quote(temporary_table)
+    columns_sql = ", ".join(quote(name) for name in column_names)
+    statements = [
+        "PRAGMA foreign_keys=OFF",
+        f"DROP TABLE IF EXISTS {temporary_sql}",
+        f"CREATE TABLE {temporary_sql} ({', '.join(definitions)})",
+        f"INSERT INTO {temporary_sql} ({columns_sql}) "
+        f"SELECT {columns_sql} FROM {table_sql}",
+        f"DROP TABLE {table_sql}",
+        f"ALTER TABLE {temporary_sql} RENAME TO {table_sql}",
+    ]
+    statements.extend(
+        "CREATE "
+        f"{'UNIQUE ' if unique else ''}INDEX {quote(name)} ON {table_sql}"
+        f"({', '.join(quote(column) for column in index_columns)})"
+        for name, index_columns, unique in index_definitions
+    )
+    statements.append("PRAGMA foreign_keys=ON")
+
+    try:
+        async with in_transaction(connection_name="default") as transaction:
+            for statement in statements:
+                await transaction.execute_query(statement)
+    except Exception:
+        with suppress(Exception):
+            await connection.execute_query("PRAGMA foreign_keys=ON")
+        raise
 
 
 class ChatHistory(Model):
@@ -151,11 +245,11 @@ class ChatHistory(Model):
     async def _run_script(cls):
         return [
             # 允许 group_id 为空
-            "alter table chat_history alter group_id drop not null;",
+            SetColumnNullable("chat_history", "group_id", {"mysql": "VARCHAR(255)"}),
             # 允许 text 为空
-            "alter table chat_history alter text drop not null;",
+            SetColumnNullable("chat_history", "text", {"mysql": "TEXT"}),
             # 允许 plain_text 为空
-            "alter table chat_history alter plain_text drop not null;",
+            SetColumnNullable("chat_history", "plain_text", {"mysql": "TEXT"}),
             # 将user_id改为user_id
             RenameColumn("chat_history", "user_qq", "user_id"),
             AlterColumnType(

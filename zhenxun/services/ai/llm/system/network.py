@@ -9,6 +9,7 @@ from contextvars import Token
 import json
 import os
 from pathlib import Path
+import ssl
 import time
 from typing import Any
 
@@ -24,8 +25,8 @@ from zhenxun.services.ai.core.exceptions import (
     RateLimitException,
 )
 from zhenxun.services.ai.utils.logger import log_llm as logger
-from zhenxun.services.lifecycle.deadline import current_budget
-from zhenxun.services.network_proxy import ManagedAsyncClient
+from zhenxun.services.lifecycle.deadline import current_budget, remaining_timeout
+from zhenxun.services.network_proxy import ManagedAsyncClient, ProxyRequestError
 from zhenxun.utils.pydantic_compat import model_dump, parse_as
 from zhenxun.utils.user_agent import get_user_agent
 
@@ -87,10 +88,83 @@ class LLMHttpClient:
         async with self._lock:
             self._active_requests += 1
         try:
-            return await client.request(method, url, **kwargs)
+            timeout = kwargs.get("timeout", self.config.timeout)
+            if isinstance(timeout, httpx.Timeout):
+                timeout = max(
+                    value or self.config.timeout for value in timeout.as_dict().values()
+                )
+            budget = remaining_timeout(float(timeout or self.config.timeout))
+            return await asyncio.wait_for(
+                self._request_with_recovery(client, method, url, kwargs), budget
+            )
+        except asyncio.TimeoutError as error:
+            raise httpx.ReadTimeout("LLM request budget exhausted") from error
         finally:
             async with self._lock:
                 self._active_requests -= 1
+
+    async def _request_with_recovery(self, client, method, url, kwargs):
+        # httpcore's trace identifies a failed TCP connect before any application
+        # headers were sent. A reused socket's read/write failure is NOT replayable.
+        extensions = dict(kwargs.pop("extensions", {}) or {})
+        original_trace = extensions.get("trace")
+        application_started = False
+        connect_failed = False
+
+        async def trace(event, info):
+            nonlocal application_started, connect_failed
+            if event.endswith("send_request_headers.started"):
+                request = info.get("request")
+                if getattr(request, "method", None) != b"CONNECT":
+                    application_started = True
+            if event == "connection.connect_tcp.failed":
+                connect_failed = True
+            if original_trace is not None:
+                await original_trace(event, info)
+
+        extensions["trace"] = trace
+        async with client.proxy_runtime.request_scope() as scope:
+            for attempt in range(2):
+                connect_failed = False
+                try:
+                    return await client.request(
+                        method, url, extensions=extensions, **kwargs
+                    )
+                except (
+                    ProxyRequestError,
+                    httpx.ConnectError,
+                    httpx.ConnectTimeout,
+                ) as error:
+                    cause = (
+                        error.__cause__
+                        if isinstance(error, ProxyRequestError)
+                        else error
+                    )
+                    seen = set()
+                    tls_failure = False
+                    current = cause
+                    while current is not None and id(current) not in seen:
+                        seen.add(id(current))
+                        tls_failure |= isinstance(current, ssl.SSLError)
+                        current = current.__cause__ or current.__context__
+                    retry = (
+                        attempt == 0
+                        and connect_failed
+                        and not application_started
+                        and not tls_failure
+                        and isinstance(cause, httpx.ConnectError | httpx.ConnectTimeout)
+                        and not client.proxy_runtime.stopping
+                        and client.proxy_runtime.current is scope.generation
+                    )
+                    if not retry:
+                        raise
+                    await asyncio.sleep(0.2)
+                    if (
+                        client.proxy_runtime.stopping
+                        or client.proxy_runtime.current is not scope.generation
+                    ):
+                        raise
+                    logger.debug("AI 连接尚未建立，重新连接一次")
 
     async def post(self, url: str, **kwargs: Any) -> httpx.Response:
         """发送异步 POST 请求"""

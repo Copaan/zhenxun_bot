@@ -147,6 +147,32 @@ class DropColumn:
 
 
 @dataclass(frozen=True, slots=True)
+class DropConstraint:
+    table: str
+    constraint: str
+    risk: SchemaOpRisk = SchemaOpRisk.GUARDED
+
+    def to_sql(self, dialect: Dialect) -> list[str]:
+        """Drop a named legacy uniqueness object using the database dialect.
+
+        SQLite has no ``ALTER TABLE ... DROP CONSTRAINT`` form.  A named
+        constraint from a PostgreSQL migration is therefore deliberately not
+        emitted for SQLite; an SQLite table rebuild must be an explicit,
+        model-specific migration because the engine may represent the legacy
+        constraint as an unnamed autoindex.
+        """
+        table = quote_identifier(self.table, dialect)
+        constraint = quote_identifier(self.constraint, dialect)
+        if dialect == "postgres":
+            return [f"ALTER TABLE {table} DROP CONSTRAINT IF EXISTS {constraint}"]
+        if dialect == "mysql":
+            return [f"ALTER TABLE {table} DROP INDEX {constraint}"]
+        if dialect == "sqlite":
+            return []
+        raise ValueError(f"unsupported_constraint_dialect:{dialect}")
+
+
+@dataclass(frozen=True, slots=True)
 class AlterColumnType:
     table: str
     column: str
@@ -168,6 +194,30 @@ class AlterColumnType:
                 f"ALTER TABLE {table} MODIFY COLUMN {column} {column_type}{null_sql}"
             ]
         return []
+
+
+@dataclass(frozen=True, slots=True)
+class SetColumnNullable:
+    """Make an existing column nullable using the database dialect."""
+
+    table: str
+    column: str
+    column_type: str | dict[str, str]
+    risk: SchemaOpRisk = SchemaOpRisk.SAFE
+
+    def to_sql(self, dialect: Dialect) -> list[str]:
+        table = quote_identifier(self.table, dialect)
+        column = quote_identifier(self.column, dialect)
+        if dialect == "postgres":
+            return [f"ALTER TABLE {table} ALTER COLUMN {column} DROP NOT NULL"]
+        if dialect == "mysql":
+            column_type = _column_type(self.column_type, dialect)
+            return [f"ALTER TABLE {table} MODIFY COLUMN {column} {column_type} NULL"]
+        if dialect == "sqlite":
+            # SQLite requires a table rebuild.  The model-specific migration
+            # performs that rebuild after schema generation.
+            return []
+        raise ValueError(f"unsupported_nullable_dialect:{dialect}")
 
 
 def normalize_schema_ops(items: list[str | SchemaOp], dialect: Dialect) -> list[str]:

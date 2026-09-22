@@ -96,6 +96,7 @@ def archive_dependency_contract() -> dict[str, Any]:
     package_source_revisions: dict[str, list[str]] = {}
     legacy_receipts: list[str] = []
     resolved_records: list[str] = []
+    receipt_fingerprints: dict[str, str | None] = {}
     current_fingerprint = archive_environment_fingerprint()
     for key, receipt in records:
         if not isinstance(receipt, dict):
@@ -103,6 +104,7 @@ def archive_dependency_contract() -> dict[str, Any]:
                 "archive_dependency_receipt_invalid",
                 details={"archive_owner": key, "reason": "receipt_not_object"},
             )
+        receipt_fingerprints[key] = receipt.get("environment_fingerprint")
         roots = receipt.get("dependency_inputs")
         pins = receipt.get("dependency_packages")
         if not isinstance(roots, list):
@@ -236,6 +238,7 @@ def archive_dependency_contract() -> dict[str, Any]:
         },
         "legacy_receipts": sorted(set(legacy_receipts)),
         "resolved_records": sorted(set(resolved_records)),
+        "receipt_environment_fingerprints": receipt_fingerprints,
         "requires_wheels": bool(wheels_only_packages),
         "environment_fingerprint": current_fingerprint,
     }

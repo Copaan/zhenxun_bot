@@ -443,11 +443,11 @@ class RateLimitException(LLMException):
 class UpstreamServerException(LLMException):
     @property
     def is_retryable(self) -> bool:
-        return True
+        return not self.details.get("network_attempt_complete", False)
 
     @property
     def should_failover(self) -> bool:
-        return True
+        return not self.details.get("network_attempt_complete", False)
 
     @property
     def user_friendly_message(self) -> str:
@@ -457,11 +457,11 @@ class UpstreamServerException(LLMException):
 class NetworkTimeoutException(LLMException):
     @property
     def is_retryable(self) -> bool:
-        return True
+        return not self.details.get("network_attempt_complete", False)
 
     @property
     def should_failover(self) -> bool:
-        return True
+        return not self.details.get("network_attempt_complete", False)
 
     @property
     def user_friendly_message(self) -> str:

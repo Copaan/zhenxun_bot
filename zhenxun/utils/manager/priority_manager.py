@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
 import inspect
+import os
 import time
 from typing import ClassVar, Literal
 
@@ -275,9 +276,10 @@ def _build_start_component(
             return result
         except (Exception, HookPriorityException) as error:
             logger.error(
-                "执行启动钩子失败: " f"{_hook_name(func)} ({type(error).__name__})",
+                f"执行启动钩子失败: {_hook_name(func)} ({type(error).__name__})",
                 e=error if isinstance(error, Exception) else None,
             )
+            error._startup_trace_logged = True
             from zhenxun.services.lifecycle.provider_undo import active_undo
             from zhenxun.services.startup_load import startup_load_planner
 
@@ -539,12 +541,18 @@ async def _shutdown_with_budget():
     from zhenxun.services.lifecycle.deadline import remaining_timeout
     from zhenxun.services.runtime_mutation import runtime_mutation_coordinator
 
+    def probe_phase(name: str) -> None:
+        if os.getenv("ZHENXUN_SHUTDOWN_PROBE"):
+            print(f"[shutdown-phase] {name}", flush=True)  # noqa: T201
+
+    probe_phase("quiesce-runtime-mutations")
     mutation_drained = await runtime_mutation_coordinator.quiesce(
         timeout=remaining_timeout(10)
     )
     if not mutation_drained:
         logger.error("运行时变更事务未能在关闭前排空，将要求 worker 恢复。")
     task = _post_management_task
+    probe_phase("cancel-post-management")
     _post_management_task = None
     if task is not None and not task.done():
         task.cancel()
@@ -555,6 +563,7 @@ async def _shutdown_with_budget():
             if not completed.cancelled():
                 completed.exception()
 
+    probe_phase("stop-lifecycle-components")
     paired = _sync_kernel_declarations()
     await lifecycle_kernel.stop_all()
     runtime_mutation_coordinator.close()
@@ -562,6 +571,7 @@ async def _shutdown_with_budget():
     if not priority_data:
         return
     for priority in sorted(priority_data):
+        probe_phase(f"shutdown-priority-{priority}")
         for func in list(priority_data[priority]):
             if func in paired:
                 continue

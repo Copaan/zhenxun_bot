@@ -52,6 +52,7 @@ from zhenxun.services.ai.llm.system.network import (
     LLMHttpClient,
 )
 from zhenxun.services.ai.utils.logger import log_llm as logger
+from zhenxun.services.network_proxy import ProxyPolicyError
 from zhenxun.utils.http_utils import AsyncHttpx
 from zhenxun.utils.log_sanitizer import sanitize_for_logging
 from zhenxun.utils.pydantic_compat import (
@@ -222,9 +223,10 @@ class FailoverAndRetryMiddleware:
             except LLMException as e:
                 last_exception = e
 
-                await self.health_manager.record_key_failure(
-                    self.provider_name, selected_key, e
-                )
+                if not e.details.get("network_attempt_complete"):
+                    await self.health_manager.record_key_failure(
+                        self.provider_name, selected_key, e
+                    )
 
                 if e.should_rotate_key:
                     self._failed_keys.add(selected_key)
@@ -295,7 +297,7 @@ class LoggingMiddleware:
 
         if logger.is_enabled("debug"):
             logger.debug(f"📡 请求URL: {request_data.url}")
-            logger.debug(f"📋 请求头: {dict(request_data.headers)}")
+            logger.debug(f"📋 请求头名称: {list(request_data.headers)}")
 
             if self.identity.api_type == "smart":
                 from zhenxun.services.ai.llm.adapters.factory import SmartAdapter
@@ -423,10 +425,16 @@ class HttpExecutionMiddleware:
             raise
         except httpx.TimeoutException as e:
             await self.health_manager.record_route_failure(route_id, e)
-            raise NetworkTimeoutException(f"HTTP请求超时: {e}", cause=e)
-        except httpx.NetworkError as e:
+            raise NetworkTimeoutException(
+                "HTTP请求超时", cause=e, details={"network_attempt_complete": True}
+            ) from e
+        except (httpx.RequestError, ProxyPolicyError) as e:
             await self.health_manager.record_route_failure(route_id, e)
-            raise UpstreamServerException(f"网络连接中断: {e}", cause=e)
+            raise UpstreamServerException(
+                f"网络请求失败: {getattr(e, 'code', type(e).__name__)}",
+                cause=e,
+                details={"network_attempt_complete": True},
+            ) from e
         except LLMException as e:
             if e.should_failover:
                 await self.health_manager.record_route_failure(route_id, e)

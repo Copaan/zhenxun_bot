@@ -165,7 +165,7 @@ class PlatformUtils:
             return True
         if BotConfig.get_qbot_uid(session.self_id):
             return True
-        return session.scope == SupportScope.qq_api
+        return getattr(session, "scope", None) == SupportScope.qq_api
 
     @classmethod
     async def ban_user(cls, bot: Bot, user_id: str, group_id: str, duration: int):
@@ -247,9 +247,13 @@ class PlatformUtils:
     ) -> AsyncIterator[UserData]:
         """Enumerate only on demand; errors never masquerade as an empty roster."""
         from nonebot.adapters.onebot.v11 import Bot as OneBotBot
-        from nonebot.adapters.qq import Bot as QQBot
 
-        if isinstance(bot, QQBot):
+        try:
+            from nonebot.adapters.qq import Bot as QQBot
+        except ModuleNotFoundError:
+            QQBot = None
+
+        if QQBot is not None and isinstance(bot, QQBot):
             if scene == SceneType.GROUP:
                 cursor = None
                 seen = set()
@@ -654,9 +658,13 @@ class PlatformUtils:
     def get_platform_scope(cls, t: Bot | Uninfo | object) -> str:
         """Resolve a verified protocol domain, never infer QQ from a name fragment."""
         from nonebot.adapters.onebot.v11 import Bot as OneBotBot
-        from nonebot.adapters.qq import Bot as QQBot
 
-        if isinstance(t, QQBot):
+        try:
+            from nonebot.adapters.qq import Bot as QQBot
+        except ModuleNotFoundError:
+            QQBot = None
+
+        if QQBot is not None and isinstance(t, QQBot):
             return "qq_api"
         if isinstance(t, OneBotBot):
             return "qq_client"

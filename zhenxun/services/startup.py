@@ -415,8 +415,13 @@ class StartupCoordinator:
                 f"stage={reason['stage']} | source={reason['source_type']}:"
                 f"{reason['source_id']} | code={reason['code']}",
                 "Startup",
-                e=error if isinstance(error, Exception) else None,
+                e=error
+                if isinstance(error, Exception)
+                and not getattr(error, "_startup_trace_logged", False)
+                else None,
             )
+            if error is not None:
+                error._startup_trace_logged = True
         except Exception:
             pass
 

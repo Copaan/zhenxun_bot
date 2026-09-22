@@ -241,6 +241,8 @@ def _registered_groups() -> list[dict[str, Any]]:
                 "module": module,
                 "name": group.name or module,
                 "fields": fields,
+                "registered": True,
+                "source_status": "loaded",
             }
         )
     stored = _yaml_parser().load(StringIO(_read(_SIMPLE_FILE))) or {}
@@ -254,6 +256,7 @@ def _registered_groups() -> list[dict[str, Any]]:
                         "name": str(module),
                         "fields": [],
                         "registered": False,
+                        "source_status": "invalid_top_level",
                         "raw_value": jsonable_encoder(values),
                         "readonly_reason": "此顶层值不是配置组映射，请使用原文编辑。",
                     }
@@ -266,6 +269,7 @@ def _registered_groups() -> list[dict[str, Any]]:
                     "name": str(module),
                     "fields": [],
                     "registered": False,
+                    "source_status": "orphaned",
                 }
                 groups.append(group)
             existing = {item["key"].upper(): item for item in group["fields"]}

@@ -1,5 +1,6 @@
 import asyncio
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 import hashlib
 import json
 import os
@@ -13,7 +14,8 @@ import nonebot
 from nonebot.utils import is_coroutine_callable
 from tortoise import Tortoise
 from tortoise.connection import connections
-from tortoise.exceptions import ConfigurationError, OperationalError
+from tortoise.exceptions import ConfigurationError
+from tortoise.transactions import in_transaction
 
 from zhenxun.configs.config import BotConfig
 from zhenxun.configs.database import is_sqlite_memory_url, sqlite_path_from_url
@@ -34,9 +36,17 @@ from .config import (
 from .exceptions import DbConnectError, DbUrlIsNode
 from .schema_guard import repair_safe_schema_drift
 from .schema_ops import SchemaOpRisk, normalize_schema_ops
+from .script_compat import script_action
 from .utils import with_db_timeout
 
 Dialect = Literal["sqlite", "postgres", "mysql", "unknown"]
+
+
+@dataclass(frozen=True, slots=True)
+class MigrationStatement:
+    owner: str
+    sql: str
+
 
 MODELS = db_model.models
 SCRIPT_METHOD = db_model.script_method
@@ -102,6 +112,21 @@ def _extract_alter_table_name(sql: str) -> str | None:
 def _extract_create_index_table_name(sql: str) -> str | None:
     match = re.search(r"\bON\s+[`\"]?(\w+)[`\"]?\s*\(", sql, re.IGNORECASE)
     return match.group(1) if match else None
+
+
+def _extract_statement_table_name(sql: str) -> str | None:
+    """Extract the target table for statements that need existence checks."""
+    patterns = (
+        r"^ALTER\s+TABLE\s+[`\"]?(\w+)[`\"]?",
+        r"^UPDATE\s+[`\"]?(\w+)[`\"]?",
+        r"^DELETE\s+FROM\s+[`\"]?(\w+)[`\"]?",
+        r"^INSERT\s+INTO\s+[`\"]?(\w+)[`\"]?",
+    )
+    for pattern in patterns:
+        match = re.match(pattern, sql.strip(), re.IGNORECASE)
+        if match:
+            return match.group(1)
+    return _extract_create_index_table_name(sql)
 
 
 def _db_script_hash_file(script_fingerprint: str) -> Path:
@@ -175,101 +200,111 @@ async def _schema_migration_lock():
             handle.close()
 
 
-async def _run_script_migrations(sql_list: list[str], fingerprint: str) -> None:
-    """Run additive scripts once per database, with a cross-process lock."""
+async def _run_script_migrations(
+    statements: list[MigrationStatement | str], fingerprint: str
+) -> None:
+    """Run legacy scripts once; deferred declarations are not completed DDL."""
+    normalized = [
+        item
+        if isinstance(item, MigrationStatement)
+        else MigrationStatement("unknown", item)
+        for item in statements
+    ]
     script_hash_file = _db_script_hash_file(fingerprint)
     async with _schema_migration_lock():
+        # Read both fingerprint formats. Adding diagnostics must not replay DML.
+        aliases = {
+            fingerprint,
+            hashlib.md5(
+                json.dumps(
+                    sorted(item.sql for item in normalized), ensure_ascii=False
+                ).encode()
+            ).hexdigest(),
+            hashlib.md5(
+                json.dumps(
+                    sorted((item.owner, item.sql) for item in normalized),
+                    ensure_ascii=False,
+                ).encode()
+            ).hexdigest(),
+        }
+        previous = {}
+        for candidate in aliases:
+            try:
+                saved = json.loads(
+                    _db_script_hash_file(candidate).read_text(encoding="utf-8")
+                )
+            except (OSError, json.JSONDecodeError):
+                continue
+            if isinstance(saved, dict) and saved.get("script_fingerprint") == candidate:
+                if saved.get("status") in {None, "completed", "legacy_deferred"}:
+                    logger.debug("迁移脚本无变化，跳过执行")
+                    return
+                # Ordinals are meaningful only for the exact ordered input.
+                if saved.get("status") == "pending_tables":
+                    if saved.get("statements") != [item.sql for item in normalized]:
+                        raise RuntimeError(
+                            "待完成迁移的语句顺序已变化，拒绝重放已执行数据脚本"
+                        )
+                    previous = saved
+
+        dialect = _connection_dialect()
+        attempted: list[MigrationStatement] = []
+        completed = set(previous.get("completed", []))
+        deferred_indexes = set(previous.get("deferred_indexes", []))
+        deferred = list(previous.get("deferred", []))
+        pending = []
+        current: MigrationStatement | None = None
+        current_index = -1
         try:
-            previous = json.loads(script_hash_file.read_text(encoding="utf-8"))
-        except (FileNotFoundError, OSError, json.JSONDecodeError):
-            previous = {}
-        if previous.get("script_fingerprint") == fingerprint:
-            logger.debug("迁移脚本无变化，跳过执行")
-            return
-
-        db = Tortoise.get_connection("default")
-
-        async def table_exists(table_name: str) -> bool:
-            try:
-                result = await db.execute_query_dict(
-                    "SELECT to_regclass($1) IS NOT NULL as exists", [table_name]
-                )
-                if result:
-                    return bool(result[0]["exists"])
-            except Exception:
-                pass
-            try:
-                result = await db.execute_query_dict(
-                    "SELECT COUNT(*) as count FROM information_schema.tables "
-                    "WHERE table_name = %s",
-                    [table_name],
-                )
-                if result:
-                    return bool(result[0]["count"])
-            except Exception:
-                pass
-            try:
-                result = await db.execute_query_dict(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
-                    [table_name],
-                )
-                return bool(result)
-            except Exception:
-                return True
-
-        failed: list[tuple[str, Exception]] = []
-        for sql in sql_list:
-            sql_upper = sql.strip().upper()
-            if sql_upper.startswith("ALTER TABLE"):
-                table_name = _extract_alter_table_name(sql)
-                if table_name and not await table_exists(table_name):
-                    logger.debug(f"跳过SQL（表不存在）: {sql}")
-                    continue
-            elif sql_upper.startswith("CREATE INDEX"):
-                table_name = _extract_create_index_table_name(sql)
-                if table_name and not await table_exists(table_name):
-                    logger.debug(f"跳过SQL（表不存在）: {sql}")
-                    continue
-
-            logger.debug(f"执行SQL: {sql}")
-            try:
-                await asyncio.wait_for(
-                    db.execute_query_dict(sql), timeout=DB_TIMEOUT_SECONDS
-                )
-            except OperationalError as error:
-                error_text = str(error).lower()
-                sql_lower = sql.lower()
-                if any(
-                    marker in error_text
-                    for marker in (
-                        "already exists",
-                        "duplicate column",
-                        "已经存在",
-                        "已存在",
+            async with in_transaction(connection_name="default") as transaction:
+                for index, statement in enumerate(normalized):
+                    current = statement
+                    current_index = index
+                    sql = statement.sql
+                    if index in completed or index in deferred_indexes:
+                        continue
+                    action = await asyncio.wait_for(
+                        script_action(transaction, sql, dialect), DB_TIMEOUT_SECONDS
                     )
-                ):
-                    continue
-                if any(
-                    marker in error_text
-                    for marker in (
-                        "does not exist",
-                        "check that",
-                        "不存在",
-                        "no such column",
-                    )
-                ) and ("drop" in sql_lower or "rename" in sql_lower):
-                    continue
-                if "syntax error" in error_text and (
-                    "alter column" in sql_lower or "drop not null" in sql_lower
-                ):
-                    continue
-                failed.append((sql, error))
-            except Exception as error:
-                failed.append((sql, error))
-
-        if failed:
-            details = "; ".join(f"{sql}: {error}" for sql, error in failed[:3])
-            raise RuntimeError(f"数据库迁移未完成，未写入脚本指纹: {details}")
+                    if action == "missing_table":
+                        pending.append(index)
+                        continue
+                    if action == "legacy_deferred":
+                        deferred.append({"owner": statement.owner, "sql": sql})
+                        logger.warning(
+                            "SQLite 保留旧插件兼容声明（未执行类型转换）: "
+                            f"{statement.owner}: {sql}"
+                        )
+                        deferred_indexes.add(index)
+                        continue
+                    elif action == "execute":
+                        attempted.append(statement)
+                        logger.debug(f"执行迁移SQL: {statement.owner}: {sql}")
+                        await asyncio.wait_for(
+                            transaction.execute_query_dict(sql),
+                            timeout=DB_TIMEOUT_SECONDS,
+                        )
+                    completed.add(index)
+        except Exception as error:
+            remaining = (
+                normalized[current_index + 1 :] if current_index >= 0 else normalized
+            )
+            current_text = f"{current.owner}: {current.sql}" if current else "<unknown>"
+            logger.debug(
+                f"迁移失败明细: dialect={dialect}; "
+                f"attempted={attempted}; pending={remaining}"
+            )
+            rollback = (
+                "DDL may be committed"
+                if dialect == "mysql"
+                else "transaction rolled back"
+            )
+            raise RuntimeError(
+                "数据库迁移未完成，未写入脚本指纹: "
+                f"dialect={dialect}; current={current_text}; error={error}; "
+                f"attempted_count={len(attempted)}; pending_count={len(remaining)}; "
+                f"rollback={rollback}"
+            ) from error
 
         payload = json.dumps(
             {
@@ -278,6 +313,16 @@ async def _run_script_migrations(sql_list: list[str], fingerprint: str) -> None:
                     (BotConfig.db_url or "").encode()
                 ).hexdigest(),
                 "script_fingerprint": fingerprint,
+                "status": "pending_tables"
+                if pending
+                else "legacy_deferred"
+                if deferred
+                else "completed",
+                "statements": [item.sql for item in normalized],
+                "completed": sorted(completed),
+                "deferred_indexes": sorted(deferred_indexes),
+                "deferred": deferred,
+                "pending": pending,
             },
             ensure_ascii=False,
             indent=2,
@@ -383,12 +428,12 @@ async def init():
         from .timing import instrument_client
 
         instrument_client(Tortoise.get_connection("default"))
+        migration_statements: list[MigrationStatement] = []
         if db_model.script_method:
             logger.debug(
                 "即将运行SCRIPT_METHOD方法, 合计 "
                 f"<u><y>{len(db_model.script_method)}</y></u> 个..."
             )
-            sql_list = []
             allow_guarded_ops = _allow_guarded_schema_ops()
             for module, func in db_model.script_method:
                 try:
@@ -409,25 +454,38 @@ async def init():
                             if item.risk != SchemaOpRisk.SAFE and not allow_guarded_ops:
                                 logger.debug(f"{module} 跳过未知风险迁移动作: {item}")
                                 continue
-                        sql_list += normalize_schema_ops([item], _connection_dialect())
+                        owner = f"{module}:{getattr(func, '__qualname__', 'script')}"
+                        migration_statements.extend(
+                            MigrationStatement(owner, sql)
+                            for sql in normalize_schema_ops(
+                                [item], _connection_dialect()
+                            )
+                        )
                 except Exception as e:
                     logger.debug(f"{module} 执行SCRIPT_METHOD方法出错...", e=e)
-            if sql_list:
+            if migration_statements:
                 fingerprint = hashlib.md5(
-                    json.dumps(sorted(sql_list), ensure_ascii=False).encode()
+                    json.dumps(
+                        sorted(item.sql for item in migration_statements),
+                        ensure_ascii=False,
+                    ).encode()
                 ).hexdigest()
-                await _run_script_migrations(sql_list, fingerprint)
+                await _run_script_migrations(migration_statements, fingerprint)
         # Tortoise may emit column comments/index SQL during generate_schemas().
         # On existing databases with newly added nullable fields, PostgreSQL can
         # fail before the post-generate SchemaGuard gets a chance to repair drift.
         await repair_safe_schema_drift()
         logger.debug("开始生成数据库表结构...")
         await Tortoise.generate_schemas()
+        if migration_statements:
+            await _run_script_migrations(migration_statements, fingerprint)
         logger.debug("数据库表结构生成完毕!")
+        from zhenxun.models.chat_history import ensure_chat_history_nullable_columns
         from zhenxun.models.group_plugin_setting import (
             ensure_group_plugin_scope_constraint,
         )
 
+        await ensure_chat_history_nullable_columns()
         async with _schema_migration_lock():
             await ensure_group_plugin_scope_constraint()
         await repair_safe_schema_drift()

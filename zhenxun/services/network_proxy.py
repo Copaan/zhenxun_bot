@@ -557,10 +557,12 @@ class LeasedStream(httpx.AsyncByteStream):
 
     async def aclose(self):
         if not self.closed:
-            await self.stream.aclose()
             self.closed = True
-            self.generation.users -= 1
-            await self.runtime.reap(suppress_errors=True)
+            try:
+                await self.stream.aclose()
+            finally:
+                self.generation.users -= 1
+                await self.runtime.reap(suppress_errors=True)
 
 
 class RoutingTransport(httpx.AsyncBaseTransport):
@@ -623,7 +625,7 @@ class RoutingTransport(httpx.AsyncBaseTransport):
                 if isinstance(error, httpx.TimeoutException)
                 else "proxy_connection_failed"
             )
-            raise ProxyRequestError(code) from None
+            raise ProxyRequestError(code) from error
         if proxy and response.status_code == 407:
             await response.aclose()
             self.runtime.counts["proxy_error"] += 1

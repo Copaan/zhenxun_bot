@@ -184,6 +184,10 @@ def _httpx(client_type, transport_type, asynchronous):
 
     @wraps(send)
     async def async_send(client, request, **kwargs):
+        from .network_proxy import ManagedAsyncClient
+
+        if isinstance(client, ManagedAsyncClient):
+            return await send(client, request, **kwargs)
         with request_scope():
             try:
                 return await send(client, request, **kwargs)
