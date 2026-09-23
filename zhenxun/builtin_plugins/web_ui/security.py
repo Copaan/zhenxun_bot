@@ -4,11 +4,12 @@ import asyncio
 from collections.abc import Coroutine
 import contextlib
 import json
+from pathlib import Path
 import time
 from typing import Any
 
 from fastapi import HTTPException, Request
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 from jose import JWTError, jwt
 from jose.exceptions import ExpiredSignatureError
@@ -276,7 +277,6 @@ class PrivateNetworkStaticFiles(StaticFiles):
         await super().__call__(scope, receive, send)
 
     async def get_response(self, path: str, scope: Scope):
-        response = await super().get_response(path, scope)
         filename = path.rsplit("/", 1)[-1]
         parts = filename.split(".")
         has_content_hash = any(
@@ -284,6 +284,33 @@ class PrivateNetworkStaticFiles(StaticFiles):
             and all(character in "0123456789abcdef" for character in part.lower())
             for part in parts[1:-1]
         )
+        if has_content_hash:
+            response = await super().get_response(path, scope)
+        else:
+            from zhenxun.services.webui_resources import webui_resources
+
+            headers = dict(scope.get("headers", []))
+            unconditional = {
+                **scope,
+                "headers": [
+                    (key, value)
+                    for key, value in scope.get("headers", [])
+                    if key.lower() not in {b"if-none-match", b"if-modified-since"}
+                ],
+            }
+            response = await super().get_response(path, unconditional)
+            response.headers["Cache-Control"] = "no-cache"
+            etag = webui_resources.etag(Path(self.directory) / path)
+            if etag and response.status_code == 200:
+                response.headers["ETag"] = etag
+                if headers.get(b"if-none-match", b"").decode("latin-1") == etag:
+                    return Response(
+                        status_code=304,
+                        headers={
+                            "ETag": etag,
+                            "Cache-Control": "no-cache",
+                        },
+                    )
         if has_content_hash and response.status_code == 200:
             response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
         return response

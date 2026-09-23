@@ -59,6 +59,7 @@ class ProcessHandle:
     completion_expected: bool = False
     _next_tree_discovery: float = 0.0
     _tree_scan_count: int = 0
+    _identity_unverified: bool = False
     _runtime_identity: tuple[int, float] | None = field(
         default=None, init=False, repr=False
     )
@@ -76,17 +77,18 @@ class ProcessHandle:
     def _live_processes(self, *, discover: bool = False):
         import psutil
 
-        if not self.identities and self.process.poll() is None:
+        # Reap the direct child before inspecting psutil's stale zombie state.
+        returncode = self.process.poll()
+        if self._identity_unverified or (not self.identities and returncode is None):
             raise RuntimeError("process_identity_unverified")
         live = []
         for pid, created in list(self.identities.items()):
             try:
                 process = psutil.Process(pid)
-                if (
-                    process.create_time() != created
-                    or not process.is_running()
-                    or process.status() == psutil.STATUS_ZOMBIE
-                ):
+                if process.create_time() != created:
+                    self._identity_unverified = True
+                    raise RuntimeError("process_identity_unverified")
+                if not process.is_running() or process.status() == psutil.STATUS_ZOMBIE:
                     self.identities.pop(pid, None)
                     continue
                 live.append(process)
@@ -539,7 +541,9 @@ class LauncherSupervisor:
         self._publish_processes()
         return self._handles[self._role_pids[role]].process
 
-    async def stop_process(self, process: subprocess.Popen) -> None:
+    async def stop_process(
+        self, process: subprocess.Popen, *, allow_force: bool = True
+    ) -> None:
         handle = self._handles.get(process.pid)
         if handle is None:
             handle = self.attach("worker", process)
@@ -561,6 +565,8 @@ class LauncherSupervisor:
                 try:
                     await handle.close()
                 except (TimeoutError, asyncio.CancelledError):
+                    if not allow_force:
+                        raise TimeoutError("process_cooperative_timeout") from None
                     await handle.force_close()
             self.release(process, handle.exit_reason or "exited")
         finally:
@@ -569,13 +575,22 @@ class LauncherSupervisor:
     async def shutdown(self) -> None:
         self.begin_shutdown()
         extra_roles = set(self._role_pids) - {"qq_ingress", "http_sidecar", "worker"}
+        first_error = None
         for role in ("qq_ingress", "http_sidecar", *sorted(extra_roles), "worker"):
             pid = self._role_pids.get(role)
             if pid in self._handles:
-                await self.stop_process(self._handles[pid].process)
+                try:
+                    await self.stop_process(self._handles[pid].process)
+                except Exception as error:
+                    first_error = first_error or error
         token = current_budget.set(self.shutdown_deadline)
         try:
-            await self.kernel.stop_all(timeout=15.0)
+            try:
+                await self.kernel.stop_all(timeout=15.0)
+            except Exception as error:
+                first_error = first_error or error
+            if first_error is not None:
+                raise first_error
         finally:
             current_budget.reset(token)
 

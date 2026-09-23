@@ -311,6 +311,8 @@ def create_router(
             if set(payload) - {
                 "categories",
                 "confirm_secrets",
+                "allow_forced_shutdown",
+                "task_id",
                 "dependencies",
                 "password",
             }:
@@ -331,8 +333,12 @@ def create_router(
                         categories=frozenset(categories),
                         plaintext_confirmed=True,
                         dependencies=payload.get("dependencies", True) is True,
+                        allow_forced_shutdown=payload.get(
+                            "allow_forced_shutdown", False
+                        ),
                     ),
                     password=payload.get("password"),
+                    task_id=payload.get("task_id"),
                 )
             )
 

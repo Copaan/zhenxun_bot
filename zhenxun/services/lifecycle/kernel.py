@@ -1477,11 +1477,39 @@ class LifecycleKernel:
                 context = self._registrations[component_id].context
                 if context is not None:
                     context.accepting = False
-            for component_id in ordered:
-                if component_id == "runtime:plugin_host":
+            remaining = set(ordered)
+            while remaining:
+                ordered = self._component_stop_order(remaining)
+                first = self._registrations[ordered[0]].spec
+                ready = [
+                    name
+                    for name in ordered
+                    if self._registrations[name].spec.scope == first.scope
+                    and self._registrations[name].spec.stop_priority
+                    == first.stop_priority
+                    and not (self._registrations[name].stop_after & remaining)
+                    and not any(
+                        name in self._registrations[other].spec.depends_on
+                        for other in remaining
+                    )
+                    and (
+                        name != "runtime:plugin_host"
+                        or not any(
+                            self._registrations[other].spec.source == "plugin_runtime"
+                            for other in remaining
+                            if other != name
+                        )
+                    )
+                ]
+                if not ready:
+                    ready = [ordered[0]]
+                if "runtime:plugin_host" in ready:
                     await asyncio.sleep(0)
                     self._reconcile_plugin_stops()
-                await self._stop_one(component_id, suppress_errors=True)
+                await asyncio.gather(
+                    *(self._stop_one(name, suppress_errors=True) for name in ready)
+                )
+                remaining.difference_update(ready)
             try:
                 await self.drain_scope_cleanups()
             except LifecycleError:

@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>真寻 · 迁移维护</title>
+<style>
+body{font:16px/1.6 sans-serif;background:#f5f7fa;color:#303133;margin:8vh auto;padding:24px;max-width:900px}
+main{background:#fff;border:1px solid #e4e7ed;border-radius:12px;padding:28px}
+label{display:block;margin:12px 0}input,button{font:inherit;padding:8px 12px}button{cursor:pointer}
+pre{white-space:pre-wrap;overflow-wrap:anywhere}#notice{color:#805500}
+</style>
+<main>
+  <h1>实例迁移维护</h1>
+  <p>业务服务正在切换。此页面独立于前端开发服务，不会重复提交迁移请求。</p>
+  <p id="notice" role="status">正在查询原任务…</p>
+  <form id="login" hidden>
+    <label>管理员账号 <input name="username" autocomplete="username" required></label>
+    <label>管理员密码 <input name="password" type="password" autocomplete="current-password" required></label>
+    <button type="submit">登录查看任务</button>
+  </form>
+  <pre id="task"></pre>
+  <button id="refresh" type="button">刷新状态</button>
+  <a href="/" id="return" hidden>返回管理页面</a>
+</main>
+<script>
+const notice=document.getElementById('notice');
+const login=document.getElementById('login');
+const output=document.getElementById('task');
+let token=sessionStorage.getItem('zhenxunAuthToken')||'';
+let timer, busy=false;
+let taskId=sessionStorage.getItem('migration-export:'+location.origin)||'';
+const stages={queued:'等待执行',quiescing:'停止业务中',snapshotting:'创建快照中',
+resuming:'恢复原实例中',compressing:'压缩校验中',completed:'已完成',failed:'失败',
+recovery_required:'恢复受阻',awaiting_credentials:'等待恢复授权',cancelled:'已取消'};
+async function request(path, options={}){
+  const response=await fetch('/zhenxun/api/'+path,{
+    credentials:'omit',cache:'no-store',redirect:'error',
+    headers:token?{Authorization:token}:{},...options});
+  if(response.status===401){token='';login.hidden=false;throw Error('请使用原管理员账号登录。')}
+  const value=await response.json();
+  if(!response.ok||value.suc===false)throw Error(value.detail||value.info||'查询失败');
+  return value.data;
+}
+async function refresh(){
+  clearTimeout(timer);if(busy)return;busy=true;let follow=true;
+  try{
+    const state=await request('system/startup/status');
+    const ready=state.state==='warmup_ready';
+    document.getElementById('return').hidden=!ready;
+    notice.textContent=ready?'Bot 已恢复就绪，可以返回管理页面。':'管理连接正常，正在跟踪迁移任务。';
+    if(!token){login.hidden=false;return}
+    if(!taskId){const listing=await request('migration/tasks');taskId=(listing.items||[])[0]?.id||''}
+    if(taskId){
+      const task=await request('migration/tasks/'+encodeURIComponent(taskId));
+      follow=!(ready&&['completed','failed','cancelled'].includes(task.stage));
+      output.textContent='任务：'+task.id+'\n状态：'+(stages[task.stage]||task.stage)+
+        (task.first_error?'\n原因：'+task.first_error:'')+
+        (task.progress?.snapshot_generated?'\n快照已生成':'')+
+        (task.progress?.original_worker_resumed?'\n原实例已恢复并就绪':'');
+    }
+  }catch(error){notice.textContent=token?'连接暂时中断，保留原任务，正在重试。':error.message}
+  finally{busy=false;if(token&&follow)timer=setTimeout(refresh,2000)}
+}
+login.onsubmit=async event=>{
+  event.preventDefault();clearTimeout(timer);
+  try{
+    const data=await request('login',{method:'POST',body:new URLSearchParams(new FormData(login))});
+    token=data.token_type+' '+data.access_token;
+    sessionStorage.setItem('zhenxunAuthToken',token);login.reset();login.hidden=true;refresh();
+  }catch(error){notice.textContent=error.message}
+};
+document.getElementById('refresh').onclick=refresh;
+refresh();
+</script>
+</html>

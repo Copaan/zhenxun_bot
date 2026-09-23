@@ -149,7 +149,7 @@ _STARTUP_VALUES = _read_startup_env()
 
 def environment_effect(key: str) -> str:
     normalized = key.upper()
-    if normalized in DIRECT_KEYS:
+    if normalized in DIRECT_KEYS or normalized == "RUNTIME_WATCH_MODE":
         return "in_place"
     if normalized in COMPONENT_KEYS or normalized in CACHE_KEYS:
         return "component_restart"
@@ -191,6 +191,7 @@ class RuntimeEnvironmentError(RuntimeError):
 class RuntimeEnvironmentManager:
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
+        self.external_values = dict(os.environ)
         self.startup_values = dict(_STARTUP_VALUES)
         self.effective_values = dict(_STARTUP_VALUES)
         self._core_defaults = NoneBotConfig(_env_file=None)
@@ -327,6 +328,10 @@ class RuntimeEnvironmentManager:
                 )
 
         self._set_process_env(values, keys)
+        if "RUNTIME_WATCH_MODE" in keys:
+            from zhenxun.services.runtime_reload import plugin_runtime_manager
+
+            plugin_runtime_manager.refresh_watcher()
         if "LOG_LEVEL" in keys:
             from zhenxun.services.log import reload_log_level
 

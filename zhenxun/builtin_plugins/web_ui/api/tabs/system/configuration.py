@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import timedelta
 import hashlib
 from io import StringIO
 import json
@@ -14,6 +15,7 @@ from fastapi import APIRouter, HTTPException, Response
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+from pydantic.errors import PydanticUserError
 from ruamel.yaml import YAML
 
 from zhenxun.configs.config import Config
@@ -51,6 +53,13 @@ from ....config_validation import (
     validate_dotenv,
     validate_simple_yaml,
     validation_detail,
+)
+from ....environment_fields import (
+    CORE_FIELDS,
+    comparable_value,
+    environment_category,
+    typed_environment_value,
+    visible_environment_fields,
 )
 from ....restart_service import preferred_access_targets, request_webui_restart
 from ....utils import authentication
@@ -191,7 +200,11 @@ def _model_field_descriptors(model: type[BaseModel]) -> dict[str, dict[str, Any]
         )
         schema = _schema_for_type(annotation)
         default = getattr(field, "default", None)
-        if default is not None and "default" not in schema:
+        if (
+            default is not None
+            and type(default).__name__ not in {"PydanticUndefinedType", "UndefinedType"}
+            and "default" not in schema
+        ):
             try:
                 schema["default"] = configuration_value(default)
             except (TypeError, ValueError):
@@ -309,13 +322,14 @@ def _registered_groups() -> list[dict[str, Any]]:
 
 def _environment_models():
     from nonebot import get_loaded_plugins
+    from nonebot.adapters.onebot.v11.config import Config as OneBotConfig
     from nonebot.config import Config as NoneBotConfig
 
     from zhenxun.adapters.qq_official.config import QQOfficialConfig
     from zhenxun.configs.config import BotSetting
     from zhenxun.services.cache import Config as CacheConfig
 
-    models = [NoneBotConfig, BotSetting, QQOfficialConfig, CacheConfig]
+    models = [NoneBotConfig, BotSetting, QQOfficialConfig, CacheConfig, OneBotConfig]
     for plugin in sorted(get_loaded_plugins(), key=lambda item: item.id_):
         model = getattr(getattr(plugin, "metadata", None), "config", None)
         if model is not None and model not in models:
@@ -324,28 +338,71 @@ def _environment_models():
 
 
 def _environment_fields(values: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    from nonebot import get_driver
+    from nonebot import get_adapters, get_driver, get_loaded_plugins
 
     from zhenxun.utils.pydantic_compat import model_json_schema
 
     values = {key.upper(): value for key, value in values.items()}
     schemas = {}
+    annotations = {}
+    defaults = {}
     declarations = {}
     conflicts = {}
     schema_errors = {}
+    owner_names = {
+        plugin.metadata.config: plugin.metadata.name or plugin.id_
+        for plugin in get_loaded_plugins()
+        if plugin.metadata and plugin.metadata.config
+    }
+    labels = {}
+    attribute_names = {}
     for model in _environment_models():
         source = f"{model.__module__}.{model.__name__}"
         try:
-            root = model_json_schema(model)
+            root = model_json_schema(model, by_alias=False)
         except Exception as error:
             root = {
                 "properties": _model_field_descriptors(model),
                 "x-schema-error": type(error).__name__,
             }
             schema_errors[source] = type(error).__name__
-        for name, schema in root.get("properties", {}).items():
+        fields = dict(
+            getattr(model, "model_fields", None) or getattr(model, "__fields__", {})
+        )
+        properties = dict(root.get("properties", {}))
+        for name, field in list(fields.items()):
+            attribute_names.setdefault(name.upper(), name)
+            alias = getattr(field, "alias", None)
+            if (
+                isinstance(alias, str)
+                and alias != name
+                and alias.upper() in values
+                and name in properties
+            ):
+                fields[alias] = field
+                properties[alias] = properties[name]
+                attribute_names[alias.upper()] = name
+        for name, schema in properties.items():
+            field = fields.get(name)
+            if field is not None:
+                annotation = getattr(field, "outer_type_", None) or getattr(
+                    field, "annotation", Any
+                )
+                annotations.setdefault(name.upper(), annotation)
+                if "default" in schema:
+                    defaults.setdefault(name.upper(), schema["default"])
+                elif not getattr(field, "default_factory", None):
+                    from pydantic_core import PydanticUndefined
+
+                    default = getattr(field, "default", PydanticUndefined)
+                    if (
+                        default is not PydanticUndefined
+                        and type(default).__name__ != "UndefinedType"
+                    ):
+                        defaults.setdefault(name.upper(), default)
             key = name.upper()
             declarations.setdefault(key, []).append(source)
+            labels.setdefault(key, []).append(owner_names.get(model, source))
             # Ignore presentation/default differences; retain definitions when
             # comparing referenced types so equal names cannot hide conflicts.
             signature = {
@@ -367,35 +424,119 @@ def _environment_fields(values: dict[str, Any]) -> dict[str, dict[str, Any]]:
                         "signature": signature,
                     },
                 )
-    keys = set(KNOWN_ENV_KEYS) | set(_ENV_FORM_KEYS) | set(schemas) | set(values)
+    for key, (annotation, default, _) in CORE_FIELDS.items():
+        annotations.setdefault(key, annotation)
+        defaults.setdefault(key, default)
+        schemas.setdefault(
+            key,
+            {
+                "schema": {
+                    **schema_for_type(annotation),
+                    **({"default": default} if default is not None else {}),
+                }
+            },
+        )
+    keys = set(KNOWN_ENV_KEYS) | set(_ENV_FORM_KEYS) | set(schemas)
     runtime = get_driver().config
+    from zhenxun.configs.config import BotConfig, BotSetting
+    from zhenxun.services.cache import Config as CacheConfig
+    from zhenxun.services.cache import cache_config
+
+    bot_keys = set(BotSetting.model_fields)
+    cache_keys = set(CacheConfig.model_fields)
+    onebot = next(
+        (
+            getattr(adapter, "onebot_config", None)
+            for adapter in get_adapters().values()
+            if getattr(adapter, "onebot_config", None) is not None
+        ),
+        None,
+    )
     result = {}
     for key in sorted(keys):
         schema = {} if key in conflicts else schemas.get(key, {}).get("schema", {})
         raw = values.get(key)
-        default = schema.get("default")
-        parsed = raw
-        if (
-            raw is not None
-            and schema.get("type") != "string"
-            and (schema or str(raw).lstrip().startswith(("{", "[")))
-        ):
+        annotation = annotations.get(key, Any)
+        default = defaults.get(key, schema.get("default"))
+        if default is not None:
             try:
-                parsed = json.loads(raw)
-            except (ValueError, TypeError):
+                default = typed_environment_value(default, annotation)
+            except (ValueError, TypeError, PydanticUserError):
+                pass
+        parsed = raw
+        valid = True
+        if key in values:
+            try:
+                parsed = typed_environment_value(raw, annotation)
+            except (ValueError, TypeError, PydanticUserError):
+                valid = False
+        secret = is_sensitive_env_key(key) or key == "DB_URL"
+        attr = attribute_names.get(key, key.lower())
+        provider = (
+            cache_config
+            if attr in cache_keys
+            else BotConfig
+            if attr in bot_keys
+            else runtime
+        )
+        if attr.startswith("onebot_"):
+            provider = onebot
+        available = hasattr(provider, attr)
+        category = environment_category(key, declarations.get(key, []))
+        if provider is runtime and category == "plugins":
+            # Driver extras are loader inputs, not evidence of the plugin's
+            # currently consumed configuration instance.
+            available = False
+        effective = getattr(provider, attr, None)
+        if available:
+            try:
+                effective = typed_environment_value(effective, annotation)
+            except (ValueError, TypeError, PydanticUserError):
+                available = False
+        if annotation is timedelta:
+            schema = {
+                "type": "number",
+                "minimum": 0,
+                "description": "交互会话的超时时间，单位：秒。",
+            }
+        if default is not None:
+            schema = {**schema, "default": comparable_value(default)}
+        expected = parsed if key in values else default
+        external_present = key in runtime_environment_manager.external_values
+        overridden = False
+        if available and external_present:
+            try:
+                external = typed_environment_value(
+                    runtime_environment_manager.external_values[key], annotation
+                )
+                overridden = comparable_value(external) == comparable_value(
+                    effective
+                ) and comparable_value(expected) != comparable_value(effective)
+            except (ValueError, TypeError, PydanticUserError):
                 pass
         if (
-            isinstance(parsed, str)
-            and parsed.lower() in {"true", "false"}
-            and schema.get("type") == "boolean"
+            available
+            and valid
+            and comparable_value(expected) == comparable_value(effective)
         ):
-            parsed = parsed.lower() == "true"
-        secret = is_sensitive_env_key(key)
-        effective = getattr(runtime, key.lower(), None)
+            apply_state = "applied"
+        elif key in runtime_environment_manager.pending_keys:
+            apply_state = "restart_pending"
+        elif runtime_environment_manager._lock.locked():
+            apply_state = "applying"
+        else:
+            apply_state = "unknown"
         result[key] = {
             "key": key,
-            "schema": schema,
+            "schema": {
+                k: v
+                for k, v in schema.items()
+                if k not in {"default", "examples", "x-root-schema"}
+            }
+            if secret
+            else schema,
             "schema_sources": declarations.get(key, []),
+            "source_labels": labels.get(key, []),
             "schema_errors": [
                 schema_errors[source]
                 for source in declarations.get(key, [])
@@ -412,11 +553,18 @@ def _environment_fields(values: dict[str, Any]) -> dict[str, dict[str, Any]]:
                 else None
             ),
             "sensitive": secret,
-            "value": None if secret else jsonable_encoder(parsed),
-            "default_value": None if secret else default,
+            "value": None if secret else comparable_value(parsed),
+            "default_value": None if secret else comparable_value(default),
             "configured": key in values,
-            "effective_value": None if secret else configuration_value(effective),
-            "overridden": key in os.environ,
+            "effective_value": None
+            if secret or not available
+            else comparable_value(effective),
+            "runtime_available": available and not secret,
+            "apply_state": apply_state,
+            "category": category,
+            "registered": key in annotations or key in KNOWN_ENV_KEYS,
+            "overridden": overridden,
+            "external_environment_present": external_present,
             "apply_effect": environment_effect(key),
         }
     return result
@@ -446,9 +594,13 @@ def _validate_environment_types(
         and (changed_keys is None or key in changed_keys)
     ]
     for model in _environment_models():
-        fields = getattr(model, "model_fields", None) or getattr(
-            model, "__fields__", {}
+        fields = dict(
+            getattr(model, "model_fields", None) or getattr(model, "__fields__", {})
         )
+        for field in list(fields.values()):
+            alias = getattr(field, "alias", None)
+            if isinstance(alias, str) and alias.upper() in values:
+                fields[alias] = field
         for name, field in fields.items():
             key = name.upper()
             if key not in values or (
@@ -492,6 +644,24 @@ def _env_encode(value: Any) -> str:
 def _update_env(content: str, fields: dict[str, Any]) -> str:
     validate_dotenv(content)
     remaining = {key.upper(): value for key, value in fields.items()}
+    for model in _environment_models():
+        declarations = getattr(model, "model_fields", None) or getattr(
+            model, "__fields__", {}
+        )
+        for name, field in declarations.items():
+            key = name.upper()
+            annotation = getattr(field, "outer_type_", None) or getattr(
+                field, "annotation", Any
+            )
+            if (
+                annotation is timedelta
+                and key in remaining
+                and isinstance(remaining[key], int | float)
+            ):
+                seconds = typed_environment_value(
+                    remaining[key], timedelta
+                ).total_seconds()
+                remaining[key] = f"PT{seconds:g}S"
     output: list[str] = []
     from dotenv.parser import parse_stream
 
@@ -532,13 +702,14 @@ def _replace_env_binding(binding, value: Any) -> str:
 def _update_custom_env(content: str, operations: list[CustomEnvOperation]) -> str:
     if not operations:
         return content
+    registered = set(_environment_fields({}))
     changes: dict[str, CustomEnvOperation] = {}
     for operation in operations:
         key = operation.key.strip()
         folded = key.casefold()
         if not _ENV_KEY_PATTERN.fullmatch(key):
             raise ValueError("custom_env_key_invalid")
-        if key.upper() in KNOWN_ENV_KEYS:
+        if key.upper() in registered:
             raise ValueError("custom_env_key_managed")
         if folded in changes:
             raise ValueError("custom_env_key_duplicate")
@@ -682,20 +853,35 @@ def _validation_error(file: str, error: Exception) -> HTTPException:
     response_class=JSONResponse,
 )
 async def configuration_summary() -> Result:
+    from nonebot import get_loaded_plugins
+
     from ....restart_service import network_configuration_status
 
     env_path = _path("env")
     env_content = _read(env_path)
 
     values = dict(dotenv_values(stream=StringIO(env_content)))
-    descriptors = _environment_fields(values)
+    registry = _environment_fields(values)
+    library_sources = {
+        f"{model.__module__}.{model.__name__}"
+        for plugin in get_loaded_plugins()
+        if (metadata := plugin.metadata)
+        and metadata.type == "library"
+        and (model := metadata.config) is not None
+    }
+    descriptors = visible_environment_fields(
+        registry,
+        library_sources=library_sources,
+        core_keys=set(KNOWN_ENV_KEYS) | set(CORE_FIELDS),
+        proxy_keys=PROXY_KEYS,
+    )
     env_fields = {
-        key: None if is_sensitive_env_key(key) else values.get(key)
+        key: None if descriptors[key]["sensitive"] else values.get(key)
         for key in descriptors
     }
     custom_env = []
     for key, value in sorted(values.items(), key=lambda item: str(item[0]).casefold()):
-        if str(key).upper() in descriptors:
+        if str(key).upper() in registry:
             continue
         sensitive = is_sensitive_env_key(str(key))
         custom_env.append(

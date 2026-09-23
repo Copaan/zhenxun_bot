@@ -71,15 +71,20 @@ class OnlineExport:
 
     async def snapshot_after_shutdown(self, shutdown: dict, *, network=None) -> None:
         self.store.record_shutdown(self.identity, shutdown)
-        if (
-            shutdown.get("result") != "confirmed"
-            or shutdown.get("forced")
-            or not shutdown.get("process_tree_released")
-        ):
+        from .shutdown import export_snapshot_mode
+
+        self.service.lease.require_held()
+        try:
+            mode = export_snapshot_mode(
+                shutdown, self.store.read("jobs", self.identity)["options"]
+            )
+        except MigrationError:
             self.fail("migration_shutdown_unconfirmed", recovery=True)
-            raise MigrationError("migration_shutdown_unconfirmed")
-        self._receipt("quiesced.json", shutdown)
-        self.store.transition(self.identity, "snapshotting")
+            raise
+        self._receipt("quiesced.json", {**shutdown, "snapshot_mode": mode})
+        self.store.transition(
+            self.identity, "snapshotting", progress={"snapshot_mode": mode}
+        )
         management = None
         try:
             if network is not None:
@@ -91,6 +96,9 @@ class OnlineExport:
                 await management.start(network, budget=self.budget.phase())
             await self.service.phases.run(
                 self.identity, "export_snapshot", budget=self.budget.phase()
+            )
+            self.store.transition(
+                self.identity, "snapshotting", progress={"snapshot_generated": True}
             )
         except Exception as error:
             # Even a failed/cancelled snapshot must resume the original instance.
@@ -143,7 +151,9 @@ class OnlineExport:
             code = self.first_error or "migration_cancelled"
             self.fail(code)
             return
-        self.store.transition(self.identity, "compressing")
+        self.store.transition(
+            self.identity, "compressing", progress={"original_worker_resumed": True}
+        )
         self.pack_task = asyncio.create_task(
             self._pack(), name=f"migration-export:{self.identity}"
         )

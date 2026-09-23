@@ -29,8 +29,11 @@ class ExportOptions:
     plaintext_confirmed: bool = False
     dependencies: bool = True
     budget_seconds: int = 6 * 3600
+    allow_forced_shutdown: bool = False
 
     def __post_init__(self) -> None:
+        if type(self.allow_forced_shutdown) is not bool:
+            raise MigrationError("migration_export_options_invalid")
         if not self.categories or not self.categories <= CATEGORIES:
             raise MigrationError("migration_categories_invalid")
         MigrationBudget.start(self.budget_seconds)

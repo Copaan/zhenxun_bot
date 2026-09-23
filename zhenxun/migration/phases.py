@@ -238,6 +238,11 @@ def execute_phase(project: Path, request: dict, *, lease: DelegatedLease) -> dic
     if phase == "export_reconcile":
         return store.reconcile_export(identity, lease=lease, checkpoint=check)
     if phase == "export_snapshot":
+        from .shutdown import export_snapshot_mode
+
+        stopped = read_json_locked(directory / "quiesced.json", {})
+        snapshot_mode = export_snapshot_mode(stopped, job["options"])
+        check()
         files, metadata = capture_snapshot(
             project,
             snapshot,
@@ -246,6 +251,7 @@ def execute_phase(project: Path, request: dict, *, lease: DelegatedLease) -> dic
             budget=budget,
             checkpoint=check,
         )
+        metadata["snapshot_mode"] = snapshot_mode
         entries = [
             {
                 **asdict(entry),
@@ -256,7 +262,11 @@ def execute_phase(project: Path, request: dict, *, lease: DelegatedLease) -> dic
             for entry in files
         ]
         write_json_locked(description, {"files": entries, "metadata": metadata})
-        return {"files": len(files), "bytes": sum(entry.size for entry in files)}
+        return {
+            "files": len(files),
+            "bytes": sum(entry.size for entry in files),
+            "snapshot_mode": metadata["snapshot_mode"],
+        }
     if phase == "export_pack":
         from .discovery import FileEntry
 

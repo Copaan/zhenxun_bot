@@ -109,6 +109,8 @@ class SystemStatus(BaseModel):
     check_time: datetime
     runtime_generation: int = 0
     webui_revision: str = ""
+    resource_revision: str = ""
+    resources_ready: bool = False
 
 
 class SystemFolderSize(BaseModel):

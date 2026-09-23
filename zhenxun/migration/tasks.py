@@ -234,7 +234,16 @@ class TaskStore:
                 stage=stage, updated_at=self.clock(), revision=value["revision"] + 1
             )
             if progress is not None:
-                value["progress"] = progress
+                retained = {
+                    key: value.get("progress", {})[key]
+                    for key in (
+                        "snapshot_mode",
+                        "snapshot_generated",
+                        "original_worker_resumed",
+                    )
+                    if value["action"] == "export" and key in value.get("progress", {})
+                }
+                value["progress"] = {**retained, **progress}
             if error_code:
                 key = "rollback_error" if current == "rolling_back" else "first_error"
                 value[key] = value.get(key) or error_code
@@ -302,6 +311,7 @@ class TaskStore:
                 revision=value["revision"] + 1,
                 first_error=value.get("first_error") or "migration_export_interrupted",
                 progress={
+                    **value.get("progress", {}),
                     "export_recovered": True,
                     "original_instance_start_allowed": True,
                 },
@@ -321,6 +331,19 @@ class TaskStore:
                 raise MigrationError("migration_export_phase_invalid", status=409)
             if value["cancel_requested"]:
                 raise MigrationError("migration_cancelled")
+            outcome = {
+                **{
+                    key: item
+                    for key, item in value.get("progress", {}).items()
+                    if key
+                    in {
+                        "snapshot_mode",
+                        "snapshot_generated",
+                        "original_worker_resumed",
+                    }
+                },
+                **result,
+            }
             if receipt.exists():
                 raise MigrationError("migration_publication_recovery_required")
             info = source.stat()
@@ -332,7 +355,7 @@ class TaskStore:
                     "destination": str(destination.absolute()),
                     "device": info.st_dev,
                     "inode": info.st_ino,
-                    "result": result,
+                    "result": outcome,
                     "decided_at": self.clock(),
                 },
             )
@@ -343,7 +366,7 @@ class TaskStore:
                 expires_at=self.clock() + 72 * 3600,
                 updated_at=self.clock(),
                 revision=value["revision"] + 1,
-                progress=result,
+                progress=outcome,
             )
             return dict(value)
 
@@ -648,6 +671,8 @@ class TaskStore:
             "identity",
             "forced",
             "process_tree_released",
+            "process_identity_verified",
+            "stop_stages",
             "unresolved_roles",
             "budget_remaining_ms",
             "budget_exhausted",

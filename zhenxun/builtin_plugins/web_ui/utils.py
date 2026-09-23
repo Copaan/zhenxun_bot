@@ -201,6 +201,9 @@ def _get_dir_size(dir_path: Path) -> float:
 def get_system_status() -> SystemStatus:
     """获取系统信息等"""
     from zhenxun.services.runtime_reload import plugin_runtime_manager
+    from zhenxun.services.webui_resources import webui_resources
+
+    resources = webui_resources.snapshot
 
     cpu = psutil.cpu_percent()
     memory = psutil.virtual_memory().percent
@@ -212,7 +215,11 @@ def get_system_status() -> SystemStatus:
         disk=disk,
         check_time=datetime.now().replace(microsecond=0),
         runtime_generation=plugin_runtime_manager.generation,
-        webui_revision=plugin_runtime_manager.webui_revision,
+        webui_revision=str(
+            resources.manifest.get("revision") or plugin_runtime_manager.webui_revision
+        ),
+        resource_revision=resources.revision,
+        resources_ready=resources.ready,
     )
 
 

@@ -655,23 +655,30 @@ class LauncherMigrationService:
             quiesce_started = True
             shutdown = await self._wait(quiesce, budget.phase(15))
             self.store.record_shutdown(identity, shutdown)
-            if (
-                shutdown.get("result") != "confirmed"
-                or shutdown.get("forced")
-                or not shutdown.get("process_tree_released")
-            ):
-                raise MigrationError("migration_shutdown_unconfirmed")
+            from .shutdown import export_snapshot_mode
+
+            self.lease.require_held()
+            mode = export_snapshot_mode(
+                shutdown, self.store.read("jobs", identity)["options"]
+            )
             stopped = True
             write_json_locked(
-                self.store.path("jobs", identity).parent / "quiesced.json", shutdown
+                self.store.path("jobs", identity).parent / "quiesced.json",
+                {**shutdown, "snapshot_mode": mode},
             )
-            self.store.transition(identity, "snapshotting")
+            self.store.transition(
+                identity, "snapshotting", progress={"snapshot_mode": mode}
+            )
             await self.phases.run(identity, "export_snapshot", budget=budget.phase())
-            self.store.transition(identity, "resuming")
+            self.store.transition(
+                identity, "resuming", progress={"snapshot_generated": True}
+            )
             resume_attempted = True
             await self._wait(resume, budget.phase())
             resumed = True
-            self.store.transition(identity, "compressing")
+            self.store.transition(
+                identity, "compressing", progress={"original_worker_resumed": True}
+            )
             return await self.phases.run(
                 identity,
                 "export_pack",
@@ -809,11 +816,26 @@ async def install_launcher_migration(
     return service
 
 
-async def stop_worker_for_snapshot(worker, supervisor) -> dict:
+async def stop_worker_for_snapshot(
+    worker, supervisor, *, allow_forced_shutdown: bool = False
+) -> dict:
     handle = supervisor._handles.get(worker.pid)
     if handle is None or not handle.worker_boot_id or not handle.runtime_pid:
         raise MigrationError("migration_worker_identity_unconfirmed")
-    await supervisor.stop_process(worker)
+    handle._live_processes(discover=True)
+    identity_verified = bool(handle._runtime_identity and handle.identities)
+    accepted_identity = {
+        "boot_id": handle.worker_boot_id,
+        "startup_id": handle.startup_id,
+        "launcher_boot_id": handle.launcher_boot_id,
+        "pid": handle.runtime_pid,
+        "shutdown_correlation_id": handle.shutdown_id or handle.startup_id,
+    }
+    try:
+        await supervisor.stop_process(worker, allow_force=allow_forced_shutdown)
+    except TimeoutError:
+        if allow_forced_shutdown:
+            raise
     receipt = handle.runtime_shutdown_receipt()
     unresolved_roles = sorted(
         item.role
@@ -833,7 +855,9 @@ async def stop_worker_for_snapshot(worker, supervisor) -> dict:
             if receipt and key in receipt
         },
         "result": receipt.get("result", "unconfirmed") if receipt else "unconfirmed",
-        "identity": receipt.get("identity", {}) if receipt else {},
+        "identity": receipt.get("identity", {}) if receipt else accepted_identity,
+        "process_identity_verified": identity_verified,
+        "stop_stages": list(handle.stop_stages),
         "forced": any(
             stage["stage"] in {"terminate", "kill"} for stage in handle.stop_stages
         ),

@@ -2,6 +2,7 @@
 
 用法:
     zx run          启动 launcher
+    zx run --webui-dev [--webui-source PATH]  在原入口使用前端开发热更新
     zx run-worker   启动 worker（由 launcher 调用）
     zx version      显示版本信息
     zx migration    实例迁移导出、包核验及任务状态
@@ -45,6 +46,7 @@ HTTP_SIDECAR_START_TIMEOUT = 7.0
 ENV_EXAMPLE_FILE = ".env.example"
 ENV_DEV_FILE = ".env.dev"
 _worker_certificate_pin: str | None = None
+_webui_dev_source: Path | None = None
 
 
 def _sync_env_missing_items(project_root: Path) -> None:
@@ -1165,8 +1167,16 @@ async def _launcher_entry() -> None:
     try:
         await _run_launcher_async()
     finally:
+        original_failure = sys.exc_info()[1]
         try:
-            await launcher_supervisor.shutdown()
+            try:
+                await launcher_supervisor.shutdown()
+            except Exception:
+                if original_failure is None:
+                    raise
+                _launcher_log(
+                    "final cleanup failed; preserving original launcher failure"
+                )
         finally:
             for sig, handler in original.items():
                 signal.signal(sig, handler)
@@ -1270,6 +1280,12 @@ async def _run_launcher_async() -> None:
             signal.signal(sig, _handle_launcher_signal)
         except Exception:
             pass
+
+    webui_dev = None
+    if _webui_dev_source is not None:
+        from zhenxun.services.webui_dev import WebUIDevServer
+
+        webui_dev = WebUIDevServer(_webui_dev_source, launcher_supervisor)
 
     while True:
         if stop_requested or launcher_supervisor.shutdown_deadline is not None:
@@ -1444,6 +1460,12 @@ async def _run_launcher_async() -> None:
         if builtin_ingress:
             validate_builtin_ingress(qq_settings, check_port=ingress is None)
         worker_env = os.environ.copy()
+        worker_env.pop("ZHENXUN_WEBUI_DEV_PORT", None)
+        worker_env.pop("ZHENXUN_WEBUI_DEV_TOKEN", None)
+        if webui_dev is not None:
+            worker_env.update(webui_dev.worker_environment())
+            if migration_export is None:
+                await webui_dev.start()
         worker_env["ZHENXUN_LAUNCHER_PID"] = str(os.getpid())
         worker_env["ZHENXUN_LAUNCHER_STARTED_AT"] = str(launcher_started_at)
         worker_env["ZHENXUN_WORKER_SPAWNED_AT"] = str(time.time())
@@ -1658,6 +1680,13 @@ async def _run_launcher_async() -> None:
                 await migration_service.recover_with_management()
                 migration_export = None
                 continue
+            if webui_dev is not None:
+                try:
+                    await webui_dev.start()
+                except Exception as error:
+                    _launcher_log(
+                        f"Bot resumed; WebUI dev service unavailable: {error}"
+                    )
         if migration_service is not None:
             migration_service.bind_export_worker(worker)
         migration_snapshot = False
@@ -1780,6 +1809,8 @@ async def _run_launcher_async() -> None:
                             async def stop_restore_ingress():
                                 nonlocal ingress, ingress_signature
                                 nonlocal http_sidecar, http_sidecar_signature
+                                if webui_dev is not None:
+                                    await webui_dev.stop()
                                 if ingress is not None:
                                     await _terminate_named_process_async(
                                         ingress, "QQ HTTPS ingress"
@@ -1857,6 +1888,8 @@ async def _run_launcher_async() -> None:
 
                             # One deadline includes ingress, sidecar and worker.
                             with shutdown_budget(15):
+                                if webui_dev is not None:
+                                    await webui_dev.stop()
                                 if ingress is not None:
                                     await _terminate_named_process_async(
                                         ingress, "QQ HTTPS ingress"
@@ -1870,8 +1903,27 @@ async def _run_launcher_async() -> None:
                                     http_sidecar = None
                                     http_sidecar_signature = None
                                 migration_shutdown = await stop_worker_for_snapshot(
-                                    worker, launcher_supervisor
+                                    worker,
+                                    launcher_supervisor,
+                                    allow_forced_shutdown=migration_export.store.read(
+                                        "jobs", migration_export.identity
+                                    )["options"].get("allow_forced_shutdown")
+                                    is True,
                                 )
+                            if not migration_shutdown.get("process_tree_released"):
+                                migration_export.store.record_shutdown(
+                                    migration_export.identity, migration_shutdown
+                                )
+                                migration_export.fail(
+                                    "migration_shutdown_unconfirmed", recovery=True
+                                )
+                                migration_export = None
+                                if webui_dev is not None:
+                                    await webui_dev.start()
+                                # Keep supervising the old writer; a replacement
+                                # may only start after its process tree exits.
+                                restart_requested = True
+                                continue
                             migration_snapshot = True
                             return_code = worker.poll()
                             break
@@ -2076,12 +2128,37 @@ async def _run_launcher_async() -> None:
 
 
 def main() -> None:
+    global _webui_dev_source
     args = sys.argv[1:]
 
     if not args or args[0] == "run":
+        import argparse
+
         from zhenxun.migration.lease import InstanceLease
         from zhenxun.services.startup_banner import show_startup_banner
 
+        parser = argparse.ArgumentParser(prog="zx run")
+        parser.add_argument(
+            "--webui-dev",
+            action="store_true",
+            help="Serve live WebUI source through the Bot address",
+        )
+        parser.add_argument(
+            "--webui-source",
+            type=Path,
+            help="WebUI source directory (default: sibling zhenxun_bot_webui)",
+        )
+        options = parser.parse_args(args[1:] if args else [])
+        if options.webui_source and not options.webui_dev:
+            parser.error("--webui-source requires --webui-dev")
+        _webui_dev_source = (
+            (
+                options.webui_source
+                or _ensure_project_root().parent / "zhenxun_bot_webui"
+            ).resolve()
+            if options.webui_dev
+            else None
+        )
         show_startup_banner()
         with InstanceLease(_ensure_project_root(), role="launcher") as lease:
             previous = os.environ.get("ZHENXUN_INSTANCE_LEASE_ID")

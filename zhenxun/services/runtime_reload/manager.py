@@ -191,6 +191,8 @@ class PluginRuntimeManager:
         self._watcher_task: asyncio.Task[Any] | None = None
         self._watcher_refresh_task: asyncio.Task[Any] | None = None
         self._watcher_refresh_requested = False
+        self._watcher_refresh_event = asyncio.Event()
+        self._watcher_stopping = False
         self.watcher_state = "idle"
         self.watcher_retry_count = 0
         self.watcher_last_error: str | None = None
@@ -316,7 +318,6 @@ class PluginRuntimeManager:
             component_id="warmup:runtime_index",
             resource_group="runtime_index",
             restart_policy="component",
-            config_keys=("RUNTIME_WATCH_MODE",),
             pass_context=True,
         )
         async def _start_runtime_manager(context) -> None:
@@ -324,11 +325,13 @@ class PluginRuntimeManager:
             self._index_ready.set()
             from .watcher import watch_runtime_changes
 
-            if self.runtime_watch_mode() == "disabled":
-                self.watcher_state = "disabled"
+            if self._watcher_task and not self._watcher_task.done():
                 return
+            self._watcher_stopping = False
             self._watcher_task = context.spawn_task(
-                watch_runtime_changes(self), name="zhenxun-runtime-watcher"
+                watch_runtime_changes(self),
+                name="zhenxun-runtime-watcher",
+                cancel=self.stop_watcher,
             )
 
         @PriorityLifecycle.on_shutdown(
@@ -336,7 +339,7 @@ class PluginRuntimeManager:
         )
         async def _stop_runtime_manager() -> None:
             if self._watcher_task:
-                self._watcher_task.cancel()
+                self.stop_watcher()
                 with contextlib.suppress(asyncio.CancelledError):
                     await self._watcher_task
                 self._watcher_task = None
@@ -3519,26 +3522,33 @@ class PluginRuntimeManager:
         self._candidate_roots.difference_update({plugin_id, module_name})
         self._finish_initialization_work({plugin_id, module_name})
 
-    async def apply_plugin_changes(
-        self, changed: set[Path], *, submit_restart: bool = True
-    ) -> RuntimeOperation:
+    def plugin_change_restart_reason(self, changed: set[Path]) -> str | None:
+        """Check the whole code batch before any consumer imports new modules."""
         affected = self.affected_units(changed)
-        if not affected:
-            return await self._request_restart_compat(
-                set(), "core_source_changed", submit_restart=submit_restart
-            )
+        if not affected or any(not self.affected_units({path}) for path in changed):
+            return "core_source_changed"
         if not self.enabled:
-            return await self._request_restart_compat(
-                affected, "nonebot_compatibility", submit_restart=submit_restart
-            )
+            return "nonebot_compatibility"
         if any(
             path.name in {"requirements.txt", "requirement.txt", "pyproject.toml"}
             for path in changed
         ):
+            return "plugin_dependencies_changed"
+        for plugin_id in sorted(affected):
+            unit = self.units[plugin_id]
+            if unit.classification is not ReloadClassification.HOT_RELOADABLE:
+                return next(iter(sorted(unit.reasons)), "plugin_not_hot_reloadable")
+            if changed_model_file(unit, changed):
+                return "orm_model_changed"
+        return None
+
+    async def apply_plugin_changes(
+        self, changed: set[Path], *, submit_restart: bool = True
+    ) -> RuntimeOperation:
+        affected = self.affected_units(changed)
+        if reason := self.plugin_change_restart_reason(changed):
             return await self._request_restart_compat(
-                affected,
-                "plugin_dependencies_changed",
-                submit_restart=submit_restart,
+                affected, reason, submit_restart=submit_restart
             )
         removed = {
             plugin_id
@@ -3563,18 +3573,6 @@ class PluginRuntimeManager:
             return await self._unload_removed_units(
                 removed, submit_restart=submit_restart
             )
-        for plugin_id in affected:
-            unit = self.units[plugin_id]
-            if unit.classification is not ReloadClassification.HOT_RELOADABLE:
-                return await self._request_restart_compat(
-                    affected,
-                    sorted(unit.reasons)[0],
-                    submit_restart=submit_restart,
-                )
-            if changed_model_file(unit, changed):
-                return await self._request_restart_compat(
-                    affected, "orm_model_changed", submit_restart=submit_restart
-                )
         return await self._reload_units(affected)
 
     @managed_mutation("plugin_unload")
@@ -4735,15 +4733,8 @@ class PluginRuntimeManager:
                         observed_tasks.update(children)
                     for child in children:
                         child.add_done_callback(self._consume_cleanup_task)
-                        if (
-                            not child.done()
-                            and child not in self._cancellation_requests
-                            and not getattr(child, "cancelling", lambda: 0)()
-                        ):
-                            marker = f"plugin_cleanup_cancel:{uuid4().hex}"
-                            self._cancellation_requests[child] = (marker, 0)
-                            child.add_done_callback(self._forget_cancellation_task)
-                            child.cancel(marker)
+                        # These tasks were admitted by the bounded cleanup lease;
+                        # cancelling them can interrupt a parent's finally block.
                     pending = {child for child in children if not child.done()}
                     if pending:
                         await asyncio.wait(pending, timeout=budget.remaining())
@@ -5661,14 +5652,25 @@ class PluginRuntimeManager:
         }
         return affected, unsafe
 
+    def stop_watcher(self) -> None:
+        """Stop observation after an owned mutation has reached its safe point."""
+        if self._watcher_stopping:
+            return
+        self._watcher_stopping = True
+        self._watcher_refresh_event.set()
+        if self._watcher_task and not self._watcher_task.done():
+            self._watcher_task.cancel()
+
     def refresh_watcher(self) -> None:
         if not self._watcher_task or self._watcher_task.done():
             return
         self._watcher_refresh_requested = True
+        self._watcher_refresh_event.set()
 
     def consume_watcher_refresh(self) -> bool:
         requested = self._watcher_refresh_requested
         self._watcher_refresh_requested = False
+        self._watcher_refresh_event.clear()
         return requested
 
     def claim_content_changes(self, paths: set[Path]) -> set[Path]:
@@ -5803,7 +5805,9 @@ class PluginRuntimeManager:
 
     @staticmethod
     def runtime_watch_mode() -> str:
-        value = str(os.getenv("RUNTIME_WATCH_MODE", "hot_only")).strip().lower()
+        from zhenxun.configs.config import BotConfig
+
+        value = str(BotConfig.runtime_watch_mode).strip().lower()
         return (
             value if value in {"hot_only", "disabled", "auto_restart"} else "hot_only"
         )
@@ -5842,7 +5846,8 @@ class PluginRuntimeManager:
         return {
             "index_ready": self._index_ready.is_set(),
             "watching": self._watcher_task is not None
-            and not self._watcher_task.done(),
+            and not self._watcher_task.done()
+            and self.watcher_state == "watching",
             "watcher": {
                 "mode": self.runtime_watch_mode(),
                 "state": self.watcher_state,

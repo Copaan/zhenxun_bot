@@ -286,4 +286,11 @@ def create_maintenance_app(
             entry = contained_path(static, "maintenance.html", regular=True)
             return FileResponse(entry)
 
+    else:
+
+        @app.get("/")
+        @app.get("/maintenance.html")
+        def source_maintenance_page():
+            return FileResponse(Path(__file__).with_name("maintenance_fallback.html"))
+
     return app

@@ -153,7 +153,7 @@ async def _(context):
         app: FastAPI = nonebot.get_app()
         app.include_router(BaseApiRouter)
         app.include_router(WsApiRouter)
-        public_ready = await init_public(app)
+        public_ready = await init_public(app, context)
         logger.info("<g>API启动成功</g>", "WebUi")
 
         async def emit_ready_banner() -> None:

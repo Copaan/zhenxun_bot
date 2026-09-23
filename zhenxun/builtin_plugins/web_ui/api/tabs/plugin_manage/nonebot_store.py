@@ -74,6 +74,7 @@ from .store import StoreOperationBusyError, _store_operation
 router = APIRouter(prefix="/store/nonebot")
 _ANALYSIS_TTL = timedelta(minutes=20)
 _ANALYSES: dict[str, dict[str, Any]] = {}
+_REPAIR_PREVIEWS: dict[str, dict[str, Any]] = {}
 _PENDING_TRANSACTION_STATES = {
     "building",
     "pending_restart",
@@ -100,6 +101,7 @@ class ApplyPayload(BaseModel):
 class EnvironmentRepairPayload(BaseModel):
     expected_fingerprint: str = Field(min_length=64, max_length=64)
     confirmed: bool = False
+    preview_id: str | None = None
 
 
 def _environment_view() -> dict[str, Any]:
@@ -712,6 +714,57 @@ async def dependency_environment() -> Result[dict]:
 
 
 @router.post(
+    "/environment/repair/preview",
+    dependencies=[authentication()],
+    response_model=Result[dict],
+)
+async def preview_dependency_repair() -> Result[dict]:
+    from zhenxun.services.nonebot_store.repair import preview_layer_repair
+
+    view = _environment_view()
+    if not view.get("repairable"):
+        return Result.fail("dependency_environment_not_repairable", code=409)
+    if pending_transaction():
+        return Result.fail("dependency_transaction_pending", code=409)
+    try:
+        if view.get("repair_mode") == "layer":
+            preview = await preview_layer_repair(view)
+        else:
+            ok, detail = await preflight_environment_repair()
+            if not ok:
+                return Result.fail(
+                    f"dependency_repair_preflight_failed: {detail}", code=409
+                )
+            preview = {
+                "mode": "base",
+                "fingerprint": view["fingerprint"],
+                "changes": view["immutable_drift"] + view["incompatible_shared_drift"],
+                "diagnostic": detail,
+            }
+    except (
+        DependencyAnalysisError,
+        ArchiveDependencyConflict,
+        ArchiveSourceBuildConflict,
+    ) as error:
+        return Result.fail(str(error), code=409)
+    identity = uuid.uuid4().hex
+    now = datetime.now(timezone.utc)
+    for key, value in list(_REPAIR_PREVIEWS.items()):
+        if now - value["created_at"] > _ANALYSIS_TTL:
+            _REPAIR_PREVIEWS.pop(key, None)
+    if len(_REPAIR_PREVIEWS) >= 64:
+        _REPAIR_PREVIEWS.pop(next(iter(_REPAIR_PREVIEWS)))
+    _REPAIR_PREVIEWS[identity] = {**preview, "created_at": now}
+    return Result.ok(
+        {
+            key: value
+            for key, value in {**preview, "preview_id": identity}.items()
+            if key != "target_manifest"
+        }
+    )
+
+
+@router.post(
     "/environment/repair",
     dependencies=[authentication()],
     response_model=Result[dict],
@@ -729,6 +782,69 @@ async def repair_dependency_environment(
         return Result.fail("environment_analysis_stale", code=409)
     if not view.get("repairable"):
         return Result.fail("dependency_environment_not_repairable", code=409)
+    preview = _REPAIR_PREVIEWS.get(payload.preview_id or "")
+    if (
+        not preview
+        or preview["fingerprint"] != view["fingerprint"]
+        or datetime.now(timezone.utc) - preview["created_at"] > _ANALYSIS_TTL
+    ):
+        return Result.fail("environment_analysis_stale", code=409)
+    if preview["mode"] == "layer":
+        try:
+            async with _store_operation(owner="webui.nonebot-store.environment-repair"):
+                if (
+                    pending_transaction()
+                    or environment_report()["fingerprint"] != preview["fingerprint"]
+                ):
+                    return Result.fail("environment_analysis_stale", code=409)
+                transaction = {
+                    "version": 2,
+                    "revision": uuid.uuid4().hex,
+                    "action": "environment_repair",
+                    "operations": [],
+                    "base_manifest": load_manifest(),
+                    "target_manifest": deepcopy(preview["target_manifest"]),
+                    "source_build_confirmed": False,
+                    "state": "building",
+                    "created_at": utc_now(),
+                }
+                build_task = asyncio.create_task(
+                    asyncio.to_thread(build_generation, transaction)
+                )
+                try:
+                    build = await asyncio.shield(build_task)
+                except asyncio.CancelledError:
+                    try:
+                        abandoned = await build_task
+                        remove_generation(abandoned["generation"])
+                    finally:
+                        raise
+                if environment_report()["fingerprint"] != preview["fingerprint"]:
+                    remove_generation(build["generation"])
+                    return Result.fail("environment_analysis_stale", code=409)
+                stage_generation(transaction, build)
+                _REPAIR_PREVIEWS.pop(payload.preview_id, None)
+                update_pending_restart(
+                    "webui.nonebot-store",
+                    ["dependency_environment_repair"],
+                    issue_ticket=True,
+                )
+                return Result.ok(
+                    _operation_result(
+                        "restart_pending",
+                        ["dependency_environment_repair"],
+                        changes=preview["changes"],
+                    ),
+                    info="定向修复已准备完成，重启 Bot 后验证并生效",
+                )
+        except (
+            DependencyAnalysisError,
+            LayerBuildError,
+            ArchiveDependencyConflict,
+            ArchiveSourceBuildConflict,
+            StoreOperationBusyError,
+        ) as error:
+            return Result.fail(str(error), code=409)
     ok, detail = await preflight_environment_repair()
     if not ok:
         return Result.fail(f"dependency_repair_preflight_failed: {detail}", code=409)

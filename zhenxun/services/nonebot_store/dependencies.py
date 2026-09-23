@@ -36,7 +36,7 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10
 
 from .storage import LAYER_ROOT, generation_path, load_manifest
 
-SOLVER_POLICY_VERSION = 5
+SOLVER_POLICY_VERSION = 6
 LOCK_FILE = Path("uv.lock")
 _REQ_LINE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)==([^\s;]+)")
 _SENSITIVE = re.compile(r"(?i)(authorization|token|password|secret)=?[^\s]*")
@@ -307,18 +307,79 @@ def _project_venv_active() -> bool:
         return False
 
 
+def active_requirement_conflicts(
+    effective: dict[str, str], layer: dict[str, str], manifest: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Check declarations against the same distribution view used by the solver."""
+    declarations = [("pyproject.toml", raw) for raw in project_requirements()]
+    generation = manifest.get("active_generation")
+    distributions = list(importlib.metadata.distributions())
+    if isinstance(generation, int):
+        distributions.extend(
+            importlib.metadata.distributions(path=[str(generation_path(generation))])
+        )
+    selected = {}
+    for distribution in distributions:
+        name = canonicalize_name(distribution.metadata.get("Name") or "")
+        if name and distribution.version == effective.get(name):
+            selected[name] = distribution
+    for owner, distribution in selected.items():
+        declarations.extend((owner, raw) for raw in distribution.requires or [])
+    conflicts = []
+    for owner, raw in declarations:
+        try:
+            requirement = Requirement(raw)
+            if requirement.marker and not requirement.marker.evaluate({"extra": ""}):
+                continue
+            name = canonicalize_name(requirement.name)
+            actual = effective.get(name)
+            if actual and requirement.specifier.contains(actual, prereleases=True):
+                continue
+        except (InvalidRequirement, InvalidVersion):
+            continue
+        conflicts.append(
+            {
+                "name": name,
+                "actual": actual,
+                "requirement": str(requirement),
+                "owner": owner,
+                "layer": "active_generation" if name in layer else "base",
+            }
+        )
+    return conflicts
+
+
 def environment_report(*, check_lock: bool = False) -> dict[str, Any]:
     immutable = protected_core()
     shared = shared_dependencies()
     base = base_installed_inventory()
     layer = layer_inventory()
+    effective = {**base, **layer}
+    manifest = load_manifest()
+    recorded = {
+        canonicalize_name(name): str(info.get("version", ""))
+        for name, info in manifest.get("packages", {}).items()
+        if isinstance(info, dict)
+    }
+    layer_mismatch = [
+        {
+            "name": name,
+            "recorded": recorded.get(name),
+            "actual": layer.get(name),
+            "layer": "active_generation",
+            "generation": manifest.get("active_generation"),
+        }
+        for name in sorted(set(recorded) | set(layer))
+        if recorded.get(name) != layer.get(name)
+    ]
     requirements = _project_requirement_map()
+    requirement_conflicts = active_requirement_conflicts(effective, layer, manifest)
     immutable_drift: list[dict[str, Any]] = []
     compatible_shared_drift: list[dict[str, Any]] = []
     incompatible_shared_drift: list[dict[str, Any]] = []
 
     for name, expected in sorted(immutable.items()):
-        actual = base.get(name)
+        actual = effective.get(name)
         if actual == expected:
             continue
         immutable_drift.append(
@@ -327,12 +388,14 @@ def environment_report(*, check_lock: bool = False) -> dict[str, Any]:
                 "tier": "immutable_core",
                 "expected": expected,
                 "actual": actual,
+                "layer": "active_generation" if name in layer else "base",
+                "requirement": f"{name}=={expected}",
                 "kind": _version_relation(actual, expected),
             }
         )
 
     for name, expected in sorted(shared.items()):
-        actual = base.get(name)
+        actual = effective.get(name)
         if actual == expected:
             continue
         requirement = requirements.get(name)
@@ -351,6 +414,7 @@ def environment_report(*, check_lock: bool = False) -> dict[str, Any]:
             "actual": actual,
             "kind": _version_relation(actual, expected),
             "requirement": str(requirement) if requirement else None,
+            "layer": "active_generation" if name in layer else "base",
         }
         target = compatible_shared_drift if compatible else incompatible_shared_drift
         target.append(item)
@@ -385,10 +449,14 @@ def environment_report(*, check_lock: bool = False) -> dict[str, Any]:
         status = "project_lock_stale"
     elif interpreter_mismatch:
         status = "interpreter_mismatch"
+    elif layer_mismatch:
+        status = "dependency_layer_state_mismatch"
     elif immutable_drift:
         status = "immutable_drift"
     elif incompatible_shared_drift:
         status = "incompatible_shared_drift"
+    elif requirement_conflicts:
+        status = "current_environment_dependency_conflict"
     elif compatible_shared_drift:
         status = "compatible_shared_drift"
     elif external:
@@ -405,6 +473,8 @@ def environment_report(*, check_lock: bool = False) -> dict[str, Any]:
         "immutable_count": len(immutable),
         "shared_count": len(shared),
         "immutable_drift": immutable_drift,
+        "layer_mismatch": layer_mismatch,
+        "requirement_conflicts": requirement_conflicts,
         "compatible_shared_drift": compatible_shared_drift,
         "incompatible_shared_drift": incompatible_shared_drift,
         "extra_packages": external,
@@ -414,10 +484,32 @@ def environment_report(*, check_lock: bool = False) -> dict[str, Any]:
         "repairable": bool(
             not interpreter_mismatch
             and not lock_stale
-            and (immutable_drift or incompatible_shared_drift)
+            and not layer_mismatch
+            and (
+                immutable_drift
+                or incompatible_shared_drift
+                or any(
+                    item["layer"] == "active_generation"
+                    for item in requirement_conflicts
+                )
+                or any(
+                    item["name"] in set(immutable) | set(shared)
+                    for item in requirement_conflicts
+                )
+            )
             and LOCK_FILE.is_file()
         ),
         "repair_command": "uv sync --locked --inexact",
+        "repair_mode": "layer"
+        if any(
+            item.get("layer") == "active_generation"
+            for item in [
+                *immutable_drift,
+                *incompatible_shared_drift,
+                *requirement_conflicts,
+            ]
+        )
+        else "base",
         "lock_digest": lock_digest,
         "layer_packages": len(layer),
     }
@@ -427,6 +519,16 @@ def environment_report(*, check_lock: bool = False) -> dict[str, Any]:
                 "lock": lock_digest,
                 "base": sorted(base.items()),
                 "layer": sorted(layer.items()),
+                "manifest": {
+                    key: manifest.get(key)
+                    for key in (
+                        "active_generation",
+                        "packages",
+                        "plugins",
+                        "generation_digest",
+                        "pending_verification",
+                    )
+                },
                 "python": payload["python"],
                 "platform": payload["platform"],
                 "lock_stale": lock_stale,
@@ -867,6 +969,15 @@ async def solve_install(
         )
 
     report = environment_report()
+    if report.get("layer_mismatch"):
+        raise DependencyAnalysisError(
+            "dependency_layer_state_mismatch", details=report["layer_mismatch"]
+        )
+    if report.get("requirement_conflicts"):
+        raise DependencyAnalysisError(
+            "current_environment_dependency_conflict",
+            details=report["requirement_conflicts"],
+        )
     blocking_drift = [
         *(
             {
@@ -884,7 +995,7 @@ async def solve_install(
         )
     if blocking_drift:
         raise DependencyAnalysisError(
-            "environment_drift",
+            "current_environment_dependency_conflict",
             ", ".join(
                 f"{item['name']}={item['actual'] or 'missing'}"
                 f" (lock={item['expected']})"
@@ -922,13 +1033,16 @@ async def solve_install(
     baseline = {
         name: version for name, version in current.items() if name != candidate_name
     }
-    baseline.update(
-        {
-            name: str(info["version"])
-            for name, info in manifest.get("packages", {}).items()
-            if name != candidate_name
-        }
-    )
+    # Pending transactions are not yet active; only their explicit plan may
+    # replace the installed view. Historical active metadata is checked above.
+    if manifest.get("packages") != load_manifest().get("packages"):
+        baseline.update(
+            {
+                name: str(info["version"])
+                for name, info in manifest.get("packages", {}).items()
+                if name != candidate_name
+            }
+        )
     baseline.update(immutable)
 
     # Discover only the requested plugin's closure. Other installed plugins

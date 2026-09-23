@@ -78,6 +78,8 @@ class RuntimeOperation:
     component_effects: dict[str, str] = field(default_factory=dict)
     affected_components: list[str] = field(default_factory=list)
     rollback_state: str = "none"
+    steps: list[dict[str, Any]] = field(default_factory=list)
+    reason_codes: list[str] = field(default_factory=list)
 
     def public_dict(self) -> dict[str, Any]:
         return {
@@ -90,4 +92,7 @@ class RuntimeOperation:
             "component_effects": dict(self.component_effects),
             "affected_components": list(self.affected_components),
             "rollback_state": self.rollback_state,
+            "steps": list(self.steps),
+            "reason_codes": list(self.reason_codes)
+            or ([self.reason] if self.reason else []),
         }

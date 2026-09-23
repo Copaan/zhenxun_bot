@@ -122,11 +122,22 @@ async def submit_restore(
 
 
 async def submit_export(
-    project: Path, session: str, options: ExportOptions, *, password: str | None = None
+    project: Path,
+    session: str,
+    options: ExportOptions,
+    *,
+    password: str | None = None,
+    task_id: str | None = None,
 ) -> dict:
     """Reserve under the worker mutation owner, then transfer durable ownership."""
     from zhenxun.services.runtime_mutation import runtime_mutation_coordinator
     from zhenxun.services.startup import startup_coordinator
+
+    if task_id is not None:
+        import re
+
+        if not isinstance(task_id, str) or not re.fullmatch(r"[a-f0-9]{32}", task_id):
+            raise MigrationError("migration_task_invalid")
 
     async def submit():
         from zhenxun.configs.config import Config
@@ -174,7 +185,16 @@ async def submit_export(
             "categories": sorted(options.categories),
             "requester_boot_id": state["boot_id"],
         }
-        job = store.create_job(session, "export", values)
+        if task_id is not None and store.path("jobs", task_id).exists():
+            existing = store.read("jobs", task_id, session=session)
+            if existing["action"] != "export" or any(
+                existing["options"].get(key) != value
+                for key, value in values.items()
+                if key != "requester_boot_id"
+            ):
+                raise MigrationError("migration_operation_id_conflict", status=409)
+            return store.public(existing)
+        job = store.create_job(session, "export", values, identity=task_id)
         # The persistent reservation blocks mutations across processes and
         # naturally releases them if preparation fails before worker shutdown.
         store.reserve(job["id"])

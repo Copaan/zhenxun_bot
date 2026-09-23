@@ -12,6 +12,7 @@ from zhenxun.services.runtime_mutation import (
     RuntimeMutationBusyError,
     runtime_mutation_coordinator,
 )
+from zhenxun.services.webui_resources import webui_resources
 
 if TYPE_CHECKING:
     from .manager import PluginRuntimeManager
@@ -24,7 +25,7 @@ def _watch_roots(manager: PluginRuntimeManager) -> list[Path]:
     project_root = Path.cwd().resolve()
     runtime_root = (Path("data") / "runtime").resolve()
     virtual_env_root = (Path(__file__).resolve().parents[3] / ".venv").resolve()
-    roots = {Path("zhenxun"), Path("data/web_ui/public")}
+    roots = {Path("zhenxun")}
     roots.update(
         unit.root
         for unit in manager.units.values()
@@ -43,6 +44,7 @@ def _watch_roots(manager: PluginRuntimeManager) -> list[Path]:
             ".env",
             "pyproject.toml",
             "uv.lock",
+            "requirements.txt",
         )
         if Path(name).exists()
     )
@@ -56,12 +58,16 @@ def _watch_roots(manager: PluginRuntimeManager) -> list[Path]:
 
 def _interesting(change: Change, raw_path: str) -> bool:
     path = Path(raw_path)
+    if webui_resources.contains(path):
+        return False
     if path.resolve().is_relative_to((Path("data") / "runtime").resolve()):
         return False
     if any(part in {"__pycache__", ".git", ".pytest_cache"} for part in path.parts):
         return False
     if path.suffix == ".json":
-        return path.name == "version.json" and "web_ui" in path.parts
+        return False
+    if path.name in {"requirements.txt", "requirement.txt"}:
+        return True
     return path.suffix in {
         ".py",
         ".yaml",
@@ -77,10 +83,15 @@ def _interesting(change: Change, raw_path: str) -> bool:
 async def watch_runtime_changes(manager: PluginRuntimeManager) -> None:
     retry_index = 0
     while True:
-        if not runtime_mutation_coordinator.accepting:
+        if manager._watcher_stopping or not runtime_mutation_coordinator.accepting:
             manager.watcher_state = "stopped"
             return
         try:
+            manager.consume_watcher_refresh()
+            if manager.runtime_watch_mode() == "disabled":
+                manager.watcher_state = "disabled"
+                await manager._watcher_refresh_event.wait()
+                continue
             roots = _watch_roots(manager)
             manager.watcher_roots = [str(path) for path in roots]
             if not roots:
@@ -97,20 +108,39 @@ async def watch_runtime_changes(manager: PluginRuntimeManager) -> None:
                 step=250,
                 rust_timeout=5000,
                 yield_on_timeout=True,
+                stop_event=manager._watcher_refresh_event,
             ):
+                if (
+                    manager._watcher_stopping
+                    or not runtime_mutation_coordinator.accepting
+                ):
+                    manager.watcher_state = "stopped"
+                    return
                 retry_index = 0
                 manager.watcher_retry_count = 0
                 manager.watcher_last_error = None
                 paths = {
-                    Path(raw_path)
+                    Path(raw_path).resolve()
                     for change, raw_path in changes
                     if _interesting(change, raw_path)
                 }
                 if paths:
+                    observed = _path_manifest(paths)
                     await manager.process_changes(
                         paths,
                         submit_restart=manager.runtime_watch_mode() == "auto_restart",
                     )
+                    for path in paths:
+                        if path in observed:
+                            manifest[path] = observed[path]
+                        else:
+                            manifest.pop(path, None)
+                if (
+                    manager._watcher_stopping
+                    or not runtime_mutation_coordinator.accepting
+                ):
+                    manager.watcher_state = "stopped"
+                    return
                 if manager.consume_watcher_refresh():
                     break
                 if time.monotonic() - last_reconcile >= 60:
@@ -131,9 +161,6 @@ async def watch_runtime_changes(manager: PluginRuntimeManager) -> None:
                 await asyncio.sleep(0)
             retry_index = 0
             manager.watcher_retry_count = 0
-            if manager.runtime_watch_mode() == "disabled":
-                manager.watcher_state = "disabled"
-                return
         except asyncio.CancelledError:
             manager.watcher_state = "stopped"
             raise
@@ -168,4 +195,17 @@ def _build_manifest(roots: list[Path]) -> dict[Path, tuple[int, int]]:
             except OSError:
                 continue
             result[path.resolve()] = (stat.st_mtime_ns, stat.st_size)
+    return result
+
+
+def _path_manifest(paths: set[Path]) -> dict[Path, tuple[int, int]]:
+    """Capture only observed paths before awaiting a reload operation."""
+    result = {}
+    for path in paths:
+        try:
+            stat = path.stat()
+            if path.is_file():
+                result[path] = (stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            continue
     return result
