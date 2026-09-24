@@ -122,19 +122,58 @@ class ProcessHandle:
                     children = verified_descendants(process)
                     covered.update(child.pid for child in children)
                     for child in children:
-                        created = child.create_time()
-                        previous = self.identities.get(child.pid)
-                        if previous is not None and previous != created:
+                        try:
+                            if child.status() == psutil.STATUS_ZOMBIE:
+                                continue
+                            created = child.create_time()
+                            previous = self.identities.get(child.pid)
+                            if previous is not None and previous != created:
+                                continue
+                            self.identities[child.pid] = created
+                            if child.pid not in known and child.is_running():
+                                live.append(child)
+                                known.add(child.pid)
+                        except (psutil.NoSuchProcess, psutil.ZombieProcess):
                             continue
-                        self.identities[child.pid] = created
-                        if child.pid not in known and child.is_running():
-                            live.append(child)
-                            known.add(child.pid)
-                except psutil.NoSuchProcess:
+                except (psutil.NoSuchProcess, psutil.ZombieProcess):
                     continue
                 except psutil.AccessDenied as error:
                     raise RuntimeError("process_identity_unverified") from error
         return live
+
+    def process_diagnostic(self) -> dict[str, Any]:
+        """Capture bounded process identities and states without command arguments."""
+        import psutil
+
+        observations = []
+        for pid, expected in sorted(self.identities.items())[:32]:
+            item = {"pid": pid, "expected_created_at": expected}
+            try:
+                process = psutil.Process(pid)
+                created = process.create_time()
+                item.update(
+                    created_at=created,
+                    identity_verified=created == expected,
+                    status=process.status(),
+                    parent_pid=process.ppid(),
+                    name=process.name()[:128],
+                )
+            except psutil.ZombieProcess:
+                item["status"] = "zombie"
+            except psutil.NoSuchProcess:
+                item["status"] = "exited"
+            except psutil.AccessDenied:
+                item.update(status="access_denied", identity_verified=False)
+            observations.append(item)
+        return {
+            "recorded_at": _now(),
+            "role": self.role,
+            "spawn_pid": self.spawn_pid,
+            "runtime_pid": self.runtime_pid,
+            "return_code": self.process.poll(),
+            "processes": observations,
+            "truncated": len(self.identities) > 32,
+        }
 
     @property
     def spawn_pid(self) -> int:
@@ -244,6 +283,11 @@ class ProcessHandle:
                         "elapsed_seconds": asyncio.get_running_loop().time() - started,
                         "timed_out": pending,
                         "identity_verified": verified,
+                        **(
+                            {"process_diagnostic": self.process_diagnostic()}
+                            if pending
+                            else {}
+                        ),
                     }
                 )
             if self._live_processes():
@@ -291,6 +335,11 @@ class ProcessHandle:
                     "elapsed_seconds": time.monotonic() - started,
                     "timed_out": pending,
                     "identity_verified": verified,
+                    **(
+                        {"process_diagnostic": self.process_diagnostic()}
+                        if pending
+                        else {}
+                    ),
                 }
             )
 

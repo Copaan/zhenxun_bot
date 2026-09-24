@@ -1690,6 +1690,7 @@ async def _run_launcher_async() -> None:
         if migration_service is not None:
             migration_service.bind_export_worker(worker)
         migration_snapshot = False
+        failed_export_id: str | None = None
         migration_shutdown = None
         migration_restore = None
         migration_preparation = None
@@ -1705,6 +1706,15 @@ async def _run_launcher_async() -> None:
                     migration_export = None
                 return_code = worker.poll()
                 if return_code is not None:
+                    if failed_export_id is not None:
+                        handle = launcher_supervisor._handles.get(worker.pid)
+                        if handle is not None and handle._live_processes(discover=True):
+                            if stop_requested:
+                                raise SystemExit(
+                                    128 + int(stop_signal or signal.SIGINT)
+                                )
+                            await asyncio.sleep(WORKER_POLL_INTERVAL)
+                            continue
                     if migration_export is not None:
                         await migration_export.interrupt(
                             "migration_resumed_worker_exited"
@@ -1917,9 +1927,8 @@ async def _run_launcher_async() -> None:
                                 migration_export.fail(
                                     "migration_shutdown_unconfirmed", recovery=True
                                 )
+                                failed_export_id = migration_export.identity
                                 migration_export = None
-                                if webui_dev is not None:
-                                    await webui_dev.start()
                                 # Keep supervising the old writer; a replacement
                                 # may only start after its process tree exits.
                                 restart_requested = True
@@ -1930,6 +1939,7 @@ async def _run_launcher_async() -> None:
                 if (
                     migration_export is None
                     and migration_restore is None
+                    and failed_export_id is None
                     and now >= next_restart_check
                 ):
                     next_restart_check = now + RESTART_POLL_INTERVAL
@@ -1962,6 +1972,7 @@ async def _run_launcher_async() -> None:
                 if (
                     webui_tls.http_sidecar_enabled
                     and http_sidecar is None
+                    and failed_export_id is None
                     and now >= next_http_sidecar_retry
                 ):
                     if await _worker_webui_is_ready_once(
@@ -2054,6 +2065,12 @@ async def _run_launcher_async() -> None:
             if current_worker is worker:
                 current_worker = None
 
+        if failed_export_id is not None:
+            if stop_requested:
+                raise SystemExit(128 + int(stop_signal or signal.SIGINT))
+            await migration_service.recover_with_management()
+            require_resolved_restore(cwd)
+            continue
         if migration_adopted_worker is not None or migration_resume_original:
             continue
         if migration_snapshot:

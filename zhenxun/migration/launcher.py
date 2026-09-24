@@ -352,6 +352,12 @@ class LauncherMigrationService:
         if job is None:
             return None
         if job["action"] != "restore":
+            if any(
+                handle._live_processes(discover=True)
+                for handle in self.supervisor._handles.values()
+                if handle.role != "migration_management"
+            ):
+                raise MigrationError("migration_instance_running", status=409)
             assert_offline(self.lease.project, management_peers=self.management_peers())
             directory = self.store.path("jobs", job["id"]).parent
             if (directory / "publication.json").exists():
