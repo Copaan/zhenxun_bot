@@ -342,7 +342,7 @@ def active_requirement_conflicts(
 def environment_report(*, check_lock: bool = False, snapshot=None) -> dict[str, Any]:
     immutable = protected_core()
     shared = shared_dependencies()
-    from .environment import capture_environment
+    from .environment import capture_environment, core_environment_summary
 
     snapshot = snapshot or capture_environment()
     base = {name: dist.version for name, dist in snapshot.base.items()}
@@ -519,6 +519,7 @@ def environment_report(*, check_lock: bool = False, snapshot=None) -> dict[str, 
             sort_keys=True,
         ).encode()
     ).hexdigest()
+    payload["core_summary"] = core_environment_summary(snapshot, immutable, payload)
     return payload
 
 

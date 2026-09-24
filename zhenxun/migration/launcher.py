@@ -196,6 +196,11 @@ class LauncherMigrationService:
             if not password and options.get("plaintext_confirmed") is not True:
                 raise MigrationError("migration_plaintext_confirmation_required")
             snapshot = ManagementSnapshot.parse(payload.get("management"))
+            database_connection = payload.get("database_connection")
+            if "data" in options.get("categories", []):
+                from .snapshot import bound_database_connection
+
+                bound_database_connection(database_connection)
             receipt = self.accept(identity)
             if job["stage"] == "queued" and self._accepted_export_id != identity:
                 self._queued_export = OnlineExport.accepted(
@@ -203,6 +208,7 @@ class LauncherMigrationService:
                 )
                 self._accepted_export_id = identity
                 self._queued_export.management_snapshot = snapshot
+                self._queued_export.database_connection = database_connection
             elif self._queued_export and self._queued_export.identity != identity:
                 raise MigrationError("migration_operation_in_progress", status=409)
             return receipt
@@ -657,6 +663,31 @@ class LauncherMigrationService:
             if self.store.read("jobs", identity)["cancel_requested"]:
                 raise MigrationError("migration_cancelled")
             self.store.transition(identity, "preparing")
+            from zhenxun.configs.database import DatabaseConnection
+            from zhenxun.services.database_probe import probe_native_database
+
+            from .snapshot import _database_configuration
+
+            private_input = {}
+            if "data" in self.store.read("jobs", identity)["options"].get(
+                "categories", []
+            ):
+                from dataclasses import asdict
+
+                endpoint = DatabaseConnection.parse(
+                    _database_configuration(self.lease.project)
+                )
+                checked = await probe_native_database(endpoint, self.lease.project)
+                if checked["status"] != "ok":
+                    if checked.get("diagnostic"):
+                        self.store.record_database_diagnostic(
+                            identity, checked["diagnostic"]
+                        )
+                    raise MigrationError(checked["code"])
+                private_input["database_connection"] = {
+                    "endpoint": asdict(endpoint),
+                    "certificates": endpoint.certificate_hashes(),
+                }
             self.store.transition(identity, "quiescing")
             quiesce_started = True
             shutdown = await self._wait(quiesce, budget.phase(15))
@@ -675,7 +706,12 @@ class LauncherMigrationService:
             self.store.transition(
                 identity, "snapshotting", progress={"snapshot_mode": mode}
             )
-            await self.phases.run(identity, "export_snapshot", budget=budget.phase())
+            await self.phases.run(
+                identity,
+                "export_snapshot",
+                budget=budget.phase(),
+                private_input=private_input,
+            )
             self.store.transition(
                 identity, "resuming", progress={"snapshot_generated": True}
             )

@@ -138,6 +138,19 @@ def _environment_view() -> dict[str, Any]:
             "extra_count": 0,
             "error_code": type(error).__name__,
         }
+    result.setdefault(
+        "core_summary",
+        {
+            "status": "unconfirmed",
+            "checked_count": 0,
+            "issues": [
+                {
+                    "kind": "environment_check_failed",
+                    "error_code": result.get("error_code"),
+                }
+            ],
+        },
+    )
     result["sync"] = dependency_sync_status()
     result["startup_verification"] = read_json(STARTUP_STATUS_FILE, {})
     pending = pending_transaction() or {}

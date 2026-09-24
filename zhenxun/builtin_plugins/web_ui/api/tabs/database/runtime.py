@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 import time
 from typing import Literal
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from dotenv import dotenv_values
 from fastapi import APIRouter, HTTPException
@@ -15,7 +15,6 @@ from pydantic import BaseModel
 from redis.asyncio import Redis
 from redis.asyncio.retry import Retry
 from redis.backoff import NoBackoff
-from tortoise import Tortoise
 
 from zhenxun.configs.environment import environment_file, environment_target
 from zhenxun.services.cache import cache_config
@@ -87,18 +86,26 @@ def _current_database(values: dict[str, str]) -> DatabaseConfig:
     if not url:
         return DatabaseConfig()
     if url.startswith("sqlite"):
-        path = url.split(":", 1)[1].lstrip("/") or "data/db/zhenxun.db"
-        return DatabaseConfig(mode="sqlite", path=path)
+        from zhenxun.configs.database import DatabaseConnection
+
+        endpoint = DatabaseConnection.parse(url)
+        if endpoint.database == ":memory:" or not Path(
+            endpoint.database
+        ).is_relative_to(Path.cwd()):
+            return DatabaseConfig(mode="url", url=url)
+        return DatabaseConfig(mode="sqlite", path=endpoint.database)
     parsed = urlsplit(url)
+    if parsed.query:
+        return DatabaseConfig(mode="url", url=url)
     mode = "mysql" if parsed.scheme.startswith("mysql") else "postgres"
     if parsed.scheme.startswith(("mysql", "postgres")):
         return DatabaseConfig(
             mode=mode,
             host=parsed.hostname or "",
             port=parsed.port,
-            username=parsed.username or "",
-            password=parsed.password or "",
-            database=parsed.path.lstrip("/"),
+            username=unquote(parsed.username or ""),
+            password=unquote(parsed.password or ""),
+            database=unquote(parsed.path.lstrip("/")),
         )
     return DatabaseConfig(mode="url", url=url)
 
@@ -153,20 +160,9 @@ def _cache_public(config: CacheConfig) -> dict:
 
 
 async def _database_status() -> dict:
-    started = time.perf_counter()
-    try:
-        connection = Tortoise.get_connection("default")
-        await asyncio.wait_for(connection.execute_query("SELECT 1"), timeout=2)
-        return {
-            "status": "ok",
-            "latency_ms": round((time.perf_counter() - started) * 1000),
-        }
-    except Exception as error:
-        return {
-            "status": "error",
-            "latency_ms": round((time.perf_counter() - started) * 1000),
-            "code": f"database_{error.__class__.__name__.lower()}",
-        }
+    from zhenxun.services.database_probe import probe_runtime_database
+
+    return await probe_runtime_database()
 
 
 async def _redis_metrics(config: CacheConfig) -> dict:
@@ -274,7 +270,13 @@ async def database_runtime() -> Result:
     response_model=Result,
     response_class=JSONResponse,
 )
-async def database_probe(payload: RuntimeProbeRequest) -> Result:
+async def database_probe(payload: RuntimeProbeRequest | None = None) -> Result:
+    payload = payload or RuntimeProbeRequest()
+    if payload.database is None and payload.cache is None:
+        database_result, cache_result = await asyncio.gather(
+            _database_status(), probe_cache(_applied_cache())
+        )
+        return Result.ok({"database": database_result, "cache": cache_result})
     values = _env_values()
     current_database = _current_database(values)
     current_cache = _current_cache(values)

@@ -84,6 +84,21 @@ def _database_configuration(project: Path) -> str | None:
     return environment.get("DB_URL", values.get("DB_URL"))
 
 
+def bound_database_connection(value):
+    """Verify the private handoff policy without rereading pending configuration."""
+    from zhenxun.configs.database import DatabaseConnection
+
+    try:
+        endpoint = DatabaseConnection(**value["endpoint"])
+        if endpoint.certificate_hashes() != value["certificates"]:
+            raise ValueError("changed")
+        return endpoint
+    except (TypeError, KeyError, ValueError, OSError):
+        raise MigrationError(
+            "migration_database_connection_changed", status=409
+        ) from None
+
+
 def capture_snapshot(
     project: Path,
     destination: Path,
@@ -95,6 +110,7 @@ def capture_snapshot(
     checkpoint=lambda: None,
     progress=None,
     database_diagnostic=None,
+    database_connection=None,
 ) -> tuple[list[FileEntry], dict]:
     lease.require_held()
     budget.checkpoint()
@@ -103,6 +119,22 @@ def capture_snapshot(
         budget.checkpoint()
         checkpoint()
 
+    if database_connection is None and "data" in options.categories:
+        from zhenxun.configs.database import DatabaseConnection
+        from zhenxun.services.database_probe import probe_native_database
+
+        configured = _database_configuration(project)
+        if configured:
+            endpoint = DatabaseConnection.parse(configured, root=project)
+            probe = asyncio.run(probe_native_database(endpoint, project))
+            if probe["status"] != "ok":
+                if database_diagnostic and probe.get("diagnostic"):
+                    database_diagnostic(probe["diagnostic"])
+                raise MigrationError(probe["code"])
+            database_connection = {
+                "endpoint": asdict(endpoint),
+                "certificates": endpoint.certificate_hashes(),
+            }
     initial = scan_project(project, max_entries=limits.entries, checkpoint=check)
 
     def stable_files(scan):
@@ -137,14 +169,24 @@ def capture_snapshot(
         )
     if sum(entry.size for entry in files) > limits.expanded:
         raise MigrationError("migration_expanded_limit")
-    database_url = _database_configuration(project)
+    database_url = (
+        bound_database_connection(database_connection).url()
+        if database_connection is not None
+        else _database_configuration(project)
+    )
     primary_database = None
     native_endpoint = None
     if "data" in options.categories and database_url:
         if not database_url.lower().startswith("sqlite:"):
             from .native_database import DatabaseEndpoint
 
-            native_endpoint = DatabaseEndpoint.parse(database_url)
+            native_endpoint = (
+                DatabaseEndpoint.from_connection(
+                    bound_database_connection(database_connection)
+                )
+                if database_connection is not None
+                else DatabaseEndpoint.parse(database_url, root=project)
+            )
         else:
             from zhenxun.configs.database import (
                 is_sqlite_memory_url,

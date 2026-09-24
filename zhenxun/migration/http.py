@@ -301,6 +301,14 @@ def create_router(
         with boundary(exclusive=True):
             return result(await application.preview_export(offset=offset, limit=limit))
 
+    @router.post("/export/connection-check")
+    async def export_connection_check(session: str = Depends(session_dependency)):
+        from zhenxun.services.database_probe import probe_export_connection
+
+        with boundary(exclusive=True):
+            checked, _ = await probe_export_connection(project)
+            return result(checked)
+
     @router.post("/export")
     async def export(request: Request, session: str = Depends(session_dependency)):
         from .discovery import CATEGORIES
@@ -315,6 +323,7 @@ def create_router(
                 "task_id",
                 "dependencies",
                 "password",
+                "connection_fingerprint",
             }:
                 raise MigrationError("migration_export_options_invalid")
             if payload.get("confirm_secrets") is not True:
@@ -339,6 +348,7 @@ def create_router(
                     ),
                     password=payload.get("password"),
                     task_id=payload.get("task_id"),
+                    connection_fingerprint=payload.get("connection_fingerprint"),
                 )
             )
 

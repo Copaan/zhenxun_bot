@@ -304,6 +304,9 @@ def execute_phase(project: Path, request: dict, *, lease: DelegatedLease) -> dic
             checkpoint=check,
             progress=progress.update,
             database_diagnostic=record_database_diagnostic,
+            database_connection=request.get("private_input", {}).get(
+                "database_connection"
+            ),
         )
         metadata["snapshot_mode"] = snapshot_mode
         entries = [

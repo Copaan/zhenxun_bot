@@ -336,12 +336,10 @@ async def _run_script_migrations(
         return json.loads(payload)
 
 
-def get_config() -> dict:
+def get_config(endpoint=None) -> dict:
     """获取数据库配置"""
     if not BotConfig.db_url:
         raise DbUrlIsNode("数据库Url连接字符串为空，请检查配置文件（.env.dev）")
-    parsed = urlparse(BotConfig.db_url)
-
     config = {
         "connections": {"default": BotConfig.db_url},
         "apps": {
@@ -353,44 +351,17 @@ def get_config() -> dict:
         "timezone": "Asia/Shanghai",
     }
 
-    if parsed.scheme.startswith("postgres"):
-        config["connections"]["default"] = {
-            "engine": "tortoise.backends.asyncpg",
-            "credentials": {
-                "host": parsed.hostname,
-                "port": parsed.port or 5432,
-                "user": parsed.username,
-                "password": parsed.password,
-                "database": parsed.path[1:],
-                **POSTGRESQL_CONFIG,
-            },
-        }
-    elif parsed.scheme == "mysql":
-        config["connections"]["default"] = {
-            "engine": "tortoise.backends.mysql",
-            "credentials": {
-                "host": parsed.hostname,
-                "port": parsed.port or 3306,
-                "user": parsed.username,
-                "password": parsed.password,
-                "database": parsed.path[1:],
-                **MYSQL_CONFIG,
-            },
-        }
-    elif parsed.scheme == "sqlite":
-        if is_sqlite_memory_url(BotConfig.db_url):
-            sqlite_file_path = ":memory:"
-        else:
-            sqlite_path = sqlite_path_from_url(BotConfig.db_url)
-            sqlite_path.parent.mkdir(parents=True, exist_ok=True)
-            sqlite_file_path = str(sqlite_path)
-        config["connections"]["default"] = {
-            "engine": "tortoise.backends.sqlite",
-            "credentials": {
-                "file_path": sqlite_file_path,
-                **SQLITE_CONFIG,
-            },
-        }
+    from zhenxun.configs.database import DatabaseConnection
+
+    endpoint = endpoint or DatabaseConnection.parse(BotConfig.db_url)
+    defaults = {
+        "postgres": POSTGRESQL_CONFIG,
+        "mysql": MYSQL_CONFIG,
+        "sqlite": SQLITE_CONFIG,
+    }[endpoint.engine]
+    if endpoint.engine == "sqlite" and endpoint.database != ":memory:":
+        Path(endpoint.database).parent.mkdir(parents=True, exist_ok=True)
+    config["connections"]["default"] = endpoint.orm_config(defaults)
     return config
 
 
@@ -423,9 +394,30 @@ async def init():
         error = prompt
         raise DbUrlIsNode("\n" + error.strip())
     try:
-        await Tortoise.init(
-            config=get_config(),
+        from zhenxun.configs.database import (
+            DatabaseConnection,
+            bind_database_connection,
+            inspect_database_tls,
         )
+
+        bind_database_connection(None)
+        from dataclasses import replace
+
+        endpoint = replace(
+            DatabaseConnection.parse(BotConfig.db_url),
+            source="environment"
+            if any(key.upper() == "DB_URL" for key in os.environ)
+            else "configuration_file",
+        )
+        endpoint_certificates = endpoint.certificate_hashes()
+        await Tortoise.init(
+            config=get_config(endpoint),
+        )
+        if endpoint.engine == "mysql" and endpoint.tls != "DISABLED":
+            await asyncio.wait_for(
+                inspect_database_tls(endpoint, Tortoise.get_connection("default")),
+                DB_TIMEOUT_SECONDS,
+            )
         from .timing import instrument_client
 
         instrument_client(Tortoise.get_connection("default"))
@@ -503,6 +495,9 @@ async def init():
         async with _schema_migration_lock():
             await ensure_group_plugin_scope_constraint()
         await repair_safe_schema_drift()
+        if endpoint.certificate_hashes() != endpoint_certificates:
+            raise ValueError("database_connection_changed")
+        bind_database_connection(endpoint)
         _database_ready = True
         logger.info("Database loaded successfully!")
     except Exception as e:
@@ -513,7 +508,10 @@ async def init():
 async def disconnect():
     global _database_ready
 
+    from zhenxun.configs.database import bind_database_connection
+
     _database_ready = False
+    bind_database_connection(None)
     try:
         await connections.close_all()
     except ConfigurationError:

@@ -249,6 +249,54 @@ def capture_environment(
     )
 
 
+def core_environment_summary(
+    snapshot: EnvironmentSnapshot, protected: dict[str, str], report: dict
+) -> dict:
+    """Summarize protected packages without attributing plugin constraints to core."""
+    relevant = set(protected)
+    relevant.update(
+        item["name"] for item in snapshot.declarations if item["owner"] in protected
+    )
+    issues = [{**item, "kind": "core_version"} for item in report["immutable_drift"]]
+    issues.extend(
+        {"kind": "requirement_conflict", **item}
+        for item in snapshot.conflicts
+        if item["owner"] in protected
+        or (item["owner"] == "pyproject.toml" and item["name"] in protected)
+    )
+    uncertain = [item for item in issues if item["kind"] == "source_unverified"]
+    for flag in ("interpreter_mismatch", "project_lock_stale"):
+        if report[flag]:
+            uncertain.append({"kind": flag})
+    if not protected:
+        uncertain.append({"kind": "core_scope_unavailable"})
+    uncertain.extend(
+        {**item, "kind": "layer_mismatch"}
+        for item in report["layer_mismatch"]
+        if item["name"] in relevant
+    )
+    for name in sorted(relevant):
+        if name in snapshot.selected and not snapshot.sources.get(name, {}).get("path"):
+            uncertain.append({"name": name, "kind": "source_unverified"})
+        if snapshot.duplicates.get(name):
+            uncertain.append({"name": name, "kind": "duplicate_metadata"})
+    uncertain.extend(
+        {**item, "kind": "loaded_source_mismatch"}
+        for item in snapshot.loaded_mismatches
+        if item["name"] in relevant
+    )
+    issues.extend(item for item in uncertain if item not in issues)
+    return {
+        "status": "unconfirmed"
+        if uncertain
+        else "incompatible"
+        if issues
+        else "healthy",
+        "checked_count": len(protected),
+        "issues": issues,
+    }
+
+
 def conflict_key(issue: dict) -> tuple:
     return tuple(
         issue.get(key)

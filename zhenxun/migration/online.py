@@ -19,6 +19,7 @@ class OnlineExport:
     budget: MigrationBudget
     password: str | None = field(default=None, repr=False)
     management_snapshot: object | None = field(default=None, repr=False)
+    database_connection: dict | None = field(default=None, repr=False)
     first_error: str | None = None
     pack_task: asyncio.Task | None = None
 
@@ -48,6 +49,12 @@ class OnlineExport:
     def begin(self, *, network=None) -> bool:
         try:
             self.budget.checkpoint()
+            if "data" in self.store.read("jobs", self.identity)["options"].get(
+                "categories", []
+            ):
+                from .snapshot import bound_database_connection
+
+                bound_database_connection(self.database_connection)
             if network is not None:
                 from .recovery_context import save_management_context
 
@@ -95,7 +102,10 @@ class OnlineExport:
                 )
                 await management.start(network, budget=self.budget.phase())
             await self.service.phases.run(
-                self.identity, "export_snapshot", budget=self.budget.phase()
+                self.identity,
+                "export_snapshot",
+                budget=self.budget.phase(),
+                private_input={"database_connection": self.database_connection},
             )
             self.store.transition(
                 self.identity, "snapshotting", progress={"snapshot_generated": True}
@@ -121,7 +131,14 @@ class OnlineExport:
         if self.store.read("jobs", self.identity)["stage"] != "resuming":
             raise MigrationError("migration_export_phase_invalid")
         self._receipt("resume-authorization.json", {"startup_id": startup_id})
-        return {"ZHENXUN_MIGRATION_RESUME_ID": self.identity}
+        environment = {"ZHENXUN_MIGRATION_RESUME_ID": self.identity}
+        if self.database_connection is not None:
+            from .snapshot import bound_database_connection
+
+            environment["DB_URL"] = bound_database_connection(
+                self.database_connection
+            ).url()
+        return environment
 
     def resumed(self, worker) -> None:
         handle = self.service.supervisor._handles.get(worker.pid)

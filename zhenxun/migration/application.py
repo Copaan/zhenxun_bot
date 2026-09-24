@@ -92,11 +92,24 @@ class MigrationApplication:
                 await service.close()
                 await supervisor.shutdown()
 
-    async def export(self, session: str, options, *, password=None, task_id=None):
+    async def export(
+        self,
+        session: str,
+        options,
+        *,
+        password=None,
+        task_id=None,
+        connection_fingerprint=None,
+    ):
         from .submission import submit_export
 
         return await submit_export(
-            self.project, session, options, password=password, task_id=task_id
+            self.project,
+            session,
+            options,
+            password=password,
+            task_id=task_id,
+            connection_fingerprint=connection_fingerprint,
         )
 
     async def preflight(

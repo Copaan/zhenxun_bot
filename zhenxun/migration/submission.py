@@ -128,6 +128,7 @@ async def submit_export(
     *,
     password: str | None = None,
     task_id: str | None = None,
+    connection_fingerprint: str | None = None,
 ) -> dict:
     """Reserve under the worker mutation owner, then transfer durable ownership."""
     from zhenxun.services.runtime_mutation import runtime_mutation_coordinator
@@ -198,7 +199,38 @@ async def submit_export(
         # The persistent reservation blocks mutations across processes and
         # naturally releases them if preparation fails before worker shutdown.
         store.reserve(job["id"])
+        handoff_started = False
         try:
+            from zhenxun.services.database_probe import probe_export_connection
+
+            checked, database_connection = (
+                await probe_export_connection(project)
+                if "data" in options.categories
+                else ({"ready": True}, None)
+            )
+            if not checked["ready"]:
+                native = checked.get("native", {})
+                if native.get("diagnostic"):
+                    store.record_database_diagnostic(job["id"], native["diagnostic"])
+                code = (
+                    native.get("code")
+                    or checked.get("code")
+                    or checked.get("runtime", {}).get("code")
+                    or "migration_database_connection_unconfirmed"
+                )
+                raise MigrationError(
+                    "migration_" + code if code.startswith("database_") else code,
+                    status=409,
+                )
+            if (
+                "data" in options.categories
+                and connection_fingerprint is not None
+                and connection_fingerprint != checked.get("fingerprint")
+            ):
+                raise MigrationError(
+                    "migration_database_connection_changed", status=409
+                )
+            handoff_started = True
             receipt = await asyncio.to_thread(
                 request_control,
                 project,
@@ -206,6 +238,7 @@ async def submit_export(
                 {
                     "task_id": job["id"],
                     "archive_password": password,
+                    "database_connection": database_connection,
                     "management": asdict(management),
                 },
             )
@@ -216,6 +249,16 @@ async def submit_export(
             uncertain = error.code.startswith("migration_control_")
             if not recorded and not uncertain:
                 store.transition(job["id"], "failed", error_code=error.code)
+            raise
+        except BaseException as error:
+            if not handoff_started:
+                store.transition(
+                    job["id"],
+                    "failed",
+                    error_code="migration_cancelled"
+                    if isinstance(error, asyncio.CancelledError)
+                    else "migration_database_preflight_failed",
+                )
             raise
         recorded = read_json_locked(
             store.path("jobs", job["id"]).parent / "handoff.json", None

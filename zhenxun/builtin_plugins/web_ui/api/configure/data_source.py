@@ -15,8 +15,12 @@ from urllib.parse import quote
 
 import psutil
 from redis.asyncio import Redis
-from tortoise.backends.base.config_generator import expand_db_url
 
+from zhenxun.configs.database import (
+    DatabaseConnection,
+    database_error_code,
+    inspect_database_tls,
+)
 from zhenxun.configs.webui_tls import current_webui_scheme
 from zhenxun.services.log import logger
 from zhenxun.utils.network import local_access_urls, private_ipv4_addresses
@@ -85,7 +89,7 @@ def build_database_url(config: DatabaseConfig, root: Path | None = None) -> str:
         value = config.url.strip()
         if not value:
             raise ValueError("database_url_empty")
-        expand_db_url(value)
+        DatabaseConnection.parse(value, root=root)
         return value
 
     host = config.host.strip()
@@ -162,7 +166,8 @@ async def probe_database(
     client: Any | None = None
     try:
         database_url = build_database_url(config, root)
-        db_config = expand_db_url(database_url)
+        endpoint = DatabaseConnection.parse(database_url, root=root)
+        db_config = endpoint.orm_config()
         engine = importlib.import_module(db_config["engine"])
         client = engine.client_class(
             connection_name="webui_configure_test",
@@ -172,6 +177,7 @@ async def probe_database(
         async def _ping() -> None:
             await client.create_connection(with_db=True)
             await client.execute_query("SELECT 1")
+            await inspect_database_tls(endpoint, client)
 
         await asyncio.wait_for(_ping(), timeout=10)
         return _result(
@@ -187,7 +193,20 @@ async def probe_database(
         code = str(error) if str(error).startswith("database_") else "database_invalid"
         return _result("error", code, "数据库配置不完整或格式无效。", started_at)
     except Exception as error:
-        return _safe_failure("数据库", error, started_at)
+        code = database_error_code(error)
+        message = {
+            "database_tls_driver_incompatible": (
+                "当前数据库驱动与 Windows 事件循环的 TLS 握手不兼容；"
+                "未改为明文连接。"
+            ),
+            "database_tls_verification_failed": (
+                "数据库证书校验失败，请检查 CA、证书有效期及主机名。"
+            ),
+            "database_connection_refused": (
+                "数据库拒绝连接，请检查目标地址、端口与监听状态。"
+            ),
+        }.get(code, f"数据库连接失败（{error.__class__.__name__}）。")
+        return _result("error", code, message, started_at)
     finally:
         if client is not None:
             with contextlib.suppress(Exception):

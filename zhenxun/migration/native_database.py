@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import asdict
 from functools import partial
 import hashlib
 import json
@@ -15,9 +15,10 @@ import shutil
 import subprocess
 import sys
 import time
-from urllib.parse import parse_qs, quote, unquote, urlsplit
+from urllib.parse import quote
 import uuid
 
+from zhenxun.configs.database import DatabaseConnection
 from zhenxun.services.lifecycle.deadline import ShutdownBudget, current_budget
 from zhenxun.services.lifecycle.kernel import LifecycleKernel
 from zhenxun.services.lifecycle.launcher import LauncherSupervisor
@@ -38,68 +39,39 @@ _TOOLS = {
 }
 
 
-@dataclass(frozen=True)
-class DatabaseEndpoint:
-    engine: str
-    host: str
-    port: int
-    database: str
-    username: str = field(repr=False)
-    password: str = field(repr=False)
-    tls: str = ""
+class DatabaseEndpoint(DatabaseConnection):
+    @classmethod
+    def from_connection(cls, endpoint):
+        """Validate migration restrictions without resolving configuration again."""
+        if endpoint.engine not in _TOOLS or not _NAME.fullmatch(endpoint.database):
+            raise MigrationError("migration_database_connection_invalid")
+        if endpoint.options.get("schema", "public") != "public":
+            raise MigrationError("migration_database_schema_unsupported")
+        if len(endpoint.username) > 128 or len(endpoint.password) > 4096:
+            raise MigrationError("migration_database_connection_invalid")
+        if endpoint.engine == "postgres" and endpoint.tls in {"allow", "prefer"}:
+            if endpoint.options.get("sslrootcert") or endpoint.options.get("sslcrl"):
+                raise MigrationError("migration_database_tls_policy_not_equivalent")
+        if endpoint.engine == "mysql" and endpoint.tls in {
+            "VERIFY_CA",
+            "VERIFY_IDENTITY",
+        }:
+            if not endpoint.options.get("sslrootcert"):
+                raise MigrationError("migration_database_tls_policy_not_equivalent")
+        return cls(**asdict(endpoint))
 
     @classmethod
-    def parse(cls, value: str) -> DatabaseEndpoint:
+    def parse(cls, value: str, **kwargs):
         try:
-            parsed = urlsplit(value)
-            engine = "postgres" if parsed.scheme == "postgresql" else parsed.scheme
-            query = parse_qs(parsed.query, strict_parsing=True) if parsed.query else {}
-            if (
-                engine not in _TOOLS
-                or not parsed.hostname
-                or parsed.fragment
-                or set(query) - {"sslmode", "ssl_mode"}
-                or any(len(v) != 1 for v in query.values())
-                or len(query) > 1
-            ):
-                raise ValueError
-            database = unquote(parsed.path.removeprefix("/"))
-            username = unquote(parsed.username or "")
-            password = unquote(parsed.password or "")
-            if not _NAME.fullmatch(database) or not username:
-                raise ValueError
-            if any(c in username + password for c in "\r\n\x00"):
-                raise ValueError
-            if len(username) > 128 or len(password) > 4096:
-                raise ValueError
-            local = parsed.hostname in {"localhost", "127.0.0.1", "::1"}
-            tls = next(iter(query.values()), ["disable" if local else "verify-full"])[0]
-            allowed = (
-                {"disable", "verify-full"}
-                if engine == "postgres"
-                else {
-                    "DISABLED",
-                    "VERIFY_IDENTITY",
-                }
-            )
-            if engine == "mysql":
-                tls = {"disable": "DISABLED", "verify-full": "VERIFY_IDENTITY"}.get(
-                    tls, tls
-                )
-            if tls not in allowed or (not local and tls in {"disable", "DISABLED"}):
-                raise MigrationError("migration_database_tls_configuration_required")
-            port = parsed.port or (3306 if engine == "mysql" else 5432)
-            return cls(engine, parsed.hostname, port, database, username, password, tls)
-        except (ValueError, TypeError, AttributeError):
-            raise MigrationError("migration_database_connection_invalid") from None
-
-    def identity(self) -> dict:
-        return {
-            "engine": self.engine,
-            "host": self.host.lower(),
-            "port": self.port,
-            "database": self.database,
-        }
+            endpoint = DatabaseConnection.parse(value, **kwargs)
+            return cls.from_connection(endpoint)
+        except (ValueError, OSError) as error:
+            code = str(error)
+            raise MigrationError(
+                "migration_" + code
+                if code.startswith("database_")
+                else "migration_database_connection_invalid"
+            ) from None
 
 
 def require_version(engine: str, source: str, target: str) -> None:
@@ -185,6 +157,7 @@ class NativeDatabase:
         self.diagnostic, self.progress, self.phase = diagnostic, progress, phase
         self.secrets = [
             endpoint.password,
+            endpoint.options.get("sslpassword"),
             *[
                 value
                 for key, value in os.environ.items()
@@ -242,7 +215,18 @@ class NativeDatabase:
                         "user": endpoint.username,
                         "password": endpoint.password,
                         "ssl-mode": endpoint.tls,
-                        "default-character-set": "utf8mb4",
+                        "default-character-set": endpoint.options.get(
+                            "charset", "utf8mb4"
+                        ),
+                        **{
+                            target: endpoint.options[source]
+                            for source, target in {
+                                "sslrootcert": "ssl-ca",
+                                "sslcert": "ssl-cert",
+                                "sslkey": "ssl-key",
+                            }.items()
+                            if source in endpoint.options
+                        },
                     }.items()
                 )
                 + "\n",
@@ -253,8 +237,7 @@ class NativeDatabase:
             )
             self.connection = [f"--defaults-file={credential}"]
             if endpoint.tls == "DISABLED":
-                # Only loopback endpoints may use plaintext. SHA2 authentication
-                # still needs the server's RSA public key for password exchange.
+                # SHA2 authentication needs the server key without TLS.
                 self.connection.append("--get-server-public-key")
         else:
             credential = self.directory / "pgpass"
@@ -282,8 +265,31 @@ class NativeDatabase:
             self.secrets.extend(
                 (credential.read_text("utf-8"), escape(endpoint.password))
             )
+            service = self.directory / "pg_service.conf"
+            service.write_text(
+                "[migration]\n"
+                + "\n".join(
+                    f"{key}={value}"
+                    for key, value in {
+                        **endpoint.certificate_defaults,
+                        **{
+                            key: value
+                            for key, value in endpoint.options.items()
+                            if key.startswith("ssl")
+                        },
+                        "sslmode": endpoint.tls,
+                        "gssencmode": "disable",
+                    }.items()
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            service.chmod(0o600)
+            self.secrets.append(service.read_text("utf-8"))
             self.environment.update(
                 PGPASSFILE=str(credential),
+                PGSERVICEFILE=str(service),
+                PGSERVICE="migration",
                 PGSSLMODE=endpoint.tls,
                 PGCONNECT_TIMEOUT="10",
                 PGOPTIONS=(
@@ -518,6 +524,44 @@ class NativeDatabase:
                 != "0"
             ):
                 raise MigrationError("migration_database_relations_invalid")
+
+    async def probe_connection(self):
+        """Check connection, tool versions and read privileges without a snapshot."""
+        for tool in self.tools:
+            await self.run(tool, ["--version"])
+        if self.endpoint.engine == "postgres":
+            version = await self.query("SHOW server_version;")
+            tls = await self.query(
+                "SELECT ssl FROM pg_stat_ssl WHERE pid=pg_backend_pid();"
+            )
+            denied = await self.query(
+                "SELECT count(*) FROM pg_class c "
+                "JOIN pg_namespace n ON n.oid=c.relnamespace "
+                "WHERE n.nspname='public' AND c.relkind IN ('r','p','S') "
+                "AND NOT CASE WHEN c.relkind='S' "
+                "THEN has_sequence_privilege(c.oid,'SELECT') "
+                "ELSE has_table_privilege(c.oid,'SELECT') END;"
+            )
+            if denied != "0":
+                raise MigrationError("migration_database_read_permission_denied")
+            observed = tls == "t" if tls in {"t", "f"} else None
+        else:
+            version = await self.query("SELECT VERSION();")
+            tls = await self.query("SHOW SESSION STATUS LIKE 'Ssl_cipher';")
+            observed = bool(tls.partition("\t")[2])
+            tables = await self.query(
+                "SELECT TABLE_NAME FROM information_schema.TABLES "
+                "WHERE TABLE_SCHEMA=DATABASE();"
+            )
+            for table in tables.splitlines():
+                await self.query(f"SELECT 1 FROM {self.identifier(table)} LIMIT 0;")
+        for tool in self.tools:
+            require_version(self.endpoint.engine, version, self.tool_versions[tool])
+        return {
+            "observed_tls": observed,
+            "server_version": version,
+            "tools": dict(self.tool_versions),
+        }
 
     async def inspect(self, *, quiet=True):
         engine = self.endpoint.engine
