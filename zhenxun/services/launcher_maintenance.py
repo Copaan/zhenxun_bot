@@ -56,11 +56,19 @@ def execute(action: str) -> None:
 
             _sync_dependencies(preserve_extras=True)
             result["value"] = True
+        elif action == "verify-dependencies":
+            from zhenxun.services.nonebot_store.environment import (
+                verify_effective_environment,
+            )
+
+            verify_effective_environment()
+            result["value"] = True
         else:
             raise ValueError("maintenance_action_invalid")
         result["completed"] = True
     except BaseException as error:
-        result["error_code"] = type(error).__name__
+        result["error_code"] = getattr(error, "code", type(error).__name__)
+        result["details"] = getattr(error, "details", None)
         raise
     finally:
         write_json_locked(Path(os.environ["ZHENXUN_MAINTENANCE_RESULT_PATH"]), result)
@@ -101,6 +109,18 @@ async def run(action: str) -> bool:
             or result.get("startup_id") != startup_id
             or not result.get("completed")
         ):
+            if (
+                action == "verify-dependencies"
+                and result.get("startup_id") == startup_id
+            ):
+                from zhenxun.services.nonebot_store.dependencies import (
+                    DependencyAnalysisError,
+                )
+
+                raise DependencyAnalysisError(
+                    result.get("error_code", "dependency_verification_failed"),
+                    details=result.get("details"),
+                )
             raise RuntimeError("maintenance_failed")
         return bool(result.get("value"))
     except BaseException:
@@ -113,4 +133,4 @@ async def run(action: str) -> bool:
         )
         raise
     finally:
-        await launcher_supervisor.stop_process(process)
+        await launcher_supervisor.stop_process(process, allow_force=True)

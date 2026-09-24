@@ -457,6 +457,7 @@ async def notify_bulk_write(model) -> None:
         }
         if table in mapping:
             cache, label = mapping[table]
+            runtime.RuntimeCacheSync.note_local_mutation(label)
             await cache.refresh()
             if getattr(cache, "_last_error", None):
                 raise RuntimeError(f"Cache reconciliation failed: {label}")

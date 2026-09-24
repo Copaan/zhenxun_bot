@@ -577,6 +577,7 @@ def apply_files(
     destructive_confirmed: bool = False,
     checkpoint=lambda: None,
     rollback_checkpoint=lambda: None,
+    progress=None,
 ) -> dict:
     """Caller must hold the instance lease and keep all business writers stopped."""
     from zhenxun.services.message_store import assert_replaceable_inbox
@@ -603,6 +604,7 @@ def apply_files(
         expected_revision=expected_revision,
         checkpoint=checkpoint,
         rollback_checkpoint=rollback_checkpoint,
+        progress=progress,
     )
 
 
@@ -645,7 +647,15 @@ def recheck_files(root: Path, staging: Path, plan: dict, *, checkpoint=lambda: N
 
 
 def _apply_checked_files(
-    root, staging, plan, journal, *, expected_revision, checkpoint, rollback_checkpoint
+    root,
+    staging,
+    plan,
+    journal,
+    *,
+    expected_revision,
+    checkpoint,
+    rollback_checkpoint,
+    progress=None,
 ):
     boundary = SourceBoundary.read(root)
     rollback = staging / "rollback"
@@ -688,6 +698,16 @@ def _apply_checked_files(
                     checkpoint=checkpoint,
                 )
             log.append("applied", {"index": index})
+            if progress is not None:
+                progress(
+                    current=index + 1,
+                    total=len(plan["actions"]),
+                    unit="项",
+                    step="应用文件变更",
+                    percent=(index + 1) / len(plan["actions"]) * 100
+                    if plan["actions"]
+                    else 100,
+                )
         for index, directory in enumerate(plan.get("removed_directories", [])):
             checkpoint()
             target = contained_path(root, directory["path"])

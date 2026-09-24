@@ -22,7 +22,16 @@ def evidence_digests(evidence):
 
 
 @asynccontextmanager
-async def clients(private, staging, budget, checkpoint):
+async def clients(
+    private,
+    staging,
+    budget,
+    checkpoint,
+    *,
+    diagnostic=None,
+    progress=None,
+    phase="database",
+):
     try:
         target = DatabaseEndpoint.parse(private["target_url"])
         candidate = DatabaseEndpoint.parse(private["candidate_url"])
@@ -34,9 +43,23 @@ async def clients(private, staging, budget, checkpoint):
         or target.username == candidate.username
     ):
         raise MigrationError("migration_database_candidate_isolation_required")
-    async with native_session(target, staging, budget, checkpoint) as target_client:
+    async with native_session(
+        target,
+        staging,
+        budget,
+        checkpoint,
+        diagnostic=diagnostic,
+        progress=progress,
+        phase=phase,
+    ) as target_client:
         async with native_session(
-            candidate, staging, budget, checkpoint
+            candidate,
+            staging,
+            budget,
+            checkpoint,
+            diagnostic=diagnostic,
+            progress=progress,
+            phase=phase,
         ) as candidate_client:
             yield target_client, candidate_client
 
@@ -63,9 +86,25 @@ async def verify_account_isolation(target, candidate):
 
 
 async def snapshot_native(
-    endpoint, staging, destination, *, budget, checkpoint, maximum
+    endpoint,
+    staging,
+    destination,
+    *,
+    budget,
+    checkpoint,
+    maximum,
+    diagnostic=None,
+    progress=None,
 ):
-    async with native_session(endpoint, staging, budget, checkpoint) as client:
+    async with native_session(
+        endpoint,
+        staging,
+        budget,
+        checkpoint,
+        diagnostic=diagnostic,
+        progress=progress,
+        phase="export_snapshot",
+    ) as client:
         before = await client.inspect()
         receipt = await client.dump(destination, maximum=maximum)
         after = await client.inspect()
@@ -103,12 +142,22 @@ async def prepare_native(
     budget,
     checkpoint=lambda: None,
     live_analysis=False,
+    diagnostic=None,
+    progress=None,
 ):
     if not source_trusted:
         raise MigrationError("migration_source_trust_required")
     if file_hash(source, checkpoint) != description["sha256"]:
         raise MigrationError("migration_database_payload_changed")
-    async with clients(private, staging, budget, checkpoint) as (target, candidate):
+    async with clients(
+        private,
+        staging,
+        budget,
+        checkpoint,
+        diagnostic=diagnostic,
+        progress=progress,
+        phase="restore_prepare",
+    ) as (target, candidate):
         require_same_engine(description["engine"], target.endpoint.engine)
         expected_format = (
             "mysql_sql" if target.endpoint.engine == "mysql" else "postgres_custom"
@@ -178,7 +227,16 @@ async def prepare_native(
 
 
 async def recheck_native(
-    staging, source, plan, *, private, budget, checkpoint, live_analysis=False
+    staging,
+    source,
+    plan,
+    *,
+    private,
+    budget,
+    checkpoint,
+    live_analysis=False,
+    diagnostic=None,
+    progress=None,
 ):
     """Reject changed native data before touching configuration or files."""
     if file_hash(source, checkpoint) != plan["source_sha256"]:
@@ -186,7 +244,15 @@ async def recheck_native(
     backup = contained_path(staging, "database-target.backup", regular=True)
     if file_hash(backup, checkpoint) != plan["backup_sha256"]:
         raise MigrationError("migration_database_backup_changed")
-    async with clients(private, staging, budget, checkpoint) as (target, candidate):
+    async with clients(
+        private,
+        staging,
+        budget,
+        checkpoint,
+        diagnostic=diagnostic,
+        progress=progress,
+        phase="restore_apply",
+    ) as (target, candidate):
         assert_identity(target, plan["target"])
         assert_identity(candidate, plan["candidate"])
         before = (
@@ -212,6 +278,8 @@ async def apply_native(
     budget,
     confirmed_name,
     checkpoint=lambda: None,
+    diagnostic=None,
+    progress=None,
 ):
     if confirmed_name != plan["database"]["target_name"]:
         raise MigrationError("migration_database_confirmation_required")
@@ -220,7 +288,15 @@ async def apply_native(
     backup = contained_path(staging, "database-target.backup", regular=True)
     if file_hash(backup, checkpoint) != plan["backup_sha256"]:
         raise MigrationError("migration_database_backup_changed")
-    async with clients(private, staging, budget, checkpoint) as (target, candidate):
+    async with clients(
+        private,
+        staging,
+        budget,
+        checkpoint,
+        diagnostic=diagnostic,
+        progress=progress,
+        phase="restore_apply",
+    ) as (target, candidate):
         assert_identity(target, plan["target"])
         assert_identity(candidate, plan["candidate"])
         before, prepared = await target.inspect(), await candidate.inspect()
@@ -253,7 +329,15 @@ async def apply_native(
 
 
 async def rollback_native(
-    staging, plan, journal, *, private, budget, checkpoint=lambda: None
+    staging,
+    plan,
+    journal,
+    *,
+    private,
+    budget,
+    checkpoint=lambda: None,
+    diagnostic=None,
+    progress=None,
 ):
     state = read_json_locked(journal, None)
     if not isinstance(state, dict) or state.get("target") != plan["target"]:
@@ -266,7 +350,15 @@ async def rollback_native(
         endpoint = DatabaseEndpoint.parse(private["target_url"])
     except (KeyError, TypeError):
         raise MigrationError("migration_database_credentials_required") from None
-    async with native_session(endpoint, staging, budget, checkpoint) as target:
+    async with native_session(
+        endpoint,
+        staging,
+        budget,
+        checkpoint,
+        diagnostic=diagnostic,
+        progress=progress,
+        phase="restore_rollback",
+    ) as target:
         assert_identity(target, plan["target"])
         before = await target.inspect()
         backup = contained_path(staging, "database-target.backup", regular=True)

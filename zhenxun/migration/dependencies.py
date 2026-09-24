@@ -328,7 +328,7 @@ class DependencyRestorer:
             return process.returncode == 0
         finally:
             if process is not None:
-                await self.supervisor.stop_process(process)
+                await self.supervisor.stop_process(process, allow_force=True)
             try:
                 output.unlink(missing_ok=True)
             except OSError:
@@ -346,9 +346,16 @@ class DependencyRestorer:
             raise MigrationError("migration_candidate_cleanup_failed") from None
 
     async def restore(
-        self, source: dict, *, budget: MigrationBudget, checkpoint=lambda: None
+        self,
+        source: dict,
+        *,
+        budget: MigrationBudget,
+        checkpoint=lambda: None,
+        progress=None,
     ) -> dict:
         requests, missing = effective_requests(source, self.core)
+        if progress is not None:
+            progress(step="分析依赖声明", current=0, total=len(requests), unit="包")
         requested_names = {item["name"] for item in requests}
         unavailable_names = {item["name"] for item in missing}
         disabled_names = {
@@ -429,6 +436,13 @@ class DependencyRestorer:
                 success = False
                 keep = False
                 try:
+                    if progress is not None:
+                        progress(
+                            step="解析原版本依赖" if exact else "解析目标兼容版本",
+                            current=0,
+                            total=len(requests),
+                            unit="包",
+                        )
                     success = await self._command(
                         [
                             self.uv,
@@ -466,6 +480,13 @@ class DependencyRestorer:
                             ),
                             encoding="utf-8",
                         )
+                        if progress is not None:
+                            progress(
+                                step="安装候选依赖",
+                                current=0,
+                                total=len(selected),
+                                unit="包",
+                            )
                         success = await self._command(
                             [
                                 self.uv,
@@ -506,6 +527,14 @@ class DependencyRestorer:
                             else current
                         )
                         current, accepted = candidate, selected
+                        if progress is not None:
+                            progress(
+                                step="候选依赖已安装，核对闭包",
+                                current=len(selected),
+                                total=len(selected),
+                                unit="包",
+                                percent=100,
+                            )
                         keep = True
                         self._remove(previous)
                         for item in batch:

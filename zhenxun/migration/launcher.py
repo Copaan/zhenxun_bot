@@ -836,7 +836,7 @@ async def stop_worker_for_snapshot(
     except TimeoutError:
         if allow_forced_shutdown:
             raise
-    receipt = handle.runtime_shutdown_receipt()
+    receipt = handle.runtime_shutdown_receipt(include_failure=True)
     unresolved_roles = sorted(
         item.role
         for item in supervisor._handles.values()
@@ -851,6 +851,7 @@ async def stop_worker_for_snapshot(
                 "recovery_required",
                 "unresolved_resources",
                 "failed_components",
+                "correlation_verified",
             )
             if receipt and key in receipt
         },

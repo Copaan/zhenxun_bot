@@ -105,7 +105,7 @@ async def run_analysis(
         supervisor.shutdown_deadline = ShutdownBudget(budget.deadline)
         try:
             if process is not None:
-                await supervisor.stop_process(process)
+                await supervisor.stop_process(process, allow_force=True)
         finally:
             await supervisor.shutdown()
             if sender is not None:

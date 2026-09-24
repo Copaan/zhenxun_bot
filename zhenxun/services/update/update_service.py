@@ -994,6 +994,16 @@ def _sync_dependencies(
     )
     if result.returncode and raise_on_error:
         raise UpdateServiceError("dependency_sync_failed")
+    if result.returncode == 0 and preserve_extras:
+        from zhenxun.services.nonebot_store.environment import (
+            verify_effective_environment,
+        )
+
+        try:
+            verify_effective_environment()
+        except RuntimeError:
+            if raise_on_error:
+                raise
 
 
 def _apply_resource_update(staged: Path, backup: Path, *, force: bool = False) -> None:

@@ -301,6 +301,9 @@ def _build_generation(transaction: dict[str, Any]) -> dict[str, Any]:
                     "dependency_layer_build_failed",
                     detail,
                 )
+        from .environment import validate_candidate
+
+        verification = validate_candidate(staging, transaction)
         native_files = _scan_native_extensions(staging)
         package_details = _package_runtime_details(staging, packages)
         metadata = {
@@ -310,6 +313,7 @@ def _build_generation(transaction: dict[str, Any]) -> dict[str, Any]:
             "packages": sorted(requested),
             "package_details": package_details,
             "native_extensions": native_files,
+            "dependency_verification": verification,
         }
         (staging / ".zhenxun-generation.json").write_text(
             json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -327,6 +331,12 @@ def _build_generation(transaction: dict[str, Any]) -> dict[str, Any]:
 def _validate_archive_generation(
     transaction: dict[str, Any], build: dict[str, Any]
 ) -> None:
+    from .environment import validate_candidate
+
+    path = generation_path(int(build["generation"]))
+    if _layer_digest(path) != build.get("digest"):
+        raise LayerBuildError("dependency_layer_state_mismatch")
+    validate_candidate(path, transaction)
     if not transaction.get("archive_wheels_only"):
         return
     path = generation_path(int(build["generation"]))
@@ -501,6 +511,15 @@ def load_managed_plugins() -> dict[str, Any]:
         "failed": failed,
         "checked_at": utc_now(),
     }
+    from .dependencies import DependencyAnalysisError
+    from .environment import capture_environment
+
+    try:
+        snapshot = capture_environment(manifest=manifest)
+        status["loaded_mismatches"] = snapshot.loaded_mismatches
+        status["environment_snapshot"] = snapshot.digest
+    except DependencyAnalysisError as error:
+        status["environment_error"] = {"code": error.code, "details": error.details}
     write_json(STARTUP_STATUS_FILE, status)
     return status
 
@@ -571,6 +590,9 @@ def _safe_plugin_import_failure(error: Exception) -> dict[str, Any]:
 
 
 def startup_verification() -> tuple[bool, dict[str, Any]]:
+    from .dependencies import DependencyAnalysisError
+    from .environment import capture_environment, validate_candidate
+
     manifest = load_manifest()
     status = read_json(STARTUP_STATUS_FILE, {})
     expected = manifest.get("active_generation")
@@ -578,7 +600,46 @@ def startup_verification() -> tuple[bool, dict[str, Any]]:
         status.get("generation") == expected
         and isinstance(status.get("failed"), list)
         and not status["failed"]
+        and set(status.get("loaded", []))
+        == {
+            item["module_name"]
+            for item in manifest.get("plugins", {}).values()
+            if item.get("state") == "managed"
+        }
     )
+    try:
+        transaction = read_json(PENDING_FILE, {})
+        if isinstance(expected, int):
+            transaction = {**transaction, "target_manifest": manifest}
+            if _layer_digest(generation_path(expected)) != manifest.get(
+                "generation_digest"
+            ):
+                raise DependencyAnalysisError("dependency_layer_state_mismatch")
+            check = validate_candidate(generation_path(expected), transaction)
+        else:
+            snapshot = capture_environment(manifest=manifest)
+            check = {
+                "state": "failed" if snapshot.conflicts else "passed",
+                "remaining_conflicts": snapshot.conflicts,
+            }
+        snapshot = capture_environment(manifest=manifest)
+        status["dependency_verification"] = check
+        valid = (
+            valid
+            and check["state"] != "failed"
+            and status.get("environment_snapshot") == snapshot.digest
+            and not status.get("loaded_mismatches")
+            and not status.get("environment_error")
+        )
+    except DependencyAnalysisError as error:
+        status["dependency_verification"] = {
+            "state": "failed",
+            "code": error.code,
+            "details": error.details,
+        }
+        valid = False
+    status["plugin_verification"] = "passed" if not status.get("failed") else "failed"
+    write_json(STARTUP_STATUS_FILE, status)
     return valid, status
 
 

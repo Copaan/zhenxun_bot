@@ -229,7 +229,7 @@ class ValidationProcess:
             return None
         process = self.process
         handle = self.service.supervisor._handles.get(process.pid)
-        await self.service.supervisor.stop_process(process)
+        await self.service.supervisor.stop_process(process, allow_force=True)
         receipt = handle.runtime_shutdown_receipt() if handle else None
         if (
             handle is None

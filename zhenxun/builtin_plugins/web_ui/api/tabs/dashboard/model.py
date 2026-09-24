@@ -93,6 +93,10 @@ class RuntimeServiceStatus(BaseModel):
     detail: str
     latency_ms: int | None = None
     mode: str | None = None
+    configured_mode: str | None = None
+    actual_mode: str | None = None
+    application_status: str | None = None
+    checked_at: str | None = None
 
 
 class RuntimeIssue(BaseModel):

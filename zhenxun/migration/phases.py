@@ -20,8 +20,9 @@ from .archive import MANIFEST_LIMIT, build_archive, file_hash
 from .errors import MigrationError
 from .lease import DelegatedLease, InstanceLease
 from .paths import contained_path
+from .progress import ConsoleProgress
 from .snapshot import ExportOptions, capture_snapshot
-from .tasks import MigrationBudget, TaskStore
+from .tasks import MigrationBudget, MigrationProgress, TaskStore
 
 PHASES = {
     "export_snapshot": ("export", "snapshotting"),
@@ -46,6 +47,7 @@ class PhaseSupervisor:
         self._inputs: dict[str, dict] = {}
         self._lock = RLock()
         self._running = False
+        self.console = ConsoleProgress()
 
     def input_for(self, payload: dict, *, peer_pid: int) -> dict:
         identity = payload.get("invocation_id")
@@ -119,7 +121,10 @@ class PhaseSupervisor:
             "job_revision": job["revision"],
             "private_input": private_input or {},
         }
+        console = self.console
+        next_progress = 0.0
         process = None
+        phase_error = None
         self._running = True
         with self._lock:
             self._inputs[invocation] = {"request": request, "deadline": budget.deadline}
@@ -163,6 +168,9 @@ class PhaseSupervisor:
             )
             while process.poll() is None:
                 budget.checkpoint()
+                if time.monotonic() >= next_progress:
+                    console.show(self.store.read("jobs", job_id))
+                    next_progress = time.monotonic() + 1
                 self.supervisor._publish_processes()
                 if (
                     phase != "restore_rollback"
@@ -172,6 +180,7 @@ class PhaseSupervisor:
                 if self.supervisor.shutdown_deadline is not None:
                     raise MigrationError("migration_launcher_stopping")
                 await asyncio.sleep(0.05)
+            console.show(self.store.read("jobs", job_id))
             result = read_json_locked(receipt_path, None)
             with self._lock:
                 process_created = self._inputs[invocation].get("runtime_created_at")
@@ -197,14 +206,41 @@ class PhaseSupervisor:
                     code = "migration_phase_failed"
                 raise MigrationError(code)
             return result["result"]
+        except BaseException as error:
+            phase_error = error
+            raise
         finally:
             try:
                 if process is not None:
-                    await self.supervisor.stop_process(process)
+                    await self.supervisor.stop_process(process, allow_force=True)
+            except BaseException as cleanup_error:
+                if phase_error is None:
+                    raise
+                try:
+                    diagnostic = self.store.read("jobs", job_id).get(
+                        "database_diagnostic"
+                    )
+                    if diagnostic:
+                        self.store.record_database_diagnostic(
+                            job_id,
+                            {
+                                **diagnostic,
+                                "cleanup_error": getattr(
+                                    cleanup_error, "code", type(cleanup_error).__name__
+                                ),
+                            },
+                        )
+                except Exception:
+                    pass
             finally:
                 with self._lock:
                     self._inputs.pop(invocation, None)
                 self._running = False
+                try:
+                    console.show(self.store.read("jobs", job_id))
+                except Exception:
+                    if phase_error is None:
+                        raise
 
 
 def execute_phase(project: Path, request: dict, *, lease: DelegatedLease) -> dict:
@@ -220,6 +256,22 @@ def execute_phase(project: Path, request: dict, *, lease: DelegatedLease) -> dic
 
         return execute_restore_phase(project, request, lease=lease)
     budget = MigrationBudget.start(min(float(request["remaining_seconds"]), 3600))
+    ranges = {
+        "export_snapshot": (10, 55),
+        "export_pack": (55, 95),
+    }
+    start_percent, end_percent = ranges.get(phase, (0, 100))
+    progress = MigrationProgress(
+        store,
+        identity,
+        phase,
+        start_percent=start_percent,
+        end_percent=end_percent,
+    )
+    progress.update(step="准备执行")
+
+    def record_database_diagnostic(value):
+        store.record_database_diagnostic(identity, value)
 
     def check():
         budget.checkpoint()
@@ -250,6 +302,8 @@ def execute_phase(project: Path, request: dict, *, lease: DelegatedLease) -> dic
             lease=lease,
             budget=budget,
             checkpoint=check,
+            progress=progress.update,
+            database_diagnostic=record_database_diagnostic,
         )
         metadata["snapshot_mode"] = snapshot_mode
         entries = [
@@ -262,6 +316,7 @@ def execute_phase(project: Path, request: dict, *, lease: DelegatedLease) -> dic
             for entry in files
         ]
         write_json_locked(description, {"files": entries, "metadata": metadata})
+        progress.finish(step="快照完成")
         return {
             "files": len(files),
             "bytes": sum(entry.size for entry in files),
@@ -293,7 +348,7 @@ def execute_phase(project: Path, request: dict, *, lease: DelegatedLease) -> dic
         ):
             raise MigrationError("migration_password_invalid")
         destination = directory / "export.zx"
-        return build_archive(
+        result = build_archive(
             snapshot,
             files,
             destination,
@@ -304,5 +359,8 @@ def execute_phase(project: Path, request: dict, *, lease: DelegatedLease) -> dic
             publish=lambda src, dst, outcome: store.publish_export(
                 identity, src, dst, outcome
             ),
+            progress=progress.update,
         )
+        progress.finish(step="迁移包已生成")
+        return result
     raise MigrationError("migration_phase_invalid")

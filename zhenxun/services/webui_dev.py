@@ -116,5 +116,5 @@ class WebUIDevServer:
 
     async def stop(self) -> None:
         if self.process is not None:
-            await self.supervisor.stop_process(self.process)
+            await self.supervisor.stop_process(self.process, allow_force=True)
             self.process = None

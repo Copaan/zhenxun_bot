@@ -134,7 +134,14 @@ def preflight_summary(plan: dict) -> dict:
 
 
 def recheck_preflight(
-    project: Path, identity: str, private: dict, budget, *, live_analysis=False
+    project: Path,
+    identity: str,
+    private: dict,
+    budget,
+    *,
+    live_analysis=False,
+    diagnostic=None,
+    progress=None,
 ) -> dict:
     store = TaskStore(project)
     record = store.read("preflights", identity)
@@ -169,6 +176,8 @@ def recheck_preflight(
                 live_analysis=live_analysis,
                 budget=budget,
                 checkpoint=budget.checkpoint,
+                diagnostic=diagnostic,
+                progress=progress,
             )
         )
     elif database:

@@ -36,7 +36,8 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10
 
 from .storage import LAYER_ROOT, generation_path, load_manifest
 
-SOLVER_POLICY_VERSION = 6
+SOLVER_POLICY_VERSION = 7
+COORDINATED_TRANSITIVE_PACKAGES = frozenset({"aiofiles", "idna"})
 LOCK_FILE = Path("uv.lock")
 _REQ_LINE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)==([^\s;]+)")
 _SENSITIVE = re.compile(r"(?i)(authorization|token|password|secret)=?[^\s]*")
@@ -100,7 +101,7 @@ def _distribution_inventory(*, include_layer: bool) -> dict[str, str]:
                     continue
             except (OSError, ValueError):
                 pass
-        result[canonicalize_name(name)] = distribution.version
+        result.setdefault(canonicalize_name(name), distribution.version)
     return result
 
 
@@ -120,12 +121,14 @@ def layer_inventory() -> dict[str, str]:
     for distribution in importlib.metadata.distributions(path=[str(active_path)]):
         name = distribution.metadata.get("Name")
         if name:
-            result[canonicalize_name(name)] = distribution.version
+            result.setdefault(canonicalize_name(name), distribution.version)
     return result
 
 
 def installed_inventory() -> dict[str, str]:
-    return {**base_installed_inventory(), **layer_inventory()}
+    from .environment import capture_environment
+
+    return capture_environment().versions
 
 
 def _marker_enabled(marker: Any) -> bool:
@@ -134,8 +137,10 @@ def _marker_enabled(marker: Any) -> bool:
         return True
     try:
         return Marker(text).evaluate(default_environment())
-    except InvalidMarker:
-        return True
+    except InvalidMarker as error:
+        raise DependencyAnalysisError(
+            "dependency_marker_invalid", text[:200]
+        ) from error
 
 
 def _lock_package_enabled(package: dict[str, Any]) -> bool:
@@ -158,6 +163,11 @@ def _lock_packages() -> tuple[dict[str, set[str]], dict[str, str], set[str]]:
         ):
             continue
         name = canonicalize_name(str(package["name"]))
+        if name in packages and (
+            packages[name].get("version") != package.get("version")
+            or packages[name].get("source") != package.get("source")
+        ):
+            raise DependencyAnalysisError("project_lock_branch_ambiguous", name)
         packages[name] = package
 
     graph: dict[str, set[str]] = {}
@@ -191,6 +201,15 @@ def _lock_packages() -> tuple[dict[str, set[str]], dict[str, str], set[str]]:
             ):
                 continue
             dependency = canonicalize_name(str(item["name"]))
+            selected = packages.get(dependency)
+            if (
+                selected is None
+                or (item.get("version") and item["version"] != selected.get("version"))
+                or (item.get("source") and item["source"] != selected.get("source"))
+            ):
+                raise DependencyAnalysisError(
+                    "project_lock_branch_ambiguous", dependency
+                )
             graph.setdefault(name, set()).add(dependency)
             queue.append(
                 (
@@ -232,7 +251,11 @@ def protected_core() -> dict[str, str]:
             continue
         protected.add(name)
         queue.extend(graph.get(name, set()) - protected)
-    return {name: lock_versions[name] for name in protected if lock_versions.get(name)}
+    return {
+        name: lock_versions[name]
+        for name in protected
+        if lock_versions.get(name) and name not in COORDINATED_TRANSITIVE_PACKAGES
+    }
 
 
 def shared_dependencies() -> dict[str, str]:
@@ -310,52 +333,22 @@ def _project_venv_active() -> bool:
 def active_requirement_conflicts(
     effective: dict[str, str], layer: dict[str, str], manifest: dict[str, Any]
 ) -> list[dict[str, Any]]:
-    """Check declarations against the same distribution view used by the solver."""
-    declarations = [("pyproject.toml", raw) for raw in project_requirements()]
-    generation = manifest.get("active_generation")
-    distributions = list(importlib.metadata.distributions())
-    if isinstance(generation, int):
-        distributions.extend(
-            importlib.metadata.distributions(path=[str(generation_path(generation))])
-        )
-    selected = {}
-    for distribution in distributions:
-        name = canonicalize_name(distribution.metadata.get("Name") or "")
-        if name and distribution.version == effective.get(name):
-            selected[name] = distribution
-    for owner, distribution in selected.items():
-        declarations.extend((owner, raw) for raw in distribution.requires or [])
-    conflicts = []
-    for owner, raw in declarations:
-        try:
-            requirement = Requirement(raw)
-            if requirement.marker and not requirement.marker.evaluate({"extra": ""}):
-                continue
-            name = canonicalize_name(requirement.name)
-            actual = effective.get(name)
-            if actual and requirement.specifier.contains(actual, prereleases=True):
-                continue
-        except (InvalidRequirement, InvalidVersion):
-            continue
-        conflicts.append(
-            {
-                "name": name,
-                "actual": actual,
-                "requirement": str(requirement),
-                "owner": owner,
-                "layer": "active_generation" if name in layer else "base",
-            }
-        )
-    return conflicts
+    """Check the selected distribution metadata, including enabled extras."""
+    from .environment import capture_environment
+
+    return capture_environment(manifest=manifest).conflicts
 
 
-def environment_report(*, check_lock: bool = False) -> dict[str, Any]:
+def environment_report(*, check_lock: bool = False, snapshot=None) -> dict[str, Any]:
     immutable = protected_core()
     shared = shared_dependencies()
-    base = base_installed_inventory()
-    layer = layer_inventory()
-    effective = {**base, **layer}
-    manifest = load_manifest()
+    from .environment import capture_environment
+
+    snapshot = snapshot or capture_environment()
+    base = {name: dist.version for name, dist in snapshot.base.items()}
+    layer = {name: dist.version for name, dist in snapshot.layer.items()}
+    effective = snapshot.versions
+    manifest = snapshot.manifest
     recorded = {
         canonicalize_name(name): str(info.get("version", ""))
         for name, info in manifest.get("packages", {}).items()
@@ -373,7 +366,7 @@ def environment_report(*, check_lock: bool = False) -> dict[str, Any]:
         if recorded.get(name) != layer.get(name)
     ]
     requirements = _project_requirement_map()
-    requirement_conflicts = active_requirement_conflicts(effective, layer, manifest)
+    requirement_conflicts = snapshot.conflicts
     immutable_drift: list[dict[str, Any]] = []
     compatible_shared_drift: list[dict[str, Any]] = []
     incompatible_shared_drift: list[dict[str, Any]] = []
@@ -468,6 +461,13 @@ def environment_report(*, check_lock: bool = False) -> dict[str, Any]:
     )
     payload = {
         "status": status,
+        "sources": snapshot.sources,
+        "duplicates": snapshot.duplicates,
+        "declarations": snapshot.declarations,
+        "loaded_mismatches": snapshot.loaded_mismatches,
+        "restart_required": bool(snapshot.loaded_mismatches),
+        "snapshot_digest": snapshot.digest,
+        "solver_policy_version": SOLVER_POLICY_VERSION,
         "python": platform.python_version(),
         "platform": sys.platform,
         "immutable_count": len(immutable),
@@ -485,31 +485,11 @@ def environment_report(*, check_lock: bool = False) -> dict[str, Any]:
             not interpreter_mismatch
             and not lock_stale
             and not layer_mismatch
-            and (
-                immutable_drift
-                or incompatible_shared_drift
-                or any(
-                    item["layer"] == "active_generation"
-                    for item in requirement_conflicts
-                )
-                or any(
-                    item["name"] in set(immutable) | set(shared)
-                    for item in requirement_conflicts
-                )
-            )
+            and (immutable_drift or incompatible_shared_drift or requirement_conflicts)
             and LOCK_FILE.is_file()
         ),
         "repair_command": "uv sync --locked --inexact",
-        "repair_mode": "layer"
-        if any(
-            item.get("layer") == "active_generation"
-            for item in [
-                *immutable_drift,
-                *incompatible_shared_drift,
-                *requirement_conflicts,
-            ]
-        )
-        else "base",
+        "repair_mode": "layer",
         "lock_digest": lock_digest,
         "layer_packages": len(layer),
     }
@@ -517,6 +497,9 @@ def environment_report(*, check_lock: bool = False) -> dict[str, Any]:
         json.dumps(
             {
                 "lock": lock_digest,
+                "project": sha256(PROJECT_FILE.read_bytes()).hexdigest(),
+                "snapshot": snapshot.digest,
+                "policy": SOLVER_POLICY_VERSION,
                 "base": sorted(base.items()),
                 "layer": sorted(layer.items()),
                 "manifest": {
@@ -842,30 +825,6 @@ def _wheel_availability(metadata: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _soft_upper_mismatch(specifier: SpecifierSet, current: Version) -> bool:
-    if specifier.contains(current, prereleases=True):
-        return False
-    upper_mismatch = False
-    for item in specifier:
-        operator = item.operator
-        if operator in {"!=", "==="}:
-            return False
-        raw = item.version.rstrip(".*")
-        try:
-            boundary = Version(raw)
-        except InvalidVersion:
-            return False
-        if operator in {">", ">="} and not item.contains(current, prereleases=True):
-            return False
-        if operator in {"<", "<="} and not item.contains(current, prereleases=True):
-            upper_mismatch = current >= boundary
-        elif operator in {"==", "~="} and not item.contains(current, prereleases=True):
-            if current <= boundary:
-                return False
-            upper_mismatch = True
-    return upper_mismatch
-
-
 def _compatibility_overrides(
     metadata: dict[str, Any],
     *,
@@ -873,58 +832,9 @@ def _compatibility_overrides(
     shared: dict[str, str],
     current: dict[str, str],
 ) -> tuple[list[dict[str, str]], list[str]]:
-    overrides: list[dict[str, str]] = []
-    rewritten: list[str] = []
-    for requirement in _active_metadata_requirements(metadata):
-        name = canonicalize_name(requirement.name)
-        actual = current.get(name)
-        if not requirement.specifier or not actual:
-            rewritten.append(str(requirement))
-            continue
-        try:
-            actual_version = Version(actual)
-        except InvalidVersion:
-            rewritten.append(str(requirement))
-            continue
-        if requirement.specifier.contains(actual_version, prereleases=True):
-            rewritten.append(str(requirement))
-            continue
-        detail = {
-            "name": name,
-            "declared_requirement": str(requirement),
-            "effective_version": actual,
-        }
-        if name in immutable:
-            raise DependencyAnalysisError(
-                "core_dependency_conflict",
-                f"{requirement}; current={actual}",
-                details=[
-                    {
-                        **detail,
-                        "tier": "immutable_core",
-                        "kind": "constraint_conflict",
-                        "expected": str(requirement.specifier),
-                        "actual": actual,
-                        "requirement": str(requirement),
-                    }
-                ],
-            )
-        if (
-            name not in shared
-            or requirement.url
-            or not _soft_upper_mismatch(requirement.specifier, actual_version)
-        ):
-            rewritten.append(str(requirement))
-            continue
-        overrides.append(
-            {
-                **detail,
-                "tier": "shared_compatible",
-                "risk": "unverified_runtime_compatibility",
-            }
-        )
-        rewritten.append(f"{name}=={actual}")
-    return overrides, rewritten
+    return [], [
+        str(requirement) for requirement in _active_metadata_requirements(metadata)
+    ]
 
 
 async def solve_install(
@@ -968,7 +878,10 @@ async def solve_install(
             },
         )
 
-    report = environment_report()
+    from .environment import capture_environment
+
+    snapshot = capture_environment()
+    report = environment_report(snapshot=snapshot)
     if report.get("layer_mismatch"):
         raise DependencyAnalysisError(
             "dependency_layer_state_mismatch", details=report["layer_mismatch"]
@@ -985,7 +898,7 @@ async def solve_install(
                 "tier": "immutable_core",
                 "kind": _version_relation(item.get("actual"), item["expected"]),
             }
-            for item in environment_drift()
+            for item in report["immutable_drift"]
         ),
         *report["incompatible_shared_drift"],
     ]
@@ -1018,8 +931,8 @@ async def solve_install(
         else:
             managed_requirements.append(f"{item['project_link']}=={item['version']}")
     candidate = f"{plugin['project_link']}=={plugin['version']}"
-    current = installed_inventory()
-    base = base_installed_inventory()
+    current = snapshot.versions
+    base = {name: dist.version for name, dist in snapshot.base.items()}
     immutable = protected_core()
     shared = shared_dependencies()
     overrides, candidate_dependencies = _compatibility_overrides(
@@ -1074,7 +987,21 @@ async def solve_install(
         *_archive_requirement_inputs(archive, relevant_archive_packages),
         *_archive_pin_requirements(archive, relevant_archive_packages),
     ]
-    active_requirements = [*managed_requirements, *archive_inputs]
+    # Keep requirements imposed by external owners on the candidate closure.
+    external_requirements = []
+    for declaration in snapshot.declarations:
+        if (
+            declaration["name"] in candidate_scope
+            and declaration["owner"] not in candidate_scope
+        ):
+            requirement = Requirement(declaration["requirement"])
+            requirement.marker = None
+            external_requirements.append(str(requirement))
+    active_requirements = [
+        *managed_requirements,
+        *archive_inputs,
+        *external_requirements,
+    ]
     requirements = [*project_requirements(), *active_requirements, *candidate_inputs]
     archive_pins = archive.get("packages", {})
     strict_constraints = {**baseline, **archive_pins, **immutable}
@@ -1087,6 +1014,9 @@ async def solve_install(
         **archive_pins,
         **immutable,
     }
+    for name, version in current.items():
+        if name.startswith("nonebot-plugin-") and name != candidate_name:
+            scoped_constraints[name] = version
 
     resolved, strict_error = await _compile(
         requirements,

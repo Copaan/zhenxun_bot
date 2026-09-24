@@ -44,10 +44,12 @@ from zhenxun.services.nonebot_store.runtime import (
     stage_generation,
 )
 from zhenxun.services.nonebot_store.storage import (
+    STARTUP_STATUS_FILE,
     clear_pending_transaction,
     dependency_sync_status,
     load_manifest,
     pending_transaction,
+    read_json,
     remove_generation,
     save_dependency_sync_status,
     save_pending_transaction,
@@ -102,6 +104,7 @@ class EnvironmentRepairPayload(BaseModel):
     expected_fingerprint: str = Field(min_length=64, max_length=64)
     confirmed: bool = False
     preview_id: str | None = None
+    group_ids: list[str] | None = None
 
 
 def _environment_view() -> dict[str, Any]:
@@ -136,6 +139,9 @@ def _environment_view() -> dict[str, Any]:
             "error_code": type(error).__name__,
         }
     result["sync"] = dependency_sync_status()
+    result["startup_verification"] = read_json(STARTUP_STATUS_FILE, {})
+    pending = pending_transaction() or {}
+    result["candidate_built"] = isinstance(pending.get("generation"), int)
     result["launcher_managed"] = bool(os.environ.get("ZHENXUN_LAUNCHER_PID"))
     return result
 
@@ -759,7 +765,7 @@ async def preview_dependency_repair() -> Result[dict]:
         {
             key: value
             for key, value in {**preview, "preview_id": identity}.items()
-            if key != "target_manifest"
+            if key not in {"target_manifest", "base_manifest"}
         }
     )
 
@@ -791,6 +797,9 @@ async def repair_dependency_environment(
         return Result.fail("environment_analysis_stale", code=409)
     if preview["mode"] == "layer":
         try:
+            from zhenxun.services.nonebot_store.repair import select_repair_groups
+
+            selected = select_repair_groups(preview, payload.group_ids)
             async with _store_operation(owner="webui.nonebot-store.environment-repair"):
                 if (
                     pending_transaction()
@@ -803,7 +812,9 @@ async def repair_dependency_environment(
                     "action": "environment_repair",
                     "operations": [],
                     "base_manifest": load_manifest(),
-                    "target_manifest": deepcopy(preview["target_manifest"]),
+                    "target_manifest": selected["target_manifest"],
+                    "remaining_conflicts": selected["remaining_conflicts"],
+                    "environment_fingerprint": preview["fingerprint"],
                     "source_build_confirmed": False,
                     "state": "building",
                     "created_at": utc_now(),
@@ -833,7 +844,7 @@ async def repair_dependency_environment(
                     _operation_result(
                         "restart_pending",
                         ["dependency_environment_repair"],
-                        changes=preview["changes"],
+                        changes=selected["changes"],
                     ),
                     info="定向修复已准备完成，重启 Bot 后验证并生效",
                 )

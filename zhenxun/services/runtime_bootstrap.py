@@ -197,7 +197,9 @@ async def finish_runtime_workers() -> None:
 
     lifecycle_kernel.request_shutdown()
     shutdown_request = received_shutdown_request()
-    if shutdown_request.get("shutdown_id"):
+    if shutdown_request.get(
+        "shutdown_id"
+    ) and not lifecycle_kernel._process_metadata.get("shutdown_id"):
         lifecycle_kernel.set_process_metadata(
             shutdown_id=shutdown_request["shutdown_id"]
         )

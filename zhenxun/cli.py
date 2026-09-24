@@ -1060,7 +1060,7 @@ def _terminate_named_process(proc: subprocess.Popen, name: str) -> None:
 async def _terminate_worker_async(proc: subprocess.Popen) -> None:
     from zhenxun.services.lifecycle.launcher import launcher_supervisor
 
-    await launcher_supervisor.stop_process(proc)
+    await launcher_supervisor.stop_process(proc, allow_force=True)
 
 
 async def _terminate_named_process_async(proc: subprocess.Popen, name: str) -> None:
@@ -1098,7 +1098,7 @@ async def _run_launcher_command(command, *, cwd):
         if process.returncode:
             raise subprocess.CalledProcessError(process.returncode, command)
     finally:
-        await launcher_supervisor.stop_process(process)
+        await launcher_supervisor.stop_process(process, allow_force=True)
 
 
 def _start_http_sidecar(settings, cwd: Path) -> subprocess.Popen | None:
@@ -2098,6 +2098,7 @@ async def _run_launcher_async() -> None:
                             ["uv", "pip", "install", "-r", dependency_path],
                             cwd=str(cwd),
                         )
+                    await run_maintenance("verify-dependencies")
                 except Exception as error:
                     _launcher_log(
                         "dependency sync failed; restarting worker with the "
@@ -2107,6 +2108,7 @@ async def _run_launcher_async() -> None:
                         {
                             "status": "failed",
                             "code": getattr(error, "code", "dependency_sync_failed"),
+                            "details": getattr(error, "details", None),
                             "paths": dependency_paths,
                         }
                     )

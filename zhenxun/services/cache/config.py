@@ -31,6 +31,14 @@ class CacheMode:
     NONE = "NONE"
 
 
+def normalize_cache_mode(value: str | None) -> str:
+    """Validate the cache mode used by configuration and runtime consumers."""
+    mode = CacheMode.NONE if value is None else str(value).strip().upper()
+    if mode not in {CacheMode.NONE, CacheMode.MEMORY, CacheMode.REDIS}:
+        raise ValueError("CACHE_MODE must be NONE, MEMORY or REDIS")
+    return mode
+
+
 SPECIAL_KEY_FORMATS = {
     "LEVEL": "{user_id}" + COMPOSITE_KEY_SEPARATOR + "{group_id}",
     "BAN": "{user_id}" + COMPOSITE_KEY_SEPARATOR + "{group_id}",

@@ -235,8 +235,24 @@ def verify_restore(project, identity: str) -> dict:
             raise MigrationError("migration_database_target_changed")
 
         async def inspect_native():
+            from .progress import ConsoleProgress
+            from .tasks import MigrationProgress
+
+            store = TaskStore(project)
+            reporter = MigrationProgress(store, identity, "restore_verify")
+            console = ConsoleProgress()
+
+            def diagnostic(value):
+                store.record_database_diagnostic(identity, value)
+                console.show(store.read("jobs", identity))
+
             async with native_session(
-                endpoint, directory, MigrationBudget.start(30)
+                endpoint,
+                directory,
+                MigrationBudget.start(30),
+                diagnostic=diagnostic,
+                progress=reporter.update,
+                phase="restore_verify",
             ) as client:
                 inspected = await client.inspect(quiet=False)
                 return inspected["revision"]

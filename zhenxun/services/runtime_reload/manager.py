@@ -9,7 +9,7 @@ from contextvars import Context, ContextVar
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from functools import wraps
+from functools import partial, wraps
 import inspect
 import json
 import os
@@ -88,6 +88,57 @@ _TASK_CANCEL_TIMEOUT = 2.0
 
 class PluginRecoveryRequired(LifecycleError):
     """Old resources cannot be proven stopped; never reactivate a generation."""
+
+
+class _ExecutorCompletion(ConcurrentFuture[None]):
+    """Track actual thread completion without retaining arguments or exceptions."""
+
+    def __init__(
+        self, owner: str, incarnation_id: str, func, *, cleanup: bool = False
+    ) -> None:
+        super().__init__()
+        while isinstance(func, partial):
+            func = func.func
+        code = getattr(func, "__code__", None)
+        self.detail = {
+            "owner": owner,
+            "incarnation_id": incarnation_id,
+            "callable": str(getattr(func, "__qualname__", type(func).__name__))[:160],
+            "module": str(getattr(func, "__module__", "") or "")[:160],
+            "file": code.co_filename if code is not None else None,
+            "line": code.co_firstlineno if code is not None else None,
+            "execution_state": "queued",
+            "error_type": None,
+            "completed_at": None,
+            "cleanup": cleanup,
+        }
+
+    def execute(self, func, *args):
+        self.detail["execution_state"] = "running"
+        try:
+            return func(*args)
+        except BaseException as error:
+            self.detail["error_type"] = type(error).__name__
+            raise
+
+    def finish(self) -> None:
+        self.detail["execution_state"] = (
+            "failed" if self.detail["error_type"] else "completed"
+        )
+        self.detail["completed_at"] = datetime.now(timezone.utc).isoformat()
+        self.set_result(None)
+
+    def cancel(self) -> bool:
+        cancelled = super().cancel()
+        if cancelled:
+            self.detail["execution_state"] = "cancelled_before_start"
+            self.detail["completed_at"] = datetime.now(timezone.utc).isoformat()
+        return cancelled
+
+    def released(self) -> bool:
+        return self.done() and not (
+            self.detail["cleanup"] and self.detail["error_type"]
+        )
 
 
 def _static_env_dependencies(files: set[Path]) -> set[str]:
@@ -176,6 +227,9 @@ class PluginRuntimeManager:
         self._owned_executor_futures: dict[str, set[ConcurrentFuture[Any]]] = (
             defaultdict(set)
         )
+        self._shutdown_executor_observers: dict[
+            str, Callable[[ConcurrentFuture], None]
+        ] = {}
         self._ownership_lock = threading.RLock()
         self._drained_events: dict[str, asyncio.Event] = {}
         self._original_task_factory: Callable[..., asyncio.Future[Any]] | None = None
@@ -185,6 +239,10 @@ class PluginRuntimeManager:
         self._shared_executors: weakref.WeakSet = weakref.WeakSet()
         self._cancellation_work: dict[tuple, LifecycleWork] = {}
         self._cancellation_requests: dict[asyncio.Task, tuple[str, int]] = {}
+        self._shutdown_observed_tasks: weakref.WeakSet = weakref.WeakSet()
+        self._cleanup_handle_work: weakref.WeakKeyDictionary = (
+            weakref.WeakKeyDictionary()
+        )
         self._executor_owners: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
         self._original_executor_init = None
         self._connection_tasks: weakref.WeakSet = weakref.WeakSet()
@@ -1718,9 +1776,19 @@ class PluginRuntimeManager:
                     return await original_worker(func, args, *options, **kwargs)
                 incarnation = manager._ensure_incarnation(owner)
                 phase = manager._current_work(owner, incarnation.incarnation_id)
-                completion = ConcurrentFuture()
+                completion = _ExecutorCompletion(
+                    owner,
+                    incarnation.incarnation_id,
+                    func,
+                    cleanup=phase is not None and phase.phase == "on_shutdown",
+                )
                 owned = manager._owned_executor_futures[owner]
                 owned.add(completion)
+                observe = manager._shutdown_executor_observers.get(
+                    incarnation.incarnation_id
+                )
+                if observe is not None:
+                    observe(completion)
                 loop = asyncio.get_running_loop()
 
                 def execute():
@@ -1734,9 +1802,9 @@ class PluginRuntimeManager:
                             manager._entry_diagnostics["plugin_work_lease_revoked"] += 1
                             raise asyncio.CancelledError("plugin_work_lease_revoked")
                         with resource_context(owner):
-                            return func(*args)
+                            return completion.execute(func, *args)
                     finally:
-                        completion.set_result(None)
+                        completion.finish()
 
                 def completed(_):
                     with contextlib.suppress(RuntimeError):
@@ -2596,6 +2664,8 @@ class PluginRuntimeManager:
                 handle = _original(*replaced, **kwargs)
                 holder.append(weakref.ref(handle))
                 manager._owned_handles[owner].add(handle)
+                if phase is not None and phase.phase == "on_shutdown":
+                    manager._cleanup_handle_work[handle] = phase
                 return handle
 
             setattr(loop, method_name, tracked)
@@ -2654,7 +2724,12 @@ class PluginRuntimeManager:
             incarnation = manager._ensure_incarnation(owner)
             budget = current_budget.get()
             phase = manager._current_work(owner, incarnation.incarnation_id)
-            completion: ConcurrentFuture[None] = ConcurrentFuture()
+            completion = _ExecutorCompletion(
+                owner,
+                incarnation.incarnation_id,
+                func,
+                cleanup=phase is not None and phase.phase == "on_shutdown",
+            )
 
             @wraps(func)
             def run_with_owner():
@@ -2670,9 +2745,9 @@ class PluginRuntimeManager:
                         manager._entry_diagnostics["plugin_work_lease_revoked"] += 1
                         raise asyncio.CancelledError("plugin_work_lease_revoked")
                     with resource_context(owner):
-                        return func(*args)
+                        return completion.execute(func, *args)
                 finally:
-                    completion.set_result(None)
+                    completion.finish()
 
             def shared_submit():
                 token = shared_executor_submission.set(True)
@@ -2688,6 +2763,11 @@ class PluginRuntimeManager:
             )
             owned = manager._owned_executor_futures[owner]
             owned.add(completion)
+            observe = manager._shutdown_executor_observers.get(
+                incarnation.incarnation_id
+            )
+            if observe is not None:
+                observe(completion)
 
             def completed(_done):
                 with contextlib.suppress(RuntimeError):
@@ -2731,6 +2811,9 @@ class PluginRuntimeManager:
             lifecycle_kernel.require_recovery("runtime_tracking_restore_failed")
 
     async def _cancel_all_owned_tasks(self) -> None:
+        from zhenxun.services.lifecycle import lifecycle_kernel
+
+        protected = lifecycle_kernel.pending_component_task_ids()
         owners = (
             set(self._owned_tasks)
             | set(self._entry_tasks)
@@ -2738,10 +2821,60 @@ class PluginRuntimeManager:
             | set(self._owned_executor_futures)
             | set(self._owned_io_watchers)
         )
+        protected_owners = {
+            owner
+            for owner in owners
+            if any(
+                id(task) in protected
+                for task in self._owned_tasks.get(owner, set())
+                | set(self._entry_tasks.get(owner, {}))
+            )
+        }
         try:
-            await self._cancel_plugin_tasks(owners)
+            remaining = {
+                task
+                for owner in owners
+                for task in self._owned_tasks.get(owner, set())
+                | set(self._entry_tasks.get(owner, {}))
+                if task not in self._shutdown_observed_tasks
+                and id(task) not in protected
+            }
+            await self._cancel_plugin_tasks(owners, only_tasks=remaining)
         finally:
-            self._stop_owned_callbacks(owners)
+            self._stop_owned_callbacks(owners - protected_owners)
+
+    async def _drain_executor_work(
+        self, owners: set[str], incarnation_id: str, observed: set[ConcurrentFuture]
+    ) -> None:
+        """Await real thread work within the caller's remaining cleanup budget."""
+        budget = current_budget.get()
+        deadline = time.monotonic() + (
+            budget.remaining() if budget is not None else _TASK_CANCEL_TIMEOUT
+        )
+        while True:
+            observed.update(
+                future
+                for owner in owners
+                for future in self._owned_executor_futures.get(owner, set())
+            )
+            if any(
+                isinstance(future, _ExecutorCompletion)
+                and future.detail["incarnation_id"] != incarnation_id
+                for future in observed
+            ):
+                raise PluginRecoveryRequired("plugin_executor_incarnation_changed")
+            pending = [future for future in observed if not future.done()]
+            if not pending:
+                if any(
+                    isinstance(future, _ExecutorCompletion) and not future.released()
+                    for future in observed
+                ):
+                    raise PluginRecoveryRequired("plugin_executor_cleanup_failed")
+                return
+            wrappers = [asyncio.wrap_future(future) for future in pending]
+            await asyncio.wait(wrappers, timeout=max(0.0, deadline - time.monotonic()))
+            if any(not future.done() for future in pending):
+                raise PluginRecoveryRequired("plugin_executor_wait_timeout")
 
     def _stop_owned_callbacks(self, owners: set[str]) -> None:
         loop = asyncio.get_running_loop()
@@ -2750,6 +2883,11 @@ class PluginRuntimeManager:
             for future in self._owned_executor_futures.get(owner, set()):
                 future.cancel()
             for handle in list(self._owned_handles.get(owner, set())):
+                work = self._cleanup_handle_work.get(handle)
+                if work is not None and self._work_lease_is_current(
+                    owner, work.incarnation_id, work
+                ):
+                    continue
                 handle.cancel()
             for kind, fd in list(self._owned_io_watchers.get(owner, set())):
                 remove = getattr(
@@ -4677,8 +4815,10 @@ class PluginRuntimeManager:
             else shutdown_budget(_TASK_CANCEL_TIMEOUT)
         )
         with budget_context as budget:
-            works = []
-            cancellation_tasks = set(tasks)
+            cancellation_tasks = observed_tasks if observed_tasks is not None else set()
+            cancellation_tasks.update(tasks)
+            if lifecycle_kernel._shutdown_requested:
+                self._shutdown_observed_tasks.update(tasks)
             for owner in owners:
                 incarnation = self._incarnations.get(owner) or self._incarnations.get(
                     self._root_owner(owner)
@@ -4691,6 +4831,9 @@ class PluginRuntimeManager:
                 ):
                     if task.done():
                         continue
+                    key = (task, owner, incarnation.incarnation_id)
+                    if key in self._cancellation_work:
+                        continue
                     work = LifecycleWork(
                         owner,
                         incarnation.incarnation_id,
@@ -4702,7 +4845,6 @@ class PluginRuntimeManager:
                     self._cancellation_work[
                         (task, owner, incarnation.incarnation_id)
                     ] = work
-                    works.append(work)
                     task.add_done_callback(self._forget_cancellation_task)
             try:
                 for task in tasks:
@@ -4744,9 +4886,8 @@ class PluginRuntimeManager:
                 observed.update(cancellation_tasks)
                 if observed_tasks is not None:
                     observed_tasks.update(cancellation_tasks)
-                for work in self._cancellation_work.values():
-                    if work.cancellation_tasks is cancellation_tasks:
-                        work.active = False
+                if lifecycle_kernel._shutdown_requested:
+                    self._shutdown_observed_tasks.update(cancellation_tasks)
         done = {task for task in observed if task.done()}
         pending = observed - done
         cleanup_error = None
@@ -5003,6 +5144,35 @@ class PluginRuntimeManager:
         ]
         checks = self._scope_release_checks(unit, receipts, owners=owners)
         shutdown_tasks: set[asyncio.Task] = set()
+        shutdown_executors: set[ConcurrentFuture] = set()
+        shutdown_started = False
+
+        def observe_executor(future: ConcurrentFuture) -> None:
+            shutdown_executors.add(future)
+            if isinstance(future, _ExecutorCompletion) and not future.done():
+                future.detail["cleanup"] = True
+            receipt_id = f"executor:{id(future)}"
+            receipt = next(
+                (item for item in context.resources if item.receipt_id == receipt_id),
+                None,
+            )
+            if receipt is None:
+                receipt = ResourceReceipt(
+                    receipt_id,
+                    "asyncio",
+                    "executor_future",
+                    context.scope_id,
+                    incarnation_id,
+                    reversible=False,
+                )
+                context.resources.append(receipt)
+            if isinstance(future, _ExecutorCompletion):
+                receipt.detail = future.detail
+            context._release_checks[receipt_id] = (
+                future.released
+                if isinstance(future, _ExecutorCompletion)
+                else future.done
+            )
 
         def reconciled() -> bool:
             incarnation = self._incarnations.get(unit.plugin_id)
@@ -5013,10 +5183,16 @@ class PluginRuntimeManager:
                 and incarnation.incarnation_id == incarnation_id
                 and not incarnation.accepts_work
                 and not unit.in_flight
-                and shutdown_tasks
+                and shutdown_started
                 and all(
                     task.done() and (task.cancelled() or task.exception() is None)
                     for task in shutdown_tasks
+                )
+                and all(
+                    future.released()
+                    if isinstance(future, _ExecutorCompletion)
+                    else future.done()
+                    for future in shutdown_executors
                 )
             )
 
@@ -5030,6 +5206,7 @@ class PluginRuntimeManager:
             ][:8]
 
         async def stop() -> None:
+            nonlocal shutdown_started
             if (
                 self.units.get(unit.plugin_id) is not unit
                 or unit.incarnation_id != incarnation_id
@@ -5037,6 +5214,14 @@ class PluginRuntimeManager:
                 raise PluginRecoveryRequired("plugin_stop_incarnation_changed")
             unit.draining = True
             owners = self._owned_keys_for_unit(unit.plugin_id)
+            shutdown_started = True
+            self._shutdown_executor_observers[incarnation_id] = observe_executor
+            for future in (
+                future
+                for owner in owners
+                for future in self._owned_executor_futures.get(owner, set())
+            ):
+                observe_executor(future)
             self._revoke_incarnation(unit.plugin_id)
             try:
                 drain_error = None
@@ -5056,6 +5241,9 @@ class PluginRuntimeManager:
                 except (TimeoutError, PluginRecoveryRequired) as error:
                     drain_error = error
                 await self._cancel_plugin_tasks(owners, observed_tasks=shutdown_tasks)
+                await self._drain_executor_work(
+                    owners, incarnation_id, shutdown_executors
+                )
                 if drain_error is not None and not (
                     str(drain_error) == "plugin_task_cancel_timeout" and reconciled()
                 ):
@@ -5082,6 +5270,7 @@ class PluginRuntimeManager:
                 index=observation[1] if observation is not None else None,
             ),
         )
+        context = lifecycle_kernel._registrations[f"plugin:{unit.plugin_id}"].context
 
     def _scope_release_checks(
         self,
@@ -5133,7 +5322,11 @@ class PluginRuntimeManager:
                     or handle not in self._owned_handles.get(owner, set())
                 )
             for future in self._owned_executor_futures.get(owner, set()):
-                checks[f"executor:{id(future)}"] = future.done
+                checks[f"executor:{id(future)}"] = (
+                    future.released
+                    if isinstance(future, _ExecutorCompletion)
+                    else future.done
+                )
             for thread in self._owned_threads.get(owner, set()):
                 checks[f"thread:{id(thread)}"] = (
                     lambda thread=thread: not thread.is_alive()
@@ -5187,6 +5380,9 @@ class PluginRuntimeManager:
                     unit.plugin_id,
                     incarnation_id,
                     reversible=False,
+                    detail=future.detail
+                    if isinstance(future, _ExecutorCompletion)
+                    else {},
                 )
                 for future in self._owned_executor_futures.get(owner, set())
                 if not future.done()

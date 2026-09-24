@@ -2,6 +2,9 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from zhenxun.services.cache.config import normalize_cache_mode
+from zhenxun.utils.pydantic_compat import model_validator
+
 
 class DatabaseConfig(BaseModel):
     mode: Literal["sqlite", "mysql", "postgres", "url"] = "sqlite"
@@ -15,10 +18,17 @@ class DatabaseConfig(BaseModel):
 
 
 class CacheConfig(BaseModel):
-    mode: Literal["NONE", "MEMORY", "REDIS"] = "MEMORY"
+    mode: Literal["NONE", "MEMORY", "REDIS"] = "NONE"
     host: str = "127.0.0.1"
     port: int = Field(default=6379, ge=1, le=65535)
     password: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_mode(cls, values):
+        if isinstance(values, dict):
+            values = {**values, "mode": normalize_cache_mode(values.get("mode"))}
+        return values
 
 
 class NetworkConfig(BaseModel):
@@ -80,7 +90,17 @@ class Setting(BaseModel):
     port: int = Field(ge=1, le=65535)
     username: str
     password: str
-    cache_mode: Literal["NONE", "MEMORY", "REDIS"] = "MEMORY"
+    cache_mode: Literal["NONE", "MEMORY", "REDIS"] = "NONE"
     redis_host: str = "127.0.0.1"
     redis_port: int = Field(default=6379, ge=1, le=65535)
     redis_password: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_mode(cls, values):
+        if isinstance(values, dict):
+            values = {
+                **values,
+                "cache_mode": normalize_cache_mode(values.get("cache_mode")),
+            }
+        return values

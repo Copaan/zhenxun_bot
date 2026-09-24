@@ -144,6 +144,9 @@ class OnlineExport:
                 "spawn_pid": worker.pid,
             },
         )
+        self.store.transition(
+            self.identity, "resuming", progress={"original_worker_resumed": True}
+        )
         if (
             self.first_error
             or self.store.read("jobs", self.identity)["cancel_requested"]

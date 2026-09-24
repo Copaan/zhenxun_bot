@@ -189,6 +189,7 @@ async def with_db_timeout(
     timeout: float = DB_TIMEOUT_SECONDS,
     operation: str | None = None,
     source: str | None = None,
+    timing: dict | None = None,
 ):
     """带超时控制的数据库操作"""
     loop = asyncio.get_running_loop()
@@ -233,11 +234,17 @@ async def with_db_timeout(
             raise asyncio.TimeoutError from None
         elapsed = loop.time() - start_time
         execution_elapsed = loop.time() - queued if entered else 0.0
+        row_count = len(result) if isinstance(result, list | tuple) else "未知"
         if elapsed > SLOW_QUERY_THRESHOLD and operation:
             logger.warning(
                 f"数据库操作耗时过高: {operation} 总耗时 {elapsed:.3f}s "
                 f"(排队 {max(0.0, queued - start_time):.3f}s, "
-                f"执行 {execution_elapsed:.3f}s)",
+                f"查询往返（含驱动等待） {execution_elapsed:.3f}s)"
+                + (
+                    f" 来源 {timing.get('source', source)}，" f"行数 {row_count}"
+                    if timing is not None
+                    else ""
+                ),
                 LOG_COMMAND,
             )
         if entered:
@@ -281,6 +288,15 @@ async def with_db_timeout(
         raise
 
     finally:
+        if timing is not None:
+            timing.update(
+                queue_wait_ms=round(
+                    ((queued if entered else loop.time()) - start_time) * 1000, 3
+                ),
+                query_roundtrip_ms=round((loop.time() - queued) * 1000, 3)
+                if entered
+                else 0,
+            )
         if timer is not None:
             timer.cancel()
         if expired and hasattr(task, "uncancel"):

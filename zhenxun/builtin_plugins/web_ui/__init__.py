@@ -147,6 +147,9 @@ async def _retain_transport_runtime_until_loop_close():
     pass_context=True,
 )
 async def _(context):
+    from .api.tabs.dashboard.overview import start_probes
+
+    start_probes()
     bind_lifecycle_context(context)
     try:
         await asyncio.to_thread(ensure_webui_secret)
@@ -218,5 +221,8 @@ async def _(context):
 
 @PriorityLifecycle.on_shutdown(priority=1000, component_id="management:webui")
 async def _cleanup_ready_banner():
+    from .api.tabs.dashboard.overview import invalidate_probes
+
+    await invalidate_probes(stopping=True)
     bind_lifecycle_context(None)
     webui_ready_banner.reset()

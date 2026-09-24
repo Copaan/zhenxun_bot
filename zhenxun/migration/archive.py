@@ -312,6 +312,7 @@ def build_archive(
     limits: Limits = Limits(),
     checkpoint: Callable[[], None] = _checkpoint,
     publish: Callable[[Path, Path, dict], None] | None = None,
+    progress=None,
 ) -> dict:
     if not password and not plaintext_confirmed:
         raise MigrationError("migration_plaintext_confirmation_required")
@@ -332,6 +333,8 @@ def build_archive(
         "source": metadata,
         "files": [],
     }
+    total_bytes = sum(entry.size for entry in files)
+    processed_bytes = 0
     index = PathIndex()
     temporary_directory = Path(
         tempfile.mkdtemp(prefix=".zx-export-", dir=destination.parent)
@@ -379,6 +382,18 @@ def build_archive(
                             )
                         writer.write(data)
                         digest.update(data)
+                        if progress is not None:
+                            progress(
+                                current=number,
+                                total=len(files),
+                                bytes_done=processed_bytes + count,
+                                bytes_total=total_bytes,
+                                step="压缩迁移文件",
+                                unit="文件",
+                                percent=(number + count / max(entry.size, 1))
+                                / len(files)
+                                * 100,
+                            )
                 after = contained_path(snapshot, entry.path, regular=True).stat()
                 if count != entry.size or (
                     before.st_mtime_ns,
@@ -396,6 +411,17 @@ def build_archive(
                         "payload": payload,
                     }
                 )
+                processed_bytes += count
+                if progress is not None:
+                    progress(
+                        current=number + 1,
+                        total=len(files),
+                        bytes_done=processed_bytes,
+                        bytes_total=total_bytes,
+                        step="压缩迁移文件",
+                        unit="文件",
+                        percent=(number + 1) / len(files) * 100 if files else 100,
+                    )
                 if temporary.stat().st_size > limits.compressed:
                     raise MigrationError("migration_compressed_limit")
             raw = json.dumps(manifest, ensure_ascii=True, sort_keys=True).encode()
@@ -404,11 +430,15 @@ def build_archive(
             archive.writestr("manifest.json", raw)
         if temporary.stat().st_size > limits.compressed:
             raise MigrationError("migration_compressed_limit")
+        if progress is not None:
+            progress(step="核验压缩包完整性")
         verify_archive(
             temporary, password=password, limits=limits, checkpoint=checkpoint
         )
         with temporary.open("rb+") as stream:
             os.fsync(stream.fileno())
+        if progress is not None:
+            progress(step="计算迁移包指纹")
         digest = file_hash(temporary, checkpoint)
         result = {
             "package_id": manifest["package_id"],
@@ -439,6 +469,7 @@ def extract_verified(
     password: bytes | None = None,
     limits: Limits = Limits(),
     checkpoint: Callable[[], None] = _checkpoint,
+    progress=None,
 ) -> dict:
     """Extract into a new private stage, never into the target instance."""
     contained_path(staging.parent, staging.name)
@@ -449,7 +480,9 @@ def extract_verified(
         private_directory(staging)
         try:
             total = 0
-            for entry in manifest["files"]:
+            entries = manifest["files"]
+            total_bytes = sum(entry["size"] for entry in entries)
+            for index, entry in enumerate(entries, 1):
                 destination = contained_path(staging, entry["payload"])
                 destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
                 actual = 0
@@ -466,11 +499,33 @@ def extract_verified(
                             raise MigrationError("migration_expanded_limit")
                         digest.update(data)
                         writer.write(data)
+                        if progress is not None:
+                            progress(
+                                current=index - 1,
+                                total=len(entries),
+                                bytes_done=total,
+                                bytes_total=total_bytes,
+                                step="解压并校验迁移文件",
+                                unit="文件",
+                                percent=(index - 1) / len(entries) * 100
+                                if entries
+                                else 100,
+                            )
                     writer.flush()
                     os.fsync(writer.fileno())
                 if actual != entry["size"] or digest.hexdigest() != entry["sha256"]:
                     raise MigrationError(
                         "migration_payload_hash_mismatch", path=entry["path"]
+                    )
+                if progress is not None:
+                    progress(
+                        current=index,
+                        total=len(entries),
+                        bytes_done=total,
+                        bytes_total=total_bytes,
+                        step="解压并校验迁移文件",
+                        unit="文件",
+                        percent=index / len(entries) * 100 if entries else 100,
                     )
             return manifest
         except BaseException:

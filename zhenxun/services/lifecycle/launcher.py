@@ -12,12 +12,13 @@ from threading import RLock
 import time
 from typing import Any, ClassVar
 import uuid
+import weakref
 
 from zhenxun.utils.atomic_json import read_json_locked, write_json_locked
 from zhenxun.utils.process_tree import verified_descendants
 
 from .deadline import ShutdownBudget, current_budget, shutdown_budget
-from .diagnostics import merge_terminal_receipt
+from .diagnostics import merge_terminal_receipt, terminal_path
 from .kernel import LifecycleKernel
 from .models import ComponentSpec, ResourceReceipt, RuntimeHandle
 
@@ -60,6 +61,9 @@ class ProcessHandle:
     _next_tree_discovery: float = 0.0
     _tree_scan_count: int = 0
     _identity_unverified: bool = False
+    _close_task: asyncio.Task | None = field(default=None, init=False, repr=False)
+    _force_task: asyncio.Task | None = field(default=None, init=False, repr=False)
+    _kernel_stop_task: asyncio.Task | None = field(default=None, init=False, repr=False)
     _runtime_identity: tuple[int, float] | None = field(
         default=None, init=False, repr=False
     )
@@ -89,12 +93,19 @@ class ProcessHandle:
                     self._identity_unverified = True
                     raise RuntimeError("process_identity_unverified")
                 if not process.is_running() or process.status() == psutil.STATUS_ZOMBIE:
+                    if pid == self.spawn_pid and self.process.poll() is None:
+                        live.append(process)
+                        continue
                     self.identities.pop(pid, None)
                     continue
                 live.append(process)
             except psutil.NoSuchProcess:
+                if pid == self.spawn_pid and self.process.poll() is None:
+                    raise RuntimeError("process_identity_unverified") from None
                 self.identities.pop(pid, None)
                 continue
+            except psutil.AccessDenied as error:
+                raise RuntimeError("process_identity_unverified") from error
         now = time.monotonic()
         if discover or not self.accepting or now >= self._next_tree_discovery:
             self._next_tree_discovery = now + 0.5
@@ -121,6 +132,8 @@ class ProcessHandle:
                             known.add(child.pid)
                 except psutil.NoSuchProcess:
                     continue
+                except psutil.AccessDenied as error:
+                    raise RuntimeError("process_identity_unverified") from error
         return live
 
     @property
@@ -161,6 +174,19 @@ class ProcessHandle:
         self.accepting = False
 
     async def close(self) -> None:
+        """Send one cooperative request and share its completion with all callers."""
+        if self._close_task is None:
+            self.shutdown_id = self.shutdown_id or self.startup_id
+            self._close_task = asyncio.create_task(self._close_once())
+            self._close_task.add_done_callback(self._consume_result)
+        await asyncio.shield(self._close_task)
+
+    @staticmethod
+    def _consume_result(task: asyncio.Task) -> None:
+        if not task.cancelled():
+            task.exception()
+
+    async def _close_once(self) -> None:
         self.accepting = False
         if not self._live_processes(discover=True):
             return
@@ -184,7 +210,7 @@ class ProcessHandle:
                         state["requests"] = {}
                     state["requests"][self.startup_id] = {
                         "shutdown_id": self.shutdown_id or self.startup_id,
-                        "requested_at": __import__("time").time(),
+                        "requested_at": time.time(),
                         "budget_ms": int(budget.remaining() * 1000),
                         "identities": {
                             str(pid): created
@@ -211,44 +237,62 @@ class ProcessHandle:
                     self.process.poll()
                     await asyncio.sleep(min(0.05, budget.remaining()))
             finally:
+                pending, verified = self._observed_running()
                 self.stop_stages.append(
                     {
                         "stage": "cooperative",
                         "elapsed_seconds": asyncio.get_running_loop().time() - started,
-                        "timed_out": bool(self._live_processes()),
+                        "timed_out": pending,
+                        "identity_verified": verified,
                     }
                 )
             if self._live_processes():
                 raise TimeoutError("process_cooperative_timeout")
             self.process.poll()
 
-    async def force_close(self) -> None:
+    async def force_close(self, budget: ShutdownBudget) -> None:
+        """Terminate a verified tree once within the supervisor's recovery window."""
+        if self._force_task is None:
+            self._force_task = asyncio.create_task(self._force_close_once(budget))
+            self._force_task.add_done_callback(self._consume_result)
+        await asyncio.shield(self._force_task)
+
+    async def _force_close_once(self, budget: ShutdownBudget) -> None:
         import psutil
 
-        for stage in ("terminate", "kill"):
-            started = asyncio.get_running_loop().time()
-            for process in reversed(self._live_processes(discover=True)):
-                try:
-                    getattr(process, stage)()
-                except psutil.Error:
-                    pass
-            budget = ShutdownBudget.start(5.0)
-            while self._live_processes() and budget.remaining():
-                self.process.poll()
+        stage = "terminate" if os.name == "nt" else "kill"
+        started = time.monotonic()
+        signalled: set[tuple[int, float]] = set()
+        try:
+            while live := self._live_processes(discover=True):
+                if not budget.remaining():
+                    raise RuntimeError("process_tree_recovery_required")
+                for process in reversed(live):
+                    identity = (process.pid, self.identities[process.pid])
+                    if identity in signalled:
+                        continue
+                    try:
+                        # A reused PID must never receive this tree's signal.
+                        if psutil.Process(process.pid).create_time() != identity[1]:
+                            self._identity_unverified = True
+                            raise RuntimeError("process_identity_unverified")
+                        getattr(process, stage)()
+                    except psutil.NoSuchProcess:
+                        continue
+                    signalled.add(identity)
+                self.exit_reason = stage
                 await asyncio.sleep(min(0.05, budget.remaining()))
-            pending = bool(self._live_processes())
+            self.process.poll()
+        finally:
+            pending, verified = self._observed_running()
             self.stop_stages.append(
                 {
                     "stage": stage,
-                    "elapsed_seconds": asyncio.get_running_loop().time() - started,
+                    "elapsed_seconds": time.monotonic() - started,
                     "timed_out": pending,
+                    "identity_verified": verified,
                 }
             )
-            self.exit_reason = stage
-            if not pending:
-                self.process.poll()
-                return
-        raise RuntimeError("process_tree_recovery_required")
 
     def _observed_running(self) -> tuple[bool, bool]:
         """只读诊断用的存活判定，返回 (running, identity_verified)。
@@ -300,7 +344,9 @@ class ProcessHandle:
             "tree_scan_count": self._tree_scan_count,
         }
 
-    def runtime_shutdown_receipt(self) -> dict[str, Any] | None:
+    def runtime_shutdown_receipt(
+        self, *, include_failure: bool = False
+    ) -> dict[str, Any] | None:
         if self.role != "worker" or not self.worker_boot_id:
             return None
         path = Path(
@@ -311,23 +357,56 @@ class ProcessHandle:
         try:
             state = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            return None
+            state = {}
         if not isinstance(state, dict):
-            return None
-        receipt = merge_terminal_receipt(state, path).get("terminal_shutdown")
-        if not isinstance(receipt, dict):
-            return None
-        identity = receipt.get("identity", {})
-        if (
-            identity.get("boot_id") != self.worker_boot_id
-            or identity.get("startup_id") != self.startup_id
-            or identity.get("launcher_boot_id") != self.launcher_boot_id
-            or identity.get("pid") != self.runtime_pid
-            or identity.get("shutdown_correlation_id")
-            != (self.shutdown_id or self.startup_id)
-        ):
-            return None
-        return receipt
+            state = {}
+        candidates = [merge_terminal_receipt(state, path).get("terminal_shutdown")]
+        if include_failure:
+            try:
+                candidates.append(
+                    json.loads(terminal_path(path).read_text(encoding="utf-8"))
+                )
+            except (OSError, ValueError):
+                pass
+            failed = [
+                {
+                    "component_id": item["component_id"],
+                    "error_code": item.get("error_code"),
+                    "diagnostic": item.get("metadata", {}).get("stop_diagnostic", {}),
+                }
+                for item in state.get("components", [])
+                if item.get("state") == "failed"
+            ][:16]
+            if failed:
+                candidates.append(
+                    {
+                        "identity": state.get("snapshot_identity", {}),
+                        "result": "unconfirmed",
+                        "phase": "last_worker_snapshot",
+                        "failed_components": failed,
+                        "recovery_required": state.get("recovery_required", []),
+                        "unresolved_resources": state.get("unresolved_resources", []),
+                    }
+                )
+        for receipt in candidates:
+            if not isinstance(receipt, dict):
+                continue
+            identity = receipt.get("identity") or {}
+            if (
+                identity.get("boot_id") != self.worker_boot_id
+                or identity.get("startup_id") != self.startup_id
+                or identity.get("launcher_boot_id") != self.launcher_boot_id
+                or identity.get("pid") != self.runtime_pid
+            ):
+                continue
+            if identity.get("shutdown_correlation_id") != (
+                self.shutdown_id or self.startup_id
+            ):
+                if not include_failure or receipt.get("result") != "unconfirmed":
+                    continue
+                return {**receipt, "correlation_verified": False}
+            return receipt
+        return None
 
     def resource_snapshot(self) -> list[ResourceReceipt]:
         return [
@@ -428,6 +507,8 @@ class LauncherSupervisor:
         self.shutdown_id: str | None = None
         self.shutdown_signal: int | None = None
         self._process_history: list[dict[str, Any]] = []
+        self._released_processes: weakref.WeakSet = weakref.WeakSet()
+        self._force_budget: ShutdownBudget | None = None
 
     async def run_recovery(self, callback):
         component_id = "launcher:recovery"
@@ -457,10 +538,12 @@ class LauncherSupervisor:
             self.kernel.request_shutdown()
         if self.shutdown_deadline is None:
             self.shutdown_deadline = ShutdownBudget.start(15.0)
+            self._force_budget = None
             self.shutdown_id = uuid.uuid4().hex
             self.kernel.set_process_metadata(shutdown_id=self.shutdown_id)
             for handle in self._handles.values():
-                handle.shutdown_id = self.shutdown_id
+                if handle._close_task is None:
+                    handle.shutdown_id = self.shutdown_id
 
     async def start_process(
         self,
@@ -475,7 +558,7 @@ class LauncherSupervisor:
             raise OSError("launcher_startup_interrupted")
         previous = self._role_pids.get(role)
         if previous in self._handles:
-            await self.stop_process(self._handles[previous].process)
+            await self.stop_process(self._handles[previous].process, allow_force=True)
         if self.shutdown_deadline is not None:
             raise OSError("launcher_startup_interrupted")
         recovery_id = "launcher:recovery"
@@ -535,15 +618,17 @@ class LauncherSupervisor:
             or self.kernel.component_status(component_id)["state"] != "ready"
         ):
             if pid in self._handles:
-                await self.stop_process(self._handles[pid].process)
+                await self.stop_process(self._handles[pid].process, allow_force=True)
             raise OSError("launcher_process_start_failed")
         self.kernel._recovery_required.discard(component_id)
         self._publish_processes()
         return self._handles[self._role_pids[role]].process
 
     async def stop_process(
-        self, process: subprocess.Popen, *, allow_force: bool = True
+        self, process: subprocess.Popen, *, allow_force: bool
     ) -> None:
+        if process in self._released_processes:
+            return
         handle = self._handles.get(process.pid)
         if handle is None:
             handle = self.attach("worker", process)
@@ -558,16 +643,35 @@ class LauncherSupervisor:
         token = current_budget.set(budget)
         try:
             try:
-                await self.kernel.stop_components({f"launcher:{handle.role}"})
-            except BaseException:
-                pass
+                if handle._kernel_stop_task is None:
+                    handle._kernel_stop_task = asyncio.create_task(
+                        self.kernel.stop_components({f"launcher:{handle.role}"})
+                    )
+                    handle._kernel_stop_task.add_done_callback(handle._consume_result)
+                await asyncio.shield(handle._kernel_stop_task)
+            except Exception as error:
+                if not any(
+                    item["stage"] == "component_stop" for item in handle.stop_stages
+                ):
+                    handle.stop_stages.append(
+                        {"stage": "component_stop", "error_code": str(error)}
+                    )
             if handle._live_processes():
-                try:
-                    await handle.close()
-                except (TimeoutError, asyncio.CancelledError):
+                if handle._close_task is not None:
+                    try:
+                        await asyncio.shield(handle._close_task)
+                    except TimeoutError:
+                        pass
+                if handle._live_processes():
                     if not allow_force:
-                        raise TimeoutError("process_cooperative_timeout") from None
-                    await handle.force_close()
+                        raise TimeoutError("process_cooperative_timeout")
+                    if self.shutdown_deadline is not None:
+                        if self._force_budget is None:
+                            self._force_budget = ShutdownBudget.start(5.0)
+                        force_budget = self._force_budget
+                    else:
+                        force_budget = ShutdownBudget.start(5.0)
+                    await handle.force_close(force_budget)
             self.release(process, handle.exit_reason or "exited")
         finally:
             current_budget.reset(token)
@@ -580,7 +684,9 @@ class LauncherSupervisor:
             pid = self._role_pids.get(role)
             if pid in self._handles:
                 try:
-                    await self.stop_process(self._handles[pid].process)
+                    await self.stop_process(
+                        self._handles[pid].process, allow_force=True
+                    )
                 except Exception as error:
                     first_error = first_error or error
         token = current_budget.set(self.shutdown_deadline)
@@ -639,6 +745,7 @@ class LauncherSupervisor:
             self.kernel._recovery_required.add(f"launcher:{handle.role}")
             return
         self._handles.pop(process.pid, None)
+        self._released_processes.add(process)
         if handle is not None:
             handle.accepting = False
             handle.exit_reason = reason
@@ -650,7 +757,9 @@ class LauncherSupervisor:
             self._process_history.append(
                 {
                     **handle.snapshot(),
-                    "runtime_shutdown": handle.runtime_shutdown_receipt(),
+                    "runtime_shutdown": handle.runtime_shutdown_receipt(
+                        include_failure=True
+                    ),
                 }
             )
             self._process_history = self._process_history[-100:]

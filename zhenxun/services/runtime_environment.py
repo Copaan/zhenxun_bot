@@ -261,39 +261,60 @@ class RuntimeEnvironmentManager:
         from zhenxun.services.cache.config import CacheMode
         from zhenxun.services.cache.runtime_cache import RuntimeCacheSync
 
-        for key, attr in _CACHE_ATTRS.items():
-            value = self._typed_value(
-                cache_config,
-                type(cache_config)(),
-                attr,
-                values.get(key),
-            )
-            setattr(cache_config, attr, value)
-
-        if cache_config.cache_mode == CacheMode.REDIS:
-            if not cache_config.redis_host:
-                raise RuntimeEnvironmentError("redis_host_required")
-            try:
-                import redis.asyncio as redis_async
-
-                probe = redis_async.Redis(
-                    host=cache_config.redis_host,
-                    port=cache_config.redis_port or 6379,
-                    password=cache_config.redis_password or None,
-                    socket_connect_timeout=3,
-                    socket_timeout=3,
+        candidate = type(cache_config)(
+            **{
+                attr: self._typed_value(
+                    cache_config, type(cache_config)(), attr, values.get(key)
                 )
-                try:
-                    await probe.ping()
-                finally:
-                    await probe.aclose()
+                for key, attr in _CACHE_ATTRS.items()
+            }
+        )
+        if candidate.cache_mode == CacheMode.REDIS:
+            if not candidate.redis_host:
+                raise RuntimeEnvironmentError("redis_host_required")
+            import redis.asyncio as redis_async
+            from redis.asyncio.retry import Retry
+            from redis.backoff import NoBackoff
+
+            probe = redis_async.Redis(
+                host=candidate.redis_host,
+                port=candidate.redis_port or 6379,
+                password=candidate.redis_password or None,
+                socket_connect_timeout=2,
+                socket_timeout=2,
+                retry=Retry(NoBackoff(), 0),
+            )
+            try:
+                await asyncio.wait_for(probe.ping(), 2)
             except Exception as error:
                 raise RuntimeEnvironmentError("redis_probe_failed") from error
+            finally:
+                await asyncio.wait_for(probe.aclose(), 2)
 
-        await RuntimeCacheSync.stop()
-        await CacheRoot.close()
-        CacheRoot.enabled = cache_config.cache_mode == CacheMode.REDIS
-        await RuntimeCacheSync.start()
+        previous = {attr: getattr(cache_config, attr) for attr in _CACHE_ATTRS.values()}
+        try:
+            await RuntimeCacheSync.stop()
+            await CacheRoot.close()
+            for attr in _CACHE_ATTRS.values():
+                setattr(cache_config, attr, getattr(candidate, attr))
+            CacheRoot.enabled = candidate.cache_mode == CacheMode.REDIS
+            await asyncio.wait_for(RuntimeCacheSync.start(strict=True), 2)
+        except BaseException:
+            await RuntimeCacheSync.stop()
+            await CacheRoot.close()
+            for attr, value in previous.items():
+                setattr(cache_config, attr, value)
+            CacheRoot.enabled = cache_config.cache_mode == CacheMode.REDIS
+            await asyncio.wait_for(RuntimeCacheSync.start(strict=True), 2)
+            raise
+        finally:
+            import sys
+
+            overview = sys.modules.get(
+                "zhenxun.builtin_plugins.web_ui.api.tabs.dashboard.overview"
+            )
+            if overview is not None:
+                await overview.invalidate_probes()
 
     async def _apply_runtime_values(
         self,

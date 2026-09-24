@@ -142,7 +142,7 @@ class MaintenanceProcess:
             return
         process, self.process = self.process, None
         handle = self.service.supervisor._handles.get(process.pid)
-        await self.service.supervisor.stop_process(process)
+        await self.service.supervisor.stop_process(process, allow_force=True)
         self.service._maintenance = None
         if (
             handle is None

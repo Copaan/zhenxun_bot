@@ -70,6 +70,7 @@ from .config import (
     LOG_COMMAND,
     SPECIAL_KEY_FORMATS,
     CacheMode,
+    normalize_cache_mode,
 )
 
 __all__ = [
@@ -102,6 +103,10 @@ class Config(BaseModel):
     """redis密码"""
     redis_expire: int = DEFAULT_EXPIRE
     """redis过期时间"""
+
+    def __init__(self, **data):
+        data["cache_mode"] = normalize_cache_mode(data.get("cache_mode"))
+        super().__init__(**data)
 
 
 # 获取配置

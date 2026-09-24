@@ -6,17 +6,20 @@ import contextlib
 from datetime import datetime
 from pathlib import Path
 import time
+import traceback
 from typing import Literal
 
 import nonebot
 from redis.asyncio import Redis
+from redis.asyncio.retry import Retry
+from redis.backoff import NoBackoff
 from tortoise import Tortoise
 
 from zhenxun.builtin_plugins.web_ui.api.configure.setup_access import setup_access
 from zhenxun.builtin_plugins.web_ui.api.protocol import build_protocol_status
 from zhenxun.builtin_plugins.web_ui.security import authenticated_websocket_count
 from zhenxun.services.cache import cache_config
-from zhenxun.services.cache.config import CacheMode
+from zhenxun.services.cache.config import CacheMode, normalize_cache_mode
 from zhenxun.services.cache.runtime_cache import health_snapshot
 from zhenxun.services.lifecycle import LifecycleError
 from zhenxun.services.lifecycle.operations import operation_registry
@@ -44,6 +47,79 @@ _probe_task: asyncio.Task[tuple[RuntimeServiceStatus, RuntimeServiceStatus]] | N
 )
 _probe_lock = asyncio.Lock()
 
+_probe_generation = 0
+_probe_signature = None
+_redis_client: Redis | None = None
+_probe_failures: dict[str, tuple[str, float, int]] = {}
+_probes_stopped = False
+
+
+def _cache_signature():
+    return (
+        cache_config.cache_mode,
+        cache_config.redis_host,
+        cache_config.redis_port,
+        cache_config.redis_password,
+    )
+
+
+async def invalidate_probes(*, stopping: bool = False) -> None:
+    """Release the WebUI-owned probe and invalidate results from the old config."""
+    global _probe_generation, _probe_task, _probe_results, _redis_client
+    global _probes_stopped, _probe_signature
+    if stopping:
+        _probes_stopped = True
+    _probe_generation += 1
+    task, _probe_task = _probe_task, None
+    client, _redis_client = _redis_client, None
+    _probe_results = None
+    _probe_signature = _cache_signature()
+    if task is not None and not task.done():
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    if client is not None:
+        await asyncio.wait_for(client.aclose(), _PROBE_TIMEOUT_SECONDS)
+
+
+def start_probes() -> None:
+    """Allow probes for the active WebUI lifecycle."""
+    global _probes_stopped
+    _probes_stopped = False
+
+
+def _record_probe(label: str, error: Exception | None) -> None:
+    now = time.monotonic()
+    previous = _probe_failures.get(label)
+    if error is None:
+        if previous:
+            logger.info(f"WebUI {label}连接检查已恢复", "WebUi")
+            _probe_failures.pop(label, None)
+        return
+    kind = type(error).__name__
+    if previous is None or previous[0] != kind:
+        from zhenxun.services.startup import _sanitize_diagnostic_text
+
+        message = str(error)
+        if cache_config.redis_password:
+            message = message.replace(cache_config.redis_password, "[redacted]")
+        message = _sanitize_diagnostic_text(message)
+        frames = "\n".join(
+            f"  {frame.filename}:{frame.lineno} in {frame.name}"
+            for frame in traceback.extract_tb(error.__traceback__)
+        )
+        logger.warning(
+            f"WebUI runtime {label} probe failed ({kind}): {message}\n{frames}",
+            "WebUi",
+        )
+        _probe_failures[label] = (kind, now, 1)
+    elif now - previous[1] >= 300:
+        logger.warning(
+            f"WebUI {label}连接检查仍失败 ({kind})，累计 {previous[2] + 1} 次", "WebUi"
+        )
+        _probe_failures[label] = (kind, now, 0)
+    else:
+        _probe_failures[label] = (kind, previous[1], previous[2] + 1)
+
 
 def _version() -> str:
     path = Path("__version__")
@@ -65,7 +141,7 @@ async def _timed_probe(
     try:
         await asyncio.wait_for(probe(), timeout=_PROBE_TIMEOUT_SECONDS)
     except Exception as error:
-        logger.warning(f"WebUI runtime {label} probe failed", "WebUi", e=error)
+        _record_probe(label, error)
         return RuntimeServiceStatus(
             status="critical" if label == "数据库" else "warning",
             code=error_code,
@@ -74,6 +150,7 @@ async def _timed_probe(
             latency_ms=round((time.perf_counter() - started_at) * 1000),
             mode=mode,
         )
+    _record_probe(label, None)
     return RuntimeServiceStatus(
         status="ok",
         code=ready_code,
@@ -111,7 +188,18 @@ def _runtime_cache_has_errors() -> bool:
 
 
 async def _probe_cache() -> RuntimeServiceStatus:
-    mode = str(cache_config.cache_mode or CacheMode.NONE).upper()
+    global _redis_client
+    try:
+        mode = normalize_cache_mode(cache_config.cache_mode)
+    except ValueError:
+        return RuntimeServiceStatus(
+            status="warning",
+            code="cache_mode_invalid",
+            label="缓存",
+            detail="缓存模式无效，请检查 CACHE_MODE。",
+        )
+    if mode != CacheMode.REDIS:
+        _record_probe("缓存", None)
     if mode == CacheMode.NONE:
         return RuntimeServiceStatus(
             status="ok",
@@ -140,27 +228,24 @@ async def _probe_cache() -> RuntimeServiceStatus:
             mode=mode,
         )
 
-    client = Redis(
-        host=cache_config.redis_host,
-        port=cache_config.redis_port or 6379,
-        password=cache_config.redis_password or None,
-        decode_responses=True,
-    )
-
-    async def ping() -> None:
-        await client.ping()
-
-    try:
-        return await _timed_probe(
-            ping,
-            label="缓存",
-            ready_code="redis_ready",
-            error_code="redis_unavailable",
-            mode=mode,
+    if _redis_client is None:
+        _redis_client = Redis(
+            host=cache_config.redis_host,
+            port=cache_config.redis_port or 6379,
+            password=cache_config.redis_password or None,
+            decode_responses=True,
+            socket_connect_timeout=_PROBE_TIMEOUT_SECONDS,
+            socket_timeout=_PROBE_TIMEOUT_SECONDS,
+            retry=Retry(NoBackoff(), 0),
+            max_connections=1,
         )
-    finally:
-        with contextlib.suppress(Exception):
-            await client.aclose()
+    return await _timed_probe(
+        _redis_client.ping,
+        label="缓存",
+        ready_code="redis_ready",
+        error_code="redis_unavailable",
+        mode=mode,
+    )
 
 
 async def _run_probes() -> tuple[RuntimeServiceStatus, RuntimeServiceStatus]:
@@ -174,7 +259,7 @@ async def _run_probes() -> tuple[RuntimeServiceStatus, RuntimeServiceStatus]:
         try:
             return await probe()
         except Exception as error:
-            logger.warning(f"WebUI runtime {label} probe failed", "WebUi", e=error)
+            _record_probe(label, error)
             return RuntimeServiceStatus(
                 status=status,
                 code=code,
@@ -202,43 +287,54 @@ async def _run_probes() -> tuple[RuntimeServiceStatus, RuntimeServiceStatus]:
 async def _get_probes(
     force: bool,
 ) -> tuple[RuntimeServiceStatus, RuntimeServiceStatus]:
-    global _probe_results, _probe_task, _probe_updated_at
-    now = time.monotonic()
-    if (
-        not force
-        and _probe_results is not None
-        and now - _probe_updated_at < _PROBE_TTL_SECONDS
-    ):
-        return _probe_results
-    async with _probe_lock:
-        now = time.monotonic()
-        if (
-            not force
-            and _probe_results is not None
-            and now - _probe_updated_at < _PROBE_TTL_SECONDS
-        ):
-            return _probe_results
-        if _probe_task is None or _probe_task.done():
-            try:
-                _, _probe_task = operation_registry.start(
-                    "dashboard_probe",
-                    _run_probes(),
-                    owner_component_id="management:webui",
-                    recovery_policy="discard",
-                    name="webui-dashboard-probe",
-                )
-            except LifecycleError:
-                _probe_task = asyncio.create_task(
-                    _run_probes(), name="webui-dashboard-probe"
-                )
-        task = _probe_task
-    results = await asyncio.shield(task)
-    async with _probe_lock:
-        if _probe_task is task:
-            _probe_results = results
-            _probe_updated_at = time.monotonic()
-            _probe_task = None
-    return results
+    global _probe_results, _probe_task, _probe_updated_at, _probe_signature
+    while True:
+        async with _probe_lock:
+            if _probes_stopped:
+                raise asyncio.CancelledError
+            signature = _cache_signature()
+            if signature != _probe_signature:
+                await invalidate_probes()
+                _probe_signature = signature
+            if (
+                not force
+                and _probe_results is not None
+                and time.monotonic() - _probe_updated_at < _PROBE_TTL_SECONDS
+            ):
+                return _probe_results
+            generation = _probe_generation
+            if _probe_task is None:
+                try:
+                    _, _probe_task = operation_registry.start(
+                        "dashboard_probe",
+                        _run_probes(),
+                        owner_component_id="management:webui",
+                        recovery_policy="discard",
+                        name="webui-dashboard-probe",
+                    )
+                except LifecycleError:
+                    _probe_task = asyncio.create_task(
+                        _run_probes(), name="webui-dashboard-probe"
+                    )
+            task = _probe_task
+        try:
+            results = await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if (
+                generation != _probe_generation
+                and not _probes_stopped
+                and not getattr(asyncio.current_task(), "cancelling", lambda: 0)()
+            ):
+                continue
+            raise
+        async with _probe_lock:
+            if generation != _probe_generation or signature != _cache_signature():
+                continue
+            if _probe_task is task:
+                _probe_results = results
+                _probe_updated_at = time.monotonic()
+                _probe_task = None
+            return results
 
 
 def _issue(
@@ -261,6 +357,43 @@ def _issue(
 
 async def build_runtime_overview(force: bool = False) -> RuntimeOverview:
     database, cache = await _get_probes(force)
+    from dotenv import dotenv_values
+
+    from zhenxun.configs.environment import environment_file
+    from zhenxun.services.runtime_environment import runtime_environment_manager
+
+    configured = next(
+        (
+            value
+            for key, value in dotenv_values(environment_file()).items()
+            if key.upper() == "CACHE_MODE"
+        ),
+        None,
+    )
+    try:
+        configured = normalize_cache_mode(configured)
+    except ValueError:
+        configured = "INVALID"
+    cache.configured_mode = configured
+    cache.actual_mode = cache.mode
+    cache.checked_at = datetime.fromtimestamp(
+        time.time() - max(0, time.monotonic() - _probe_updated_at)
+    ).isoformat()
+    external = any(
+        key.upper() == "CACHE_MODE"
+        for key in runtime_environment_manager.external_values
+    )
+    cache.application_status = (
+        "invalid"
+        if configured == "INVALID"
+        else "externally_overridden"
+        if external and configured != cache.mode
+        else "restart_pending"
+        if "CACHE_MODE" in runtime_environment_manager.pending_keys
+        else "applied"
+        if configured == cache.mode
+        else "unconfirmed"
+    )
     driver_config = nonebot.get_driver().config
     protocol_error = False
     try:
@@ -386,16 +519,13 @@ async def build_runtime_overview(force: bool = False) -> RuntimeOverview:
 
 
 async def reset_probe_cache_for_tests() -> None:
-    global _probe_results, _probe_task, _probe_updated_at
+    global _probe_signature, _probe_updated_at
     async with _probe_lock:
-        task = _probe_task
-        _probe_results = None
-        _probe_task = None
+        await invalidate_probes(stopping=True)
+        _probe_signature = None
         _probe_updated_at = 0.0
-    if task is not None and not task.done():
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
+        _probe_failures.clear()
+        start_probes()
 
 
 __all__ = ["build_runtime_overview", "reset_probe_cache_for_tests"]

@@ -200,14 +200,14 @@ wheels = [
 
 [[package]]
 name = "aiosqlite"
-version = "0.17.0"
+version = "0.20.0"
 source = { registry = "https://mirrors.aliyun.com/pypi/simple/" }
 dependencies = [
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://mirrors.aliyun.com/pypi/packages/40/e0/ad1edd74311831ca71b32a5b83352b490d78d11a90a1cde04e1b6830e018/aiosqlite-0.17.0.tar.gz", hash = "sha256:f0e6acc24bc4864149267ac82fb46dfb3be4455f99fe21df82609cc6e6baee51" }
+sdist = { url = "https://mirrors.aliyun.com/pypi/packages/0d/3a/22ff5415bf4d296c1e92b07fd746ad42c96781f13295a074d58e77747848/aiosqlite-0.20.0.tar.gz", hash = "sha256:6d35c8c256637f4672f843c31021464090805bf925385ac39473fb16eaaca3d7" }
 wheels = [
-    { url = "https://mirrors.aliyun.com/pypi/packages/a0/48/77c0092f716c4bf9460dca44f5120f70b8f71f14a12f40d22551a7152719/aiosqlite-0.17.0-py3-none-any.whl", hash = "sha256:6c49dc6d3405929b1d08eeccc72306d3677503cc5e5e43771efc1e00232e8231" },
+    { url = "https://mirrors.aliyun.com/pypi/packages/00/c4/c93eb22025a2de6b83263dfe3d7df2e19138e345bca6f18dba7394120930/aiosqlite-0.20.0-py3-none-any.whl", hash = "sha256:36a1deaca0cac40ebe32aac9977a6e2bbc7f5189f23f4a54d5908986729e5bd6" },
 ]
 
 [[package]]
@@ -1414,11 +1414,11 @@ wheels = [
 
 [[package]]
 name = "iso8601"
-version = "1.1.0"
+version = "2.1.0"
 source = { registry = "https://mirrors.aliyun.com/pypi/simple/" }
-sdist = { url = "https://mirrors.aliyun.com/pypi/packages/31/8c/1c342fdd2f4af0857684d16af766201393ef53318c15fa785fcb6c3b7c32/iso8601-1.1.0.tar.gz", hash = "sha256:32811e7b81deee2063ea6d2e94f8819a86d1f3811e49d23623a41fa832bef03f" }
+sdist = { url = "https://mirrors.aliyun.com/pypi/packages/b9/f3/ef59cee614d5e0accf6fd0cbba025b93b272e626ca89fb70a3e9187c5d15/iso8601-2.1.0.tar.gz", hash = "sha256:6b1d3829ee8921c4301998c909f7829fa9ed3cbdac0d3b16af2d743aed1ba8df" }
 wheels = [
-    { url = "https://mirrors.aliyun.com/pypi/packages/65/6c/9d72435c72adfa6e4ed1824b6df7fffbeaaf15c653881e9b041a318ba572/iso8601-1.1.0-py3-none-any.whl", hash = "sha256:8400e90141bf792bce2634df533dc57e3bee19ea120a87bebcd3da89a58ad73f" },
+    { url = "https://mirrors.aliyun.com/pypi/packages/6c/0c/f37b6a241f0759b7653ffa7213889d89ad49a2b76eb2ddf3b57b2738c347/iso8601-2.1.0-py3-none-any.whl", hash = "sha256:aac4145c4dcb66ad8b648a02830f5e2ff6c24af20f4f482689be402db2429242" },
 ]
 
 [[package]]
@@ -2826,11 +2826,11 @@ wheels = [
 
 [[package]]
 name = "pypika-tortoise"
-version = "0.1.6"
+version = "0.2.1"
 source = { registry = "https://mirrors.aliyun.com/pypi/simple/" }
-sdist = { url = "https://mirrors.aliyun.com/pypi/packages/86/55/1bfd4150f664d2e07b36c8f442178cc1f717bb9ae6cae20f21e851c208c6/pypika-tortoise-0.1.6.tar.gz", hash = "sha256:d802868f479a708e3263724c7b5719a26ad79399b2a70cea065f4a4cadbebf36" }
+sdist = { url = "https://mirrors.aliyun.com/pypi/packages/30/af/b4a6035611cf6f3990879385cf6d077013c1bdf7ea294d6ceebfa14c8d08/pypika_tortoise-0.2.1.tar.gz", hash = "sha256:979bbb9d60fe9f6e4129a25c44ee008aab4a4e97b296350be9983dcaa2766354" }
 wheels = [
-    { url = "https://mirrors.aliyun.com/pypi/packages/81/9e/cdeeceb107cb255cb039823dea80410df0b65c7372bd69ef178fea8287d5/pypika_tortoise-0.1.6-py3-none-any.whl", hash = "sha256:2d68bbb7e377673743cff42aa1059f3a80228d411fbcae591e4465e173109fd8" },
+    { url = "https://mirrors.aliyun.com/pypi/packages/ec/49/61d69d18b90b5fc43d63d0aaa14851356fcce7e89e1b2186d6c70db96682/pypika_tortoise-0.2.1-py3-none-any.whl", hash = "sha256:e91a1c5a78c6753ead1a9ba1aa169a1f1282c5035170e5462f0073564bc18886" },
 ]
 
 [[package]]
@@ -4141,7 +4141,7 @@ wheels = [
 
 [[package]]
 name = "tortoise-orm"
-version = "0.20.1"
+version = "0.21.7"
 source = { registry = "https://mirrors.aliyun.com/pypi/simple/" }
 dependencies = [
     { name = "aiosqlite" },
@@ -4150,9 +4150,9 @@ dependencies = [
     { name = "pypika-tortoise" },
     { name = "pytz" },
 ]
-sdist = { url = "https://mirrors.aliyun.com/pypi/packages/0a/40/277cdee12f14717896da63cbb1a66c03f4591119187be8d752d4da0a3ce2/tortoise_orm-0.20.1.tar.gz", hash = "sha256:c896c90a90d1213b822ac0d607b61659ad5fcd5ff72698a8ba2d9efbad9932f3" }
+sdist = { url = "https://mirrors.aliyun.com/pypi/packages/e8/0e/ad8e7554b0259072887d602617a67ef21055e1d8aa061936e381ecc1a9a5/tortoise_orm-0.21.7.tar.gz", hash = "sha256:8a790a931828aa37ac364b344c561e603422aced2af5e403f6790575da0f19c5" }
 wheels = [
-    { url = "https://mirrors.aliyun.com/pypi/packages/2b/93/3b1b4a4f93dd3e19b2cac474f27fe29f696a5836ee48afe02436447b2bb4/tortoise_orm-0.20.1-py3-none-any.whl", hash = "sha256:bf88bc1ba7495a8827565c071efba0a89c4b5f83ff1c16be3c837a4e6b672c21" },
+    { url = "https://mirrors.aliyun.com/pypi/packages/00/e4/918587b57062e83ce230635b5e4611cd192967c1fef9e08936e77f9ba2b9/tortoise_orm-0.21.7-py3-none-any.whl", hash = "sha256:2229925885461f424673223ea1875bd5e6961384c766833af55a1ea11a9b25eb" },
 ]
 
 [[package]]
@@ -4724,6 +4724,7 @@ dependencies = [
     { name = "aiofiles" },
     { name = "aiohttp" },
     { name = "aiomysql" },
+    { name = "aiosqlite" },
     { name = "alibabacloud-devops20210625" },
     { name = "asyncpg" },
     { name = "beautifulsoup4" },
@@ -4794,6 +4795,7 @@ requires-dist = [
     { name = "aiofiles", specifier = ">=23.2.1" },
     { name = "aiohttp", specifier = ">=3.11,<4.0" },
     { name = "aiomysql", specifier = ">=0.3.2" },
+    { name = "aiosqlite", specifier = ">=0.20,<0.21" },
     { name = "alibabacloud-devops20210625", specifier = ">=5.0.2,<6.0.0" },
     { name = "asyncpg", specifier = ">=0.20.0" },
     { name = "beautifulsoup4", specifier = ">=4.12.3,<5.0.0" },
@@ -4834,7 +4836,7 @@ requires-dist = [
     { name = "ruamel-yaml", specifier = ">=0.18.5" },
     { name = "strenum", specifier = ">=0.4.15,<0.5.0" },
     { name = "tenacity", specifier = ">=9.0.0,<10.0.0" },
-    { name = "tortoise-orm", specifier = ">=0.20.0,<0.21.0" },
+    { name = "tortoise-orm", specifier = ">=0.21.7,<0.22" },
     { name = "ujson", specifier = ">=5.9.0" },
     { name = "urllib3", specifier = ">=2.0.0,<3.0.0" },
     { name = "uvloop", marker = "sys_platform != 'win32'", specifier = ">=0.21.0" },

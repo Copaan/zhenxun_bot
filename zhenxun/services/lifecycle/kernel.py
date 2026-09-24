@@ -304,9 +304,10 @@ class LifecycleContext:
                 else:
                     task.cancel()
             if tasks:
-                _, pending = await asyncio.wait(
+                await asyncio.wait(
                     tasks, timeout=remaining_timeout(self.spec.cancel_timeout)
                 )
+                pending = {task for task in tasks if not task.done()}
                 if pending:
                     for task in pending:
                         receipt = self._task_receipts.get(task)
@@ -404,6 +405,8 @@ class _Registration:
         self.stop_after: set[str] = set()
         self.reconcile_stop: Callable[[], bool] | None = None
         self.pending_tasks: Callable[[], list[dict]] | None = None
+        self.stop_attempted = False
+        self.stop_error: BaseException | None = None
 
 
 class LifecycleKernel:
@@ -468,7 +471,7 @@ class LifecycleKernel:
             if remaining_timeout(timeout) <= 0:
                 raise LifecycleError("shutdown_budget_exhausted")
             done, _ = await asyncio.wait({task}, timeout=remaining_timeout(timeout))
-            if done:
+            if done or task.done():
                 return task.result()
             raise LifecycleError("component_finalizer_timeout")
         except BaseException:
@@ -748,6 +751,8 @@ class LifecycleKernel:
             )
             registration = self._registrations[component_id]
         runtime = registration.runtime
+        if registration.stop_attempted and registration.controller is controller:
+            return
         registration.controller = controller
         self._generation += 1
         runtime.state = ComponentState.READY
@@ -758,6 +763,8 @@ class LifecycleKernel:
         runtime.started_at = datetime.now(timezone.utc).isoformat()
         runtime.stopped_at = None
         runtime.metadata = {"pid": pid, **dict(metadata or {})}
+        registration.stop_attempted = False
+        registration.stop_error = None
         runtime.resources = [
             ResourceReceipt(
                 receipt_id=f"process:{pid}",
@@ -832,12 +839,22 @@ class LifecycleKernel:
             )
             registration = self._registrations[component_id]
         runtime = registration.runtime
+        if (
+            registration.stop_attempted
+            and runtime.metadata.get("incarnation_id") == incarnation_id
+        ):
+            return
         if stop is not None:
             registration.stop = stop
         registration.reconcile_stop = reconcile_stop
         registration.pending_tasks = pending_tasks
         if stop_after is not None:
             registration.stop_after = stop_after - {component_id, "runtime:plugin_host"}
+        tracking = self._registrations.get("management:runtime_tracking")
+        if tracking is not None:
+            tracking.stop_after.add(component_id)
+            if "runtime:plugin_host" in self._registrations:
+                tracking.stop_after.add("runtime:plugin_host")
         plugin_scope = self._plugin_scope_contexts.get(plugin_id)
         if plugin_scope is not None and plugin_scope.closed:
             self._plugin_scope_contexts.pop(plugin_id, None)
@@ -903,6 +920,8 @@ class LifecycleKernel:
             "source_digest": source_digest[:12],
             "classification": classification,
         }
+        registration.stop_attempted = False
+        registration.stop_error = None
         runtime.resources = list(receipts)
         if component_id not in self._start_order:
             self._start_order.append(component_id)
@@ -1213,6 +1232,8 @@ class LifecycleKernel:
         registration = self._registrations[component_id]
         runtime = registration.runtime
         runtime.state = ComponentState.STARTING
+        registration.stop_attempted = False
+        registration.stop_error = None
         runtime.error_code = None
         started_at = time.monotonic()
         runtime.metadata = {}
@@ -1373,7 +1394,21 @@ class LifecycleKernel:
         first_request = not self._shutdown_requested
         self._shutdown_requested = True
         if self._shutdown_deadline is None:
-            self._shutdown_deadline = time.monotonic() + 15.0
+            from .deadline import received_shutdown_request
+
+            request = received_shutdown_request()
+            remaining = 15.0
+            if request:
+                remaining = max(
+                    0.0,
+                    min(
+                        remaining,
+                        request["budget_ms"] / 1000
+                        - max(0.0, time.time() - request["requested_at"]),
+                    ),
+                )
+                self._process_metadata["shutdown_id"] = request["shutdown_id"]
+            self._shutdown_deadline = time.monotonic() + remaining
             self._shutdown_id = uuid.uuid4().hex
         current = None
         with contextlib.suppress(RuntimeError):
@@ -1431,6 +1466,15 @@ class LifecycleKernel:
                 "recovery_required": state["recovery_required"],
                 "component_state_counts": state["state_counts"],
                 "unresolved_resources": state["unresolved_resources"],
+                "late_release_confirmations": [
+                    {
+                        "component_id": item["component_id"],
+                        "confirmed_at": item["metadata"]["late_release_confirmed_at"],
+                        "original_diagnostic": item["metadata"].get("stop_diagnostic"),
+                    }
+                    for item in state["components"]
+                    if item.get("metadata", {}).get("late_release_confirmed_at")
+                ][:16],
                 "failed_components": [
                     {
                         "component_id": item["component_id"],
@@ -1471,6 +1515,23 @@ class LifecycleKernel:
             self._operation_lock.release()
 
     async def _stop_all_with_budget(self) -> None:
+        plugin_deadline = None
+        if self._process_metadata.get("role") == "worker":
+            plugin_deadline = time.monotonic() + max(
+                0.0, remaining_timeout(self.shutdown_remaining(15.0)) - 2.0
+            )
+
+        async def stop_component(component_id: str) -> None:
+            spec = self._registrations[component_id].spec
+            if plugin_deadline is not None and (
+                spec.scope == "plugin" or spec.source == "plugin_runtime"
+            ):
+                # Plugin cleanup shares a cutoff before infrastructure teardown.
+                with shutdown_budget(max(0.0, plugin_deadline - time.monotonic())):
+                    await self._stop_one(component_id, suppress_errors=True)
+            else:
+                await self._stop_one(component_id, suppress_errors=True)
+
         async with self._shutdown_operation_lock():
             ordered = self._component_stop_order(set(self._start_order))
             for component_id in ordered:
@@ -1506,12 +1567,14 @@ class LifecycleKernel:
                 if "runtime:plugin_host" in ready:
                     await asyncio.sleep(0)
                     self._reconcile_plugin_stops()
-                await asyncio.gather(
-                    *(self._stop_one(name, suppress_errors=True) for name in ready)
-                )
+                await asyncio.gather(*(stop_component(name) for name in ready))
                 remaining.difference_update(ready)
             try:
-                await self.drain_scope_cleanups()
+                if plugin_deadline is None:
+                    await self.drain_scope_cleanups()
+                else:
+                    with shutdown_budget(max(0.0, plugin_deadline - time.monotonic())):
+                        await self.drain_scope_cleanups()
             except LifecycleError:
                 self._recovery_required.update(ordered)
 
@@ -1533,13 +1596,12 @@ class LifecycleKernel:
                 or any(r.state == "failed" for r in context.resources)
                 or registration.controller is not None
                 or not errors
-                or not any(
-                    e["error_code"] == "plugin_task_cancel_timeout" for e in errors
-                )
                 or any(
                     e["error_code"]
                     not in {
                         "plugin_task_cancel_timeout",
+                        "plugin_executor_wait_timeout",
+                        "component_finalizer_timeout",
                         "resource_release_unconfirmed",
                     }
                     for e in errors
@@ -1586,6 +1648,7 @@ class LifecycleKernel:
             ).isoformat()
             self._recovery_required.discard(component_id)
             registration.context = None
+            registration.stop_error = None
             self._emit("stopped", component_id)
             self._persist()
 
@@ -1628,6 +1691,10 @@ class LifecycleKernel:
 
     async def _stop_one(self, component_id: str, *, suppress_errors: bool) -> None:
         registration = self._registrations.get(component_id)
+        if registration is not None and registration.stop_attempted:
+            if registration.stop_error is not None and not suppress_errors:
+                raise registration.stop_error
+            return
         if registration is None or registration.runtime.state not in {
             ComponentState.READY,
             ComponentState.DEGRADED,
@@ -1648,6 +1715,7 @@ class LifecycleKernel:
             self._persist()
             return
         runtime = registration.runtime
+        registration.stop_attempted = True
         runtime.state = ComponentState.QUIESCING
         self._current_operations[component_id] = {
             "action": "stop",
@@ -1688,11 +1756,17 @@ class LifecycleKernel:
                     check_budget()
                     result = registration.stop()
                     if inspect.isawaitable(result):
+                        timeout = registration.spec.timeout or 10.0
+                        if (
+                            registration.spec.source == "plugin_runtime"
+                            and registration.spec.timeout is None
+                        ):
+                            timeout = remaining_timeout(self.shutdown_remaining(15.0))
                         await self._run_cleanup(
                             result,
                             owner=component_id,
                             stage="stop",
-                            timeout=registration.spec.timeout or 10.0,
+                            timeout=timeout,
                             grace=registration.spec.cancel_timeout,
                         )
                 except BaseException as caught:
@@ -1702,6 +1776,7 @@ class LifecycleKernel:
                     await registration.context.close()
                 except BaseException as caught:
                     record_error("context_close", caught)
+                runtime.resources = list(registration.context.resources)
             if registration.controller is not None:
                 try:
                     await self._invoke_controller(
@@ -1760,6 +1835,12 @@ class LifecycleKernel:
                 "operation_id": self._current_operations[component_id]["operation_id"],
                 "stages": list(stop_errors),
                 "resources": dict(resources),
+                "executor_work": [
+                    receipt.public_dict()
+                    for receipt in runtime.resources
+                    if receipt.resource_type == "executor_future"
+                    and receipt.state in {"active", "unresolved", "leaked", "failed"}
+                ][:8],
                 "pending_tasks": registration.pending_tasks()
                 if registration.pending_tasks is not None
                 else [],
@@ -1770,6 +1851,7 @@ class LifecycleKernel:
         finally:
             self._current_operations.pop(component_id, None)
             self._persist()
+        registration.stop_error = error
         if error is not None and not suppress_errors:
             raise error
 
@@ -2078,6 +2160,14 @@ class LifecycleKernel:
                     "resource_type": receipt.resource_type,
                     "state": receipt.state,
                     "error_code": receipt.error_code,
+                    **(
+                        {
+                            "incarnation_id": receipt.incarnation_id,
+                            "detail": dict(receipt.detail),
+                        }
+                        if receipt.resource_type == "executor_future"
+                        else {}
+                    ),
                 }
                 for registration in self._registrations.values()
                 for receipt in registration.runtime.resources
@@ -2299,6 +2389,22 @@ class LifecycleKernel:
         result.update(self.owned_cleanup_task_ids())
         if self._state_writer is not None and self._state_writer.task is not None:
             result.add(id(self._state_writer.task))
+        return result
+
+    def pending_component_task_ids(self) -> set[int]:
+        """Tasks still awaiting their component's cooperative shutdown."""
+        result: set[int] = set()
+
+        def collect(context: LifecycleContext) -> None:
+            if context.closed:
+                return
+            result.update(id(task) for task in context._tasks if not task.done())
+            for child in context._children:
+                collect(child)
+
+        for registration in self._registrations.values():
+            if registration.context is not None and not registration.stop_attempted:
+                collect(registration.context)
         return result
 
     def owned_cleanup_task_ids(self) -> set[int]:

@@ -3,10 +3,9 @@ from __future__ import annotations
 import asyncio
 from contextlib import suppress
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 import inspect
 import json
-import os
 import time
 from typing import TYPE_CHECKING, Any, ClassVar
 import uuid
@@ -34,14 +33,6 @@ if TYPE_CHECKING:
     from zhenxun.models.plugin_info import PluginInfo
 
 LOG_COMMAND = "RuntimeCache"
-
-
-def _coerce_int(value, default: int) -> int:
-    try:
-        value_int = int(value)
-    except (TypeError, ValueError):
-        return default
-    return value_int if value_int >= 0 else default
 
 
 # RuntimeCache 以模型 save/delete 主动失效为主，周期 refresh 只做兜底。
@@ -81,18 +72,10 @@ _APPLYING_REMOTE_CACHE_EVENT: ContextVar[bool] = ContextVar(
 )
 
 
-def _env_get(name: str, default: str | None = None) -> str | None:
-    value = os.getenv(name)
-    if value is None:
-        value = os.getenv(name.lower())
-    return value if value is not None else default
-
-
 def _redis_enabled() -> bool:
-    mode = (_env_get("CACHE_MODE") or "").upper()
-    if mode != CacheMode.REDIS:
-        return False
-    return bool(_env_get("REDIS_HOST"))
+    from zhenxun.services.cache import cache_config
+
+    return cache_config.cache_mode == CacheMode.REDIS and bool(cache_config.redis_host)
 
 
 def _spawn_runtime_task(
@@ -167,29 +150,40 @@ class PluginInfoSnapshot:
 
     @classmethod
     def from_model(cls, model) -> "PluginInfoSnapshot":
+        return cls.from_values(
+            {
+                item.name: getattr(model, item.name, None)
+                for item in fields(cls)
+                if hasattr(model, item.name)
+            }
+        )
+
+    @classmethod
+    def from_values(cls, values: dict[str, Any]) -> "PluginInfoSnapshot":
+        """Construct a normalized snapshot from selected database fields."""
         return cls(
-            id=int(getattr(model, "id", 0) or 0),
-            module=str(getattr(model, "module", "") or ""),
-            module_path=str(getattr(model, "module_path", "") or ""),
-            name=str(getattr(model, "name", "") or ""),
-            status=bool(getattr(model, "status", True)),
-            block_type=getattr(model, "block_type", None),
-            load_status=bool(getattr(model, "load_status", True)),
-            author=getattr(model, "author", None),
-            version=getattr(model, "version", None),
-            level=int(getattr(model, "level", 0) or 0),
-            default_status=bool(getattr(model, "default_status", True)),
-            limit_superuser=bool(getattr(model, "limit_superuser", False)),
-            menu_type=str(getattr(model, "menu_type", "") or ""),
-            plugin_type=getattr(model, "plugin_type", None),
-            cost_gold=int(getattr(model, "cost_gold", 0) or 0),
-            admin_level=getattr(model, "admin_level", None),
-            ignore_prompt=bool(getattr(model, "ignore_prompt", False)),
-            is_delete=bool(getattr(model, "is_delete", False)),
-            parent=getattr(model, "parent", None),
-            is_show=bool(getattr(model, "is_show", True)),
-            ignore_statistics=bool(getattr(model, "ignore_statistics", False)),
-            impression=float(getattr(model, "impression", 0) or 0),
+            id=int(values.get("id", 0) or 0),
+            module=str(values.get("module", "") or ""),
+            module_path=str(values.get("module_path", "") or ""),
+            name=str(values.get("name", "") or ""),
+            status=bool(values.get("status", True)),
+            block_type=values.get("block_type", None),
+            load_status=bool(values.get("load_status", True)),
+            author=values.get("author", None),
+            version=values.get("version", None),
+            level=int(values.get("level", 0) or 0),
+            default_status=bool(values.get("default_status", True)),
+            limit_superuser=bool(values.get("limit_superuser", False)),
+            menu_type=str(values.get("menu_type", "") or ""),
+            plugin_type=values.get("plugin_type", None),
+            cost_gold=int(values.get("cost_gold", 0) or 0),
+            admin_level=values.get("admin_level", None),
+            ignore_prompt=bool(values.get("ignore_prompt", False)),
+            is_delete=bool(values.get("is_delete", False)),
+            parent=values.get("parent", None),
+            is_show=bool(values.get("is_show", True)),
+            ignore_statistics=bool(values.get("ignore_statistics", False)),
+            impression=float(values.get("impression", 0) or 0),
         )
 
     def to_model(self):
@@ -623,7 +617,7 @@ class RuntimeCacheSync:
         return enabled and _redis_enabled()
 
     @classmethod
-    async def start(cls) -> None:
+    async def start(cls, *, strict: bool = False) -> None:
         if cls._ready:
             return
         if not cls._sync_enabled():
@@ -636,11 +630,13 @@ class RuntimeCacheSync:
             )
             return
 
-        host = _env_get("REDIS_HOST")
+        from zhenxun.services.cache import cache_config
+
+        host = cache_config.redis_host
         if not host:
             return
-        port = _coerce_int(_env_get("REDIS_PORT"), 6379)
-        password = _env_get("REDIS_PASSWORD")
+        port = cache_config.redis_port or 6379
+        password = cache_config.redis_password
         cls._channel = RUNTIME_CACHE_SYNC_CHANNEL
         try:
             cls._redis = redis_async.Redis(
@@ -670,6 +666,8 @@ class RuntimeCacheSync:
                         f"{RUNTIME_CACHE_REVISION_PREFIX}:{cache_type}"
                     )
                 except Exception as error:
+                    if strict:
+                        raise
                     logger.warning(
                         f"runtime cache revision seed failed: {cache_type}",
                         LOG_COMMAND,
@@ -687,6 +685,8 @@ class RuntimeCacheSync:
         except Exception as exc:
             logger.error("runtime cache sync init failed", LOG_COMMAND, e=exc)
             await cls.stop()
+            if strict:
+                raise
 
     @classmethod
     async def stop(cls) -> None:
@@ -704,9 +704,11 @@ class RuntimeCacheSync:
                         task.cancel()
             finally:
                 cls._publish_tasks.difference_update(tasks)
-        if cls._task and not cls._task.done():
-            cls._task.cancel()
-        cls._task = None
+        task, cls._task = cls._task, None
+        if task is not None:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
         try:
             if cls._pubsub is not None:
                 await cls._pubsub.close()
@@ -1033,12 +1035,19 @@ class RuntimeCacheMutation:
                 coro.close()
             return None
         generation = getattr(cache_cls, "_publication_generation", 0)
+        timing = getattr(cache_cls, "_refresh_diagnostics", None)
+        if timing is None:
+            timing = cache_cls._refresh_diagnostics = {}
         try:
             result = await with_db_timeout(
                 coro,
                 timeout=RUNTIME_CACHE_DB_TIMEOUT_SECONDS,
                 operation=operation,
                 source="runtime_cache",
+                timing=timing,
+            )
+            timing["row_count"] = (
+                len(result) if isinstance(result, list | tuple) else None
             )
             if generation != getattr(cache_cls, "_publication_generation", 0):
                 RuntimeCacheMutation.mark_error(
@@ -1124,20 +1133,28 @@ class PluginInfoMemoryCache:
 
     @classmethod
     async def refresh(cls) -> None:
+        """Share full refresh work with scheduled and on-demand requests."""
+        await runtime_cache_refresh_coordinator.refresh_one("plugin", cls)
+
+    @classmethod
+    async def _refresh_snapshot(cls) -> None:
         from zhenxun.models.plugin_info import PluginInfo
 
         async with cls._lock:
             plugins = await RuntimeCacheMutation.read_db(
                 cls,
-                PluginInfo.all(),
+                PluginInfo.all().values(
+                    *(item.name for item in fields(PluginInfoSnapshot))
+                ),
                 operation="PluginInfoMemoryCache.refresh",
             )
             if plugins is None:
                 return
+            build_started = time.perf_counter()
             by_module: dict[str, PluginInfoSnapshot] = {}
             by_module_path: dict[str, PluginInfoSnapshot] = {}
             for plugin in plugins:
-                snapshot = PluginInfoSnapshot.from_model(plugin)
+                snapshot = PluginInfoSnapshot.from_values(plugin)
                 if snapshot.module:
                     current = by_module.get(snapshot.module)
                     if current is None or cls._module_snapshot_rank(
@@ -1146,6 +1163,9 @@ class PluginInfoMemoryCache:
                         by_module[snapshot.module] = snapshot
                 if snapshot.module_path:
                     by_module_path[snapshot.module_path] = snapshot
+            cls._refresh_diagnostics["snapshot_build_ms"] = round(
+                (time.perf_counter() - build_started) * 1000, 3
+            )
             cls._by_module = by_module
             cls._by_module_path = by_module_path
             RuntimeCacheMutation.mark_refreshed(cls)
@@ -1251,7 +1271,7 @@ class PluginInfoMemoryCache:
         elif action == "delete":
             await cls.remove(data.get("module"), data.get("module_path"))
         elif action == "refresh":
-            await cls.refresh()
+            await runtime_cache_refresh_coordinator.refresh_one("plugin", cls)
 
     @classmethod
     def start_refresh_task(cls) -> None:
@@ -1303,6 +1323,11 @@ class BotMemoryCache:
 
     @classmethod
     async def refresh(cls) -> None:
+        """Share full refresh work with scheduled and on-demand requests."""
+        await runtime_cache_refresh_coordinator.refresh_one("bot", cls)
+
+    @classmethod
+    async def _refresh_snapshot(cls) -> None:
         from zhenxun.models.bot_console import BotConsole
 
         async with cls._lock:
@@ -1422,7 +1447,7 @@ class BotMemoryCache:
         elif action == "delete":
             await cls.remove(data.get("bot_id"))
         elif action == "refresh":
-            await cls.refresh()
+            await runtime_cache_refresh_coordinator.refresh_one("bot", cls)
 
     @classmethod
     def start_tasks(cls) -> None:
@@ -1484,6 +1509,11 @@ class GroupMemoryCache:
 
     @classmethod
     async def refresh(cls) -> None:
+        """Share full refresh work with scheduled and on-demand requests."""
+        await runtime_cache_refresh_coordinator.refresh_one("group", cls)
+
+    @classmethod
+    async def _refresh_snapshot(cls) -> None:
         from zhenxun.models.group_console import GroupConsole
 
         async with cls._lock:
@@ -1593,7 +1623,7 @@ class GroupMemoryCache:
         elif action == "delete":
             await cls.remove(data.get("group_id"), data.get("channel_id"))
         elif action == "refresh":
-            await cls.refresh()
+            await runtime_cache_refresh_coordinator.refresh_one("group", cls)
 
     @classmethod
     def start_tasks(cls) -> None:
@@ -1653,6 +1683,11 @@ class LevelUserMemoryCache:
 
     @classmethod
     async def refresh(cls) -> None:
+        """Share full refresh work with scheduled and on-demand requests."""
+        await runtime_cache_refresh_coordinator.refresh_one("level", cls)
+
+    @classmethod
+    async def _refresh_snapshot(cls) -> None:
         from zhenxun.models.level_user import LevelUser
 
         async with cls._lock:
@@ -1694,12 +1729,12 @@ class LevelUserMemoryCache:
     async def ensure_fresh(cls) -> None:
         interval = LEVEL_MEM_REFRESH_INTERVAL
         if not cls._loaded:
-            await cls.refresh()
+            await runtime_cache_refresh_coordinator.refresh_one("level", cls)
             return
         if interval <= 0:
             return
         if time.time() - cls._last_refresh > interval:
-            await cls.refresh()
+            await runtime_cache_refresh_coordinator.refresh_one("level", cls)
 
     @classmethod
     async def get(
@@ -1829,7 +1864,7 @@ class LevelUserMemoryCache:
         elif action == "delete":
             await cls.remove(data.get("user_id"), data.get("group_id"))
         elif action == "refresh":
-            await cls.refresh()
+            await runtime_cache_refresh_coordinator.refresh_one("level", cls)
 
     @classmethod
     def start_tasks(cls) -> None:
@@ -1882,6 +1917,11 @@ class TaskInfoMemoryCache:
 
     @classmethod
     async def refresh(cls) -> None:
+        """Share full refresh work with scheduled and on-demand requests."""
+        await runtime_cache_refresh_coordinator.refresh_one("task", cls)
+
+    @classmethod
+    async def _refresh_snapshot(cls) -> None:
         from zhenxun.models.task_info import TaskInfo
 
         async with cls._lock:
@@ -2007,7 +2047,7 @@ class TaskInfoMemoryCache:
         elif action == "delete":
             await cls.remove(data.get("module"))
         elif action == "refresh":
-            await cls.refresh()
+            await runtime_cache_refresh_coordinator.refresh_one("task", cls)
 
     @classmethod
     def start_tasks(cls) -> None:
@@ -2060,6 +2100,11 @@ class PluginLimitMemoryCache:
 
     @classmethod
     async def refresh(cls) -> None:
+        """Share full refresh work with scheduled and on-demand requests."""
+        await runtime_cache_refresh_coordinator.refresh_one("plugin_limit", cls)
+
+    @classmethod
+    async def _refresh_snapshot(cls) -> None:
         from zhenxun.models.plugin_limit import PluginLimit
 
         async with cls._lock:
@@ -2201,7 +2246,7 @@ class PluginLimitMemoryCache:
         elif action == "delete":
             await cls.remove_by_id(data.get("id"))
         elif action == "refresh":
-            await cls.refresh()
+            await runtime_cache_refresh_coordinator.refresh_one("plugin_limit", cls)
 
     @classmethod
     def start_tasks(cls) -> None:
@@ -2281,6 +2326,11 @@ class BanMemoryCache:
 
     @classmethod
     async def refresh(cls) -> None:
+        """Share full refresh work with scheduled and on-demand requests."""
+        await runtime_cache_refresh_coordinator.refresh_one("ban", cls)
+
+    @classmethod
+    async def _refresh_snapshot(cls) -> None:
         from zhenxun.models.ban_console import BanConsole
 
         async with cls._lock:
@@ -2562,14 +2612,13 @@ class BanMemoryCache:
         elif action == "delete":
             await cls._remove_local(data.get("user_id"), data.get("group_id"))
         elif action == "refresh":
-            await cls.refresh()
+            await runtime_cache_refresh_coordinator.refresh_one("ban", cls)
 
 
 class RuntimeCacheRefreshCoordinator:
     """Own all full-table refreshes so SQLite never receives a refresh burst."""
 
     def __init__(self) -> None:
-        self._lock = asyncio.Lock()
         self._task: asyncio.Task[Any] | None = None
         self._wake = asyncio.Event()
         self._next_due: dict[str, float] = {}
@@ -2577,7 +2626,9 @@ class RuntimeCacheRefreshCoordinator:
         self._last_failed_cache: str | None = None
         self._last_error_code: str | None = None
         self._current_cache: str | None = None
-        self._queue_depth = 0
+        self._inflight: dict[str, asyncio.Task] = {}
+        self._requests: dict[str, int] = {}
+        self._semaphore = None
 
     @staticmethod
     def _specs() -> dict[str, tuple[type, int]]:
@@ -2615,6 +2666,7 @@ class RuntimeCacheRefreshCoordinator:
     def request_refresh(self, cache_cls: type) -> None:
         for name, (candidate, _) in self._specs().items():
             if candidate is cache_cls:
+                self._requests[name] = self._requests.get(name, 0) + 1
                 self._next_due[name] = time.monotonic()
                 self._wake.set()
                 if (
@@ -2651,7 +2703,61 @@ class RuntimeCacheRefreshCoordinator:
             except asyncio.CancelledError:
                 pass
 
+        tasks = list(self._inflight.values())
+        for pending in tasks:
+            if not pending.done() and not getattr(pending, "cancelling", lambda: 0)():
+                pending.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        self._inflight.clear()
+        self._semaphore = None
+
     async def _refresh_entry(
+        self,
+        name: str,
+        cache_cls: type,
+        *,
+        startup: bool = False,
+        source: str = "manual",
+    ) -> tuple[str, bool]:
+        task = self._inflight.get(name)
+        if task is None:
+            requested = self._requests.get(name, 0)
+            queued = time.monotonic()
+
+            async def run():
+                if self._semaphore is None:
+                    self._semaphore = asyncio.Semaphore(1 if self._sqlite() else 3)
+                try:
+                    async with self._semaphore:
+                        cache_cls._refresh_diagnostics = {
+                            "source": "startup" if startup else source,
+                            "coordinator_wait_ms": round(
+                                (time.monotonic() - queued) * 1000, 3
+                            ),
+                        }
+                        outcome = await self._perform_refresh(
+                            name, cache_cls, startup=startup
+                        )
+                        if self._requests.get(name, 0) == requested:
+                            interval = self._specs()[name][1]
+                            if interval > 0:
+                                self._next_due[name] = (
+                                    time.monotonic() + self._retry_delay(name, interval)
+                                )
+                                self._wake.set()
+                            else:
+                                self._next_due.pop(name, None)
+                        return outcome
+                finally:
+                    self._inflight.pop(name, None)
+
+            task = _spawn_runtime_task(
+                run(), name=f"runtime-cache-refresh:{name}", persistent=False
+            )
+            self._inflight[name] = task
+        return await asyncio.shield(task)
+
+    async def _perform_refresh(
         self, name: str, cache_cls: type, *, startup: bool = False
     ) -> tuple[str, bool]:
         if startup and getattr(cache_cls, "_loaded", False):
@@ -2662,7 +2768,7 @@ class RuntimeCacheRefreshCoordinator:
         previous_refresh = float(getattr(cache_cls, "_last_refresh", 0.0) or 0.0)
         revision_before = RuntimeCacheSync.refresh_revision(name)
         try:
-            await cache_cls.refresh()
+            await cache_cls._refresh_snapshot()
             if not RuntimeCacheSync.refresh_is_stable(name, revision_before):
                 RuntimeCacheMutation.mark_error(
                     cache_cls, RuntimeError("cache_refresh_revision_changed")
@@ -2699,67 +2805,18 @@ class RuntimeCacheRefreshCoordinator:
             return float(interval)
         return float(min(interval, max(5, 2**failures * 5)))
 
-    def _reschedule_failures(self, results: dict[str, bool]) -> None:
-        """把失败的缓存改排到退避窗口。
-
-        start() 会按 now + interval 铺满 _next_due，而 refresh_all 的失败原本
-        不改排期 —— ban 的 interval 是 300s，启动加载失败要等满 5 分钟才重试，
-        期间该缓存一直不可用。
-        """
-        specs = self._specs()
-        now = time.monotonic()
-        for name, success in results.items():
-            if success or name not in specs:
-                continue
-            interval = specs[name][1]
-            if interval <= 0:
-                continue
-            due = now + self._retry_delay(name, interval)
-            if due < self._next_due.get(name, float("inf")):
-                self._next_due[name] = due
-                self._wake.set()
-
     async def refresh_one(self, name: str, cache_cls: type) -> bool:
-        async with self._lock:
-            _, success = await self._refresh_entry(name, cache_cls)
-            return success
+        _, success = await self._refresh_entry(name, cache_cls, source="on_demand")
+        return success
 
     async def refresh_all(self, *, startup: bool = False) -> dict[str, bool]:
-        specs = self._specs()
-        async with self._lock:
-            self._queue_depth = len(specs)
-            try:
-                if self._sqlite():
-                    results = []
-                    for name, (cache_cls, _) in specs.items():
-                        results.append(
-                            await self._refresh_entry(name, cache_cls, startup=startup)
-                        )
-                        self._queue_depth -= 1
-                else:
-                    # 增加并发数以加快缓存刷新速度（非SQLite数据库）
-                    semaphore = asyncio.Semaphore(5)
-
-                    async def refresh(name: str, cache_cls: type):
-                        async with semaphore:
-                            try:
-                                return await self._refresh_entry(
-                                    name, cache_cls, startup=startup
-                                )
-                            finally:
-                                self._queue_depth -= 1
-
-                    results = await asyncio.gather(
-                        *(
-                            refresh(name, cache_cls)
-                            for name, (cache_cls, _) in specs.items()
-                        )
-                    )
-                outcome = dict(results)
-                self._reschedule_failures(outcome)
-                return outcome
-            finally:
-                self._queue_depth = 0
+        results = await asyncio.gather(
+            *(
+                self._refresh_entry(name, cache_cls, startup=startup)
+                for name, (cache_cls, _) in self._specs().items()
+            )
+        )
+        return dict(results)
 
     async def _run(self) -> None:
         # stop() clears ownership before waking/cancelling the wait. Python 3.10
@@ -2781,51 +2838,31 @@ class RuntimeCacheRefreshCoordinator:
             due_names = [name for name, due in active_due.items() if due <= now]
             if not due_names:
                 continue
-            async with self._lock:
-                now = time.monotonic()
-                due_names = [
-                    name
-                    for name, due in self._next_due.items()
-                    if name in specs and due <= now
-                ]
-                # Consume requests before work so new invalidations survive awaits.
-                # A disabled periodic timer still permits a one-shot refresh.
-                for name in due_names:
-                    interval = specs[name][1]
-                    if interval <= 0:
-                        self._next_due.pop(name, None)
-                        continue
-                    failures = self._failure_counts.get(name, 0)
-                    self._next_due[name] = now + (
-                        min(interval, max(5, 2**failures * 5)) if failures else interval
+            await asyncio.gather(
+                *(
+                    self._refresh_entry(
+                        name, specs[name][0], source="periodic_or_invalidation"
                     )
-                self._queue_depth = len(due_names)
-                if self._sqlite():
-                    for name in due_names:
-                        await self._refresh_entry(name, specs[name][0])
-                        self._queue_depth -= 1
-                else:
-                    semaphore = asyncio.Semaphore(3)
-
-                    async def refresh(name: str) -> None:
-                        async with semaphore:
-                            try:
-                                await self._refresh_entry(name, specs[name][0])
-                            finally:
-                                self._queue_depth -= 1
-
-                    await asyncio.gather(*(refresh(name) for name in due_names))
+                    for name in due_names
+                )
+            )
 
     def snapshot(self) -> dict[str, Any]:
         import sys
 
         from zhenxun.services.cache.diagnostics import availability_snapshot
         from zhenxun.services.db_context.utils import db_timing_snapshot
+        from zhenxun.services.pipeline_metrics import pipeline_metrics
 
         hot = sys.modules.get("zhenxun.services.hot_query_cache")
         return {
             "running": self._task is not None and not self._task.done(),
-            "queue_depth": self._queue_depth,
+            "queue_depth": len(self._inflight),
+            "active_caches": sorted(self._inflight),
+            "refresh_timings": {
+                name: dict(getattr(cache_cls, "_refresh_diagnostics", {}))
+                for name, (cache_cls, _) in self._specs().items()
+            },
             "current_cache": self._current_cache,
             "last_failed_cache": self._last_failed_cache,
             "cache_publication": publication_snapshot(),
@@ -2849,6 +2886,9 @@ class RuntimeCacheRefreshCoordinator:
                 else {}
             ),
             "database_timing": db_timing_snapshot(),
+            "event_loop_lag": pipeline_metrics.snapshot()["stages"].get(
+                "event_loop_lag_ms"
+            ),
             "availability_fallbacks": availability_snapshot(),
             "hot_queries": hot.hot_query_snapshot() if hot is not None else {},
             "last_error_code": self._last_error_code,

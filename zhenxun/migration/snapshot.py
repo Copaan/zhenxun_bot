@@ -20,7 +20,7 @@ from .lease import InstanceLease
 from .paths import contained_path
 from .restore import _configuration_read, _database_companion, _database_file
 from .selection import export_selection
-from .tasks import MigrationBudget, TaskStore
+from .tasks import MigrationBudget, MigrationProgress, TaskStore
 
 
 @dataclass(frozen=True)
@@ -93,6 +93,8 @@ def capture_snapshot(
     budget: MigrationBudget,
     limits: Limits = Limits(),
     checkpoint=lambda: None,
+    progress=None,
+    database_diagnostic=None,
 ) -> tuple[list[FileEntry], dict]:
     lease.require_held()
     budget.checkpoint()
@@ -117,7 +119,22 @@ def capture_snapshot(
         return file_hash(wal, check) if wal.exists() and wal.stat().st_size else None
 
     wal_hashes = {}
-    files = [entry for entry in initial.files if entry.category in options.categories]
+    files = [
+        entry
+        for entry in initial.files
+        if entry.category in options.categories
+        and not _database_companion(contained_path(project, entry.path))
+    ]
+    total_bytes = sum(entry.size for entry in files)
+    if progress is not None:
+        progress(
+            current=0,
+            total=len(files),
+            bytes_done=0,
+            bytes_total=total_bytes,
+            step="准备快照文件",
+            percent=0,
+        )
     if sum(entry.size for entry in files) > limits.expanded:
         raise MigrationError("migration_expanded_limit")
     database_url = _database_configuration(project)
@@ -155,7 +172,7 @@ def capture_snapshot(
     identities = {}
     hashes = {}
     total = 0
-    for entry in files:
+    for index, entry in enumerate(files, 1):
         checkpoint()
         budget.checkpoint()
         lease.require_held()
@@ -170,6 +187,8 @@ def capture_snapshot(
             raise MigrationError("migration_source_changed", path=entry.path)
         category = entry.category
         if _database_file(source):
+            if progress is not None:
+                progress(step="备份并校验 SQLite 数据库")
             wal_hashes[entry.path] = wal_hash(source)
             hashes[entry.path] = file_hash(source, check)
             details = snapshot_sqlite(
@@ -197,6 +216,16 @@ def capture_snapshot(
                         )
                     writer.write(data)
                     digest.update(data)
+                    if progress is not None:
+                        progress(
+                            current=index - 1,
+                            total=len(files),
+                            bytes_done=total + copied,
+                            bytes_total=total_bytes,
+                            unit="文件",
+                            step="创建文件快照",
+                            percent=(index - 1) / len(files) * 100 if files else 100,
+                        )
                 writer.flush()
                 os.fsync(writer.fileno())
             hashes[entry.path] = digest.hexdigest()
@@ -209,11 +238,22 @@ def capture_snapshot(
                 raise MigrationError("migration_source_changed", path=entry.path)
         info = target.stat()
         total += info.st_size
+        total_bytes += info.st_size - entry.size
         if total > limits.expanded:
             raise MigrationError("migration_expanded_limit")
         captured.append(
             FileEntry(entry.root, entry.path, category, info.st_size, info.st_mtime_ns)
         )
+        if progress is not None:
+            progress(
+                current=index,
+                total=len(files),
+                unit="文件",
+                bytes_done=total,
+                bytes_total=total_bytes,
+                step="创建文件快照",
+                percent=index / len(files) * 100 if files else 100,
+            )
     current = scan_project(project, max_entries=limits.entries, checkpoint=check)
     if stable_files(initial) != stable_files(current):
         raise MigrationError("migration_source_changed")
@@ -231,6 +271,8 @@ def capture_snapshot(
                 budget=budget,
                 checkpoint=check,
                 maximum=limits.expanded - total,
+                diagnostic=database_diagnostic,
+                progress=progress,
             )
         )
         primary_database = {
@@ -319,6 +361,10 @@ def export_offline(
             store.transition(identity, "quiescing")
             store.transition(identity, "snapshotting")
             snapshot = store.path("jobs", identity).parent / "snapshot"
+            reporter = MigrationProgress(
+                store, identity, "export_snapshot", start_percent=0, end_percent=55
+            )
+            reporter.console = True
             files, metadata = capture_snapshot(
                 project,
                 snapshot,
@@ -327,10 +373,19 @@ def export_offline(
                 budget=budget.phase(),
                 limits=limits,
                 checkpoint=checkpoint,
+                progress=reporter.update,
+                database_diagnostic=lambda value: store.record_database_diagnostic(
+                    identity, value
+                ),
             )
+            reporter.finish(step="快照完成")
             store.transition(identity, "resuming")
             # Offline export never starts a process that was not running before it.
             store.transition(identity, "compressing")
+            reporter = MigrationProgress(
+                store, identity, "export_pack", start_percent=55, end_percent=95
+            )
+            reporter.console = True
             result = build_archive(
                 snapshot,
                 files,
@@ -340,6 +395,7 @@ def export_offline(
                 plaintext_confirmed=options.plaintext_confirmed,
                 limits=limits,
                 checkpoint=checkpoint,
+                progress=reporter.update,
                 publish=lambda src, dst, outcome: store.publish_export(
                     identity, src, dst, outcome
                 ),
@@ -349,6 +405,9 @@ def export_offline(
                 "archive": result,
             }
         except BaseException as error:
+            from .progress import ConsoleProgress
+
+            ConsoleProgress().show(store.read("jobs", identity))
             code = (
                 error.code
                 if isinstance(error, MigrationError)

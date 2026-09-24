@@ -13,11 +13,14 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from redis.asyncio import Redis
+from redis.asyncio.retry import Retry
+from redis.backoff import NoBackoff
 from tortoise import Tortoise
 
 from zhenxun.configs.environment import environment_file, environment_target
+from zhenxun.services.cache import cache_config
 from zhenxun.services.cache.bounded_ttl import BoundedTTLCache
-from zhenxun.services.cache.config import CACHE_KEY_PREFIX
+from zhenxun.services.cache.config import CACHE_KEY_PREFIX, normalize_cache_mode
 from zhenxun.services.cache.runtime_cache import (
     health_snapshot,
     refresh_all_runtime_caches,
@@ -73,7 +76,7 @@ def _env_path() -> Path:
 
 def _env_values() -> dict[str, str]:
     return {
-        key: str(value)
+        key.upper(): str(value)
         for key, value in dotenv_values(_env_path()).items()
         if key and value is not None
     }
@@ -101,14 +104,25 @@ def _current_database(values: dict[str, str]) -> DatabaseConfig:
 
 
 def _current_cache(values: dict[str, str]) -> CacheConfig:
-    mode = values.get("CACHE_MODE", "MEMORY").upper()
-    if mode not in {"NONE", "MEMORY", "REDIS"}:
-        mode = "MEMORY"
+    try:
+        mode = normalize_cache_mode(values.get("CACHE_MODE"))
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
     return CacheConfig(
         mode=mode,
         host=values.get("REDIS_HOST", "127.0.0.1"),
         port=int(values.get("REDIS_PORT", "6379") or 6379),
         password=values.get("REDIS_PASSWORD", ""),
+    )
+
+
+def _applied_cache() -> CacheConfig:
+    """Return the cache endpoint used by the running components."""
+    return CacheConfig(
+        mode=cache_config.cache_mode,
+        host=cache_config.redis_host or "",
+        port=cache_config.redis_port or 6379,
+        password=cache_config.redis_password or "",
     )
 
 
@@ -164,6 +178,7 @@ async def _redis_metrics(config: CacheConfig) -> dict:
         password=config.password or None,
         socket_connect_timeout=2,
         socket_timeout=2,
+        retry=Retry(NoBackoff(), 0),
         decode_responses=True,
     )
     started = time.perf_counter()
@@ -230,7 +245,7 @@ async def database_runtime() -> Result:
     cache = _current_cache(values)
     database_status, redis_metrics, bounded_stats = await asyncio.gather(
         _database_status(),
-        _redis_metrics(cache),
+        _redis_metrics(_applied_cache()),
         BoundedTTLCache.stats_all(),
     )
     return Result.ok(
@@ -243,6 +258,7 @@ async def database_runtime() -> Result:
             },
             "cache": {
                 "configuration": _cache_public(cache),
+                "actual_mode": cache_config.cache_mode,
                 "redis": redis_metrics,
                 "runtime": _runtime_health(),
                 "bounded": bounded_stats,
@@ -389,7 +405,7 @@ async def clear_database_cache(payload: CacheAction) -> Result:
         return Result.ok({"cleared": cleared}, info="本地临时缓存已清理。")
     if payload.confirmation != "清理真寻Redis缓存":
         raise HTTPException(status_code=422, detail="请输入指定确认文本。")
-    cache = _current_cache(_env_values())
+    cache = _applied_cache()
     if cache.mode != "REDIS":
         raise HTTPException(status_code=409, detail="当前未启用 Redis 缓存。")
     client = Redis(
@@ -398,6 +414,7 @@ async def clear_database_cache(payload: CacheAction) -> Result:
         password=cache.password or None,
         socket_connect_timeout=2,
         socket_timeout=2,
+        retry=Retry(NoBackoff(), 0),
         decode_responses=True,
     )
     deleted = 0

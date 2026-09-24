@@ -13,7 +13,9 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
-from urllib.parse import parse_qs, unquote, urlsplit
+import sys
+import time
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 import uuid
 
 from zhenxun.services.lifecycle.deadline import ShutdownBudget, current_budget
@@ -26,6 +28,10 @@ from .errors import MigrationError
 from .paths import contained_path
 
 _NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]{0,62}$")
+_URL_CREDENTIAL = re.compile(r"(?i)(\b[a-z][a-z0-9+.-]{0,31}://)[^\s/@]+@")
+_PASSWORD_VALUE = re.compile(
+    r"(?im)(\b(?:[A-Z_]*(?:password|passwd|pwd|secret|token|credential|authorization)[A-Z_]*|PGPASSWORD)\s*[=:]\s*)(?:\"[^\"]*\"|'[^']*'|[^\r\n,;]+)"
+)
 _TOOLS = {
     "mysql": ("mysql", "mysqldump"),
     "postgres": ("psql", "pg_dump", "pg_restore"),
@@ -145,18 +151,68 @@ def mysql_grant_scope(value: str, *, literal: bool) -> str:
     return "".join(result)
 
 
+def redact_database_output(value: str, secrets=()) -> str:
+    """Remove credential-shaped values while retaining the tool diagnostic."""
+    for secret in sorted(set(filter(None, secrets)), key=len, reverse=True):
+        for encoded in {
+            secret,
+            quote(secret, safe=""),
+            secret.replace("\\", "\\\\").replace(":", "\\:"),
+        }:
+            value = value.replace(encoded, "<redacted>")
+    value = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", value)
+    value = "".join(c for c in value if c in "\n\t" or ord(c) >= 32)
+    value = _URL_CREDENTIAL.sub(r"\1<redacted>@", value)
+    return _PASSWORD_VALUE.sub(r"\1<redacted>", value)
+
+
 class NativeDatabase:
     def __init__(
-        self, endpoint, directory, supervisor, budget, checkpoint=lambda: None
+        self,
+        endpoint,
+        directory,
+        supervisor,
+        budget,
+        checkpoint=lambda: None,
+        *,
+        diagnostic=None,
+        progress=None,
+        phase="database",
     ):
         self.endpoint = endpoint
         self.directory = private_directory(directory / uuid.uuid4().hex)
         self.supervisor, self.budget, self.checkpoint = supervisor, budget, checkpoint
+        self.diagnostic, self.progress, self.phase = diagnostic, progress, phase
+        self.secrets = [
+            endpoint.password,
+            *[
+                value
+                for key, value in os.environ.items()
+                if re.search(
+                    r"PASSWORD|SECRET|TOKEN|CREDENTIAL|DATABASE_URL|DB_URL", key, re.I
+                )
+            ],
+        ]
         self.tools = {}
         self.tool_versions = {}
+        self.last_diagnostic = None
+        self.last_diagnostic_at = 0.0
         for name in _TOOLS[endpoint.engine]:
             executable = shutil.which(name)
             if executable is None:
+                if diagnostic is not None:
+                    diagnostic(
+                        {
+                            "tool": name,
+                            "engine": endpoint.engine,
+                            "phase": phase,
+                            "operation": "locate",
+                            "error_code": "migration_database_tool_missing",
+                            "stderr": "",
+                            "return_code": None,
+                            "recorded_at": time.time(),
+                        }
+                    )
                 raise MigrationError("migration_database_tool_missing")
             self.tools[name] = executable
         self.environment = {
@@ -192,6 +248,9 @@ class NativeDatabase:
                 + "\n",
                 encoding="utf-8",
             )
+            self.secrets.extend(
+                (credential.read_text("utf-8"), escape(endpoint.password))
+            )
             self.connection = [f"--defaults-file={credential}"]
             if endpoint.tls == "DISABLED":
                 # Only loopback endpoints may use plaintext. SHA2 authentication
@@ -220,6 +279,9 @@ class NativeDatabase:
                 encoding="utf-8",
             )
             credential.chmod(0o600)
+            self.secrets.extend(
+                (credential.read_text("utf-8"), escape(endpoint.password))
+            )
             self.environment.update(
                 PGPASSFILE=str(credential),
                 PGSSLMODE=endpoint.tls,
@@ -256,6 +318,7 @@ class NativeDatabase:
         maximum=16 * 1024 * 1024,
     ):
         self.check()
+        started = time.monotonic()
         identity = uuid.uuid4().hex
         output = output_path or self.directory / (identity + ".out")
         error = self.directory / (identity + ".err")
@@ -266,6 +329,20 @@ class NativeDatabase:
             sql_path.write_text(sql, encoding="utf-8")
             input_path = sql_path
         process = None
+        failure = None
+        cleanup_error = None
+        started_at = time.time()
+        operation = (
+            "version"
+            if args == ["--version"]
+            else "dump"
+            if tool in {"mysqldump", "pg_dump"}
+            else "restore"
+            if (input_path is not None and sql is None) or tool == "pg_restore"
+            else "query"
+        )
+        if self.progress is not None:
+            self.progress(step=f"数据库 {tool} / {operation}")
         try:
             with (
                 output.open("xb") as stdout,
@@ -297,17 +374,93 @@ class NativeDatabase:
                         or error.stat().st_size > 1024**2
                     ):
                         raise MigrationError("migration_database_output_limit")
+                    if self.progress is not None:
+                        self.progress(
+                            step=f"数据库 {tool} / {operation}",
+                            bytes_done=output.stat().st_size,
+                            bytes_total=None,
+                        )
                     require_space(self.directory, 16 * 1024**2)
                     await asyncio.sleep(0.05)
             self.check()
             if output.stat().st_size > maximum:
                 raise MigrationError("migration_database_output_limit")
+            if error.stat().st_size > 1024**2:
+                raise MigrationError("migration_database_output_limit")
             if process.returncode:
                 raise MigrationError("migration_database_tool_failed")
+            if operation == "version":
+                self.tool_versions[tool] = tool_version(
+                    self.endpoint.engine, output.read_text("utf-8", errors="replace")
+                )
             return output
+        except BaseException as caught:
+            failure = caught
+            raise
         finally:
-            if process is not None:
-                await self.supervisor.stop_process(process)
+            try:
+                if process is not None:
+                    await self.supervisor.stop_process(process, allow_force=True)
+            except BaseException as caught:
+                cleanup_error = caught
+                if failure is None:
+                    failure = caught
+                    raise
+            finally:
+                if self.diagnostic is not None and (
+                    failure is not None
+                    or (tool, operation) != self.last_diagnostic
+                    or time.monotonic() - self.last_diagnostic_at >= 1
+                ):
+                    try:
+                        raw = b""
+                        if error.exists():
+                            with error.open("rb") as stream:
+                                raw = stream.read(1024**2)
+                        record = {
+                            "tool": tool,
+                            "engine": self.endpoint.engine,
+                            "phase": self.phase,
+                            "operation": operation,
+                            "return_code": process.returncode
+                            if process is not None
+                            else None,
+                            "started_at": started_at,
+                            "duration_seconds": round(time.monotonic() - started, 2),
+                            "stdout_bytes": output.stat().st_size
+                            if output.exists()
+                            else 0,
+                            "stderr_bytes": error.stat().st_size
+                            if error.exists()
+                            else 0,
+                            "stderr": redact_database_output(
+                                raw.decode("utf-8", errors="replace"), self.secrets
+                            ),
+                            "truncated": error.exists()
+                            and error.stat().st_size > 1024**2,
+                            "tool_version": self.tool_versions.get(tool),
+                            "environment": (
+                                f"{sys.platform}; Python {sys.version.split()[0]}"
+                            ),
+                            "error_code": getattr(
+                                failure, "code", type(failure).__name__
+                            )
+                            if failure
+                            else None,
+                            "cleanup_error": type(cleanup_error).__name__
+                            if cleanup_error
+                            else None,
+                            "recorded_at": time.time(),
+                        }
+                        if len(record["stderr"]) > 1024**2:
+                            record["stderr"] = record["stderr"][: 1024**2]
+                            record["truncated"] = True
+                        self.diagnostic(record)
+                        self.last_diagnostic = (tool, operation)
+                        self.last_diagnostic_at = time.monotonic()
+                    except Exception:
+                        if failure is None:
+                            raise
 
     async def query(self, sql):
         if self.endpoint.engine == "mysql":
@@ -368,6 +521,9 @@ class NativeDatabase:
 
     async def inspect(self, *, quiet=True):
         engine = self.endpoint.engine
+        for tool in self.tools:
+            if tool not in self.tool_versions:
+                await self.run(tool, ["--version"])
         if engine == "mysql":
             version = await self.query("SELECT VERSION();")
             require_version(engine, version, version)
@@ -625,11 +781,6 @@ class NativeDatabase:
                 "|| ':' || inet_server_port()::text;"
             )
         for tool in self.tools:
-            if tool not in self.tool_versions:
-                output = await self.run(tool, ["--version"])
-                self.tool_versions[tool] = tool_version(
-                    engine, output.read_text("utf-8")
-                )
             require_version(engine, version, self.tool_versions[tool])
         await self.verify_relations(foreign_keys)
         data = []
@@ -801,19 +952,68 @@ class NativeDatabase:
 
 
 @asynccontextmanager
-async def native_session(endpoint, directory, budget, checkpoint=lambda: None):
+async def native_session(
+    endpoint,
+    directory,
+    budget,
+    checkpoint=lambda: None,
+    *,
+    diagnostic=None,
+    progress=None,
+    phase="database",
+):
     supervisor = LauncherSupervisor(LifecycleKernel())
     client = None
+    failure = None
     token = current_budget.set(ShutdownBudget(budget.deadline))
     try:
         client = NativeDatabase.__new__(NativeDatabase)
-        client.__init__(endpoint, directory, supervisor, budget, checkpoint)
+        client.__init__(
+            endpoint,
+            directory,
+            supervisor,
+            budget,
+            checkpoint,
+            diagnostic=diagnostic,
+            progress=progress,
+            phase=phase,
+        )
         yield client
+    except BaseException as caught:
+        failure = caught
+        raise
     finally:
         try:
             supervisor.shutdown_deadline = ShutdownBudget(budget.deadline)
-            await supervisor.shutdown()
-            if client is not None and hasattr(client, "directory"):
-                client.close()
+            try:
+                await supervisor.shutdown()
+            finally:
+                if client is not None and hasattr(client, "directory"):
+                    client.close()
+        except BaseException as cleanup_error:
+            if diagnostic is not None:
+                try:
+                    diagnostic(
+                        {
+                            "tool": "session",
+                            "engine": endpoint.engine,
+                            "phase": phase,
+                            "operation": "cleanup",
+                            "stderr": "",
+                            "error_code": getattr(failure, "code", None)
+                            or getattr(
+                                cleanup_error, "code", type(cleanup_error).__name__
+                            ),
+                            "cleanup_error": getattr(
+                                cleanup_error, "code", type(cleanup_error).__name__
+                            ),
+                            "recorded_at": time.time(),
+                        }
+                    )
+                except Exception:
+                    # A diagnostic write must not replace the tool or cleanup failure.
+                    pass
+            if failure is None:
+                raise
         finally:
             current_budget.reset(token)

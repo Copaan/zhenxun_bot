@@ -19,7 +19,7 @@ from .replacement_database import (
 from .restore import apply_files, prepare_files, recheck_files, rollback_files
 from .selection import ReplacementSelection
 from .snapshot import _database_configuration, assert_offline
-from .tasks import MigrationBudget, TaskStore
+from .tasks import MigrationBudget, MigrationProgress, TaskStore
 
 
 def _read(path: Path) -> dict:
@@ -118,6 +118,25 @@ def _execute_restore_phase(project: Path, request: dict, *, lease) -> dict:
     phase = request["phase"]
     directory = store.path("jobs", identity).parent
     budget = MigrationBudget.start(min(float(request["remaining_seconds"]), 3600))
+    ranges = {
+        "restore_prepare": (30, 55),
+        "restore_dependencies": (0, 25),
+        "restore_apply": (55, 85),
+        "restore_publish": (85, 100),
+        "restore_rollback": (55, 85),
+    }
+    start_percent, end_percent = ranges.get(phase, (0, 100))
+    progress = MigrationProgress(
+        store,
+        identity,
+        phase,
+        start_percent=start_percent,
+        end_percent=end_percent,
+    )
+    progress.update(step="准备执行")
+
+    def record_database_diagnostic(value):
+        store.record_database_diagnostic(identity, value)
 
     def check():
         budget.checkpoint()
@@ -210,7 +229,10 @@ def _execute_restore_phase(project: Path, request: dict, *, lease) -> dict:
                     declarations=tuple(private.get("declarations", ())),
                 )
                 result = await restorer.restore(
-                    dependency_source, budget=budget, checkpoint=check
+                    dependency_source,
+                    budget=budget,
+                    checkpoint=check,
+                    progress=progress.update,
                 )
                 if result["state"] != "prepared":
                     write_json_locked(directory / "dependency-result.json", result)
@@ -255,7 +277,12 @@ def _execute_restore_phase(project: Path, request: dict, *, lease) -> dict:
             )
 
             recheck_preflight(
-                project, preflight_id, request.get("private_input", {}), budget
+                project,
+                preflight_id,
+                request.get("private_input", {}),
+                budget,
+                diagnostic=record_database_diagnostic,
+                progress=progress.update,
             )
             approved = _read(
                 store.path("preflights", preflight_id).parent / "analysis.json"
@@ -277,6 +304,7 @@ def _execute_restore_phase(project: Path, request: dict, *, lease) -> dict:
             stage,
             password=password.encode() if password else None,
             checkpoint=check,
+            progress=progress.update,
         )
         if file_hash(archive, check) != digest:
             raise MigrationError("migration_archive_changed", status=409)
@@ -343,6 +371,8 @@ def _execute_restore_phase(project: Path, request: dict, *, lease) -> dict:
                         source_trusted=True,
                         budget=budget,
                         checkpoint=check,
+                        diagnostic=record_database_diagnostic,
+                        progress=progress.update,
                     )
                 )
             database_plan["source_payload"] = entry["payload"]
@@ -367,6 +397,7 @@ def _execute_restore_phase(project: Path, request: dict, *, lease) -> dict:
                     "migration_database_connection_confirmation_required"
                 )
             database_stage = private_directory(directory / "database-stage")
+            progress.update(step="准备并核验 SQLite 候选数据库")
             database_plan = prepare_sqlite_replacement(
                 project,
                 database_stage,
@@ -429,6 +460,8 @@ def _execute_restore_phase(project: Path, request: dict, *, lease) -> dict:
                     private=request.get("private_input", {}).get("database") or {},
                     budget=budget,
                     checkpoint=check,
+                    diagnostic=record_database_diagnostic,
+                    progress=progress.update,
                 )
             )
         # One durable intent covers both resources before either is modified.
@@ -449,6 +482,7 @@ def _execute_restore_phase(project: Path, request: dict, *, lease) -> dict:
             destructive_confirmed=job["options"].get("replacement_confirmed") is True,
             checkpoint=check,
             rollback_checkpoint=budget.checkpoint,
+            progress=progress.update,
         )
         if plan["database"]:
             # Restored configuration must not send validation to the source DB.
@@ -472,9 +506,12 @@ def _execute_restore_phase(project: Path, request: dict, *, lease) -> dict:
                     confirmed_name=mapping["confirmed_name"],
                     budget=budget,
                     checkpoint=check,
+                    diagnostic=record_database_diagnostic,
+                    progress=progress.update,
                 )
             )
         elif plan["database"]:
+            progress.update(step="应用并核验 SQLite 数据库")
             apply_sqlite_replacement(
                 project,
                 database_stage,
@@ -532,6 +569,8 @@ def _execute_restore_phase(project: Path, request: dict, *, lease) -> dict:
                                 or {},
                                 budget=budget,
                                 checkpoint=budget.checkpoint,
+                                diagnostic=record_database_diagnostic,
+                                progress=progress.update,
                             )
                         )
                     else:

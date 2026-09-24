@@ -42,6 +42,8 @@ _SECRET_KEYS = {
 TERMINAL = frozenset(
     {"completed", "partial", "cancelled", "failed", "rolled_back", "needs_preflight"}
 )
+
+PROGRESS_WRITE_INTERVAL = 1.0
 _TRANSITIONS = {
     "queued": {"preflight", "preparing", "awaiting_credentials", "cancelled", "failed"},
     "preflight": {"awaiting_confirmation", "failed", "cancelled"},
@@ -109,6 +111,124 @@ class MigrationBudget:
     def checkpoint(self) -> None:
         if time.monotonic() >= self.deadline:
             raise MigrationError("migration_budget_exhausted")
+
+
+class MigrationProgress:
+    """Throttle durable phase progress without changing the task revision."""
+
+    def __init__(
+        self,
+        store: TaskStore,
+        identity: str,
+        phase: str,
+        *,
+        start_percent: float = 0.0,
+        end_percent: float = 100.0,
+    ):
+        self.store = store
+        self.identity = identity
+        self.phase = phase
+        self.start_percent = start_percent
+        self.end_percent = end_percent
+        self.started_at = time.time()
+        self.started_monotonic = time.monotonic()
+        self.last_write = 0.0
+        self.last_value = None
+        job = store.read("jobs", identity)
+        self.stage = job["stage"]
+        self.revision = job["revision"]
+        self.job_started_at = job["created_at"]
+        self.step_started_at = self.started_monotonic
+        self.console = False
+
+    def update(
+        self,
+        *,
+        current: int | None = None,
+        total: int | None = None,
+        unit: str | None = None,
+        bytes_done: int | None = None,
+        bytes_total: int | None = None,
+        step: str | None = None,
+        percent: float | None = None,
+        force: bool = False,
+    ) -> None:
+        now = time.time()
+        monotonic = time.monotonic()
+        value = (
+            current,
+            total,
+            unit,
+            bytes_done,
+            bytes_total,
+            step,
+            percent,
+        )
+        changed_step = self.last_value is None or step != self.last_value[5]
+        if not force and not changed_step:
+            interval = 5.0 if value == self.last_value else PROGRESS_WRITE_INTERVAL
+            if monotonic - self.last_write < interval and not (
+                percent == 100 and value != self.last_value
+            ):
+                return
+        if changed_step:
+            self.step_started_at = monotonic
+        self.last_value = value
+        self.last_write = monotonic
+        elapsed = max(0.0, monotonic - self.step_started_at)
+        phase_percent = percent
+        eta = None
+        if phase_percent is not None:
+            phase_percent = max(0.0, min(100.0, float(phase_percent)))
+            overall = (
+                self.start_percent
+                + (self.end_percent - self.start_percent) * phase_percent / 100
+            )
+            if phase_percent > 0:
+                step_elapsed = monotonic - self.step_started_at
+                if step_elapsed >= 2:
+                    eta = step_elapsed * (100 / phase_percent - 1)
+        else:
+            overall = None
+        record = self.store.update_progress(
+            self.identity,
+            {
+                "phase": self.phase,
+                "step": step,
+                "percent": round(phase_percent, 2)
+                if phase_percent is not None
+                else None,
+                "overall_percent": round(overall, 2) if overall is not None else None,
+                "current": current,
+                "total": total,
+                "unit": unit,
+                "bytes_done": bytes_done,
+                "bytes_total": bytes_total,
+                "elapsed_seconds": round(elapsed, 2),
+                "total_elapsed_seconds": round(max(0.0, now - self.job_started_at), 2),
+                "eta_seconds": round(max(0.0, eta), 2) if eta is not None else None,
+                "updated_at": now,
+            },
+            expected_stage=self.stage,
+            expected_revision=self.revision,
+        )
+        if self.console:
+            from .progress import emit_progress
+
+            emit_progress(record)
+
+    def finish(self, *, step: str | None = None) -> None:
+        values = self.last_value or (None,) * 7
+        self.update(
+            current=values[0],
+            total=values[1],
+            unit=values[2],
+            bytes_done=values[3],
+            bytes_total=values[4],
+            percent=100,
+            step=step,
+            force=True,
+        )
 
 
 class TaskStore:
@@ -205,11 +325,14 @@ class TaskStore:
         if error_code and not _CODE.fullmatch(error_code):
             raise MigrationError("migration_error_code_invalid")
         _public_payload(progress or {})
+        stage_changed = False
 
         def change(value):
+            nonlocal stage_changed
             if not isinstance(value, dict):
                 raise MigrationError("migration_record_not_found", status=404)
             current = value["stage"]
+            stage_changed = current != stage
             decision = read_json_locked(
                 self.path("jobs", identity).parent / "restore-commit.json", None
             )
@@ -240,8 +363,10 @@ class TaskStore:
                         "snapshot_mode",
                         "snapshot_generated",
                         "original_worker_resumed",
+                        "runtime",
                     )
-                    if value["action"] == "export" and key in value.get("progress", {})
+                    if (value["action"] == "export" or key == "runtime")
+                    and key in value.get("progress", {})
                 }
                 value["progress"] = {**retained, **progress}
             if error_code:
@@ -251,6 +376,70 @@ class TaskStore:
                 value["expires_at"] = self.clock() + (
                     72 * 3600 if value["action"] == "export" else 7 * 86400
                 )
+            return dict(value)
+
+        record = mutate_json_locked(self.path("jobs", identity), None, change)
+        from .progress import emit_progress
+
+        if stage_changed:
+            emit_progress(record, stage_only=True)
+        return record
+
+    def update_progress(
+        self,
+        identity: str,
+        progress: dict,
+        *,
+        expected_stage: str,
+        expected_revision: int,
+    ) -> dict:
+        """Atomically update progress while preserving the phase revision."""
+        self.read("jobs", identity)
+        _public_payload(progress)
+        import math
+
+        for key in (
+            "current",
+            "total",
+            "bytes_done",
+            "bytes_total",
+            "percent",
+            "overall_percent",
+            "elapsed_seconds",
+            "total_elapsed_seconds",
+            "eta_seconds",
+        ):
+            number = progress.get(key)
+            if number is not None and (
+                type(number) not in {int, float}
+                or not math.isfinite(number)
+                or number < 0
+            ):
+                raise MigrationError("migration_task_metadata_invalid")
+        for key in ("percent", "overall_percent"):
+            if progress.get(key) is not None and progress[key] > 100:
+                raise MigrationError("migration_task_metadata_invalid")
+
+        def change(value):
+            if not isinstance(value, dict) or value.get("id") != identity:
+                raise MigrationError("migration_record_not_found", status=404)
+            if (
+                value["stage"] != expected_stage
+                or value["revision"] != expected_revision
+                or value["stage"] in TERMINAL
+            ):
+                return dict(value)
+            previous = value.get("progress", {}).get("runtime", {})
+            progress_value = {
+                **progress,
+                "stage": value["stage"],
+                "sequence": previous.get("sequence", 0) + 1,
+            }
+            value["progress"] = {
+                **value.get("progress", {}),
+                "runtime": progress_value,
+            }
+            value["updated_at"] = self.clock()
             return dict(value)
 
         return mutate_json_locked(self.path("jobs", identity), None, change)
@@ -340,6 +529,7 @@ class TaskStore:
                         "snapshot_mode",
                         "snapshot_generated",
                         "original_worker_resumed",
+                        "runtime",
                     }
                 },
                 **result,
@@ -641,7 +831,7 @@ class TaskStore:
 
     @staticmethod
     def public(value: dict) -> dict:
-        return {
+        result = {
             key: value[key]
             for key in (
                 "id",
@@ -660,9 +850,28 @@ class TaskStore:
                 "sha256",
                 "target_revision",
                 "shutdown_diagnostic",
+                "database_diagnostic",
             )
             if key in value
         }
+        runtime = value.get("progress", {}).get("runtime")
+        if runtime and value["stage"] == "completed":
+            result["progress"] = {
+                **value["progress"],
+                "runtime": {
+                    **runtime,
+                    "stage": "completed",
+                    "step": "迁移完成",
+                    "percent": 100,
+                    "overall_percent": 100,
+                    "eta_seconds": 0,
+                    "total_elapsed_seconds": max(
+                        0, value["updated_at"] - value["created_at"]
+                    ),
+                    "updated_at": value["updated_at"],
+                },
+            }
+        return result
 
     def record_shutdown(self, identity: str, shutdown: dict) -> None:
         """Keep the original worker's evidence even after recovery replaces it."""
@@ -679,6 +888,7 @@ class TaskStore:
             "recovery_required",
             "unresolved_resources",
             "failed_components",
+            "correlation_verified",
         )
         evidence = {key: shutdown[key] for key in allowed if key in shutdown}
         _public_payload(evidence)
@@ -692,6 +902,54 @@ class TaskStore:
                 raise MigrationError("migration_record_not_found", status=404)
             job["shutdown_diagnostic"] = record
             job["revision"] += 1
+            job["updated_at"] = self.clock()
+            return job
+
+        mutate_json_locked(self.path("jobs", identity), None, update)
+
+    def record_database_diagnostic(self, identity: str, diagnostic: dict) -> None:
+        """Persist bounded, credential-redacted database tool diagnostics."""
+        allowed = {
+            "tool",
+            "engine",
+            "phase",
+            "operation",
+            "return_code",
+            "duration_seconds",
+            "stdout_bytes",
+            "stderr_bytes",
+            "stderr",
+            "tool_version",
+            "environment",
+            "recorded_at",
+            "started_at",
+            "error_code",
+            "cleanup_error",
+            "truncated",
+        }
+        if set(diagnostic) - allowed or not isinstance(diagnostic.get("stderr"), str):
+            raise MigrationError("migration_task_metadata_invalid")
+        if len(diagnostic["stderr"]) > 1024 * 1024:
+            raise MigrationError("migration_database_output_limit")
+        for key, value in diagnostic.items():
+            if key == "stderr":
+                continue
+            if not isinstance(value, str | int | float) and value is not None:
+                raise MigrationError("migration_task_metadata_invalid")
+            if isinstance(value, str) and len(value) > 2048:
+                raise MigrationError("migration_task_metadata_invalid")
+
+        def update(job):
+            if not isinstance(job, dict) or job.get("id") != identity:
+                raise MigrationError("migration_record_not_found", status=404)
+            previous = job.get("database_diagnostic", {})
+            if not previous.get("error_code"):
+                job["database_diagnostic"] = dict(diagnostic)
+            elif diagnostic.get("cleanup_error"):
+                job["database_diagnostic"] = {
+                    **previous,
+                    "cleanup_error": diagnostic["cleanup_error"],
+                }
             job["updated_at"] = self.clock()
             return job
 
