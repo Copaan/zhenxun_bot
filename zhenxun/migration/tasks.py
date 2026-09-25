@@ -245,7 +245,7 @@ class TaskStore:
 
     def path(self, kind: str, identity: str) -> Path:
         if (
-            kind not in {"jobs", "uploads", "preflights"}
+            kind not in {"jobs", "uploads", "preflights", "inspections"}
             or not isinstance(identity, str)
             or not _ID.fullmatch(identity)
         ):
@@ -312,6 +312,135 @@ class TaskStore:
             },
             identity=identity,
         )
+
+    def create_inspection(
+        self,
+        session: str,
+        kind: str,
+        key: str,
+        request: dict,
+        *,
+        deadline: float,
+        owner_pid: int,
+        owner_created_at: float | None,
+        owner_boot_id: str,
+    ) -> dict:
+        if kind not in {"archive", "database"} or not _HASH.fullmatch(key):
+            raise MigrationError("migration_inspection_request_invalid")
+        _public_payload(request)
+        now = self.clock()
+        return self._create(
+            "inspections",
+            session,
+            {
+                "kind": kind,
+                "key": key,
+                "request": request,
+                "status": "queued",
+                "phase": "queued",
+                "progress": {},
+                "started_at": None,
+                "deadline": deadline,
+                "owner_pid": owner_pid,
+                "owner_created_at": owner_created_at,
+                "owner_boot_id": owner_boot_id,
+                "result": None,
+                "error": None,
+                "diagnostic": None,
+                "completion": None,
+                "created_at": now,
+                "updated_at": now,
+            },
+        )
+
+    def update_inspection(
+        self,
+        identity: str,
+        *,
+        status: str | None = None,
+        phase: str | None = None,
+        progress: dict | None = None,
+        result: dict | None = None,
+        error: dict | None = None,
+        diagnostic: dict | None = None,
+        completion: dict | None = None,
+    ) -> dict:
+        if status is not None and status not in {
+            "queued",
+            "running",
+            "succeeded",
+            "failed",
+            "expired",
+        }:
+            raise MigrationError("migration_inspection_status_invalid")
+        for value in (progress, result, error, diagnostic, completion):
+            if value is not None:
+                if value is diagnostic:
+                    if (
+                        not isinstance(value, dict)
+                        or len(str(value.get("stderr", ""))) > 1024 * 1024
+                    ):
+                        raise MigrationError("migration_task_metadata_invalid")
+                else:
+                    _public_payload(value)
+
+        def update(record):
+            if not isinstance(record, dict) or record.get("id") != identity:
+                raise MigrationError("migration_record_not_found", status=404)
+            if status is not None:
+                record["status"] = status
+                if status == "running" and record.get("started_at") is None:
+                    record["started_at"] = self.clock()
+            if phase is not None:
+                record["phase"] = phase
+            if progress is not None:
+                record["progress"] = dict(progress)
+            if result is not None:
+                record["result"] = result
+            if error is not None:
+                record["error"] = error
+            if diagnostic is not None:
+                record["diagnostic"] = diagnostic
+            if completion is not None:
+                record["completion"] = completion
+            record["updated_at"] = self.clock()
+            return dict(record)
+
+        return mutate_json_locked(self.path("inspections", identity), None, update)
+
+    @staticmethod
+    def public_inspection(value: dict) -> dict:
+        result = {
+            key: value[key]
+            for key in (
+                "id",
+                "kind",
+                "status",
+                "phase",
+                "progress",
+                "created_at",
+                "started_at",
+                "updated_at",
+                "deadline",
+                "owner_pid",
+                "owner_boot_id",
+                "result",
+                "error",
+                "diagnostic",
+                "completion",
+            )
+            if key in value
+        }
+        now = time.time()
+        started = result.get("started_at") or result.get("created_at") or now
+        result["elapsed_seconds"] = round(
+            max(0.0, (result.get("updated_at") or now) - started), 2
+        )
+        result["remaining_seconds"] = round(
+            max(0.0, (result.get("deadline") or now) - now),
+            2,
+        )
+        return result
 
     def transition(
         self,
@@ -926,6 +1055,9 @@ class TaskStore:
             "error_code",
             "cleanup_error",
             "truncated",
+            "timed_out",
+            "process_returned",
+            "diagnostic_id",
         }
         if set(diagnostic) - allowed or not isinstance(diagnostic.get("stderr"), str):
             raise MigrationError("migration_task_metadata_invalid")

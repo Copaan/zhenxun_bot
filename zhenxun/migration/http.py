@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import hashlib
+import json
 from pathlib import Path
-from threading import BoundedSemaphore
 from urllib.parse import urlsplit
 
 import anyio
@@ -13,6 +14,7 @@ from starlette.concurrency import run_in_threadpool
 from .application import MigrationApplication
 from .archive import Limits
 from .errors import MigrationError
+from .inspection import InspectionCoordinator
 from .paths import contained_path
 from .service import capabilities, discover_packages, inspect_archive, inspect_package
 from .tasks import UPLOAD_CHUNK, MigrationBudget, TaskStore
@@ -66,26 +68,19 @@ def create_router(
     router = APIRouter(prefix="/migration", dependencies=[authentication])
     store = TaskStore(project)
     application = MigrationApplication(project)
-    work = BoundedSemaphore(1)
+    archive_inspections = InspectionCoordinator(project, "archive")
+    database_inspections = InspectionCoordinator(project, "database")
 
     @contextmanager
-    def boundary(*, exclusive=False):
-        acquired = False
+    def boundary():
         try:
-            if exclusive:
-                acquired = work.acquire(blocking=False)
-                if not acquired:
-                    raise MigrationError("migration_inspection_busy", status=409)
             yield
         except MigrationError as error:
-            raise HTTPException(error.status, error.code) from None
+            raise HTTPException(error.status, error.public()) from None
         except TimeoutError:
             raise HTTPException(408, "migration_upload_timeout") from None
         except OSError:
             raise HTTPException(500, "migration_storage_failed") from None
-        finally:
-            if acquired:
-                work.release()
 
     @router.get("/capabilities")
     def get_capabilities():
@@ -141,7 +136,7 @@ def create_router(
         sha256: str = Query(min_length=64, max_length=64),
         session: str = Depends(session_dependency),
     ):
-        with boundary(exclusive=True):
+        with boundary():
             # Authenticate the upload before reading an attacker-controlled body.
             store.read("uploads", identity, session=session)
             data = bytearray()
@@ -164,7 +159,7 @@ def create_router(
     def seal(
         identity: str, payload: SealPayload, session: str = Depends(session_dependency)
     ):
-        with boundary(exclusive=True):
+        with boundary():
             budget = MigrationBudget.start(3600)
             return result(
                 store.public(
@@ -175,8 +170,10 @@ def create_router(
             )
 
     @router.post("/inspect")
-    def inspect(payload: InspectPayload, session: str = Depends(session_dependency)):
-        with boundary(exclusive=True):
+    async def inspect(
+        payload: InspectPayload, session: str = Depends(session_dependency)
+    ):
+        with boundary():
             if bool(payload.path) == bool(payload.upload_id):
                 raise MigrationError("migration_package_selection_required")
             password = (
@@ -204,16 +201,47 @@ def create_router(
                 if payload.path not in allowed:
                     raise MigrationError("migration_package_not_discovered", status=404)
                 path = contained_path(project, payload.path, regular=True)
-            inspected = inspect_call(
-                path,
-                password=password,
-                offset=payload.offset,
-                limit=payload.limit,
-                budget=MigrationBudget.start(3600),
+            request = {
+                "source": "upload" if payload.upload_id else "discovered",
+                "upload_id": payload.upload_id,
+                "path": payload.path,
+                "offset": payload.offset,
+                "limit": payload.limit,
+                "password_fingerprint": hashlib.sha256(password or b"").hexdigest(),
+            }
+            key = hashlib.sha256(
+                json.dumps(request, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+
+            async def run():
+                inspected = await run_in_threadpool(
+                    inspect_call,
+                    path,
+                    password=password,
+                    offset=payload.offset,
+                    limit=payload.limit,
+                    budget=MigrationBudget.start(3600),
+                )
+                if expected is not None and inspected["sha256"] != expected:
+                    raise MigrationError("migration_archive_changed", status=409)
+                return inspected
+
+            return result(
+                await archive_inspections.submit(
+                    session, key=key, request=request, runner=run
+                )
             )
-            if expected is not None and inspected["sha256"] != expected:
-                raise MigrationError("migration_archive_changed", status=409)
-            return result(inspected)
+
+    @router.get("/inspections/{identity}")
+    def inspection(identity: str, session: str = Depends(session_dependency)):
+        with boundary():
+            for coordinator in (archive_inspections, database_inspections):
+                try:
+                    return result(coordinator.get(identity, session))
+                except MigrationError as error:
+                    if error.code != "migration_record_not_found":
+                        raise
+            raise MigrationError("migration_record_not_found", status=404)
 
     @router.get("/tasks")
     def jobs(
@@ -298,23 +326,53 @@ def create_router(
         limit: int = Query(default=100, ge=1, le=100),
         session: str = Depends(session_dependency),
     ):
-        with boundary(exclusive=True):
-            return result(await application.preview_export(offset=offset, limit=limit))
+        with boundary():
+            request = {"offset": offset, "limit": limit}
+            key = hashlib.sha256(
+                json.dumps(request, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+
+            async def run():
+                return await application.preview_export(offset=offset, limit=limit)
+
+            return result(
+                await archive_inspections.submit(
+                    session, key=key, request=request, runner=run
+                )
+            )
 
     @router.post("/export/connection-check")
     async def export_connection_check(session: str = Depends(session_dependency)):
+        from zhenxun.configs.database import applied_database_connection
         from zhenxun.services.database_probe import probe_export_connection
 
-        with boundary(exclusive=True):
-            checked, _ = await probe_export_connection(project)
-            return result(checked)
+        with boundary():
+            try:
+                fingerprint = applied_database_connection().fingerprint()
+            except (OSError, ValueError):
+                fingerprint = "unavailable"
+            request = {"fingerprint": fingerprint}
+            key = hashlib.sha256(
+                json.dumps(request, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+
+            async def run():
+                checked, _ = await probe_export_connection(project)
+                diagnostic = (checked.get("native") or {}).get("diagnostic")
+                return checked, diagnostic
+
+            return result(
+                await database_inspections.submit(
+                    session, key=key, request=request, runner=run
+                )
+            )
 
     @router.post("/export")
     async def export(request: Request, session: str = Depends(session_dependency)):
         from .discovery import CATEGORIES
         from .snapshot import ExportOptions
 
-        with boundary(exclusive=True):
+        with boundary():
             payload = await payload_for(request)
             if set(payload) - {
                 "categories",
@@ -354,7 +412,7 @@ def create_router(
 
     @router.post("/preflight")
     async def preflight(request: Request, session: str = Depends(session_dependency)):
-        with boundary(exclusive=True):
+        with boundary():
             payload = await payload_for(request)
             if (
                 set(payload) != {"upload_id", "options", "private"}
@@ -375,7 +433,7 @@ def create_router(
     async def register_package(
         request: Request, session: str = Depends(session_dependency)
     ):
-        with boundary(exclusive=True):
+        with boundary():
             payload = await payload_for(request)
             if (
                 set(payload) != {"path", "confirm_secrets"}
@@ -411,7 +469,7 @@ def create_router(
     async def confirm(
         identity: str, request: Request, session: str = Depends(session_dependency)
     ):
-        with boundary(exclusive=True):
+        with boundary():
             payload = await payload_for(request)
             if set(payload) != {"private", "replacement_confirmed"} or not isinstance(
                 payload.get("private"), dict

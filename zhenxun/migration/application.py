@@ -216,7 +216,11 @@ class MigrationApplication:
                 write_json_locked(self.store.path("preflights", record["id"]), record)
                 return {**self.store.public(record), "summary": result}
         except Timeout:
-            raise MigrationError("migration_inspection_busy", status=409) from None
+            raise MigrationError(
+                "migration_operation_in_progress",
+                status=409,
+                details={"operation": "preflight", "resource": "analysis"},
+            ) from None
 
     def details(
         self, session: str, identity: str, *, section="files", offset=0, limit=100

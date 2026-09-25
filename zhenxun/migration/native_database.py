@@ -337,6 +337,7 @@ class NativeDatabase:
         process = None
         failure = None
         cleanup_error = None
+        timed_out = False
         started_at = time.time()
         operation = (
             "version"
@@ -402,6 +403,10 @@ class NativeDatabase:
             return output
         except BaseException as caught:
             failure = caught
+            timed_out = getattr(caught, "code", None) in {
+                "migration_budget_exhausted",
+                "migration_control_timeout",
+            } or isinstance(caught, asyncio.TimeoutError)
             raise
         finally:
             try:
@@ -456,6 +461,10 @@ class NativeDatabase:
                             "cleanup_error": type(cleanup_error).__name__
                             if cleanup_error
                             else None,
+                            "timed_out": timed_out,
+                            "process_returned": process is not None
+                            and process.poll() is not None,
+                            "diagnostic_id": identity,
                             "recorded_at": time.time(),
                         }
                         if len(record["stderr"]) > 1024**2:
