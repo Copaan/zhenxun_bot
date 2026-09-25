@@ -717,6 +717,7 @@ class NativeDatabase:
         else:
             version = await self.query("SHOW server_version;")
             require_version(engine, version, version)
+            privilege_started = time.monotonic()
             privileged = await self.query(
                 "SELECT COUNT(*) FROM pg_roles WHERE rolname=current_user AND "
                 "(rolsuper OR rolcreaterole OR rolcreatedb OR rolreplication "
@@ -731,6 +732,56 @@ class NativeDatabase:
                 "AND has_database_privilege(current_user,oid,'CREATE');"
             )
             if privileged != "0" or roles != "0" or other_create != "0":
+                checks = {
+                    "privileged_roles": int(privileged),
+                    "direct_role_memberships": int(roles),
+                    "other_database_create": int(other_create),
+                }
+                reasons = [
+                    label
+                    for label, value in (
+                        ("privileged_roles", checks["privileged_roles"]),
+                        (
+                            "direct_role_memberships",
+                            checks["direct_role_memberships"],
+                        ),
+                        (
+                            "other_database_create",
+                            checks["other_database_create"],
+                        ),
+                    )
+                    if value
+                ]
+                if self.diagnostic is not None:
+                    self.diagnostic(
+                        {
+                            "tool": "psql",
+                            "engine": "postgres",
+                            "phase": self.phase,
+                            "operation": "policy",
+                            "return_code": 0,
+                            "started_at": time.time()
+                            - (time.monotonic() - privilege_started),
+                            "duration_seconds": round(
+                                time.monotonic() - privilege_started, 2
+                            ),
+                            "stdout_bytes": 0,
+                            "stderr_bytes": 0,
+                            "stderr": "",
+                            "truncated": False,
+                            "tool_version": self.tool_versions.get("psql"),
+                            "environment": (
+                                f"{sys.platform}; Python {sys.version.split()[0]}"
+                            ),
+                            "error_code": "migration_database_privileges_unsupported",
+                            "timed_out": False,
+                            "process_returned": True,
+                            "diagnostic_id": uuid.uuid4().hex,
+                            "permission_checks": checks,
+                            "privilege_reasons": reasons,
+                            "recorded_at": time.time(),
+                        }
+                    )
                 raise MigrationError("migration_database_privileges_unsupported")
             if (
                 quiet

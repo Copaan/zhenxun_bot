@@ -1058,6 +1058,8 @@ class TaskStore:
             "timed_out",
             "process_returned",
             "diagnostic_id",
+            "permission_checks",
+            "privilege_reasons",
         }
         if set(diagnostic) - allowed or not isinstance(diagnostic.get("stderr"), str):
             raise MigrationError("migration_task_metadata_invalid")
@@ -1065,6 +1067,25 @@ class TaskStore:
             raise MigrationError("migration_database_output_limit")
         for key, value in diagnostic.items():
             if key == "stderr":
+                continue
+            if key == "permission_checks":
+                if (
+                    not isinstance(value, dict)
+                    or set(value)
+                    != {
+                        "privileged_roles",
+                        "direct_role_memberships",
+                        "other_database_create",
+                    }
+                    or any(type(item) is not int or item < 0 for item in value.values())
+                ):
+                    raise MigrationError("migration_task_metadata_invalid")
+                continue
+            if key == "privilege_reasons":
+                if not isinstance(value, list) or any(
+                    not isinstance(item, str) or len(item) > 128 for item in value
+                ):
+                    raise MigrationError("migration_task_metadata_invalid")
                 continue
             if not isinstance(value, str | int | float) and value is not None:
                 raise MigrationError("migration_task_metadata_invalid")

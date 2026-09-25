@@ -99,12 +99,14 @@ class ConsoleProgress:
                         if not diagnostic.get("error_code")
                         else ""
                     )
+                    + self._permission_summary(diagnostic)
                     + diagnostic.get("stderr", "")
                     + "\n"
                 )
                 sys.stderr.flush()
             except (OSError, UnicodeError):
                 pass
+
         shutdown = job.get("shutdown_diagnostic") or {}
         identity = (job["id"], shutdown.get("recorded_at"))
         if (
@@ -127,3 +129,16 @@ class ConsoleProgress:
                 sys.stderr.flush()
             except (OSError, UnicodeError):
                 pass
+
+    @staticmethod
+    def _permission_summary(diagnostic: dict) -> str:
+        checks = diagnostic.get("permission_checks") or {}
+        if not checks:
+            return ""
+        labels = {
+            "privileged_roles": "高权限角色标记",
+            "direct_role_memberships": "直接角色成员关系",
+            "other_database_create": "其他数据库 CREATE 权限",
+        }
+        details = "；".join(f"{labels[key]}={checks.get(key, 0)}" for key in labels)
+        return f"工具执行成功；权限策略检查未通过：{details}\n"
