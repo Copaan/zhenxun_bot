@@ -6,7 +6,9 @@ import shutil
 
 from .archive import Limits, encryption_available, file_hash, verify_archive
 from .database import database_capabilities
+from .database_capabilities import CAPABILITY_POLICY_VERSION
 from .errors import MigrationError
+from .inspection import WORKER_GENERATION
 from .inventory import _safe_text
 from .paths import contained_path, is_link
 from .selection import ReplacementSelection
@@ -74,6 +76,8 @@ def capabilities() -> dict:
     return {
         "format": "zhenxun-instance",
         "schema": 1,
+        "database_policy_version": CAPABILITY_POLICY_VERSION,
+        "worker_generation": WORKER_GENERATION,
         "offline_export": True,
         "inspect": True,
         "online_export": True,

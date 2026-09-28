@@ -1066,6 +1066,9 @@ class TaskStore:
             "restore_privilege_reasons",
             "account_role",
             "isolation_reasons",
+            "policy_version",
+            "capability_checks",
+            "grant_sources",
         }
         if set(diagnostic) - allowed or not isinstance(diagnostic.get("stderr"), str):
             raise MigrationError("migration_task_metadata_invalid")
@@ -1073,6 +1076,34 @@ class TaskStore:
             raise MigrationError("migration_database_output_limit")
         for key, value in diagnostic.items():
             if key == "stderr":
+                continue
+            if key == "capability_checks":
+                if (
+                    not isinstance(value, dict)
+                    or len(value) > 32
+                    or any(
+                        not isinstance(name, str)
+                        or len(name) > 64
+                        or type(item) is not int
+                        or item not in {0, 1}
+                        for name, item in value.items()
+                    )
+                ):
+                    raise MigrationError("migration_task_metadata_invalid")
+                continue
+            if key == "grant_sources":
+                if not isinstance(value, list) or any(
+                    item
+                    not in {
+                        "global",
+                        "database",
+                        "table",
+                        "partial_revoke",
+                        "enabled_role",
+                    }
+                    for item in value
+                ):
+                    raise MigrationError("migration_task_metadata_invalid")
                 continue
             if key == "permission_checks":
                 if (

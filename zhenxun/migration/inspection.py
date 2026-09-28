@@ -15,6 +15,7 @@ from .paths import contained_path
 from .tasks import TaskStore
 
 _TERMINAL = {"succeeded", "failed", "expired"}
+WORKER_GENERATION = uuid.uuid4().hex
 
 
 def _process_created_at(pid: int) -> float | None:
@@ -123,15 +124,29 @@ class InspectionCoordinator:
             with FileLock(str(self._lock_path), timeout=0, thread_local=False):
                 active = self._read_active()
                 if active:
-                    if active.get("key") == key:
-                        return self.store.public_inspection(active)
                     expired = active.get("deadline", 0) <= time.time()
                     if expired and not self._owner_alive(active):
                         self._recover_dead_owner(active)
                         active = None
+                    if (
+                        active
+                        and active.get("key") == key
+                        and (
+                            self.kind == "archive"
+                            or (
+                                active.get("status") in {"queued", "running"}
+                                and not expired
+                                and active.get("owner_pid") == self.pid
+                                and active.get("owner_created_at") == self.created_at
+                            )
+                        )
+                    ):
+                        return self.store.public_inspection(active)
                     if active:
                         raise self._busy(active)
-                completed = self._find_completed(key)
+                completed = (
+                    self._find_completed(key) if self.kind == "archive" else None
+                )
                 if completed:
                     return self.store.public_inspection(completed)
                 record = self.store.create_inspection(

@@ -8,6 +8,7 @@ from pathlib import Path
 from zhenxun.utils.atomic_json import read_json_locked, write_json_locked
 
 from .archive import file_hash
+from .database_capabilities import CAPABILITY_POLICY_VERSION
 from .errors import MigrationError
 from .native_database import DatabaseEndpoint, native_session, require_version
 from .paths import contained_path
@@ -40,10 +41,7 @@ async def clients(
     except (KeyError, TypeError):
         raise MigrationError("migration_database_credentials_required") from None
     require_same_engine(target.engine, candidate.engine)
-    if (
-        target.identity() == candidate.identity()
-        or target.username == candidate.username
-    ):
+    if target.identity() == candidate.identity():
         raise MigrationError("migration_database_candidate_isolation_required")
     async with native_session(
         target,
@@ -76,24 +74,25 @@ def assert_identity(client, expected):
 
 
 async def verify_account_isolation(target, candidate):
-    if target.endpoint.engine != "postgres":
-        # MySQL inspect() already requires every effective schema grant to
-        # name only this database, with no wildcard or role-based grants.
-        return
-    for client, other in ((target, candidate), (candidate, target)):
-        name = other.endpoint.username.replace("'", "''")
-        # CONNECT denial also covers table privileges granted without CREATE.
-        accessible = await client.query(
-            "SELECT COUNT(*) FROM pg_roles WHERE rolname='" + name + "' "
-            "AND has_database_privilege(oid,current_database(),'CONNECT');"
+    """Require distinct actual databases; shared accounts and grants are allowed."""
+    identities = [await client.actual_identity() for client in (target, candidate)]
+    if identities[0] == identities[1]:
+        target._record_policy_diagnostic(
+            error_code="migration_database_candidate_isolation_required",
+            isolation_reasons=["same_database"],
+            capability="restore",
         )
-        if accessible != "0":
-            client._record_policy_diagnostic(
-                error_code="migration_database_candidate_isolation_required",
-                isolation_reasons=["other_account_can_connect"],
-                capability="restore",
-            )
-            raise MigrationError("migration_database_candidate_isolation_required")
+        raise MigrationError("migration_database_candidate_isolation_required")
+    return identities
+
+
+async def verify_prepared_identity(target, candidate, plan):
+    """Bind destructive work to the databases inspected by this policy version."""
+    if plan.get("policy_version") != CAPABILITY_POLICY_VERSION:
+        raise MigrationError("migration_database_preflight_stale", status=409)
+    identities = await verify_account_isolation(target, candidate)
+    if identities != plan.get("actual_databases"):
+        raise MigrationError("migration_database_target_changed", status=409)
 
 
 async def snapshot_native(
@@ -182,9 +181,9 @@ async def prepare_native(
             else await target.inspect()
         )
         empty = await candidate.inspect()
-        await target.check_restore_privileges()
-        await candidate.check_restore_privileges()
-        await verify_account_isolation(target, candidate)
+        await target.check_restore_privileges(tables=description["tables"])
+        await candidate.check_restore_privileges(tables=description["tables"])
+        identities = await verify_account_isolation(target, candidate)
         if (original["server"], original["database"]) == (
             empty["server"],
             empty["database"],
@@ -211,7 +210,10 @@ async def prepare_native(
         )
         if checked["revision"] != original["revision"]:
             raise MigrationError("migration_database_target_changed", status=409)
-        await candidate.restore(source, confirmed_tables=[])
+        await verify_account_isolation(target, candidate)
+        await candidate.restore(
+            source, confirmed_tables=[], restore_tables=description["tables"]
+        )
         verified = await candidate.inspect()
         if verified["revision"] != description.get("revision"):
             write_json_locked(
@@ -225,6 +227,8 @@ async def prepare_native(
             )
             raise MigrationError("migration_database_candidate_mismatch")
         plan = {
+            "policy_version": CAPABILITY_POLICY_VERSION,
+            "actual_databases": identities,
             "engine": target.endpoint.engine,
             "target": target.endpoint.identity(),
             "candidate": candidate.endpoint.identity(),
@@ -276,9 +280,11 @@ async def recheck_native(
             else await target.inspect()
         )
         prepared = await candidate.inspect()
-        await target.check_restore_privileges()
-        await candidate.check_restore_privileges()
-        await verify_account_isolation(target, candidate)
+        await target.check_restore_privileges(
+            tables=set(plan["tables_before"]) | set(plan["tables_after"])
+        )
+        await candidate.check_restore_privileges(tables=plan["tables_after"])
+        await verify_prepared_identity(target, candidate, plan)
         if before["revision"] != plan["target_revision"]:
             raise MigrationError("migration_database_target_changed", status=409)
         if prepared["revision"] != plan["candidate_revision"]:
@@ -318,8 +324,10 @@ async def apply_native(
         assert_identity(target, plan["target"])
         assert_identity(candidate, plan["candidate"])
         before, prepared = await target.inspect(), await candidate.inspect()
-        await target.check_restore_privileges()
-        await verify_account_isolation(target, candidate)
+        await target.check_restore_privileges(
+            tables=set(plan["tables_before"]) | set(plan["tables_after"])
+        )
+        await verify_prepared_identity(target, candidate, plan)
         if before["revision"] != plan["target_revision"]:
             raise MigrationError("migration_database_target_changed", status=409)
         if prepared["revision"] != plan["candidate_revision"]:
@@ -332,7 +340,12 @@ async def apply_native(
                 "before_revision": before["revision"],
             },
         )
-        await target.restore(source, confirmed_tables=before["tables"])
+        await verify_prepared_identity(target, candidate, plan)
+        await target.restore(
+            source,
+            confirmed_tables=before["tables"],
+            restore_tables=plan["tables_after"],
+        )
         observed = await target.inspect()
         if observed["revision"] != plan["candidate_revision"]:
             raise MigrationError("migration_database_application_mismatch")
@@ -381,8 +394,15 @@ async def rollback_native(
         account_role="target",
     ) as target:
         assert_identity(target, plan["target"])
+        if (
+            plan.get("actual_databases")
+            and await target.actual_identity() != plan["actual_databases"][0]
+        ):
+            raise MigrationError("migration_database_target_changed", status=409)
         before = await target.inspect()
-        await target.check_restore_privileges()
+        await target.check_restore_privileges(
+            tables=set(plan["tables_before"]) | set(plan["tables_after"])
+        )
         backup = contained_path(staging, "database-target.backup", regular=True)
         if file_hash(backup, checkpoint) != plan["backup_sha256"]:
             raise MigrationError("migration_database_backup_changed")
@@ -406,7 +426,11 @@ async def rollback_native(
                 "after_revision": before["revision"],
             },
         )
-        await target.restore(backup, confirmed_tables=before["tables"])
+        await target.restore(
+            backup,
+            confirmed_tables=before["tables"],
+            restore_tables=plan["tables_before"],
+        )
         restored = await target.inspect()
         if restored["revision"] != plan["target_revision"]:
             raise MigrationError("migration_database_rollback_mismatch")

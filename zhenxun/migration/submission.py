@@ -108,7 +108,26 @@ async def submit_restore(
             if database_options.get("engine") in {"mysql", "postgres"}:
                 from zhenxun.services.database_probe import probe_restore_connections
 
-                checked = await probe_restore_connections(project, private)
+                restore_tables = None
+                if preflight_id := options.get("preflight_id"):
+                    from .database_capabilities import CAPABILITY_POLICY_VERSION
+
+                    analysis = read_json_locked(
+                        store.path("preflights", preflight_id).parent / "analysis.json",
+                        {},
+                    )
+                    native_plan = analysis.get("database") or {}
+                    if native_plan.get("policy_version") != CAPABILITY_POLICY_VERSION:
+                        raise MigrationError(
+                            "migration_database_preflight_stale", status=409
+                        )
+                    restore_tables = sorted(
+                        set(native_plan["tables_before"])
+                        | set(native_plan["tables_after"])
+                    )
+                checked = await probe_restore_connections(
+                    project, private, restore_tables=restore_tables
+                )
                 if not checked.get("ready"):
                     if checked.get("diagnostic"):
                         _record_preflight_diagnostic(

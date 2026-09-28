@@ -12,6 +12,8 @@ from zhenxun.configs.database import (
     database_error_code,
     inspect_database_tls,
 )
+from zhenxun.migration.database_capabilities import CAPABILITY_POLICY_VERSION
+from zhenxun.migration.inspection import WORKER_GENERATION
 
 
 async def probe_runtime_database() -> dict:
@@ -55,6 +57,7 @@ async def probe_native_database(
         "checked_at": time.time(),
         "connection": endpoint.public(),
         "capability": capability,
+        "policy_version": CAPABILITY_POLICY_VERSION,
     }
     diagnostics = []
     try:
@@ -135,7 +138,13 @@ async def probe_native_database(
 async def probe_export_connection(project: Path) -> tuple[dict, dict | None]:
     """Bind a tool check to the applied endpoint and its certificate contents."""
     runtime = await probe_runtime_database()
-    result = {"runtime": runtime, "ready": False, "source": "runtime"}
+    result = {
+        "runtime": runtime,
+        "ready": False,
+        "source": "runtime",
+        "policy_version": CAPABILITY_POLICY_VERSION,
+        "worker_generation": WORKER_GENERATION,
+    }
     if runtime["status"] != "ok":
         return result, None
     try:
@@ -160,7 +169,9 @@ async def probe_export_connection(project: Path) -> tuple[dict, dict | None]:
         return result, None
 
 
-async def probe_restore_connections(project: Path, private: dict) -> dict:
+async def probe_restore_connections(
+    project: Path, private: dict, *, restore_tables=None
+) -> dict:
     """Probe target and candidate restore accounts before worker handoff."""
     from zhenxun.migration.access import private_directory
     from zhenxun.migration.errors import MigrationError
@@ -191,7 +202,9 @@ async def probe_restore_connections(project: Path, private: dict) -> dict:
                 for name, client in (("target", target), ("candidate", candidate)):
                     account_role = name
                     client.endpoint.certificate_hashes()
-                    checked = await client.probe_connection("restore")
+                    checked = await client.probe_connection(
+                        "restore", restore_tables=restore_tables
+                    )
                     result["connections"][name] = {
                         **checked,
                         "status": "ok",
@@ -232,7 +245,7 @@ async def probe_restore_connections(project: Path, private: dict) -> dict:
             if account_role:
                 failed["account_role"] = account_role
             if result["code"] == "migration_database_candidate_isolation_required":
-                failed["isolation_reasons"] = ["same_account_or_database"]
+                failed["isolation_reasons"] = ["same_database"]
         result["diagnostic"] = failed
         role = failed.get("account_role") or account_role
         if role:

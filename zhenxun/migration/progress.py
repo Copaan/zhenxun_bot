@@ -89,11 +89,18 @@ class ConsoleProgress:
         ):
             self.diagnostic = identity
             try:
+                sources = ", ".join(diagnostic.get("grant_sources") or [])
                 sys.stderr.write(
                     f"[迁移 {job['id'][:8]}] 数据库工具 {diagnostic.get('tool')} "
                     f"退出码={diagnostic.get('return_code')} "
                     f"阶段={diagnostic.get('phase')} "
                     f"耗时={diagnostic.get('duration_seconds')}s\n"
+                    + (
+                        f"能力检查策略=v{diagnostic['policy_version']} "
+                        f"授权来源={sources or '原生权限查询'}\n"
+                        if diagnostic.get("policy_version")
+                        else ""
+                    )
                     + (
                         "工具已成功退出；后续迁移步骤失败。\n"
                         if not diagnostic.get("error_code")
@@ -171,6 +178,22 @@ class ConsoleProgress:
                 + f"{capability} 权限检查未通过；缺少恢复权限："
                 + ", ".join(missing)
                 + "\n"
+            )
+        if diagnostic.get("policy_version"):
+            checks = diagnostic.get("capability_checks") or {}
+            reasons = diagnostic.get("privilege_reasons") or []
+            labels = {
+                "process_privilege_missing": "缺少 PROCESS，无法完整核验其他连接",
+                "object_inventory_unconfirmed": "无法确认完整对象清单",
+                "table_or_sequence_select_missing": "缺少表或序列 SELECT",
+            }
+            details = "; ".join(labels.get(reason, reason) for reason in reasons)
+            failed = ", ".join(key for key, value in checks.items() if not value)
+            sources = ", ".join(diagnostic.get("grant_sources") or [])
+            return (
+                prefix + f"权限查询工具执行成功；能力检查未通过："
+                f"{details or failed or diagnostic.get('error_code', '')}；"
+                f"授权来源：{sources or '未记录'}\n"
             )
         checks = diagnostic.get("permission_checks") or {}
         if not checks:

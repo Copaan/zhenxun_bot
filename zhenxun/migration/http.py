@@ -14,7 +14,7 @@ from starlette.concurrency import run_in_threadpool
 from .application import MigrationApplication
 from .archive import Limits
 from .errors import MigrationError
-from .inspection import InspectionCoordinator
+from .inspection import WORKER_GENERATION, InspectionCoordinator
 from .paths import contained_path
 from .service import capabilities, discover_packages, inspect_archive, inspect_package
 from .tasks import UPLOAD_CHUNK, MigrationBudget, TaskStore
@@ -351,7 +351,13 @@ def create_router(
                 fingerprint = applied_database_connection().fingerprint()
             except (OSError, ValueError):
                 fingerprint = "unavailable"
-            request = {"fingerprint": fingerprint}
+            from .database_capabilities import CAPABILITY_POLICY_VERSION
+
+            request = {
+                "fingerprint": fingerprint,
+                "policy_version": CAPABILITY_POLICY_VERSION,
+                "worker_generation": WORKER_GENERATION,
+            }
             key = hashlib.sha256(
                 json.dumps(request, sort_keys=True, separators=(",", ":")).encode()
             ).hexdigest()
