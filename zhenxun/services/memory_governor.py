@@ -109,6 +109,12 @@ async def _has_active_render_work() -> bool:
     module = sys.modules.get("zhenxun.services.renderer.engine")
     if module is None:
         return False
+    tracker = getattr(module, "_HTMLRENDER_TASK_TRACKER", None)
+    if tracker is not None and tracker.active_tasks:
+        return True
+    resources = getattr(module, "browser_resources", None)
+    if resources is not None and any(not task.done() for task in resources.tasks):
+        return True
     manager = getattr(module, "engine_manager", None)
     engine = getattr(manager, "_instance", None)
     if engine is None:
@@ -165,6 +171,7 @@ async def _run_reclaim() -> None:
         f"cost={time.monotonic() - start:.3f}s "
         f"rss_before={_format_bytes(before_rss)} "
         f"rss_after={_format_bytes(after_rss)} "
+        "rss_scope=parent_and_verified_descendants "
         f"gc={collected} malloc_trim={malloc_trimmed} "
         f"cleared={cleared} cache_stats_before={cache_stats_before}",
         LOG_COMMAND,
@@ -252,7 +259,7 @@ def _clear_avatar_memory_cache() -> int:
 
 
 async def _clear_renderer_runtime_caches() -> dict[str, int]:
-    module = sys.modules.get("zhenxun.services.renderer.service")
+    module = sys.modules.get("zhenxun.services.renderer")
     if module is None:
         return {}
     service = getattr(module, "renderer_service", None)

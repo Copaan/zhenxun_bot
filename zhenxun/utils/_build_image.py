@@ -71,7 +71,13 @@ class BuildImage:
             self.markImg = Image.new(mode, (width, height), color)  # type: ignore
         else:
             raise ValueError("长度和宽度不能为空...")
-        self.draw = ImageDraw.Draw(self.markImg)
+        self._set_image(self.markImg)
+
+    def _set_image(self, image: tImage) -> None:
+        """Bind pixels, dimensions and drawing operations to the same image."""
+        self.markImg = image
+        self.width, self.height = image.size
+        self.draw = ImageDraw.Draw(image)
 
     @property
     def size(self) -> tuple[int, int]:
@@ -451,9 +457,7 @@ class BuildImage:
             if not width and not height:
                 width = int(self.width * ratio)
                 height = int(self.height * ratio)
-            self.markImg = self.markImg.resize((width, height), Image.LANCZOS)  # type: ignore
-            self.width, self.height = self.markImg.size
-            self.draw = ImageDraw.Draw(self.markImg)
+            self._set_image(self.markImg.resize((width, height), Resampling.LANCZOS))
         return self
 
     @run_sync
@@ -467,9 +471,7 @@ class BuildImage:
         返回:
             BuildImage: Self
         """
-        self.markImg = self.markImg.crop(box)
-        self.width, self.height = self.markImg.size
-        self.draw = ImageDraw.Draw(self.markImg)
+        self._set_image(self.markImg.crop(box))
         return self
 
     @run_sync
@@ -484,7 +486,7 @@ class BuildImage:
         返回:
             BuildImage: Self
         """
-        self.markImg = self.markImg.convert("RGBA")
+        self._set_image(self.markImg.convert("RGBA"))
         x, y = self.markImg.size
         for i, k in itertools.product(range(n, x - n), range(n, y - n)):
             color = self.markImg.getpixel((i, k))
@@ -499,9 +501,9 @@ class BuildImage:
         返回:
             str: base64
         """
-        buf = BytesIO()
-        self.markImg.save(buf, format="PNG")
-        base64_str = base64.b64encode(buf.getvalue()).decode()
+        with BytesIO() as buf:
+            self.markImg.save(buf, format="PNG")
+            base64_str = base64.b64encode(buf.getvalue()).decode()
         return f"base64://{base64_str}"
 
     def pic2bytes(self) -> bytes:
@@ -510,15 +512,13 @@ class BuildImage:
         返回:
             bytes: bytes
         """
-        buf = BytesIO()
-        img_format = self.markImg.format.upper() if self.markImg.format else "PNG"
-
-        if img_format == "GIF":
-            self.markImg.save(buf, format="GIF", save_all=True, loop=0)
-        else:
-            self.markImg.save(buf, format="PNG")
-
-        return buf.getvalue()
+        with BytesIO() as buf:
+            img_format = self.markImg.format.upper() if self.markImg.format else "PNG"
+            if img_format == "GIF":
+                self.markImg.save(buf, format="GIF", save_all=True, loop=0)
+            else:
+                self.markImg.save(buf, format="PNG")
+            return buf.getvalue()
 
     def convert(self, type_: ModeType) -> Self:
         """
@@ -530,7 +530,7 @@ class BuildImage:
         返回:
             BuildImage: Self
         """
-        self.markImg = self.markImg.convert(type_)
+        self._set_image(self.markImg.convert(type_))
         return self
 
     @run_sync
@@ -606,11 +606,11 @@ class BuildImage:
         返回:
             BuildImage: Self
         """
-        self.markImg.convert("RGBA")
+        self._set_image(self.markImg.convert("RGBA"))
         size = self.markImg.size
         r2 = min(size[0], size[1])
         if size[0] != size[1]:
-            self.markImg = self.markImg.resize((r2, r2), Image.LANCZOS)  # type: ignore
+            self._set_image(self.markImg.resize((r2, r2), Resampling.LANCZOS))
         width = 1
         antialias = 4
         ellipse_box = [0, 0, r2 - 2, r2 - 2]
@@ -666,8 +666,7 @@ class BuildImage:
                 (w - radii, h - radii),
             )
         img.putalpha(alpha)
-        self.markImg = img
-        self.draw = ImageDraw.Draw(self.markImg)
+        self._set_image(img)
         return self
 
     @run_sync
@@ -682,7 +681,7 @@ class BuildImage:
         返回:
             BuildImage: Self
         """
-        self.markImg = self.markImg.rotate(angle, expand=expand)
+        self._set_image(self.markImg.rotate(angle, expand=expand))
         return self
 
     @run_sync
@@ -696,7 +695,7 @@ class BuildImage:
         返回:
             BuildImage: Self
         """
-        self.markImg.transpose(angle)
+        self._set_image(self.markImg.transpose(angle))
         return self
 
     @run_sync
@@ -724,10 +723,9 @@ class BuildImage:
             _type = ImageFilter.FIND_EDGES
         if _type:
             if aud:
-                self.markImg = self.markImg.filter(_type(aud))  # type: ignore
+                self._set_image(self.markImg.filter(_type(aud)))  # type: ignore
             else:
-                self.markImg = self.markImg.filter(_type)
-        self.draw = ImageDraw.Draw(self.markImg)
+                self._set_image(self.markImg.filter(_type))
         return self
 
     def tobytes(self) -> bytes:

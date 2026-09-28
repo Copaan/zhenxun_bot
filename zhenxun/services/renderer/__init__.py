@@ -4,6 +4,7 @@ from zhenxun.services.lifecycle import ResourceReceipt, RuntimeHandle
 from zhenxun.utils.manager.priority_manager import PriorityLifecycle
 
 from .engine import engine_manager
+from .resources import browser_resources
 from .service import RendererService
 from .types import Renderable, RenderResult
 
@@ -51,30 +52,48 @@ class RendererRuntimeHandle:
                     "retiring_generations": int(
                         snapshot.get("retiring_generation_count") or 0
                     ),
+                    "browser_resources": browser_resources.snapshot(),
                 },
             )
         ]
         engine = engine_manager._instance
+        tasks = list(browser_resources.tasks)
         if engine is not None:
-            tasks = [
-                getattr(engine, "_idle_recycle_task", None),
-                engine_manager._init_task,
-                engine_manager._warmup_task,
-                renderer_service._initialization_task,
-                *engine._preparation_tasks,
-                *list(getattr(engine, "_inflight_tasks", {}).values()),
-            ]
-            receipts.extend(
-                ResourceReceipt(
-                    receipt_id=f"task:{id(task)}",
-                    provider="renderer",
-                    resource_type="task",
-                    owner_id="warmup:renderer",
-                    detail={"name": task.get_name()},
-                )
-                for task in tasks
-                if isinstance(task, asyncio.Task) and not task.done()
+            tasks.extend(
+                [
+                    getattr(engine, "_idle_recycle_task", None),
+                    engine_manager._init_task,
+                    engine_manager._warmup_task,
+                    renderer_service._initialization_task,
+                    *engine._preparation_tasks,
+                    *list(getattr(engine, "_inflight_tasks", {}).values()),
+                ]
             )
+        receipts.extend(
+            ResourceReceipt(
+                receipt_id=f"task:{id(task)}",
+                provider="renderer",
+                resource_type="task",
+                owner_id="warmup:renderer",
+                detail={"name": task.get_name()},
+            )
+            for task in set(tasks)
+            if isinstance(task, asyncio.Task) and not task.done()
+        )
+        receipts.extend(
+            ResourceReceipt(
+                receipt_id=f"renderer-context:{id(context)}",
+                provider="renderer",
+                resource_type="browser_context",
+                owner_id="warmup:renderer",
+                detail={
+                    "generation": record.generation,
+                    "owner": record.owner,
+                    "cleanup_failed": record.failed,
+                },
+            )
+            for context, record in browser_resources.contexts.items()
+        )
         return receipts
 
 

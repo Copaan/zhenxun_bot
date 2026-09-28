@@ -366,7 +366,8 @@ def get_img_hash(image_file: str | Path) -> str:
     hash_value = ""
     try:
         with open(image_file, "rb") as fp:
-            hash_value = imagehash.average_hash(Image.open(fp))
+            with Image.open(fp) as image:
+                hash_value = imagehash.average_hash(image)
     except Exception as e:
         logger.warning("获取图片Hash出错", "禁言检测", e=e)
     return str(hash_value)
@@ -401,6 +402,6 @@ def pic2bytes(image) -> bytes:
     返回:
         bytes: bytes
     """
-    buf = BytesIO()
-    image.save(buf, format="PNG")
-    return buf.getvalue()
+    with BytesIO() as buf:
+        image.save(buf, format="PNG")
+        return buf.getvalue()

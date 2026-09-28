@@ -19,8 +19,10 @@ import nonebot
 import psutil
 
 from zhenxun.configs.config import Config
+from zhenxun.services.lifecycle.deadline import remaining_timeout, shutdown_budget
 from zhenxun.services.log import logger
 
+from .resources import browser_resources
 from .types import BaseScreenshotEngine
 
 _PLAYWRIGHT_DISCONNECT_ERROR = "Connection closed while reading from the driver"
@@ -233,10 +235,9 @@ class HtmlrenderTaskTracker:
             self._idle_event.clear()
 
     async def end(self) -> None:
-        async with self._lock:
-            self._active_tasks = max(0, self._active_tasks - 1)
-            if self._active_tasks == 0:
-                self._idle_event.set()
+        self._active_tasks = max(0, self._active_tasks - 1)
+        if self._active_tasks == 0:
+            self._idle_event.set()
 
     async def wait_for_idle(self) -> None:
         await self._idle_event.wait()
@@ -269,6 +270,7 @@ class ContextGeneration:
     context_pool: asyncio.LifoQueue[Any] = field(default_factory=asyncio.LifoQueue)
     all_contexts: set[Any] = field(default_factory=set)
     active_leases: int = 0
+    pending_creations: int = 0
     retiring: bool = False
 
     def snapshot(self) -> dict[str, int | bool]:
@@ -277,6 +279,7 @@ class ContextGeneration:
             "pool_size": self.context_pool.qsize(),
             "context_count": len(self.all_contexts),
             "active_leases": self.active_leases,
+            "pending_creations": self.pending_creations,
             "retiring": self.retiring,
         }
 
@@ -417,6 +420,7 @@ async def _close_browser_resources(browser_obj, playwright_obj) -> None:
             failures.append(error)
     if failures:
         raise RuntimeError("renderer_browser_cleanup_failed") from failures[0]
+    browser_resources.confirm_browser_closed(browser_obj)
     if getattr(htmlrender_browser, "_browser", None) is browser_obj:
         setattr(htmlrender_browser, "_browser", None)
     if getattr(htmlrender_browser, "_playwright", None) is playwright_obj:
@@ -586,6 +590,7 @@ class PlaywrightEngine(BaseScreenshotEngine):
     """
     _RECENT_RESULT_TTL_SECONDS = 1.5
     _RECENT_RESULT_MAX_ITEMS = 64
+    _RECENT_RESULT_MAX_BYTES = 64 * 1024 * 1024
     _RSS_RECYCLE_MIN_THRESHOLD_BYTES = 700 * 1024 * 1024
     _RSS_RECYCLE_MAX_THRESHOLD_BYTES = 1200 * 1024 * 1024
     _RSS_RECYCLE_HEADROOM_BYTES = 224 * 1024 * 1024
@@ -626,6 +631,7 @@ class PlaywrightEngine(BaseScreenshotEngine):
         self._render_semaphore = asyncio.Semaphore(self._MAX_CONCURRENT_RENDER)
         self._debug_console_log = bool(Config.get_config("UI", "DEBUG_MODE", False))
         self._state_lock = asyncio.Lock()
+        self._context_changed = asyncio.Event()
         self._recycle_lock = asyncio.Lock()
         self._active_renders = 0
         self._render_count = 0
@@ -635,6 +641,8 @@ class PlaywrightEngine(BaseScreenshotEngine):
         self._rss_baseline_bytes: int | None = None
         self._recent_results: OrderedDict[str, tuple[float, bytes]] = OrderedDict()
         self._inflight_tasks: dict[str, asyncio.Task[bytes]] = {}
+        self._render_waiters: dict[asyncio.Task, int] = {}
+        self._close_task: asyncio.Task | None = None
         self._generation_counter = 0
         self._active_generation: ContextGeneration | None = None
         self._retiring_generations: list[ContextGeneration] = []
@@ -666,13 +674,16 @@ class PlaywrightEngine(BaseScreenshotEngine):
         return hasher.hexdigest()
 
     def _cleanup_recent_results_nolock(self, now: float) -> None:
-        while self._recent_results:
-            expire_at, _ = next(iter(self._recent_results.values()))
-            if expire_at > now:
-                break
-            self._recent_results.popitem(last=False)
-        while len(self._recent_results) > self._RECENT_RESULT_MAX_ITEMS:
-            self._recent_results.popitem(last=False)
+        for key, (expire_at, _) in tuple(self._recent_results.items()):
+            if expire_at <= now:
+                self._recent_results.pop(key)
+        size = sum(len(value) for _, value in self._recent_results.values())
+        while (
+            len(self._recent_results) > self._RECENT_RESULT_MAX_ITEMS
+            or size > self._RECENT_RESULT_MAX_BYTES
+        ):
+            _, (_, value) = self._recent_results.popitem(last=False)
+            size -= len(value)
 
     def _get_recent_result_nolock(self, key: str, now: float) -> bytes | None:
         entry = self._recent_results.get(key)
@@ -740,6 +751,7 @@ class PlaywrightEngine(BaseScreenshotEngine):
             ]
             return {
                 "closing": self._closing,
+                "memory_metric": "rss_parent_and_verified_descendants",
                 "preparation_timings": dict(self._preparation_timings),
                 "preparation_task_count": sum(
                     not task.done() for task in self._preparation_tasks
@@ -758,6 +770,10 @@ class PlaywrightEngine(BaseScreenshotEngine):
                 "preparing_generation_count": len(self._preparing_generations),
                 "inflight_task_count": len(self._inflight_tasks),
                 "recent_result_count": len(self._recent_results),
+                "recent_result_bytes": sum(
+                    len(value) for _, value in self._recent_results.values()
+                ),
+                "browser_resources": browser_resources.snapshot(),
                 "htmlrender_active_tasks": _HTMLRENDER_TASK_TRACKER.active_tasks,
                 "htmlrender_draining": _HTMLRENDER_TASK_TRACKER.is_draining,
             }
@@ -794,49 +810,121 @@ class PlaywrightEngine(BaseScreenshotEngine):
         # 浏览器在首次 _acquire_context 时按需启动，无需预热
 
     async def close(self) -> None:
+        if self._close_task is None:
+            self._close_task = browser_resources.spawn(
+                self._close_bounded(), name="renderer-engine-close"
+            )
+        await asyncio.shield(self._close_task)
+
+    async def _close_bounded(self) -> None:
+        with shutdown_budget(15.0):
+            await self._close_once()
+
+    async def _close_once(self) -> None:
         idle_task: asyncio.Task[None] | None = None
         async with self._state_lock:
             self._closing = True
+            self._context_changed.set()
             idle_task = self._idle_recycle_task
             self._idle_recycle_task = None
             self._recent_results.clear()
             self._recycle_pending = False
 
-        for task in tuple(self._preparation_tasks):
-            await stop_preparation(task)
-            self._preparation_tasks.discard(task)
         await _HTMLRENDER_TASK_TRACKER.mark_draining("engine_close")
+        failures = []
+        for task in tuple(self._preparation_tasks):
+            try:
+                await asyncio.wait_for(stop_preparation(task), remaining_timeout(10.0))
+            except Exception as error:
+                failures.append(error)
+            if task.done():
+                self._preparation_tasks.discard(task)
 
         if idle_task:
             idle_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await idle_task
 
-        await _HTMLRENDER_TASK_TRACKER.wait_for_idle()
+        try:
+            await asyncio.wait_for(
+                _HTMLRENDER_TASK_TRACKER.wait_for_idle(), remaining_timeout(10.0)
+            )
+        except Exception as error:
+            failures.append(error)
 
         async with self._state_lock:
             inflight_tasks = list(self._inflight_tasks.values())
 
         if inflight_tasks:
-            await asyncio.gather(*inflight_tasks, return_exceptions=True)
-
-        async with self._state_lock:
-            self._inflight_tasks.clear()
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(
+                        asyncio.gather(*inflight_tasks, return_exceptions=True)
+                    ),
+                    remaining_timeout(10.0),
+                )
+            except Exception as error:
+                failures.append(error)
 
         await self._log_runtime_snapshot("close:before_dispose")
-        await self._dispose_context_pool()
-        await _shutdown_browser_instance()
+
+        async def contexts():
+            with shutdown_budget(10.0):
+                results = await asyncio.gather(
+                    self._dispose_context_pool(),
+                    browser_resources.close_all(),
+                    return_exceptions=True,
+                )
+                for result in results:
+                    if isinstance(result, BaseException):
+                        raise result
+
+        for operation in (contexts, _shutdown_browser_instance):
+            try:
+                await asyncio.wait_for(operation(), remaining_timeout(10.0))
+            except Exception as error:
+                failures.append(error)
+        try:
+            await browser_resources.drain()
+        except Exception as error:
+            failures.append(error)
+        if (
+            browser_resources.contexts
+            or _HTMLRENDER_TASK_TRACKER.active_tasks
+            or any(not task.done() for task in self._inflight_tasks.values())
+            or any(not task.done() for task in self._preparation_tasks)
+            or any(
+                task is not asyncio.current_task() and not task.done()
+                for task in browser_resources.tasks
+            )
+        ):
+            raise RuntimeError("renderer_resource_release_unconfirmed") from (
+                failures[0] if failures else None
+            )
+        if (
+            failures
+            and htmlrender_browser is not None
+            and any(
+                getattr(htmlrender_browser, name, None) is not None
+                for name in ("_browser", "_playwright")
+            )
+        ):
+            raise RuntimeError("renderer_browser_cleanup_failed") from failures[0]
+        self._active_generation = None
+        self._inflight_tasks.clear()
+        self._retiring_generations.clear()
+        self._preparing_generations.clear()
         await self._log_runtime_snapshot("close:after_shutdown")
 
     async def _on_render_begin(self) -> None:
         await _HTMLRENDER_TASK_TRACKER.begin("zhenxun_renderer")
-        async with self._state_lock:
-            self._active_renders += 1
+        self._active_renders += 1
 
     async def _on_render_end(self) -> None:
+        await _HTMLRENDER_TASK_TRACKER.end()
+        self._active_renders = max(0, self._active_renders - 1)
         should_recycle = False
         async with self._state_lock:
-            self._active_renders = max(0, self._active_renders - 1)
             self._render_count += 1
             now = time.monotonic()
             self._last_render_finished_at = now
@@ -845,7 +933,6 @@ class PlaywrightEngine(BaseScreenshotEngine):
                 self._recycle_pending = False
                 self._last_recycle_at = now
                 should_recycle = True
-        await _HTMLRENDER_TASK_TRACKER.end()
         if should_recycle:
             await self._recycle_browser("active")
 
@@ -1219,14 +1306,28 @@ class PlaywrightEngine(BaseScreenshotEngine):
     ) -> bytes:
         browser = await _get_browser_instance()
         page_options = self._build_page_options(render_options, pooled=False)
-        page = await browser.new_page(**page_options)
+        context = await browser_resources.create_context(
+            browser, owner="renderer_oneoff", **page_options
+        )
+        page = None
+        failed = False
         try:
+            page = await context.new_page()
             return await self._render_with_page(
                 page, html, template_path, render_options
             )
+        except BaseException:
+            failed = True
+            raise
         finally:
-            with contextlib.suppress(Exception):
-                await page.close()
+            try:
+                await browser_resources.cleanup(
+                    browser_resources.finish_page(page, context, retain=False),
+                    name="renderer-oneoff-cleanup",
+                )
+            except Exception:
+                if not failed:
+                    raise
 
     async def _dispose_generation(self, generation: ContextGeneration) -> None:
         contexts = list(generation.all_contexts)
@@ -1236,14 +1337,12 @@ class PlaywrightEngine(BaseScreenshotEngine):
             except asyncio.QueueEmpty:
                 break
 
-        failures = []
-        for context in contexts:
-            try:
-                await context.close()
-            except Exception as error:
-                failures.append(error)
-            else:
-                generation.all_contexts.discard(context)
+        with shutdown_budget(10.0):
+            results = await asyncio.gather(
+                *(self._discard_context(generation, context) for context in contexts),
+                return_exceptions=True,
+            )
+        failures = [result for result in results if isinstance(result, BaseException)]
         if failures:
             raise RuntimeError("renderer_context_cleanup_failed") from failures[0]
 
@@ -1254,19 +1353,31 @@ class PlaywrightEngine(BaseScreenshotEngine):
                 for generation in self._retiring_generations
                 if generation.active_leases <= 0
             ]
+        failures = []
         for generation in disposable:
-            await self._dispose_generation(generation)
+            try:
+                await self._dispose_generation(generation)
+            except Exception as error:
+                failures.append(error)
+                continue
             async with self._state_lock:
                 if generation in self._retiring_generations:
                     self._retiring_generations.remove(generation)
+        if failures:
+            raise RuntimeError("renderer_context_cleanup_failed") from failures[0]
 
     async def _dispose_context_pool(self) -> None:
         async with self._state_lock:
             generations = [*self._retiring_generations, *self._preparing_generations]
             if self._active_generation is not None:
                 generations.append(self._active_generation)
+        failures = []
         for generation in generations:
-            await self._dispose_generation(generation)
+            try:
+                await self._dispose_generation(generation)
+            except Exception as error:
+                failures.append(error)
+                continue
             async with self._state_lock:
                 if self._active_generation is generation:
                     self._active_generation = None
@@ -1274,6 +1385,8 @@ class PlaywrightEngine(BaseScreenshotEngine):
                     self._retiring_generations.remove(generation)
                 if generation in self._preparing_generations:
                     self._preparing_generations.remove(generation)
+        if failures:
+            raise RuntimeError("renderer_context_cleanup_failed") from failures[0]
 
     async def _build_generation(self, *, strict: bool = False) -> ContextGeneration:
         async with self._state_lock:
@@ -1296,8 +1409,12 @@ class PlaywrightEngine(BaseScreenshotEngine):
                 async with semaphore:
                     if self._closing:
                         raise RuntimeError("renderer_closing")
-                    context = await browser.new_context(
-                        viewport={"width": 800, "height": 10}, device_scale_factor=2
+                    context = await browser_resources.create_context(
+                        browser,
+                        owner="renderer_pool",
+                        generation=generation.generation_id,
+                        viewport={"width": 800, "height": 10},
+                        device_scale_factor=2,
                     )
                     generation.all_contexts.add(context)
                     page = await context.new_page()
@@ -1330,8 +1447,14 @@ class PlaywrightEngine(BaseScreenshotEngine):
                     task.cancel()
             for task in tasks:
                 await stop_preparation(task)
-            await self._dispose_generation(generation)
-            if generation in self._preparing_generations:
+            try:
+                await self._dispose_generation(generation)
+            except Exception:
+                pass
+            if (
+                not generation.all_contexts
+                and generation in self._preparing_generations
+            ):
                 self._preparing_generations.remove(generation)
             raise
         finally:
@@ -1352,6 +1475,7 @@ class PlaywrightEngine(BaseScreenshotEngine):
                 old_generation.retiring = True
                 self._retiring_generations.append(old_generation)
             self._active_generation = new_generation
+            self._context_changed.set()
             self._preparing_generations.remove(new_generation)
 
         await self._cleanup_retiring_generations()
@@ -1370,35 +1494,52 @@ class PlaywrightEngine(BaseScreenshotEngine):
             await self._swap_generation("startup_warmup", strict=True)
 
     async def _acquire_context(self) -> tuple[ContextGeneration, Any]:
-        generation: ContextGeneration | None = None
-        create_new = False
-        async with self._state_lock:
-            generation = self._ensure_active_generation_nolock()
-            try:
-                context = generation.context_pool.get_nowait()
-                generation.active_leases += 1
-                return generation, context
-            except asyncio.QueueEmpty:
-                create_new = len(generation.all_contexts) < self._CONTEXT_POOL_SIZE
+        while True:
+            async with self._state_lock:
+                if self._closing:
+                    raise RuntimeError("renderer_closing")
+                generation = self._ensure_active_generation_nolock()
+                try:
+                    context = generation.context_pool.get_nowait()
+                except asyncio.QueueEmpty:
+                    count = len(generation.all_contexts) + generation.pending_creations
+                    if count < self._CONTEXT_POOL_SIZE:
+                        generation.pending_creations += 1
+                        generation.active_leases += 1
+                        break
+                    if not generation.active_leases:
+                        raise RuntimeError("renderer_context_cleanup_pending")
+                    self._context_changed.clear()
+                else:
+                    generation.active_leases += 1
+                    return generation, context
+            await self._context_changed.wait()
 
-        if create_new:
+        context = None
+        try:
             browser = await _get_browser_instance()
-            context = await browser.new_context(
+            context = await browser_resources.create_context(
+                browser,
+                owner="renderer_pool",
+                generation=generation.generation_id,
                 viewport={"width": 800, "height": 10},
                 device_scale_factor=2,
             )
-            async with self._state_lock:
-                target_generation = generation
-                if target_generation.retiring and self._active_generation is not None:
-                    target_generation = self._active_generation
-                target_generation.all_contexts.add(context)
-                target_generation.active_leases += 1
-                return target_generation, context
-
-        context = await generation.context_pool.get()
-        async with self._state_lock:
-            generation.active_leases += 1
-        return generation, context
+            if self._closing:
+                raise RuntimeError("renderer_closing")
+            generation.all_contexts.add(context)
+            return generation, context
+        except BaseException:
+            generation.active_leases = max(0, generation.active_leases - 1)
+            if context is not None:
+                browser_resources.spawn(
+                    browser_resources.close_context(context),
+                    name="renderer-unused-context-cleanup",
+                )
+            raise
+        finally:
+            generation.pending_creations -= 1
+            self._context_changed.set()
 
     async def _release_context(
         self,
@@ -1415,6 +1556,7 @@ class PlaywrightEngine(BaseScreenshotEngine):
                 should_discard = True
             elif not should_discard:
                 generation.context_pool.put_nowait(context)
+            self._context_changed.set()
 
         if should_discard:
             await self._discard_context(generation, context)
@@ -1424,13 +1566,24 @@ class PlaywrightEngine(BaseScreenshotEngine):
     async def _discard_context(
         self, generation: ContextGeneration, context: Any
     ) -> None:
-        async with self._state_lock:
-            existed = context in generation.all_contexts
-            if existed:
-                generation.all_contexts.remove(context)
-        if existed:
-            with contextlib.suppress(Exception):
-                await context.close()
+        if context in generation.all_contexts:
+            await browser_resources.close_context(context)
+            generation.all_contexts.discard(context)
+            self._context_changed.set()
+
+    async def _finish_pooled_page(self, generation, context, page, broken) -> None:
+        with shutdown_budget(10.0):
+            try:
+                reusable = await browser_resources.finish_page(
+                    page, context, retain=not broken
+                )
+            except BaseException:
+                # Failed contexts stay owned but must never return to the pool.
+                generation.active_leases = max(0, generation.active_leases - 1)
+                self._recycle_pending = True
+                self._context_changed.set()
+                raise
+            await self._release_context(generation, context, broken=not reusable)
 
     async def _render_with_context_pool(
         self,
@@ -1455,6 +1608,9 @@ class PlaywrightEngine(BaseScreenshotEngine):
                 return await self._render_with_page(
                     page, html, template_path, render_options
                 )
+            except asyncio.CancelledError:
+                broken = True
+                raise
             except Exception as e:
                 broken = True
                 last_error = e
@@ -1478,10 +1634,14 @@ class PlaywrightEngine(BaseScreenshotEngine):
                     continue
                 raise
             finally:
-                if page is not None:
-                    with contextlib.suppress(Exception):
-                        await page.close()
-                await self._release_context(generation, context, broken=broken)
+                try:
+                    await browser_resources.cleanup(
+                        self._finish_pooled_page(generation, context, page, broken),
+                        name="renderer-pooled-page-cleanup",
+                    )
+                except Exception:
+                    if not broken:
+                        raise
 
         if last_error is not None:
             raise last_error
@@ -1501,14 +1661,20 @@ class PlaywrightEngine(BaseScreenshotEngine):
 
     async def _recycle_browser(self, reason: str) -> None:
         async with self._recycle_lock:
+            if self._closing or _HTMLRENDER_TASK_TRACKER.active_tasks:
+                self._recycle_pending = True
+                return
             try:
+                await browser_resources.retry_failed()
                 await self._swap_generation(reason)
+                self._recycle_pending = False
                 current_rss = self._get_total_rss()
                 if current_rss is not None:
                     self._update_rss_baseline_nolock(current_rss)
                 await self._log_runtime_snapshot(f"recycle:{reason}")
             except Exception as e:
-                logger.warning("浏览器实例重建失败。", "PlaywrightEngine", e=e)
+                self._recycle_pending = True
+                logger.warning("浏览器 context 轮换失败。", "PlaywrightEngine", e=e)
 
     async def _idle_recycle_loop(self) -> None:
         while True:
@@ -1518,18 +1684,19 @@ class PlaywrightEngine(BaseScreenshotEngine):
                 if self._closing:
                     return
                 now = time.monotonic()
+                self._cleanup_recent_results_nolock(now)
                 if _HTMLRENDER_TASK_TRACKER.active_tasks > 0:
                     continue
                 if now - self._last_recycle_at < self._RECYCLE_COOLDOWN_SECONDS:
                     continue
                 idle_for = now - self._last_render_finished_at
-                if idle_for < self._IDLE_RECYCLE_SECONDS:
+                if not self._recycle_pending and idle_for < self._IDLE_RECYCLE_SECONDS:
                     continue
                 current_rss = self._get_total_rss()
                 if current_rss is None:
                     continue
                 threshold = self._get_dynamic_threshold_nolock(current_rss)
-                if current_rss >= threshold:
+                if self._recycle_pending or current_rss >= threshold:
                     self._last_recycle_at = now
                     should_recycle = True
             if should_recycle:
@@ -1555,11 +1722,12 @@ class PlaywrightEngine(BaseScreenshotEngine):
 
         async with self._state_lock:
             now = time.monotonic()
-            self._recent_results[key] = (
-                now + self._RECENT_RESULT_TTL_SECONDS,
-                result,
-            )
-            self._recent_results.move_to_end(key)
+            if len(result) <= self._RECENT_RESULT_MAX_BYTES and not self._closing:
+                self._recent_results[key] = (
+                    now + self._RECENT_RESULT_TTL_SECONDS,
+                    result,
+                )
+                self._recent_results.move_to_end(key)
             self._cleanup_recent_results_nolock(now)
         return result
 
@@ -1581,8 +1749,9 @@ class PlaywrightEngine(BaseScreenshotEngine):
             final_render_options,
         )
 
-        owner = False
         async with self._state_lock:
+            if self._closing or _HTMLRENDER_TASK_TRACKER.is_draining:
+                raise RuntimeError("renderer_closing")
             now = time.monotonic()
             self._cleanup_recent_results_nolock(now)
             if cached_result := self._get_recent_result_nolock(dedupe_key, now):
@@ -1599,15 +1768,32 @@ class PlaywrightEngine(BaseScreenshotEngine):
                     )
                 )
                 self._inflight_tasks[dedupe_key] = task
-                owner = True
+
+                def finished(done: asyncio.Task) -> None:
+                    if self._inflight_tasks.get(dedupe_key) is done:
+                        self._inflight_tasks.pop(dedupe_key, None)
+                    if not done.cancelled():
+                        done.exception()
+
+                task.add_done_callback(finished)
+            self._render_waiters[task] = self._render_waiters.get(task, 0) + 1
 
         try:
-            return await task
+            return await asyncio.shield(task)
         finally:
-            if owner:
-                async with self._state_lock:
-                    if self._inflight_tasks.get(dedupe_key) is task:
-                        self._inflight_tasks.pop(dedupe_key, None)
+            remaining = self._render_waiters[task] - 1
+            if remaining:
+                self._render_waiters[task] = remaining
+            else:
+                self._render_waiters.pop(task, None)
+                if not task.done():
+                    task.cancel()
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(task), remaining_timeout(10.0)
+                        )
+                    except (asyncio.CancelledError, Exception):
+                        pass
 
 
 async def stop_preparation(task: asyncio.Task | None) -> None:
