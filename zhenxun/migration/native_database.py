@@ -37,6 +37,18 @@ _TOOLS = {
     "mysql": ("mysql", "mysqldump"),
     "postgres": ("psql", "pg_dump", "pg_restore"),
 }
+_MYSQL_RESTORE_PRIVILEGES = {
+    "CREATE",
+    "ALTER",
+    "DROP",
+    "INDEX",
+    "INSERT",
+    "UPDATE",
+    "DELETE",
+    "REFERENCES",
+    "SELECT",
+    "LOCK TABLES",
+}
 
 
 class DatabaseEndpoint(DatabaseConnection):
@@ -150,11 +162,13 @@ class NativeDatabase:
         diagnostic=None,
         progress=None,
         phase="database",
+        capability="export",
     ):
         self.endpoint = endpoint
         self.directory = private_directory(directory / uuid.uuid4().hex)
         self.supervisor, self.budget, self.checkpoint = supervisor, budget, checkpoint
         self.diagnostic, self.progress, self.phase = diagnostic, progress, phase
+        self.capability = capability
         self.secrets = [
             endpoint.password,
             endpoint.options.get("sslpassword"),
@@ -179,6 +193,7 @@ class NativeDatabase:
                             "tool": name,
                             "engine": endpoint.engine,
                             "phase": phase,
+                            "capability": capability,
                             "operation": "locate",
                             "error_code": "migration_database_tool_missing",
                             "stderr": "",
@@ -432,6 +447,7 @@ class NativeDatabase:
                             "tool": tool,
                             "engine": self.endpoint.engine,
                             "phase": self.phase,
+                            "capability": self.capability,
                             "operation": operation,
                             "return_code": process.returncode
                             if process is not None
@@ -534,8 +550,11 @@ class NativeDatabase:
             ):
                 raise MigrationError("migration_database_relations_invalid")
 
-    async def probe_connection(self):
-        """Check connection, tool versions and read privileges without a snapshot."""
+    async def probe_connection(self, capability=None):
+        """Check connection, tools and migration permissions without a snapshot."""
+        capability = self.capability if capability is None else capability
+        if capability not in {"export", "restore"}:
+            raise MigrationError("migration_database_capability_invalid")
         for tool in self.tools:
             await self.run(tool, ["--version"])
         if self.endpoint.engine == "postgres":
@@ -543,6 +562,16 @@ class NativeDatabase:
             tls = await self.query(
                 "SELECT ssl FROM pg_stat_ssl WHERE pid=pg_backend_pid();"
             )
+            usage = await self.query(
+                "SELECT COUNT(*) FROM pg_namespace WHERE nspname='public' "
+                "AND has_schema_privilege(current_user,oid,'USAGE');"
+            )
+            if usage != "1":
+                self._record_policy_diagnostic(
+                    reasons=["schema_usage_missing"],
+                    error_code="migration_database_read_permission_denied",
+                )
+                raise MigrationError("migration_database_read_permission_denied")
             denied = await self.query(
                 "SELECT count(*) FROM pg_class c "
                 "JOIN pg_namespace n ON n.oid=c.relnamespace "
@@ -552,6 +581,10 @@ class NativeDatabase:
                 "ELSE has_table_privilege(c.oid,'SELECT') END;"
             )
             if denied != "0":
+                self._record_policy_diagnostic(
+                    reasons=["table_or_sequence_select_missing"],
+                    error_code="migration_database_read_permission_denied",
+                )
                 raise MigrationError("migration_database_read_permission_denied")
             observed = tls == "t" if tls in {"t", "f"} else None
         else:
@@ -566,11 +599,248 @@ class NativeDatabase:
                 await self.query(f"SELECT 1 FROM {self.identifier(table)} LIMIT 0;")
         for tool in self.tools:
             require_version(self.endpoint.engine, version, self.tool_versions[tool])
+        await self._check_migration_privileges()
+        if capability == "restore":
+            await self._check_restore_privileges()
         return {
             "observed_tls": observed,
             "server_version": version,
             "tools": dict(self.tool_versions),
+            "capability": capability,
+            "server": await self.server_identity(),
         }
+
+    async def server_identity(self):
+        """Read the server identity used by migration target comparisons."""
+        if self.endpoint.engine == "mysql":
+            return await self.query("SELECT @@server_uuid;")
+        return await self.query(
+            "SELECT COALESCE(inet_server_addr()::text,'local') "
+            "|| ':' || inet_server_port()::text;"
+        )
+
+    def _record_policy_diagnostic(
+        self,
+        *,
+        reasons=None,
+        permission_checks=None,
+        restore_permission_checks=None,
+        missing_restore_privileges=None,
+        restore_privilege_reasons=None,
+        capability=None,
+        error_code="migration_database_privileges_unsupported",
+        isolation_reasons=None,
+    ):
+        if self.diagnostic is None:
+            return
+        now = time.time()
+        record = {
+            "tool": "mysql" if self.endpoint.engine == "mysql" else "psql",
+            "engine": self.endpoint.engine,
+            "phase": self.phase,
+            "operation": "policy",
+            "return_code": 0,
+            "started_at": now,
+            "duration_seconds": 0,
+            "stdout_bytes": 0,
+            "stderr_bytes": 0,
+            "stderr": "",
+            "truncated": False,
+            "tool_version": self.tool_versions.get(
+                "mysql" if self.endpoint.engine == "mysql" else "psql"
+            ),
+            "environment": f"{sys.platform}; Python {sys.version.split()[0]}",
+            "error_code": error_code,
+            "timed_out": False,
+            "process_returned": True,
+            "diagnostic_id": uuid.uuid4().hex,
+            "capability": capability or self.capability,
+            "recorded_at": now,
+        }
+        if permission_checks is not None:
+            record["permission_checks"] = permission_checks
+        if reasons:
+            record["privilege_reasons"] = reasons
+        if restore_permission_checks is not None:
+            record["restore_permission_checks"] = restore_permission_checks
+        if missing_restore_privileges is not None:
+            record["missing_restore_privileges"] = missing_restore_privileges
+        if restore_privilege_reasons:
+            record["restore_privilege_reasons"] = restore_privilege_reasons
+        if isolation_reasons:
+            record["isolation_reasons"] = isolation_reasons
+        try:
+            self.diagnostic(record)
+        except Exception:
+            # Diagnostic storage must not replace the policy rejection.
+            pass
+
+    async def _mysql_schema_grants(self):
+        """Read current-account grants with MySQL's literal scope semantics."""
+        grantee = (
+            "CONCAT(QUOTE(SUBSTRING_INDEX(CURRENT_USER(),'@',1)), '@', "
+            "QUOTE(SUBSTRING_INDEX(CURRENT_USER(),'@',-1)))"
+        )
+        grants = await self.rows(
+            "SELECT JSON_OBJECT('scope',TABLE_SCHEMA,'grantable',IS_GRANTABLE,"
+            "'privilege',PRIVILEGE_TYPE) FROM information_schema.SCHEMA_PRIVILEGES "
+            f"WHERE GRANTEE={grantee}"
+        )
+        literal = await self.query("SELECT @@partial_revokes;") == "1"
+        try:
+            return [
+                {**row, "scope": mysql_grant_scope(row["scope"], literal=literal)}
+                for row in grants
+            ]
+        except MigrationError as error:
+            self._record_policy_diagnostic(
+                reasons=["schema_scope"], error_code=error.code
+            )
+            raise
+
+    async def _check_migration_privileges(self):
+        """Validate the read-only account boundary required by migration."""
+        if self.endpoint.engine == "mysql":
+            grantee = (
+                "CONCAT(QUOTE(SUBSTRING_INDEX(CURRENT_USER(),'@',1)), '@', "
+                "QUOTE(SUBSTRING_INDEX(CURRENT_USER(),'@',-1)))"
+            )
+            global_grants = await self.rows(
+                "SELECT JSON_OBJECT('privilege',PRIVILEGE_TYPE,"
+                "'grantable',IS_GRANTABLE) FROM "
+                "information_schema.USER_PRIVILEGES "
+                f"WHERE GRANTEE={grantee}"
+            )
+            privileges = {r["privilege"] for r in global_grants}
+            reasons = []
+            if privileges - {"USAGE", "PROCESS"}:
+                reasons.append("global_privileges")
+            if any(row.get("grantable") == "YES" for row in global_grants):
+                reasons.append("global_grantable")
+            if "PROCESS" not in privileges:
+                reasons.append("process_privilege_missing")
+            if (
+                await self.query(
+                    "SELECT COUNT(*) FROM information_schema.APPLICABLE_ROLES;"
+                )
+                != "0"
+            ):
+                reasons.append("role_inheritance")
+            scopes = await self._mysql_schema_grants()
+            if not scopes or any(
+                r["scope"] != self.endpoint.database or r["grantable"] != "NO"
+                for r in scopes
+            ):
+                reasons.append("schema_scope")
+            for table in ("TABLE_PRIVILEGES", "COLUMN_PRIVILEGES"):
+                if (
+                    await self.query(
+                        f"SELECT COUNT(*) FROM information_schema.{table} "
+                        f"WHERE GRANTEE={grantee};"
+                    )
+                    != "0"
+                ):
+                    reasons.append(f"{table.lower()}_grants")
+            if reasons:
+                self._record_policy_diagnostic(reasons=sorted(set(reasons)))
+                raise MigrationError("migration_database_privileges_unsupported")
+            return
+
+        privileged = await self.query(
+            "SELECT COUNT(*) FROM pg_roles WHERE rolname=current_user AND "
+            "(rolsuper OR rolcreaterole OR rolcreatedb OR rolreplication "
+            "OR rolbypassrls);"
+        )
+        roles = await self.query(
+            "SELECT COUNT(*) FROM pg_auth_members WHERE "
+            "member=(SELECT oid FROM pg_roles WHERE rolname=current_user);"
+        )
+        other_create = await self.query(
+            "SELECT COUNT(*) FROM pg_database WHERE datname<>current_database() "
+            "AND has_database_privilege(current_user,oid,'CREATE');"
+        )
+        if privileged == "0" and roles == "0" and other_create == "0":
+            return
+
+        checks = {
+            "privileged_roles": int(privileged),
+            "direct_role_memberships": int(roles),
+            "other_database_create": int(other_create),
+        }
+        reasons = [label for label, value in checks.items() if value]
+        self._record_policy_diagnostic(
+            reasons=reasons,
+            permission_checks=checks,
+        )
+        raise MigrationError("migration_database_privileges_unsupported")
+
+    async def _check_restore_privileges(self):
+        """Validate the DDL and DML permissions used by native restore."""
+        if self.endpoint.engine == "mysql":
+            grants = await self._mysql_schema_grants()
+            privileges = {
+                row["privilege"]
+                for row in grants
+                if row["scope"] == self.endpoint.database and row["grantable"] == "NO"
+            }
+            effective = (
+                set(_MYSQL_RESTORE_PRIVILEGES)
+                if "ALL PRIVILEGES" in privileges
+                else privileges
+            )
+            missing = sorted(_MYSQL_RESTORE_PRIVILEGES - effective)
+            checks = {
+                privilege.lower().replace(" ", "_"): int(privilege in effective)
+                for privilege in sorted(_MYSQL_RESTORE_PRIVILEGES)
+            }
+            if missing:
+                self._record_policy_diagnostic(
+                    restore_permission_checks=checks,
+                    missing_restore_privileges=missing,
+                    restore_privilege_reasons=["schema_restore_privileges_missing"],
+                    capability="restore",
+                )
+                raise MigrationError("migration_database_privileges_unsupported")
+            return
+
+        rows = await self.rows(
+            "SELECT has_database_privilege(current_user,current_database(),"
+            "'CONNECT') AS database_connect, "
+            "has_database_privilege(current_user,current_database(),'CREATE') "
+            "AS database_create, "
+            "has_schema_privilege(current_user,'public','USAGE') AS schema_usage, "
+            "has_schema_privilege(current_user,'public','CREATE') AS schema_create, "
+            "(pg_get_userbyid(nspowner)=current_user OR "
+            "pg_has_role(current_user,nspowner,'USAGE')) AS schema_owner "
+            "FROM pg_namespace WHERE nspname='public'"
+        )
+        observed = rows[0] if rows else {}
+        names = (
+            "database_connect",
+            "database_create",
+            "schema_usage",
+            "schema_create",
+            "schema_owner",
+        )
+        checks = {
+            name: int(observed.get(name) is True or observed.get(name) == "true")
+            for name in names
+        }
+        missing = [name for name in names if not checks[name]]
+        if missing:
+            self._record_policy_diagnostic(
+                restore_permission_checks=checks,
+                missing_restore_privileges=missing,
+                restore_privilege_reasons=["public_schema_restore_privileges_missing"],
+                capability="restore",
+            )
+            raise MigrationError("migration_database_privileges_unsupported")
+
+    async def check_restore_privileges(self):
+        """Recheck restore privileges immediately before a destructive phase."""
+        self.capability = "restore"
+        await self._check_migration_privileges()
+        await self._check_restore_privileges()
 
     async def inspect(self, *, quiet=True):
         engine = self.endpoint.engine
@@ -580,45 +850,7 @@ class NativeDatabase:
         if engine == "mysql":
             version = await self.query("SELECT VERSION();")
             require_version(engine, version, version)
-            grantee = (
-                "CONCAT(QUOTE(SUBSTRING_INDEX(CURRENT_USER(),'@',1)), '@', "
-                "QUOTE(SUBSTRING_INDEX(CURRENT_USER(),'@',-1)))"
-            )
-            global_grants = await self.rows(
-                "SELECT JSON_OBJECT('privilege',PRIVILEGE_TYPE) FROM "
-                f"information_schema.USER_PRIVILEGES WHERE GRANTEE={grantee}"
-            )
-            privileges = {r["privilege"] for r in global_grants}
-            if privileges - {"USAGE", "PROCESS"} or "PROCESS" not in privileges:
-                raise MigrationError("migration_database_privileges_unsupported")
-            if (
-                await self.query(
-                    "SELECT COUNT(*) FROM information_schema.APPLICABLE_ROLES;"
-                )
-                != "0"
-            ):
-                raise MigrationError("migration_database_privileges_unsupported")
-            scopes = await self.rows(
-                "SELECT JSON_OBJECT('scope',TABLE_SCHEMA,'grantable',IS_GRANTABLE) "
-                f"FROM information_schema.SCHEMA_PRIVILEGES WHERE GRANTEE={grantee}"
-            )
-            literal_grants = await self.query("SELECT @@partial_revokes;") == "1"
-            if not scopes or any(
-                mysql_grant_scope(r["scope"], literal=literal_grants)
-                != self.endpoint.database
-                or r["grantable"] != "NO"
-                for r in scopes
-            ):
-                raise MigrationError("migration_database_privileges_unsupported")
-            for table in ("TABLE_PRIVILEGES", "COLUMN_PRIVILEGES"):
-                if (
-                    await self.query(
-                        f"SELECT COUNT(*) FROM information_schema.{table} "
-                        f"WHERE GRANTEE={grantee};"
-                    )
-                    != "0"
-                ):
-                    raise MigrationError("migration_database_privileges_unsupported")
+            await self._check_migration_privileges()
             if (
                 quiet
                 and await self.query(
@@ -713,76 +945,11 @@ class NativeDatabase:
                 "ORDER BY TABLE_NAME,INDEX_NAME,SEQ_IN_INDEX"
             )
             sequence = []
-            server = await self.query("SELECT @@server_uuid;")
+            server = await self.server_identity()
         else:
             version = await self.query("SHOW server_version;")
             require_version(engine, version, version)
-            privilege_started = time.monotonic()
-            privileged = await self.query(
-                "SELECT COUNT(*) FROM pg_roles WHERE rolname=current_user AND "
-                "(rolsuper OR rolcreaterole OR rolcreatedb OR rolreplication "
-                "OR rolbypassrls);"
-            )
-            roles = await self.query(
-                "SELECT COUNT(*) FROM pg_auth_members WHERE "
-                "member=(SELECT oid FROM pg_roles WHERE rolname=current_user);"
-            )
-            other_create = await self.query(
-                "SELECT COUNT(*) FROM pg_database WHERE datname<>current_database() "
-                "AND has_database_privilege(current_user,oid,'CREATE');"
-            )
-            if privileged != "0" or roles != "0" or other_create != "0":
-                checks = {
-                    "privileged_roles": int(privileged),
-                    "direct_role_memberships": int(roles),
-                    "other_database_create": int(other_create),
-                }
-                reasons = [
-                    label
-                    for label, value in (
-                        ("privileged_roles", checks["privileged_roles"]),
-                        (
-                            "direct_role_memberships",
-                            checks["direct_role_memberships"],
-                        ),
-                        (
-                            "other_database_create",
-                            checks["other_database_create"],
-                        ),
-                    )
-                    if value
-                ]
-                if self.diagnostic is not None:
-                    self.diagnostic(
-                        {
-                            "tool": "psql",
-                            "engine": "postgres",
-                            "phase": self.phase,
-                            "operation": "policy",
-                            "return_code": 0,
-                            "started_at": time.time()
-                            - (time.monotonic() - privilege_started),
-                            "duration_seconds": round(
-                                time.monotonic() - privilege_started, 2
-                            ),
-                            "stdout_bytes": 0,
-                            "stderr_bytes": 0,
-                            "stderr": "",
-                            "truncated": False,
-                            "tool_version": self.tool_versions.get("psql"),
-                            "environment": (
-                                f"{sys.platform}; Python {sys.version.split()[0]}"
-                            ),
-                            "error_code": "migration_database_privileges_unsupported",
-                            "timed_out": False,
-                            "process_returned": True,
-                            "diagnostic_id": uuid.uuid4().hex,
-                            "permission_checks": checks,
-                            "privilege_reasons": reasons,
-                            "recorded_at": time.time(),
-                        }
-                    )
-                raise MigrationError("migration_database_privileges_unsupported")
+            await self._check_migration_privileges()
             if (
                 quiet
                 and await self.query(
@@ -880,10 +1047,7 @@ class NativeDatabase:
                     + self.identifier(row["name"])
                 )
                 sequence.append({**row, **values[0]})
-            server = await self.query(
-                "SELECT COALESCE(inet_server_addr()::text,'local') "
-                "|| ':' || inet_server_port()::text;"
-            )
+            server = await self.server_identity()
         for tool in self.tools:
             require_version(engine, version, self.tool_versions[tool])
         await self.verify_relations(foreign_keys)
@@ -1012,6 +1176,7 @@ class NativeDatabase:
 
     async def restore(self, payload, *, confirmed_tables):
         self.check()
+        await self.check_restore_privileges()
         if self.endpoint.engine == "mysql":
             if confirmed_tables:
                 await self.query(
@@ -1065,7 +1230,15 @@ async def native_session(
     diagnostic=None,
     progress=None,
     phase="database",
+    capability="export",
+    account_role=None,
 ):
+    if diagnostic is not None and account_role is not None:
+        original_diagnostic = diagnostic
+
+        def diagnostic(record):
+            original_diagnostic({**record, "account_role": account_role})
+
     supervisor = LauncherSupervisor(LifecycleKernel())
     client = None
     failure = None
@@ -1081,6 +1254,7 @@ async def native_session(
             diagnostic=diagnostic,
             progress=progress,
             phase=phase,
+            capability=capability,
         )
         yield client
     except BaseException as caught:

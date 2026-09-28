@@ -1058,8 +1058,14 @@ class TaskStore:
             "timed_out",
             "process_returned",
             "diagnostic_id",
+            "capability",
             "permission_checks",
             "privilege_reasons",
+            "restore_permission_checks",
+            "missing_restore_privileges",
+            "restore_privilege_reasons",
+            "account_role",
+            "isolation_reasons",
         }
         if set(diagnostic) - allowed or not isinstance(diagnostic.get("stderr"), str):
             raise MigrationError("migration_task_metadata_invalid")
@@ -1081,7 +1087,68 @@ class TaskStore:
                 ):
                     raise MigrationError("migration_task_metadata_invalid")
                 continue
-            if key == "privilege_reasons":
+            if key in {"privilege_reasons", "isolation_reasons"}:
+                if not isinstance(value, list) or any(
+                    not isinstance(item, str) or len(item) > 128 for item in value
+                ):
+                    raise MigrationError("migration_task_metadata_invalid")
+                continue
+            if key == "account_role":
+                if value not in {"target", "candidate"}:
+                    raise MigrationError("migration_task_metadata_invalid")
+                continue
+            if key == "capability":
+                if value not in {"export", "restore"}:
+                    raise MigrationError("migration_task_metadata_invalid")
+                continue
+            if key == "restore_permission_checks":
+                allowed_checks = (
+                    frozenset(
+                        {
+                            "alter",
+                            "create",
+                            "delete",
+                            "drop",
+                            "index",
+                            "insert",
+                            "references",
+                            "update",
+                        }
+                    ),
+                    frozenset(
+                        {
+                            "database_connect",
+                            "database_create",
+                            "schema_usage",
+                            "schema_create",
+                            "schema_owner",
+                        }
+                    ),
+                )
+                if (
+                    not isinstance(value, dict)
+                    or (
+                        frozenset(value) not in allowed_checks
+                        and not (
+                            allowed_checks[0]
+                            <= frozenset(value)
+                            <= allowed_checks[0] | {"select", "lock_tables"}
+                        )
+                    )
+                    or any(
+                        type(item) is not int or item not in {0, 1}
+                        for item in value.values()
+                    )
+                ):
+                    raise MigrationError("migration_task_metadata_invalid")
+                continue
+            if key == "missing_restore_privileges":
+                if not isinstance(value, list) or any(
+                    not isinstance(item, str) or len(item) > 128 for item in value
+                ):
+                    raise MigrationError("migration_task_metadata_invalid")
+                continue
+            if key == "restore_privilege_reasons":
                 if not isinstance(value, list) or any(
                     not isinstance(item, str) or len(item) > 128 for item in value
                 ):

@@ -31,10 +31,12 @@ async def clients(
     diagnostic=None,
     progress=None,
     phase="database",
+    capability="export",
+    root=None,
 ):
     try:
-        target = DatabaseEndpoint.parse(private["target_url"])
-        candidate = DatabaseEndpoint.parse(private["candidate_url"])
+        target = DatabaseEndpoint.parse(private["target_url"], root=root)
+        candidate = DatabaseEndpoint.parse(private["candidate_url"], root=root)
     except (KeyError, TypeError):
         raise MigrationError("migration_database_credentials_required") from None
     require_same_engine(target.engine, candidate.engine)
@@ -51,6 +53,8 @@ async def clients(
         diagnostic=diagnostic,
         progress=progress,
         phase=phase,
+        capability=capability,
+        account_role="target",
     ) as target_client:
         async with native_session(
             candidate,
@@ -60,6 +64,8 @@ async def clients(
             diagnostic=diagnostic,
             progress=progress,
             phase=phase,
+            capability=capability,
+            account_role="candidate",
         ) as candidate_client:
             yield target_client, candidate_client
 
@@ -82,6 +88,11 @@ async def verify_account_isolation(target, candidate):
             "AND has_database_privilege(oid,current_database(),'CONNECT');"
         )
         if accessible != "0":
+            client._record_policy_diagnostic(
+                error_code="migration_database_candidate_isolation_required",
+                isolation_reasons=["other_account_can_connect"],
+                capability="restore",
+            )
             raise MigrationError("migration_database_candidate_isolation_required")
 
 
@@ -157,6 +168,7 @@ async def prepare_native(
         diagnostic=diagnostic,
         progress=progress,
         phase="restore_prepare",
+        capability="restore",
     ) as (target, candidate):
         require_same_engine(description["engine"], target.endpoint.engine)
         expected_format = (
@@ -170,6 +182,8 @@ async def prepare_native(
             else await target.inspect()
         )
         empty = await candidate.inspect()
+        await target.check_restore_privileges()
+        await candidate.check_restore_privileges()
         await verify_account_isolation(target, candidate)
         if (original["server"], original["database"]) == (
             empty["server"],
@@ -252,6 +266,7 @@ async def recheck_native(
         diagnostic=diagnostic,
         progress=progress,
         phase="restore_apply",
+        capability="restore",
     ) as (target, candidate):
         assert_identity(target, plan["target"])
         assert_identity(candidate, plan["candidate"])
@@ -261,6 +276,8 @@ async def recheck_native(
             else await target.inspect()
         )
         prepared = await candidate.inspect()
+        await target.check_restore_privileges()
+        await candidate.check_restore_privileges()
         await verify_account_isolation(target, candidate)
         if before["revision"] != plan["target_revision"]:
             raise MigrationError("migration_database_target_changed", status=409)
@@ -296,10 +313,12 @@ async def apply_native(
         diagnostic=diagnostic,
         progress=progress,
         phase="restore_apply",
+        capability="restore",
     ) as (target, candidate):
         assert_identity(target, plan["target"])
         assert_identity(candidate, plan["candidate"])
         before, prepared = await target.inspect(), await candidate.inspect()
+        await target.check_restore_privileges()
         await verify_account_isolation(target, candidate)
         if before["revision"] != plan["target_revision"]:
             raise MigrationError("migration_database_target_changed", status=409)
@@ -358,9 +377,12 @@ async def rollback_native(
         diagnostic=diagnostic,
         progress=progress,
         phase="restore_rollback",
+        capability="restore",
+        account_role="target",
     ) as target:
         assert_identity(target, plan["target"])
         before = await target.inspect()
+        await target.check_restore_privileges()
         backup = contained_path(staging, "database-target.backup", regular=True)
         if file_hash(backup, checkpoint) != plan["backup_sha256"]:
             raise MigrationError("migration_database_backup_changed")

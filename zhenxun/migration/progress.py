@@ -69,10 +69,10 @@ class ConsoleProgress:
         self.diagnostic = None
         self.shutdown = None
 
-    def show(self, job: dict) -> None:
+    def show(self, job: dict, *, emit_stage: bool = True) -> None:
         value = job.get("progress", {}).get("runtime", {})
         sequence = (job["id"], job.get("stage"), value.get("sequence"))
-        if sequence != self.sequence:
+        if emit_stage and sequence != self.sequence:
             emit_progress(job)
             self.sequence = sequence
         diagnostic = job.get("database_diagnostic") or {}
@@ -100,6 +100,11 @@ class ConsoleProgress:
                         else ""
                     )
                     + self._permission_summary(diagnostic)
+                    + (
+                        "诊断或工具清理异常：" + diagnostic["cleanup_error"] + "\n"
+                        if diagnostic.get("cleanup_error")
+                        else ""
+                    )
                     + diagnostic.get("stderr", "")
                     + "\n"
                 )
@@ -132,13 +137,51 @@ class ConsoleProgress:
 
     @staticmethod
     def _permission_summary(diagnostic: dict) -> str:
+        phase = diagnostic.get("phase")
+        role = {"target": "目标账号", "candidate": "候选账号"}.get(
+            diagnostic.get("account_role"), ""
+        )
+        prefix = (
+            "恢复前数据库权限检查失败，未停止 Bot；"
+            if phase == "restore_preflight"
+            else "导出前数据库权限检查失败，未停止 Bot；"
+            if phase == "export_preflight"
+            else ""
+        ) + (f"{role}；" if role else "")
+        isolation = diagnostic.get("isolation_reasons") or []
+        if isolation:
+            labels = {
+                "other_account_can_connect": (
+                    "另一账号仍可连接本数据库（包含 PUBLIC CONNECT）"
+                ),
+                "same_account_or_database": "目标与候选账号或数据库未隔离",
+                "same_database": "目标与候选指向同一实际数据库",
+            }
+            return (
+                prefix
+                + "隔离检查未通过："
+                + "；".join(labels.get(reason, reason) for reason in isolation)
+                + "\n"
+            )
+        missing = diagnostic.get("missing_restore_privileges") or []
+        if missing:
+            capability = diagnostic.get("capability") or "restore"
+            return (
+                prefix
+                + f"{capability} 权限检查未通过；缺少恢复权限："
+                + ", ".join(missing)
+                + "\n"
+            )
         checks = diagnostic.get("permission_checks") or {}
         if not checks:
-            return ""
+            reasons = diagnostic.get("privilege_reasons") or []
+            return (
+                prefix + "权限策略阻断：" + ", ".join(reasons) + "\n" if reasons else ""
+            )
         labels = {
             "privileged_roles": "高权限角色标记",
             "direct_role_memberships": "直接角色成员关系",
             "other_database_create": "其他数据库 CREATE 权限",
         }
         details = "；".join(f"{labels[key]}={checks.get(key, 0)}" for key in labels)
-        return f"工具执行成功；权限策略检查未通过：{details}\n"
+        return prefix + f"工具执行成功；权限策略检查未通过：{details}\n"

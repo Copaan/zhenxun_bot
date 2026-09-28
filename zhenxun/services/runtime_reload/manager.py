@@ -4875,8 +4875,20 @@ class PluginRuntimeManager:
                         observed_tasks.update(children)
                     for child in children:
                         child.add_done_callback(self._consume_cleanup_task)
-                        # These tasks were admitted by the bounded cleanup lease;
-                        # cancelling them can interrupt a parent's finally block.
+                        if (
+                            not child.done()
+                            and not self._cancellation_requests.get(child)
+                            and not getattr(child, "cancelling", lambda: 0)()
+                            and not any(not task.done() for task in tasks)
+                        ):
+                            marker = f"plugin_cleanup_cancel:{uuid4().hex}"
+                            self._cancellation_requests[child] = (
+                                marker,
+                                child.cancelling()
+                                if hasattr(child, "cancelling")
+                                else 0,
+                            )
+                            child.cancel(marker)
                     pending = {child for child in children if not child.done()}
                     if pending:
                         await asyncio.wait(pending, timeout=budget.remaining())

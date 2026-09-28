@@ -14,6 +14,22 @@ from .snapshot import ExportOptions
 from .tasks import TaskStore
 
 
+def _record_preflight_diagnostic(store, identity, diagnostic):
+    """Persist and print pre-handoff failures without replacing their first cause."""
+    from .progress import ConsoleProgress
+
+    try:
+        store.record_database_diagnostic(identity, diagnostic)
+    except Exception:
+        diagnostic = {
+            **diagnostic,
+            "cleanup_error": "migration_diagnostic_storage_failed",
+        }
+    ConsoleProgress().show(
+        {"id": identity, "database_diagnostic": diagnostic}, emit_stage=False
+    )
+
+
 async def submit_restore(
     project: Path,
     session: str,
@@ -86,7 +102,44 @@ async def submit_restore(
             job = store.bind_requester(identity, session, state["boot_id"])
             values = job["options"]
         store.reserve(job["id"])
+        handoff_started = False
         try:
+            database_options = options.get("database") or {}
+            if database_options.get("engine") in {"mysql", "postgres"}:
+                from zhenxun.services.database_probe import probe_restore_connections
+
+                checked = await probe_restore_connections(project, private)
+                if not checked.get("ready"):
+                    if checked.get("diagnostic"):
+                        _record_preflight_diagnostic(
+                            store, job["id"], checked["diagnostic"]
+                        )
+                    raise MigrationError(
+                        checked.get(
+                            "code", "migration_database_connection_unconfirmed"
+                        ),
+                        status=409,
+                    )
+            elif database_options.get("engine") == "sqlite":
+                from zhenxun.services.database_probe import (
+                    probe_sqlite_restore_target,
+                )
+
+                checked = probe_sqlite_restore_target(
+                    project, database_options.get("target_path", "")
+                )
+                if not checked.get("ready"):
+                    if checked.get("diagnostic"):
+                        _record_preflight_diagnostic(
+                            store, job["id"], checked["diagnostic"]
+                        )
+                    raise MigrationError(
+                        checked.get(
+                            "code", "migration_database_connection_unconfirmed"
+                        ),
+                        status=409,
+                    )
+            handoff_started = True
             receipt = await asyncio.to_thread(
                 request_control,
                 project,
@@ -101,8 +154,18 @@ async def submit_restore(
             recorded = read_json_locked(
                 store.path("jobs", job["id"]).parent / "handoff.json", None
             )
-            if not recorded and not error.code.startswith("migration_control_"):
+            if not recorded and not handoff_started:
                 store.transition(job["id"], "failed", error_code=error.code)
+            raise
+        except BaseException as error:
+            if not handoff_started:
+                store.transition(
+                    job["id"],
+                    "failed",
+                    error_code="migration_cancelled"
+                    if isinstance(error, asyncio.CancelledError)
+                    else "migration_database_preflight_failed",
+                )
             raise
         recorded = read_json_locked(
             store.path("jobs", job["id"]).parent / "handoff.json", None
@@ -211,7 +274,7 @@ async def submit_export(
             if not checked["ready"]:
                 native = checked.get("native", {})
                 if native.get("diagnostic"):
-                    store.record_database_diagnostic(job["id"], native["diagnostic"])
+                    _record_preflight_diagnostic(store, job["id"], native["diagnostic"])
                 code = (
                     native.get("code")
                     or checked.get("code")
