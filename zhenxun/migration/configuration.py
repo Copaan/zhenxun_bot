@@ -240,25 +240,43 @@ def dump_yaml(value: dict) -> str:
 def override_administrator(
     path: str, content: bytes, administrator: dict | None
 ) -> bytes:
+    """Apply confirmed credentials with canonical keys and retain field metadata."""
     if not administrator or path not in {
         "data/config.yaml",
         "data/configs/plugins2config.yaml",
     }:
         return content
     value = yaml_document(content.decode("utf-8-sig"))
+    groups = [key for key in value if str(key).casefold() == "web-ui"]
+    if len(groups) > 1:
+        raise MigrationError("migration_configuration_ambiguous_key")
+    if groups and groups[0] != "web-ui":
+        value["web-ui"] = value.pop(groups[0])
     group = value.setdefault("web-ui", {})
     if not isinstance(group, dict):
         raise MigrationError("migration_configuration_shape_invalid")
     for key, item in administrator.items():
         if key not in {"USERNAME", "PASSWORD"}:
             raise MigrationError("migration_administrator_confirmation_required")
+        aliases = [field for field in group if str(field).upper() == key]
         if path == "data/configs/plugins2config.yaml":
-            entry = group.setdefault(key, {})
-            if not isinstance(entry, dict):
-                raise MigrationError("migration_configuration_shape_invalid")
+            entry = {}
+            for alias in aliases:
+                original = group[alias]
+                if not isinstance(original, dict):
+                    raise MigrationError("migration_configuration_shape_invalid")
+                for field, metadata in original.items():
+                    if field == "value":
+                        continue
+                    if field in entry and entry[field] != metadata:
+                        raise MigrationError("migration_configuration_ambiguous_key")
+                    entry[field] = metadata
             entry["value"] = item
         else:
-            group[key] = item
+            entry = item
+        for alias in aliases:
+            del group[alias]
+        group[key] = entry
     return dump_yaml(value).encode("utf-8")
 
 

@@ -19,7 +19,6 @@ from zhenxun.utils.pydantic_compat import model_dump
 DIR_PATH = DATA_PATH / "bot_profile"
 
 PROFILE_PATH = DIR_PATH / "profile"
-PROFILE_PATH.mkdir(parents=True, exist_ok=True)
 
 
 Config.add_plugin_config(
@@ -70,20 +69,16 @@ class BotProfileManager:
 
     @classmethod
     async def _read_profile(cls, bot_id: str):
-        """读取BOT自我介绍
+        """读取已有的BOT自我介绍；未配置时跳过，不创建目录或文件。
 
         参数:
             bot_id: BOT ID
 
-        异常:
-            FileNotFoundError: 文件不存在
         """
         bot_file_path = PROFILE_PATH / f"{bot_id}"
-        bot_file_path.mkdir(parents=True, exist_ok=True)
         bot_profile_file = bot_file_path / "profile.txt"
         if not bot_profile_file.exists():
             logger.debug(f"BOT自我介绍文件不存在: {bot_profile_file}, 跳过读取")
-            bot_file_path.touch()
             return
         async with aiofiles.open(bot_profile_file, encoding="utf-8") as f:
             introduction = await f.read()

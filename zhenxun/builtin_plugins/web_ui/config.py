@@ -5,6 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import nonebot
 
+from zhenxun.migration.bootstrap_access import allows_bootstrap_mutation
 from zhenxun.services.startup import startup_coordinator
 
 if sys.version_info >= (3, 11):
@@ -52,6 +53,8 @@ def install_cors_middleware(app: FastAPI | None = None) -> bool:
                 and not startup_coordinator.runtime_ready
             ):
                 snapshot = startup_coordinator.snapshot()
+                if allows_bootstrap_mutation(request.method, path, snapshot):
+                    return await call_next(request)
                 return JSONResponse(
                     status_code=409,
                     content={
@@ -60,6 +63,7 @@ def install_cors_middleware(app: FastAPI | None = None) -> bool:
                         "suc": False,
                         "data": {
                             "state": snapshot["state"],
+                            "operating_mode": snapshot.get("operating_mode"),
                             "current_operation": snapshot.get("current_operation"),
                             "load_plan": snapshot.get("load_plan"),
                         },
