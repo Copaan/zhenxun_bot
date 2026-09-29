@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-from contextlib import suppress
 import hashlib
 import json
-import os
 from typing import Any
 
 from tortoise import Tortoise, fields
@@ -216,88 +214,16 @@ async def _populate_scope_keys(connection: Any, dialect: str) -> None:
 
 
 async def _rebuild_sqlite_scope_constraint(connection: Any) -> None:
-    """Rebuild SQLite's table because its inline UNIQUE autoindex is not droppable."""
-    columns = await connection.execute_query_dict(
-        f"PRAGMA table_info({_quote(_GROUP_PLUGIN_TABLE, 'sqlite')})"
-    )
-    if not columns:
-        return
-    column_names = [str(row["name"]) for row in columns if row.get("name")]
-    if not set(_SCOPE_KEY_COLUMNS).issubset(column_names):
-        raise RuntimeError("group_plugin_settings_scope_columns_missing")
+    """Replace the legacy scope constraint without simplifying existing DDL."""
+    from zhenxun.services.db_context.sqlite_rebuild import replace_unique_constraint
 
-    definitions = []
-    for row in columns:
-        name = str(row["name"])
-        sql_type = str(row.get("type") or "TEXT")
-        definition = f"{_quote(name, 'sqlite')} {sql_type}"
-        if int(row.get("pk") or 0) == 1:
-            definition += " PRIMARY KEY"
-            if name == "id" and sql_type.upper() == "INTEGER":
-                definition += " AUTOINCREMENT"
-        elif int(row.get("notnull") or 0):
-            definition += " NOT NULL"
-        default = row.get("dflt_value")
-        if default is not None:
-            definition += f" DEFAULT {default}"
-        definitions.append(definition)
-
-    indexes = await connection.execute_query_dict(
-        f"PRAGMA index_list({_quote(_GROUP_PLUGIN_TABLE, 'sqlite')})"
+    await replace_unique_constraint(
+        connection,
+        _GROUP_PLUGIN_TABLE,
+        obsolete={_LEGACY_SCOPE_COLUMNS, _LEGACY_SCOPED_COLUMNS},
+        desired=_SCOPE_KEY_COLUMNS,
+        constraint=_SCOPED_CONSTRAINT,
     )
-    index_definitions: list[tuple[str, tuple[str, ...], bool]] = []
-    for index in indexes:
-        name = str(index.get("name") or "")
-        if not name or name.startswith("sqlite_autoindex"):
-            continue
-        info = await connection.execute_query_dict(
-            f"PRAGMA index_info({_quote(name, 'sqlite')})"
-        )
-        index_columns = tuple(
-            str(item["name"])
-            for item in sorted(info, key=lambda item: int(item.get("seqno") or 0))
-            if item.get("name")
-        )
-        if index_columns in {
-            _LEGACY_SCOPE_COLUMNS,
-            _LEGACY_SCOPED_COLUMNS,
-            _SCOPE_KEY_COLUMNS,
-        }:
-            continue
-        if index_columns:
-            index_definitions.append((name, index_columns, bool(index.get("unique"))))
-
-    temporary_table = f"{_GROUP_PLUGIN_TABLE}__scope_{os.getpid()}"
-    table_sql = _quote(_GROUP_PLUGIN_TABLE, "sqlite")
-    temporary_sql = _quote(temporary_table, "sqlite")
-    columns_sql = ", ".join(_quote(name, "sqlite") for name in column_names)
-    copy_columns = ", ".join(_quote(name, "sqlite") for name in column_names)
-    unique_sql = ", ".join(_quote(name, "sqlite") for name in _SCOPE_KEY_COLUMNS)
-    statements = [
-        "PRAGMA foreign_keys=OFF",
-        f"DROP TABLE IF EXISTS {temporary_sql}",
-        f"CREATE TABLE {temporary_sql} ({', '.join(definitions)}, "
-        f"CONSTRAINT {_quote(_SCOPED_CONSTRAINT, 'sqlite')} UNIQUE ({unique_sql}))",
-        f"INSERT INTO {temporary_sql} ({copy_columns}) "
-        f"SELECT {columns_sql} FROM {table_sql}",
-        f"DROP TABLE {table_sql}",
-        f"ALTER TABLE {temporary_sql} RENAME TO {table_sql}",
-    ]
-    statements.extend(
-        "CREATE "
-        f"{'UNIQUE ' if unique else ''}INDEX "
-        f"{_quote(name, 'sqlite')} ON {table_sql}"
-        f"({', '.join(_quote(column, 'sqlite') for column in index_columns)})"
-        for name, index_columns, unique in index_definitions
-    )
-    statements.append("PRAGMA foreign_keys=ON")
-    script = ";\n".join(statements) + ";"
-    try:
-        await connection.execute_script(script)
-    except Exception:
-        with suppress(Exception):
-            await connection.execute_query("PRAGMA foreign_keys=ON")
-        raise
 
 
 async def ensure_group_plugin_scope_constraint() -> None:

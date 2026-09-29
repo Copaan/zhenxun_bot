@@ -225,7 +225,11 @@ def verify_restore(project, identity: str) -> dict:
                 if time.monotonic() >= deadline:
                     raise MigrationError("migration_database_timeout")
 
-            database_revision = sqlite_content_revision(snapshot, checkpoint=checkpoint)
+            database_revision = sqlite_content_revision(
+                snapshot,
+                checkpoint=checkpoint,
+                algorithm=database.get("revision_algorithm", "sqlite-content-v1"),
+            )
     elif database_plan.get("engine") in {"mysql", "postgres"}:
         from .native_database import DatabaseEndpoint, native_session
         from .restore_phases import _database_configuration
@@ -254,6 +258,9 @@ def verify_restore(project, identity: str) -> dict:
                 progress=reporter.update,
                 phase="restore_verify",
             ) as client:
+                client.revision_algorithm = database_plan.get(
+                    "revision_algorithm", "native-content-v1"
+                )
                 inspected = await client.inspect(quiet=False)
                 return inspected["revision"]
 
@@ -263,6 +270,41 @@ def verify_restore(project, identity: str) -> dict:
             database_revision = executor.submit(
                 lambda: asyncio.run(inspect_native())
             ).result()
+    auxiliary_revisions = {}
+    for item in plan.get("auxiliary_databases", []):
+        from .database import snapshot_sqlite
+        from .replacement_database import sqlite_content_revision
+
+        metadata = item["plan"]["database"]
+        target = contained_path(project, metadata["target_path"], regular=True)
+        with tempfile.TemporaryDirectory(
+            prefix="verify-aux-", dir=directory
+        ) as temporary:
+            snapshot = Path(temporary) / "snapshot.db"
+            deadline = time.monotonic() + 30
+            snapshot_sqlite(target, snapshot, deadline=deadline)
+
+            def check_auxiliary():
+                if time.monotonic() >= deadline:
+                    raise MigrationError("migration_database_timeout")
+
+            auxiliary_revisions[item["id"]] = sqlite_content_revision(
+                snapshot,
+                checkpoint=check_auxiliary,
+                algorithm=metadata.get("revision_algorithm", "sqlite-content-v1"),
+            )
+    additional = (
+        {
+            "auxiliary_database_revisions": auxiliary_revisions,
+            "database_before_upgrade": database.get("source_content_revision")
+            or database_plan.get("candidate_revision"),
+            "source_integrity": database.get("source", {}).get(
+                "integrity", "unconfirmed"
+            ),
+        }
+        if plan.get("schema", 1) >= 2
+        else {}
+    )
     evidence = {
         "schema": 2,
         "job_id": identity,
@@ -271,6 +313,7 @@ def verify_restore(project, identity: str) -> dict:
         "dependency_tree_sha256": generation["tree_sha256"],
         "dependency_result_sha256": digest(result),
         "database_revision": database_revision,
+        **additional,
         "files": files,
         "preserved": preserved,
         "excluded": [
@@ -289,6 +332,7 @@ def verify_restore(project, identity: str) -> dict:
         "file_count": len(files),
         "preserved_count": len(preserved),
         "database_revision": database_revision,
+        **additional,
     }
 
 

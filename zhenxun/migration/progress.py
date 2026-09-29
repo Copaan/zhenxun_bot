@@ -68,8 +68,25 @@ class ConsoleProgress:
         self.sequence = None
         self.diagnostic = None
         self.shutdown = None
+        self.databases = None
 
     def show(self, job: dict, *, emit_stage: bool = True) -> None:
+        databases = [
+            (item.get("id"), item.get("state"), item.get("error_code"))
+            for item in job.get("databases", [])
+        ]
+        if databases and databases != self.databases:
+            self.databases = databases
+            try:
+                for item in job["databases"]:
+                    sys.stderr.write(
+                        f"[迁移 {job['id'][:8]}] {item.get('engine')} "
+                        f"{item.get('path') or item.get('target_name')} "
+                        f"· {item.get('state')}\n"
+                    )
+                sys.stderr.flush()
+            except (OSError, UnicodeError):
+                pass
         value = job.get("progress", {}).get("runtime", {})
         sequence = (job["id"], job.get("stage"), value.get("sequence"))
         if emit_stage and sequence != self.sequence:

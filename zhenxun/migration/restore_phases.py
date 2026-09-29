@@ -44,8 +44,14 @@ def database_selection(
         if mapping:
             raise MigrationError("migration_database_payload_missing")
         return None
+    primary = manifest.get("source", {}).get("primary_database") or {}
+    selected_path = primary.get("path") or (mapping or {}).get("source_path")
+    if selected_path:
+        entries = [entry for entry in entries if entry["path"] == selected_path]
+    elif not mapping:
+        return None
     if len(entries) != 1:
-        raise MigrationError("migration_multiple_databases_require_mapping")
+        raise MigrationError("migration_database_mapping_required")
     if not isinstance(mapping, dict) or mapping.get("engine") not in {
         "sqlite",
         "mysql",
@@ -108,7 +114,28 @@ def execute_restore_phase(project: Path, request: dict, *, lease) -> dict:
         options = TaskStore(project).read("jobs", request["job_id"])["options"]
         values = bound_environment(options, values)
     with confirmed_process_environment(values):
-        return _execute_restore_phase(project, request, lease=lease)
+        try:
+            return _execute_restore_phase(project, request, lease=lease)
+        except BaseException as error:
+            store = TaskStore(project)
+            try:
+                for item in store.read("jobs", request["job_id"]).get("databases", []):
+                    if item.get("state") == "applying":
+                        store.record_database_state(
+                            request["job_id"],
+                            {
+                                **item,
+                                "state": "failed",
+                                "error_code": getattr(
+                                    error,
+                                    "code",
+                                    "migration_database_application_failed",
+                                ),
+                            },
+                        )
+            except Exception:
+                pass
+            raise
 
 
 def _execute_restore_phase(project: Path, request: dict, *, lease) -> dict:
@@ -153,7 +180,39 @@ def _execute_restore_phase(project: Path, request: dict, *, lease) -> dict:
     if phase == "restore_publish":
         from .publication import publish_restore
 
-        return publish_restore(project, identity, lease=lease, checkpoint=check)
+        def publish_database():
+            plan = _read(directory / "restore-plan.json").get("database") or {}
+            if plan.get("engine") != "mysql" or not plan.get("events_after"):
+                return
+
+            async def activate():
+                from .native_database import DatabaseEndpoint, native_session
+                from .native_restore import set_event_states
+
+                endpoint = DatabaseEndpoint.parse(_database_configuration(project))
+                if endpoint.identity() != plan["target"]:
+                    raise MigrationError("migration_database_target_changed")
+                async with native_session(
+                    endpoint,
+                    directory,
+                    budget,
+                    check,
+                    diagnostic=record_database_diagnostic,
+                    phase="restore_publish",
+                ) as client:
+                    if await client.actual_identity() != plan["actual_databases"][0]:
+                        raise MigrationError("migration_database_target_changed")
+                    await set_event_states(client, plan["events_after"])
+
+            asyncio.run(activate())
+
+        return publish_restore(
+            project,
+            identity,
+            lease=lease,
+            checkpoint=check,
+            publish_database=publish_database,
+        )
     if phase == "restore_dependencies":
         from .generation import stage_generation
 
@@ -360,6 +419,20 @@ def _execute_restore_phase(project: Path, request: dict, *, lease) -> dict:
                     database_stage / "database-target.backup",
                     checkpoint=check,
                 )
+                for item in database_plan.get("mysql_phases") or []:
+                    source_payload = contained_path(
+                        store.path("preflights", preflight_id).parent
+                        / "database-stage",
+                        item["payload"],
+                        regular=True,
+                    )
+                    if file_hash(source_payload, check) != item["sha256"]:
+                        raise MigrationError("migration_database_payload_changed")
+                    _atomic_copy(
+                        source_payload,
+                        contained_path(database_stage, item["payload"]),
+                        checkpoint=check,
+                    )
             else:
                 database_plan = asyncio.run(
                     prepare_native(
@@ -410,21 +483,43 @@ def _execute_restore_phase(project: Path, request: dict, *, lease) -> dict:
                 deadline=budget.deadline,
                 cancel=lambda: (check() or False),
             )
+        from .database_set import prepare_auxiliary, public_databases
+
+        auxiliary = prepare_auxiliary(
+            project,
+            directory,
+            stage,
+            manifest,
+            mapping,
+            first_deployment=job["options"].get("first_deployment") is True,
+            budget=budget,
+        )
         plan = {
-            "schema": 1,
+            "schema": 2,
             "job_id": identity,
             "package_id": manifest["package_id"],
             "archive_sha256": digest,
             "files": files,
             "database": database_plan,
+            "auxiliary_databases": auxiliary,
         }
         plan["revision"] = _digest(plan)
         write_json_locked(directory / "restore-plan.json", plan)
+        from .database_set import resource_state
+
+        for item in auxiliary:
+            store.record_database_state(identity, resource_state(item, "prepared"))
+        if database_plan:
+            store.record_database_state(
+                identity,
+                resource_state({"id": "primary", "plan": database_plan}, "prepared"),
+            )
         return {
             "revision": plan["revision"],
             "file_actions": len(files["actions"]),
             "removed_directories": len(files["removed_directories"]),
             "database_prepared": database_plan is not None,
+            "databases": public_databases(database_plan, auxiliary),
             "validation": "not_started",
         }
     plan = _read(directory / "restore-plan.json")
@@ -436,9 +531,14 @@ def _execute_restore_phase(project: Path, request: dict, *, lease) -> dict:
     files_journal = stage / "files-journal.json"
     database_journal = database_stage / "database-journal.json"
     if phase == "restore_apply":
+        from .database_set import apply_auxiliary, recheck_auxiliary
+
         if request.get("private_input", {}).get("expected_revision") != digest:
             raise MigrationError("migration_target_changed", status=409)
         recheck_files(project, stage, plan["files"], checkpoint=check)
+        recheck_auxiliary(
+            project, directory, plan.get("auxiliary_databases", []), budget
+        )
         mapping = job["options"].get("database") or {}
         if (
             plan["database"]
@@ -491,6 +591,12 @@ def _execute_restore_phase(project: Path, request: dict, *, lease) -> dict:
                 mapping,
                 request.get("private_input", {}).get("database") or {},
             )
+            from .database_set import resource_state
+
+            store.record_database_state(
+                identity,
+                resource_state({"id": "primary", "plan": plan["database"]}, "applying"),
+            )
         if plan["database"] and plan["database"].get("engine") in {"mysql", "postgres"}:
             from .native_replacement import apply_native
 
@@ -525,17 +631,30 @@ def _execute_restore_phase(project: Path, request: dict, *, lease) -> dict:
                 rollback_deadline=budget.deadline,
                 cancel=lambda: (check() or False),
             )
+        if plan["database"]:
+            store.record_database_state(
+                identity,
+                resource_state(
+                    {"id": "primary", "plan": plan["database"]}, "applied_unverified"
+                ),
+            )
+        apply_auxiliary(
+            project,
+            directory,
+            plan.get("auxiliary_databases", []),
+            lease=lease,
+            budget=budget,
+            record=lambda value: store.record_database_state(identity, value),
+        )
         write_json_locked(
             directory / "restore-application.json",
-            {
-                "job_id": identity,
-                "revision": digest,
-                "state": "applied_unverified",
-            },
+            {"job_id": identity, "revision": digest, "state": "applied_unverified"},
         )
         from .verification import verify_file_plan
 
         verify_file_plan(project, plan["files"])
+        for item in plan.get("auxiliary_databases", []):
+            verify_file_plan(project, item["plan"])
         if plan["database"] and plan["database"].get("engine") not in {
             "mysql",
             "postgres",
@@ -545,8 +664,21 @@ def _execute_restore_phase(project: Path, request: dict, *, lease) -> dict:
     if phase == "restore_rollback":
         if (directory / "restore-commit.json").exists():
             raise MigrationError("migration_committed_rollback_forbidden")
-        results = {}
-        failures = []
+        from .database_set import rollback_auxiliary
+
+        results = rollback_auxiliary(
+            project,
+            directory,
+            plan.get("auxiliary_databases", []),
+            lease=lease,
+            budget=budget,
+            record=lambda value: store.record_database_state(identity, value),
+        )
+        failures = [
+            value
+            for value in results.values()
+            if value not in {"rolled_back", "not_applied"}
+        ]
         for kind, journal in (("database", database_journal), ("files", files_journal)):
             check()
             if (
@@ -585,6 +717,15 @@ def _execute_restore_phase(project: Path, request: dict, *, lease) -> dict:
                 else:
                     rollback_files(project, stage, journal, checkpoint=check)
                 results[kind] = "rolled_back"
+                if kind == "database":
+                    from .database_set import resource_state
+
+                    store.record_database_state(
+                        identity,
+                        resource_state(
+                            {"id": "primary", "plan": plan["database"]}, "rolled_back"
+                        ),
+                    )
             except MigrationError as error:
                 results[kind] = error.code
                 failures.append(error.code)

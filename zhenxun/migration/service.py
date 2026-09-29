@@ -190,6 +190,27 @@ def inspect_archive(
         }
         if isinstance(manifest["source"].get("primary_database"), dict)
         else None,
+        "databases": [
+            {
+                key: item[key]
+                for key in (
+                    "id",
+                    "role",
+                    "engine",
+                    "path",
+                    "size",
+                    "backup_verified",
+                    "restore_verified",
+                    "revision_algorithm",
+                    "revision_verified",
+                    "integrity",
+                )
+                if key in item
+            }
+            for item in manifest["source"].get("databases", [])
+        ],
+        "backup_verified": True,
+        "restore_verified": False,
         "sha256": before,
         "source": summary,
         "categories": categories,

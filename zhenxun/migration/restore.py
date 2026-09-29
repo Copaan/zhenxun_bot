@@ -78,22 +78,15 @@ def _fingerprint(path: Path, checkpoint=lambda: None) -> str | None:
 
 
 def _database_companion(path: Path) -> bool:
-    for suffix in ("-wal", "-shm", "-journal"):
-        if path.name.endswith(suffix) and path.name != suffix:
-            base = path.with_name(path.name[: -len(suffix)])
-            return base.suffix.lower() in _DATABASE or _database_file(base)
-    return False
+    from .sqlite_resources import sqlite_companion
+
+    return sqlite_companion(path)
 
 
 def _database_file(path: Path) -> bool:
-    if path.suffix.lower() in _DATABASE:
-        return True
-    if path.is_file():
-        if is_link(path):
-            raise MigrationError("migration_link_forbidden")
-        with path.open("rb") as stream:
-            return stream.read(16) == b"SQLite format 3\0"
-    return False
+    from .sqlite_resources import classify_sqlite
+
+    return classify_sqlite(path) == "sqlite"
 
 
 def _scope_revision(
@@ -227,7 +220,6 @@ def prepare_files(
                 _database_file(target)
                 or _database_companion(target)
                 or _database_file(incoming)
-                or Path(path).suffix.lower() in _DATABASE
             ):
                 skipped.append(
                     {"path": path, "reason": "database_requires_separate_plan"}

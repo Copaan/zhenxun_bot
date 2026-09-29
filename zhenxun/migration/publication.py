@@ -21,7 +21,12 @@ from .tasks import TaskStore
 
 
 def publish_restore(
-    project: Path, identity: str, *, lease, checkpoint=lambda: None
+    project: Path,
+    identity: str,
+    *,
+    lease,
+    checkpoint=lambda: None,
+    publish_database=lambda: None,
 ) -> dict:
     """Finish a committed restore without reopening business or accepting rollback."""
     lease.require_held()
@@ -139,6 +144,7 @@ def publish_restore(
                 os.fsync(output.fileno())
         temporary.replace(target)
     generation = publish_generation(project, identity, lease=lease)
+    publish_database()
     result = {
         "job_id": identity,
         "decided_at": decision["decided_at"],

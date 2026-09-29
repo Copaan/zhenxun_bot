@@ -7,7 +7,7 @@ import re
 
 from .errors import MigrationError
 
-CAPABILITY_POLICY_VERSION = 2
+CAPABILITY_POLICY_VERSION = 3
 MYSQL_RESTORE_PRIVILEGES = {
     "CREATE",
     "ALTER",
@@ -43,7 +43,17 @@ def _privileges(value):
             raise MigrationError("migration_database_capability_unconfirmed")
         result.add(item)
     if "ALL PRIVILEGES" in result:
-        result |= MYSQL_RESTORE_PRIVILEGES | {"PROCESS"}
+        result |= MYSQL_RESTORE_PRIVILEGES | {
+            "PROCESS",
+            "TRIGGER",
+            "EVENT",
+            "CREATE ROUTINE",
+            "ALTER ROUTINE",
+            "EXECUTE",
+            "CREATE VIEW",
+            "SHOW VIEW",
+            "RELOAD",
+        }
     return result
 
 
@@ -78,6 +88,7 @@ class MySQLCapabilities:
     global_privileges: set[str] = field(default_factory=set)
     database_privileges: set[str] = field(default_factory=set)
     table_privileges: dict[str, set[str]] = field(default_factory=dict)
+    routine_privileges: dict[str, set[str]] = field(default_factory=dict)
     revoked: set[str] = field(default_factory=set)
     sources: set[str] = field(default_factory=set)
     ignore_case: bool = False
@@ -100,12 +111,22 @@ class MySQLCapabilities:
                 raise MigrationError("migration_database_capability_unconfirmed")
             action, privileges, scope = match.groups()
             if action == "GRANT" and scope.startswith(("PROCEDURE ", "FUNCTION ")):
-                _, object_scope = scope.split(" ", 1)
-                if _SCOPE.fullmatch(object_scope) and _privileges(privileges) <= {
+                kind, object_scope = scope.split(" ", 1)
+                routine = _SCOPE.fullmatch(object_scope)
+                if routine and _privileges(privileges) <= {
                     "EXECUTE",
                     "ALTER ROUTINE",
                     "GRANT OPTION",
                 }:
+                    db, name = map(_identifier, routine.groups())
+                    if scope_matches(
+                        db, database, literal=True, ignore_case=ignore_case
+                    ):
+                        key = kind + ":" + name.casefold()
+                        result.routine_privileges.setdefault(key, set()).update(
+                            _privileges(privileges)
+                        )
+                        result.sources.add("routine")
                     continue
                 raise MigrationError("migration_database_capability_unconfirmed")
             if (
@@ -149,6 +170,11 @@ class MySQLCapabilities:
                 table.casefold() if self.ignore_case else table, set()
             )
         return values - {"ALL PRIVILEGES", "USAGE"}
+
+    def effective_routine(self, kind, name):
+        return self.effective() | self.routine_privileges.get(
+            kind.upper() + ":" + name.casefold(), set()
+        )
 
     @property
     def inventory_visible(self):

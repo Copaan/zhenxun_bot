@@ -32,7 +32,7 @@ def _sqlite_version(source: str) -> None:
         version = Version(source)
     except (InvalidVersion, TypeError):
         raise MigrationError("migration_database_version_invalid") from None
-    if version.major != 3 or version > Version(sqlite3.sqlite_version):
+    if version.major != 3:
         raise MigrationError("migration_database_version_unsupported")
 
 
@@ -48,17 +48,50 @@ def _quiet_target(root: Path, relative: str, *, online: bool = False) -> Path:
     ):
         raise MigrationError("migration_database_target_invalid")
     path = contained_path(root, relative)
+    companions = [
+        contained_path(root, relative + suffix)
+        for suffix in ("-wal", "-shm", "-journal")
+    ]
+    if not online and path.exists() and any(p.exists() for p in companions):
+        try:
+            with closing(
+                sqlite3.connect(path.as_uri() + "?mode=rw", uri=True, timeout=0)
+            ) as connection:
+                connection.execute("PRAGMA locking_mode=EXCLUSIVE")
+                connection.execute("BEGIN EXCLUSIVE")
+                connection.execute("SELECT COUNT(*) FROM sqlite_schema").fetchone()
+                connection.commit()
+                checkpoint = connection.execute(
+                    "PRAGMA wal_checkpoint(TRUNCATE)"
+                ).fetchone()
+                if checkpoint and checkpoint[0]:
+                    raise MigrationError("migration_database_writers_unconfirmed")
+        except sqlite3.Error:
+            raise MigrationError("migration_database_writers_unconfirmed") from None
     for suffix in ("-wal", "-shm", "-journal"):
         companion = contained_path(root, relative + suffix)
-        if companion.exists() and not online:
+        if (
+            companion.exists()
+            and companion.stat().st_size
+            and not online
+            and suffix != "-shm"
+        ):
             # Replacing only the main file while a journal exists can discard
             # committed pages or leave another connection on the old database.
             raise MigrationError("migration_database_writers_unconfirmed")
     return path
 
 
-def sqlite_content_revision(path: Path, *, checkpoint=lambda: None) -> str:
+def sqlite_content_revision(
+    path: Path, *, checkpoint=lambda: None, algorithm="sqlite-content-v2"
+) -> str:
     """Hash a consistent snapshot without WAL/checkpoint-specific file headers."""
+    if algorithm == "sqlite-content-v2":
+        from .sqlite_resources import content_revision
+
+        return content_revision(path.absolute(), checkpoint=checkpoint)
+    if algorithm != "sqlite-content-v1":
+        raise MigrationError("migration_database_revision_unsupported")
     digest = hashlib.sha256()
     with closing(_readonly(path, immutable=True)) as connection:
 
@@ -115,7 +148,17 @@ def _validate_candidate(path: Path, *, deadline: float, cancel=None) -> dict:
 
         connection.set_progress_handler(progress, 1000)
         try:
-            tables = _tables(connection)
+            tables = dict(
+                connection.execute(
+                    "SELECT name,sql FROM sqlite_schema WHERE type='table' "
+                    "AND name NOT LIKE 'sqlite_%'"
+                )
+            )
+            for table, statement in tables.items():
+                if statement and statement.lstrip().upper().startswith(
+                    "CREATE VIRTUAL TABLE"
+                ):
+                    connection.execute(f"SELECT * FROM {_quote(table)} LIMIT 0")
             if connection.execute("PRAGMA integrity_check").fetchone() != ("ok",):
                 raise MigrationError("migration_database_integrity_failed")
             if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
@@ -125,9 +168,21 @@ def _validate_candidate(path: Path, *, deadline: float, cancel=None) -> dict:
                 "WHERE type IN ('trigger', 'view') GROUP BY type"
             ).fetchall()
             _check_deadline(deadline, cancel)
-            return {"tables": len(tables), "executable_objects": dict(objects)}
-        except sqlite3.Error:
+            return {
+                "tables": len(tables),
+                "executable_objects": dict(objects),
+                "integrity": "ok",
+            }
+        except sqlite3.Error as error:
             _check_deadline(deadline, cancel)
+            if any(
+                marker in str(error).lower()
+                for marker in ("no such module", "no such collation")
+            ):
+                raise MigrationError(
+                    "migration_database_feature_unavailable",
+                    details={"feature": str(error)[:256]},
+                ) from None
             raise MigrationError("migration_database_validation_failed") from None
 
 
@@ -208,7 +263,9 @@ def prepare_sqlite_replacement(
         "first_deployment": first_deployment,
         "source_version": source_version,
         "target_version": sqlite3.sqlite_version,
+        "revision_algorithm": "sqlite-content-v2",
         "source": source_summary,
+        "source_content_revision": sqlite_content_revision(candidate, checkpoint=check),
         "target": target_summary,
         "target_content_revision": sqlite_content_revision(backup, checkpoint=check)
         if before is not None

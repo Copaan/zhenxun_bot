@@ -103,13 +103,26 @@ def analyse_preflight(project: Path, identity: str, private: dict, budget) -> di
             database["source_payload"] = entry["payload"]
         if mapping.get("confirmed_name") != database["database"]["target_name"]:
             raise MigrationError("migration_database_confirmation_required")
+    from .database_set import prepare_auxiliary
+
+    auxiliary = prepare_auxiliary(
+        project,
+        directory,
+        stage,
+        manifest,
+        options.get("database"),
+        first_deployment=options["first_deployment"],
+        budget=budget,
+        online=True,
+    )
     dependencies, issues = effective_requests(manifest["source"], {})
     plan = {
-        "schema": 1,
+        "schema": 2,
         "preflight_id": identity,
         "archive_sha256": record["sha256"],
         "files": files,
         "database": database,
+        "auxiliary_databases": auxiliary,
         "dependencies": dependencies,
         "dependency_issues": issues,
     }
@@ -119,6 +132,8 @@ def analyse_preflight(project: Path, identity: str, private: dict, budget) -> di
 
 
 def preflight_summary(plan: dict) -> dict:
+    from .database_set import public_databases
+
     counts = {name: 0 for name in ("add", "replace", "remove")}
     for action in plan["files"]["actions"]:
         counts[action["action"]] += 1
@@ -128,6 +143,9 @@ def preflight_summary(plan: dict) -> dict:
         "dependencies": len(plan["dependencies"]),
         "dependency_issues": len(plan["dependency_issues"]),
         "database": (plan.get("database") or {}).get("database"),
+        "databases": public_databases(
+            plan.get("database"), plan.get("auxiliary_databases", [])
+        ),
         "source_trust_verified": False,
         "plugin_side_effects_reversible": False,
     }
@@ -155,6 +173,8 @@ def recheck_preflight(
         raise MigrationError("migration_preflight_receipt_invalid", status=409)
     if plan["revision"] != record["target_revision"]:
         raise MigrationError("migration_preflight_receipt_invalid", status=409)
+    if plan.get("schema") != 2:
+        raise MigrationError("migration_database_preflight_stale", status=409)
     archive = contained_path(project, record["options"]["archive_path"], regular=True)
     if file_hash(archive, budget.checkpoint) != record["sha256"]:
         raise MigrationError("migration_archive_changed", status=409)
@@ -189,12 +209,19 @@ def recheck_preflight(
             try:
                 snapshot_sqlite(target, snapshot, deadline=budget.deadline)
                 observed = sqlite_content_revision(
-                    snapshot, checkpoint=budget.checkpoint
+                    snapshot,
+                    checkpoint=budget.checkpoint,
+                    algorithm=database["database"].get(
+                        "revision_algorithm", "sqlite-content-v1"
+                    ),
                 )
             finally:
                 snapshot.unlink(missing_ok=True)
         if observed != expected:
             raise MigrationError("migration_database_target_changed", status=409)
+    from .database_set import recheck_auxiliary
+
+    recheck_auxiliary(project, directory, plan.get("auxiliary_databases", []), budget)
     return {"revision": plan["revision"]}
 
 
@@ -204,12 +231,41 @@ def export_preview(project: Path, *, offset=0, limit=100, budget) -> dict:
     scan = scan_project(project, checkpoint=budget.checkpoint).public()
     entries = scan.pop("files")
     excluded = scan.pop("excluded")
+    from zhenxun.configs.database import DatabaseConnection
+
+    from .snapshot import _database_configuration
+    from .sqlite_resources import file_database_summary
+
+    configured = _database_configuration(project)
+    endpoint = (
+        DatabaseConnection.parse(configured, root=project) if configured else None
+    )
+    primary = None
+    if endpoint and endpoint.engine == "sqlite":
+        from zhenxun.configs.database import sqlite_path_from_url
+
+        primary = sqlite_path_from_url(configured, root=project)
+    database_files, counts = [], {}
+    for entry in entries:
+        budget.checkpoint()
+        path = contained_path(project, entry["path"])
+        summary = file_database_summary(path, configured=path == primary)
+        if summary:
+            entry["database_file"] = summary
+            values = counts.setdefault(summary["kind"], {"count": 0, "bytes": 0})
+            values["count"] += 1
+            values["bytes"] += summary["bytes"]
+            database_files.append(entry)
     return {
         **scan,
         "items": entries[offset : offset + limit],
         "total": len(entries),
         "excluded": excluded[offset : offset + limit],
         "excluded_total": len(excluded),
+        "database_files": database_files[offset : offset + limit],
+        "database_files_total": len(database_files),
+        "database_file_summary": counts,
+        "primary_engine": endpoint.engine if endpoint else None,
     }
 
 

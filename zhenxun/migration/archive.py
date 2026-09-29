@@ -20,7 +20,7 @@ from .discovery import CATEGORIES, FileEntry
 from .errors import MigrationError
 from .paths import PathIndex, contained_path, logical_path
 
-SCHEMA = 1
+SCHEMA = 2
 CHUNK = 1024 * 1024
 MANIFEST_LIMIT = 128 * CHUNK
 
@@ -159,7 +159,7 @@ def _central_directory_limit(path: Path, limits: Limits) -> None:
 def _validate_manifest(value: object, infos: dict, limits: Limits) -> dict:
     if not isinstance(value, dict) or value.get("format") != "zhenxun-instance":
         raise MigrationError("migration_manifest_invalid")
-    if type(value.get("schema")) is not int or value["schema"] != SCHEMA:
+    if type(value.get("schema")) is not int or value["schema"] not in {1, SCHEMA}:
         raise MigrationError("migration_schema_unsupported")
     if not isinstance(value.get("source"), dict):
         raise MigrationError("migration_manifest_invalid")

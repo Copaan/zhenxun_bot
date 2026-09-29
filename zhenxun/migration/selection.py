@@ -118,7 +118,7 @@ class ReplacementSelection:
             if entry["category"] == "database":
                 primary = manifest.get("source", {}).get("primary_database") or {}
                 engine = primary.get("engine")
-                if engine in {"mysql", "postgres"}:
+                if engine in {"mysql", "postgres"} and path == primary.get("path"):
                     # Logical backups belong to the database transaction, never
                     # to the authority to replace ordinary project directories.
                     if (

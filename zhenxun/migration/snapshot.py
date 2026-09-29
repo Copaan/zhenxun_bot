@@ -18,7 +18,7 @@ from .errors import MigrationError
 from .inventory import environment_inventory, plugin_descriptors
 from .lease import InstanceLease
 from .paths import contained_path
-from .restore import _configuration_read, _database_companion, _database_file
+from .restore import _configuration_read, _database_file
 from .selection import export_selection
 from .tasks import MigrationBudget, MigrationProgress, TaskStore
 
@@ -136,15 +136,26 @@ def capture_snapshot(
                 "certificates": endpoint.certificate_hashes(),
             }
     initial = scan_project(project, max_entries=limits.entries, checkpoint=check)
+    sqlite_paths = {
+        entry.path
+        for entry in initial.files
+        if entry.category in options.categories
+        and _database_file(contained_path(project, entry.path))
+    }
+
+    companions = {
+        path + suffix
+        for path in sqlite_paths
+        for suffix in ("-wal", "-shm", "-journal")
+    }
+
+    def captured_companion(entry):
+        return entry.path in companions
 
     def stable_files(scan):
         # SQLite readers update SHM and may create an empty WAL. Verify WAL
         # payload separately; these transient files are never archive entries.
-        return [
-            entry
-            for entry in scan.files
-            if not _database_companion(contained_path(project, entry.path))
-        ]
+        return [entry for entry in scan.files if not captured_companion(entry)]
 
     def wal_hash(source):
         wal = contained_path(project, source.relative_to(project).as_posix() + "-wal")
@@ -154,8 +165,7 @@ def capture_snapshot(
     files = [
         entry
         for entry in initial.files
-        if entry.category in options.categories
-        and not _database_companion(contained_path(project, entry.path))
+        if entry.category in options.categories and not captured_companion(entry)
     ]
     total_bytes = sum(entry.size for entry in files)
     if progress is not None:
@@ -219,8 +229,6 @@ def capture_snapshot(
         budget.checkpoint()
         lease.require_held()
         source = contained_path(project, entry.path, regular=True)
-        if _database_companion(source):
-            continue
         target = contained_path(destination, entry.path)
         target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         before = source.stat()
@@ -228,19 +236,47 @@ def capture_snapshot(
         if (before.st_size, before.st_mtime_ns) != (entry.size, entry.mtime_ns):
             raise MigrationError("migration_source_changed", path=entry.path)
         category = entry.category
-        if _database_file(source):
+        is_primary = primary_database and entry.path == primary_database["path"]
+        if is_primary:
+            from .sqlite_resources import classify_sqlite
+
+            if classify_sqlite(source, configured=True) not in {
+                "sqlite",
+                "sqlite_empty",
+            }:
+                raise MigrationError(
+                    "migration_database_validation_failed", path=entry.path
+                )
+        if _database_file(source) or is_primary:
             if progress is not None:
                 progress(step="备份并校验 SQLite 数据库")
             wal_hashes[entry.path] = wal_hash(source)
             hashes[entry.path] = file_hash(source, check)
-            details = snapshot_sqlite(
-                source,
-                target,
-                deadline=budget.deadline,
-                cancel=lambda: (checkpoint() or False),
-            )
+            try:
+                details = snapshot_sqlite(
+                    source,
+                    target,
+                    deadline=budget.deadline,
+                    cancel=lambda: (checkpoint() or False),
+                    strict_validation=False,
+                )
+            except MigrationError as error:
+                raise MigrationError(
+                    error.code, path=entry.path, details=error.details
+                ) from error
             category = "database"
-            databases.append({"root": entry.root, "path": entry.path, **details})
+            databases.append(
+                {
+                    "root": entry.root,
+                    "path": entry.path,
+                    **details,
+                    "id": entry.path,
+                    "role": "primary" if is_primary else "auxiliary",
+                    "backup_verified": True,
+                    "restore_verified": False,
+                    "revision_algorithm": "sqlite-content-v2",
+                }
+            )
         else:
             with source.open("rb") as reader, target.open("xb") as writer:
                 opened = os.fstat(reader.fileno())
@@ -322,7 +358,9 @@ def capture_snapshot(
             "path": relative,
             "engine": native_endpoint.engine,
         }
-        databases.append({**primary_database, **details})
+        databases.append(
+            {**primary_database, **details, "id": relative, "role": "primary"}
+        )
         info = payload.stat()
         captured.append(
             FileEntry("project", relative, "database", info.st_size, info.st_mtime_ns)

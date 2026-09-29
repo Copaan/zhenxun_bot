@@ -5,7 +5,6 @@ from contextlib import closing, contextmanager
 import hashlib
 import json
 from pathlib import Path
-import re
 import shutil
 import sqlite3
 import tempfile
@@ -83,6 +82,7 @@ def snapshot_sqlite(
     deadline: float,
     cancel: Callable[[], bool] | None = None,
     immutable: bool = False,
+    strict_validation: bool = True,
 ) -> dict:
     """Use SQLite's backup API, including committed pages still present in the WAL."""
     _check_deadline(deadline, cancel)
@@ -103,15 +103,43 @@ def snapshot_sqlite(
 
             original.backup(backup, pages=128, progress=progress, sleep=0.05)
             backup.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
-            if backup.execute("PRAGMA quick_check").fetchone() != ("ok",):
-                raise MigrationError("migration_database_integrity_failed")
+            integrity = "ok"
+            try:
+                if backup.execute("PRAGMA quick_check").fetchone() != ("ok",):
+                    raise MigrationError("migration_database_integrity_failed")
+            except sqlite3.Error as error:
+                _check_deadline(deadline, cancel)
+                if strict_validation or not any(
+                    reason in str(error).lower()
+                    for reason in ("no such module", "no such collation")
+                ):
+                    raise
+                integrity = "unconfirmed"
             version = backup.execute("PRAGMA user_version").fetchone()[0]
         return {
             "engine": "sqlite",
             "engine_version": sqlite3.sqlite_version,
             "user_version": version,
             "size": destination.stat().st_size,
+            "integrity": integrity,
         }
+    except sqlite3.Error as error:
+        destination.unlink(missing_ok=True)
+        _check_deadline(deadline, cancel)
+        if any(
+            reason in str(error).lower()
+            for reason in ("no such module", "no such collation")
+        ):
+            raise MigrationError(
+                "migration_database_feature_unavailable",
+                details={"feature": str(error)[:256]},
+            ) from None
+        raise MigrationError(
+            "migration_database_validation_failed",
+            details={
+                "sqlite_error": getattr(error, "sqlite_errorname", "SQLITE_ERROR"),
+            },
+        ) from None
     except BaseException:
         destination.unlink(missing_ok=True)
         raise
@@ -168,98 +196,120 @@ def _upgrade_group_scope(
         return
     if deadline is not None:
         connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+    previous_fk = connection.execute("PRAGMA foreign_keys").fetchone()[0]
+    previous_alter = connection.execute("PRAGMA legacy_alter_table").fetchone()[0]
     connection.execute("PRAGMA foreign_keys=OFF")
-    with connection:
-        columns = {row[1] for row in _columns(connection, table)}
-        for name, kind in (
-            ("bot_id", "VARCHAR(255)"),
-            ("platform_scope", "VARCHAR(64)"),
-            ("channel_id", "VARCHAR(255)"),
-            ("scope_key", "VARCHAR(64)"),
-        ):
-            if name not in columns:
-                connection.execute(f'ALTER TABLE "{table}" ADD COLUMN "{name}" {kind}')
-        rows = connection.execute(
-            "SELECT id, bot_id, platform_scope, group_id, channel_id, plugin_name "
-            f'FROM "{table}"'
-        )
-        for count, row in enumerate(rows, 1):
-            if count > max_rows:
-                raise MigrationError("migration_database_row_limit")
-            if deadline is not None:
-                _check_deadline(deadline)
-            payload = json.dumps(
-                ["v1", *(str(value or "") for value in row[1:])],
-                ensure_ascii=False,
-                separators=(",", ":"),
+    connection.execute("PRAGMA legacy_alter_table=ON")
+    try:
+        with connection:
+            if not connection.in_transaction:
+                connection.execute("BEGIN IMMEDIATE")
+            columns = {row[1] for row in _columns(connection, table)}
+            for name, kind in (
+                ("bot_id", "VARCHAR(255)"),
+                ("platform_scope", "VARCHAR(64)"),
+                ("channel_id", "VARCHAR(255)"),
+                ("scope_key", "VARCHAR(64)"),
+            ):
+                if name not in columns:
+                    connection.execute(
+                        f'ALTER TABLE "{table}" ADD COLUMN "{name}" {kind}'
+                    )
+            rows = connection.execute(
+                "SELECT id, bot_id, platform_scope, group_id, channel_id, plugin_name "
+                f'FROM "{table}"'
             )
-            connection.execute(
-                f'UPDATE "{table}" SET scope_key=? WHERE id=?',
-                (hashlib.sha256(payload.encode()).hexdigest(), row[0]),
-            )
-        schema = _tables(connection)[table]
-        legacy = {
-            ("group_id", "plugin_name"),
-            ("bot_id", "platform_scope", "group_id", "channel_id", "plugin_name"),
-        }
-        objects = list(
-            connection.execute(
-                "SELECT type, name, sql FROM sqlite_master "
-                "WHERE tbl_name=? AND sql IS NOT NULL AND type != 'table'",
-                (table,),
-            )
-        )
-        obsolete = []
-        inline = False
-        for index in connection.execute(f'PRAGMA index_list("{table}")'):
-            names = tuple(
-                row[2]
-                for row in connection.execute(f"PRAGMA index_info({_quote(index[1])})")
-            )
-            if index[2] and not index[4] and names in legacy:
-                obsolete.append(index[1])
-                inline |= index[3] == "u"
-        if inline:
-            # Rewrite only recognized table-level UNIQUE clauses; preserve the rest
-            # of the original DDL, including checks, defaults and foreign keys.
-            pattern = r",\s*(?:CONSTRAINT\s+\S+\s+)?UNIQUE\s*\(([^)]+)\)"
-
-            def remove_legacy(match):
-                names = tuple(
-                    part.strip().strip('"`[]') for part in match[1].split(",")
+            for count, row in enumerate(rows, 1):
+                if count > max_rows:
+                    raise MigrationError("migration_database_row_limit")
+                if deadline is not None:
+                    _check_deadline(deadline)
+                payload = json.dumps(
+                    ["v1", *(str(value or "") for value in row[1:])],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
                 )
-                return "" if names in legacy else match[0]
+                connection.execute(
+                    f'UPDATE "{table}" SET scope_key=? WHERE id=?',
+                    (hashlib.sha256(payload.encode()).hexdigest(), row[0]),
+                )
+            schema = _tables(connection)[table]
+            legacy = {
+                ("group_id", "plugin_name"),
+                ("bot_id", "platform_scope", "group_id", "channel_id", "plugin_name"),
+            }
+            objects = list(
+                connection.execute(
+                    "SELECT type, name, sql FROM sqlite_master "
+                    "WHERE tbl_name=? AND sql IS NOT NULL AND type != 'table'",
+                    (table,),
+                )
+            )
+            obsolete = []
+            inline = False
+            for index in connection.execute(f'PRAGMA index_list("{table}")'):
+                names = tuple(
+                    row[2]
+                    for row in connection.execute(
+                        f"PRAGMA index_info({_quote(index[1])})"
+                    )
+                )
+                if index[2] and not index[4] and names in legacy:
+                    obsolete.append(index[1])
+                    inline |= index[3] == "u"
+            if inline:
+                from .sql_tokens import replace_sqlite_unique
 
-            rebuilt = re.sub(pattern, remove_legacy, schema, flags=re.I)
-            if rebuilt == schema:
-                raise MigrationError("migration_group_scope_rebuild_unsupported")
-            temporary = table + "__migration_scope"
-            rebuilt = re.sub(
-                r"^(CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?)\S+(\s*\()",
-                lambda match: match[1] + _quote(temporary) + match[2],
-                rebuilt,
-                count=1,
-                flags=re.I,
-            )
-            connection.execute(rebuilt)
-            names = ",".join(_quote(row[1]) for row in _columns(connection, table))
-            connection.execute(
-                f'INSERT INTO "{temporary}" ({names}) ' f'SELECT {names} FROM "{table}"'
-            )
-            connection.execute(f'DROP TABLE "{table}"')
-            connection.execute(f'ALTER TABLE "{temporary}" RENAME TO "{table}"')
-            for _, name, sql in objects:
-                if name not in obsolete:
-                    connection.execute(sql)
-        else:
-            for name in obsolete:
-                connection.execute(f"DROP INDEX {_quote(name)}")
-        if (("scope_key",), 0) not in _unique_keys(connection, table):
-            connection.execute(
-                f"CREATE UNIQUE INDEX IF NOT EXISTS uid_group_plugi_scope_key "
-                f'ON "{table}" (scope_key)'
-            )
-    connection.execute("PRAGMA foreign_keys=ON")
+                temporary = table + "__migration_scope"
+                rebuilt = replace_sqlite_unique(
+                    schema,
+                    temporary,
+                    legacy,
+                    ("scope_key",),
+                    "uid_group_plugi_scope_key",
+                )
+                sequence = (
+                    connection.execute(
+                        "SELECT seq FROM sqlite_sequence WHERE name=?", (table,)
+                    ).fetchall()
+                    if connection.execute(
+                        "SELECT 1 FROM sqlite_schema WHERE name='sqlite_sequence'"
+                    ).fetchone()
+                    else []
+                )
+                connection.execute(rebuilt)
+                names = ",".join(
+                    _quote(row[1])
+                    for row in connection.execute(
+                        f"PRAGMA table_xinfo({_quote(table)})"
+                    )
+                    if row[6] == 0
+                )
+                connection.execute(
+                    f'INSERT INTO "{temporary}" ({names}) '
+                    f'SELECT {names} FROM "{table}"'
+                )
+                connection.execute(f'DROP TABLE "{table}"')
+                connection.execute(f'ALTER TABLE "{temporary}" RENAME TO "{table}"')
+                if sequence:
+                    connection.execute(
+                        "UPDATE sqlite_sequence SET seq=? WHERE name=?",
+                        (sequence[0][0], table),
+                    )
+                for _, name, sql in objects:
+                    if name not in obsolete:
+                        connection.execute(sql)
+            else:
+                for name in obsolete:
+                    connection.execute(f"DROP INDEX {_quote(name)}")
+            if (("scope_key",), 0) not in _unique_keys(connection, table):
+                connection.execute(
+                    f"CREATE UNIQUE INDEX IF NOT EXISTS uid_group_plugi_scope_key "
+                    f'ON "{table}" (scope_key)'
+                )
+    finally:
+        connection.execute(f"PRAGMA legacy_alter_table={int(previous_alter)}")
+        connection.execute(f"PRAGMA foreign_keys={int(previous_fk)}")
 
 
 @contextmanager

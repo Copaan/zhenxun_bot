@@ -980,6 +980,7 @@ class TaskStore:
                 "target_revision",
                 "shutdown_diagnostic",
                 "database_diagnostic",
+                "databases",
             )
             if key in value
         }
@@ -1001,6 +1002,34 @@ class TaskStore:
                 },
             }
         return result
+
+    def record_database_state(self, identity: str, resource: dict) -> None:
+        """Update one resource receipt without invalidating the active phase."""
+        if set(resource) - {
+            "id",
+            "role",
+            "engine",
+            "path",
+            "target_name",
+            "state",
+            "error_code",
+        }:
+            raise MigrationError("migration_task_metadata_invalid")
+        _public_payload(resource)
+
+        def update(value):
+            if not isinstance(value, dict) or value.get("id") != identity:
+                raise MigrationError("migration_record_not_found", status=404)
+            items = value.setdefault("databases", [])
+            previous = next(
+                (item for item in items if item["id"] == resource["id"]), None
+            )
+            if previous is None:
+                items.append(dict(resource))
+            else:
+                previous.update(resource)
+
+        mutate_json_locked(self.path("jobs", identity), None, update)
 
     def record_shutdown(self, identity: str, shutdown: dict) -> None:
         """Keep the original worker's evidence even after recovery replaces it."""
@@ -1098,6 +1127,7 @@ class TaskStore:
                         "global",
                         "database",
                         "table",
+                        "routine",
                         "partial_revoke",
                         "enabled_role",
                     }
@@ -1133,39 +1163,33 @@ class TaskStore:
                     raise MigrationError("migration_task_metadata_invalid")
                 continue
             if key == "restore_permission_checks":
-                allowed_checks = (
-                    frozenset(
-                        {
-                            "alter",
-                            "create",
-                            "delete",
-                            "drop",
-                            "index",
-                            "insert",
-                            "references",
-                            "update",
-                        }
-                    ),
-                    frozenset(
-                        {
-                            "database_connect",
-                            "database_create",
-                            "schema_usage",
-                            "schema_create",
-                            "schema_owner",
-                        }
-                    ),
-                )
+                allowed_checks = {
+                    "alter",
+                    "create",
+                    "delete",
+                    "drop",
+                    "index",
+                    "insert",
+                    "references",
+                    "update",
+                    "select",
+                    "lock_tables",
+                    "database_connect",
+                    "database_create",
+                    "schema_usage",
+                    "schema_create",
+                    "schema_owner",
+                    "create_view",
+                    "show_view",
+                    "trigger",
+                    "event",
+                    "create_routine",
+                    "alter_routine",
+                    "execute",
+                }
                 if (
                     not isinstance(value, dict)
-                    or (
-                        frozenset(value) not in allowed_checks
-                        and not (
-                            allowed_checks[0]
-                            <= frozenset(value)
-                            <= allowed_checks[0] | {"select", "lock_tables"}
-                        )
-                    )
+                    or not set(value) <= allowed_checks
                     or any(
                         type(item) is not int or item not in {0, 1}
                         for item in value.values()
