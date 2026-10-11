@@ -2,7 +2,7 @@ from collections import defaultdict
 
 import nonebot
 from nonebot.plugin import PluginMetadata
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from zhenxun import ui
 from zhenxun.configs.config import BotConfig, Config
@@ -24,8 +24,7 @@ class PluginData(BaseModel):
     plugin: PluginInfo
     metadata: PluginMetadata
 
-    class Config:
-        arbitrary_types_allowed = True
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
 
 async def _get_plugins_by_types(plugin_types: list[PluginType]) -> list[PluginData]:

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import uuid
 
-from zhenxun.migration.sql_tokens import replace_sqlite_unique as replace_unique_sql
+from zhenxun.services.migration.sql_tokens import (
+    replace_sqlite_unique as replace_unique_sql,
+)
 
 
 def quote(value):

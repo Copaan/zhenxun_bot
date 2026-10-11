@@ -295,9 +295,7 @@ async def _save_websocket_bot(app_id: str, secret: str) -> dict[str, Any]:
         )
         restart_required = bool(set(changed_keys) & set(pending_keys))
         reasons = [f"environment:{key}" for key in pending_keys]
-        launcher_managed = update_pending_restart(
-            "webui.protocol", reasons, issue_ticket=False
-        )
+        launcher_managed = update_pending_restart("webui.protocol", reasons)
         if restart_required and launcher_managed:
             issue_restart_ticket("webui.settings", ttl_seconds=10 * 60)
         return {

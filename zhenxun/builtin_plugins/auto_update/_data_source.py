@@ -1,4 +1,5 @@
 import asyncio
+from pathlib import Path
 from typing import Literal
 
 from nonebot.adapters import Bot
@@ -6,8 +7,8 @@ from packaging.specifiers import SpecifierSet
 from packaging.version import InvalidVersion, Version
 
 from zhenxun.services.log import logger
+from zhenxun.utils._restart_utils import request_dependency_restart
 from zhenxun.utils.http_utils import AsyncHttpx
-from zhenxun.utils.manager.virtual_env_package_manager import VirtualEnvPackageManager
 from zhenxun.utils.manager.zhenxun_repo_manager import (
     ZhenxunRepoConfig,
     ZhenxunRepoManager,
@@ -226,16 +227,7 @@ class UpdateManager:
         result_message = ""
         if zip:
             new_version = await ZhenxunRepoManager.zhenxun_zip_update(version_type)
-            await PlatformUtils.send_superuser(
-                bot, "真寻更新完成，开始安装依赖...", user_id
-            )
-            await VirtualEnvPackageManager.install_requirement(
-                ZhenxunRepoConfig.REQUIREMENTS_FILE
-            )
-            result_message = (
-                f"版本更新完成！\n版本: {cur_version} -> {new_version}\n"
-                "请重新启动真寻以完成更新!"
-            )
+            result_message = f"版本更新完成！\n版本: {cur_version} -> {new_version}"
         else:
             result = await ZhenxunRepoManager.zhenxun_git_update(
                 source,
@@ -248,18 +240,11 @@ class UpdateManager:
                     LOG_COMMAND,
                 )
                 return f"版本更新失败...错误: {result.error_message}"
-            await PlatformUtils.send_superuser(
-                bot, "真寻更新完成，开始安装依赖...", user_id
-            )
-            await VirtualEnvPackageManager.install_requirement(
-                ZhenxunRepoConfig.REQUIREMENTS_FILE
-            )
             result_message = (
                 f"版本更新完成！\n"
                 f"版本: {cur_version} -> {result.new_version}\n"
                 f"变更文件个数: {len(result.changed_files)}"
-                f"{'' if source == 'git' else '（阿里云更新不支持查看变更文件）'}\n"
-                "请重新启动真寻以完成更新!"
+                f"{'' if source == 'git' else '（阿里云更新不支持查看变更文件）'}"
             )
         resource_warning = ""
         if version_type == "main":
@@ -301,7 +286,10 @@ class UpdateManager:
                 resource_warning = (
                     "\n\n⚠️ 检查资源版本兼容性时出错，建议手动运行 `检查更新 resource`"
                 )
-        return result_message + resource_warning
+        _, dependency_message = await request_dependency_restart(
+            "auto_update", {Path("pyproject.toml"), Path("uv.lock")}
+        )
+        return f"{result_message}\n{dependency_message}{resource_warning}"
 
     @classmethod
     def __get_version(cls) -> str:

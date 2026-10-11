@@ -137,7 +137,7 @@ def _generate_simple_config(exists_module: list[str]) -> bool:
     priority=0,
     stage="runtime",
     timeout=15,
-    task_id="runtime:reconcile_config",
+    component_id="runtime:reconcile_config",
     depends_on=("management:database",),
 )
 def reconcile_config_runtime() -> set[Path]:

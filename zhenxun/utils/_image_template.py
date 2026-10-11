@@ -4,7 +4,7 @@ from pathlib import Path
 import random
 
 from PIL.ImageFont import FreeTypeFont
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from ._build_image import BuildImage
 
@@ -17,8 +17,7 @@ class RowStyle(BaseModel):
     font_color: str | tuple[int, int, int] = (0, 0, 0)
     """字体颜色"""
 
-    class Config:
-        arbitrary_types_allowed = True
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
 
 class ImageTemplate:

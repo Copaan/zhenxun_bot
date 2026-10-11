@@ -104,8 +104,7 @@ from bag_users t1
     timeout=300,
     parallel_safe=True,
     failure_policy="degrade",
-    task_id="warmup:resources",
-    resource_group="resources",
+    component_id="warmup:resources",
 )
 async def _prepare_resources():
     try:
@@ -171,9 +170,8 @@ async def _prepare_resources():
     stage="runtime",
     timeout=300,
     failure_policy="fatal",
-    task_id="runtime:legacy_data",
+    component_id="runtime:legacy_data",
     depends_on=("management:database", "runtime:reconcile_tasks"),
-    resource_group="database",
 )
 async def _migrate_legacy_data():
     """签到与用户的数据迁移"""

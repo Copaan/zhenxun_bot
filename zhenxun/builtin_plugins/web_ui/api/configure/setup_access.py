@@ -9,11 +9,18 @@ import time
 from typing import Literal
 
 from fastapi import Header, HTTPException, Request
+from jose import JWTError
 
 from zhenxun.configs.config import BotConfig, Config
+from zhenxun.utils.webui_session import (
+    SESSION_SECONDS,
+    AuthenticatedSession,
+    decode_token,
+    issue_token,
+)
 
 SetupState = Literal["unconfigured", "partial", "restart_pending", "configured"]
-_SESSION_TTL_SECONDS = 15 * 60
+_SESSION_TTL_SECONDS = SESSION_SECONDS
 _MAX_SESSIONS = 16
 
 
@@ -24,11 +31,13 @@ class SetupSession:
     expires_at: float
     claimed_state: SetupState
     restart_receipt_digest: str | None = None
+    claims: dict | None = None
 
 
 class SetupAccessManager:
     def __init__(self) -> None:
         self._pepper = secrets.token_bytes(32)
+        self.secret = secrets.token_urlsafe(48)
         self._sessions: dict[str, SetupSession] = {}
         self._restart_pending = False
         self._lock = asyncio.Lock()
@@ -37,7 +46,7 @@ class SetupAccessManager:
         return hmac.new(self._pepper, value.encode("utf-8"), sha256).hexdigest()
 
     def _prune_sessions(self) -> None:
-        now = time.monotonic()
+        now = time.time()
         self._sessions = {
             digest: session
             for digest, session in self._sessions.items()
@@ -58,13 +67,21 @@ class SetupAccessManager:
             return "partial"
         return "unconfigured"
 
-    async def create_session(self, client_ip: str) -> tuple[str, int]:
+    async def create_session(self, client_ip: str, *, boot_id="") -> tuple[str, int]:
         async with self._lock:
             claimed_state = self.state()
             if claimed_state in {"configured", "restart_pending"}:
                 raise HTTPException(status_code=409, detail="首次配置已经完成。")
-            token = secrets.token_urlsafe(32)
-            token_digest = self._digest(token)
+            token = issue_token(
+                self.secret,
+                "console-operator",
+                claims={
+                    "auth_source": "console",
+                    "boot_id": boot_id,
+                },
+            )
+            claims = decode_token(token, self.secret)
+            token_digest = claims["sid"]
             self._prune_sessions()
             while len(self._sessions) >= _MAX_SESSIONS:
                 oldest = min(
@@ -75,8 +92,9 @@ class SetupAccessManager:
             self._sessions[token_digest] = SetupSession(
                 token_digest=token_digest,
                 client_ip=client_ip,
-                expires_at=time.monotonic() + _SESSION_TTL_SECONDS,
+                expires_at=claims["exp"],
                 claimed_state=claimed_state,
+                claims=claims,
             )
             return token, _SESSION_TTL_SECONDS
 
@@ -89,7 +107,11 @@ class SetupAccessManager:
     ) -> SetupSession:
         async with self._lock:
             self._prune_sessions()
-            token_digest = self._digest(token) if token else ""
+            try:
+                claims = decode_token(token or "", self.secret)
+            except JWTError:
+                raise HTTPException(401, detail="首次配置会话无效或已过期。") from None
+            token_digest = claims["sid"]
             session = self._sessions.get(token_digest)
             state = self.state()
             if state == "configured" or (
@@ -102,6 +124,11 @@ class SetupAccessManager:
                     detail="首次配置会话无效或已过期。",
                 )
             return session
+
+    def identity(self, session: SetupSession) -> AuthenticatedSession:
+        return AuthenticatedSession(
+            session.token_digest, session.claims, self.secret, first_deployment=True
+        )
 
     async def mark_applied(self, session: SetupSession) -> str:
         async with self._lock:
@@ -138,9 +165,13 @@ setup_access = SetupAccessManager()
 
 async def require_setup_token(
     request: Request,
-    x_setup_token: str | None = Header(default=None, alias="X-Setup-Token"),
+    authorization: str | None = Header(default=None, alias="Authorization"),
 ) -> SetupSession:
-    return await setup_access.authorize(x_setup_token, client_ip(request))
+    if request.headers.get("x-setup-token") or request.headers.get(
+        "x-migration-session"
+    ):
+        raise HTTPException(410, "migration_session_protocol_obsolete")
+    return await setup_access.authorize(authorization, client_ip(request))
 
 
 __all__ = [

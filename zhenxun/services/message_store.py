@@ -56,7 +56,7 @@ def assert_replaceable_inbox(root: Path):
     path = root / "data/runtime/message-inbox/inbox.sqlite3"
     if not path.exists():
         return
-    from zhenxun.migration.errors import MigrationError
+    from zhenxun.services.migration.errors import MigrationError
 
     db = None
     try:

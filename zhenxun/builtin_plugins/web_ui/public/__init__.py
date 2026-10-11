@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from fastapi import APIRouter, Depends, FastAPI
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
@@ -29,6 +31,17 @@ async def version_manifest():
         webui_resources.snapshot.public(),
         headers={"Cache-Control": "no-store"},
     )
+
+
+@router.get("/maintenance.html")
+async def maintenance_page():
+    """Keep the task page available before and after launcher handoff."""
+    entry = ZhenxunRepoManager.config.WEBUI_PATH / "maintenance.html"
+    if not entry.is_file():
+        from zhenxun.services.migration import maintenance_app
+
+        entry = Path(maintenance_app.__file__).with_name("maintenance_fallback.html")
+    return FileResponse(entry, headers={"Cache-Control": "no-store"})
 
 
 @router.get("/favicon.ico")

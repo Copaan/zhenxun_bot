@@ -21,7 +21,7 @@ def test_update_service_imports_before_nonebot_initialization() -> None:
         "    pass\n"
         "else:\n"
         "    raise AssertionError('NoneBot unexpectedly initialized')\n"
-        "import zhenxun.update_service\n"
+        "import zhenxun.services.update.update_service\n"
     )
     result = subprocess.run(
         [sys.executable, "-c", code],
@@ -57,8 +57,15 @@ def test_protocol_env_update_preserves_multiline_and_masks_credentials() -> None
     serialized = json.dumps(masked)
     assert "token-value" not in serialized
     assert "secret-value" not in serialized
+    # 摘要同时回显非敏感的 intent/shard 设置，未配置时取默认值
     assert masked["qq"]["bots"] == [
-        {"id": "100", "has_token": True, "has_secret": True}
+        {
+            "id": "100",
+            "has_token": True,
+            "has_secret": True,
+            "intent": {},
+            "shard": None,
+        }
     ]
 
 
@@ -169,7 +176,7 @@ async def test_qq_probe_reuses_saved_credentials(
 
 
 def test_update_archive_rejects_path_escape(tmp_path: Path) -> None:
-    from zhenxun import update_service
+    from zhenxun.services.update import update_service
 
     archive = tmp_path / "bad.zip"
     with zipfile.ZipFile(archive, "w") as bundle:
@@ -182,7 +189,7 @@ def test_update_archive_rejects_path_escape(tmp_path: Path) -> None:
 def test_webui_apply_preserves_nested_git_and_rolls_visible_assets(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from zhenxun import update_service
+    from zhenxun.services.update import update_service
 
     public = tmp_path / "data" / "web_ui" / "public"
     (public / ".git").mkdir(parents=True)
@@ -205,7 +212,7 @@ def test_webui_apply_preserves_nested_git_and_rolls_visible_assets(
 def test_webui_staging_requires_compatible_manifest_and_assets(
     tmp_path: Path,
 ) -> None:
-    from zhenxun import update_service
+    from zhenxun.services.update import update_service
 
     (tmp_path / "js").mkdir()
     (tmp_path / "css").mkdir()
@@ -233,7 +240,7 @@ def test_webui_staging_requires_compatible_manifest_and_assets(
 
 
 def test_webui_status_compares_matching_source_commits() -> None:
-    from zhenxun import update_service
+    from zhenxun.services.update import update_service
 
     status = update_service._component_status(
         "webui",
@@ -251,7 +258,7 @@ def test_webui_status_compares_matching_source_commits() -> None:
 
 
 def test_blocked_bot_release_is_visible_but_not_updateable() -> None:
-    from zhenxun import update_service
+    from zhenxun.services.update import update_service
 
     status = update_service._component_status(
         "bot",
@@ -269,7 +276,7 @@ def test_blocked_bot_release_is_visible_but_not_updateable() -> None:
 async def test_blocked_bot_release_cannot_bypass_job_creation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from zhenxun import update_service
+    from zhenxun.services.update import update_service
 
     async def blocked_ref(*_args):
         return "0.2.4-fix"
@@ -291,7 +298,7 @@ async def test_blocked_bot_release_cannot_bypass_job_creation(
 def test_bot_update_can_roll_back_after_health_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from zhenxun import update_service
+    from zhenxun.services.update import update_service
 
     staging = tmp_path / "data" / "update" / "staging"
     backups = tmp_path / "data" / "update" / "backups"

@@ -43,10 +43,20 @@ def select_repair_groups(preview: dict, selected: list[str] | None) -> dict:
             else:
                 target["packages"][name] = deepcopy(value)
     remaining = [item for item in preview["issues"] if item["name"] not in repaired]
+    target["dependency_warnings"] = [
+        item
+        for item in preview.get("bound_conflicts", [])
+        if item["name"] not in repaired and item["owner"] not in repaired
+    ]
     return {
         "target_manifest": target,
         "changes": changes,
         "remaining_conflicts": remaining,
+        "source_build_required": any(
+            group.get("source_build_required")
+            for group in groups
+            if group["id"] in chosen
+        ),
     }
 
 
@@ -62,6 +72,8 @@ async def preview_layer_repair(report: dict[str, Any]) -> dict[str, Any]:
     )
 
     snapshot = capture_environment()
+    from .policy import ORM_PACKAGES, guard_orm_changes, retained_conflicts
+
     if environment_report(snapshot=snapshot)["fingerprint"] != report["fingerprint"]:
         raise DependencyAnalysisError("environment_analysis_stale")
     manifest, current = snapshot.manifest, snapshot.versions
@@ -72,6 +84,7 @@ async def preview_layer_repair(report: dict[str, Any]) -> dict[str, Any]:
         canonicalize_name(p["project_link"]) for p in manifest["plugins"].values()
     )
     fixed = {**{name: current[name] for name in plugins if name in current}, **core}
+    fixed.update({name: current[name] for name in ORM_PACKAGES if name in current})
     issues = (
         report["requirement_conflicts"]
         + report["immutable_drift"]
@@ -148,12 +161,27 @@ async def preview_layer_repair(report: dict[str, Any]) -> dict[str, Any]:
             resolved, detail = await _compile(
                 inputs, constraints, wheels_only=True, preferences=current
             )
+            group["source_build_required"] = False
+            if resolved is None:
+                resolved, source_detail = await _compile(
+                    inputs,
+                    constraints,
+                    wheels_only=False,
+                    preferences=current,
+                    restricted_packages=tuple(archive.get("wheels_only_packages", [])),
+                )
+                if resolved is not None:
+                    group["source_build_required"] = True
+                    group["diagnostic"] = detail
+                else:
+                    detail = source_detail or detail
             if resolved is None:
                 raise DependencyAnalysisError(
-                    "current_environment_dependency_conflict",
+                    "dependency_resolution_failed",
                     detail,
                     details=group["issues"],
                 )
+            guard_orm_changes(current, {**current, **resolved})
             if (set(resolved) - scope) & (roots - group_roots):
                 raise DependencyAnalysisError("dependency_repair_scope_changed")
             for name, version in resolved.items():
@@ -191,7 +219,7 @@ async def preview_layer_repair(report: dict[str, Any]) -> dict[str, Any]:
                 {
                     "base_manifest": manifest,
                     "target_manifest": target,
-                    "source_build_confirmed": False,
+                    "source_build_confirmed": group["source_build_required"],
                     "action": "environment_repair",
                     "affected_dependency_packages": sorted(scope),
                 }
@@ -206,6 +234,7 @@ async def preview_layer_repair(report: dict[str, Any]) -> dict[str, Any]:
             group["changes"], group["package_updates"] = [], {}
     return {
         "base_manifest": manifest,
+        "bound_conflicts": retained_conflicts(snapshot, set()),
         "groups": groups,
         "issues": issues,
         "changes": [item for group in groups for item in group["changes"]],

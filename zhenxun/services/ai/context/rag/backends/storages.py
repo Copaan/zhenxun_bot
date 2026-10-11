@@ -260,7 +260,8 @@ class QdrantStorageBackend(StorageBackend):
             from qdrant_client import AsyncQdrantClient
         except ImportError:
             raise ImportError(
-                "缺少 Qdrant 依赖！请执行 `pip install qdrant-client` 安装"
+                "缺少 Qdrant 依赖！"
+                "请在 WebUI「插件管理 → 依赖管理」中安装 qdrant-client"
             )
 
         self.client = AsyncQdrantClient(location=location, **kwargs)
@@ -444,7 +445,9 @@ class LanceDBStorageBackend(StorageBackend):
         try:
             import lancedb
         except ImportError:
-            raise ImportError("缺少 LanceDB 依赖！请执行 `pip install lancedb` 安装")
+            raise ImportError(
+                "缺少 LanceDB 依赖！请在 WebUI「插件管理 → 依赖管理」中安装 lancedb"
+            )
 
         os.makedirs(
             os.path.dirname(uri) if os.path.dirname(uri) else ".", exist_ok=True

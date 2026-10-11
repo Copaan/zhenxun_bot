@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
+from hashlib import sha256
 import importlib.metadata
 import os
-from pathlib import Path
 from typing import Any, Literal
 import uuid
 
@@ -17,10 +18,13 @@ from pydantic import BaseModel, Field
 
 from zhenxun.services.lifecycle.operations import operation_registry
 from zhenxun.services.log import logger
+from zhenxun.services.nonebot_store.cleanup import (
+    active_transaction as pending_transaction,
+)
 from zhenxun.services.nonebot_store.dependencies import (
     DependencyAnalysisError,
     environment_fingerprint,
-    environment_report,
+    environment_report_async,
     fetch_pypi_metadata,
     installed_inventory,
     metadata_compatibility,
@@ -34,12 +38,13 @@ from zhenxun.services.nonebot_store.registry import get_registry, get_registry_p
 from zhenxun.services.nonebot_store.runtime import (
     LayerBuildError,
     activate_current_generation,
-    build_generation,
     commit_generation,
     finalize_orm_migration,
     finalize_pending_transaction,
     generation_native_extensions,
     module_source_path,
+    prepare_generation,
+    record_manual_operations,
     rollback_pending_transaction,
     stage_generation,
 )
@@ -48,12 +53,16 @@ from zhenxun.services.nonebot_store.storage import (
     clear_pending_transaction,
     dependency_sync_status,
     load_manifest,
-    pending_transaction,
     read_json,
     remove_generation,
     save_dependency_sync_status,
     save_pending_transaction,
     utc_now,
+)
+from zhenxun.services.plugin_host import plugin_host
+from zhenxun.services.plugin_store.operation_journal import (
+    operation_status,
+    record_operation,
 )
 from zhenxun.services.plugin_store.plugin_archive_dependencies import (
     ArchiveDependencyConflict,
@@ -64,30 +73,34 @@ from zhenxun.services.plugin_store.plugin_store_transaction import (
     archive_dependency_policy,
     preflight_archive_dependency_policy,
 )
-from zhenxun.services.runtime_reload import plugin_runtime_manager
 
 from ....apply_result import update_pending_restart
 from ....base_model import Result
 from ....restart_service import restart_status_data
 from ....utils import authentication
-from .operation_journal import begin_operation, record_operation
 from .store import StoreOperationBusyError, _store_operation
 
 router = APIRouter(prefix="/store/nonebot")
 _ANALYSIS_TTL = timedelta(minutes=20)
 _ANALYSES: dict[str, dict[str, Any]] = {}
 _REPAIR_PREVIEWS: dict[str, dict[str, Any]] = {}
+_ACTIVE_APPLIES: dict[str, tuple[str, asyncio.Task]] = {}
+_ACTIVE_REPAIRS: dict[str, tuple[str, asyncio.Task]] = {}
 _PENDING_TRANSACTION_STATES = {
     "building",
     "pending_restart",
     "verification_pending",
     "migration_blocked",
+    "recovery_required",
+    "cleanup_pending",
+    "committed",
 }
 
 
 class AnalyzePayload(BaseModel):
     project_link: str = Field(min_length=1, max_length=200)
     action: Literal["install", "update", "uninstall"]
+    prefer_existing: bool = True
 
 
 class ApplyPayload(BaseModel):
@@ -98,18 +111,21 @@ class ApplyPayload(BaseModel):
     confirm_third_party_code: bool = False
     confirm_compatibility_overrides: bool = False
     confirm_database_migration: bool = False
+    confirmed: bool = False
+    summary_revision: str | None = None
 
 
 class EnvironmentRepairPayload(BaseModel):
+    operation_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
     expected_fingerprint: str = Field(min_length=64, max_length=64)
     confirmed: bool = False
     preview_id: str | None = None
     group_ids: list[str] | None = None
 
 
-def _environment_view() -> dict[str, Any]:
+async def _environment_view() -> dict[str, Any]:
     try:
-        result = environment_report(check_lock=True)
+        result = await environment_report_async(check_lock=True)
     except DependencyAnalysisError as error:
         result = {
             "status": (
@@ -154,8 +170,14 @@ def _environment_view() -> dict[str, Any]:
     result["sync"] = dependency_sync_status()
     result["startup_verification"] = read_json(STARTUP_STATUS_FILE, {})
     pending = pending_transaction() or {}
+    from zhenxun.services.nonebot_store.policy import orm_console_instructions
+
+    result["orm_manual"] = orm_console_instructions(pending)
     result["candidate_built"] = isinstance(pending.get("generation"), int)
     result["launcher_managed"] = bool(os.environ.get("ZHENXUN_LAUNCHER_PID"))
+    from zhenxun.services.nonebot_store.cleanup import public_records
+
+    result["cleanup_records"] = public_records()
     return result
 
 
@@ -177,6 +199,11 @@ def _basic_block_reasons(plugin: dict[str, Any]) -> list[dict[str, str]]:
                 "message": "Registry 模块名不是有效的 Python 导入路径",
             }
         )
+    return reasons
+
+
+def _registry_warnings(plugin: dict[str, Any]) -> list[dict[str, str]]:
+    reasons = []
     if not plugin.get("valid"):
         reasons.append(
             {"code": "registry_plugin_invalid", "message": "Registry 标记为无效"}
@@ -196,6 +223,37 @@ def _basic_block_reasons(plugin: dict[str, Any]) -> list[dict[str, str]]:
                 }
             )
     return reasons
+
+
+def _local_registry_item(plugin: dict) -> dict:
+    return {
+        **plugin,
+        "valid": True,
+        "skip_test": False,
+        "supported_adapters": [],
+        "catalog_source": "local",
+    }
+
+
+async def _catalog_sources(
+    manifest: dict, *, refresh: bool = False
+) -> tuple[list, dict]:
+    """Keep managed packages discoverable when remote catalog data is unavailable."""
+    local = {
+        p["project_link"]: _local_registry_item(p)
+        for p in manifest.get("plugins", {}).values()
+        if p.get("state") == "managed"
+    }
+    try:
+        entries, meta = await get_registry(refresh=refresh)
+    except Exception as error:
+        return list(local.values()), {
+            "unavailable": True,
+            "diagnostic": type(error).__name__,
+        }
+    for item in entries:
+        local[item["project_link"]] = item
+    return list(local.values()), meta
 
 
 def _managed_plugin(
@@ -254,7 +312,38 @@ def _catalog_item(
     pending: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     project_link = str(plugin["project_link"])
+    if pending is None:
+        from zhenxun.services.nonebot_store.cleanup import records
+        from zhenxun.services.nonebot_store.storage import (
+            pending_transaction as recorded_transaction,
+        )
+
+        history = [recorded_transaction(), *records()]
+        pending = next(
+            (
+                record
+                for record in history
+                if record
+                and any(
+                    item.get("project_link") == project_link
+                    for item in record.get("operations", [])
+                )
+            ),
+            None,
+        )
+        if pending and not pending.get("rollback_confirmed"):
+            pending = None
     managed = _managed_plugin(project_link, manifest)
+    if (
+        pending
+        and pending.get("rollback_confirmed")
+        and managed
+        and (
+            str(managed.get("installed_at") or "")
+            > str(pending.get("created_at") or "")
+        )
+    ):
+        pending = None
     external = None if managed else _external_version(project_link, inventory)
     pending_operations = pending.get("operations", []) if pending else []
     matching_operation = next(
@@ -327,17 +416,17 @@ def _catalog_item(
     )
     if failure_reasons:
         install_state = "failed"
-    elif reasons:
-        install_state = "blocked"
     elif managed:
         install_state = "update_available" if update_available else "managed"
     elif external:
         install_state = "external"
+    elif reasons:
+        install_state = "blocked"
     else:
         install_state = "not_installed"
     module_name = str(plugin.get("module_name") or "")
     runtime = (
-        plugin_runtime_manager.classification_for(module_name)
+        plugin_host.classification_for(module_name)
         if (managed or external) and module_name
         else {"reload_support": "hot_reloadable", "reload_reasons": []}
     )
@@ -368,7 +457,18 @@ def _catalog_item(
         "update_available": update_available,
         "compatibility": "blocked" if reasons else "compatible",
         "blocked_reasons": reasons,
+        "warnings": _registry_warnings(plugin),
+        "catalog_source": plugin.get("catalog_source", "registry"),
         "failure_reasons": failure_reasons,
+        "dependency_retry_available": bool(
+            matching_transaction
+            and pending
+            and pending.get("rollback_confirmed")
+            and any(
+                item.get("code") == "dependency_import_failed"
+                for item in failure_reasons
+            )
+        ),
         "pending_reasons": pending_reasons,
         "managed": bool(managed),
         "external": bool(external),
@@ -389,7 +489,11 @@ def _catalog_item(
         ),
         **runtime,
         "apply_mode": (
-            "restart_pending"
+            "recovery_required"
+            if transaction_state == "recovery_required"
+            else "cleanup_pending"
+            if transaction_state in {"committed", "cleanup_pending"}
+            else "restart_pending"
             if pending_action
             else "failed"
             if failure_reasons
@@ -400,6 +504,9 @@ def _catalog_item(
             matching_operation.get("operation_id") if matching_operation else None
         ),
         "transaction_state": transaction_state or None,
+        "rollback_confirmed": bool(
+            matching_transaction and pending and pending.get("rollback_confirmed")
+        ),
     }
 
 
@@ -429,13 +536,17 @@ async def _analyze(analysis_id: str) -> None:
     analysis = _ANALYSES[analysis_id]
     analysis["status"] = "analyzing"
     try:
-        plugin, registry_meta = await get_registry_plugin(analysis["project_link"])
-        reasons = _basic_block_reasons(plugin)
         pending = pending_transaction()
         manifest = _effective_manifest(pending)
         pending_revision = _pending_revision(pending)
         inventory = installed_inventory()
         managed = _managed_plugin(analysis["project_link"], manifest)
+        if analysis["action"] == "uninstall" and managed:
+            plugin, registry_meta = _local_registry_item(managed), {"source": "local"}
+            reasons = []
+        else:
+            plugin, registry_meta = await get_registry_plugin(analysis["project_link"])
+            reasons = _basic_block_reasons(plugin)
         external = (
             None if managed else _external_version(analysis["project_link"], inventory)
         )
@@ -459,7 +570,11 @@ async def _analyze(analysis_id: str) -> None:
             metadata = await fetch_pypi_metadata(
                 str(plugin["project_link"]), str(plugin["version"])
             )
-            reasons.extend(metadata_compatibility(metadata))
+            reasons.extend(
+                item
+                for item in metadata_compatibility(metadata)
+                if not item["code"].endswith("_version_incompatible")
+            )
         if reasons:
             analysis.update(
                 {
@@ -475,7 +590,32 @@ async def _analyze(analysis_id: str) -> None:
         plan = (
             uninstall_plan(managed or plugin, manifest=manifest)
             if action == "uninstall"
-            else await solve_install(plugin, metadata or {}, manifest=manifest)
+            else await solve_install(
+                plugin,
+                metadata or {},
+                manifest=manifest,
+                prefer_existing=analysis.get("prefer_existing", True),
+            )
+        )
+        from zhenxun.services.nonebot_store.policy import summary_revision
+
+        plan["warnings"] = _registry_warnings(plugin)
+        plan["artifact_hashes"] = sorted(
+            {
+                str(item.get("digests", {}).get("sha256"))
+                for item in (metadata or {}).get("urls", [])
+                if item.get("digests", {}).get("sha256")
+            }
+        )
+        plan["restart_required"] = True
+        plan["summary_revision"] = summary_revision(
+            {
+                **plan,
+                "plugin": {
+                    key: plugin.get(key)
+                    for key in ("project_link", "version", "module_name")
+                },
+            }
         )
         analysis.update(
             {
@@ -491,7 +631,7 @@ async def _analyze(analysis_id: str) -> None:
                 "pending_revision": pending_revision,
                 "base_manifest": manifest,
                 "plan": plan,
-                "environment": _environment_view(),
+                "environment": await _environment_view(),
                 "plugin": _catalog_item(plugin, manifest=manifest, inventory=inventory),
             }
         )
@@ -527,7 +667,7 @@ async def _analyze(analysis_id: str) -> None:
                 "status": "blocked",
                 "compatible": False,
                 "blocked_reasons": [reason],
-                "environment": _environment_view(),
+                "environment": await _environment_view(),
             }
         )
     except KeyError:
@@ -580,6 +720,7 @@ def _recover_analysis(record: dict[str, Any]):
         "analysis_id": analysis_id,
         "project_link": project_link,
         "action": action,
+        "prefer_existing": public_input.get("prefer_existing", True),
         "status": "queued",
         "created_at": utc_now(),
         "recovered": True,
@@ -613,6 +754,9 @@ def _target_manifest(analysis: dict[str, Any]) -> dict[str, Any]:
     target = deepcopy(current)
     target.pop("generation_digest", None)
     target["pending_verification"] = False
+    target["dependency_warnings"] = deepcopy(
+        analysis["plan"].get("remaining_conflicts", [])
+    )
     plugin = analysis["registry_plugin"]
     store_key = f"nonebot:{plugin['project_link']}"
     if analysis["action"] == "uninstall":
@@ -654,13 +798,7 @@ def _operation_result(
 ) -> dict[str, Any]:
     source = "webui.nonebot-store"
     restart_required = mode == "restart_pending"
-    launcher_managed = update_pending_restart(
-        source, reason_codes if restart_required else [], issue_ticket=False
-    )
-    if restart_required and launcher_managed:
-        from zhenxun.utils._restart_utils import issue_restart_ticket
-
-        issue_restart_ticket("webui.nonebot-store", ttl_seconds=10 * 60)
+    update_pending_restart(source, reason_codes if restart_required else [])
     status = restart_status_data()
     return {
         "apply_mode": mode,
@@ -695,31 +833,40 @@ async def _apply_hot(
             root = module_source_path(module_name)
             if root is None:
                 raise RuntimeError("plugin_module_missing_after_install")
-            operation = await plugin_runtime_manager.load_new_plugin(
+            operation = await plugin_host.load_new_plugin(
                 module_name, root, submit_restart=False, dependencies_verified=True
             )
         elif action == "update":
-            operation = await plugin_runtime_manager.reload_plugin(module_name)
+            operation = await plugin_host.reload_plugin(module_name)
         else:
-            operation = await plugin_runtime_manager.unload_plugin(module_name)
+            operation = await plugin_host.unload_plugin(module_name)
         if operation.mode.value != "hot_reloaded":
             raise RuntimeError(operation.reason or "plugin_runtime_apply_failed")
     except Exception:
         rollback_pending_transaction()
         activate_current_generation()
         if action in {"update", "uninstall"}:
-            await plugin_runtime_manager.recover_plugin(
-                module_name, submit_restart=False
-            )
+            await plugin_host.recover_plugin(module_name, submit_restart=False)
         raise
     finalize_pending_transaction()
     old_generation = previous_manifest.get("active_generation")
-    return _operation_result(
-        "hot_reloaded",
-        [],
-        generation=build["generation"],
-        previous_generation=old_generation,
-    )
+    try:
+        return _operation_result(
+            "hot_reloaded",
+            [],
+            generation=build["generation"],
+            previous_generation=old_generation,
+        )
+    except OSError as error:
+        return {
+            "apply_mode": "hot_reloaded",
+            "generation": build["generation"],
+            "previous_generation": old_generation,
+            "cleanup_error": {
+                "code": "operation_followup_pending",
+                "diagnostic": safe_process_error(str(error)),
+            },
+        }
 
 
 @router.get(
@@ -729,7 +876,7 @@ async def _apply_hot(
     response_class=JSONResponse,
 )
 async def dependency_environment() -> Result[dict]:
-    return Result.ok(_environment_view())
+    return Result.ok(await _environment_view())
 
 
 @router.post(
@@ -740,10 +887,14 @@ async def dependency_environment() -> Result[dict]:
 async def preview_dependency_repair() -> Result[dict]:
     from zhenxun.services.nonebot_store.repair import preview_layer_repair
 
-    view = _environment_view()
+    view = await _environment_view()
     if not view.get("repairable"):
         return Result.fail("dependency_environment_not_repairable", code=409)
-    if pending_transaction():
+    if pending_transaction() or dependency_sync_status().get("status") in {
+        "prepared",
+        "pending",
+        "running",
+    }:
         return Result.fail("dependency_transaction_pending", code=409)
     try:
         if view.get("repair_mode") == "layer":
@@ -792,7 +943,118 @@ async def preview_dependency_repair() -> Result[dict]:
 async def repair_dependency_environment(
     payload: EnvironmentRepairPayload,
 ) -> Result[dict]:
-    view = _environment_view()
+    """Keep a bound repair queryable across disconnects and worker replacement."""
+    payload = payload.model_copy(
+        update={"operation_id": payload.operation_id or uuid.uuid4().hex}
+    )
+    identity = str(payload.operation_id)
+    binding = sha256(payload.model_dump_json().encode()).hexdigest()
+    active = _ACTIVE_REPAIRS.get(identity)
+    if active:
+        if binding != active[0]:
+            return Result.fail("plugin_operation_input_changed", code=409)
+        return await asyncio.shield(active[1])
+    previous = operation_status(identity)
+    if previous:
+        result = previous.get("result") or {}
+        if result.get("request_binding") != binding:
+            return Result.fail("plugin_operation_input_changed", code=409)
+        return Result.ok(result, info="重复请求已复用原操作结果")
+    task = asyncio.create_task(_repair_dependency_environment(payload, binding))
+    _ACTIVE_REPAIRS[identity] = (binding, task)
+    task.add_done_callback(lambda _: _ACTIVE_REPAIRS.pop(identity, None))
+    return await asyncio.shield(task)
+
+
+def active_operation(identity: str) -> dict | None:
+    """Expose accepted store work before its first journal write."""
+    active = _ACTIVE_REPAIRS.get(identity) or _ACTIVE_APPLIES.get(identity)
+    if active is None or active[1].done():
+        return None
+    return {
+        "operation_id": identity,
+        "status": "running",
+        "result": {"operation_id": identity, "status": "running"},
+    }
+
+
+async def _repair_dependency_environment(
+    payload: EnvironmentRepairPayload, binding: str
+) -> Result[dict]:
+    identity = str(payload.operation_id)
+
+    def record(result: dict) -> None:
+        result.update(operation_id=identity, request_binding=binding)
+        record_operation("dependencies:repair", result)
+
+    recorded = False
+    response = None
+    try:
+        async with _store_operation(
+            operation_id=identity, owner="webui.nonebot-store.environment-repair"
+        ):
+            previous = operation_status(identity)
+            if previous:
+                result = previous.get("result") or {}
+                if result.get("request_binding") != binding:
+                    return Result.fail("plugin_operation_input_changed", code=409)
+                return Result.ok(result, info="重复请求已复用原操作结果")
+            record({"status": "running", "apply_mode": "preparing"})
+            recorded = True
+            response = await _perform_environment_repair(payload, binding)
+            result = (
+                response.data
+                if response.suc
+                else {
+                    "status": "failed",
+                    "apply_mode": "failed",
+                    "reason": response.info,
+                }
+            )
+            record(result)
+            return response
+    except StoreOperationBusyError:
+        return Result.fail("plugin_operation_in_progress", code=409)
+    except (Exception, asyncio.CancelledError) as error:
+        if response is not None and response.suc:
+            response.data["cleanup_error"] = {
+                "code": "operation_receipt_pending",
+                "diagnostic": safe_process_error(str(error)),
+            }
+            return response
+        transaction = pending_transaction() or {}
+        staged = any(
+            item.get("operation_id") == identity
+            for item in transaction.get("operations", [])
+        )
+        result = {
+            "operation_id": identity,
+            "request_binding": binding,
+            "status": "pending"
+            if staged
+            else "interrupted"
+            if isinstance(error, asyncio.CancelledError)
+            else "failed",
+            "apply_mode": "restart_pending" if staged else "failed",
+            "reason": "dependency_followup_required"
+            if staged
+            else getattr(error, "code", type(error).__name__),
+            "diagnostic": safe_process_error(str(error)),
+        }
+        if recorded:
+            with contextlib.suppress(Exception):
+                record(result)
+        if isinstance(error, asyncio.CancelledError):
+            raise
+        if staged:
+            return Result.ok(result, info="修复事务已保存；请查询原操作，不要重复提交")
+        return Result.fail(result["reason"], code=409, details=result)
+
+
+async def _perform_environment_repair(
+    payload: EnvironmentRepairPayload, binding: str
+) -> Result[dict]:
+    view = await _environment_view()
     if not payload.confirmed:
         return Result.fail("dependency_repair_confirmation_required", code=400)
     if not view.get("launcher_managed"):
@@ -809,99 +1071,93 @@ async def repair_dependency_environment(
     ):
         return Result.fail("environment_analysis_stale", code=409)
     if preview["mode"] == "layer":
+        build = None
         try:
             from zhenxun.services.nonebot_store.repair import select_repair_groups
 
             selected = select_repair_groups(preview, payload.group_ids)
-            async with _store_operation(owner="webui.nonebot-store.environment-repair"):
-                if (
-                    pending_transaction()
-                    or environment_report()["fingerprint"] != preview["fingerprint"]
-                ):
-                    return Result.fail("environment_analysis_stale", code=409)
-                transaction = {
-                    "version": 2,
-                    "revision": uuid.uuid4().hex,
-                    "action": "environment_repair",
-                    "operations": [],
-                    "base_manifest": load_manifest(),
-                    "target_manifest": selected["target_manifest"],
-                    "remaining_conflicts": selected["remaining_conflicts"],
-                    "environment_fingerprint": preview["fingerprint"],
-                    "source_build_confirmed": False,
-                    "state": "building",
-                    "created_at": utc_now(),
-                }
-                build_task = asyncio.create_task(
-                    asyncio.to_thread(build_generation, transaction)
-                )
-                try:
-                    build = await asyncio.shield(build_task)
-                except asyncio.CancelledError:
-                    try:
-                        abandoned = await build_task
-                        remove_generation(abandoned["generation"])
-                    finally:
-                        raise
-                if environment_report()["fingerprint"] != preview["fingerprint"]:
-                    remove_generation(build["generation"])
-                    return Result.fail("environment_analysis_stale", code=409)
-                stage_generation(transaction, build)
-                _REPAIR_PREVIEWS.pop(payload.preview_id, None)
-                update_pending_restart(
-                    "webui.nonebot-store",
+            if (
+                pending_transaction()
+                or (await environment_report_async())["fingerprint"]
+                != preview["fingerprint"]
+            ):
+                return Result.fail("environment_analysis_stale", code=409)
+            transaction = {
+                "version": 2,
+                "revision": uuid.uuid4().hex,
+                "action": "environment_repair",
+                "operations": [
+                    {
+                        "operation_id": payload.operation_id,
+                        "kind": "environment_repair",
+                        "request_binding": binding,
+                        "name": "依赖环境修复",
+                        "target_manifest": deepcopy(selected["target_manifest"]),
+                        "created_at": utc_now(),
+                    }
+                ],
+                "base_manifest": load_manifest(),
+                "target_manifest": selected["target_manifest"],
+                "remaining_conflicts": selected["remaining_conflicts"],
+                "environment_fingerprint": preview["fingerprint"],
+                "source_build_confirmed": bool(selected.get("source_build_required")),
+                "state": "building",
+                "created_at": utc_now(),
+            }
+            build = await prepare_generation(transaction)
+            if (await environment_report_async())["fingerprint"] != preview[
+                "fingerprint"
+            ]:
+                raise DependencyAnalysisError("environment_analysis_stale")
+            stage_generation(transaction, build)
+            _REPAIR_PREVIEWS.pop(payload.preview_id, None)
+            update_pending_restart(
+                "webui.nonebot-store",
+                ["dependency_environment_repair"],
+            )
+            return Result.ok(
+                _operation_result(
+                    "restart_pending",
                     ["dependency_environment_repair"],
-                    issue_ticket=True,
-                )
-                return Result.ok(
-                    _operation_result(
-                        "restart_pending",
-                        ["dependency_environment_repair"],
-                        changes=selected["changes"],
-                    ),
-                    info="定向修复已准备完成，重启 Bot 后验证并生效",
-                )
-        except (
-            DependencyAnalysisError,
-            LayerBuildError,
-            ArchiveDependencyConflict,
-            ArchiveSourceBuildConflict,
-            StoreOperationBusyError,
-        ) as error:
-            return Result.fail(str(error), code=409)
+                    status="pending",
+                    changes=selected["changes"],
+                    remaining_conflicts=selected["remaining_conflicts"],
+                ),
+                info="定向修复已准备完成，重启 Bot 后验证并生效",
+            )
+        finally:
+            if (
+                build is not None
+                and (pending_transaction() or {}).get("generation")
+                != build["generation"]
+            ):
+                remove_generation(build["generation"])
     ok, detail = await preflight_environment_repair()
     if not ok:
         return Result.fail(f"dependency_repair_preflight_failed: {detail}", code=409)
-    from zhenxun.utils._restart_utils import request_dependency_restart
-
+    if (
+        pending_transaction()
+        or (await environment_report_async())["fingerprint"]
+        != payload.expected_fingerprint
+    ):
+        return Result.fail("environment_analysis_stale", code=409)
     save_dependency_sync_status(
         {
-            "status": "pending",
+            "status": "prepared",
             "fingerprint": payload.expected_fingerprint,
             "mode": "locked_inexact",
+            "operation_id": payload.operation_id,
+            "request_binding": binding,
         }
     )
-    accepted, message = await request_dependency_restart(
-        "webui.nonebot-store.environment-repair",
-        {Path("pyproject.toml"), Path("uv.lock")},
-    )
-    if not accepted:
-        save_dependency_sync_status(
-            {"status": "failed", "code": "dependency_restart_not_accepted"}
-        )
-        return Result.fail(message, code=409)
-    status = restart_status_data()
     return Result.ok(
-        {
-            "apply_mode": "restart_requested",
-            "restart_required": True,
-            "restart_available": True,
-            "reason_codes": ["dependency_environment_repair"],
-            "boot_id": status.get("boot_id"),
-            "access_urls": status["access_urls"],
-            "access_targets": status["access_targets"],
-        },
-        info="依赖同步已提交，正在重启真寻",
+        _operation_result(
+            "restart_pending",
+            ["dependency_environment_repair"],
+            status="pending",
+            operation_id=payload.operation_id,
+        ),
+        info="基础环境修复已准备，请点击重启执行",
     )
 
 
@@ -922,9 +1178,9 @@ async def list_plugins(
     refresh: bool = False,
 ) -> Result[dict]:
     try:
-        entries, meta = await get_registry(refresh=refresh)
         pending = pending_transaction()
         manifest = _effective_manifest(pending)
+        entries, meta = await _catalog_sources(manifest, refresh=refresh)
         inventory = installed_inventory()
         keyword = search.strip().casefold()
         items = []
@@ -935,7 +1191,11 @@ async def list_plugins(
                 inventory=inventory,
                 pending=pending,
             )
-            if item["compatibility"] == "blocked" and not include_incompatible:
+            if (
+                item["compatibility"] == "blocked"
+                and not item["managed"]
+                and not include_incompatible
+            ):
                 continue
             if (
                 keyword
@@ -984,8 +1244,20 @@ async def list_plugins(
 )
 async def plugin_detail(project_link: str) -> Result[dict]:
     try:
-        plugin, meta = await get_registry_plugin(project_link)
-        metadata = await fetch_pypi_metadata(project_link, str(plugin["version"]))
+        local = _managed_plugin(project_link, _effective_manifest())
+        try:
+            plugin, meta = await get_registry_plugin(project_link)
+        except Exception:
+            if not local:
+                raise
+            plugin, meta = _local_registry_item(local), {"unavailable": True}
+        try:
+            metadata = await fetch_pypi_metadata(project_link, str(plugin["version"]))
+        except Exception as error:
+            if not local:
+                raise
+            metadata = {"info": {}, "urls": []}
+            meta["metadata_unavailable"] = type(error).__name__
         info = metadata["info"]
         return Result.ok(
             {
@@ -1034,6 +1306,7 @@ async def analyze_plugin(payload: AnalyzePayload) -> Result[dict]:
         "analysis_id": analysis_id,
         "project_link": payload.project_link,
         "action": payload.action,
+        "prefer_existing": payload.prefer_existing,
         "status": "queued",
         "created_at": utc_now(),
     }
@@ -1045,6 +1318,7 @@ async def analyze_plugin(payload: AnalyzePayload) -> Result[dict]:
         public_input={
             "project_link": payload.project_link,
             "action": payload.action,
+            "prefer_existing": payload.prefer_existing,
         },
         recovery_policy="restart",
         name=f"nonebot-analysis:{analysis_id[:8]}",
@@ -1074,6 +1348,30 @@ async def analysis_status(analysis_id: str) -> Result[dict]:
     response_class=JSONResponse,
 )
 async def apply_analysis(payload: ApplyPayload) -> Result[dict]:
+    """Keep one accepted operation alive when its browser disconnects."""
+    payload = payload.model_copy(
+        update={"operation_id": payload.operation_id or uuid.uuid4().hex}
+    )
+    identity = str(payload.operation_id)
+    binding = sha256(payload.model_dump_json().encode()).hexdigest()
+    active = _ACTIVE_APPLIES.get(identity)
+    if active:
+        if binding != active[0]:
+            return Result.fail("plugin_operation_input_changed", code=409)
+        return await asyncio.shield(active[1])
+    previous = operation_status(identity)
+    if previous:
+        result = previous.get("result") or {}
+        if result.get("request_binding") != binding:
+            return Result.fail("plugin_operation_input_changed", code=409)
+        return Result.ok(result, info="重复请求已复用原操作结果")
+    task = asyncio.create_task(_apply_analysis(payload, binding))
+    _ACTIVE_APPLIES[identity] = (binding, task)
+    task.add_done_callback(lambda _: _ACTIVE_APPLIES.pop(identity, None))
+    return await asyncio.shield(task)
+
+
+async def _apply_analysis(payload: ApplyPayload, binding: str) -> Result[dict]:
     analysis = _ANALYSES.get(payload.analysis_id)
     if analysis is None:
         return Result.fail("analysis_not_found", code=404)
@@ -1088,22 +1386,32 @@ async def apply_analysis(payload: ApplyPayload) -> Result[dict]:
 
     def completed(result: dict[str, Any], info: str) -> Result[dict]:
         result.setdefault("operation_id", operation_id)
+        result["request_binding"] = binding
         analysis["applied_operation_id"] = operation_id
         analysis["applied_result"] = deepcopy(result)
-        record_operation(
-            f"nonebot:{analysis['registry_plugin']['project_link']}", result
-        )
+        try:
+            record_operation(
+                f"nonebot:{analysis['registry_plugin']['project_link']}", result
+            )
+        except OSError as error:
+            result["cleanup_error"] = {
+                "code": "operation_receipt_pending",
+                "diagnostic": safe_process_error(str(error)),
+            }
         return Result.ok(result, info=info)
 
-    def record_failure(code: str) -> None:
+    def record_failure(code: str, diagnostic: str = "") -> None:
         record_operation(
             f"nonebot:{analysis['registry_plugin']['project_link']}",
             {
                 "operation_id": operation_id,
-                "status": "failed",
+                "status": "interrupted"
+                if code == "dependency_operation_interrupted"
+                else "failed",
                 "apply_mode": "failed",
                 "reason": code,
-                "rolled_back": True,
+                "request_binding": binding,
+                "diagnostic": diagnostic,
             },
         )
 
@@ -1117,6 +1425,18 @@ async def apply_analysis(payload: ApplyPayload) -> Result[dict]:
     ) != analysis.get("fingerprint"):
         return Result.fail("analysis_stale", code=409)
     plan = analysis["plan"]
+    if payload.confirmed:
+        if payload.summary_revision != plan.get("summary_revision"):
+            return Result.fail("analysis_stale", code=409)
+        payload = payload.model_copy(
+            update={
+                "confirm_third_party_code": True,
+                "confirm_non_core_changes": True,
+                "confirm_source_build": bool(plan["source_build_required"]),
+                "confirm_compatibility_overrides": True,
+                "confirm_database_migration": True,
+            }
+        )
     if not payload.confirm_third_party_code:
         return Result.fail("third_party_code_confirmation_required", code=400)
     if plan["non_core_changes"] and not payload.confirm_non_core_changes:
@@ -1135,16 +1455,35 @@ async def apply_analysis(payload: ApplyPayload) -> Result[dict]:
         return Result.fail("database_migration_confirmation_required", code=400)
 
     journal_store_key = f"nonebot:{plugin['project_link']}"
-    begin_operation(journal_store_key, analysis["action"], operation_id)
     previous_pending = deepcopy(current_pending)
     new_generation: int | None = None
+    staged = False
     try:
         async with _store_operation(
             operation_id=operation_id, owner="webui.nonebot_store"
         ):
+            previous = operation_status(operation_id)
+            if previous:
+                result = previous.get("result") or {}
+                if result.get("request_binding") != binding:
+                    return Result.fail("plugin_operation_input_changed", code=409)
+                return Result.ok(result, info="重复请求已复用原操作结果")
             latest_pending = pending_transaction()
-            if _pending_revision(latest_pending) != current_revision:
+            if _pending_revision(
+                latest_pending
+            ) != current_revision or environment_fingerprint(
+                plugin, pending_revision=current_revision
+            ) != analysis.get("fingerprint"):
                 return Result.fail("analysis_stale", code=409)
+            record_operation(
+                journal_store_key,
+                {
+                    "operation_id": operation_id,
+                    "action": analysis["action"],
+                    "status": "running",
+                    "request_binding": binding,
+                },
+            )
             target = _target_manifest(analysis)
             operations = deepcopy(
                 latest_pending.get("operations", []) if latest_pending else []
@@ -1200,6 +1539,7 @@ async def apply_analysis(payload: ApplyPayload) -> Result[dict]:
                 ),
                 "operations": operations,
                 "target_manifest": target,
+                "remaining_conflicts": plan.get("remaining_conflicts", []),
                 "source_build_confirmed": bool(
                     payload.confirm_source_build
                     or (latest_pending or {}).get("source_build_confirmed")
@@ -1230,7 +1570,7 @@ async def apply_analysis(payload: ApplyPayload) -> Result[dict]:
                 remove_generation(transaction.get("generation"))
                 finalize_orm_migration()
                 clear_pending_transaction()
-                update_pending_restart("webui.nonebot-store", [], issue_ticket=False)
+                update_pending_restart("webui.nonebot-store", [])
                 return completed(
                     _operation_result("rolled_back", ["transaction_canceled"]),
                     "待应用插件变更已相互抵消",
@@ -1238,7 +1578,7 @@ async def apply_analysis(payload: ApplyPayload) -> Result[dict]:
             with archive_dependency_policy(transaction):
                 pass
             module_name = str(plugin["module_name"])
-            runtime = plugin_runtime_manager.classification_for(module_name)
+            runtime = plugin_host.classification_for(module_name)
             root_change = next(
                 (
                     item
@@ -1253,18 +1593,7 @@ async def apply_analysis(payload: ApplyPayload) -> Result[dict]:
                 for item in plan["package_changes"]["changed"]
                 if item is not root_change
             ]
-            hot_candidate = (
-                latest_pending is None
-                and not plan["source_build_required"]
-                and not dependency_changes
-                and not plan.get("shared_changes")
-                and not plan.get("compatibility_overrides")
-                and plan["pure_python_candidate"]
-                and (
-                    analysis["action"] == "install"
-                    or runtime["reload_support"] == "hot_reloadable"
-                )
-            )
+            hot_candidate = False
             deferred_source_build = bool(
                 plan["source_build_required"]
                 or (
@@ -1274,12 +1603,14 @@ async def apply_analysis(payload: ApplyPayload) -> Result[dict]:
                 )
             )
             if deferred_source_build:
-                remove_generation(transaction.get("generation"))
+                old_generation = transaction.get("generation")
                 transaction.pop("generation", None)
                 transaction.pop("generation_digest", None)
                 transaction["native_extensions"] = []
                 transaction["state"] = "pending_restart"
                 save_pending_transaction(transaction)
+                staged = True
+                remove_generation(old_generation)
                 return completed(
                     _operation_result(
                         "restart_pending",
@@ -1291,7 +1622,7 @@ async def apply_analysis(payload: ApplyPayload) -> Result[dict]:
                 )
 
             previous_native = generation_native_extensions()
-            build = build_generation(transaction)
+            build = await prepare_generation(transaction)
             new_generation = int(build["generation"])
             next_native = generation_native_extensions(build["path"])
             native_changed = previous_native != next_native
@@ -1307,7 +1638,7 @@ async def apply_analysis(payload: ApplyPayload) -> Result[dict]:
                 # any requirements file inside the package is already satisfied
                 # by the layer. Tell the classifier, or it reports a dependency
                 # restart that _apply_hot can only turn into a hard failure.
-                source_runtime = plugin_runtime_manager.classification_for_source(
+                source_runtime = plugin_host.classification_for_source(
                     module_name, source_root, dependencies_verified=True
                 )
                 hot_candidate = hot_candidate and (
@@ -1319,6 +1650,7 @@ async def apply_analysis(payload: ApplyPayload) -> Result[dict]:
 
             transaction["native_extensions_changed"] = native_changed
             stage_generation(transaction, build)
+            staged = True
             reasons = []
             if dependency_changes:
                 reasons.append("non_core_dependencies_changed")
@@ -1351,34 +1683,76 @@ async def apply_analysis(payload: ApplyPayload) -> Result[dict]:
                 ),
                 "插件事务已准备，重启后生效",
             )
+    except asyncio.CancelledError:
+        with contextlib.suppress(Exception):
+            record_operation(
+                journal_store_key,
+                {
+                    "operation_id": operation_id,
+                    "request_binding": binding,
+                    "status": "pending" if staged else "interrupted",
+                    "apply_mode": "restart_pending" if staged else "failed",
+                    "reason": "dependency_operation_interrupted",
+                },
+            )
+        raise
     except StoreOperationBusyError:
         record_failure("plugin_operation_in_progress")
         return Result.fail("plugin_operation_in_progress", code=409)
     except (ArchiveSourceBuildConflict, ArchiveDependencyConflict) as error:
-        record_failure(error.code)
+        record_failure(error.code, safe_process_error(str(error)))
         return Result.fail(
             error.code, code=409, details=getattr(error, "details", None)
         )
-    except LayerBuildError as error:
+    except (LayerBuildError, DependencyAnalysisError) as error:
+        if staged:
+            return completed(
+                {
+                    "apply_mode": "restart_pending",
+                    "status": "pending",
+                    "diagnostic": safe_process_error(str(error)),
+                },
+                "依赖事务已保存，请查询原操作状态",
+            )
         if new_generation is not None:
             remove_generation(new_generation)
         if previous_pending is not None:
             save_pending_transaction(previous_pending)
         logger.error(f"NoneBot 依赖层构建失败: {error.code}", "WebUi")
-        record_failure(error.code)
+        record_failure(error.code, safe_process_error(str(error)))
         return Result.fail(
             error.code,
             code=400,
-            details=getattr(error, "details", None),
+            details={
+                "stage": "dependency_build",
+                "diagnostic": safe_process_error(str(error)),
+                "issues": getattr(error, "details", None),
+            },
         )
     except Exception as error:
+        if staged:
+            return completed(
+                {
+                    "apply_mode": "restart_pending",
+                    "status": "pending",
+                    "diagnostic": safe_process_error(str(error)),
+                },
+                "依赖事务已保存，请查询原操作状态",
+            )
         if new_generation is not None:
             remove_generation(new_generation)
         if previous_pending is not None:
             save_pending_transaction(previous_pending)
         logger.error("NoneBot 插件应用失败，已保留原事务", "WebUi", e=error)
-        record_failure("nonebot_plugin_apply_failed")
-        return Result.fail("nonebot_plugin_apply_failed", code=500)
+        record_failure("nonebot_plugin_apply_failed", safe_process_error(str(error)))
+        return Result.fail(
+            "nonebot_plugin_apply_failed",
+            code=500,
+            details={
+                "stage": "dependency_transaction",
+                "diagnostic": safe_process_error(str(error)),
+            },
+        )
 
 
 def _public_transaction(transaction: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -1387,6 +1761,10 @@ def _public_transaction(transaction: dict[str, Any] | None) -> dict[str, Any] | 
     return {
         "revision": transaction.get("revision"),
         "state": transaction.get("state"),
+        "error_code": transaction.get("error_code"),
+        "rollback_confirmed": bool(transaction.get("rollback_confirmed")),
+        "rollback_error": transaction.get("rollback_error"),
+        "cleanup_error": transaction.get("cleanup_error"),
         "created_at": transaction.get("created_at"),
         "updated_at": transaction.get("updated_at"),
         "database_migration_possible": bool(
@@ -1421,6 +1799,20 @@ async def pending_transaction_status() -> Result[dict]:
     return Result.ok({"transaction": _public_transaction(pending_transaction())})
 
 
+def _cancel_prepared_repair(sync: dict) -> Result[dict]:
+    save_dependency_sync_status({**sync, "status": "canceled"})
+    update_pending_restart("webui.nonebot-store", [])
+    return Result.ok(
+        _operation_result(
+            "rolled_back",
+            ["transaction_canceled"],
+            operation_id=sync.get("operation_id"),
+            status="rolled_back",
+        ),
+        info="已撤销待执行的基础环境修复，运行环境未改变",
+    )
+
+
 @router.delete(
     "/transactions/pending/{operation_id}",
     dependencies=[authentication()],
@@ -1432,11 +1824,24 @@ async def cancel_pending_operation(operation_id: str) -> Result[dict]:
         async with _store_operation(
             operation_id=operation_id, owner="webui.nonebot_store"
         ):
+            sync = dependency_sync_status()
+            if (
+                sync.get("operation_id") == operation_id
+                and sync.get("status") == "prepared"
+            ):
+                return _cancel_prepared_repair(sync)
             transaction = pending_transaction()
             if transaction is None or transaction.get("state") not in {
                 "pending_restart",
                 "migration_blocked",
+                "failed",
             }:
+                return Result.fail("nonebot_transaction_not_cancelable", code=409)
+            if (
+                isinstance(transaction.get("generation"), int)
+                and load_manifest().get("active_generation")
+                == transaction["generation"]
+            ):
                 return Result.fail("nonebot_transaction_not_cancelable", code=409)
             operations = transaction.get("operations", [])
             index = next(
@@ -1456,7 +1861,8 @@ async def cancel_pending_operation(operation_id: str) -> Result[dict]:
                 remove_generation(old_generation)
                 finalize_orm_migration()
                 clear_pending_transaction()
-                update_pending_restart("webui.nonebot-store", [], issue_ticket=False)
+                record_manual_operations(transaction, "rolled_back", "rolled_back")
+                update_pending_restart("webui.nonebot-store", [])
                 return Result.ok(
                     {
                         **_operation_result("rolled_back", ["transaction_canceled"]),
@@ -1471,10 +1877,13 @@ async def cancel_pending_operation(operation_id: str) -> Result[dict]:
             transaction["revision"] = uuid.uuid4().hex
             transaction["updated_at"] = utc_now()
             if isinstance(old_generation, int):
-                build = build_generation(transaction)
+                build = await prepare_generation(transaction)
                 stage_generation(transaction, build)
             else:
                 save_pending_transaction(transaction)
+            record_manual_operations(
+                {"operations": removed}, "rolled_back", "rolled_back"
+            )
             return Result.ok(
                 {
                     **_operation_result(
@@ -1505,26 +1914,33 @@ async def cancel_pending_operation(operation_id: str) -> Result[dict]:
 )
 async def cancel_transaction() -> Result[dict]:
     try:
-        async with _store_operation(owner="webui.nonebot_store"):
+        async with _store_operation(
+            owner="webui.nonebot_store", allow_prepared_repair=True
+        ):
+            sync = dependency_sync_status()
+            if sync.get("status") == "prepared":
+                return _cancel_prepared_repair(sync)
             transaction = pending_transaction()
             if transaction is None:
                 return Result.fail("nonebot_transaction_not_found", code=404)
             state = str(transaction.get("state") or "")
             if state not in {
                 "pending_restart",
-                "verification_pending",
                 "migration_blocked",
                 "failed",
             }:
                 return Result.fail("nonebot_transaction_not_cancelable", code=409)
-            if state == "verification_pending":
-                rollback_pending_transaction()
-                activate_current_generation()
-            elif state in {"pending_restart", "migration_blocked", "failed"}:
-                remove_generation(transaction.get("generation"))
+            if (
+                isinstance(transaction.get("generation"), int)
+                and load_manifest().get("active_generation")
+                == transaction["generation"]
+            ):
+                return Result.fail("nonebot_transaction_not_cancelable", code=409)
+            remove_generation(transaction.get("generation"))
             finalize_orm_migration()
             clear_pending_transaction()
-            update_pending_restart("webui.nonebot-store", [], issue_ticket=False)
+            record_manual_operations(transaction, "rolled_back", "rolled_back")
+            update_pending_restart("webui.nonebot-store", [])
             failed = state == "failed"
             return Result.ok(
                 _operation_result(
@@ -1544,3 +1960,26 @@ async def cancel_transaction() -> Result[dict]:
     except Exception as error:
         logger.error("取消 NoneBot 插件事务失败", "WebUi", e=error)
         return Result.fail("nonebot_transaction_cancel_failed", code=500)
+
+
+@router.post(
+    "/transactions/{revision}/cleanup/retry",
+    dependencies=[authentication()],
+    response_model=Result[dict],
+)
+async def retry_transaction_cleanup(revision: str) -> Result[dict]:
+    from zhenxun.services.nonebot_store.cleanup import retry_cleanup
+
+    try:
+        async with _store_operation(owner="webui.nonebot-cleanup"):
+            record = retry_cleanup(revision)
+        return Result.ok(
+            {
+                key: record.get(key)
+                for key in ("revision", "state", "cleanup_state", "cleanup_error")
+            }
+        )
+    except StoreOperationBusyError:
+        return Result.fail("plugin_operation_in_progress", code=409)
+    except ValueError as error:
+        return Result.fail(str(error), code=404)

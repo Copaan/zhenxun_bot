@@ -9,7 +9,7 @@ from alibabacloud_devops20210625.client import Client as devops20210625Client
 from alibabacloud_tea_openapi import models as open_api_models
 from alibabacloud_tea_util import models as util_models
 from nonebot.compat import model_dump
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from zhenxun.utils.http_utils import AsyncHttpx
 
@@ -302,8 +302,7 @@ class AliyunTree(BaseModel):
     path: str
     type: AliyunTreeType
 
-    class Config:
-        populate_by_name = True
+    model_config = ConfigDict(populate_by_name=True)
 
 
 class AliyunFileInfo:

@@ -7,20 +7,14 @@ from types import UnionType
 from typing import Annotated, Any, Union, get_args, get_origin
 
 from fastapi.encoders import jsonable_encoder
-from nonebot.compat import PYDANTIC_V2
+from pydantic import TypeAdapter
 
 
 def schema_for_type(value_type: Any, _seen: tuple[Any, ...] = ()) -> dict[str, Any]:
     if value_type is None or value_type is Any:
         return {}
     try:
-        if PYDANTIC_V2:
-            from pydantic import TypeAdapter
-
-            return TypeAdapter(value_type).json_schema()
-        from pydantic import schema_of
-
-        return schema_of(value_type)
+        return TypeAdapter(value_type).json_schema()
     except Exception as error:
         # Some third-party annotations (for example SQLAlchemy URL/Engine)
         # cannot be represented by Pydantic's JSON Schema generator. Keep the

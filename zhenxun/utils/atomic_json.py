@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import time
 from typing import Any, TypeVar
 import uuid
 
@@ -54,9 +55,26 @@ def _write_unlocked(path: Path, value: Any) -> None:
             stream.write(payload)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+        deadline = time.monotonic() + 0.5
+        while True:
+            try:
+                os.replace(temporary, path)
+                break
+            except OSError as error:
+                # Windows readers and scanners may briefly omit delete sharing.
+                # Keep the decision lock and fail on persistent access denial.
+                if (
+                    getattr(error, "winerror", None) not in {5, 32, 33}
+                    or time.monotonic() >= deadline
+                ):
+                    raise
+                time.sleep(min(0.02, max(0, deadline - time.monotonic())))
+    except BaseException:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 def read_json_locked(

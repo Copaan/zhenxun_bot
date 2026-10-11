@@ -787,14 +787,9 @@ async def _prepare_job(job_id: str) -> None:
             apply_mode="restart_pending",
             fallback_reason=fallback_reason,
         )
-        from zhenxun.utils._restart_utils import (
-            issue_restart_ticket,
-            mark_restart_pending,
-        )
+        from zhenxun.utils._restart_utils import mark_restart_pending
 
         mark_restart_pending(f"webui.update:{job_id}", [f"update:{component}:{job_id}"])
-        if launcher_managed:
-            issue_restart_ticket("webui.update", ttl_seconds=10 * 60)
     except Exception as exc:
         code = (
             str(exc)
@@ -973,28 +968,41 @@ def _restore_bot_update(backup: Path) -> None:
 
 
 def _sync_dependencies(
-    *, raise_on_error: bool = True, preserve_extras: bool = False
+    *, raise_on_error: bool = True, verify_environment: bool = False
 ) -> None:
+    """按 uv.lock 同步核心虚拟环境，保留锁文件之外已安装的包
+
+    参数:
+        raise_on_error: 同步失败时是否抛出异常
+        verify_environment: 同步后是否校验有效依赖环境
+    """
     if not (_ROOT / "uv.lock").is_file():
         return
-    uv_executable = shutil.which("uv")
-    if uv_executable is None:
+    from zhenxun.services.installer_network import project_environment, uv_executable
+    from zhenxun.services.network_proxy import ProxyPolicyError
+
+    uv = uv_executable()
+    if uv is None:
         if raise_on_error:
             raise UpdateServiceError("dependency_tool_unavailable")
         return
-    command = [uv_executable, "sync", "--locked"]
-    if preserve_extras:
-        command.append("--inexact")
+    try:
+        environment = project_environment()
+    except ProxyPolicyError:
+        if raise_on_error:
+            raise UpdateServiceError("dependency_sync_failed") from None
+        return
     result = subprocess.run(
-        command,
+        [uv, "sync", "--locked", "--inexact"],
         cwd=_ROOT,
         capture_output=True,
         timeout=900,
         check=False,
+        env=environment,
     )
     if result.returncode and raise_on_error:
         raise UpdateServiceError("dependency_sync_failed")
-    if result.returncode == 0 and preserve_extras:
+    if result.returncode == 0 and verify_environment:
         from zhenxun.services.nonebot_store.environment import (
             verify_effective_environment,
         )

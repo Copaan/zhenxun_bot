@@ -40,6 +40,7 @@ def default_manifest() -> dict[str, Any]:
         "pending_verification": False,
         "plugins": {},
         "packages": {},
+        "manual_requirements": {},
         "updated_at": utc_now(),
     }
 
@@ -50,6 +51,7 @@ def load_manifest() -> dict[str, Any]:
         return default_manifest()
     manifest.setdefault("plugins", {})
     manifest.setdefault("packages", {})
+    manifest.setdefault("manual_requirements", {})
     manifest.setdefault("active_generation", None)
     manifest.setdefault("previous_generation", None)
     manifest.setdefault("pending_verification", False)
@@ -86,7 +88,7 @@ def remove_generation(generation: int | str | None) -> None:
         return
     path = generation_path(generation)
     if path.is_dir():
-        shutil.rmtree(path, ignore_errors=True)
+        shutil.rmtree(path)
 
 
 def prune_generations(keep: set[int]) -> None:
@@ -99,12 +101,26 @@ def prune_generations(keep: set[int]) -> None:
         except (IndexError, ValueError):
             continue
         if generation not in keep and path.is_dir():
-            shutil.rmtree(path, ignore_errors=True)
+            shutil.rmtree(path)
 
 
 def pending_transaction() -> dict[str, Any] | None:
     value = read_json(PENDING_FILE, None)
-    return value if isinstance(value, dict) else None
+    if not isinstance(value, dict):
+        return None
+    if value.get("state") == "verification_pending" and value.get("revision"):
+        manifest = load_manifest()
+        if (
+            manifest.get("verified_transaction_revision") == value["revision"]
+            and manifest.get("active_generation") == value.get("generation")
+            and not manifest.get("pending_verification")
+        ):
+            value.update(
+                state="cleanup_pending",
+                verification_confirmed=True,
+                cleanup_error={"code": "dependency_commit_receipt_pending"},
+            )
+    return value
 
 
 def save_pending_transaction(value: dict[str, Any]) -> None:

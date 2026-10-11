@@ -28,7 +28,7 @@ from zhenxun.utils.bytecode import precompile_path
 
 ROOT = Path("data/runtime/plugin-store-transaction")
 PENDING_FILE = ROOT / "pending-v1.json"
-LIFECYCLE_INDEX = Path("data/runtime/lifecycle-index-v2.json")
+LOADED_PLUGINS_INDEX = Path("data/runtime/loaded-plugins-v1.json")
 _TRANSACTION_LOCK = ROOT / ".transaction.lock"
 
 
@@ -841,12 +841,8 @@ def startup_verification() -> tuple[bool, dict[str, Any]]:
     transaction = pending_transaction()
     if not transaction or transaction.get("state") != "verification_pending":
         return True, {"failed": []}
-    index = read_json_locked(LIFECYCLE_INDEX, {})
-    modules = {
-        str(item.get("module"))
-        for item in index.get("plugins", [])
-        if isinstance(item, dict)
-    }
+    index = read_json_locked(LOADED_PLUGINS_INDEX, {})
+    modules = {str(module) for module in index.get("modules", [])}
     failures = []
     for operation in transaction.get("operations", []):
         runtime_module = str(operation.get("runtime_module") or "")

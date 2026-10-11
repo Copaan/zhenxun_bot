@@ -149,7 +149,7 @@ def _file_digest(path: Path) -> str:
 
 @PriorityLifecycle.on_startup(
     priority=4,
-    task_id="runtime:reconcile_plugins",
+    component_id="runtime:reconcile_plugins",
     depends_on=("runtime:reconcile_config",),
 )
 async def reconcile_plugin_runtime():

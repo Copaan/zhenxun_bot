@@ -49,7 +49,7 @@ def chat_plugin_enabled(owner: str | None, values: dict | None = None) -> bool:
 
 def require_chat_enabled(owner: str | None = None) -> None:
     from zhenxun.services.ai.core.exceptions import ConfigurationException
-    from zhenxun.services.runtime_reload.ownership import current_owner
+    from zhenxun.services.plugin_host import current_owner
 
     if _admitted.get() is asyncio.current_task():
         return

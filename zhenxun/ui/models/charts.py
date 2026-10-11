@@ -3,7 +3,7 @@ from typing import Any, Literal
 from typing_extensions import Self
 import uuid
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from zhenxun.utils.pydantic_compat import model_dump
 
@@ -95,8 +95,7 @@ class BaseChartData(RenderableComponent, ABC):
 class EChartsData(BaseChartData):
     """统一的 ECharts 图表数据模型"""
 
-    class Config:
-        populate_by_name = True
+    model_config = ConfigDict(populate_by_name=True)
 
     template_path: str = Field(..., exclude=True, description="图表组件的模板路径")  # type: ignore
     """图表组件的模板路径"""

@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+import shlex
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from zhenxun.services.ai.utils.logger import log_sandbox as logger
@@ -76,9 +77,8 @@ class UnifiedManifestProvisioner(BaseProvisioner):
         if session.get_meta("env_hash") == target_hash:
             return True
 
-        hash_check = await session.run_process(
-            f"cat {session.workspace_path}/.zx_env_hash"
-        )
+        hash_file = shlex.quote(f"{session.workspace_path}/.zx_env_hash")
+        hash_check = await session.run_process(f"cat {hash_file}")
         if hash_check.exit_code == 0 and hash_check.stdout.strip() == target_hash:
             logger.debug(
                 f"[Sandbox] ⚡ 环境指纹 ({target_hash[:8]}) "
@@ -90,9 +90,7 @@ class UnifiedManifestProvisioner(BaseProvisioner):
         for step in blueprint.setup_steps:
             await step.apply(session)
 
-        await session.run_process(
-            f"echo '{target_hash}' > {session.workspace_path}/.zx_env_hash"
-        )
+        await session.run_process(f"echo {shlex.quote(target_hash)} > {hash_file}")
         session._meta["env_hash"] = target_hash
         logger.debug(f"[Sandbox] 环境装配完毕，已写入指纹快照: {target_hash[:8]}")
 
@@ -102,31 +100,36 @@ class UnifiedManifestProvisioner(BaseProvisioner):
         self, session: "BaseSandboxSession", workspace_dir: str
     ) -> bool:
         """扫描项目工作区，根据 requirements.txt 或 package.json 自动安装所需依赖"""
-        check = await session.run_process(f"test -f {workspace_dir}/requirements.txt")
+        directory = shlex.quote(workspace_dir)
+        ok = True
+        check = await session.run_process(f"test -f {directory}/requirements.txt")
         if check.exit_code == 0:
             check_uv = await session.run_process("command -v uv")
-            if check_uv.exit_code == 0:
-                await session.run_process(
-                    "uv pip install -r requirements.txt",
-                    cwd=workspace_dir,
-                    timeout=300,
+            res = await session.run_process(
+                "uv pip install -r requirements.txt"
+                if check_uv.exit_code == 0
+                else "pip install -q -r requirements.txt",
+                cwd=workspace_dir,
+                timeout=300,
+            )
+            if res.exit_code != 0:
+                logger.warning(
+                    f"[UnifiedProvisioner] Python 依赖安装失败: {res.stderr}"
                 )
-            else:
-                await session.run_process(
-                    "pip install -q -r requirements.txt",
-                    cwd=workspace_dir,
-                    timeout=300,
-                )
+                ok = False
 
-        check_npm = await session.run_process(f"test -f {workspace_dir}/package.json")
+        check_npm = await session.run_process(f"test -f {directory}/package.json")
         if check_npm.exit_code == 0:
             logger.info("[UnifiedProvisioner] 发现 package.json，正在安装 npm 依赖...")
-            await session.run_process(
+            res = await session.run_process(
                 "npm install --no-fund --no-audit --loglevel=error",
                 cwd=workspace_dir,
                 timeout=300,
             )
-        return True
+            if res.exit_code != 0:
+                logger.warning(f"[UnifiedProvisioner] npm 依赖安装失败: {res.stderr}")
+                ok = False
+        return ok
 
 
 ProvisionerRegistry.register(UnifiedManifestProvisioner())

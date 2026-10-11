@@ -3,7 +3,6 @@ from collections.abc import Awaitable, Iterable
 from typing import Any
 from typing_extensions import Self
 
-from pydantic import VERSION as PYDANTIC_VERSION
 from pydantic import BaseModel, Field
 
 from zhenxun.services.renderer.types import Renderable
@@ -26,12 +25,7 @@ def _iter_renderables(obj: Any) -> Iterable["Renderable"]:
         for value in obj.values():
             yield from _iter_renderables(value)
     elif isinstance(obj, BaseModel):
-        if PYDANTIC_VERSION.startswith("1"):
-            fields = obj.__fields__
-        else:
-            fields = obj.model_fields  # type: ignore
-
-        for field_name in fields:
+        for field_name in type(obj).model_fields:
             value = getattr(obj, field_name)
             yield from _iter_renderables(value)
 
@@ -141,12 +135,7 @@ class RenderableComponent(BaseModel, Renderable):
 
     def get_children(self) -> Iterable["Renderable"]:
         """获取所有子组件的迭代器。"""
-        if PYDANTIC_VERSION.startswith("1"):
-            fields = self.__fields__
-        else:
-            fields = self.model_fields  # type: ignore
-
-        for field_name in fields:
+        for field_name in type(self).model_fields:
             value = getattr(self, field_name)
             yield from _iter_renderables(value)
 

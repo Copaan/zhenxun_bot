@@ -210,7 +210,7 @@ class Manager:
                     for k, v in temp["PluginCdLimit"].items():
                         if "." in k:
                             k = k.split(".")[-1]
-                        self.cd_data[k] = PluginCdBlock.parse_obj(v)
+                        self.cd_data[k] = PluginCdBlock.model_validate(v)
 
     def __load_block_file(self):
         self.block_data: dict[str, BaseBlock] = {}
@@ -221,7 +221,7 @@ class Manager:
                     for k, v in temp["PluginBlockLimit"].items():
                         if "." in k:
                             k = k.split(".")[-1]
-                        self.block_data[k] = BaseBlock.parse_obj(v)
+                        self.block_data[k] = BaseBlock.model_validate(v)
 
     def __load_count_file(self):
         self.count_data: dict[str, PluginCountBlock] = {}
@@ -232,7 +232,7 @@ class Manager:
                     for k, v in temp["PluginCountLimit"].items():
                         if "." in k:
                             k = k.split(".")[-1]
-                        self.count_data[k] = PluginCountBlock.parse_obj(v)
+                        self.count_data[k] = PluginCountBlock.model_validate(v)
 
     def __replace_data(
         self,
@@ -250,7 +250,8 @@ class Manager:
             check_type = LimitCheckType.PRIVATE
         db_data.check_type = check_type
         db_data.watch_type = limit.watch_type
-        db_data.result = limit.result or ""
+        if db_data.result or limit.result:
+            db_data.result = limit.result
         return db_data
 
     def __set_data(

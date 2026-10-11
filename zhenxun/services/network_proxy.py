@@ -270,7 +270,7 @@ class ProxyPolicy:
 
 
 def request_owner() -> str | None:
-    from zhenxun.services.runtime_reload.ownership import current_owner
+    from zhenxun.services.plugin_host import current_owner
 
     return current_owner()
 
@@ -307,7 +307,6 @@ class ProxyRuntime:
         self.probes: set[ProxyRuntime] = set()
         self._close_lock = asyncio.Lock()
         self._closing: dict[Any, asyncio.Task] = {}
-        self._kernel = None
 
     def initialize(self, values=None):
         if self.current is None:
@@ -327,15 +326,6 @@ class ProxyRuntime:
 
     def attach(self, context):
         self.initialize()
-        self._kernel = context.kernel
-        context.own_resource(
-            receipt_id="network_proxy:pools",
-            provider="httpx",
-            resource_type="proxy_pools",
-            release_check=lambda: self.stopping
-            and not self.probes
-            and all(not gen.pools and not gen.users for gen in self.generations()),
-        )
         context.add_finalizer(self.shutdown)
 
     def generations(self):
@@ -392,20 +382,11 @@ class ProxyRuntime:
                 else completed.exception()
             )
         try:
-            if self._kernel:
-                await self._kernel._run_cleanup(
-                    task,
-                    owner="management:http_client",
-                    stage="proxy_pool_close",
-                    timeout=timeout,
-                    grace=0,
-                )
-            else:
-                done, _ = await asyncio.wait({task}, timeout=timeout)
-                if not done:
-                    task.cancel()
-                    raise ProxyPolicyError("proxy_cleanup_budget_exhausted")
-                task.result()
+            done, _ = await asyncio.wait({task}, timeout=timeout)
+            if not done:
+                task.cancel()
+                raise ProxyPolicyError("proxy_cleanup_budget_exhausted")
+            task.result()
         except BaseException:
             self.error_code = "proxy_resources_unreleased"
             raise
@@ -697,7 +678,6 @@ async def _probe_proxy_scoped(policy: ProxyPolicy) -> dict:
     if len(proxy_runtime.probes) >= 4:
         raise ProxyPolicyError("proxy_probe_busy")
     runtime = ProxyRuntime()
-    runtime._kernel = proxy_runtime._kernel
     proxy_runtime.probes.add(runtime)
     runtime.current = PoolGeneration(
         ProxyPolicy(mode="global", proxy=policy.proxy, bypass=())

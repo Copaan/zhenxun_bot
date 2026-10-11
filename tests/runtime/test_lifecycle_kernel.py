@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+import json
 
 import pytest
 
@@ -10,8 +11,6 @@ from zhenxun.services.lifecycle import (
     ComponentState,
     LifecycleError,
     LifecycleKernel,
-    ResourceReceipt,
-    RuntimeHandle,
 )
 
 
@@ -39,7 +38,7 @@ async def test_lifecycle_kernel_starts_topologically_and_stops_in_reverse() -> N
         stop=stop_b,
     )
 
-    await kernel.start_stage("management")
+    await kernel.start_components({"a", "b"})
     await kernel.stop_all()
 
     assert calls == ["start:a", "start:b", "stop:b", "stop:a"]
@@ -68,7 +67,7 @@ async def test_lifecycle_kernel_rolls_back_partial_fatal_start() -> None:
     )
 
     with pytest.raises(RuntimeError, match="failed"):
-        await kernel.start_stage("runtime")
+        await kernel.start_components({"ok", "failed"})
 
     assert calls == ["start:ok", "stop:ok"]
     assert kernel.component_status("ok")["state"] == "stopped"  # type: ignore[index]
@@ -89,12 +88,12 @@ async def test_never_started_failed_component_does_not_run_stop_callback() -> No
 
     kernel.register(ComponentSpec("never-started"), failed_start, stop=stop)
     with pytest.raises(RuntimeError, match="start failed"):
-        await kernel.start_stage("runtime")
+        await kernel.start_components({"never-started"})
 
     await kernel.stop_all()
 
     assert stops == 0
-    assert kernel.component_status("never-started")["state"] == "failed"
+    assert kernel.component_status("never-started")["state"] == "failed"  # type: ignore[index]
 
 
 @pytest.mark.asyncio
@@ -109,11 +108,7 @@ async def test_lifecycle_kernel_blocks_dependents_of_degraded_component() -> Non
         calls.append("dependent")
 
     kernel.register(
-        ComponentSpec(
-            "optional",
-            stage="warmup",
-            failure_policy="degrade",
-        ),
+        ComponentSpec("optional", stage="warmup", failure_policy="degrade"),
         broken,
     )
     kernel.register(
@@ -126,7 +121,7 @@ async def test_lifecycle_kernel_blocks_dependents_of_degraded_component() -> Non
         dependent,
     )
 
-    await kernel.start_stage("warmup")
+    await kernel.start_components({"optional", "dependent"})
 
     assert calls == []
     assert kernel.component_status("optional")["state"] == "degraded"  # type: ignore[index]
@@ -149,22 +144,18 @@ async def test_lifecycle_context_cancels_owned_tasks_and_runs_finalizers() -> No
         context.spawn_task(worker(), name="lifecycle-test-worker")
         context.add_finalizer(finalized.append, "done")
 
-    kernel.register(
-        ComponentSpec("owned", stage="runtime"),
-        start,
-        pass_context=True,
-    )
+    kernel.register(ComponentSpec("owned"), start, pass_context=True)
 
-    await kernel.start_stage("runtime")
+    await kernel.start_components({"owned"})
     await kernel.stop_all()
 
     assert stopped.is_set()
     assert finalized == ["done"]
-    assert kernel.component_status("owned")["resource_count"] == 1  # type: ignore[index]
+    assert kernel.component_status("owned")["state"] == "stopped"  # type: ignore[index]
 
 
 @pytest.mark.asyncio
-async def test_supervised_task_failure_updates_component_and_receipt() -> None:
+async def test_background_task_failure_degrades_component() -> None:
     kernel = LifecycleKernel()
 
     async def start(context) -> None:
@@ -172,21 +163,25 @@ async def test_supervised_task_failure_updates_component_and_receipt() -> None:
             await asyncio.sleep(0)
             raise RuntimeError("background failed")
 
+        async def operation() -> None:
+            await asyncio.sleep(0)
+            raise RuntimeError("operation failed")
+
         context.spawn_task(broken(), name="broken-background")
+        context.spawn_task(operation(), name="operation", degrade_on_error=False)
 
     kernel.register(
-        ComponentSpec("supervised", stage="runtime", failure_policy="degrade"),
+        ComponentSpec("supervised", failure_policy="degrade"),
         start,
         pass_context=True,
     )
-    await kernel.start_stage("runtime")
+    await kernel.start_components({"supervised"})
     await asyncio.sleep(0.01)
 
     status = kernel.component_status("supervised")
     assert status is not None
     assert status["state"] == "degraded"
-    assert status["consecutive_health_failures"] == 1
-    assert status["resource_counts"] == {"asyncio:task:failed": 1}
+    assert status["error_code"] == "task_failed:RuntimeError"
     await kernel.stop_all()
 
 
@@ -201,14 +196,13 @@ async def test_config_stop_failure_does_not_rollback_unapplied_change() -> None:
     kernel.register(
         ComponentSpec(
             "component",
-            stage="runtime",
             restart_policy="component",
             config_keys=("VALUE",),
         ),
         lambda: None,
         stop=stop,
     )
-    await kernel.start_stage("runtime")
+    await kernel.start_components({"component"})
 
     result = await kernel.restart_for_config(
         {"VALUE"},
@@ -218,6 +212,20 @@ async def test_config_stop_failure_does_not_rollback_unapplied_change() -> None:
 
     assert calls == []
     assert result.apply_effect == "rolled_back"
+
+
+@pytest.mark.asyncio
+async def test_worker_policy_component_requires_restart() -> None:
+    kernel = LifecycleKernel()
+    kernel.register(ComponentSpec("cache", config_keys=("CACHE_MODE",)), lambda: None)
+    await kernel.start_components({"cache"})
+
+    result = await kernel.restart_for_config(
+        {"cache_mode"}, apply_change=lambda: None, rollback_change=lambda: None
+    )
+
+    assert result.apply_effect == "restart_pending"
+    assert result.reason_codes == ["component_not_restartable"]
 
 
 @pytest.mark.asyncio
@@ -256,7 +264,7 @@ async def test_component_restart_uses_dependency_closure() -> None:
         second_start,
         stop=second_stop,
     )
-    await kernel.start_stage("management")
+    await kernel.start_components({"first", "second"})
     calls.clear()
 
     result = await kernel.restart_for_config(
@@ -300,133 +308,32 @@ def test_component_state_values_are_stable() -> None:
     assert ComponentState.READY.value == "ready"
 
 
-def test_external_process_receipt_tracks_launcher_child_lifecycle() -> None:
-    kernel = LifecycleKernel()
-    kernel.observe_external_process(
-        "launcher:worker",
-        pid=1234,
-        scope="worker",
-        metadata={"role": "worker"},
-    )
-
-    ready = kernel.component_status("launcher:worker")
-    assert ready is not None
-    assert ready["state"] == "ready"
-    assert ready["resource_counts"] == {"subprocess:process:active": 1}
-
-    kernel.release_external_process(1234, return_code=0, reason="normal")
-    stopped = kernel.component_status("launcher:worker")
-    assert stopped is not None
-    assert stopped["state"] == "stopped"
-    assert stopped["resource_counts"] == {"subprocess:process:released": 1}
-
-
-def test_restart_required_plugin_is_healthy_but_not_hot_reloadable() -> None:
-    kernel = LifecycleKernel()
-    kernel.observe_plugin_incarnation(
-        "route-plugin",
-        "incarnation",
-        source_digest="abc",
-        receipts=[],
-        classification="restart_required",
-    )
-
-    status = kernel.component_status("plugin:route-plugin")
-    assert status is not None
-    assert status["state"] == "ready"
-    assert status["health"] == "healthy"
-    assert status["metadata"]["classification"] == "restart_required"
-
-
-@pytest.mark.asyncio
-async def test_stop_all_releases_observed_plugin_resources() -> None:
-    kernel = LifecycleKernel()
-    kernel.observe_plugin_incarnation(
-        "observed",
-        "incarnation",
-        source_digest="abc",
-        receipts=[
-            ResourceReceipt(
-                receipt_id="timer",
-                provider="asyncio",
-                resource_type="timer",
-                owner_id="observed",
-            )
-        ],
-        classification="hot_reloadable",
-    )
-
-    await kernel.stop_all()
-
-    status = kernel.component_status("plugin:observed")
-    assert status is not None
-    assert status["resource_counts"] == {"asyncio:timer:released": 1}
-
-
-def test_launcher_lifecycle_state_path_can_be_isolated(monkeypatch, tmp_path) -> None:
-    import importlib
-
-    import zhenxun.services.lifecycle.launcher as launcher
-
-    state_path = tmp_path / "launcher-state.json"
-    monkeypatch.setenv("ZHENXUN_LAUNCHER_LIFECYCLE_STATE_PATH", str(state_path))
-    launcher = importlib.reload(launcher)
-
-    launcher.initialize_launcher_lifecycle()
-
-    assert state_path.exists()
-    assert launcher.launcher_lifecycle_snapshot()["process"]["role"] == "launcher"
-
-
 @pytest.mark.asyncio
 async def test_stop_failure_still_runs_context_finalizers() -> None:
     kernel = LifecycleKernel()
     finalized: list[str] = []
 
-    async def start(context) -> RuntimeHandle:
+    async def start(context) -> str:
         context.add_finalizer(finalized.append, "released")
-        return RuntimeHandle(value="ready")
+        return "ready"
 
     async def stop() -> None:
         raise RuntimeError("stop failed")
 
-    kernel.register(
-        ComponentSpec("failing-stop", stage="runtime"),
-        start,
-        stop=stop,
-        pass_context=True,
-    )
-    await kernel.start_stage("runtime")
+    kernel.register(ComponentSpec("failing-stop"), start, stop=stop, pass_context=True)
+    await kernel.start_components({"failing-stop"})
 
     await kernel.stop_all()
 
     assert finalized == ["released"]
-    assert kernel.component_status("failing-stop")["state"] == "failed"  # type: ignore[index]
+    status = kernel.component_status("failing-stop")
+    assert status is not None
+    assert status["state"] == "failed"
+    assert kernel.status()["recovery_required"] == ["failing-stop"]
 
 
 @pytest.mark.asyncio
-async def test_child_scope_closes_before_parent_resources() -> None:
-    kernel = LifecycleKernel()
-    calls: list[str] = []
-
-    async def start(context) -> None:
-        child = context.create_child_scope("task", "consumer")
-        child.add_finalizer(calls.append, "child")
-        context.add_finalizer(calls.append, "parent")
-
-    kernel.register(
-        ComponentSpec("parent", scope="infrastructure", stage="runtime"),
-        start,
-        pass_context=True,
-    )
-    await kernel.start_stage("runtime")
-    await kernel.stop_all()
-
-    assert calls == ["child", "parent"]
-
-
-@pytest.mark.asyncio
-async def test_task_cancel_timeout_is_bounded_and_marks_receipt_leaked() -> None:
+async def test_task_cancel_timeout_is_bounded_and_requires_recovery() -> None:
     kernel = LifecycleKernel()
     release = asyncio.Event()
     task: asyncio.Task[None] | None = None
@@ -441,69 +348,20 @@ async def test_task_cancel_timeout_is_bounded_and_marks_receipt_leaked() -> None
         nonlocal task
         task = context.spawn_task(cancellation_resistant(), name="resistant")
 
-    kernel.register(
-        ComponentSpec("resistant", cancel_timeout=0.01),
-        start,
-        pass_context=True,
-    )
-    await kernel.start_stage("runtime")
+    kernel.register(ComponentSpec("resistant"), start, pass_context=True)
+    await kernel.start_components({"resistant"})
 
     started = asyncio.get_running_loop().time()
-    await kernel.stop_all()
+    await kernel.stop_all(timeout=0.05)
     elapsed = asyncio.get_running_loop().time() - started
 
     status = kernel.component_status("resistant")
-    assert elapsed < 0.2
+    assert elapsed < 0.5
     assert status is not None
     assert status["state"] == "failed"
-    assert status["resource_counts"] == {"asyncio:task:leaked": 1}
+    assert status["error_code"] == "component_stop_failed:component_task_cancel_timeout"
+    assert kernel.status()["recovery_required"] == ["resistant"]
 
-    release.set()
-    assert task is not None
-    await task
-
-
-@pytest.mark.asyncio
-async def test_component_restart_does_not_overlap_task_that_refused_cancel() -> None:
-    kernel = LifecycleKernel()
-    release = asyncio.Event()
-    starts = 0
-    task: asyncio.Task[None] | None = None
-
-    async def start(context) -> None:
-        nonlocal starts, task
-        starts += 1
-
-        async def cancellation_resistant() -> None:
-            try:
-                await asyncio.Event().wait()
-            except asyncio.CancelledError:
-                await release.wait()
-
-        task = context.spawn_task(cancellation_resistant(), name="resistant")
-
-    kernel.register(
-        ComponentSpec(
-            "resistant-restart",
-            restart_policy="component",
-            config_keys=("VALUE",),
-            cancel_timeout=0.01,
-        ),
-        start,
-        pass_context=True,
-    )
-    await kernel.start_stage("runtime")
-
-    result = await kernel.restart_for_config(
-        {"VALUE"}, apply_change=lambda: None, rollback_change=lambda: None
-    )
-
-    assert result.apply_effect == "restart_pending"
-    assert result.rollback_state == "worker_recovery_required"
-    assert result.reason_codes == [
-        "component_restart_failed:component_task_cancel_timeout"
-    ]
-    assert starts == 1
     release.set()
     assert task is not None
     await task
@@ -525,7 +383,7 @@ async def test_finalizers_are_lifo_and_continue_after_failure() -> None:
         context.add_finalizer(calls.append, "last")
 
     kernel.register(ComponentSpec("finalizers"), start, pass_context=True)
-    await kernel.start_stage("runtime")
+    await kernel.start_components({"finalizers"})
     await kernel.stop_all()
 
     assert calls == ["last", "broken", "first"]
@@ -550,74 +408,70 @@ async def test_async_context_exit_timeout_is_bounded() -> None:
     async def start(context) -> None:
         await context.enter_async_context(resistant_context())
 
-    kernel.register(
-        ComponentSpec("resistant-context", finalizer_timeout=0.01),
-        start,
-        pass_context=True,
-    )
-    await kernel.start_stage("runtime")
+    kernel.register(ComponentSpec("resistant-context"), start, pass_context=True)
+    await kernel.start_components({"resistant-context"})
 
     started = asyncio.get_running_loop().time()
-    await kernel.stop_all()
+    await kernel.stop_all(timeout=0.05)
     elapsed = asyncio.get_running_loop().time() - started
 
-    assert elapsed < 0.2
+    assert elapsed < 0.5
     assert kernel.component_status("resistant-context")["state"] == "failed"  # type: ignore[index]
     release.set()
     await asyncio.sleep(0)
 
 
 @pytest.mark.asyncio
-async def test_start_failure_preserves_receipts_when_cleanup_also_fails() -> None:
+async def test_start_failure_with_failed_cleanup_requires_recovery() -> None:
     kernel = LifecycleKernel()
 
     async def start(context) -> None:
-        context.own_resource(
-            receipt_id="partial",
-            provider="test",
-            resource_type="partial",
-        )
         context.add_finalizer(lambda: (_ for _ in ()).throw(RuntimeError("cleanup")))
         raise ValueError("start")
 
     kernel.register(ComponentSpec("partial"), start, pass_context=True)
     with pytest.raises(ValueError, match="start"):
-        await kernel.start_stage("runtime")
+        await kernel.start_components({"partial"})
 
     status = kernel.component_status("partial")
     assert status is not None
+    assert status["state"] == "failed"
     assert status["error_code"] == "component_start_failed:ValueError"
-    assert status["metadata"] == {
-        "cleanup_error_code": "component_start_cleanup_failed:RuntimeError"
-    }
-    assert status["resource_counts"] == {"test:partial:released": 1}
+    assert kernel.status()["recovery_required"] == ["partial"]
 
 
-def test_lifecycle_kernel_rejects_parent_dependency_on_child_scope() -> None:
-    kernel = LifecycleKernel()
-    kernel.register(ComponentSpec("request", scope="request"), lambda: None)
-    kernel.register(
-        ComponentSpec("worker", scope="worker", depends_on=("request",)),
-        lambda: None,
-    )
+@pytest.mark.asyncio
+async def test_terminal_receipt_confirms_clean_shutdown(tmp_path) -> None:
+    receipt_path = tmp_path / "receipt.json"
+    kernel = LifecycleKernel(receipt_path)
+    kernel.set_process_metadata(boot_id="boot", startup_id="startup")
+    kernel.register(ComponentSpec("clean"), lambda: None)
+    await kernel.start_components({"clean"})
 
-    with pytest.raises(LifecycleError, match="component_scope_dependency_invalid"):
-        kernel.validate()
+    await kernel.stop_all()
+    kernel.finalize_terminal_receipt(exit_signals=[2])
+
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["result"] == "confirmed"
+    assert receipt["identity"]["boot_id"] == "boot"
+    assert receipt["identity"]["startup_id"] == "startup"
+    assert receipt["exit_signals"] == [2]
+    assert receipt["recovery_required"] == []
 
 
-def test_plugin_incarnation_unload_does_not_grow_component_registry() -> None:
-    kernel = LifecycleKernel()
-    baseline = kernel.status()["component_count"]
+@pytest.mark.asyncio
+async def test_terminal_receipt_is_unconfirmed_when_component_still_running(
+    tmp_path,
+) -> None:
+    receipt_path = tmp_path / "receipt.json"
+    kernel = LifecycleKernel(receipt_path)
+    kernel.register(ComponentSpec("running"), lambda: None)
+    await kernel.start_components({"running"})
+    kernel.request_shutdown()
 
-    for index in range(100):
-        plugin_id = f"fixture-{index}"
-        kernel.observe_plugin_incarnation(
-            plugin_id,
-            f"incarnation-{index}",
-            source_digest="digest",
-            receipts=[],
-            classification="hot_reloadable",
-        )
-        kernel.forget_plugin_incarnation(plugin_id)
+    kernel.finalize_terminal_receipt()
 
-    assert kernel.status()["component_count"] == baseline
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["result"] == "unconfirmed"
+    assert receipt["recovery_required"] == ["running"]
+    await kernel.stop_all()

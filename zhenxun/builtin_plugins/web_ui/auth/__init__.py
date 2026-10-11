@@ -1,6 +1,7 @@
 import asyncio
 from datetime import timedelta
 import json
+from pathlib import Path
 import secrets
 import time
 
@@ -12,6 +13,7 @@ from pydantic import BaseModel, Field
 
 from zhenxun.configs.config import Config
 from zhenxun.services.log import logger
+from zhenxun.utils.webui_session import decode_token, session_response
 
 from ..api.configure.persistence import persist_webui_credentials
 from ..api.configure.setup_access import setup_access
@@ -26,11 +28,9 @@ from ..passwords import (
 from ..security import (
     decode_access_token_status,
     login_attempt_limiter,
-    renew_authenticated_websockets,
     revoke_authenticated_websockets,
 )
 from ..utils import (
-    ACCESS_TOKEN_ABSOLUTE_HOURS,
     ACCESS_TOKEN_EXPIRE_MINUTES,
     authentication,
     create_token,
@@ -61,6 +61,8 @@ class SessionActivityResponse(BaseModel):
     token_type: str = "bearer"
     expires_in: int
     absolute_expires_in: int
+    expires_at: int
+    session_auth_version: int
 
 
 def _client_key(request: Request) -> str:
@@ -112,7 +114,11 @@ async def login_get_token(
     )
     await _remember_token(access_token)
     return Result.ok(
-        {"access_token": access_token, "token_type": "bearer"}, "欢迎回家, 欧尼酱!"
+        session_response(
+            access_token,
+            decode_token(access_token, Config.get_config("web-ui", "secret")),
+        ),
+        "欢迎回家, 欧尼酱!",
     )
 
 
@@ -122,12 +128,13 @@ async def console_connect(request: Request, payload: ConsoleConnectRequest) -> R
     boot_id = await console_access.claim(payload.code, client_key)
     state = setup_access.state()
     if state in {"unconfigured", "partial"}:
-        setup_token, expires_in = await setup_access.create_session(client_key)
+        setup_token, _ = await setup_access.create_session(client_key, boot_id=boot_id)
         return Result.ok(
             {
                 "mode": "setup",
-                "setup_token": setup_token,
-                "expires_in": expires_in,
+                **session_response(
+                    setup_token, decode_token(setup_token, setup_access.secret)
+                ),
             },
             "控制台连接已授权，请继续完成首次配置。",
         )
@@ -147,54 +154,42 @@ async def console_connect(request: Request, payload: ConsoleConnectRequest) -> R
     return Result.ok(
         {
             "mode": "login",
-            "access_token": access_token,
-            "token_type": "bearer",
-            "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+            **session_response(
+                access_token,
+                decode_token(access_token, Config.get_config("web-ui", "secret")),
+            ),
         },
         "已通过本次启动的控制台链接临时登录。",
     )
 
 
 @router.post("/auth/activity", response_model=Result[SessionActivityResponse])
-async def renew_session_activity(token: str = Depends(oauth2_scheme)) -> Result:
+async def renew_session_activity(
+    request: Request, token: str = Depends(oauth2_scheme)
+) -> Result:
     claims, status = decode_access_token_status(token)
+    if claims is None:
+        try:
+            session = await setup_access.authorize(token, _client_key(request))
+            claims = session.claims
+        except HTTPException:
+            from zhenxun.services.migration.errors import MigrationError
+            from zhenxun.services.migration.session import continuation_session
+
+            try:
+                claims = continuation_session(Path.cwd(), token).claims
+            except MigrationError:
+                pass
     if claims is None:
         raise HTTPException(
             status_code=401,
             detail=("登录会话已过期。" if status == "expired" else "登录验证失败。"),
             headers={"WWW-Authenticate": "Bearer"},
         )
-    username = str(claims.get("sub") or "")
-    user = get_user(username)
-    if user is None:
-        raise HTTPException(status_code=401, detail="登录账户已失效。")
-    now = int(time.time())
-    absolute_exp = int(
-        claims.get("absolute_exp")
-        or claims.get("auth_time", now) + ACCESS_TOKEN_ABSOLUTE_HOURS * 3600
-    )
-    if now >= absolute_exp:
-        raise HTTPException(status_code=401, detail="登录会话已达到最长有效期。")
-    retained = {
-        key: claims[key]
-        for key in ("sid", "auth_time", "absolute_exp", "auth_source", "boot_id")
-        if key in claims
-    }
-    access_token = create_token(
-        user=user,
-        expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
-        extra_claims=retained,
-    )
-    refreshed, _ = decode_access_token_status(access_token)
-    expires_at = int((refreshed or {}).get("exp", now))
-    renew_authenticated_websockets(str((refreshed or {}).get("sid") or ""), expires_at)
-    await _remember_token(access_token)
     return Result.ok(
         {
-            "access_token": access_token,
-            "token_type": "bearer",
-            "expires_in": max(0, expires_at - now),
-            "absolute_expires_in": max(0, absolute_exp - now),
+            **session_response(token, claims),
+            "absolute_expires_in": max(0, int(claims["exp"] - time.time())),
         }
     )
 

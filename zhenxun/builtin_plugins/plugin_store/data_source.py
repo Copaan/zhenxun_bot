@@ -21,7 +21,6 @@ from zhenxun.services.plugin_store.plugin_store_coordinator import (
 )
 from zhenxun.utils.enum import PluginType
 from zhenxun.utils.image_utils import BuildImage, ImageTemplate, RowStyle
-from zhenxun.utils.manager.virtual_env_package_manager import VirtualEnvPackageManager
 from zhenxun.utils.repo_utils import RepoFileManager
 from zhenxun.utils.repo_utils.models import RepoFileInfo, RepoType
 from zhenxun.utils.utils import is_number, win_on_rm_error
@@ -50,6 +49,7 @@ class StoreInstallResult:
     dependency_plan: dict[str, Any] = field(default_factory=dict)
     download_source: str = "auto"
     unchanged: bool = False
+    dependency_message: str = ""
 
     @property
     def dependency_changes(self) -> bool:
@@ -531,7 +531,7 @@ class StoreManager:
             confirm_source_build=confirm_source_build,
         )
         dependency_status = (
-            "依赖已更新，需由运行时决定生效方式"
+            install_result.dependency_message or "依赖将在重启后安装"
             if install_result.dependency_changes
             else "依赖已满足"
         )
@@ -631,19 +631,29 @@ class StoreManager:
                         f"插件 {plugin_info.module_path} 的依赖已满足，跳过安装",
                         LOG_COMMAND,
                     )
-            if dependency_changes and install_dependencies:
-                for requirement_file in requirement_files:
-                    logger.info(
-                        f"开始安装插件 {plugin_info.module_path} "
-                        f"依赖文件: {requirement_file}",
-                        LOG_COMMAND,
-                    )
-                    await VirtualEnvPackageManager.install_requirement(requirement_file)
 
             cls._deploy_staged_plugin(plugin_info, deploy_files)
+            dependency_message = ""
+            if dependency_changes and install_dependencies:
+                from zhenxun.utils._restart_utils import request_dependency_restart
+
+                staged = {path.resolve() for path in requirement_files}
+                deployed = {
+                    target
+                    for source, target in deploy_files
+                    if source.resolve() in staged
+                }
+                logger.info(
+                    f"插件 {plugin_info.module_path} 的依赖将在重启时安装到依赖层",
+                    LOG_COMMAND,
+                )
+                _, dependency_message = await request_dependency_restart(
+                    "plugin_store", deployed
+                )
             return StoreInstallResult(
                 dependency_plan=dependency_plan,
                 download_source="ali" if selected_source == RepoType.ALIYUN else "git",
+                dependency_message=dependency_message,
             )
 
     @classmethod

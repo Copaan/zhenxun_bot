@@ -10,11 +10,7 @@ from nonebot_plugin_uninfo import Uninfo
 from zhenxun.configs.config import BotConfig
 from zhenxun.configs.utils import PluginExtraData
 from zhenxun.services.log import logger
-from zhenxun.utils._restart_utils import (
-    handle_restart_connect,
-    handle_restart_disconnect,
-    request_restart,
-)
+from zhenxun.utils._restart_utils import handle_restart_connect, request_restart
 from zhenxun.utils.enum import PluginType
 from zhenxun.utils.message import MessageUtils
 from zhenxun.utils.platform import PlatformUtils
@@ -76,8 +72,3 @@ async def _(bot: Bot, session: Uninfo, flag: str = ArgStr("flag")):
 @driver.on_bot_connect
 async def _(bot: Bot):
     await handle_restart_connect(bot)
-
-
-@driver.on_bot_disconnect
-async def _(bot: Bot):
-    await handle_restart_disconnect(bot)

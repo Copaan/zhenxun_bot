@@ -85,8 +85,7 @@ class AgentRunResult(BaseModel, Generic[OutputDataT]):
     handoff: HandoffPayload | None = None
     """向外抛出的软移交载荷（存在时说明Agent发起了移交请求）"""
 
-    class Config:
-        arbitrary_types_allowed = True
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
     @property
     def llm_messages(self) -> list[LLMMessage]:

@@ -4,15 +4,14 @@ import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
 import inspect
-import os
 import time
 from typing import ClassVar, Literal
 
 import nonebot
 
-from zhenxun.migration.mutation import migration_startup_scope
 from zhenxun.services.lifecycle import ComponentSpec, LifecycleError, lifecycle_kernel
 from zhenxun.services.log import logger
+from zhenxun.services.migration.mutation import migration_startup_scope
 from zhenxun.services.startup import StartupStage, startup_coordinator
 from zhenxun.utils.enum import PriorityLifecycleType
 from zhenxun.utils.exception import HookPriorityException
@@ -28,15 +27,11 @@ class HookSpec:
     timeout: float | None = None
     parallel_safe: bool = False
     failure_policy: FailurePolicy = "fatal"
-    task_id: str | None = None
     depends_on: tuple[str, ...] = ()
-    resource_group: str | None = None
     component_id: str | None = None
-    scope: str = "infrastructure"
     restart_policy: str = "worker"
     config_keys: tuple[str, ...] = ()
     pass_context: bool = False
-    health: Callable | None = None
 
 
 class PriorityLifecycle:
@@ -55,15 +50,11 @@ class PriorityLifecycle:
         timeout: float | None = None,
         parallel_safe: bool = False,
         failure_policy: FailurePolicy | None = None,
-        task_id: str | None = None,
         depends_on: tuple[str, ...] = (),
-        resource_group: str | None = None,
         component_id: str | None = None,
-        scope: str = "infrastructure",
         restart_policy: str = "worker",
         config_keys: tuple[str, ...] = (),
         pass_context: bool = False,
-        health: Callable | None = None,
     ):
         if hook_type not in cls._data:
             cls._data[hook_type] = {}
@@ -76,15 +67,11 @@ class PriorityLifecycle:
             parallel_safe=parallel_safe,
             failure_policy=failure_policy
             or ("degrade" if stage == "warmup" else "fatal"),
-            task_id=task_id,
             depends_on=depends_on,
-            resource_group=resource_group,
             component_id=component_id,
-            scope=scope,
             restart_policy=restart_policy,
             config_keys=config_keys,
             pass_context=pass_context,
-            health=health,
         )
 
     @classmethod
@@ -96,15 +83,11 @@ class PriorityLifecycle:
         timeout: float | None = None,
         parallel_safe: bool = False,
         failure_policy: FailurePolicy | None = None,
-        task_id: str | None = None,
         depends_on: tuple[str, ...] = (),
-        resource_group: str | None = None,
         component_id: str | None = None,
-        scope: str = "infrastructure",
         restart_policy: str = "worker",
         config_keys: tuple[str, ...] = (),
         pass_context: bool = False,
-        health: Callable | None = None,
     ):
         def wrapper(func):
             cls.add(
@@ -115,15 +98,11 @@ class PriorityLifecycle:
                 timeout=timeout,
                 parallel_safe=parallel_safe,
                 failure_policy=failure_policy,
-                task_id=task_id,
                 depends_on=depends_on,
-                resource_group=resource_group,
                 component_id=component_id,
-                scope=scope,
                 restart_policy=restart_policy,
                 config_keys=config_keys,
                 pass_context=pass_context,
-                health=health,
             )
             return func
 
@@ -204,11 +183,7 @@ def _stage_hooks() -> dict[str, tuple[int, Callable, HookSpec]]:
     for priority in sorted(priority_data):
         for func in list(priority_data[priority]):
             spec = PriorityLifecycle._metadata.get(func, HookSpec())
-            base_id = (
-                spec.component_id
-                or spec.task_id
-                or f"legacy:{spec.stage}:{_hook_name(func)}"
-            )
+            base_id = spec.component_id or f"legacy:{spec.stage}:{_hook_name(func)}"
             task_id = base_id
             suffix = 2
             while task_id in pending:
@@ -260,33 +235,20 @@ def _build_start_component(
 ) -> Callable:
     async def start_component(context=None):
         try:
-            result = await _run_hook(
+            return await _run_hook(
                 func,
                 priority,
                 stage=spec.stage,
                 timeout=spec.timeout,
                 context=context if spec.pass_context else None,
             )
-            if spec.stage == "warmup":
-                from zhenxun.services.startup_load import startup_load_planner
-
-                startup_load_planner.finish_warmup_hook(
-                    str(getattr(func, "__module__", ""))
-                )
-            return result
         except (Exception, HookPriorityException) as error:
             logger.error(
                 f"执行启动钩子失败: {_hook_name(func)} ({type(error).__name__})",
                 e=error if isinstance(error, Exception) else None,
             )
             error._startup_trace_logged = True
-            from zhenxun.services.lifecycle.provider_undo import active_undo
             from zhenxun.services.startup_load import startup_load_planner
-
-            # A failed candidate belongs to the transaction, not the boot report.
-            # The caller validates component state and rolls back before admission.
-            if active_undo.get() is not None:
-                raise
 
             owner = startup_load_planner.owner_for_module(
                 str(getattr(func, "__module__", ""))
@@ -295,10 +257,6 @@ def _build_start_component(
                 startup_load_planner.mark_failed(
                     owner, f"plugin_lifecycle_failed:{type(error).__name__}"
                 )
-                if spec.stage == "warmup":
-                    startup_load_planner.finish_warmup_hook(
-                        str(getattr(func, "__module__", ""))
-                    )
             elif spec.failure_policy != "fatal":
                 startup_coordinator.record_error(
                     spec.stage,
@@ -364,10 +322,8 @@ def _sync_kernel_declarations() -> set[Callable]:
         lifecycle_kernel.register(
             ComponentSpec(
                 component_id=component_id,
-                scope=spec.scope,  # type: ignore[arg-type]
                 stage=spec.stage,
                 depends_on=spec.depends_on,
-                resource_group=spec.resource_group,
                 timeout=spec.timeout,
                 failure_policy=failure_policy,
                 restart_policy=spec.restart_policy,  # type: ignore[arg-type]
@@ -379,7 +335,6 @@ def _sync_kernel_declarations() -> set[Callable]:
             ),
             start_component,
             stop=stop_component,
-            health=spec.health,
             pass_context=spec.pass_context,
             replace=status is not None,
         )
@@ -390,7 +345,6 @@ def _sync_kernel_declarations() -> set[Callable]:
         lifecycle_kernel.register(
             ComponentSpec(
                 component_id=component_id,
-                scope="infrastructure",
                 stage="runtime",
                 timeout=spec.timeout,
                 failure_policy="degrade",
@@ -450,9 +404,9 @@ async def _run_post_management() -> None:
 
         if startup_load_planner.prepared:
             await startup_load_planner.load_runtime()
-            from zhenxun.services.runtime_reload import plugin_runtime_manager
+            from zhenxun.services.plugin_host import plugin_host
 
-            plugin_runtime_manager.activate_loaded_incarnations()
+            plugin_host.write_index()
         await _run_stage("runtime")
     except asyncio.CancelledError:
         raise
@@ -461,8 +415,6 @@ async def _run_post_management() -> None:
             "runtime", f"runtime_stage_failed:{type(error).__name__}", error=error
         )
         return
-    if startup_load_planner.prepared:
-        startup_load_planner.prepare_warmup_gates()
     startup_coordinator.finish_stage("runtime")
 
     startup_coordinator.begin_stage("warmup")
@@ -491,13 +443,18 @@ async def _start_application_lifecycle() -> None:
     from zhenxun.builtin_plugins.web_ui.api.configure.setup_access import setup_access
 
     setup_required = setup_access.state() in {"unconfigured", "partial"}
+    from zhenxun.services.nonebot_store.runtime import recovery_required
+
+    store_recovery = recovery_required()
     if setup_required:
         startup_coordinator.enter_setup_mode()
     startup_coordinator.begin_stage("management")
     try:
         await _run_stage(
             "management",
-            excluded_components={"management:database"} if setup_required else None,
+            excluded_components={"management:database"}
+            if setup_required or store_recovery
+            else None,
         )
     except BaseException as error:
         startup_coordinator.fail_stage(
@@ -507,6 +464,11 @@ async def _start_application_lifecycle() -> None:
         )
         raise
     startup_coordinator.finish_stage("management")
+    if store_recovery:
+        startup_coordinator.fail_stage(
+            "runtime", "dependency_transaction_recovery_required"
+        )
+        return
     if setup_required:
         logger.info(
             "首次配置尚未完成，worker 已进入 setup_only 管理模式；"
@@ -517,22 +479,19 @@ async def _start_application_lifecycle() -> None:
     startup_context = lifecycle_kernel.component_context(
         "management:runtime_concurrency"
     )
-    _post_management_task = startup_context.spawn_detached(
-        _run_post_management(),
-        scope_id="startup-runtime",
-        scope="operation",
-        name="zhenxun-startup-runtime",
+    _post_management_task = startup_context.spawn_task(
+        _run_post_management(), name="zhenxun-startup-runtime"
     )
 
 
 @driver.on_shutdown
 async def _():
     from zhenxun.services.lifecycle.deadline import (
-        received_shutdown_budget,
+        WORKER_SHUTDOWN_SECONDS,
         shutdown_budget,
     )
 
-    with shutdown_budget(received_shutdown_budget(15.0)):
+    with shutdown_budget(lifecycle_kernel.shutdown_remaining(WORKER_SHUTDOWN_SECONDS)):
         await _shutdown_with_budget()
 
 
@@ -541,51 +500,22 @@ async def _shutdown_with_budget():
     from zhenxun.services.lifecycle.deadline import remaining_timeout
     from zhenxun.services.runtime_mutation import runtime_mutation_coordinator
 
-    def probe_phase(name: str) -> None:
-        if os.getenv("ZHENXUN_SHUTDOWN_PROBE"):
-            print(f"[shutdown-phase] {name}", flush=True)  # noqa: T201
-
-    probe_phase("quiesce-runtime-mutations")
     mutation_drained = await runtime_mutation_coordinator.quiesce(
         timeout=remaining_timeout(10)
     )
     if not mutation_drained:
         logger.error("运行时变更事务未能在关闭前排空，将要求 worker 恢复。")
     task = _post_management_task
-    probe_phase("cancel-post-management")
     _post_management_task = None
     if task is not None and not task.done():
         task.cancel()
         done, pending = await asyncio.wait({task}, timeout=remaining_timeout(2.0))
         if pending:
-            lifecycle_kernel._recovery_required.add("runtime_bootstrap")
+            lifecycle_kernel.require_recovery("runtime_bootstrap")
         for completed in done:
             if not completed.cancelled():
                 completed.exception()
 
-    probe_phase("stop-lifecycle-components")
-    paired = _sync_kernel_declarations()
+    _sync_kernel_declarations()
     await lifecycle_kernel.stop_all()
     runtime_mutation_coordinator.close()
-    priority_data = PriorityLifecycle._data.get(PriorityLifecycleType.SHUTDOWN)
-    if not priority_data:
-        return
-    for priority in sorted(priority_data):
-        probe_phase(f"shutdown-priority-{priority}")
-        for func in list(priority_data[priority]):
-            if func in paired:
-                continue
-            spec = PriorityLifecycle._metadata.get(func, HookSpec())
-            try:
-                await _run_hook(
-                    func,
-                    priority,
-                    "shutdown",
-                    stage="shutdown",
-                    timeout=remaining_timeout(spec.timeout or 5.0),
-                )
-            except Exception as error:
-                logger.error(
-                    f"执行优先级 [{priority}] on_shutdown 方法出错: {error}",
-                    e=error,
-                )

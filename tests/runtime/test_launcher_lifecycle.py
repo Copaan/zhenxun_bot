@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+import contextvars
 from dataclasses import dataclass
+import os
 from pathlib import Path
+import subprocess
+import sys
+from types import SimpleNamespace
 
-import pytest
 
-from zhenxun.services.lifecycle.launcher import CommitSession
-
-
-@dataclass
+# eq=False 保持按身份哈希，与真实 Popen 一致（启动器用 WeakSet 跟踪已释放进程）
+@dataclass(eq=False)
 class FakeProcess:
     pid: int = 1234
     returncode: int | None = None
@@ -31,86 +35,105 @@ class FakeProcess:
         return self.returncode
 
 
-def test_wait_worker_exit_records_natural_exit(monkeypatch) -> None:
-    import zhenxun.cli as cli
+def _isolated_supervisor(tmp_path: Path, monkeypatch):
+    """构造隔离的启动器监督者，initialize 写的环境变量会被还原"""
+    import zhenxun.services.launcher.sidecars as sidecars_module
+    import zhenxun.services.launcher.supervisor as launcher_module
+    from zhenxun.services.launcher.supervisor import LauncherSupervisor
 
-    process = FakeProcess(returncode=0)
-    exits: list[tuple[int, str]] = []
-    monkeypatch.setattr(
-        cli,
-        "_record_launcher_process_exit",
-        lambda proc, reason: exits.append((proc.pid, reason)),
+    monkeypatch.setenv("ZHENXUN_LAUNCHER_BOOT_ID", "")
+    supervisor = LauncherSupervisor()
+    supervisor.initialize()
+    monkeypatch.setattr(launcher_module, "launcher_supervisor", supervisor)
+    monkeypatch.setattr(sidecars_module, "launcher_supervisor", supervisor)
+    return supervisor
+
+
+def test_terminate_worker_escalates_to_kill(tmp_path: Path, monkeypatch) -> None:
+    from zhenxun.services.launcher.sidecars import stop_process
+    from zhenxun.services.lifecycle.deadline import ShutdownBudget, current_budget
+
+    supervisor = _isolated_supervisor(tmp_path, monkeypatch)
+    # 子进程忽略协作式停止信号，迫使启动器在预算耗尽后升级为强制结束
+    script = (
+        "import signal, sys, time\n"
+        "for name in ('SIGBREAK', 'SIGTERM'):\n"
+        "    if hasattr(signal, name):\n"
+        "        signal.signal(getattr(signal, name), signal.SIG_IGN)\n"
+        "sys.stdout.write('ready\\n')\n"
+        "sys.stdout.flush()\n"
+        "time.sleep(60)\n"
     )
-
-    assert cli._wait_worker_exit(process, 0.1)
-    assert exits == [(1234, "process_exit")]
-
-
-def test_terminate_worker_escalates_to_kill(monkeypatch) -> None:
-    import zhenxun.cli as cli
-
-    process = FakeProcess()
-    exits: list[tuple[int, str]] = []
-    monkeypatch.setattr(cli.os, "name", "posix")
-    monkeypatch.setattr(cli, "_wait_worker_exit", lambda _proc, _timeout: False)
-    monkeypatch.setattr(
-        cli,
-        "_record_launcher_process_exit",
-        lambda proc, reason: exits.append((proc.pid, reason)),
+    process = subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdout=subprocess.PIPE,
+        creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
     )
+    try:
+        assert process.stdout is not None
+        assert process.stdout.readline().strip() == b"ready"
+        handle = supervisor.attach("worker", process)
+        # 用较短的外层预算限制协作阶段，避免等待默认的 15 秒。
+        # 在独立线程的事件循环中执行，避免 asyncio.run 结束时清空主线程的事件循环。
+        context = contextvars.copy_context()
+        context.run(current_budget.set, ShutdownBudget.start(1.5))
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pool.submit(context.run, asyncio.run, stop_process(process)).result(
+                timeout=30
+            )
 
-    cli._terminate_worker(process)
-
-    assert process.terminated == 1
-    assert process.killed == 1
-    assert process.waited == 1
-    assert exits == [(1234, "killed")]
-
-
-def test_launcher_commit_session_is_idempotent_and_recoverable(
-    tmp_path: Path,
-) -> None:
-    session = CommitSession(tmp_path / "commit.json")
-    prepared = session.begin(["source_plugins", "nonebot_generation"], "boot")
-    assert session.begin(["ignored"], "other") == prepared
-
-    session.transition("applied")
-    session.transition("verifying")
-    session.transition("rolling_back")
-    rolled_back = session.transition("rolled_back")
-    assert rolled_back["phase"] == "rolled_back"
-
-    next_session = session.begin(["update"], "next-boot")
-    assert next_session["session_id"] != prepared["session_id"]
-    with pytest.raises(RuntimeError, match="launcher_commit_transition_invalid"):
-        session.transition("committed")
+        assert process.wait(timeout=10) is not None
+        force_stage = "terminate" if os.name == "nt" else "kill"
+        assert handle.exit_reason == force_stage
+        stages = [item["stage"] for item in handle.stop_stages]
+        assert stages.index("cooperative") < stages.index(force_stage)
+        cooperative = next(
+            item for item in handle.stop_stages if item["stage"] == "cooperative"
+        )
+        assert cooperative["timed_out"] is True
+        assert supervisor._handles == {}
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=10)
+        if process.stdout is not None:
+            process.stdout.close()
 
 
 def test_launcher_process_handle_distinguishes_spawn_and_runtime_pid(
     tmp_path: Path, monkeypatch
 ) -> None:
-    from zhenxun.services.lifecycle import LifecycleKernel
-    import zhenxun.services.lifecycle.launcher as launcher_module
-    from zhenxun.services.lifecycle.launcher import LauncherSupervisor
+    from zhenxun.services.launcher.supervisor import ProcessHandle
 
-    monkeypatch.setattr(launcher_module, "_COMMIT_PATH", tmp_path / "commit.json")
-    supervisor = LauncherSupervisor(LifecycleKernel(tmp_path / "lifecycle.json"))
-    supervisor.initialize()
+    # 假进程没有真实 psutil 身份：模拟已核实的进程树（spawn 1234 → 运行时 5678）
+    tree = {1234: 1.0, 5678: 2.0}
+
+    def verified_tree(self, *, discover: bool = False):
+        self.identities.update(tree)
+        return [SimpleNamespace(pid=pid) for pid in tree]
+
+    monkeypatch.setattr(ProcessHandle, "_live_processes", verified_tree)
+    supervisor = _isolated_supervisor(tmp_path, monkeypatch)
     process = FakeProcess(pid=1234)
-    supervisor.attach("worker", process)  # type: ignore[arg-type]
+    handle = supervisor.attach("worker", process)  # type: ignore[arg-type]
 
-    supervisor.bind_worker_runtime(
+    # 运行时状态必须携带本次启动器与本次 spawn 的身份，否则拒绝绑定
+    assert not supervisor.bind_worker_runtime(
+        process,  # type: ignore[arg-type]
+        {"pid": 5678, "boot_id": "worker-boot"},
+    )
+    assert supervisor.bind_worker_runtime(
         process,  # type: ignore[arg-type]
         {
             "pid": 5678,
             "boot_id": "worker-boot",
             "operating_mode": "management_only",
+            "launcher_boot_id": supervisor.boot_id,
+            "startup_id": handle.startup_id,
         },
     )
 
-    worker = supervisor.snapshot()["process_graph"][0]
-    assert worker["spawn_pid"] == 1234
-    assert worker["runtime_pid"] == 5678
-    assert worker["pid"] == 5678
-    assert worker["worker_boot_id"] == "worker-boot"
-    assert worker["operating_mode"] == "management_only"
+    assert handle.spawn_pid == 1234
+    assert handle.runtime_pid == 5678
+    assert handle.worker_boot_id == "worker-boot"
+    assert handle.operating_mode == "management_only"

@@ -2,7 +2,7 @@ from collections.abc import Callable
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from zhenxun.utils.enum import BlockType, LimitWatchType, PluginLimitType, PluginType
 from zhenxun.utils.pydantic_compat import model_dump
@@ -314,5 +314,4 @@ class PluginExtraData(BaseModel):
     group_config_model: type[BaseModel] | None = None
     """插件的分群配置模型"""
 
-    class Config:
-        arbitrary_types_allowed = True
+    model_config = ConfigDict(arbitrary_types_allowed=True)

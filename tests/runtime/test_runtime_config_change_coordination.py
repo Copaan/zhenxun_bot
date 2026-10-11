@@ -48,9 +48,8 @@ async def test_alapi_runtime_value_reload_does_not_request_restart(
     from zhenxun.builtin_plugins.hooks.auth.auth_limit import LimitManager
     from zhenxun.builtin_plugins.init.manager import manager as init_manager
     from zhenxun.configs.config import Config
+    from zhenxun.services.plugin_host import ApplyMode, plugin_host
     import zhenxun.services.runtime_config_reload as runtime_config
-    from zhenxun.services.runtime_reload import plugin_runtime_manager
-    from zhenxun.services.runtime_reload.models import ApplyMode
 
     monkeypatch.setattr(Config, "_simple_data", {"alapi": {"ALAPI_TOKEN": "old-token"}})
 
@@ -67,7 +66,10 @@ async def test_alapi_runtime_value_reload_does_not_request_restart(
     captured: list[tuple[set[tuple[str, str]], bool]] = []
 
     async def reload_consumers(
-        changed: set[tuple[str, str]], *, submit_restart: bool = True
+        changed: set[tuple[str, str]],
+        *,
+        restart_dependencies: set[tuple[str, str]] | None = None,
+        submit_restart: bool = True,
     ) -> None:
         captured.append((changed, submit_restart))
         return None
@@ -78,12 +80,7 @@ async def test_alapi_runtime_value_reload_does_not_request_restart(
     monkeypatch.setattr(init_manager, "init", lambda: None)
     monkeypatch.setattr(init_manager, "load_to_db", load_to_db)
     monkeypatch.setattr(LimitManager, "update_limits", update_limits)
-    monkeypatch.setattr(
-        plugin_runtime_manager, "reload_config_consumers", reload_consumers
-    )
-    monkeypatch.setattr(
-        plugin_runtime_manager, "mark_content_processed", lambda _path: None
-    )
+    monkeypatch.setattr(plugin_host, "reload_config_consumers", reload_consumers)
 
     operation = await runtime_config.reload_runtime_config(submit_restart=False)
 
@@ -127,9 +124,8 @@ async def test_runtime_config_consumer_failure_restores_memory_and_caches(
     from zhenxun.builtin_plugins.hooks.auth.auth_limit import LimitManager
     from zhenxun.builtin_plugins.init.manager import manager as init_manager
     from zhenxun.configs.config import Config
+    from zhenxun.services.plugin_host import ApplyMode, RuntimeOperation, plugin_host
     import zhenxun.services.runtime_config_reload as runtime_config
-    from zhenxun.services.runtime_reload import plugin_runtime_manager
-    from zhenxun.services.runtime_reload.models import ApplyMode, RuntimeOperation
 
     old_data = {"demo": {"VALUE": "old"}}
     new_data = {"demo": {"VALUE": "new"}}
@@ -170,9 +166,7 @@ async def test_runtime_config_consumer_failure_restores_memory_and_caches(
     monkeypatch.setattr(init_manager, "init", lambda: None)
     monkeypatch.setattr(init_manager, "load_to_db", load_to_db)
     monkeypatch.setattr(LimitManager, "update_limits", update_limits)
-    monkeypatch.setattr(
-        plugin_runtime_manager, "reload_config_consumers", reload_consumers
-    )
+    monkeypatch.setattr(plugin_host, "reload_config_consumers", reload_consumers)
 
     with pytest.raises(runtime_config.RuntimeConfigReloadError):
         await runtime_config.reload_runtime_config(submit_restart=False)
@@ -200,211 +194,13 @@ def test_unchanged_simple_config_is_not_rewritten(
 
 
 @pytest.mark.asyncio
-async def test_runtime_metadata_claims_generated_config_write(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from tortoise import Tortoise
-
-    from zhenxun.builtin_plugins.init import init_config, init_plugin, init_task
-    from zhenxun.services.runtime_reload.manager import PluginRuntimeManager
-
-    config_path = tmp_path / "config.yaml"
-
-    def reconcile_config_runtime() -> set[Path]:
-        config_path.write_text("alapi:\n  ALAPI_TOKEN:\n", encoding="utf-8")
-        return {config_path.resolve()}
-
-    async def reconcile_runtime() -> None:
-        return None
-
-    monkeypatch.setattr(Tortoise, "_inited", True)
-    monkeypatch.setattr(
-        init_config, "reconcile_config_runtime", reconcile_config_runtime
-    )
-    monkeypatch.setattr(init_plugin, "reconcile_plugin_runtime", reconcile_runtime)
-    monkeypatch.setattr(init_task, "reconcile_task_runtime", reconcile_runtime)
-    manager = PluginRuntimeManager()
-
-    await manager._reconcile_runtime_metadata()
-
-    assert manager.claim_content_changes({config_path.resolve()}) == set()
-
-
-@pytest.mark.asyncio
-async def test_delayed_internal_event_is_ignored_but_external_edit_reloads(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from zhenxun.services.runtime_reload import coordinator as coordinator_module
-    from zhenxun.services.runtime_reload.coordinator import RuntimeChangeCoordinator
-    from zhenxun.services.runtime_reload.manager import PluginRuntimeManager
-    from zhenxun.services.runtime_reload.models import ApplyMode, RuntimeOperation
-
-    config_path = tmp_path / "config.yaml"
-    config_path.write_text("demo:\n  VALUE: 1\n", encoding="utf-8")
-    manager = PluginRuntimeManager()
-    coordinator = RuntimeChangeCoordinator(manager)
-    reload_count = 0
-
-    async def reload_runtime_config() -> RuntimeOperation:
-        nonlocal reload_count
-        reload_count += 1
-        return RuntimeOperation(
-            ApplyMode.CONFIG_RELOADED,
-            "completed",
-            ["demo.VALUE"],
-            config_keys=["demo.VALUE"],
-        )
-
-    monkeypatch.setattr(coordinator_module, "_CONFIG_FILE", config_path.resolve())
-    monkeypatch.setattr(
-        coordinator_module, "reload_runtime_config", reload_runtime_config
-    )
-    manager.mark_content_processed(config_path)
-
-    assert await coordinator.process({config_path}) is None
-    assert reload_count == 0
-
-    config_path.write_text("demo:\n  VALUE: 2\n", encoding="utf-8")
-    operation = await coordinator.process({config_path})
-
-    assert operation is not None
-    assert operation.mode is ApplyMode.CONFIG_RELOADED
-    assert reload_count == 1
-
-
-@pytest.mark.asyncio
-async def test_webui_env_transaction_is_ignored_but_external_edit_restarts(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from zhenxun.builtin_plugins.web_ui.api.configure import persistence
-    from zhenxun.services import runtime_reload
-    from zhenxun.services.runtime_reload import coordinator as coordinator_module
-    from zhenxun.services.runtime_reload.coordinator import RuntimeChangeCoordinator
-    from zhenxun.services.runtime_reload.manager import PluginRuntimeManager
-    from zhenxun.services.runtime_reload.models import (
-        ApplyMode,
-        RuntimeOperation,
-    )
-
-    env_path = tmp_path / ".env.dev"
-    manager = PluginRuntimeManager()
-    coordinator = RuntimeChangeCoordinator(manager)
-    restart_reasons: list[str] = []
-
-    async def request_restart(affected: set[str], reason: str) -> RuntimeOperation:
-        restart_reasons.append(reason)
-        return RuntimeOperation(
-            ApplyMode.RESTART_PENDING,
-            "pending_restart",
-            sorted(affected),
-            reason,
-        )
-
-    monkeypatch.setattr(runtime_reload, "plugin_runtime_manager", manager)
-    monkeypatch.setattr(coordinator_module, "_ENV_FILES", {env_path.resolve()})
-    monkeypatch.setattr(manager, "request_restart", request_restart)
-
-    persistence._write_transaction([(env_path, b"HOST = 0.0.0.0\n")])
-    assert await coordinator.process({env_path}) is None
-    assert restart_reasons == []
-
-    env_path.write_text("HOST = 127.0.0.1\n", encoding="utf-8")
-    operation = await coordinator.process({env_path})
-
-    assert operation is not None
-    assert operation.mode is ApplyMode.RESTART_PENDING
-    assert restart_reasons == ["environment_changed"]
-
-
-@pytest.mark.asyncio
-async def test_real_import_time_config_change_keeps_restart_fallback(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from zhenxun.services.runtime_reload.manager import PluginRuntimeManager
-    from zhenxun.services.runtime_reload.models import (
-        ApplyMode,
-        PluginUnit,
-        ReloadClassification,
-        RuntimeOperation,
-    )
-
-    source = tmp_path / "consumer.py"
-    source.write_text("VALUE = 1\n", encoding="utf-8")
-    manager = PluginRuntimeManager()
-    unit = PluginUnit("consumer", "demo.consumer", object(), source, files={source})
-    unit.config_dependencies.add(("demo", "VALUE"))
-    unit.classification = ReloadClassification.RESTART_REQUIRED
-    manager.units = {unit.plugin_id: unit}
-
-    restart_submissions: list[bool] = []
-
-    async def request_restart(
-        affected: set[str], reason: str, *, submit_launcher: bool = True
-    ) -> RuntimeOperation:
-        restart_submissions.append(submit_launcher)
-        return RuntimeOperation(
-            ApplyMode.RESTART_PENDING,
-            "pending_restart",
-            sorted(affected),
-            reason,
-        )
-
-    monkeypatch.setattr(manager, "request_restart", request_restart)
-
-    assert await manager.reload_config_consumers({("other", "VALUE")}) is None
-
-    operation = await manager.reload_config_consumers(
-        {("demo", "VALUE")}, submit_restart=False
-    )
-
-    assert operation is not None
-    assert operation.mode is ApplyMode.RESTART_PENDING
-    assert operation.reason == "import_time_config_consumer_requires_restart"
-    assert restart_submissions == [False]
-
-
-@pytest.mark.asyncio
-async def test_matching_hot_config_consumer_is_reloaded_without_unrelated_units(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from zhenxun.services.runtime_reload.manager import PluginRuntimeManager
-    from zhenxun.services.runtime_reload.models import (
-        ApplyMode,
-        PluginUnit,
-        ReloadClassification,
-        RuntimeOperation,
-    )
-
-    manager = PluginRuntimeManager()
-    hot = PluginUnit("hot", "demo.hot", object(), tmp_path / "hot.py")
-    hot.config_dependencies.add(("alapi", "ALAPI_TOKEN"))
-    hot.classification = ReloadClassification.HOT_RELOADABLE
-    unrelated = PluginUnit("unsafe", "demo.unsafe", object(), tmp_path / "unsafe.py")
-    unrelated.config_dependencies.add(("other", "VALUE"))
-    unrelated.classification = ReloadClassification.RESTART_REQUIRED
-    manager.units = {hot.plugin_id: hot, unrelated.plugin_id: unrelated}
-    reloaded: list[set[str]] = []
-
-    async def reload_units(affected: set[str]) -> RuntimeOperation:
-        reloaded.append(affected)
-        return RuntimeOperation(ApplyMode.HOT_RELOADED, "completed", sorted(affected))
-
-    monkeypatch.setattr(manager, "_reload_units", reload_units)
-
-    operation = await manager.reload_config_consumers({("alapi", "ALAPI_TOKEN")})
-
-    assert operation is not None
-    assert operation.mode is ApplyMode.HOT_RELOADED
-    assert reloaded == [{"hot"}]
-
-
-@pytest.mark.asyncio
+@pytest.mark.usefixtures("bound_operation_registry")
 async def test_webui_config_save_waits_for_explicit_restart(
     app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     del app
     import zhenxun.builtin_plugins.web_ui.api.tabs.system.configuration as module
-    from zhenxun.services.runtime_reload.models import ApplyMode, RuntimeOperation
+    from zhenxun.services.plugin_host import ApplyMode, RuntimeOperation
     from zhenxun.utils import _restart_utils, restart_state
 
     config_path = tmp_path / "config.yaml"
@@ -423,7 +219,6 @@ async def test_webui_config_save_waits_for_explicit_restart(
 
     monkeypatch.setattr(module, "_SIMPLE_FILE", config_path)
     monkeypatch.setattr(module, "reload_runtime_config", reload_config)
-    monkeypatch.setattr(_restart_utils, "_RESTART_STATE_FILE", state_path)
     monkeypatch.setattr(restart_state, "_RESTART_STATE_FILE", state_path)
     monkeypatch.setattr(_restart_utils, "_restart_pending", False)
     monkeypatch.setenv("ZHENXUN_LAUNCHER_PID", "123")

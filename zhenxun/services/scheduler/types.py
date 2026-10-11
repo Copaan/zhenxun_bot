@@ -7,7 +7,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from zhenxun.utils.pydantic_compat import model_validate
 
@@ -183,8 +183,7 @@ class ExecutionPolicy(BaseModel):
     ) = None
     """任务执行失败后的回调函数"""
 
-    class Config:
-        arbitrary_types_allowed = True
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
 
 class JobConfig(BaseModel):
@@ -214,8 +213,7 @@ class JobConfig(BaseModel):
     )
     """执行控制选项配置"""
 
-    class Config:
-        arbitrary_types_allowed = True
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
 
 class ScheduledJobDeclaration(BaseModel):
@@ -232,8 +230,7 @@ class ScheduledJobDeclaration(BaseModel):
     job_kwargs: dict[str, Any]
     """任务执行参数"""
 
-    class Config:
-        arbitrary_types_allowed = True
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
 
 class EphemeralJobDeclaration(BaseModel):
@@ -246,5 +243,4 @@ class EphemeralJobDeclaration(BaseModel):
     trigger: BaseTrigger
     """触发器配置"""
 
-    class Config:
-        arbitrary_types_allowed = True
+    model_config = ConfigDict(arbitrary_types_allowed=True)

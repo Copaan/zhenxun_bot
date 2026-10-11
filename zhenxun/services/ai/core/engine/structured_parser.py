@@ -75,10 +75,7 @@ class BaseOutputProcessor(Generic[OutputDataT]):
             return self.raw_schema
         if self.target_model is None:
             raise ValueError("未提供 response_model 或 raw_schema")
-        try:
-            return model_json_schema(self.target_model)
-        except AttributeError:
-            return self.target_model.schema()
+        return model_json_schema(self.target_model)
 
     def _parse_and_validate(self, text: str) -> Any:
         """[私有方法] 执行带有容错修复的 JSON 解析与模型验证"""

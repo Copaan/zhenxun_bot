@@ -370,7 +370,6 @@ def get_config(endpoint=None) -> dict:
     stage="management",
     timeout=60,
     component_id="management:database",
-    scope="worker",
     restart_policy="worker",
     config_keys=("DB_URL", "DATABASE_MODELS", "DATABASE_SCHEMA"),
 )

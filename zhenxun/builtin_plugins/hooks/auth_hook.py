@@ -169,6 +169,28 @@ async def _drop_message_before_cache_ready(event: Event, bot: Bot):
         raise IgnoredException("drop backlog message")
 
 
+def _admit_plugin(matcher: Matcher) -> None:
+    """启动期尚未就绪、加载失败或 AI 对话开关已关闭的插件不处理事件
+
+    参数:
+        matcher: Matcher
+    """
+    from zhenxun.services.ai.chat_switch import chat_plugin_enabled
+    from zhenxun.services.startup_load import startup_load_planner
+
+    plugin_id = matcher.plugin_id
+    if not plugin_id:
+        return
+    owner = (
+        startup_load_planner.owner_for_module(matcher.module_name or "")
+        or plugin_id.split(":", 1)[0]
+    )
+    if owner in startup_load_planner.failed_plugins:
+        raise IgnoredException("plugin not admitted")
+    if not chat_plugin_enabled(plugin_id):
+        raise IgnoredException("ai chat plugin disabled")
+
+
 @run_preprocessor
 @_defer_unavailable
 async def _auth_preprocessor(
@@ -185,6 +207,7 @@ async def _auth_preprocessor(
     if execution := current_execution.get():
         if execution.deferred_reason:
             raise IgnoredException("message_deferred")
+    _admit_plugin(matcher)
 
     if not adapter_contract_matches(matcher_supported_adapters(matcher), bot.adapter):
         raise IgnoredException("plugin adapter unsupported")

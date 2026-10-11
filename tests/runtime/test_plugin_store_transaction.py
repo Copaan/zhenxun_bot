@@ -9,17 +9,21 @@ import pytest
 
 @pytest.fixture
 def source_transaction(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    from zhenxun import plugin_store_transaction as transaction
+    from zhenxun.services.nonebot_store import dependencies
+    from zhenxun.services.plugin_store import plugin_store_transaction as transaction
 
     monkeypatch.chdir(tmp_path)
+    # 临时目录没有 uv.lock；归档构建策略校验会读取受保护核心包，
+    # 这里隔离为空集合，避免依赖真实项目锁文件。
+    monkeypatch.setattr(dependencies, "protected_core", lambda: {})
     root = tmp_path / "data" / "runtime" / "plugin-store-transaction"
     monkeypatch.setattr(transaction, "ROOT", root)
     monkeypatch.setattr(transaction, "PENDING_FILE", root / "pending-v1.json")
     monkeypatch.setattr(transaction, "_TRANSACTION_LOCK", root / ".transaction.lock")
     monkeypatch.setattr(
         transaction,
-        "LIFECYCLE_INDEX",
-        tmp_path / "data" / "runtime" / "lifecycle-index-v2.json",
+        "LOADED_PLUGINS_INDEX",
+        tmp_path / "data" / "runtime" / "loaded-plugins-v1.json",
     )
     return transaction
 
@@ -73,11 +77,9 @@ def test_startup_verification_reads_current_runtime_index(
     )
     live.unlink()
     assert source_transaction.apply_pending_transaction()
-    source_transaction.LIFECYCLE_INDEX.parent.mkdir(parents=True, exist_ok=True)
-    source_transaction.LIFECYCLE_INDEX.write_text(
-        '{"version":2,"plugins":['
-        '{"plugin_id":"demo","module":"zhenxun.plugins.demo"}]}',
-        encoding="utf-8",
+    source_transaction.LOADED_PLUGINS_INDEX.parent.mkdir(parents=True, exist_ok=True)
+    source_transaction.LOADED_PLUGINS_INDEX.write_text(
+        '{"modules":["zhenxun.plugins.demo"]}', encoding="utf-8"
     )
 
     verified, detail = source_transaction.startup_verification()
@@ -217,7 +219,7 @@ def test_uninstall_allows_plugin_runtime_files_to_change(
 def test_source_dependencies_join_managed_nonebot_generation(
     tmp_path: Path, source_transaction, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from zhenxun.nonebot_store import dependencies, storage
+    from zhenxun.services.nonebot_store import dependencies, storage
 
     store_root = tmp_path / "data" / "runtime" / "nonebot-store"
     monkeypatch.setattr(storage, "STORE_ROOT", store_root)
@@ -252,7 +254,7 @@ def test_source_dependencies_join_managed_nonebot_generation(
 def test_source_build_confirmation_joins_managed_generation(
     tmp_path: Path, source_transaction, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from zhenxun.nonebot_store import dependencies, storage
+    from zhenxun.services.nonebot_store import dependencies, storage
 
     store_root = tmp_path / "data" / "runtime" / "nonebot-store"
     monkeypatch.setattr(storage, "STORE_ROOT", store_root)
@@ -287,7 +289,7 @@ def test_source_build_confirmation_joins_managed_generation(
 def test_failed_source_transaction_does_not_rebuild_dependency_layer(
     tmp_path: Path, source_transaction, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from zhenxun.nonebot_store import storage
+    from zhenxun.services.nonebot_store import storage
 
     candidate = _plugin(tmp_path, "demo", "VALUE = 1\n")
     source_transaction.stage_operation(
@@ -316,7 +318,7 @@ def test_failed_source_transaction_does_not_rebuild_dependency_layer(
 
 @pytest.mark.asyncio
 async def test_shared_store_coordinator_is_reentrant_and_rejects_parallel() -> None:
-    from zhenxun.plugin_store_coordinator import (
+    from zhenxun.services.plugin_store.plugin_store_coordinator import (
         StoreOperationBusyError,
         plugin_store_operation_coordinator,
     )
@@ -342,9 +344,9 @@ async def test_shared_store_coordinator_is_reentrant_and_rejects_parallel() -> N
 def test_restart_status_counts_nonebot_operations_not_unique_reasons(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from zhenxun import plugin_store_transaction
     from zhenxun.builtin_plugins.web_ui import restart_service
-    from zhenxun.nonebot_store import storage
+    from zhenxun.services.nonebot_store import storage
+    from zhenxun.services.plugin_store import plugin_store_transaction
 
     monkeypatch.setattr(restart_service, "_current_access_urls", lambda: [])
     monkeypatch.setattr(
@@ -403,9 +405,9 @@ def test_restart_status_counts_nonebot_operations_not_unique_reasons(
 def test_transaction_verification_status_reports_both_stores(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from zhenxun import plugin_store_transaction
     from zhenxun.builtin_plugins.web_ui import restart_service
-    from zhenxun.nonebot_store import storage
+    from zhenxun.services.nonebot_store import storage
+    from zhenxun.services.plugin_store import plugin_store_transaction
 
     monkeypatch.setattr(
         storage, "load_manifest", lambda: {"pending_verification": True}

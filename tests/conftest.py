@@ -142,3 +142,49 @@ def create_bot() -> Callable:
 @pytest.fixture
 def mocked_api(respx_mock: MockRouter):
     return respx_mock
+
+
+@pytest.fixture
+async def bound_operation_registry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """提供已绑定生命周期上下文、可接受操作的隔离 OperationRegistry（需显式请求）
+
+    运行时变更（插件商店安装、热重载、WebUI 保存等）都通过
+    operation_registry.start() 托管；生产环境由 management:operations 组件绑定，
+    测试中未启动该组件时会抛出 operation_registry_not_accepting。
+    这里在全局 lifecycle_kernel 上注册一个临时组件来绑定隔离的注册表，
+    状态写入 tmp_path，并替换所有已导入模块中对全局注册表的引用。
+    """
+    import sys
+    import uuid
+
+    from zhenxun.services.lifecycle import ComponentSpec, lifecycle_kernel
+    from zhenxun.services.lifecycle import operations as lifecycle_operations
+    from zhenxun.services.lifecycle.operations import OperationRegistry
+
+    original = lifecycle_operations.operation_registry
+    registry = OperationRegistry(lifecycle_kernel, tmp_path / "operations.json")
+    component_id = f"test:operations:{uuid.uuid4().hex[:8]}"
+
+    async def start_operations(context) -> None:
+        registry.bind(context)
+
+    lifecycle_kernel.register(
+        ComponentSpec(component_id, stage="runtime"),
+        start_operations,
+        pass_context=True,
+    )
+    await lifecycle_kernel.start_components({component_id})
+    # 部分模块在导入时 from ... import operation_registry，需逐一替换
+    for module in list(sys.modules.values()):
+        namespace = getattr(module, "__dict__", None)
+        if (
+            isinstance(namespace, dict)
+            and namespace.get("operation_registry") is original
+        ):
+            monkeypatch.setattr(module, "operation_registry", registry)
+    try:
+        yield registry
+    finally:
+        await registry.shutdown()
+        await lifecycle_kernel.stop_components({component_id})
+        lifecycle_kernel.unregister_components({component_id})

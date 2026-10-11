@@ -79,6 +79,17 @@ def _make_official_bot(self_id: str = "qq-api") -> DummyBot:
     return DummyBot(self_id=self_id, adapter=DummyAdapter("qq", []))
 
 
+def _make_qq_api_bot(self_id: str = "qq-api"):
+    """构造真实的 QQ 官方 Bot 实例；平台作用域只认已验证的 Bot 类型。"""
+    from types import SimpleNamespace
+
+    from nonebot.adapters.qq import Bot as QQBot
+
+    adapter = SimpleNamespace(get_name=lambda: "QQ", config=nonebot.get_driver().config)
+    bot_info = SimpleNamespace(id=self_id, secret="test-only")
+    return QQBot(cast(Any, adapter), self_id, cast(Any, bot_info))
+
+
 @pytest.mark.asyncio
 async def test_onebot_only_keeps_legacy_platform_and_scope():
     from zhenxun.utils.platform import PlatformUtils
@@ -93,10 +104,14 @@ async def test_onebot_only_keeps_legacy_platform_and_scope():
 async def test_qq_official_only_uses_qq_api_scope_without_changing_legacy_platform():
     from zhenxun.utils.platform import PlatformUtils
 
-    bot = _make_official_bot()
+    bot = _make_qq_api_bot()
 
     assert PlatformUtils.get_platform_scope(bot) == "qq_api"
-    assert PlatformUtils.is_qbot(cast(Any, bot)) is True
+    assert PlatformUtils.get_platform(bot) == "qq"
+    assert PlatformUtils.is_qbot(bot) is True
+
+    # 仅凭适配器名称为 "qq" 的非官方 Bot 不得被推断为 qq_api。
+    assert PlatformUtils.get_platform_scope(_make_official_bot()) != "qq_api"
 
 
 @pytest.mark.asyncio
@@ -179,7 +194,7 @@ async def test_background_task_without_bot_id_prefers_unique_onebot(monkeypatch)
     from zhenxun.utils.platform import PlatformUtils
 
     onebot = _make_onebot_bot("onebot-client")
-    official = _make_official_bot("qq-api")
+    official = _make_qq_api_bot("qq-api")
     monkeypatch.setattr(
         nonebot,
         "get_bots",
@@ -243,7 +258,8 @@ async def test_send_queue_start_repairs_partial_worker_set():
 
     await send_queue.start_send_queue()
 
-    assert send_queue.send_queue_healthy()
+    assert send_queue._PATCHED
+    assert all(not task.done() for task in send_queue._WORKER_TASKS)
     assert len(send_queue._WORKER_TASKS) == send_queue._WORKERS
     await send_queue.stop_send_queue()
 

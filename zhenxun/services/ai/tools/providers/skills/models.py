@@ -1,4 +1,5 @@
 from pathlib import Path
+import shlex
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -209,7 +210,7 @@ class SkillBlueprintBuilder:
                             pkg = inst.get("package", "")
                             if isinstance(pkg, str) and pkg:
                                 node_packages.append(pkg)
-                        elif kind in ("apt"):
+                        elif kind == "apt":
                             pkg = inst.get("formula") or inst.get("package") or ""
                             if isinstance(pkg, str) and pkg:
                                 pkg_name = pkg.split("/")[-1]
@@ -217,7 +218,7 @@ class SkillBlueprintBuilder:
                         elif kind == "go":
                             mod = inst.get("module", "")
                             if isinstance(mod, str) and mod:
-                                install_scripts.append(f"go install {mod}")
+                                install_scripts.append(f"go install {shlex.quote(mod)}")
 
         key = "allowed-tools"
         alt_key = "allowed_tools"

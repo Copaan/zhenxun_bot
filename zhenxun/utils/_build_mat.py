@@ -3,7 +3,7 @@ from pathlib import Path
 import random
 import sys
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from ._build_image import BuildImage
 
@@ -79,8 +79,7 @@ class BuildMat:
         graph_height: int
         """坐标轴高度"""
 
-        class Config:
-            arbitrary_types_allowed = True
+        model_config = ConfigDict(arbitrary_types_allowed=True)
 
     def __init__(self, mat_type: MatType) -> None:
         self.line_length = 760

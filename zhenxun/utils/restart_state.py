@@ -83,10 +83,6 @@ def clear_restart_tickets(state: dict[str, Any]) -> None:
     state.pop(_RESTART_TICKETS_KEY, None)
 
 
-def consume_launcher_restart_signal() -> bool:
-    return consume_launcher_action() is not None
-
-
 def consume_launcher_action() -> tuple[str, list[str]] | None:
     def consume(state: dict[str, Any]) -> tuple[str, list[str]] | None:
         action = state.get(_LAUNCHER_ACTION_KEY)
@@ -143,7 +139,6 @@ __all__ = [
     "clear_pending_restart_state",
     "clear_restart_tickets",
     "consume_launcher_action",
-    "consume_launcher_restart_signal",
     "consume_restart_ticket",
     "issue_restart_ticket",
     "mutate_restart_state",

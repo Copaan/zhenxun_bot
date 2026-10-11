@@ -1,7 +1,7 @@
 """
-Pydantic V1 & V2 兼容层模块
+Pydantic 便捷函数模块
 
-为 Pydantic V1 与 V2 版本提供统一的便捷函数与类，
+为 Pydantic V2 提供统一的便捷函数，
 包括 model_dump, model_copy, model_json_schema, parse_as 等。
 """
 
@@ -17,47 +17,12 @@ from nonebot.compat import (
     type_validate_json,
     type_validate_python,
 )
-from pydantic import BaseModel
+from pydantic import BaseModel, TypeAdapter, model_validator
+from pydantic import computed_field as compat_computed_field
 import ujson as json
 
 T = TypeVar("T", bound=BaseModel)
 V = TypeVar("V")
-
-
-import typing
-
-if typing.TYPE_CHECKING:
-    _T_TA = TypeVar("_T_TA")
-
-    class TypeAdapter(typing.Generic[_T_TA]):
-        def __init__(self, type_: Any, **kwargs: Any): ...
-        def validate_python(self, obj: Any) -> _T_TA: ...
-
-    def model_validator(*args: Any, **kwargs: Any) -> Any: ...
-else:
-    try:
-        from pydantic import TypeAdapter, model_validator
-    except ImportError:
-
-        class TypeAdapter:
-            def __init__(self, type_: Any, **kwargs: Any):
-                self.type_ = type_
-
-            def validate_python(self, obj: Any) -> Any:
-                from nonebot.compat import type_validate_python
-
-                return type_validate_python(self.type_, obj)
-
-        from pydantic import root_validator
-
-        def model_validator(*args: Any, **kwargs: Any) -> Any:
-            mode = kwargs.get("mode", "after")
-            pre = mode == "before"
-
-            def decorator(func: Any) -> Any:
-                return root_validator(pre=pre, allow_reuse=True)(func)
-
-            return decorator
 
 
 __all__ = [
@@ -86,54 +51,37 @@ def model_copy(
     model: T, *, update: dict[str, Any] | None = None, deep: bool = False
 ) -> T:
     """
-    Pydantic `model.copy()` (v1) 和 `model.model_copy()` (v2) 的兼容函数。
+    复制模型实例，可同时更新部分字段。
     """
-    if PYDANTIC_V2:
-        return model.model_copy(update=update, deep=deep)
-    else:
-        update_dict = update or {}
-        return model.copy(update=update_dict, deep=deep)
+    return model.model_copy(update=update, deep=deep)
 
 
 def model_construct(model_class: type[T], **kwargs: Any) -> T:
     """
-    Pydantic `model_construct` (v2) 与 `construct` (v1) 的兼容函数。
+    不经校验直接构造模型实例。
     """
-    if PYDANTIC_V2:
-        return model_class.model_construct(**kwargs)
-    else:
-        return model_class.construct(**kwargs)
+    return model_class.model_construct(**kwargs)
 
 
 def model_validate(model_class: type[T], obj: Any) -> T:
     """
-    Pydantic 模型验证兼容函数。
+    校验数据并构造模型实例。
     """
     return type_validate_python(model_class, obj)
 
 
 def model_dump_json(model: BaseModel, **kwargs: Any) -> str:
     """
-    Pydantic `model.json()` (v1) 和 `model.model_dump_json()` (v2) 的兼容函数。
+    将模型实例序列化为 JSON 字符串。
     """
-    if PYDANTIC_V2:
-        return model.model_dump_json(**kwargs)
-    return model.json(**kwargs)
-
-
-if PYDANTIC_V2:
-    from pydantic import computed_field as compat_computed_field
-else:
-    compat_computed_field = property
+    return model.model_dump_json(**kwargs)
 
 
 def model_json_schema(model_class: type[BaseModel], **kwargs: Any) -> dict[str, Any]:
     """
-    Pydantic `Model.schema()` (v1) 和 `Model.model_json_schema()` (v2) 的兼容函数。
+    生成模型的 JSON Schema。
     """
-    if PYDANTIC_V2:
-        return model_class.model_json_schema(**kwargs)
-    return model_class.schema(by_alias=kwargs.get("by_alias", True))
+    return model_class.model_json_schema(**kwargs)
 
 
 def _is_pydantic_type(t: Any) -> bool:
@@ -190,10 +138,6 @@ def dump_json_safely(obj: Any, **kwargs) -> str:
 
 def model_rebuild(model_class: type[BaseModel], **kwargs: Any) -> None:
     """
-    Pydantic V1/V2 兼容的前向引用重建函数。
-    V2 调用 `model_rebuild()`，V1 调用 `update_forward_refs()`。
+    重建模型以解析前向引用。
     """
-    if PYDANTIC_V2:
-        model_class.model_rebuild(**kwargs)
-    else:
-        model_class.update_forward_refs(**kwargs)
+    model_class.model_rebuild(**kwargs)

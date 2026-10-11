@@ -14,10 +14,9 @@ from zhenxun.services.cache.runtime_cache import PluginInfoMemoryCache
 from zhenxun.services.nonebot_store.storage import (
     load_manifest as load_nonebot_manifest,
 )
+from zhenxun.services.plugin_host import ApplyMode, RuntimeOperation
 from zhenxun.services.runtime_config_reload import reload_runtime_config
 from zhenxun.services.runtime_mutation import managed_mutation
-from zhenxun.services.runtime_reload import plugin_runtime_manager
-from zhenxun.services.runtime_reload.models import ApplyMode, RuntimeOperation
 from zhenxun.utils.enum import BlockType, PluginType
 
 from ....config_schema import configuration_value
@@ -248,7 +247,6 @@ class ApiDataSource:
                 )
                 validate_simple_yaml(content)
                 _write_transaction([(simple_path, content.encode("utf-8"))])
-                plugin_runtime_manager.mark_content_processed(simple_path)
                 operation = await reload_runtime_config(
                     submit_restart=False,
                     previous_simple_data=previous_simple,
@@ -266,7 +264,6 @@ class ApiDataSource:
                 simple_path.unlink(missing_ok=True)
             else:
                 _write_transaction([(simple_path, previous_file)])
-            plugin_runtime_manager.mark_content_processed(simple_path)
             await plugin_policy_service.set_global_settings(
                 param.module,
                 default_status=previous_db["default_status"],
@@ -492,8 +489,6 @@ class ApiDataSource:
         )
         if summary is None:
             raise ValueError("插件不存在")
-        data = (
-            summary.model_dump() if hasattr(summary, "model_dump") else summary.dict()
-        )
+        data = summary.model_dump()
         data["config_list"] = config_list
         return PluginDetail(**data)

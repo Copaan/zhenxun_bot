@@ -6,7 +6,7 @@ from typing import Any, ClassVar
 
 import nonebot
 from nonebot_plugin_uninfo import Uninfo
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from zhenxun.models.plugin_info import PluginInfo
 from zhenxun.models.plugin_limit import PluginLimit
@@ -44,8 +44,7 @@ class Limit(BaseModel):
     limit: PluginLimit | PluginLimitSnapshot
     limiter: FreqLimiter | UserBlockLimiter | CountLimiter
 
-    class Config:
-        arbitrary_types_allowed = True
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
 
 @dataclass(slots=True)

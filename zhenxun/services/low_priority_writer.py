@@ -319,10 +319,6 @@ def low_priority_writer_backlog() -> dict[str, int]:
     return {name: len(state.buffer) for name, state in _WRITERS.items()}
 
 
-def low_priority_writer_healthy(_value=None) -> bool:
-    return not _WRITERS or (_WORKER_TASK is not None and not _WORKER_TASK.done())
-
-
 async def stop_low_priority_writer() -> int:
     global _STOPPING, _WORKER_TASK
     _STOPPING = True
@@ -342,7 +338,6 @@ async def stop_low_priority_writer() -> int:
     component_id="runtime:low_priority_writer",
     depends_on=("management:database",),
     pass_context=True,
-    health=low_priority_writer_healthy,
 )
 async def _start_low_priority_writer(context) -> None:
     global _LIFECYCLE_ACTIVE, _LIFECYCLE_CONTEXT

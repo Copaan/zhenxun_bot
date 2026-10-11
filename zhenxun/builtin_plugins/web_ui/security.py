@@ -11,7 +11,7 @@ from typing import Any
 from fastapi import HTTPException, Request
 from fastapi.responses import PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
-from jose import JWTError, jwt
+from jose import JWTError
 from jose.exceptions import ExpiredSignatureError
 from starlette.types import Receive, Scope, Send
 from starlette.websockets import WebSocket, WebSocketDisconnect, WebSocketState
@@ -113,7 +113,9 @@ def decode_access_token_status(
     if not secret or not configured_username or not configured_password:
         return None, "invalid"
     try:
-        payload = jwt.decode(token, secret, algorithms=["HS256"])
+        from zhenxun.utils.webui_session import decode_token
+
+        payload = decode_token(token, secret)
     except ExpiredSignatureError:
         return None, "expired"
     except (JWTError, TypeError, ValueError):
@@ -139,24 +141,22 @@ def validate_access_token(token: str) -> bool:
 def _spawn_expiry_task(websocket: WebSocket, expires_at: float) -> asyncio.Task[None]:
     coroutine = _expire_websocket(websocket, expires_at)
     if _LIFECYCLE_CONTEXT is not None:
-        return _LIFECYCLE_CONTEXT.spawn_detached(
+        return _LIFECYCLE_CONTEXT.spawn_task(
             coroutine,
-            scope_id=f"websocket-auth-{id(websocket)}-{time.monotonic_ns()}",
-            scope="task",
             name="webui-websocket-auth-expiry",
+            degrade_on_error=False,
         )
     return asyncio.create_task(coroutine, name="webui-websocket-auth-expiry")
 
 
 def spawn_websocket_task(
-    coroutine: Coroutine[Any, Any, None], *, scope_id: str, name: str
+    coroutine: Coroutine[Any, Any, None], *, name: str
 ) -> asyncio.Task[None]:
     if _LIFECYCLE_CONTEXT is not None:
-        return _LIFECYCLE_CONTEXT.spawn_detached(
+        return _LIFECYCLE_CONTEXT.spawn_task(
             coroutine,
-            scope_id=scope_id,
-            scope="task",
             name=name,
+            degrade_on_error=False,
         )
     return asyncio.create_task(coroutine, name=name)
 

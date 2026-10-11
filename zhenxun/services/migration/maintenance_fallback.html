@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>真寻 · 迁移维护</title>
+<style>
+body{font:16px/1.6 sans-serif;background:#f5f7fa;color:#303133;margin:8vh auto;padding:24px;max-width:900px}
+main{background:#fff;border:1px solid #e4e7ed;border-radius:12px;padding:28px}
+label{display:block;margin:12px 0}input,button{font:inherit;padding:8px 12px}button{cursor:pointer}
+pre{white-space:pre-wrap;overflow-wrap:anywhere}#notice{color:#805500}
+</style>
+<main>
+  <h1>实例迁移维护</h1>
+  <p>业务服务正在切换。此页面独立于前端开发服务，不会重复提交迁移请求。</p>
+  <p id="notice" role="status">正在查询原任务…</p>
+  <form id="login" hidden>
+    <label>管理员账号 <input name="username" autocomplete="username" required></label>
+    <label>管理员密码 <input name="password" type="password" autocomplete="current-password" required></label>
+    <button type="submit">登录查看任务</button>
+  </form>
+  <pre id="task"></pre>
+  <button id="refresh" type="button">刷新状态</button>
+  <a href="/" id="return" hidden>返回管理页面</a>
+</main>
+<script>
+const notice=document.getElementById('notice');
+const login=document.getElementById('login');
+const output=document.getElementById('task');
+let token=sessionStorage.getItem('zhenxunAuthToken')||'';
+for(const key of ['zhenxunSetupToken','zhenxunMigrationSession'])sessionStorage.removeItem(key);
+let timer, expiryTimer, busy=false, revision=0;
+const requests=new Set();
+function expire(){revision++;for(const controller of requests)controller.abort();clearTimeout(timer);clearTimeout(expiryTimer);token='';sessionStorage.removeItem('zhenxunAuthToken');login.hidden=false;notice.textContent='会话已过期，连接已断开；已提交任务仍在后台执行。'}
+function armExpiry(){clearTimeout(expiryTimer);if(!token)return;try{const claims=JSON.parse(atob(token.replace(/^Bearer\s+/i,'').split('.')[1].replace(/-/g,'+').replace(/_/g,'/')));const left=Number(claims.exp)*1000-Date.now();if(!Number.isFinite(left)||left<=0){expire();return}expiryTimer=setTimeout(expire,left)}catch{expire()}}
+armExpiry();
+document.addEventListener('visibilitychange',armExpiry);
+let taskId=sessionStorage.getItem('migration-restore:'+location.origin)||sessionStorage.getItem('migration-export:'+location.origin)||'';
+const stages={queued:'等待执行',quiescing:'停止业务中',snapshotting:'创建快照中',
+resuming:'恢复原实例中',compressing:'压缩校验中',completed:'已完成',failed:'失败',
+recovery_required:'恢复受阻',awaiting_credentials:'等待恢复授权',cancelled:'已取消'};
+async function request(path, options={}){
+  const current=revision,controller=new AbortController();requests.add(controller);
+  try{
+  const response=await fetch('/zhenxun/api/'+path,{
+    credentials:'omit',cache:'no-store',redirect:'error',
+    headers:token?{Authorization:token}:{},...options,signal:controller.signal});
+  if(current!==revision)throw new DOMException('Session changed','AbortError');
+  if(response.status===401){expire();throw Error('会话已过期，连接已断开。')}
+  const value=await response.json();
+  if(current!==revision)throw new DOMException('Session changed','AbortError');
+  if(!response.ok||value.suc===false)throw Error(value.detail||value.info||'查询失败');
+  return value.data;
+  }finally{requests.delete(controller)}
+}
+async function refresh(){
+  clearTimeout(timer);if(busy)return;busy=true;let follow=true;
+  try{
+    const state=await request('system/startup/status');
+    const ready=state.state==='warmup_ready';
+    document.getElementById('return').hidden=!ready;
+    notice.textContent=ready?'Bot 已恢复就绪，可以返回管理页面。':'管理连接正常，正在跟踪迁移任务。';
+    if(!token){login.hidden=false;return}
+    if(!taskId){const listing=await request('migration/tasks');taskId=(listing.items||[])[0]?.id||''}
+    if(taskId){
+      const task=await request('migration/tasks/'+encodeURIComponent(taskId));
+      follow=!(ready&&['completed','failed','cancelled'].includes(task.stage));
+      output.textContent='任务：'+task.id+'\n状态：'+(stages[task.stage]||task.stage)+
+        (task.first_error?'\n原因：'+task.first_error:'')+
+        (task.progress?.snapshot_generated?'\n快照已生成':'')+
+        (task.progress?.original_worker_resumed?'\n原实例已恢复并就绪':'')+
+        (task.export_file?.state==='available'?'\n已保存至项目根目录：./'+task.export_file.path:'')+
+        (task.export_file?.state==='removed'?'\n导出文件已清理':'')+
+        (task.export_cleanup?.state==='failed'?'\n导出文件清理待重试：'+task.export_cleanup.code:'');
+    }
+  }catch(error){notice.textContent=token?'连接暂时中断，保留原任务，正在重试。':error.message}
+  finally{busy=false;if(token&&follow)timer=setTimeout(refresh,2000)}
+}
+login.onsubmit=async event=>{
+  event.preventDefault();clearTimeout(timer);
+  try{
+    const data=await request('login',{method:'POST',body:new URLSearchParams(new FormData(login))});
+    token=data.token_type+' '+data.access_token;
+    sessionStorage.setItem('zhenxunAuthToken',token);armExpiry();login.reset();login.hidden=true;refresh();
+  }catch(error){notice.textContent=error.message}
+};
+document.getElementById('refresh').onclick=refresh;
+refresh();
+</script>
+</html>

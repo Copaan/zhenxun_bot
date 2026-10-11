@@ -28,12 +28,6 @@ _reclaim_lock = asyncio.Lock()
 _last_reclaim_at = 0.0
 
 
-def memory_governor_healthy(_value=None) -> bool:
-    if IDLE_CHECK_INTERVAL_SECONDS <= 0 or IDLE_RECLAIM_SECONDS <= 0:
-        return True
-    return _task is not None and not _task.done()
-
-
 def _cooldown_left(now: float | None = None) -> float:
     now = time.monotonic() if now is None else now
     return max(0.0, _last_reclaim_at + RECLAIM_COOLDOWN_SECONDS - now)

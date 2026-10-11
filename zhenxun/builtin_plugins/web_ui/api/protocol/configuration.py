@@ -504,9 +504,7 @@ async def save_protocol_configuration(
     changed_keys, pending_keys = env_change_impact(current, updated, _PROTOCOL_ENV_KEYS)
     restart_required = bool(set(changed_keys) & set(pending_keys))
     reasons = [f"environment:{key}" for key in pending_keys]
-    launcher_managed = update_pending_restart(
-        "webui.protocol", reasons, issue_ticket=False
-    )
+    launcher_managed = update_pending_restart("webui.protocol", reasons)
     if restart_required and launcher_managed:
         issue_restart_ticket("webui.settings", ttl_seconds=10 * 60)
     status = restart_status_data()
@@ -613,9 +611,7 @@ async def delete_qq_bot(
     changed_keys, pending_keys = env_change_impact(current, updated, _PROTOCOL_ENV_KEYS)
     restart_required = bool(set(changed_keys) & set(pending_keys))
     reasons = [f"environment:{key}" for key in pending_keys]
-    launcher_managed = update_pending_restart(
-        "webui.protocol", reasons, issue_ticket=False
-    )
+    launcher_managed = update_pending_restart("webui.protocol", reasons)
     if restart_required and launcher_managed:
         issue_restart_ticket("webui.settings", ttl_seconds=10 * 60)
     restart = restart_status_data()

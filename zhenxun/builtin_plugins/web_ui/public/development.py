@@ -144,6 +144,10 @@ async def install_development(app, context, endpoint: tuple[str, str]) -> None:
             )
         return await forward(request, PREFIX + "index.html")
 
+    @router.api_route("/maintenance.html", methods=["GET", "HEAD"])
+    async def maintenance_page(request: Request):
+        return await forward(request, PREFIX + "maintenance.html")
+
     @router.api_route(PREFIX + "{path:path}", methods=["GET", "HEAD"])
     async def assets(request: Request, path: str):
         if any(part in {".", ".."} for part in path.replace("\\", "/").split("/")):
@@ -191,10 +195,12 @@ async def install_development(app, context, endpoint: tuple[str, str]) -> None:
 
             tasks = [
                 context.spawn_task(
-                    receive_browser(), name="webui-hmr-browser", persistent=False
+                    receive_browser(), name="webui-hmr-browser", degrade_on_error=False
                 ),
                 context.spawn_task(
-                    receive_compiler(), name="webui-hmr-compiler", persistent=False
+                    receive_compiler(),
+                    name="webui-hmr-compiler",
+                    degrade_on_error=False,
                 ),
             ]
             try:

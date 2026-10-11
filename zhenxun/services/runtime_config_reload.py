@@ -4,14 +4,13 @@ import asyncio
 from collections.abc import Callable
 import contextlib
 from copy import deepcopy
-from pathlib import Path
 from typing import Any
 
 from zhenxun.configs.config import Config
 from zhenxun.services.ai.config import get_llm_config
 from zhenxun.services.ai.llm.manager import clear_all_cache
 from zhenxun.services.log import logger
-from zhenxun.services.runtime_reload.models import ApplyMode, RuntimeOperation
+from zhenxun.services.plugin_host import ApplyMode, RuntimeOperation
 
 ConfigDependency = tuple[str, str]
 _STARTUP_SIMPLE_DATA = deepcopy(Config._simple_data)
@@ -58,7 +57,7 @@ async def reload_runtime_config(
     """Reload config.yaml and the runtime state derived from it."""
     from zhenxun.builtin_plugins.hooks.auth.auth_limit import LimitManager
     from zhenxun.builtin_plugins.init.manager import manager
-    from zhenxun.services.runtime_reload import plugin_runtime_manager
+    from zhenxun.services.plugin_host import plugin_host
 
     async def refresh_derived_state() -> None:
         get_llm_config.cache_clear()
@@ -111,7 +110,7 @@ async def reload_runtime_config(
         if component_result.apply_effect == "no_change":
             await apply_new_runtime()
         elif component_result.apply_effect == "restart_pending":
-            operation = await plugin_runtime_manager.request_restart(
+            operation = await plugin_host.request_restart(
                 set(component_result.affected_components),
                 "component_not_restartable",
                 submit_launcher=submit_restart,
@@ -126,19 +125,11 @@ async def reload_runtime_config(
             raise RuntimeConfigReloadError("component_restart_rolled_back")
         operation = None
         if reload_consumers:
-            try:
-                operation = await plugin_runtime_manager.reload_config_consumers(
-                    changed_dependencies,
-                    restart_dependencies=startup_changed_dependencies,
-                    submit_restart=submit_restart,
-                )
-            except TypeError as error:
-                if "restart_dependencies" not in str(error):
-                    raise
-                operation = await plugin_runtime_manager.reload_config_consumers(
-                    changed_dependencies,
-                    submit_restart=submit_restart,
-                )
+            operation = await plugin_host.reload_config_consumers(
+                changed_dependencies,
+                restart_dependencies=startup_changed_dependencies,
+                submit_restart=submit_restart,
+            )
         if operation is not None and operation.mode is ApplyMode.FAILED:
             raise RuntimeConfigReloadError(
                 operation.reason or "config_consumer_reload_failed"
@@ -150,16 +141,15 @@ async def reload_runtime_config(
                 else ApplyMode.CONFIG_RELOADED,
                 "completed",
                 changed_paths,
-                generation=plugin_runtime_manager.generation,
+                generation=plugin_host.generation,
             )
-            plugin_runtime_manager.last_operation = operation
+            plugin_host.last_operation = operation
         operation.config_keys = changed_paths
         operation.component_effects = {
             key: component_result.apply_effect for key in sorted(lifecycle_keys)
         }
         operation.affected_components = component_result.affected_components
         operation.rollback_state = component_result.rollback_state
-        plugin_runtime_manager.mark_content_processed(Path("data/config.yaml"))
         return operation
     except (Exception, asyncio.CancelledError):
         try:

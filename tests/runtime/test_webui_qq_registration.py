@@ -23,6 +23,24 @@ def _request(token: str = "admin-token", host: str = "192.168.1.10") -> Request:
     )
 
 
+@pytest.fixture
+def webui_session_claims(monkeypatch):
+    """注册会话按 WebUI 登录会话（sub + sid）绑定归属
+
+    这里替换模块内的令牌解析，让每个 Bearer token 对应同一用户的不同登录会话，
+    避免依赖真实 WebUI 账号与密钥配置。
+    """
+    import zhenxun.builtin_plugins.web_ui.api.protocol.qq_registration as registration
+
+    def decode(authorization: str):
+        token = authorization.removeprefix("Bearer ").strip()
+        if not token:
+            return None, "invalid"
+        return {"sub": "admin", "sid": f"sid-{token}"}, "valid"
+
+    monkeypatch.setattr(registration, "decode_access_token_status", decode)
+
+
 def test_qr_secret_decryption_uses_aes_gcm(app) -> None:
     del app
     from zhenxun.builtin_plugins.web_ui.api.protocol.qq_registration import (
@@ -37,9 +55,15 @@ def test_qr_secret_decryption_uses_aes_gcm(app) -> None:
     assert _decrypt_secret(payload, key) == "app-secret"
 
 
+@pytest.mark.usefixtures("webui_session_claims")
 async def test_registration_sessions_are_owner_bound_and_bounded(app) -> None:
     del app
     import zhenxun.builtin_plugins.web_ui.api.protocol.qq_registration as registration
+
+    # 没有有效登录会话时拒绝创建注册会话
+    with pytest.raises(HTTPException) as exc_info:
+        registration._owner(_request(token=""))
+    assert getattr(exc_info.value, "status_code", None) == 401
 
     store = registration._RegistrationStore()
     owner = registration._owner(_request())
@@ -59,6 +83,7 @@ async def test_registration_sessions_are_owner_bound_and_bounded(app) -> None:
     assert getattr(exc_info.value, "status_code", None) == 429
 
 
+@pytest.mark.usefixtures("webui_session_claims")
 async def test_completed_registration_saves_websocket_bot_without_leaking_secret(
     app, monkeypatch
 ) -> None:
@@ -184,16 +209,12 @@ async def test_registration_merges_bot_and_preserves_existing_token(
     assert bots[0]["use_websocket"] is True
 
 
+@pytest.mark.usefixtures("bound_operation_registry")
 async def test_registration_save_waits_for_explicit_restart(
     app, monkeypatch, tmp_path
 ) -> None:
     del app
     import zhenxun.builtin_plugins.web_ui.api.protocol.qq_registration as registration
-    from zhenxun.services import runtime_reload
-    from zhenxun.services.runtime_reload import coordinator as coordinator_module
-    from zhenxun.services.runtime_reload.coordinator import RuntimeChangeCoordinator
-    from zhenxun.services.runtime_reload.manager import PluginRuntimeManager
-    from zhenxun.services.runtime_reload.models import ApplyMode, RuntimeOperation
     from zhenxun.utils import _restart_utils, restart_state
 
     env_file = tmp_path / ".env.dev"
@@ -202,25 +223,8 @@ async def test_registration_save_waits_for_explicit_restart(
         encoding="utf-8",
     )
     state_file = tmp_path / "restart.json"
-    manager = PluginRuntimeManager()
-    coordinator = RuntimeChangeCoordinator(manager)
-    restart_reasons: list[str] = []
-
-    async def record_restart(affected: set[str], reason: str) -> RuntimeOperation:
-        restart_reasons.append(reason)
-        return RuntimeOperation(
-            ApplyMode.RESTART_PENDING,
-            "pending_restart",
-            sorted(affected),
-            reason,
-        )
-
     monkeypatch.setattr(registration, "_ENV_FILE", env_file)
     monkeypatch.setattr(registration, "_source_path", lambda: env_file)
-    monkeypatch.setattr(runtime_reload, "plugin_runtime_manager", manager)
-    monkeypatch.setattr(coordinator_module, "_ENV_FILES", {env_file.resolve()})
-    monkeypatch.setattr(manager, "request_restart", record_restart)
-    monkeypatch.setattr(_restart_utils, "_RESTART_STATE_FILE", state_file)
     monkeypatch.setattr(restart_state, "_RESTART_STATE_FILE", state_file)
     monkeypatch.setattr(_restart_utils, "_restart_pending", False)
     monkeypatch.setenv("ZHENXUN_LAUNCHER_PID", "123")
@@ -234,10 +238,6 @@ async def test_registration_save_waits_for_explicit_restart(
     assert "launcher_action" not in saved_state
     assert "pending_request" not in saved_state
     assert restart_state.consume_launcher_action() is None
-
-    # A delayed watchfiles notification for the WebUI transaction is absorbed.
-    assert await coordinator.process({env_file}) is None
-    assert restart_reasons == []
 
     ok, _ = await _restart_utils.request_restart(
         "webui.settings",

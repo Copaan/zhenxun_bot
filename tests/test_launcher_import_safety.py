@@ -48,10 +48,11 @@ def test_nonebot_store_launcher_import_has_no_nonebot_side_effects() -> None:
 import sys
 import nonebot
 
-from zhenxun.nonebot_store.runtime import activate_current_generation
+from zhenxun.services.nonebot_store.runtime import activate_current_generation
 
 activate_current_generation()
-assert "zhenxun.services" not in sys.modules
+assert "zhenxun.services.db_context" not in sys.modules
+assert "zhenxun.services.renderer" not in sys.modules
 assert "nonebot_plugin_apscheduler" not in sys.modules
 try:
     nonebot.get_driver()
@@ -78,10 +79,11 @@ def test_source_store_launcher_import_has_no_nonebot_side_effects() -> None:
 import sys
 import nonebot
 
-from zhenxun.plugin_store_transaction import pending_transaction
+from zhenxun.services.plugin_store.plugin_store_transaction import pending_transaction
 
 pending_transaction()
-assert "zhenxun.services" not in sys.modules
+assert "zhenxun.services.db_context" not in sys.modules
+assert "zhenxun.services.renderer" not in sys.modules
 assert "nonebot_plugin_apscheduler" not in sys.modules
 try:
     nonebot.get_driver()
@@ -125,17 +127,18 @@ assert "nonebot_plugin_apscheduler" not in sys.modules
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_hook_kernel_install_does_not_preimport_library_plugins() -> None:
+def test_runtime_hooks_install_does_not_preimport_library_plugins() -> None:
     root = Path(__file__).resolve().parents[1]
     script = """
 import sys
 import nonebot
 
 nonebot.init()
-from zhenxun.services.lifecycle import hook_kernel
-from zhenxun.services.runtime_reload import plugin_runtime_manager
+from zhenxun.services.message_execution import install_matcher_execution
+from zhenxun.services.plugin_host import plugin_host
 
-hook_kernel.install(plugin_runtime_manager)
+install_matcher_execution()
+plugin_host.status()
 for name in (
     "nonebot_plugin_apscheduler",
     "nonebot_plugin_alconna",

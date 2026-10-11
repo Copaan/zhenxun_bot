@@ -47,7 +47,7 @@ class BotGroupSync:
             previous[1].cancel()
         self.final_logs.discard(key)
         task = self.context.spawn_task(
-            self._sync(bot, key), name="bot-group-sync", persistent=False
+            self._sync(bot, key), name="bot-group-sync", degrade_on_error=False
         )
         self.connections[key] = (bot, task)
 

@@ -17,7 +17,13 @@ from strenum import StrEnum
 from zhenxun.utils.atomic_json import read_json_locked, write_json_locked
 
 from .deadline import remaining_timeout, shutdown_budget
-from .kernel import LifecycleContext, LifecycleError, LifecycleKernel, lifecycle_kernel
+from .kernel import (
+    LifecycleContext,
+    LifecycleError,
+    LifecycleKernel,
+    lifecycle_kernel,
+    run_bounded,
+)
 
 OperationRecoveryPolicy = Literal["resume", "restart", "rollback", "discard"]
 CheckpointCallback = Callable[[], Any | Awaitable[Any]]
@@ -60,7 +66,6 @@ class OperationRecord:
     recovery_policy: OperationRecoveryPolicy = "restart"
     phase: str = "queued"
     error_code: str | None = None
-    scope_id: str | None = None
     created_at: str = field(default_factory=lambda: _now())
     updated_at: str = field(default_factory=lambda: _now())
     completed_at: str | None = None
@@ -78,7 +83,6 @@ class OperationRecord:
             "recovery_policy": self.recovery_policy,
             "phase": self.phase,
             "error_code": self.error_code,
-            "scope_id": self.scope_id,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "completed_at": self.completed_at,
@@ -119,7 +123,6 @@ class OperationRegistry:
         self._lock = RLock()
         self._records: dict[str, OperationRecord] = {}
         self._tasks: dict[str, asyncio.Task[Any]] = {}
-        self._scopes: dict[str, LifecycleContext] = {}
         self._checkpoint_callbacks: dict[str, CheckpointCallback] = {}
         self._cancel_callbacks: dict[str, Callable[[], None]] = {}
         self._recovery_handlers: dict[str, RecoveryCallback] = {}
@@ -170,30 +173,24 @@ class OperationRegistry:
                 operation_id=operation_id,
                 kind=kind,
                 owner_component_id=owner_component_id,
-                owner_boot_id=str(
-                    self._kernel.status().get("process", {}).get("boot_id") or ""
-                )
-                or None,
+                owner_boot_id=self._kernel.process_metadata.get("boot_id"),
                 public_input=_public_value(public_input or {}),
                 recovery_policy=recovery_policy,
                 progress=existing.progress if existing else 0,
                 checkpoint=deepcopy(existing.checkpoint) if existing else {},
                 created_at=existing.created_at if existing else _now(),
             )
-            scope = self._context.create_child_scope("operation", operation_id)
-            record.scope_id = scope.scope_id
             self._records[operation_id] = record
-            self._scopes[operation_id] = scope
             if checkpoint is not None:
                 self._checkpoint_callbacks[operation_id] = checkpoint
             if cancel is not None:
                 self._cancel_callbacks[operation_id] = cancel
             self._persist()
-        task = scope.spawn_task(
+        task = self._context.spawn_task(
             self._run(record, coroutine),
             name=name or f"operation:{kind}:{operation_id[:8]}",
-            persistent=False,
             cancel=cancel,
+            degrade_on_error=False,
         )
         self._tasks[operation_id] = task
         task.add_done_callback(
@@ -373,15 +370,13 @@ class OperationRegistry:
 
         if checkpoint_ids:
             try:
-                checkpoint_results = await self._kernel._run_cleanup(
+                checkpoint_results = await run_bounded(
                     asyncio.gather(
                         *(checkpoint_one(item) for item in checkpoint_ids),
                         return_exceptions=True,
                     ),
-                    owner="management:operations",
-                    stage="checkpoint",
-                    timeout=checkpoint_timeout,
-                    grace=0.05,
+                    checkpoint_timeout,
+                    "operation_checkpoint_timeout",
                 )
                 for operation_id, result in zip(checkpoint_ids, checkpoint_results):
                     if not isinstance(result, BaseException):
@@ -446,17 +441,7 @@ class OperationRegistry:
                         phase="shutdown_timeout",
                         error_code="operation_shutdown_timeout",
                     )
-        scopes = [
-            scope
-            for operation_id, scope in self._scopes.items()
-            if operation_id not in self._tasks or self._tasks[operation_id].done()
-        ]
-        for scope in reversed(scopes):
-            await scope.close()
-        try:
-            await self._kernel.drain_scope_cleanups()
-        except LifecycleError:
-            self._kernel._recovery_required.add("management:operations")
+                    self._kernel.require_recovery("management:operations")
         self._context = None
         self._persist()
 
@@ -489,9 +474,6 @@ class OperationRegistry:
         self._tasks.pop(operation_id, None)
         self._checkpoint_callbacks.pop(operation_id, None)
         self._cancel_callbacks.pop(operation_id, None)
-        scope = self._scopes.pop(operation_id, None)
-        if scope is not None:
-            self._kernel._schedule_scope_close(scope)
         self._persist()
 
     def _load(self) -> None:
@@ -538,7 +520,6 @@ class OperationRegistry:
                     recovery_policy=recovery_policy,  # type: ignore[arg-type]
                     phase=str(value.get("phase") or state_value.value),
                     error_code=value.get("error_code"),
-                    scope_id=None,
                     created_at=str(value.get("created_at") or _now()),
                     updated_at=str(value.get("updated_at") or _now()),
                     completed_at=value.get("completed_at"),

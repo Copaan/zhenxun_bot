@@ -120,9 +120,10 @@ async def test_catalog_health_requires_both_sources_before_marking_missing(
     )
 
 
+@pytest.mark.usefixtures("bound_operation_registry")
 @pytest.mark.parametrize("is_external", [False, True])
 @pytest.mark.parametrize(
-    ("dependency_changes", "expected_install_count"),
+    ("dependency_changes", "expected_dependency_requests"),
     [
         (
             {
@@ -140,7 +141,7 @@ async def test_default_source_falls_back_to_github_for_all_plugins(
     tmp_path: Path,
     is_external: bool,
     dependency_changes: dict[str, list[dict[str, str]]],
-    expected_install_count: int,
+    expected_dependency_requests: int,
 ) -> None:
     from zhenxun.builtin_plugins.plugin_store.data_source import StoreManager
     from zhenxun.utils.repo_utils.models import (
@@ -204,12 +205,12 @@ async def test_default_source_falls_back_to_github_for_all_plugins(
         "RepoFileManager.download_files",
         side_effect=download_files,
     )
-    install_requirement = mocker.patch(
-        "zhenxun.builtin_plugins.plugin_store.data_source."
-        "VirtualEnvPackageManager.install_requirement",
+    request_dependency_restart = mocker.patch(
+        "zhenxun.utils._restart_utils.request_dependency_restart",
+        return_value=(True, "重启请求已提交"),
     )
     mocker.patch(
-        "zhenxun.nonebot_store.dependencies.preflight_source_requirements",
+        "zhenxun.services.nonebot_store.dependencies.preflight_source_requirements",
         return_value={
             "resolved_packages": {"demo-dependency": "1.0.0"},
             "package_changes": dependency_changes,
@@ -243,9 +244,14 @@ async def test_default_source_falls_back_to_github_for_all_plugins(
     staging_root = tmp_path / "data" / "runtime" / "plugin-store-staging"
     assert staging_root.is_dir()
     assert not list(staging_root.iterdir())
-    assert install_requirement.await_count == expected_install_count
+    assert request_dependency_restart.await_count == expected_dependency_requests
+    if expected_dependency_requests:
+        source, paths = request_dependency_restart.await_args.args
+        assert source == "plugin_store"
+        assert paths == {mock_base_path / "plugins" / "demo" / "requirements.txt"}
 
 
+@pytest.mark.usefixtures("bound_operation_registry")
 async def test_zero_byte_aliyun_binary_falls_back_to_github(
     mocker: MockerFixture,
     tmp_path: Path,
@@ -301,10 +307,6 @@ async def test_zero_byte_aliyun_binary_falls_back_to_github(
         "RepoFileManager.download_files",
         side_effect=download_files,
     )
-    mocker.patch(
-        "zhenxun.builtin_plugins.plugin_store.data_source."
-        "VirtualEnvPackageManager.install_requirement",
-    )
 
     await StoreManager.install_plugin_with_repo(_plugin_info(), is_external=True)
 
@@ -312,6 +314,7 @@ async def test_zero_byte_aliyun_binary_falls_back_to_github(
     assert (mock_base_path / "plugins" / "demo" / "icon.png").read_bytes() == b"image"
 
 
+@pytest.mark.usefixtures("bound_operation_registry")
 async def test_forced_aliyun_does_not_fall_back(
     mocker: MockerFixture,
     tmp_path: Path,
@@ -342,6 +345,7 @@ async def test_forced_aliyun_does_not_fall_back(
     assert await_args.kwargs["repo_type"] == RepoType.ALIYUN
 
 
+@pytest.mark.usefixtures("bound_operation_registry")
 async def test_root_plugin_uses_exact_sparse_paths(
     mocker: MockerFixture,
     tmp_path: Path,
@@ -397,10 +401,6 @@ async def test_root_plugin_uses_exact_sparse_paths(
         "zhenxun.builtin_plugins.plugin_store.data_source."
         "RepoFileManager.download_files",
         side_effect=download_files,
-    )
-    mocker.patch(
-        "zhenxun.builtin_plugins.plugin_store.data_source."
-        "VirtualEnvPackageManager.install_requirement",
     )
 
     await StoreManager.install_plugin_with_repo(plugin_info, source="ali")
@@ -464,15 +464,25 @@ async def test_sparse_checkout_retries_git_fetch(
     fetch_attempts = 0
     fetch_timeouts: list[float | None] = []
 
+    fetch_envs: list[bool] = []
+
     async def run_git_command(
         command: str | list[str],
         cwd: Path | None = None,
         timeout_seconds: float | None = None,
+        env: dict[str, str] | None = None,
+        isolated_env: bool = False,
     ) -> tuple[bool, str, str]:
         nonlocal fetch_attempts
         if isinstance(command, list) and "fetch" in command:
             fetch_attempts += 1
             fetch_timeouts.append(timeout_seconds)
+            # fetch 必须使用代理策略生成的隔离环境，不能继承用户 Git 配置
+            fetch_envs.append(
+                isolated_env
+                and env is not None
+                and env.get("GIT_CONFIG_NOSYSTEM") == "1"
+            )
             if fetch_attempts < 3:
                 return False, "", "connection reset"
         return True, "", ""
@@ -492,11 +502,16 @@ async def test_sparse_checkout_retries_git_fetch(
     assert downloaded == []
     assert fetch_attempts == 3
     assert fetch_timeouts == [60, 60, 60]
+    assert fetch_envs == [True, True, True]
     assert sleep.await_count == 2
 
 
 @pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
-async def test_git_checkout_preserves_binary(tmp_path: Path) -> None:
+async def test_git_checkout_preserves_binary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import zhenxun.services.git_proxy as git_proxy
+    from zhenxun.services.network_proxy import ProxyPolicyError
     from zhenxun.utils.repo_utils.utils import sparse_checkout_clone
 
     source_repo = tmp_path / "source"
@@ -511,6 +526,29 @@ async def test_git_checkout_preserves_binary(tmp_path: Path) -> None:
     await _run_git("-C", str(source_repo), "commit", "-m", "test")
 
     target_dir = tmp_path / "target"
+    # 代理策略只托管 http(s) Git 传输，本地 file:// 仓库默认被拒绝
+    with pytest.raises(ProxyPolicyError, match="proxy_git_protocol_unmanaged"):
+        await sparse_checkout_clone(
+            repo_url=source_repo.as_uri(),
+            branch="main",
+            sparse_path=["icon.png", "__init__.py"],
+            target_dir=target_dir,
+        )
+
+    real_environment = git_proxy.git_download_environment
+
+    def local_file_environment(policy, url, authentication=None):
+        # 复用真实策略生成的隔离 Git 环境，仅额外放行本地 file 协议以便离线验证
+        environment, route = real_environment(
+            policy, "https://example.invalid/demo.git", authentication
+        )
+        index = int(environment["GIT_CONFIG_COUNT"])
+        environment[f"GIT_CONFIG_KEY_{index}"] = "protocol.file.allow"
+        environment[f"GIT_CONFIG_VALUE_{index}"] = "always"
+        environment["GIT_CONFIG_COUNT"] = str(index + 1)
+        return environment, route
+
+    monkeypatch.setattr(git_proxy, "git_download_environment", local_file_environment)
     downloaded = await sparse_checkout_clone(
         repo_url=source_repo.as_uri(),
         branch="main",

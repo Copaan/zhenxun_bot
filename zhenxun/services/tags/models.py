@@ -4,7 +4,7 @@
 
 from abc import ABC
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from tortoise.expressions import Q
 
 
@@ -25,8 +25,7 @@ class QueryResult(RuleExecutionResult):
 
     q_object: Q
 
-    class Config:
-        arbitrary_types_allowed = True
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
 
 class IDSetResult(RuleExecutionResult):

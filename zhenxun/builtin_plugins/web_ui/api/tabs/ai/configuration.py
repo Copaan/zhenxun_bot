@@ -51,8 +51,8 @@ from zhenxun.services.ai.llm.manager import get_default_api_base_for_type
 from zhenxun.services.ai.llm.system.capabilities import get_model_capabilities
 from zhenxun.services.ai.llm.system.network import health_manager, http_client_manager
 from zhenxun.services.log import logger
+from zhenxun.services.plugin_host import RuntimeOperation
 from zhenxun.services.runtime_config_reload import reload_runtime_config
-from zhenxun.services.runtime_reload.models import RuntimeOperation
 from zhenxun.utils._restart_utils import issue_restart_ticket
 from zhenxun.utils.pydantic_compat import (
     model_dump,
@@ -680,7 +680,6 @@ def _apply_response(
         launcher_managed = update_pending_restart(
             pending_source,
             reasons or ["ai_runtime_restart_required"],
-            issue_ticket=False,
         )
         if launcher_managed:
             issue_restart_ticket("webui.settings", ttl_seconds=10 * 60)
@@ -1170,7 +1169,7 @@ async def update_section(section: str, payload: SectionUpdate) -> Result:
             _restore_sandbox_startup_runtime()
         pending_source = "webui.ai-sandbox"
         reason_codes = [f"ai.sandbox.{key}" for key in deferred_fields]
-        update_pending_restart(pending_source, reason_codes, issue_ticket=False)
+        update_pending_restart(pending_source, reason_codes)
         if changed_startup_fields and deferred_fields:
             apply_mode = APPLY_RESTART_PENDING
             restart_required = True

@@ -11,7 +11,7 @@ from typing import Literal
 from cryptography import x509
 from cryptography.hazmat.primitives import serialization
 from dotenv import dotenv_values
-from pydantic import BaseModel, Field, ValidationError, validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from zhenxun.utils.network import internal_connect_host
 
@@ -34,8 +34,7 @@ class QQOfficialIntent(BaseModel):
     audio_action: bool = False
     at_messages: bool = False
 
-    class Config:
-        extra = "forbid"
+    model_config = ConfigDict(extra="forbid")
 
 
 class QQOfficialBotConfig(BaseModel):
@@ -46,25 +45,27 @@ class QQOfficialBotConfig(BaseModel):
     intent: QQOfficialIntent = Field(default_factory=QQOfficialIntent)
     shard: tuple[int, int] | None = None
 
-    @validator("shard")
+    @field_validator("shard")
+    @classmethod
     def _valid_shard(cls, value):
         if value is not None and not 0 <= value[0] < value[1]:
             raise ValueError("shard requires 0 <= index < total")
         return value
 
-    @validator("id", "secret")
+    @field_validator("id", "secret")
+    @classmethod
     def _not_blank(cls, value: str) -> str:
         value = value.strip()
         if not value:
             raise ValueError("must not be blank")
         return value
 
-    @validator("token")
+    @field_validator("token")
+    @classmethod
     def _strip_token(cls, value: str) -> str:
         return value.strip()
 
-    class Config:
-        extra = "forbid"
+    model_config = ConfigDict(extra="forbid")
 
 
 class QQOfficialConfig(BaseModel):
@@ -338,7 +339,7 @@ def validate_qq_config_data(config: QQOfficialConfig) -> None:
             )
         unsupported_intents = [
             name
-            for name, enabled in item.intent.dict().items()
+            for name, enabled in item.intent.model_dump().items()
             if name not in supported and enabled
         ]
         if unsupported_intents:

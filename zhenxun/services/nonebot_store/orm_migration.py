@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from argparse import Namespace
+from argparse import ArgumentParser, Namespace
 import asyncio
+from contextlib import closing, suppress
 import json
 from pathlib import Path
 import shutil
@@ -14,6 +15,7 @@ import nonebot
 
 from .storage import (
     ORM_MIGRATION_STATUS_FILE,
+    PENDING_FILE,
     STORE_ROOT,
     generation_path,
     pending_transaction,
@@ -79,25 +81,35 @@ def _sqlite_paths(orm_module: Any) -> tuple[list[Path], bool]:
 def _backup_sqlite(paths: list[Path], revision: str) -> Path:
     root = _backup_root(revision)
     root.mkdir(parents=True, exist_ok=True)
+    manifest = root / "manifest.json"
+    if manifest.is_file():
+        existing = json.loads(manifest.read_text(encoding="utf-8"))
+        if {item["path"] for item in existing.get("databases", [])} != {
+            str(path) for path in paths
+        }:
+            raise RuntimeError("orm_backup_target_changed")
+        return root
     entries = []
     for index, path in enumerate(paths):
         backup = root / f"database-{index}.sqlite3"
         existed = path.exists()
         if existed:
             path.parent.mkdir(parents=True, exist_ok=True)
-            with sqlite3.connect(path) as source, sqlite3.connect(backup) as target:
+            with (
+                closing(sqlite3.connect(path)) as source,
+                closing(sqlite3.connect(backup)) as target,
+            ):
                 source.backup(target)
         entries.append({"path": str(path), "backup": str(backup), "existed": existed})
-    (root / "manifest.json").write_text(
-        json.dumps({"databases": entries}, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    write_json(root / "manifest.json", {"databases": entries})
     return root
 
 
 def restore() -> int:
     transaction = pending_transaction() or {}
     revision = str(transaction.get("revision") or "")
+    if not revision:
+        return 0
     manifest_path = _backup_root(revision) / "manifest.json"
     if not manifest_path.is_file():
         return 0
@@ -105,9 +117,14 @@ def restore() -> int:
     for item in data.get("databases", []):
         path = Path(item["path"])
         backup = Path(item["backup"])
-        if item.get("existed") and backup.is_file():
+        if item.get("existed"):
+            if not backup.is_file():
+                raise RuntimeError("orm_rollback_backup_missing")
             path.parent.mkdir(parents=True, exist_ok=True)
-            with sqlite3.connect(backup) as source, sqlite3.connect(path) as target:
+            with (
+                closing(sqlite3.connect(backup)) as source,
+                closing(sqlite3.connect(path)) as target,
+            ):
                 source.backup(target)
         elif not item.get("existed"):
             path.unlink(missing_ok=True)
@@ -121,31 +138,38 @@ def restore() -> int:
 def finalize() -> int:
     transaction = pending_transaction() or {}
     revision = str(transaction.get("revision") or "")
+    if not revision:
+        return 0
     root = _backup_root(revision)
     if root.is_dir():
-        shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(root)
     ORM_MIGRATION_STATUS_FILE.unlink(missing_ok=True)
     return 0
 
 
-async def apply() -> int:
+async def apply(*, manual_external: bool = False) -> int:
     transaction = pending_transaction()
     if not transaction or not transaction.get("database_migration_possible"):
         return 0
     if not transaction.get("database_migration_confirmed"):
         return 4
     revision = str(transaction.get("revision") or "")
+    external_write_started = False
     try:
         _activate_staged_generation(transaction)
         from sqlalchemy.util import greenlet_spawn
 
-        nonebot.init()
+        from zhenxun.configs.environment import environment_file
+
+        nonebot.init(_env_file=environment_file())
         _load_target_plugins(transaction)
         import nonebot_plugin_orm as orm
         from nonebot_plugin_orm import migrate
 
         orm._init_orm()
         sqlite_paths, external = _sqlite_paths(orm)
+        if not external:
+            _backup_sqlite(sqlite_paths, revision)
         cmd_opts = Namespace()
         migration_required = False
         with migrate.AlembicConfig(cmd_opts=cmd_opts) as config:
@@ -164,7 +188,7 @@ async def apply() -> int:
                     },
                 )
                 return 0
-            if external:
+            if external and not manual_external:
                 write_json(
                     ORM_MIGRATION_STATUS_FILE,
                     {
@@ -174,8 +198,8 @@ async def apply() -> int:
                     },
                 )
                 return 3
-            _backup_sqlite(sqlite_paths, revision)
             cmd_opts.cmd = (migrate.upgrade, [], [])
+            external_write_started = external
             await greenlet_spawn(migrate.upgrade, config)
         write_json(
             ORM_MIGRATION_STATUS_FILE,
@@ -183,24 +207,79 @@ async def apply() -> int:
         )
         return 0
     except Exception as error:
-        restore()
+        from .dependencies import safe_process_error
+
+        rollback_error = (
+            {"code": "external_database_state_unconfirmed"}
+            if external_write_started
+            else None
+        )
+        try:
+            for engine in getattr(locals().get("orm"), "_engines", {}).values():
+                await engine.dispose()
+            if not external_write_started:
+                restore()
+        except Exception as failure:
+            rollback_error = {
+                "code": type(failure).__name__,
+                "diagnostic": safe_process_error(str(failure)),
+            }
         write_json(
             ORM_MIGRATION_STATUS_FILE,
             {
-                "status": "failed",
+                "status": "recovery_required" if rollback_error else "failed",
                 "revision": revision,
                 "error_code": type(error).__name__,
+                "diagnostic": safe_process_error(str(error)),
+                "rollback_error": rollback_error,
                 "updated_at": utc_now(),
             },
         )
-        return 2
+        if external_write_started:
+            write_json(
+                PENDING_FILE,
+                {
+                    **transaction,
+                    "state": "recovery_required",
+                    "error_code": "external_database_state_unconfirmed",
+                },
+            )
+        return 5 if rollback_error else 2
     finally:
-        with __import__("contextlib").suppress(Exception):
+        with suppress(Exception):
             for engine in getattr(locals().get("orm"), "_engines", {}).values():
                 await engine.dispose()
 
 
 def main() -> int:
+    if len(sys.argv) > 1 and sys.argv[1] == "manual-upgrade":
+        parser = ArgumentParser(
+            description=(
+                "Upgrade the pending plugin schema in its candidate environment. "
+                "Dependencies are never installed by this command."
+            )
+        )
+        parser.add_argument("action", choices=["manual-upgrade"])
+        parser.add_argument("--revision", required=True)
+        parser.add_argument("--backup-confirmed", action="store_true", required=True)
+        arguments = parser.parse_args()
+        transaction = pending_transaction() or {}
+        if (
+            transaction.get("revision") != arguments.revision
+            or transaction.get("state") != "migration_blocked"
+        ):
+            raise RuntimeError("orm_manual_transaction_changed")
+        from zhenxun.services.migration.lease import InstanceLease
+
+        with InstanceLease(Path.cwd(), role="migration"):
+            from .runtime import _staged_build
+
+            current = pending_transaction() or {}
+            if current != transaction:
+                raise RuntimeError("orm_manual_transaction_changed")
+            if _staged_build(current) is None:
+                raise RuntimeError("dependency_layer_state_mismatch")
+            return asyncio.run(apply(manual_external=True))
     action = sys.argv[1] if len(sys.argv) > 1 else "apply"
     if action == "restore":
         return restore()

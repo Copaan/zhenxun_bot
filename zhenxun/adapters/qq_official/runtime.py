@@ -3,8 +3,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from datetime import datetime, timezone
+from typing import Any
 
-from zhenxun.services.lifecycle import ResourceReceipt, RuntimeHandle
 from zhenxun.utils.manager.priority_manager import PriorityLifecycle
 
 from .cache import clear_qq_official_caches
@@ -14,122 +14,13 @@ RECEIPT_CLEANUP_INTERVAL = 60 * 60
 RECEIPT_CLEANUP_BATCH = 1000
 
 _cleanup_task: asyncio.Task[None] | None = None
-_adapters: set[object] = set()
+_adapters: set[Any] = set()
 _database_ready = False
 _connection_lock: asyncio.Lock | None = None
 
 
-class QQOfficialRuntimeHandle:
-    def __init__(self, adapters: tuple[object, ...]) -> None:
-        self._adapters = adapters
-
-    async def quiesce(self) -> None:
-        for adapter in self._adapters:
-            dispatcher = getattr(adapter, "_dispatcher", None)
-            stop = getattr(dispatcher, "stop", None)
-            if callable(stop):
-                await stop()
-
-    async def close(self) -> None:
-        return None
-
-    async def health(self) -> dict[str, object]:
-        # 用 runtime_healthy 而不是 runtime_ready：WebSocket bot 在后台任务里握手，
-        # 组件启动返回时必然还没连上，用严格就绪判定会把正常启动判成健康失败。
-        return {
-            "healthy": runtime_healthy() or not self._adapters,
-            "ready": runtime_ready(),
-            "adapter_count": len(self._adapters),
-            "pending_bots": sorted(_collect_bot_ids("pending_bot_ids")),
-            "failed_bots": sorted(_collect_bot_ids("failed_bot_ids")),
-        }
-
-    async def snapshot(self) -> dict[str, object]:
-        return await runtime_diagnostics()
-
-    async def resource_snapshot(self) -> list[ResourceReceipt]:
-        receipts: list[ResourceReceipt] = []
-        for index, adapter in enumerate(self._adapters):
-            dispatcher = getattr(adapter, "_dispatcher", None)
-            snapshot = await dispatcher.snapshot() if dispatcher is not None else {}
-            receipts.append(
-                ResourceReceipt(
-                    receipt_id=f"qq-dispatcher:{id(dispatcher)}",
-                    provider="qq_official",
-                    resource_type="dispatcher",
-                    owner_id="runtime:qq_official",
-                    detail={
-                        "index": index,
-                        "queue_depth": snapshot.get("queue_depth", 0),
-                        "in_flight": snapshot.get("in_flight", 0),
-                        "shards": snapshot.get("shards", 0),
-                    },
-                )
-            )
-            receipts.extend(
-                ResourceReceipt(
-                    receipt_id=f"task:{id(task)}",
-                    provider="qq_official",
-                    resource_type="task",
-                    owner_id="runtime:qq_official",
-                    detail={"name": task.get_name(), "dispatcher": index},
-                )
-                for task in getattr(dispatcher, "_workers", ())
-                if not task.done()
-            )
-        return receipts
-
-
 def database_ready() -> bool:
     return _database_ready
-
-
-def runtime_ready() -> bool:
-    """所有已配置 bot 都已连接。用于对外展示的严格就绪。"""
-    if not _database_ready or not _adapters:
-        return False
-    return all(
-        bool(getattr(adapter, "is_ready", lambda: False)()) for adapter in _adapters
-    )
-
-
-def runtime_healthy() -> bool:
-    """没有确定性故障即视为健康，正在握手的 bot 不算故障。"""
-    if not _database_ready or not _adapters:
-        return False
-    return all(
-        bool(
-            getattr(
-                adapter,
-                "is_healthy",
-                getattr(adapter, "is_ready", lambda: False),
-            )()
-        )
-        for adapter in _adapters
-    )
-
-
-def _collect_bot_ids(method_name: str) -> set[str]:
-    collected: set[str] = set()
-    for adapter in tuple(_adapters):
-        collector = getattr(adapter, method_name, None)
-        if callable(collector):
-            collected |= set(collector())
-    return collected
-
-
-async def runtime_diagnostics() -> dict[str, object]:
-    adapters = []
-    for adapter in tuple(_adapters):
-        diagnostics = getattr(adapter, "diagnostics", None)
-        if callable(diagnostics):
-            adapters.append(await diagnostics())
-    return {
-        "database_ready": _database_ready,
-        "ready": runtime_ready(),
-        "healthy": runtime_healthy(),
-        "adapters": adapters,
-    }
 
 
 def register_adapter_runtime(adapter: object) -> None:
@@ -180,7 +71,6 @@ async def _cleanup_loop() -> None:
 @PriorityLifecycle.on_startup(
     priority=2,
     component_id="runtime:qq_official",
-    scope="bot_connection",
     depends_on=("management:database",),
     restart_policy="worker",
     config_keys=("QQ_ADAPTER_LOAD", "QQ_BOTS", "QQ_WEBHOOK"),
@@ -190,7 +80,7 @@ async def _cleanup_loop() -> None:
     # 原因会记进 degraded_reasons 供 WebUI 展示。
     failure_policy="degrade",
 )
-async def start_qq_official_runtime(context=None) -> RuntimeHandle:
+async def start_qq_official_runtime(context=None) -> None:
     global _cleanup_task, _database_ready
     await _drain_expired_receipts()
     _database_ready = True
@@ -203,16 +93,14 @@ async def start_qq_official_runtime(context=None) -> RuntimeHandle:
             if context is not None
             else asyncio.create_task(coroutine, name="qq-official-receipt-cleanup")
         )
-    return RuntimeHandle(
-        controller=QQOfficialRuntimeHandle(tuple(_adapters)),
-        metadata={"ownership": "composite"},
-    )
 
 
 @PriorityLifecycle.on_shutdown(priority=40, component_id="runtime:qq_official")
 async def stop_qq_official_runtime() -> None:
     global _cleanup_task, _connection_lock, _database_ready
     _database_ready = False
+    for adapter in tuple(_adapters):
+        await adapter._dispatcher.stop()
     task = _cleanup_task
     _cleanup_task = None
     if task is not None and not task.done():
@@ -229,9 +117,6 @@ __all__ = [
     "connect_prepared_adapter",
     "database_ready",
     "register_adapter_runtime",
-    "runtime_diagnostics",
-    "runtime_healthy",
-    "runtime_ready",
     "start_qq_official_runtime",
     "stop_qq_official_runtime",
     "unregister_adapter_runtime",

@@ -164,7 +164,10 @@ def test_launcher_uses_dialable_worker_address(bind_host, connect_host) -> None:
         QQLauncherSettings,
         QQOfficialConfig,
     )
-    from zhenxun.cli import _build_ingress_command, _worker_health_url
+    from zhenxun.services.launcher.sidecars import (
+        build_ingress_command,
+        worker_health_url,
+    )
 
     settings = QQLauncherSettings(
         enabled=True,
@@ -177,10 +180,10 @@ def test_launcher_uses_dialable_worker_address(bind_host, connect_host) -> None:
         worker_port=8080,
     )
 
-    command = _build_ingress_command(settings)
+    command = build_ingress_command(settings)
     expected_host = f"[{connect_host}]" if ":" in connect_host else connect_host
     assert command[-1] == f"http://{expected_host}:8080"
-    assert _worker_health_url(settings) == f"http://{expected_host}:8080/qq/healthz"
+    assert worker_health_url(settings) == f"http://{expected_host}:8080/qq/healthz"
 
 
 @pytest.mark.asyncio
@@ -306,14 +309,14 @@ async def test_dispatcher_orders_shards_and_enforces_global_capacity() -> None:
 
 
 def test_ingress_child_environment_excludes_credentials(monkeypatch) -> None:
-    from zhenxun.cli import _ingress_environment
+    from zhenxun.services.launcher.sidecars import ingress_environment
 
     monkeypatch.setenv("QQ_BOTS", "secret-json")
     monkeypatch.setenv("QQ_TOKEN", "token")
     monkeypatch.setenv("SOME_API_KEY", "key")
     monkeypatch.setenv("SAFE_VALUE", "visible")
 
-    environment = _ingress_environment()
+    environment = ingress_environment()
 
     assert "QQ_BOTS" not in environment
     assert "QQ_TOKEN" not in environment

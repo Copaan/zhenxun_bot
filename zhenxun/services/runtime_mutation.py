@@ -217,8 +217,8 @@ class RuntimeMutationCoordinator:
         async with self._lock:
             if self._state != "open":
                 raise RuntimeMutationBusyError(f"runtime_mutation_{self._state}")
-            from zhenxun.migration.errors import MigrationError
-            from zhenxun.migration.mutation import require_mutation_available
+            from zhenxun.services.migration.errors import MigrationError
+            from zhenxun.services.migration.mutation import require_mutation_available
 
             try:
                 require_mutation_available(Path.cwd())

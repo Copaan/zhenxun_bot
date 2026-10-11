@@ -5,6 +5,7 @@ from typing import Any, TypeVar
 
 import cattrs
 from nonebot.log import logger as _nonebot_logger
+from nonebot.plugin import _current_plugin
 from pydantic import BaseModel, Field
 from ruamel.yaml import YAML
 from ruamel.yaml.scanner import ScannerError
@@ -90,6 +91,16 @@ class SimpleConfigValidationError(ValueError):
         self.column = column
 
 
+import_readers: dict[tuple[str, str], set[str]] = {}
+"""导入期读取过的配置项 (模块, 键) 到读取它的插件 id"""
+
+
+def _track_import_read(module: str, key: str) -> None:
+    """插件导入期间读取配置时，记录该插件依赖此配置项"""
+    if (plugin := _current_plugin.get()) is not None:
+        import_readers.setdefault((module, key), set()).add(plugin.id_)
+
+
 class ConfigGroup(BaseModel):
     """
     配置组
@@ -107,6 +118,7 @@ class ConfigGroup(BaseModel):
         获取配置项的值。如果指定了类型，会自动构建实例。
         """
         key = c.upper()
+        _track_import_read(self.module, key)
         cfg = self.configs.get(key)
 
         if cfg is None:
@@ -154,6 +166,9 @@ class ConfigsManager:
     """
     插件配置 与 资源 管理器
     """
+
+    import_readers = import_readers
+    """导入期读取过的配置项 (模块, 键) 到读取它的插件 id"""
 
     def __init__(self, file: Path):
         self._data: dict[str, ConfigGroup] = {}
@@ -479,6 +494,7 @@ class ConfigsManager:
         - 优先使用Pydantic原生方式解析，失败后回退到cattrs。
         """
         key = key.upper()
+        _track_import_read(module, key)
         config_group = self._data.get(module)
         if not config_group:
             return copy.deepcopy(default)
@@ -527,6 +543,18 @@ class ConfigsManager:
                     )
 
         return value_to_process
+
+    @staticmethod
+    def forget_import_readers(plugin_ids: set[str] | frozenset[str]) -> None:
+        """移除插件在导入期读取配置的记录
+
+        参数:
+            plugin_ids: 插件 id
+        """
+        for dependency, readers in list(import_readers.items()):
+            readers -= plugin_ids
+            if not readers:
+                import_readers.pop(dependency, None)
 
     def get(self, key: str) -> ConfigGroup:
         """获取插件配置数据

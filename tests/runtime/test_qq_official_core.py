@@ -68,20 +68,27 @@ def test_config_validation_rejects_unsafe_enablement(app, monkeypatch) -> None:
         validate_qq_official_config,
     )
 
+    # intent 校验只约束 WebSocket 模式；Webhook 订阅由 QQ 开放平台管理。
     configs = [
         QQOfficialConfig(qq_bots=[]),
         QQOfficialConfig(qq_bots=[_valid_bot(), _valid_bot()]),
         QQOfficialConfig(
-            qq_bots=[_valid_bot(intent=QQOfficialIntent(c2c_group_at_messages=False))]
+            qq_bots=[
+                _valid_bot(
+                    use_websocket=True,
+                    intent=QQOfficialIntent(c2c_group_at_messages=False),
+                )
+            ]
         ),
         QQOfficialConfig(qq_bots=[_valid_bot()], qq_verify_webhook=False),
         QQOfficialConfig(
             qq_bots=[
                 _valid_bot(
+                    use_websocket=True,
                     intent=QQOfficialIntent(
                         c2c_group_at_messages=True,
                         open_forum_event=True,
-                    )
+                    ),
                 )
             ]
         ),
@@ -90,6 +97,15 @@ def test_config_validation_rejects_unsafe_enablement(app, monkeypatch) -> None:
         monkeypatch.setattr(nonebot, "get_plugin_config", lambda _, c=config: c)
         with pytest.raises(QQOfficialConfigError):
             validate_qq_official_config()
+
+    # Webhook 模式不校验 intent，空订阅与未支持字段均应放行。
+    for intent in (
+        QQOfficialIntent(c2c_group_at_messages=False),
+        QQOfficialIntent(c2c_group_at_messages=True, open_forum_event=True),
+    ):
+        config = QQOfficialConfig(qq_bots=[_valid_bot(intent=intent)])
+        monkeypatch.setattr(nonebot, "get_plugin_config", lambda _, c=config: c)
+        assert validate_qq_official_config() == config
 
 
 def test_models_use_cross_database_unique_keys_and_no_raw_openid(app) -> None:
@@ -178,11 +194,18 @@ async def test_failed_reply_consumes_sequence_but_not_success_limit(app) -> None
 
 def test_storage_bot_id_namespaces_official_adapter(app) -> None:
     del app
+    from nonebot.adapters.qq import Bot as QQBot
+
     from zhenxun.utils.platform import PlatformUtils
 
-    adapter = SimpleNamespace(get_name=lambda: "QQ")
-    bot = SimpleNamespace(self_id="123", adapter=adapter)
-    assert PlatformUtils.get_storage_bot_id(bot) == "qq_api:123"  # type: ignore[arg-type]
+    # 作用域只认已验证的 QQ 官方 Bot 类型，不再按适配器名称推断。
+    adapter = SimpleNamespace(get_name=lambda: "QQ", config=nonebot.get_driver().config)
+    bot_info = SimpleNamespace(id="123", secret="test-only")
+    bot = QQBot(adapter, "123", bot_info)  # type: ignore[arg-type]
+    assert PlatformUtils.get_storage_bot_id(bot) == "qq_api:123"
+
+    name_only = SimpleNamespace(self_id="123", adapter=adapter)
+    assert PlatformUtils.get_storage_bot_id(name_only) == "123"  # type: ignore[arg-type]
 
 
 @pytest.mark.asyncio
@@ -235,11 +258,14 @@ async def test_webhook_dispatch_ack_deduplicates_and_fails_closed(
     adapter.tasks = set()
     adapter._dispatcher = QQWebhookDispatcher(shard_count=2, capacity=4)
     await adapter._dispatcher.start()
-    adapter.is_ready = lambda: True
+    # Webhook 入口按 webhook_ready() 判定：需数据库就绪且启动准备完成。
+    adapter._startup_prepared = True
+    monkeypatch.setattr(adapter_module._runtime, "database_ready", lambda: True)
+    # 消息类事件改走持久化收件箱；此处覆盖非消息事件的回执去重与分发路径。
     adapter.data_to_payload = lambda bot, content: Dispatch(
-        id="event-1", t="GROUP_AT_MESSAGE_CREATE", d={}
+        id="event-1", t="GROUP_ADD_ROBOT", d={}
     )
-    event = SimpleNamespace()
+    event = SimpleNamespace(get_type=lambda: "notice")
     adapter.payload_to_event = lambda payload: event
     adapter._check_signature = lambda bot, request: None
     adapter.bot_connect = lambda bot: adapter.bots.__setitem__(bot.self_id, bot)
@@ -341,6 +367,8 @@ async def test_runtime_connects_when_database_is_ready_before_adapter(
     connected = 0
 
     class FakeAdapter:
+        _dispatcher = SimpleNamespace(stop=_no_op_args)
+
         async def connect_prepared_bots(self) -> None:
             nonlocal connected
             connected += 1
@@ -371,6 +399,8 @@ async def test_runtime_connects_when_adapter_is_prepared_before_database(
     connected = 0
 
     class FakeAdapter:
+        _dispatcher = SimpleNamespace(stop=_no_op_args)
+
         async def connect_prepared_bots(self) -> None:
             nonlocal connected
             connected += 1

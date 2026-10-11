@@ -8,8 +8,11 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import shlex
 from typing import TYPE_CHECKING, Annotated, Any, Literal
 
+from packaging.requirements import InvalidRequirement, Requirement
+from packaging.utils import canonicalize_name
 from pydantic import BaseModel, ConfigDict, Field
 
 from zhenxun.services.ai.utils.logger import log_sandbox as logger
@@ -101,6 +104,62 @@ class BaseSetupStep(BaseModel, ABC):
         pass
 
 
+_APT_PACKAGE = re.compile(r"^[a-z0-9][a-z0-9+.-]*$")
+_NODE_PACKAGE = re.compile(
+    r"^(?:@[a-z0-9][a-z0-9._-]*/)?[a-z0-9][a-z0-9._-]*(?:@[A-Za-z0-9.^~<>=*|+ -]+)?$"
+)
+
+
+def _setup_error(kind: str, result: Any) -> Exception:
+    """构造依赖装配失败异常
+
+    参数:
+        kind: 依赖类型
+        result: 安装命令的执行结果
+
+    返回:
+        Exception: 沙箱致命错误
+    """
+    from zhenxun.services.ai.core.exceptions import SandboxFatalError
+
+    return SandboxFatalError(
+        f"{kind} 依赖安装失败 (Exit Code: {result.exit_code}): "
+        f"{result.stderr or result.error}"
+    )
+
+
+def _shell_arguments(values: list[str]) -> str:
+    """将包名逐个转义后拼接为 shell 参数
+
+    参数:
+        values: 包名或依赖声明
+
+    返回:
+        str: 可安全放入 shell 命令的参数串
+    """
+    return " ".join(shlex.quote(value) for value in values)
+
+
+def _validated(kind: str, values: list[str], pattern: re.Pattern[str]) -> list[str]:
+    """校验依赖名格式，拒绝可能被解释为 shell 语法或安装器参数的输入
+
+    参数:
+        kind: 依赖类型
+        values: 依赖名
+        pattern: 允许的格式
+
+    返回:
+        list[str]: 去除首尾空白后的依赖名
+    """
+    from zhenxun.services.ai.core.exceptions import SandboxFatalError
+
+    result = [value.strip() for value in values if value.strip()]
+    for value in result:
+        if not pattern.fullmatch(value):
+            raise SandboxFatalError(f"{kind} 依赖名不合法: {value[:80]}")
+    return result
+
+
 class AptSetup(BaseSetupStep):
     type: Literal["apt"] = "apt"
     packages: list[str]
@@ -119,20 +178,21 @@ class AptSetup(BaseSetupStep):
                         pkg_name = parts[1].split(":")[0].strip().lower()
                         installed_pkgs.add(pkg_name)
 
-        missing_packages = [
-            pkg for pkg in self.packages if pkg.strip().lower() not in installed_pkgs
-        ]
+        packages = _validated("Apt", self.packages, _APT_PACKAGE)
+        missing_packages = [pkg for pkg in packages if pkg not in installed_pkgs]
         if not missing_packages:
             logger.debug(f"[Sandbox] Apt 依赖已全部满足，跳过安装: {self.packages}")
             return
 
-        pkg_str = " ".join(missing_packages)
+        pkg_str = _shell_arguments(missing_packages)
         logger.info(f"[Sandbox] 正在安装缺失的系统级依赖 (Apt): {pkg_str}")
-        await session.run_process(
+        res = await session.run_process(
             "sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq && "
             f"sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq {pkg_str}",
             timeout=300,
         )
+        if res.exit_code != 0:
+            raise _setup_error("Apt", res)
 
 
 class PythonSetup(BaseSetupStep):
@@ -143,25 +203,39 @@ class PythonSetup(BaseSetupStep):
         if not self.packages:
             return
 
+        from zhenxun.services.ai.core.exceptions import SandboxFatalError
+
+        requirements: list[Requirement] = []
+        for raw in self.packages:
+            if not raw.strip():
+                continue
+            try:
+                requirement = Requirement(raw.strip())
+            except InvalidRequirement as error:
+                raise SandboxFatalError(f"Python 依赖声明不合法: {raw[:80]}") from error
+            if requirement.url:
+                raise SandboxFatalError(f"Python 依赖不允许直链: {requirement.name}")
+            requirements.append(requirement)
+
         res = await session.run_process("python3 -m pip freeze", timeout=10)
-        installed_pkgs = set()
+        installed: dict[str, str] = {}
         if res.exit_code == 0:
             for line in res.stdout.splitlines():
-                if "==" not in line and "@" not in line:
-                    continue
-                base_name = re.split(r"[=><~!@\[]", line)[0].strip().lower()
-                installed_pkgs.add(base_name)
+                name, separator, version = line.partition("==")
+                if separator:
+                    installed[canonicalize_name(name.strip())] = version.strip()
 
         missing_packages = [
-            pkg
-            for pkg in self.packages
-            if re.split(r"[=><~!@\[]", pkg)[0].strip().lower() not in installed_pkgs
+            str(requirement)
+            for requirement in requirements
+            if (version := installed.get(canonicalize_name(requirement.name))) is None
+            or not requirement.specifier.contains(version, prereleases=True)
         ]
         if not missing_packages:
             logger.debug(f"[Sandbox] Python 依赖已全部满足，跳过安装: {self.packages}")
             return
 
-        pkg_str = " ".join(missing_packages)
+        pkg_str = _shell_arguments(missing_packages)
         check_uv = await session.run_process("command -v uv")
         if check_uv.exit_code != 0:
             logger.info("[Sandbox] 未检测到 uv，正在极速下载 uv...")
@@ -172,7 +246,9 @@ class PythonSetup(BaseSetupStep):
         res = await session.run_process(f"uv pip install {pkg_str}", timeout=120)
         if res.exit_code != 0:
             logger.warning(f"[Sandbox] uv 安装报错，尝试降级使用 pip: {res.stderr}")
-            await session.run_process(f"pip install {pkg_str} -q", timeout=180)
+            res = await session.run_process(f"pip install {pkg_str} -q", timeout=180)
+            if res.exit_code != 0:
+                raise _setup_error("Python", res)
 
 
 class NodeSetup(BaseSetupStep):
@@ -192,7 +268,7 @@ class NodeSetup(BaseSetupStep):
                     installed_pkgs.add(match.group(1).strip().lower())
 
         missing_packages = []
-        for pkg in self.packages:
+        for pkg in _validated("Node", self.packages, _NODE_PACKAGE):
             base_name = (
                 ("@" + pkg[1:].split("@")[0])
                 if pkg.startswith("@")
@@ -205,19 +281,14 @@ class NodeSetup(BaseSetupStep):
             logger.debug(f"[Sandbox] Node 依赖已全部满足，跳过安装: {self.packages}")
             return
 
-        pkg_str = " ".join(missing_packages)
+        pkg_str = _shell_arguments(missing_packages)
         logger.info(f"[Sandbox] 正在安装缺失的 Node 依赖: {pkg_str}")
         res = await session.run_process(
             f"npm install -g {pkg_str} --no-fund --no-audit --cache /tmp/npm-cache",
             timeout=180,
         )
         if res.exit_code != 0:
-            from zhenxun.services.ai.core.exceptions import SandboxFatalError
-
-            raise SandboxFatalError(
-                f"Node 依赖安装失败 (Exit Code: {res.exit_code}): "
-                f"{res.stderr or res.error}"
-            )
+            raise _setup_error("Node", res)
 
 
 class ShellSetup(BaseSetupStep):

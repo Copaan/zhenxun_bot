@@ -91,9 +91,7 @@ class AgentConfig(BaseRuntimeConfig):
         if isinstance(other, dict):
             other_dict = {k: v for k, v in other.items() if v is not None}
         else:
-            fields_set = getattr(
-                other, "model_fields_set", getattr(other, "__fields_set__", set())
-            )
+            fields_set = getattr(other, "model_fields_set", set())
             other_dict = {}
             for k in fields_set:
                 val = getattr(other, k)

@@ -4,7 +4,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from zhenxun.services.runtime_reload import plugin_runtime_manager
+from zhenxun.services.plugin_host import plugin_host
 from zhenxun.services.startup import startup_coordinator
 
 from ....base_model import Result
@@ -39,7 +39,7 @@ async def get_runtime_status() -> Result[dict[str, Any]]:
 
     return Result.ok(
         {
-            **plugin_runtime_manager.status(),
+            **plugin_host.status(),
             "message_inbox": message_inbox.snapshot(),
             "group_membership_writes": dict(bot_group_policy_service.write_counts),
         }

@@ -119,7 +119,8 @@ class FastEmbedder(BaseLocalEmbedder):
 
         if importlib.util.find_spec("fastembed") is None:
             raise ImportError(
-                "⚠️ 使用 FastEmbed 需要额外依赖，请在终端执行: pip install fastembed"
+                "⚠️ 使用 FastEmbed 需要额外依赖，"
+                "请在 WebUI「插件管理 → 依赖管理」中安装 fastembed"
             )
 
     def _load_model_impl(self) -> Any:
@@ -127,7 +128,8 @@ class FastEmbedder(BaseLocalEmbedder):
             from fastembed import TextEmbedding
         except ImportError:
             raise ImportError(
-                "⚠️ 使用 FastEmbed 需要额外依赖，请在终端执行: pip install fastembed"
+                "⚠️ 使用 FastEmbed 需要额外依赖，"
+                "请在 WebUI「插件管理 → 依赖管理」中安装 fastembed"
             )
         return TextEmbedding(model_name=self.model_name)
 
@@ -151,7 +153,7 @@ class SentenceTransformerEmbedder(BaseLocalEmbedder):
         if importlib.util.find_spec("sentence_transformers") is None:
             raise ImportError(
                 "⚠️ 使用 SentenceTransformers 需要额外依赖，"
-                "请在终端执行: pip install sentence-transformers"
+                "请在 WebUI「插件管理 → 依赖管理」中安装 sentence-transformers"
             )
 
     def _load_model_impl(self) -> Any:
@@ -160,7 +162,7 @@ class SentenceTransformerEmbedder(BaseLocalEmbedder):
         except ImportError:
             raise ImportError(
                 "⚠️ 使用 SentenceTransformers 需要额外依赖，"
-                "请在终端执行: pip install sentence-transformers"
+                "请在 WebUI「插件管理 → 依赖管理」中安装 sentence-transformers"
             )
         return SentenceTransformer(self.model_name)
 

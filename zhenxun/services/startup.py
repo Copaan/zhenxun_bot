@@ -5,9 +5,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import os
 from pathlib import Path
-import platform
 import re
-import sys
 from threading import RLock
 import time
 from typing import Any, Literal
@@ -119,13 +117,10 @@ class StartupCoordinator:
         self._finished_monotonic: float | None = None
         self._state: StartupState = "starting"
         self._stage_started: dict[str, float] = {}
-        self._stage_completed_wall: dict[str, float] = {}
         self._stages: dict[str, dict[str, Any]] = {}
         self._operations: list[OperationRecord] = []
-        self._errors: list[dict[str, str]] = []
         self._degraded_reasons: list[dict[str, str]] = []
         self._diagnostics: list[StartupDiagnostic] = []
-        self._lifecycle_diagnostics: list[dict[str, Any]] = []
         self._current_operation: dict[str, Any] | None = None
         self._load_planner: Any | None = None
         self._management_complete = False
@@ -137,7 +132,6 @@ class StartupCoordinator:
         self._runtime_event: asyncio.Event | None = None
         self._warmup_event: asyncio.Event | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
-        self._state_writer = None
 
     @property
     def state(self) -> StartupState:
@@ -154,19 +148,9 @@ class StartupCoordinator:
 
     @staticmethod
     def _business_allowed() -> bool:
-        from zhenxun.migration.validation import validation_gate
+        from zhenxun.services.migration.validation import validation_gate
 
         return validation_gate.business_allowed
-
-    @property
-    def final_business_ready(self) -> bool:
-        with self._lock:
-            return (
-                self._business_allowed()
-                and self._stages.get("runtime", {}).get("state") == "completed"
-                and self._stages.get("warmup", {}).get("state") == "completed"
-                and self._state in {"warmup_ready", "degraded"}
-            )
 
     def begin_stage(self, stage: StartupStage) -> None:
         with self._lock:
@@ -181,7 +165,6 @@ class StartupCoordinator:
                 "state": "completed",
                 "duration_ms": round((time.monotonic() - started) * 1000, 2),
             }
-            self._stage_completed_wall[stage] = time.time()
             if stage == "management":
                 self._management_complete = True
                 if self._server_bound:
@@ -190,7 +173,7 @@ class StartupCoordinator:
                 self._state = "runtime_ready"
                 self._set_event(self._runtime_event)
             else:
-                self._state = "warmup_ready" if not self._errors else "degraded"
+                self._state = "degraded" if self._degraded_reasons else "warmup_ready"
                 if self._finished_monotonic is None:
                     self._finished_monotonic = time.monotonic()
                 self._set_event(self._warmup_event)
@@ -232,12 +215,6 @@ class StartupCoordinator:
                 "duration_ms": round((time.monotonic() - started) * 1000, 2),
                 "error_code": error_code,
             }
-            self._stage_completed_wall[stage] = time.time()
-            # 不要复用 error 变量名：诊断负载需要原始异常来给出错误类型，
-            # 被字典覆盖后只会输出无意义的 "dict"。
-            item = {"stage": stage, "code": error_code}
-            if item not in self._errors:
-                self._errors.append(item)
             added = self._append_degraded_reason_locked(
                 stage,
                 error_code,
@@ -300,22 +277,31 @@ class StartupCoordinator:
             self._load_planner = planner
         self._persist_throttled(force=True)
 
-    def mark_plugins_recovered(self, owners: set[str], generation: int) -> None:
+    def clear_plugin_failures(self, owners: set[str]) -> None:
+        """移除已恢复插件的降级原因，全部恢复后回到 warmup_ready
+
+        参数:
+            owners: 已恢复的插件 id
+        """
         with self._lock:
-            for diagnostic in self._diagnostics:
-                if (
-                    diagnostic.source_type == "plugin"
-                    and diagnostic.source_id in owners
-                ):
-                    diagnostic.details.update(
-                        recovered=True, recovered_generation=generation
-                    )
-            for reason in self._degraded_reasons:
-                if (
-                    reason.get("source_type") == "plugin"
-                    and reason.get("source_id") in owners
-                ):
-                    reason.update(recovered=True, recovered_generation=generation)
+            self._degraded_reasons = [
+                reason
+                for reason in self._degraded_reasons
+                if reason["source_type"] != "plugin"
+                or reason["source_id"] not in owners
+            ]
+            self._diagnostics = [
+                item
+                for item in self._diagnostics
+                if item.source_type != "plugin" or item.source_id not in owners
+            ]
+            if (
+                self._state == "degraded"
+                and not self._degraded_reasons
+                and self._stages.get("warmup", {}).get("state") == "completed"
+            ):
+                self._state = "warmup_ready"
+        self.persist()
 
     def record_error(
         self,
@@ -327,11 +313,7 @@ class StartupCoordinator:
         display_name: str | None = None,
         error: BaseException | None = None,
     ) -> None:
-        added = False
         with self._lock:
-            item = {"stage": stage, "code": error_code}
-            if item not in self._errors:
-                self._errors.append(item)
             added = self._append_degraded_reason_locked(
                 stage,
                 error_code,
@@ -422,92 +404,6 @@ class StartupCoordinator:
             )
             if error is not None:
                 error._startup_trace_logged = True
-        except Exception:
-            pass
-
-    def record_lifecycle_event(self, event: dict[str, Any]) -> None:
-        component = event.get("component") or {}
-        component_id = str(component.get("component_id") or "unknown")
-        state = str(component.get("state") or event.get("event") or "unknown")
-        action = (event.get("operation") or {}).get("action")
-        if action in {"stop", "health_check", "rebuild"}:
-            if state in {"failed", "degraded"}:
-                self._record_lifecycle_diagnostic(event)
-            return
-        with self._lock:
-            self._current_operation = (
-                {
-                    "name": component_id,
-                    "stage": str(component.get("stage") or "runtime"),
-                    "state": state,
-                }
-                if state in {"starting", "quiescing", "stopping"}
-                else None
-            )
-        if state in {"degraded", "failed"}:
-            error_code = str(
-                component.get("error_code")
-                or event.get("error_code")
-                or f"component_{state}"
-            )
-            self.record_error(
-                str(component.get("stage") or "runtime"),
-                error_code,
-                source_type="component",
-                source_id=component_id,
-                display_name=component_id,
-            )
-        self._persist_throttled(force=state in {"failed", "degraded"})
-
-    def _record_lifecycle_diagnostic(self, event: dict[str, Any]) -> None:
-        component = event.get("component") or {}
-        operation = event.get("operation") or {}
-        diagnostic = (component.get("metadata") or {}).get("stop_diagnostic") or {}
-        source = _sanitize_diagnostic_text(
-            component.get("component_id", "unknown"), limit=120
-        )
-        code = _sanitize_diagnostic_text(
-            component.get("error_code", "component_failed"), limit=120
-        )
-        operation_id = operation.get("operation_id") or diagnostic.get("operation_id")
-        identity = (source, code, operation.get("action"), operation_id)
-        with self._lock:
-            if any(
-                tuple(item["identity"]) == identity
-                for item in self._lifecycle_diagnostics
-            ):
-                return
-            item = {
-                "identity": list(identity),
-                "diagnostic_id": diagnostic.get("diagnostic_id")
-                or f"diag-{uuid.uuid4().hex[:12]}",
-                "occurred_at": diagnostic.get("occurred_at")
-                or datetime.now(timezone.utc).isoformat(),
-                "action": operation.get("action"),
-                "component_id": source,
-                "code": code,
-                "failure_stage": _sanitize_diagnostic_text(
-                    event.get("failure_stage") or "unknown"
-                ),
-                "resources": {
-                    _sanitize_diagnostic_text(key, limit=100): value
-                    for key, value in (diagnostic.get("resources") or {}).items()
-                },
-            }
-            self._lifecycle_diagnostics.append(item)
-            self._lifecycle_diagnostics = self._lifecycle_diagnostics[-100:]
-        try:
-            from zhenxun.services.log import logger
-
-            label = (
-                "生命周期关闭异常" if item["action"] == "stop" else "生命周期运行异常"
-            )
-            logger.error(
-                f"{label} | diagnostic_id={item['diagnostic_id']} | "
-                f"component={source} | stage={item['failure_stage']} | "
-                f"code={code} | resources={item['resources']}",
-                "Lifecycle",
-            )
         except Exception:
             pass
 
@@ -608,13 +504,15 @@ class StartupCoordinator:
                     2,
                 ),
                 "stages": dict(self._stages),
-                "errors": list(self._errors),
+                "errors": [
+                    {"stage": item["stage"], "code": item["code"]}
+                    for item in self._degraded_reasons
+                ],
                 "degraded_reasons": list(self._degraded_reasons),
                 "slow_operations": slow,
                 "current_operation": dict(self._current_operation)
                 if self._current_operation
                 else None,
-                "persistence": self.persistence_status(),
                 "server_bound": self._server_bound,
                 "operating_mode": (
                     "migration_validation"
@@ -628,76 +526,23 @@ class StartupCoordinator:
                 "accepts_bot_events": self.runtime_ready,
                 "failure_terminal": self._state == "failed",
                 "setup_required": self._setup_required,
-                "python": {
-                    "version": platform.python_version(),
-                    "implementation": platform.python_implementation(),
-                },
             }
             if self._load_planner is not None:
                 result["load_plan"] = self._load_planner.summary()
             try:
                 from zhenxun.services.lifecycle import lifecycle_kernel
 
-                lifecycle = lifecycle_kernel.status()
                 result["running_operations"] = [
                     {
-                        **item,
-                        "name": item.get("component_id"),
-                        "stage": (
-                            lifecycle_kernel.component_status(
-                                item.get("component_id", "")
-                            )
-                            or {}
-                        ).get("stage", "warmup"),
+                        "name": item["component_id"],
+                        "component_id": item["component_id"],
+                        "stage": item["stage"],
                     }
-                    for item in lifecycle.get("current_operations", [])
-                    if item.get("action") in {"start", "rebuild"}
+                    for item in lifecycle_kernel.status()["components"]
+                    if item["state"] == "starting"
                 ]
-                result["lifecycle"] = {
-                    key: value
-                    for key, value in lifecycle.items()
-                    if key != "components"
-                }
             except Exception:
                 pass
-            try:
-                from zhenxun.services.message_load import (
-                    db_unhealthy_reason,
-                    is_db_unhealthy,
-                )
-
-                cache_module = sys.modules.get("zhenxun.services.cache.runtime_cache")
-                watchdog_module = sys.modules.get(
-                    "zhenxun.services.db_context.watchdog"
-                )
-                result["database_health"] = {
-                    "unhealthy": is_db_unhealthy(),
-                    "reason": db_unhealthy_reason(),
-                    "runtime_cache": (
-                        cache_module.refresh_coordinator_snapshot()
-                        if cache_module is not None
-                        else {"running": False, "state": "not_loaded"}
-                    ),
-                    "watchdog": (
-                        watchdog_module.watchdog_snapshot()
-                        if watchdog_module is not None
-                        else {"running": False, "state": "not_loaded"}
-                    ),
-                }
-            except Exception:
-                pass
-            for stage, completed_at in self._stage_completed_wall.items():
-                for key, prefix in (
-                    ("ZHENXUN_LAUNCHER_STARTED_AT", "launcher"),
-                    ("ZHENXUN_WORKER_SPAWNED_AT", "worker"),
-                ):
-                    try:
-                        started_at = float(os.getenv(key, ""))
-                    except ValueError:
-                        continue
-                    result[f"{prefix}_{stage}_ready_ms"] = round(
-                        (completed_at - started_at) * 1000, 2
-                    )
             return result
 
     def report(self) -> dict[str, Any]:
@@ -705,17 +550,6 @@ class StartupCoordinator:
         with self._lock:
             result["operations"] = [asdict(item) for item in self._operations]
             result["diagnostics"] = [asdict(item) for item in self._diagnostics]
-            result["lifecycle_diagnostics"] = [
-                dict(item) for item in self._lifecycle_diagnostics
-            ]
-            if self._load_planner is not None:
-                result["load_plan"] = self._load_planner.summary(detail=True)
-        try:
-            from zhenxun.services.lifecycle import lifecycle_kernel
-
-            result["lifecycle"] = lifecycle_kernel.status()
-        except Exception:
-            pass
         return result
 
     def _persist_throttled(self, *, force: bool = False) -> None:
@@ -727,42 +561,12 @@ class StartupCoordinator:
         self.persist()
 
     def persist(self) -> None:
-        if self._state_writer is not None:
-            self._state_writer.mark_dirty()
-            return
         try:
-            asyncio.get_running_loop()
-        except RuntimeError:
+            write_json_locked(_REPORT_PATH, self.snapshot(), timeout=0.2)
+        except (OSError, TimeoutError):
             pass
-        else:
-            from zhenxun.services.lifecycle.diagnostics import LifecycleStateWriter
-
-            self._state_writer = LifecycleStateWriter(_REPORT_PATH, self.snapshot)
-            self._state_writer.mark_dirty()
-            return
-        try:
-            write_json_locked(_REPORT_PATH, self.snapshot())
-        except OSError:
-            pass
-
-    def persistence_status(self) -> dict[str, Any]:
-        if self._state_writer is None:
-            return {"mode": "synchronous", "pending": False}
-        return {"mode": "managed", **self._state_writer.status()}
-
-    async def finish_persistence(self, timeout: float) -> bool:
-        if self._state_writer is None:
-            return True
-        return await self._state_writer.close(timeout)
 
 
 startup_coordinator = StartupCoordinator()
-
-try:
-    from zhenxun.services.lifecycle import lifecycle_kernel
-
-    lifecycle_kernel.add_observer(startup_coordinator.record_lifecycle_event)
-except Exception:
-    pass
 
 __all__ = ["StartupCoordinator", "StartupDiagnostic", "startup_coordinator"]

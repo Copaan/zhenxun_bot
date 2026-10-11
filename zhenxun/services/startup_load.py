@@ -4,14 +4,10 @@ import ast
 import asyncio
 from collections import defaultdict
 from collections.abc import Callable, Iterable
-from contextlib import contextmanager
-from contextvars import ContextVar
 from dataclasses import dataclass, field
-from functools import wraps
 import hashlib
 import importlib.util
 from pathlib import Path
-import sys
 import time
 from typing import Any
 
@@ -24,7 +20,7 @@ from .startup import startup_coordinator
 
 _INDEX_PATH = Path("data/runtime/startup-load-index-v1.json")
 _RECORD_VERSION = 6
-_CORE_BUILTINS = {"hooks", "init", "web_ui"}
+_CORE_BUILTINS = {"hooks", "init", "migration", "nonebot_store", "web_ui"}
 _PREBIND_HOOK_PREFIXES = (
     "nonebot_plugin_orm",
     "nonebot.drivers",
@@ -336,24 +332,6 @@ class PlannedPlugin:
     status: str = "pending"
     duration_ms: float | None = None
 
-    def public_dict(self, *, detail: bool = False) -> dict[str, Any]:
-        result: dict[str, Any] = {
-            "source": self.source,
-            "plugin_id": self.plugin_id,
-            "module": self.module_name,
-            "phase": self.phase,
-            "status": self.status,
-            "reasons": sorted(self.reasons),
-            "duration_ms": self.duration_ms,
-            "cache_hits": self.cache_hits,
-            "scanned_files": self.scanned_files,
-            "fingerprint": self.fingerprint[:12],
-        }
-        if detail:
-            result["dependencies"] = sorted(self.dependencies)
-            result["requires"] = sorted(self.requires)
-        return result
-
 
 @dataclass(slots=True)
 class NativeHook:
@@ -371,10 +349,7 @@ class StartupLoadPlanner:
         self.fingerprint = ""
         self.prepared = False
         self._file_lookup: dict[str, dict[str, Any]] = {}
-        self.warming_plugins: set[str] = set()
-        self._warmup_hook_counts: dict[str, int] = {}
         self.dependency_cycles: list[list[str]] = []
-        self._recovery_preview = ContextVar("plugin_recovery_preview", default=None)
 
     def reset(self) -> None:
         self.entries.clear()
@@ -384,8 +359,6 @@ class StartupLoadPlanner:
         self.fingerprint = ""
         self.prepared = False
         self._file_lookup.clear()
-        self.warming_plugins.clear()
-        self._warmup_hook_counts.clear()
         self.dependency_cycles.clear()
 
     def prepare(self, roots: Iterable[tuple[str, Path]]) -> None:
@@ -440,7 +413,7 @@ class StartupLoadPlanner:
             for path, record in entry.file_records.items()
         }
         self.prepared = True
-        self._persist_index()
+        self._persist_index(cached_data)
         startup_coordinator.set_load_plan(self)
 
     @staticmethod
@@ -497,6 +470,12 @@ class StartupLoadPlanner:
         entry.dependencies = imports
         entry.fingerprint = digest.hexdigest()
         entry.file_records = records
+        if isinstance(cached, dict) and cached.get("fingerprint") == entry.fingerprint:
+            entry.reasons.update(
+                str(reason)
+                for reason in cached.get("reasons", [])
+                if str(reason).startswith("classification_miss")
+            )
 
     def _resolve_dependencies(self) -> None:
         module_to_id = {
@@ -582,9 +561,11 @@ class StartupLoadPlanner:
                 result.append(plugin_id)
         return result
 
-    def load_critical(self) -> None:
+    def load_critical(self, *, management_only: bool = False) -> None:
         for plugin_id in self.order:
             entry = self.entries[plugin_id]
+            if management_only and "core_builtin" not in entry.reasons:
+                continue
             if entry.phase == "critical_preload":
                 self._load_entry(entry)
 
@@ -596,6 +577,8 @@ class StartupLoadPlanner:
         import nonebot
 
         for library in ("nonebot_plugin_localstore", "nonebot_plugin_orm"):
+            if importlib.util.find_spec(library) is None:
+                continue
             try:
                 nonebot.require(library)
             except Exception as error:
@@ -633,70 +616,6 @@ class StartupLoadPlanner:
                 await asyncio.sleep(0)
         await self._run_native_hooks()
 
-    def instrument_prebind_hooks(self, driver: Any) -> None:
-        for hook_type, registry in (
-            ("startup", driver._lifespan._startup_funcs),
-            ("ready", driver._lifespan._ready_funcs),
-        ):
-            for index, func in enumerate(list(registry)):
-                if getattr(func, "__zhenxun_startup_profiled__", False):
-                    continue
-                name = (
-                    f"native_prebind_{hook_type}:"
-                    f"{getattr(func, '__module__', 'unknown')}:"
-                    f"{getattr(func, '__name__', '?')}"
-                )
-                if is_coroutine_callable(func):
-
-                    @wraps(func)
-                    async def async_profiled(_func=func, _name=name):
-                        startup_coordinator.begin_operation(_name, "management")
-                        started = time.monotonic()
-                        state = "completed"
-                        error_code = None
-                        try:
-                            return await _func()
-                        except Exception as error:
-                            state = "failed"
-                            error_code = f"native_hook_failed:{type(error).__name__}"
-                            raise
-                        finally:
-                            startup_coordinator.record_operation(
-                                _name,
-                                "management",
-                                state,
-                                (time.monotonic() - started) * 1000,
-                                error_code=error_code,
-                            )
-
-                    profiled = async_profiled
-                else:
-
-                    @wraps(func)
-                    def sync_profiled(_func=func, _name=name):
-                        startup_coordinator.begin_operation(_name, "management")
-                        started = time.monotonic()
-                        state = "completed"
-                        error_code = None
-                        try:
-                            return _func()
-                        except Exception as error:
-                            state = "failed"
-                            error_code = f"native_hook_failed:{type(error).__name__}"
-                            raise
-                        finally:
-                            startup_coordinator.record_operation(
-                                _name,
-                                "management",
-                                state,
-                                (time.monotonic() - started) * 1000,
-                                error_code=error_code,
-                            )
-
-                    profiled = sync_profiled
-                setattr(profiled, "__zhenxun_startup_profiled__", True)
-                registry[index] = profiled
-
     def _load_entry(self, entry: PlannedPlugin) -> None:
         if entry.status != "pending":
             return
@@ -704,24 +623,11 @@ class StartupLoadPlanner:
         before_startup = set(driver._lifespan._startup_funcs)
         before_ready = set(driver._lifespan._ready_funcs)
         before_models: list[str] = []
-        before_routes: list[Any] = []
         before_adapters = dict(getattr(driver, "_adapters", {}))
-        before_plugins: set[str] = set()
-        before_matchers: set[type] = set()
         if entry.phase == "runtime_load":
-            from nonebot.matcher import matchers
-            from nonebot.plugin import get_loaded_plugins
-
             from zhenxun.services.db_context.config import db_model
 
             before_models = list(db_model.models)
-            before_routes = list(getattr(__import__("nonebot").get_app(), "routes", []))
-            before_plugins = {plugin.id_ for plugin in get_loaded_plugins()}
-            before_matchers = {
-                matcher
-                for priority_matchers in matchers.values()
-                for matcher in priority_matchers
-            }
         startup_coordinator.begin_operation(
             f"plugin_import:{entry.plugin_id}",
             "worker" if entry.phase == "critical_preload" else "runtime",
@@ -747,17 +653,7 @@ class StartupLoadPlanner:
             elif dict(getattr(driver, "_adapters", {})) != before_adapters:
                 classification_miss = "classification_miss:adapter_registration"
             if classification_miss:
-                self._rollback_classification_miss(
-                    entry,
-                    before_models,
-                    before_routes,
-                    before_adapters,
-                    before_plugins,
-                    before_matchers,
-                )
-                entry.reasons.add(classification_miss)
-                entry.status = "failed"
-                self.mark_failed(entry.plugin_id, classification_miss)
+                self._handle_classification_miss(entry, classification_miss)
                 result = None
         self._capture_native_hooks(
             entry,
@@ -774,58 +670,23 @@ class StartupLoadPlanner:
             details={"plugin_id": entry.plugin_id, "phase": entry.phase},
         )
 
-    @staticmethod
-    def _rollback_classification_miss(
-        entry: PlannedPlugin,
-        before_models: list[str],
-        before_routes: list[Any],
-        before_adapters: dict[str, Any],
-        before_plugins: set[str],
-        before_matchers: set[type],
-    ) -> None:
-        import nonebot
-        from nonebot.matcher import matchers
-        from nonebot.plugin import get_loaded_plugins
+    def _handle_classification_miss(self, entry: PlannedPlugin, reason: str) -> None:
+        """插件需要在 HTTP 绑定前加载却被分到运行期：停用并登记重启
 
-        from zhenxun.services.db_context.config import db_model
-        from zhenxun.services.runtime_reload.compat import (
-            clean_matchers,
-            remove_driver_hooks,
-            remove_plugin_init,
-            remove_plugins,
-            remove_priority_hooks,
-            remove_processors,
+        参数:
+            entry: 插件加载项
+            reason: 遗漏原因
+        """
+        from zhenxun.services.plugin_host.host import plugin_host
+
+        entry.reasons.add(reason)
+        self.mark_failed(entry.plugin_id, reason)
+        self._persist_index()
+        plugin_host.pending_restart.add("plugin_classification_miss")
+        nonebot_logger.warning(
+            f"插件 {entry.plugin_id} 需要在启动早期加载（{reason}），"
+            "已暂停使用，重启后生效"
         )
-
-        current_matchers = {
-            matcher
-            for priority_matchers in matchers.values()
-            for matcher in priority_matchers
-        }
-        clean_matchers(current_matchers - before_matchers)
-        new_plugins = [
-            plugin
-            for plugin in get_loaded_plugins()
-            if plugin.id_ not in before_plugins
-        ]
-        module_names = {plugin.module_name for plugin in new_plugins} | {
-            entry.module_name
-        }
-        remove_processors(module_names)
-        remove_driver_hooks(nonebot.get_driver(), module_names)
-        remove_priority_hooks(module_names)
-        remove_plugin_init(module_names)
-        remove_plugins(new_plugins)
-        app = nonebot.get_app()
-        app.routes[:] = before_routes
-        db_model.models[:] = before_models
-        adapters = getattr(nonebot.get_driver(), "_adapters", None)
-        if isinstance(adapters, dict):
-            adapters.clear()
-            adapters.update(before_adapters)
-        for name in list(sys.modules):
-            if name == entry.module_name or name.startswith(f"{entry.module_name}."):
-                sys.modules.pop(name, None)
 
     def _capture_native_hooks(
         self,
@@ -886,7 +747,7 @@ class StartupLoadPlanner:
                 details={"plugin_id": hook.owner, "hook_type": hook.hook_type},
             )
 
-    def summary(self, *, detail: bool = False) -> dict[str, Any]:
+    def summary(self) -> dict[str, Any]:
         counts = defaultdict(int)
         status_counts = {"loaded": 0, "failed": 0, "pending": 0}
         completed = 0
@@ -901,7 +762,7 @@ class StartupLoadPlanner:
                 else "pending"
             )
             status_counts[state] += 1
-        result: dict[str, Any] = {
+        return {
             "fingerprint": self.fingerprint,
             "counts": dict(counts),
             "status_counts": status_counts,
@@ -914,12 +775,6 @@ class StartupLoadPlanner:
                 entry.scanned_files for entry in self.entries.values()
             ),
         }
-        if detail:
-            result["plugins"] = [
-                self.entries[plugin_id].public_dict(detail=True)
-                for plugin_id in self.order
-            ]
-        return result
 
     def owner_for_module(self, module_name: str) -> str | None:
         best: tuple[int, str] | None = None
@@ -936,13 +791,6 @@ class StartupLoadPlanner:
         return self._file_lookup.get(str(path))
 
     def plugin_available(self, module_name: str) -> bool:
-        preview = self._recovery_preview.get()
-        if preview is not None and module_name in preview[1]:
-            try:
-                if asyncio.current_task() is preview[0]:
-                    return True
-            except RuntimeError:
-                pass
         owner = self.owner_for_module(module_name)
         if owner in self.failed_plugins or module_name in self.failed_plugins:
             return False
@@ -975,70 +823,38 @@ class StartupLoadPlanner:
             error=error,
         )
 
-    @contextmanager
-    def preview_runtime_recovery(self, module_names: set[str]):
-        token = self._recovery_preview.set(
-            (asyncio.current_task(), frozenset(module_names))
-        )
-        try:
-            yield
-        finally:
-            self._recovery_preview.reset(token)
-
     def commit_runtime_recovery(
         self,
         module_names: set[str],
-        generation: int,
         *,
         plugin_ids: set[str] | None = None,
     ) -> None:
-        # Historical startup diagnostics stay intact; only current admission is
-        # changed after the replacement generation has fully initialized.
+        """热重载成功后恢复插件可用状态并清除其降级原因
+
+        参数:
+            module_names: 重新加载的模块
+            plugin_ids: 重新加载的插件 id
+        """
         owners = {
             owner for name in module_names if (owner := self.owner_for_module(name))
         } | (plugin_ids or set())
         for owner in owners:
             self.failed_plugins.discard(owner)
-            self.warming_plugins.discard(owner)
-            self._warmup_hook_counts.pop(owner, None)
             if entry := self.entries.get(owner):
                 entry.status = "loaded"
         self.failed_plugins.difference_update(module_names)
-        startup_coordinator.mark_plugins_recovered(owners, generation)
-
-    def prepare_warmup_gates(self) -> None:
-        from zhenxun.utils.enum import PriorityLifecycleType
-        from zhenxun.utils.manager.priority_manager import HookSpec, PriorityLifecycle
-
-        counts: dict[str, int] = defaultdict(int)
-        priority_data = PriorityLifecycle._data.get(PriorityLifecycleType.STARTUP, {})
-        for funcs in priority_data.values():
-            for func in funcs:
-                spec = PriorityLifecycle._metadata.get(func, HookSpec())
-                if spec.stage != "warmup":
-                    continue
-                owner = self.owner_for_module(str(getattr(func, "__module__", "")))
-                if owner:
-                    counts[owner] += 1
-        self._warmup_hook_counts = counts
-        self.warming_plugins = set(counts)
-
-    def finish_warmup_hook(self, module_name: str) -> None:
-        owner = self.owner_for_module(module_name)
-        if owner is None:
-            return
-        remaining = self._warmup_hook_counts.get(owner, 0) - 1
-        if remaining > 0:
-            self._warmup_hook_counts[owner] = remaining
-            return
-        self._warmup_hook_counts.pop(owner, None)
-        self.warming_plugins.discard(owner)
+        startup_coordinator.clear_plugin_failures(owners)
 
     def is_core_plugin(self, plugin_id: str) -> bool:
         entry = self.entries.get(plugin_id)
         return bool(entry and entry.source == "builtin" and plugin_id in _CORE_BUILTINS)
 
-    def _persist_index(self) -> None:
+    def _persist_index(self, previous: dict[str, Any] | None = None) -> None:
+        """写入插件加载索引，内容未变化时跳过
+
+        参数:
+            previous: 启动时读到的旧索引
+        """
         plugins: dict[str, Any] = {}
         for plugin_id, entry in self.entries.items():
             plugins[plugin_id] = {
@@ -1049,14 +865,13 @@ class StartupLoadPlanner:
                 "reasons": sorted(entry.reasons),
                 "files": entry.file_records,
             }
-        write_json_locked(
-            _INDEX_PATH,
-            {
-                "version": 2,
-                "fingerprint": self.fingerprint,
-                "plugins": plugins,
-            },
-        )
+        payload = {
+            "version": 2,
+            "fingerprint": self.fingerprint,
+            "plugins": plugins,
+        }
+        if payload != previous:
+            write_json_locked(_INDEX_PATH, payload)
 
 
 startup_load_planner = StartupLoadPlanner()

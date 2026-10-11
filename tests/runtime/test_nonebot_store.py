@@ -1,12 +1,24 @@
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
 from typing import Any, ClassVar
 
 import httpx
 import pytest
 
-from zhenxun.nonebot_store import dependencies, registry, runtime, storage
+from zhenxun.services.nonebot_store import (
+    dependencies,
+    environment,
+    registry,
+    runtime,
+    storage,
+)
+from zhenxun.services.nonebot_store.environment import EnvironmentSnapshot
+from zhenxun.services.plugin_store import (
+    plugin_archive_dependencies,
+    plugin_store_transaction,
+)
 
 
 def test_orm_migration_import_does_not_require_plugin_private_sqlalchemy() -> None:
@@ -21,7 +33,7 @@ class BlockSqlalchemy(importlib.abc.MetaPathFinder):
         return None
 
 sys.meta_path.insert(0, BlockSqlalchemy())
-import zhenxun.nonebot_store.orm_migration
+import zhenxun.services.nonebot_store.orm_migration
 """
     completed = subprocess.run(
         [sys.executable, "-c", code],
@@ -53,7 +65,7 @@ def test_nonebot_hot_apply_info_matches_action(action: str, expected: str) -> No
 def test_orm_migration_loads_only_operations_that_own_models(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from zhenxun.nonebot_store import orm_migration, runtime
+    from zhenxun.services.nonebot_store import orm_migration, runtime
 
     loaded: list[str] = []
     monkeypatch.setattr(runtime, "_load_managed_plugin", loaded.append)
@@ -215,6 +227,7 @@ def test_stage_generation_does_not_switch_active_manifest(
     monkeypatch.setattr(storage, "PENDING_FILE", pending_file)
     monkeypatch.setattr(storage, "LAYER_ROOT", layer_root)
     monkeypatch.setattr(runtime, "PENDING_FILE", pending_file)
+    (generation / "marker.txt").write_text("layer", encoding="utf-8")
     storage.save_manifest({**storage.default_manifest(), "active_generation": 1})
     transaction = {
         "target_manifest": {
@@ -222,17 +235,34 @@ def test_stage_generation_does_not_switch_active_manifest(
             "active_generation": 1,
         }
     }
-
-    runtime.stage_generation(
-        transaction,
-        {
-            "generation": 2,
-            "path": generation,
-            "digest": "digest",
-            "native_extensions": [],
-        },
+    # 隔离真实归档回执与真实 .venv：暂存只需证明候选代已通过校验
+    monkeypatch.setattr(
+        plugin_archive_dependencies,
+        "archive_dependency_contract",
+        lambda: {"packages": {}, "requirements": []},
     )
+    monkeypatch.setattr(plugin_store_transaction, "_read_pending", lambda: None)
+    validated: list[Path] = []
+    monkeypatch.setattr(
+        environment,
+        "validate_candidate",
+        lambda path, _transaction: validated.append(path),
+    )
+    build = {
+        "generation": 2,
+        "path": generation,
+        "digest": runtime._layer_digest(generation),
+        "native_extensions": [],
+    }
 
+    # 摘要与构建结果不一致的代不得被暂存
+    with pytest.raises(runtime.LayerBuildError, match="layer_state_mismatch"):
+        runtime.stage_generation(dict(transaction), {**build, "digest": "stale"})
+    assert storage.pending_transaction() is None
+
+    runtime.stage_generation(transaction, build)
+
+    assert validated == [generation]
     assert storage.load_manifest()["active_generation"] == 1
     assert storage.pending_transaction()["generation"] == 2
     assert storage.pending_transaction()["state"] == "pending_restart"
@@ -241,7 +271,7 @@ def test_stage_generation_does_not_switch_active_manifest(
 def test_managed_orm_sqlite_backup_can_restore(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from zhenxun.nonebot_store import orm_migration
+    from zhenxun.services.nonebot_store import orm_migration
 
     database = tmp_path / "plugin.sqlite3"
     with orm_migration.sqlite3.connect(database) as connection:
@@ -312,6 +342,39 @@ def test_safe_plugin_import_failure_extracts_only_validation_paths() -> None:
     }
 
 
+def _fake_snapshot(
+    base: dict[str, str],
+    *,
+    layer: dict[str, str] | None = None,
+    manifest: dict[str, Any] | None = None,
+) -> EnvironmentSnapshot:
+    """构造无冲突的环境快照，隔离真实 .venv 中的分发与依赖冲突。"""
+    base_dists = {name: SimpleNamespace(version=v) for name, v in base.items()}
+    layer_dists = {
+        name: SimpleNamespace(version=v) for name, v in (layer or {}).items()
+    }
+    selected = {**base_dists, **layer_dists}
+    return EnvironmentSnapshot(
+        manifest=manifest if manifest is not None else storage.default_manifest(),
+        base=base_dists,
+        layer=layer_dists,
+        selected=selected,
+        declarations=[],
+        conflicts=[],
+        sources={
+            name: {
+                "version": dist.version,
+                "layer": "active_generation" if name in layer_dists else "base",
+                "path": f"site-packages/{name}",
+            }
+            for name, dist in selected.items()
+        },
+        duplicates={},
+        loaded_mismatches=[],
+        digest="fake",
+    )
+
+
 def _registry_entry(**overrides: Any) -> dict[str, Any]:
     return {
         "module_name": "nonebot_plugin_demo",
@@ -354,7 +417,7 @@ class _RegistryClient:
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         pass
 
-    async def __aenter__(self) -> "_RegistryClient":
+    async def __aenter__(self):
         return self
 
     async def __aexit__(self, *args: object) -> None:
@@ -501,7 +564,7 @@ async def test_registry_uses_etag_and_cached_payload(
     )
     _RegistryClient.responses = [_RegistryResponse(304)]
     _RegistryClient.requests = []
-    monkeypatch.setattr(registry.httpx, "AsyncClient", _RegistryClient)
+    monkeypatch.setattr(registry, "ManagedAsyncClient", _RegistryClient)
 
     entries, meta = await registry.get_registry(refresh=True)
 
@@ -523,7 +586,7 @@ async def test_registry_falls_back_to_mirror(
         _RegistryResponse(200, [_registry_entry()], headers={"etag": '"mirror"'}),
     ]
     _RegistryClient.requests = []
-    monkeypatch.setattr(registry.httpx, "AsyncClient", _RegistryClient)
+    monkeypatch.setattr(registry, "ManagedAsyncClient", _RegistryClient)
 
     entries, meta = await registry.get_registry(refresh=True)
 
@@ -577,16 +640,24 @@ async def test_source_requirements_detect_source_build_before_staging(
     monkeypatch.setattr(dependencies, "environment_drift", lambda: [])
     monkeypatch.setattr(dependencies, "installed_inventory", lambda: {})
     monkeypatch.setattr(dependencies, "protected_core", lambda: {})
-    calls: list[bool] = []
+    monkeypatch.setattr(dependencies, "load_manifest", storage.default_manifest)
+    monkeypatch.setattr(
+        plugin_archive_dependencies,
+        "archive_dependency_contract",
+        lambda: {"packages": {}, "requirements": []},
+    )
+    calls: list[tuple[bool, tuple[str, ...]]] = []
 
     async def compile_stub(
         _requirements: list[str],
         _constraints: dict[str, str],
         *,
         wheels_only: bool,
+        restricted_packages: tuple[str, ...] = (),
     ):
-        calls.append(wheels_only)
-        if wheels_only:
+        # 当前契约：wheel 探测以 restricted_packages 限定必须使用二进制的包
+        calls.append((wheels_only, restricted_packages))
+        if "sdist-only-helper" in restricted_packages:
             return None, "no compatible wheel"
         return {"sdist-only-helper": "1.0.0"}, ""
 
@@ -594,7 +665,7 @@ async def test_source_requirements_detect_source_build_before_staging(
 
     plan = await dependencies.preflight_source_requirements([requirement])
 
-    assert calls == [False, True]
+    assert calls == [(False, ()), (False, ("sdist-only-helper",))]
     assert plan["source_build_required"] is True
     assert plan["source_build_detail"] == "no compatible wheel"
 
@@ -614,27 +685,37 @@ async def test_solver_classifies_unsatisfied_dependency_layers(
     candidate_free: dict[str, str] | None,
     expected_code: str,
 ) -> None:
-    monkeypatch.setattr(dependencies, "environment_drift", lambda: [])
+    manifest = {"plugins": {}}
     monkeypatch.setattr(
         dependencies,
         "environment_report",
-        lambda: {
+        lambda **_: {
+            "immutable_drift": [],
             "interpreter_mismatch": False,
             "incompatible_shared_drift": [],
             "compatible_shared_drift": [],
             "extra_packages": [],
         },
     )
-    monkeypatch.setattr(dependencies, "load_manifest", lambda: {"plugins": {}})
-    monkeypatch.setattr(dependencies, "installed_inventory", lambda: {"core": "1"})
-    monkeypatch.setattr(dependencies, "base_installed_inventory", lambda: {"core": "1"})
+    monkeypatch.setattr(dependencies, "load_manifest", lambda: manifest)
+    monkeypatch.setattr(
+        environment,
+        "capture_environment",
+        lambda **_: _fake_snapshot({"core": "1"}, manifest=manifest),
+    )
+    monkeypatch.setattr(
+        plugin_archive_dependencies,
+        "archive_dependency_contract",
+        lambda: {"packages": {}, "requirements": []},
+    )
     monkeypatch.setattr(dependencies, "protected_core", lambda: {"core": "1"})
     monkeypatch.setattr(dependencies, "shared_dependencies", lambda: {})
-    monkeypatch.setattr(dependencies, "project_closure", lambda: {"core": "1"})
     monkeypatch.setattr(dependencies, "project_requirements", lambda: [])
+    # 当前流程：候选闭包探测 -> 严格解析 -> 作用域放宽 -> 分层归因
     results = [
+        ({"nonebot-plugin-demo": "1.0.0"}, "candidate-probe"),
         (None, "strict"),
-        (None, "core"),
+        (None, "relaxed"),
         (candidate_core, "candidate-core"),
     ]
     if candidate_core is None:
@@ -649,6 +730,7 @@ async def test_solver_classifies_unsatisfied_dependency_layers(
         await dependencies.solve_install(_registry_entry(), {"info": {}})
 
     assert exc_info.value.code == expected_code
+    assert results == []
 
 
 def test_environment_report_does_not_block_extra_packages(
@@ -658,20 +740,17 @@ def test_environment_report_does_not_block_extra_packages(
     monkeypatch.setattr(
         dependencies, "shared_dependencies", lambda: {"pillow": "10.4.0"}
     )
-    monkeypatch.setattr(
-        dependencies,
-        "base_installed_inventory",
-        lambda: {
+    monkeypatch.setattr(dependencies, "_project_requirement_map", lambda: {})
+    monkeypatch.setattr(dependencies, "_project_venv_active", lambda: True)
+    snapshot = _fake_snapshot(
+        {
             "nonebot2": "2.5.0",
             "pillow": "10.4.0",
             "user-plugin-helper": "3.0.0",
-        },
+        }
     )
-    monkeypatch.setattr(dependencies, "layer_inventory", lambda: {})
-    monkeypatch.setattr(dependencies, "_project_requirement_map", lambda: {})
-    monkeypatch.setattr(dependencies, "_project_venv_active", lambda: True)
 
-    report = dependencies.environment_report()
+    report = dependencies.environment_report(snapshot=snapshot)
 
     assert report["status"] == "extra_packages"
     assert report["immutable_drift"] == []
@@ -775,7 +854,8 @@ def test_core_old_upper_bound_cannot_be_overridden() -> None:
 def test_dependency_repair_sync_preserves_extra_packages(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from zhenxun import update_service
+    from zhenxun.services import installer_network
+    from zhenxun.services.update import update_service
 
     (tmp_path / "uv.lock").write_text("version = 1\n", encoding="utf-8")
     commands: list[list[str]] = []
@@ -788,10 +868,14 @@ def test_dependency_repair_sync_preserves_extra_packages(
         return Result()
 
     monkeypatch.setattr(update_service, "_ROOT", tmp_path)
-    monkeypatch.setattr(update_service.shutil, "which", lambda _: "uv")
+    monkeypatch.setattr(installer_network, "uv_executable", lambda: "uv")
     monkeypatch.setattr(update_service.subprocess, "run", run)
+    monkeypatch.setattr(
+        "zhenxun.services.nonebot_store.environment.verify_effective_environment",
+        lambda: None,
+    )
 
-    update_service._sync_dependencies(preserve_extras=True)
+    update_service._sync_dependencies(verify_environment=True)
 
     assert commands == [["uv", "sync", "--locked", "--inexact"]]
 
@@ -800,10 +884,13 @@ def test_dependency_repair_sync_preserves_extra_packages(
 async def test_environment_repair_requires_fingerprint_and_submits_locked_paths(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from zhenxun.builtin_plugins.web_ui import restart_service, security
     from zhenxun.builtin_plugins.web_ui.api.tabs.plugin_manage import (
         nonebot_store as web_store,
     )
-    from zhenxun.nonebot_store import storage as store_storage
+    from zhenxun.services.nonebot_store import cleanup
+    from zhenxun.services.nonebot_store import storage as store_storage
+    from zhenxun.services.plugin_store import operation_journal
     from zhenxun.utils import _restart_utils
 
     fingerprint = "a" * 64
@@ -816,43 +903,87 @@ async def test_environment_repair_requires_fingerprint_and_submits_locked_paths(
         captured.append(paths)
         return True, "accepted"
 
-    monkeypatch.setenv("ZHENXUN_LAUNCHER_PID", "123")
-    monkeypatch.setattr(
-        web_store,
-        "_environment_view",
-        lambda: {
+    async def quiesce(**_: Any) -> None:
+        return None
+
+    status = {
+        "boot_id": "boot",
+        "launcher_managed": True,
+        "access_urls": ["http://localhost:8080"],
+        "access_targets": [],
+        "target_access_urls": ["http://localhost:8080"],
+        "target_access_targets": [],
+    }
+    report = {"fingerprint": fingerprint}
+
+    async def environment_view() -> dict[str, Any]:
+        return {
             "fingerprint": fingerprint,
             "repairable": True,
             "launcher_managed": True,
-        },
-    )
+            "repair_mode": "base",
+            "immutable_drift": [],
+            "incompatible_shared_drift": [],
+        }
+
+    async def environment_report_async(**_: Any) -> dict[str, Any]:
+        return report
+
+    monkeypatch.setenv("ZHENXUN_LAUNCHER_PID", "123")
+    monkeypatch.setattr(web_store, "_environment_view", environment_view)
     monkeypatch.setattr(web_store, "preflight_environment_repair", preflight)
+    monkeypatch.setattr(web_store, "pending_transaction", lambda: None)
+    monkeypatch.setattr(web_store, "environment_report_async", environment_report_async)
+    monkeypatch.setattr(dependencies, "environment_report", lambda **_: report)
+    monkeypatch.setattr(dependencies, "guard_orm_sync", lambda: None)
+    monkeypatch.setattr(web_store, "update_pending_restart", lambda *_, **__: True)
+    monkeypatch.setattr(_restart_utils, "issue_restart_ticket", lambda *_, **__: None)
     monkeypatch.setattr(_restart_utils, "request_dependency_restart", request)
+    monkeypatch.setattr(web_store, "restart_status_data", lambda: dict(status))
     monkeypatch.setattr(
-        web_store,
-        "restart_status_data",
-        lambda: {
-            "boot_id": "boot",
-            "access_urls": ["http://localhost:8080"],
-            "access_targets": [],
-        },
+        restart_service, "restart_status_data", lambda **_: dict(status)
+    )
+    monkeypatch.setattr(security, "quiesce_authenticated_websockets", quiesce)
+    monkeypatch.setattr(cleanup, "archive_settled", lambda: None)
+    monkeypatch.setattr(
+        operation_journal, "_JOURNAL_FILE", tmp_path / "operations.json"
     )
     monkeypatch.setattr(
         store_storage, "DEPENDENCY_SYNC_STATUS_FILE", tmp_path / "sync.json"
     )
-    monkeypatch.setattr(
-        web_store,
-        "save_dependency_sync_status",
-        store_storage.save_dependency_sync_status,
-    )
 
-    result = await web_store.repair_dependency_environment(
+    preview = await web_store.preview_dependency_repair()
+    assert preview.suc, preview.info
+    preview_id = preview.data["preview_id"]
+    assert preview.data["mode"] == "base"
+
+    # 指纹不匹配时拒绝修复，且不准备同步
+    stale = await web_store.repair_dependency_environment(
         web_store.EnvironmentRepairPayload(
-            expected_fingerprint=fingerprint, confirmed=True
+            expected_fingerprint="b" * 64, confirmed=True, preview_id=preview_id
         )
     )
+    assert not stale.suc
+    assert "environment_analysis_stale" in str(stale.info)
+    assert store_storage.dependency_sync_status().get("status") is None
 
-    assert result.data["apply_mode"] == "restart_requested"
+    # 修复只准备锁定同步，由用户点击重启时才提交锁文件路径
+    result = await web_store.repair_dependency_environment(
+        web_store.EnvironmentRepairPayload(
+            expected_fingerprint=fingerprint, confirmed=True, preview_id=preview_id
+        )
+    )
+    assert result.suc, result.info
+    assert result.data["apply_mode"] == "restart_pending"
+    assert captured == []
+    sync = store_storage.dependency_sync_status()
+    assert sync["status"] == "prepared"
+    assert sync["mode"] == "locked_inexact"
+    assert sync["fingerprint"] == fingerprint
+
+    ok, message, _ = await restart_service.request_webui_restart("webui")
+
+    assert (ok, message) == (True, "accepted")
     assert captured == [{Path("pyproject.toml"), Path("uv.lock")}]
     assert store_storage.dependency_sync_status()["status"] == "pending"
 

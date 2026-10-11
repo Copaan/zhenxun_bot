@@ -3,7 +3,7 @@ from typing import Any
 from nonebot.adapters import Bot
 from nonebot.compat import model_dump
 from nonebot.config import Config
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class BotManageUpdateParam(BaseModel):
@@ -94,8 +94,7 @@ class BaseInfo(BaseModel):
     platform: str = "other"
     capabilities: dict[str, bool] = Field(default_factory=dict)
 
-    class Config:
-        arbitrary_types_allowed = True
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
     def to_dict(self, **kwargs):
         return model_dump(self, **kwargs)

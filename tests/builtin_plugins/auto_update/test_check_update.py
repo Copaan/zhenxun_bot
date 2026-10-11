@@ -169,8 +169,8 @@ def init_mocker_path(mocker: MockerFixture, tmp_path: Path):
     from zhenxun.utils.manager.zhenxun_repo_manager import ZhenxunRepoManager
 
     mocker.patch(
-        "zhenxun.utils.manager.virtual_env_package_manager.VirtualEnvPackageManager.install_requirement",
-        return_value=None,
+        "zhenxun.builtin_plugins.auto_update._data_source.request_dependency_restart",
+        return_value=(True, "重启请求已提交"),
     )
     mock_tmp_path = mocker.patch(
         "zhenxun.configs.path_config.TEMP_PATH",
@@ -291,9 +291,7 @@ async def test_check_update_release(
         )
         ctx.should_call_send(
             event=event,
-            message=Message(
-                "版本更新完成！\n版本: v0.2.2 -> v0.2.2\n请重新启动真寻以完成更新!"
-            ),
+            message=Message("版本更新完成！\n版本: v0.2.2 -> v0.2.2\n重启请求已提交"),
             result=None,
             bot=bot,
         )
@@ -392,7 +390,7 @@ async def test_check_update_main(
             message=Message(
                 "版本更新完成！\n"
                 "版本: v0.2.2 -> v0.2.2-e6f17c4\n"
-                "请重新启动真寻以完成更新!\n"
+                "重启请求已提交\n"
                 "真寻资源更新完成!"
             ),
             result=None,

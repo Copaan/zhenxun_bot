@@ -23,7 +23,6 @@ from zhenxun.services.resource_install import (
 )
 from zhenxun.utils.github_utils import GithubUtils
 from zhenxun.utils.http_utils import AsyncHttpx
-from zhenxun.utils.manager.virtual_env_package_manager import VirtualEnvPackageManager
 from zhenxun.utils.repo_utils import AliyunRepoManager, GithubRepoManager
 from zhenxun.utils.repo_utils.models import RepoType, RepoUpdateResult
 from zhenxun.utils.repo_utils.utils import check_git, redact_git_output
@@ -346,12 +345,6 @@ class ZhenxunRepoManagerClass:
         else:
             await self.zhenxun_zip_update(ver_type)
             logger.debug("使用zip更新真寻!", LOG_COMMAND)
-
-    async def install_requirements(self):
-        """安装真寻依赖"""
-        await VirtualEnvPackageManager.install_requirement(
-            self.config.REQUIREMENTS_FILE
-        )
 
     # ==================== 资源管理相关方法 ====================
 

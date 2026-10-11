@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 from urllib.parse import urlsplit
 
 from .network_proxy import ProxyPolicyError, proxy_runtime
@@ -30,10 +31,70 @@ def uv_binary_options(
     ]
 
 
+_uv_path: str | None = None
+_uv_versions: dict[str, str] = {}
+
+
+def uv_executable() -> str | None:
+    """查找 uv 可执行文件
+
+    返回:
+        str | None: uv 路径，未安装时为 None
+    """
+    global _uv_path
+    if _uv_path is None:
+        _uv_path = shutil.which("uv")
+    return _uv_path
+
+
+def uv_command(*arguments: str) -> list[str]:
+    """构造 uv 命令，未找到 uv 时保留命令名由启动子进程时报错
+
+    参数:
+        arguments: uv 子命令及参数
+
+    返回:
+        list[str]: 完整命令
+    """
+    return [uv_executable() or "uv", *arguments]
+
+
+def uv_compile_command(
+    source: Path, output: Path, constraints: Path, *options: str
+) -> list[str]:
+    """构造针对当前解释器的 uv pip compile 命令
+
+    参数:
+        source: 依赖声明文件
+        output: 解析结果输出文件
+        constraints: 约束文件
+        options: 额外参数
+
+    返回:
+        list[str]: 完整命令
+    """
+    return uv_command(
+        "pip",
+        "compile",
+        str(source),
+        "--output-file",
+        str(output),
+        "--constraints",
+        str(constraints),
+        "--no-header",
+        "--no-annotate",
+        "--python",
+        sys.executable,
+        *options,
+    )
+
+
 def uv_version() -> str:
-    executable = shutil.which("uv")
+    executable = uv_executable()
     if executable is None:
         return "unavailable"
+    if executable in _uv_versions:
+        return _uv_versions[executable]
     try:
         result = subprocess.run(
             [executable, "--version"],
@@ -44,7 +105,10 @@ def uv_version() -> str:
         )
     except (OSError, subprocess.SubprocessError):
         return "unknown"
-    return " ".join((result.stdout or result.stderr).split()) or "unknown"
+    version = " ".join((result.stdout or result.stderr).split()) or "unknown"
+    if result.returncode == 0:
+        _uv_versions[executable] = version
+    return version
 
 
 def resolver_configuration_error(text: str) -> bool:
@@ -60,8 +124,7 @@ def resolver_configuration_error(text: str) -> bool:
     )
 
 
-def source_environment():
-    environment = dict(os.environ)
+def _configured_sources(environment, project: Path) -> tuple[str, str]:
     # Ignore configuration from uploaded/staging trees. Only the target's
     # configured default index and explicit index environment are authoritative.
     index = (
@@ -74,7 +137,7 @@ def source_environment():
     except ImportError:
         import tomli as tomllib
     uv = {}
-    for path in (Path("uv.toml"), Path("pyproject.toml")):
+    for path in (project / "uv.toml", project / "pyproject.toml"):
         if path.is_file():
             values = tomllib.loads(path.read_text("utf-8"))
             uv = (
@@ -106,7 +169,25 @@ def source_environment():
         )
     index = index or "https://pypi.org/simple"
     for value in [index, *extra.split()]:
-        _validate_index(re.sub(r"^[A-Za-z0-9_-]+=", "", value))
+        validate_index(re.sub(r"^[A-Za-z0-9_-]+=", "", value))
+    return index, extra
+
+
+def default_index(project: Path = Path()) -> str:
+    """解析项目配置的默认包索引
+
+    参数:
+        project: 项目根目录
+
+    返回:
+        str: 默认索引地址
+    """
+    return _configured_sources(os.environ, project)[0]
+
+
+def source_environment():
+    environment = dict(os.environ)
+    index, extra = _configured_sources(environment, Path())
     authentication = {
         key: value
         for key, value in environment.items()
@@ -126,7 +207,7 @@ def source_environment():
     return environment
 
 
-def _validate_index(index):
+def validate_index(index):
     parsed = urlsplit(index)
     try:
         local = (
@@ -157,7 +238,25 @@ def source_revision():
 
 
 def installer_environment():
-    environment = source_environment()
+    return _apply_proxy(source_environment())
+
+
+def project_environment():
+    """构造 uv 项目命令（sync/lock）的子进程环境
+
+    项目命令按 pyproject.toml 和 uv.lock 解析索引，这里只附加代理策略，
+    并在虚拟环境中运行时把目标环境固定为当前解释器所在的环境。
+
+    返回:
+        dict[str, str]: 子进程环境变量
+    """
+    environment = {**os.environ, "UV_NO_PROGRESS": "1"}
+    if sys.prefix != sys.base_prefix:
+        environment["UV_PROJECT_ENVIRONMENT"] = sys.prefix
+    return _apply_proxy(environment)
+
+
+def _apply_proxy(environment):
     policy = proxy_runtime.policy_snapshot()
     if policy.selected(None):
         if not policy.proxy:

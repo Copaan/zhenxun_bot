@@ -58,13 +58,12 @@ async def test_unknown_env_pending_is_cleared_when_restored(
 
 
 @pytest.mark.asyncio
-async def test_proxy_change_uses_component_transaction(
+async def test_proxy_change_hot_swaps_policy_without_component_restart(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from zhenxun.services import runtime_environment as module
     import zhenxun.services.lifecycle as lifecycle_module
     from zhenxun.services.lifecycle import ComponentSpec, LifecycleKernel
-    from zhenxun.services.runtime_reload import plugin_runtime_manager
 
     calls: list[str] = []
     kernel = LifecycleKernel()
@@ -85,19 +84,11 @@ async def test_proxy_change_uses_component_transaction(
         start,
         stop=stop,
     )
-    await kernel.start_stage("management")
+    await kernel.start_components({"http"})
     calls.clear()
     monkeypatch.setattr(lifecycle_module, "lifecycle_kernel", kernel)
     monkeypatch.setattr(module, "clear_restart_pending", lambda _source: None)
     monkeypatch.setattr(module, "clear_restart_ticket_if_idle", lambda: None)
-    monkeypatch.setattr(
-        plugin_runtime_manager, "environment_consumers", lambda _keys: (set(), set())
-    )
-
-    async def no_consumers(*_args, **_kwargs):
-        return None
-
-    monkeypatch.setattr(plugin_runtime_manager, "reload_env_consumers", no_consumers)
     manager = module.RuntimeEnvironmentManager()
     manager.startup_values = {"SYSTEM_PROXY": None}
     manager.effective_values = {"SYSTEM_PROXY": None}
@@ -106,19 +97,31 @@ async def test_proxy_change_uses_component_transaction(
         calls.append("apply" if not rebuild_components else "direct")
 
     monkeypatch.setattr(manager, "_apply_runtime_values", apply_values)
+    published: list[str | None] = []
+
+    async def apply_proxy(values) -> None:
+        published.append(values.get("SYSTEM_PROXY"))
+        calls.append("proxy")
+
+    monkeypatch.setattr(module.proxy_runtime, "apply", apply_proxy)
 
     result = await manager.apply("", "SYSTEM_PROXY=http://127.0.0.1:8080\n")
 
-    assert result.apply_mode == "component_restarted"
-    assert result.affected_components == ["http"]
-    assert result.component_effects == {"SYSTEM_PROXY": "component_restarted"}
-    assert calls == ["stop", "apply", "start"]
+    # 代理改为原地发布新策略，不再重启 http 组件以免打断进行中的请求
+    assert result.apply_mode == "config_reloaded"
+    assert result.field_effects == {"SYSTEM_PROXY": "in_place"}
+    assert result.affected_components == []
+    assert result.component_effects == {}
+    assert result.restart_required is False
+    assert published == ["http://127.0.0.1:8080"]
+    assert calls == ["direct", "proxy"]
+    assert manager.effective_values["SYSTEM_PROXY"] == "http://127.0.0.1:8080"
 
 
 def test_resource_entry_swap_preserves_temp(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from zhenxun import update_service
+    from zhenxun.services.update import update_service
 
     root = tmp_path / "project"
     resources = root / "resources"
@@ -145,7 +148,7 @@ def test_resource_entry_swap_preserves_temp(
 def test_resource_swap_lock_restores_old_entry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from zhenxun import update_service
+    from zhenxun.services.update import update_service
 
     root = tmp_path / "project"
     resources = root / "resources"
@@ -169,18 +172,3 @@ def test_resource_swap_lock_restores_old_entry(
         update_service._swap_resource_entries(next_root, old_root)
 
     assert (resources / "image" / "asset.txt").read_text(encoding="utf-8") == "old"
-
-
-def test_static_env_scan_only_records_import_scope(tmp_path: Path) -> None:
-    from zhenxun.services.runtime_reload.manager import _static_env_dependencies
-
-    source = tmp_path / "plugin.py"
-    source.write_text(
-        "from zhenxun.configs.config import BotConfig\n"
-        "NAME = BotConfig.self_nickname\n"
-        "def handler():\n"
-        "    return BotConfig.system_proxy\n",
-        encoding="utf-8",
-    )
-
-    assert _static_env_dependencies({source}) == {"SELF_NICKNAME"}

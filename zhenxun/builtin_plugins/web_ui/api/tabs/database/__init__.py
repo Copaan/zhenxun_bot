@@ -6,6 +6,7 @@ from tortoise import Tortoise
 
 from zhenxun.configs.config import BotConfig
 from zhenxun.models.plugin_info import PluginInfo
+from zhenxun.models.sql_log import SqlLog
 from zhenxun.models.task_info import TaskInfo
 from zhenxun.services.log import logger
 from zhenxun.utils.manager.priority_manager import PriorityLifecycle
@@ -14,7 +15,6 @@ from ....base_model import BaseResultModel, QueryModel, Result
 from ....utils import authentication
 from .data_source import ApiDataSource, type2sql
 from .models.model import Column, SqlLogInfo, SqlModel, SqlText
-from .models.sql_log import SqlLog
 from .runtime import router as runtime_router
 
 router = APIRouter(prefix="/database")

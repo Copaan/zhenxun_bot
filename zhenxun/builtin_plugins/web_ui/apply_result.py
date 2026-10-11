@@ -9,7 +9,6 @@ from dotenv import dotenv_values
 
 from zhenxun.utils._restart_utils import (
     clear_restart_pending,
-    issue_restart_ticket,
     mark_restart_pending,
 )
 
@@ -77,18 +76,13 @@ def env_change_impact(
 def update_pending_restart(
     source: str,
     reasons: list[str] | set[str],
-    *,
-    issue_ticket: bool = True,
 ) -> bool:
     normalized = sorted({str(reason) for reason in reasons if str(reason).strip()})
     if not normalized:
         clear_restart_pending(source)
         return False
     mark_restart_pending(source, normalized)
-    launcher_managed = bool(os.getenv("ZHENXUN_LAUNCHER_PID"))
-    if launcher_managed and issue_ticket:
-        issue_restart_ticket(source, ttl_seconds=10 * 60)
-    return launcher_managed
+    return bool(os.getenv("ZHENXUN_LAUNCHER_PID"))
 
 
 def apply_result_data(

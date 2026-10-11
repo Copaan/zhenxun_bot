@@ -49,6 +49,7 @@ from zhenxun.services.plugin_store.plugin_store_receipts import (
     source_digest,
 )
 from zhenxun.utils.atomic_json import read_json_locked, write_json_locked
+from zhenxun.utils.pythonpath import subprocess_pythonpath
 
 MAX_COMPRESSED = 100 * 1024 * 1024
 MAX_EXPANDED = 500 * 1024 * 1024
@@ -478,8 +479,12 @@ async def inspect_in_worker(path: Path, kind: str) -> dict[str, Any]:
         "zhenxun.services.plugin_store.plugin_archive_worker",
         str(path.resolve()),
         kind,
-        cwd=str(Path(__file__).resolve().parents[1]),
-        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        cwd=str(Path.cwd()),
+        env={
+            **os.environ,
+            "PYTHONPATH": subprocess_pythonpath(),
+            "PYTHONDONTWRITEBYTECODE": "1",
+        },
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.DEVNULL,
     )
@@ -517,12 +522,10 @@ _archive_processes: dict[str, _OwnedArchiveProcess] = {}
 @dataclass
 class _OwnedArchiveProcess:
     identity: str
-    context: Any
     directory: Path
     preflight: Path | None
     task: asyncio.Task | None = None
     process: Any = None
-    resource: Any = None
     stopping: bool = False
     killing: bool = False
     diagnostic: bytes = b""
@@ -553,17 +556,12 @@ class _OwnedArchiveProcess:
         self.signal(kill=True)
 
     def require_recovery(self) -> None:
-        self.resource.state = "leaked"
-        self.resource.error_code = "archive_process_cleanup_unconfirmed"
-        self.resource.detail["retained_directory"] = str(self.directory)
-        self.resource.detail["preflight_directory"] = (
-            str(self.preflight) if self.preflight else None
-        )
-        self.context.kernel.require_recovery(_PROCESS_COMPONENT)
+        from zhenxun.services.lifecycle import lifecycle_kernel
+
+        lifecycle_kernel.require_recovery(_PROCESS_COMPONENT)
 
     async def run(self, args, kwargs):
         self.process = await asyncio.create_subprocess_exec(*args, **kwargs)
-        self.resource.detail["pid"] = getattr(self.process, "pid", None)
         if self.stopping:
             self.signal()
         if (
@@ -579,33 +577,21 @@ class _OwnedArchiveProcess:
 async def _start_process(directory: Path, *args, **kwargs) -> _OwnedArchiveProcess:
     from zhenxun.services.lifecycle import ComponentSpec, lifecycle_kernel
 
-    if lifecycle_kernel.status()["snapshot_phase"] == "shutdown":
+    if lifecycle_kernel.shutdown_requested:
         raise ArchiveError("archive_process_shutdown", 503)
     if lifecycle_kernel.component_status(_PROCESS_COMPONENT) is None:
         lifecycle_kernel.register(
             ComponentSpec(
-                _PROCESS_COMPONENT,
-                stage="management",
-                cancel_timeout=2 * _PROCESS_STOP_GRACE,
-                failure_policy="degrade",
+                _PROCESS_COMPONENT, stage="management", failure_policy="degrade"
             ),
             lambda: None,
         )
     await lifecycle_kernel.start_components({_PROCESS_COMPONENT})
-    if lifecycle_kernel.status()["snapshot_phase"] == "shutdown":
+    if lifecycle_kernel.shutdown_requested:
         raise ArchiveError("archive_process_shutdown", 503)
-    parent = lifecycle_kernel.component_context(_PROCESS_COMPONENT)
-    identity = uuid.uuid4().hex
-    context = parent.create_child_scope("task", f"archive-process:{identity}")
+    context = lifecycle_kernel.component_context(_PROCESS_COMPONENT)
     job = _OwnedArchiveProcess(
-        identity, context, directory.resolve(), _preflight_directory.get()
-    )
-    job.resource = context.own_resource(
-        receipt_id=f"archive-process:{job.identity}",
-        provider="subprocess",
-        resource_type="process",
-        detail={"directory": str(job.directory), "pid": None},
-        release_check=lambda: job.confirmed,
+        uuid.uuid4().hex, directory.resolve(), _preflight_directory.get()
     )
     _archive_processes[job.identity] = job
     # Never inherit an HTTP request's short-lived execution lease or cancel spawn.
@@ -615,30 +601,21 @@ async def _start_process(directory: Path, *args, **kwargs) -> _OwnedArchiveProce
             context.spawn_task,
             coroutine,
             name=f"archive-process:{job.identity}",
-            persistent=False,
+            degrade_on_error=False,
             cancel=job.kill,
         )
     except BaseException:
         coroutine.close()
-        job.resource.state = "released"
         _archive_processes.pop(job.identity, None)
-        Context().run(lifecycle_kernel._schedule_scope_close, context)
         raise
 
     def completed(task: asyncio.Task) -> None:
-        try:
-            if not task.cancelled():
-                task.exception()
-            if job.confirmed:
-                job.resource.state = "released"
-                job.resource.completed_at = datetime.now(timezone.utc).isoformat()
-                _archive_processes.pop(job.identity, None)
-            else:
-                job.require_recovery()
-        finally:
-            if job.confirmed:
-                # Close outside the request lease, pruning job-holding callbacks.
-                Context().run(lifecycle_kernel._schedule_scope_close, context)
+        if not task.cancelled():
+            task.exception()
+        if job.confirmed:
+            _archive_processes.pop(job.identity, None)
+        else:
+            job.require_recovery()
 
     job.task.add_done_callback(completed)
     return job
@@ -693,12 +670,13 @@ async def _compile_wheels(
         resolver_configuration_error,
         resolver_failure,
         uv_binary_options,
+        uv_compile_command,
         uv_version,
     )
     from zhenxun.services.nonebot_store import dependencies as deps
 
-    # Reuse the store's constraints/output parser, but own process cancellation:
-    # its general resolver has neither a deadline nor child cleanup on cancel.
+    # Reuse the store's constraints/output parser; the process is owned by the
+    # lifecycle kernel so an interrupted resolve is tracked for recovery.
     directory = Path(tempfile.mkdtemp(prefix="zhenxun_archive_deps_"))
     job = None
     try:
@@ -720,20 +698,13 @@ async def _compile_wheels(
         deps._write_constraints(constraints_file, constraints)
         job = await _start_process(
             directory,
-            "uv",
-            "pip",
-            "compile",
-            str(source),
-            "--output-file",
-            str(output),
-            "--constraints",
-            str(constraints_file),
-            "--no-header",
-            "--no-annotate",
-            "--python",
-            sys.executable,
-            *([] if source_build else uv_binary_options(wheels_only=True)),
-            *build_restrictions,
+            *uv_compile_command(
+                source,
+                output,
+                constraints_file,
+                *([] if source_build else uv_binary_options(wheels_only=True)),
+                *build_restrictions,
+            ),
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
             env=installer_environment(),
@@ -1158,7 +1129,7 @@ async def resolve_preflight(
 def confirm(
     preflight_id: str, session_id: str, digest: str, *, replace: bool, trusted: bool
 ) -> dict[str, Any]:
-    from zhenxun.builtin_plugins.web_ui.api.tabs.plugin_manage.operation_journal import (  # noqa: E501
+    from zhenxun.services.plugin_store.operation_journal import (
         operation_status,
         record_operation,
     )

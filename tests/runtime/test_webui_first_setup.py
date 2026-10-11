@@ -89,8 +89,11 @@ async def test_setup_session_is_ip_bound(monkeypatch: pytest.MonkeyPatch) -> Non
     manager = module.SetupAccessManager()
     monkeypatch.setattr(manager, "state", lambda: "unconfigured")
 
+    from zhenxun.utils.webui_session import SESSION_SECONDS
+
     token, expires_in = await manager.create_session("192.168.1.10")
-    assert expires_in == 15 * 60
+    # 首次配置会话与控制台会话共用统一的 JWT 有效期
+    assert expires_in == SESSION_SECONDS
     await manager.authorize(token, "192.168.1.10")
     with pytest.raises(HTTPException) as error:
         await manager.authorize(token, "192.168.1.11")
@@ -298,7 +301,7 @@ def test_apply_is_atomic_and_preserves_unrelated_configuration(
 
     environment = dotenv_values(tmp_path / ".env.dev")
     assert environment["QQ_ADAPTER_LOAD"] == "False"
-    assert environment["DB_URL"] == "sqlite://data/db/zhenxun.db"
+    assert environment["DB_URL"] == "sqlite:data/db/zhenxun.db"
     assert environment["HOST"] == "0.0.0.0"
     simple = YAML().load((tmp_path / "data/config.yaml").read_text("utf-8"))
     assert simple["other"]["VALUE"] == "retained"

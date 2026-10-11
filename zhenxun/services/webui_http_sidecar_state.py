@@ -125,8 +125,6 @@ def write_http_sidecar_state(**changes: Any) -> dict[str, Any]:
                 first_error_at=None,
                 latest_error=None,
                 latest_error_at=None,
-                diagnostic_identity_verified=None,
-                unverified_child_diagnostic=None,
             )
         current["version"] = 1
         current["updated_at"] = _now()

@@ -96,6 +96,13 @@ def capture_environment(
     )
     selected = {**base, **layer}
     roots = [("pyproject.toml", raw) for raw in project_requirements()]
+    from .manual import manual_requirements
+
+    roots.extend(
+        (f"manual:{name}", raw)
+        for name, requirements in manual_requirements(manifest).items()
+        for raw in requirements
+    )
     for plugin in manifest.get("plugins", {}).values():
         if plugin.get("state") == "managed":
             roots.extend(
@@ -231,6 +238,7 @@ def capture_environment(
             for name, dist in selected.items()
         },
         "generation": manifest.get("active_generation"),
+        "manual_requirements": manual_requirements(manifest),
         "duplicates": {**duplicates, **layer_duplicates},
         "environment": default_environment(),
         "executable": sys.executable,
@@ -315,13 +323,21 @@ def conflict_key(issue: dict) -> tuple:
 def verify_effective_environment() -> dict:
     """Verify the base and active layer after a dependency synchronization."""
     from .dependencies import DependencyAnalysisError, environment_report
+    from .policy import trial_permits, unchanged_conflict
 
     report = environment_report()
+    snapshot = capture_environment()
+    permitted = snapshot.manifest.get("dependency_warnings", [])
     failures = [
         *report["layer_mismatch"],
         *report["immutable_drift"],
         *report["incompatible_shared_drift"],
-        *report["requirement_conflicts"],
+        *[
+            item
+            for item in snapshot.conflicts
+            if not trial_permits(snapshot, item)
+            and not unchanged_conflict(snapshot, item, permitted)
+        ],
     ]
     if failures:
         raise DependencyAnalysisError(
@@ -348,10 +364,14 @@ def validate_candidate(path: Path, transaction: dict[str, Any]) -> dict:
         raise DependencyAnalysisError(
             "dependency_layer_state_mismatch", details=duplicate_layer
         )
-    permitted = (
-        transaction.get("remaining_conflicts", [])
-        if transaction.get("action") == "environment_repair"
-        else []
+    from .policy import guard_orm_changes, trial_permits, unchanged_conflict
+
+    baseline = capture_environment(
+        manifest=transaction.get("base_manifest") or load_manifest()
+    )
+    guard_orm_changes(baseline.versions, snapshot.versions)
+    permitted = transaction.get(
+        "remaining_conflicts", snapshot.manifest.get("dependency_warnings", [])
     )
     remaining_core = []
     for name, version in protected_core().items():
@@ -381,8 +401,18 @@ def validate_candidate(path: Path, transaction: dict[str, Any]) -> dict:
                     }
                 ],
             )
-    allowed = {conflict_key(item) for item in permitted}
-    errors = [item for item in snapshot.conflicts if conflict_key(item) not in allowed]
+    allowed = (
+        {conflict_key(item) for item in permitted}
+        if transaction.get("action") == "environment_repair"
+        else set()
+    )
+    errors = [
+        item
+        for item in snapshot.conflicts
+        if conflict_key(item) not in allowed
+        and not unchanged_conflict(snapshot, item, permitted)
+        and not trial_permits(snapshot, item)
+    ]
     if errors:
         raise DependencyAnalysisError(
             "current_environment_dependency_conflict", details=errors

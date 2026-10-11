@@ -38,20 +38,13 @@ _SENTINEL = object()
 _client: AsyncClient | None = None
 
 
-def _http_client_healthy(_value=None) -> bool:
-    return _client is not None and not _client.is_closed
-
-
 @PriorityLifecycle.on_startup(
     priority=0,
     stage="management",
     timeout=15,
     component_id="management:http_client",
     depends_on=("management:runtime_concurrency",),
-    restart_policy="component",
-    config_keys=(),
     pass_context=True,
-    health=_http_client_healthy,
 )
 async def _(context):
     """
@@ -63,13 +56,6 @@ async def _(context):
         headers=get_user_agent(),
         follow_redirects=True,
     )
-    context.own_resource(
-        receipt_id=f"httpx:{id(_client)}",
-        provider="httpx",
-        resource_type="client",
-        release_check=lambda client=_client: client.is_closed,
-    )
-
     logger.info("全局 httpx.AsyncClient 已启动。", "HTTPClient")
 
 

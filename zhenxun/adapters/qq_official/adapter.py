@@ -4,7 +4,6 @@ import asyncio
 from collections import Counter
 import hashlib
 import inspect
-import json
 import time
 from typing import Any, cast
 from typing_extensions import override
@@ -589,7 +588,7 @@ class ZhenxunQQAdapter(QQAdapter):
             event,
             decode=decode,
             dispatch=dispatch,
-            raw_payload=json.loads(payload.json()),
+            raw_payload=payload.model_dump(mode="json"),
         )
 
     def _resolve_webhook_bot(self, app_id: str) -> ZhenxunQQBot | None:

@@ -27,6 +27,7 @@ from zhenxun.configs.webui_tls import (
 )
 from zhenxun.services.log import logger
 from zhenxun.services.network_proxy import PROXY_KEYS, ProxyPolicy, proxy_runtime
+from zhenxun.services.plugin_host import ApplyMode, RuntimeOperation
 from zhenxun.services.runtime_config_reload import reload_runtime_config
 from zhenxun.services.runtime_environment import (
     KNOWN_ENV_KEYS,
@@ -35,7 +36,6 @@ from zhenxun.services.runtime_environment import (
     runtime_environment_manager,
 )
 from zhenxun.services.runtime_mutation import managed_mutation
-from zhenxun.services.runtime_reload.models import ApplyMode, RuntimeOperation
 from zhenxun.utils._restart_utils import issue_restart_ticket
 from zhenxun.utils.pydantic_compat import (
     model_dump,
@@ -1073,7 +1073,6 @@ async def update_configuration_file(
         launcher_managed = update_pending_restart(
             "webui.config",
             reason_codes if restart_required else [],
-            issue_ticket=False,
         )
     if restart_required and launcher_managed:
         issue_restart_ticket("webui.settings", ttl_seconds=10 * 60)
@@ -1119,13 +1118,7 @@ async def update_configuration_file(
             env_operation.affected_components if env_operation else []
         ),
         rolled_back=bool(env_operation and env_operation.rolled_back),
-        affected=(
-            env_operation.changed_plugins
-            if env_operation is not None
-            else operation.changed
-            if operation is not None
-            else []
-        ),
+        affected=operation.changed if operation is not None else [],
     )
     if apply_mode == APPLY_NO_CHANGE:
         info = "配置已保存，没有需要应用的运行时变化。"

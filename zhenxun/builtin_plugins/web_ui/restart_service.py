@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -137,8 +138,6 @@ def network_configuration_status() -> dict[str, Any]:
                     "retry_in_seconds",
                     "next_retry_at",
                     "total_retries",
-                    "diagnostic_identity_verified",
-                    "unverified_child_diagnostic",
                 )
             },
         },
@@ -261,9 +260,9 @@ def restart_status_data(*, access_urls: list[str] | None = None) -> dict[str, An
     except Exception:
         pass
     try:
-        from zhenxun.services.runtime_reload import plugin_runtime_manager
+        from zhenxun.services.plugin_host import plugin_host
 
-        runtime_reasons = set(plugin_runtime_manager.pending_restart)
+        runtime_reasons = set(plugin_host.pending_restart)
         pending_reasons.update(runtime_reasons)
         persisted_reasons = {
             str(reason) for item in pending_items for reason in item.get("reasons", [])
@@ -320,7 +319,45 @@ async def request_webui_restart(
     status["preferred_url"] = next(iter(status["access_urls"]), None)
     if not status["launcher_managed"]:
         return False, "当前不是 launcher 托管模式，请手动重启真寻。", status
-    ok, message = await request_restart(source, require_ticket=require_ticket)
+    from zhenxun.services.nonebot_store.storage import (
+        dependency_sync_status,
+        save_dependency_sync_status,
+    )
+
+    sync = dependency_sync_status()
+    if sync.get("status") == "prepared":
+        from zhenxun.services.nonebot_store.dependencies import (
+            environment_report_async,
+            guard_orm_sync,
+        )
+        from zhenxun.services.plugin_store.plugin_store_coordinator import (
+            StoreOperationBusyError,
+            plugin_store_operation_coordinator,
+        )
+        from zhenxun.utils._restart_utils import request_dependency_restart
+
+        try:
+            async with plugin_store_operation_coordinator.operation(
+                operation_id=sync.get("operation_id"), owner="webui.dependency-restart"
+            ):
+                report = await environment_report_async()
+                if dependency_sync_status() != sync or report[
+                    "fingerprint"
+                ] != sync.get("fingerprint"):
+                    return False, "environment_analysis_stale", status
+                guard_orm_sync()
+                save_dependency_sync_status({**sync, "status": "pending"})
+                ok, message = await request_dependency_restart(
+                    source, {Path("uv.lock"), Path("pyproject.toml")}
+                )
+                if not ok:
+                    save_dependency_sync_status(sync)
+        except StoreOperationBusyError:
+            return False, "plugin_operation_in_progress", status
+        except Exception as error:
+            return False, str(error), status
+    else:
+        ok, message = await request_restart(source, require_ticket=require_ticket)
     if ok:
         from .security import quiesce_authenticated_websockets
 

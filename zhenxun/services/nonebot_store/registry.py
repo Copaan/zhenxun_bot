@@ -144,13 +144,14 @@ async def get_registry(
             entries = _validate_entries(cached)
         except ValueError as error:
             raise RegistryUnavailableError("registry_unavailable") from error
-        return entries, {
+        fallback = {
             **meta,
-            **_validation_meta(entries),
-            "cached": True,
             "stale": True,
             "fallback_errors": errors,
+            "last_refresh_failed_at": utc_now(),
         }
+        write_json(REGISTRY_META_FILE, fallback)
+        return entries, {**fallback, **_validation_meta(entries), "cached": True}
 
 
 async def get_registry_plugin(

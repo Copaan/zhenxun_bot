@@ -119,3 +119,58 @@ def test_static_scan_reuses_unchanged_file_record(tmp_path: Path) -> None:
     path.write_text("VALUE = 2\n", encoding="utf-8")
     third = _file_record(path, "demo.plugin", second)
     assert third["digest"] != first["digest"]
+
+
+def test_plugin_recovery_restores_warmup_ready(monkeypatch) -> None:
+    from zhenxun.services.startup import StartupCoordinator
+
+    coordinator = StartupCoordinator()
+    monkeypatch.setattr(coordinator, "persist", lambda: None)
+    for stage in ("runtime", "warmup"):
+        coordinator.begin_stage(stage)
+    coordinator.record_error(
+        "runtime", "plugin_import_failed", source_type="plugin", source_id="demo"
+    )
+    coordinator.finish_stage("runtime")
+    coordinator.finish_stage("warmup")
+    assert coordinator.state == "degraded"
+    assert coordinator.snapshot()["errors"] == [
+        {"stage": "runtime", "code": "plugin_import_failed"}
+    ]
+
+    coordinator.clear_plugin_failures({"demo"})
+
+    snapshot = coordinator.snapshot()
+    assert snapshot["state"] == "warmup_ready"
+    assert snapshot["errors"] == []
+    assert snapshot["degraded_reasons"] == []
+
+
+def test_classification_miss_is_preloaded_on_next_boot(tmp_path: Path) -> None:
+    from zhenxun.services.startup_load import PlannedPlugin, StartupLoadPlanner
+
+    root = tmp_path / "demo.py"
+    root.write_text("VALUE = 1\n", encoding="utf-8")
+
+    def classify(cached: dict | None) -> PlannedPlugin:
+        entry = PlannedPlugin(
+            source="source",
+            plugin_id="demo",
+            module_name="demo",
+            root=root,
+            manager=None,
+        )
+        StartupLoadPlanner()._classify_entry(entry, cached)
+        return entry
+
+    first = classify(None)
+    assert not first.reasons
+    cached = {
+        "fingerprint": first.fingerprint,
+        "reasons": ["classification_miss:orm_model"],
+        "files": first.file_records,
+    }
+
+    assert classify(cached).reasons == {"classification_miss:orm_model"}
+    root.write_text("VALUE = 2\n", encoding="utf-8")
+    assert not classify(cached).reasons

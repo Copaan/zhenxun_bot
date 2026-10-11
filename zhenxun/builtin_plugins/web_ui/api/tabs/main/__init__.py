@@ -324,7 +324,6 @@ async def system_logs_realtime(websocket: WebSocket, sleep: int = 5):
 
     receive_task = spawn_websocket_task(
         _watch_disconnect(),
-        scope_id=f"system-status-receive-{id(websocket)}",
         name="webui-system-status-receive",
     )
     try:
@@ -334,7 +333,8 @@ async def system_logs_realtime(websocket: WebSocket, sleep: int = 5):
         ):
             system_status = await get_system_status()
             sent = await asyncio.wait_for(
-                send_authenticated_text(websocket, system_status.json()), timeout=5
+                send_authenticated_text(websocket, system_status.model_dump_json()),
+                timeout=5,
             )
             if not sent:
                 break

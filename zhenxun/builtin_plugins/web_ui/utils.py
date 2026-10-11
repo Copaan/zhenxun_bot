@@ -1,13 +1,11 @@
 import contextlib
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 import os
 from pathlib import Path
-import secrets
 from typing import Any
 
 from fastapi import Depends, HTTPException
 from fastapi.security import OAuth2PasswordBearer
-from jose import jwt
 from nonebot.utils import run_sync
 import psutil
 import ujson as json
@@ -16,13 +14,14 @@ from zhenxun.configs.config import Config
 from zhenxun.configs.path_config import DATA_PATH
 from zhenxun.services.db_context import with_db_timeout
 from zhenxun.services.message_load import is_db_unhealthy
+from zhenxun.utils.webui_session import SESSION_SECONDS
 
 from .base_model import SystemFolderSize, SystemStatus, User
 from .security import validate_access_token
 
 ALGORITHM = "HS256"
-ACCESS_TOKEN_IDLE_MINUTES = 30
-ACCESS_TOKEN_ABSOLUTE_HOURS = 24
+ACCESS_TOKEN_IDLE_MINUTES = SESSION_SECONDS // 60
+ACCESS_TOKEN_ABSOLUTE_HOURS = SESSION_SECONDS // 3600
 # Compatibility alias for extensions importing the old constant.
 ACCESS_TOKEN_EXPIRE_MINUTES = ACCESS_TOKEN_IDLE_MINUTES
 DB_BUSY_MESSAGE = "数据库繁忙，请稍后再试"
@@ -133,35 +132,10 @@ def create_token(
         user: 用户信息
         expires_delta: 过期时间.
     """
-    now = datetime.now(timezone.utc)
-    supplied = dict(extra_claims or {})
-    auth_time = int(supplied.pop("auth_time", int(now.timestamp())))
-    absolute_exp = int(
-        supplied.pop(
-            "absolute_exp",
-            auth_time
-            + int(timedelta(hours=ACCESS_TOKEN_ABSOLUTE_HOURS).total_seconds()),
-        )
-    )
-    idle_exp = int(
-        (
-            now + (expires_delta or timedelta(minutes=ACCESS_TOKEN_IDLE_MINUTES))
-        ).timestamp()
-    )
-    expire = min(idle_exp, absolute_exp)
-    claims = {
-        "sub": user.username,
-        "sid": supplied.pop("sid", secrets.token_urlsafe(18)),
-        "auth_time": auth_time,
-        "absolute_exp": absolute_exp,
-        "iat": int(now.timestamp()),
-        "exp": expire,
-    }
-    claims.update(supplied)
-    return jwt.encode(
-        claims=claims,
-        key=Config.get_config("web-ui", "secret"),
-        algorithm=ALGORITHM,
+    from zhenxun.utils.webui_session import issue_token
+
+    return issue_token(
+        Config.get_config("web-ui", "secret"), user.username, claims=extra_claims
     )
 
 
@@ -200,7 +174,7 @@ def _get_dir_size(dir_path: Path) -> float:
 @run_sync
 def get_system_status() -> SystemStatus:
     """获取系统信息等"""
-    from zhenxun.services.runtime_reload import plugin_runtime_manager
+    from zhenxun.services.plugin_host import plugin_host
     from zhenxun.services.webui_resources import webui_resources
 
     resources = webui_resources.snapshot
@@ -214,10 +188,8 @@ def get_system_status() -> SystemStatus:
         memory=memory,
         disk=disk,
         check_time=datetime.now().replace(microsecond=0),
-        runtime_generation=plugin_runtime_manager.generation,
-        webui_revision=str(
-            resources.manifest.get("revision") or plugin_runtime_manager.webui_revision
-        ),
+        runtime_generation=plugin_host.generation,
+        webui_revision=str(resources.manifest.get("revision") or ""),
         resource_revision=resources.revision,
         resources_ready=resources.ready,
     )

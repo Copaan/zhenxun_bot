@@ -179,10 +179,10 @@ async def _startup_sandboxes(context=None):
 
         coroutine = _delayed_silent_cleanup()
         task = (
-            context.spawn_detached(
+            context.spawn_task(
                 coroutine,
-                scope_id="sandbox-orphan-cleanup",
                 name="sandbox-orphan-cleanup",
+                degrade_on_error=False,
             )
             if context is not None
             else asyncio.create_task(coroutine)

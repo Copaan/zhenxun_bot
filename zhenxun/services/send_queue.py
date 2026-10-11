@@ -57,13 +57,6 @@ _CURRENT_ATTEMPT: ContextVar[_SendAttempt | None] = ContextVar(
 )
 
 
-def send_queue_healthy(_value=None) -> bool:
-    return (
-        _PATCHED
-        and len([task for task in _WORKER_TASKS if not task.done()]) == _WORKERS
-    )
-
-
 def _send_platform_scope(adapter: Any) -> str:
     if adapter is None:
         return "unknown"

@@ -143,7 +143,7 @@ async def create_schedule(task: Task):
 
 @PriorityLifecycle.on_startup(
     priority=5,
-    task_id="runtime:reconcile_tasks",
+    component_id="runtime:reconcile_tasks",
     depends_on=("runtime:reconcile_plugins",),
 )
 async def reconcile_task_runtime():

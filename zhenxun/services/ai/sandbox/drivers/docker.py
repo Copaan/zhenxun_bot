@@ -578,7 +578,8 @@ class DockerSandboxClient(BaseSandboxClient):
             init_res = await session.run_process(
                 "rm -rf /global_env/python_venv && "
                 "uv venv --seed --system-site-packages /global_env/python_venv || "
-                "python3 -m venv --system-site-packages /global_env/python_venv"
+                "python3 -m venv --clear --system-site-packages "
+                "/global_env/python_venv"
             )
             if init_res.exit_code != 0:
                 logger.error(

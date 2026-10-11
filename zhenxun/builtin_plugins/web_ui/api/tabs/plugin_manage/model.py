@@ -228,3 +228,9 @@ class InstallDependenciesPayload(BaseModel):
 
     dependencies: list[str] = Field(..., description="依赖列表")
     """依赖列表"""
+    preview_id: str | None = None
+    expected_fingerprint: str | None = None
+    operation_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
+    confirmed: bool = False
+    confirm_source_build: bool = False
+    summary_revision: str | None = None

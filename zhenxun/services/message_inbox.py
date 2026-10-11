@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import suppress
+from contextvars import Context
 from datetime import datetime, timezone
 from hashlib import sha256
 import json
 from pathlib import Path
+import threading
 import time
+from typing import Any
 
 from .lifecycle.deadline import remaining_timeout
-from .lifecycle.diagnostics import DiagnosticWorker
 from .message_buffer import PayloadCapacityError, PayloadQueue
 from .message_execution import (
     MessageExecution,
@@ -21,6 +25,65 @@ from .message_execution import (
 )
 from .message_store import MessageStore
 from .pipeline_metrics import pipeline_metrics
+
+
+class DiskWorker:
+    """单线程磁盘工作者，关闭时确认线程已退出"""
+
+    def __init__(self, name: str) -> None:
+        self.threads: set[threading.Thread] = set()
+        self.pending: Future[Any] | None = None
+        self.closed = False
+        self._executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix=name,
+            initializer=lambda: self.threads.add(threading.current_thread()),
+        )
+
+    def submit(self, callback: Callable[..., Any], *args: Any) -> asyncio.Future[Any]:
+        """提交一个磁盘操作，同一时刻只允许一个进行中的操作
+
+        参数:
+            callback: 在工作线程中执行的函数
+            args: 位置参数
+
+        返回:
+            asyncio.Future[Any]: 操作结果
+        """
+        if self.closed or (self.pending is not None and not self.pending.done()):
+            raise RuntimeError("disk_worker_unavailable")
+        self.pending = Context().run(self._executor.submit, callback, *args)
+        future = asyncio.wrap_future(self.pending)
+        future.add_done_callback(
+            lambda done: None if done.cancelled() else done.exception()
+        )
+        return future
+
+    async def close(self, timeout: float) -> bool:
+        """关闭工作者并等待线程退出
+
+        参数:
+            timeout: 最长等待秒数
+
+        返回:
+            bool: 线程是否已退出
+        """
+        self.closed = True
+        self._executor.shutdown(wait=False, cancel_futures=True)
+        deadline = time.monotonic() + remaining_timeout(timeout)
+        while not self.released:
+            if time.monotonic() >= deadline:
+                return False
+            await asyncio.sleep(min(0.01, max(0, deadline - time.monotonic())))
+        return True
+
+    @property
+    def released(self) -> bool:
+        return (
+            self.closed
+            and (self.pending is None or self.pending.done())
+            and not any(thread.is_alive() for thread in self.threads)
+        )
 
 
 class MessageInbox:
@@ -152,9 +215,9 @@ class MessageInbox:
         return digest.hexdigest()
 
     async def refresh_generation(self):
-        from .runtime_reload import plugin_runtime_manager
+        from .plugin_host import plugin_host
 
-        revision = plugin_runtime_manager.generation
+        revision = plugin_host.generation
         if self.code_revision == revision:
             return
         self.generation = await self.io(self._source_digest, Path.cwd() / "zhenxun")
@@ -186,14 +249,8 @@ class MessageInbox:
             raise RuntimeError("message_inbox_previous_worker_unreleased")
         self.context = context
         self._close_task = None
-        self.worker = DiagnosticWorker("zhenxun-message-inbox")
+        self.worker = DiskWorker("zhenxun-message-inbox")
         worker = self.worker
-        context.own_resource(
-            receipt_id="message-inbox:disk",
-            provider="lifecycle",
-            resource_type="disk_worker",
-            release_check=lambda: worker.released,
-        )
         try:
             self.status = await self.io(self.store.initialize)
             await self.refresh_generation()
@@ -227,7 +284,7 @@ class MessageInbox:
                 self.resource_snapshot = sample
             except Exception as error:
                 self.resource_snapshot = {"sample_error": type(error).__name__}
-            await asyncio.sleep(5)
+            await asyncio.sleep(30)
 
     async def mutate(self, method, *args):
         if self.mutation_task is None:
@@ -323,7 +380,7 @@ class MessageInbox:
         key = self.register_bot(
             bot, decode or bot.adapter.json_to_event, dispatch or bot.handle_event
         )
-        payload = json.loads(event.json())
+        payload = event.model_dump(mode="json")
         message_id = payload.get("message_id")
         if message_id is None:
             message_id = payload.get("id")
@@ -409,7 +466,7 @@ class MessageInbox:
     def ready(self):
         from .startup import startup_coordinator
 
-        return startup_coordinator.final_business_ready
+        return startup_coordinator.runtime_ready
 
     async def enqueue_delivery(self, name, record):
         from .message_execution import operation_key
@@ -574,7 +631,7 @@ class MessageInbox:
                         task = self.context.spawn_task(
                             self._execute(row),
                             name=f"inbox-{row['sequence']}",
-                            persistent=False,
+                            degrade_on_error=False,
                         )
                     except BaseException:
                         self.release_slot(row["id"])

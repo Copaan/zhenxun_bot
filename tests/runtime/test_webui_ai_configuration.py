@@ -395,17 +395,16 @@ async def test_deepseek_discovery_uses_runtime_default_base(
             return {"data": [{"id": "deepseek-chat"}]}
 
     class Client:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *args):
-            return None
-
-        async def get(self, url: str, **kwargs):
+        async def request(self, method: str, url: str, **kwargs):
+            assert method == "GET"
             requested_urls.append(url)
             return Response()
 
-    monkeypatch.setattr(module.httpx, "AsyncClient", lambda **kwargs: Client())
+    async def get_client(provider):
+        return Client()
+
+    # 模型发现统一经由 LLM HTTP 客户端管理器发起请求，这里替换该接缝以隔离网络。
+    monkeypatch.setattr(module.http_client_manager, "get_client", get_client)
 
     result = await module.discover_models(
         module.ProviderDiscoveryRequest(provider_name="Test", api_type="deepseek")

@@ -3,11 +3,10 @@ from fastapi.responses import JSONResponse
 
 from zhenxun.models.plugin_info import PluginInfo as DbPluginInfo
 from zhenxun.services.log import logger
+from zhenxun.services.plugin_host import ApplyMode
 from zhenxun.services.plugin_policy import PluginPolicyConflict
-from zhenxun.services.runtime_reload.models import ApplyMode
 from zhenxun.utils._restart_utils import issue_restart_ticket
 from zhenxun.utils.enum import PluginType
-from zhenxun.utils.manager.virtual_env_package_manager import VirtualEnvPackageManager
 
 from ....apply_result import (
     APPLY_CONFIG_RELOADED,
@@ -106,7 +105,6 @@ async def _(param: UpdatePlugin) -> Result:
         launcher_managed = update_pending_restart(
             f"webui.plugin-config:{param.module}",
             reasons if restart_required else [],
-            issue_ticket=False,
         )
         if restart_required and launcher_managed:
             issue_restart_ticket("webui.settings", ttl_seconds=10 * 60)
@@ -259,6 +257,18 @@ async def _(payload: RenameMenuTypePayload) -> Result[str]:
 
 
 @router.post(
+    "/dependencies/preview",
+    dependencies=[authentication()],
+    response_model=Result,
+    response_class=JSONResponse,
+)
+async def preview_dependencies(payload: InstallDependenciesPayload) -> Result:
+    from .manual_dependencies import preview
+
+    return await preview(payload)
+
+
+@router.post(
     "/install_dependencies",
     dependencies=[authentication()],
     response_model=Result,
@@ -266,14 +276,6 @@ async def _(payload: RenameMenuTypePayload) -> Result[str]:
     description="安装/卸载依赖",
 )
 async def _(payload: InstallDependenciesPayload) -> Result:
-    try:
-        if not payload.dependencies:
-            return Result.fail("依赖列表不能为空")
-        if payload.handle_type == "install":
-            result = await VirtualEnvPackageManager.install(payload.dependencies)
-        else:
-            result = await VirtualEnvPackageManager.uninstall(payload.dependencies)
-        return Result.ok(result)
-    except Exception as e:
-        logger.error(f"{router.prefix}/install_dependencies 调用错误", "WebUi", e=e)
-        return Result.fail(f"发生了一点错误捏 {type(e)}: {e}")
+    from .manual_dependencies import apply
+
+    return await apply(payload)

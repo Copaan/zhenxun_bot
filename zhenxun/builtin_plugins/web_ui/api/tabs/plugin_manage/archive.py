@@ -7,6 +7,10 @@ from urllib.parse import urlsplit
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from zhenxun.services.plugin_store import plugin_archive as service
+from zhenxun.services.plugin_store.operation_journal import (
+    operation_status,
+    record_operation,
+)
 from zhenxun.services.plugin_store.plugin_archive_dependencies import (
     ArchiveDependencyConflict,
 )
@@ -25,7 +29,6 @@ from ....base_model import Result
 from ....security import decode_access_token_status
 from ....utils import authentication, oauth2_scheme
 from .model import ArchiveActionPayload, ArchiveConfirmPayload, ArchiveResolvePayload
-from .operation_journal import operation_status, record_operation
 
 
 async def archive_session(request: Request, token: str = Depends(oauth2_scheme)) -> str:
@@ -125,7 +128,6 @@ async def confirm(
                 update_pending_restart(
                     f"webui.plugin:{result['store_key']}",
                     ["local_archive_install"],
-                    issue_ticket=False,
                 )
         return Result.ok(result, "归档安装已暂存，重启验证后生效。")
     except Exception as error:
@@ -243,7 +245,6 @@ async def _action(payload: ArchiveActionPayload, action: str, session: str) -> d
         update_pending_restart(
             f"webui.plugin:{payload.store_key}",
             [f"local_archive_{action}"],
-            issue_ticket=False,
         )
         return result
 

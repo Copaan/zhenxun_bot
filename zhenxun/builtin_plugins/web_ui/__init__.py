@@ -122,7 +122,6 @@ WsApiRouter.include_router(chat_routes)
     stage="management",
     timeout=5,
     component_id="management:webui-transport",
-    scope="worker",
     depends_on=("management:runtime_concurrency",),
     restart_policy="worker",
 )
@@ -140,7 +139,6 @@ async def _retain_transport_runtime_until_loop_close():
     stage="management",
     timeout=20,
     component_id="management:webui",
-    scope="worker",
     depends_on=("management:webui-transport",),
     restart_policy="worker",
     config_keys=("HOST", "PORT", "DRIVER", "WEBUI_TLS"),

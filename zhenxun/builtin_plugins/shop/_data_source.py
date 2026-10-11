@@ -12,7 +12,7 @@ from typing import Any, Literal
 from nonebot.adapters import Bot, Event
 from nonebot_plugin_alconna import At, UniMessage, UniMsg
 from nonebot_plugin_uninfo import Uninfo
-from pydantic import BaseModel, Field, create_model
+from pydantic import BaseModel, ConfigDict, Field, create_model
 from tortoise.expressions import Q
 from tortoise.functions import Sum
 from tortoise.timezone import localtime
@@ -103,8 +103,7 @@ class ShopParam(BaseModel):
     extra_data: dict[str, Any] = Field(default_factory=dict)
     """额外数据"""
 
-    class Config:
-        arbitrary_types_allowed = True
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
     def to_dict(self, **kwargs):
         return model_dump(self, **kwargs)

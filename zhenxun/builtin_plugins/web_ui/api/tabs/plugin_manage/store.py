@@ -16,12 +16,19 @@ from nonebot.utils import path_to_module_name
 from packaging.version import InvalidVersion, Version
 
 from zhenxun.services.log import logger
+from zhenxun.services.plugin_host import plugin_host
+from zhenxun.services.plugin_host.classifier import DEPENDENCY_FILES
+from zhenxun.services.plugin_store.operation_journal import (
+    begin_operation,
+    current_operation,
+    operation_status,
+    record_operation,
+)
 from zhenxun.services.plugin_store.plugin_store_coordinator import (
     StoreOperationBusyError,
     plugin_store_operation_coordinator,
 )
 from zhenxun.services.plugin_store.plugin_store_transaction import stage_operation
-from zhenxun.services.runtime_reload import plugin_runtime_manager
 from zhenxun.utils.repo_utils.utils import redact_git_output
 
 from ....apply_result import update_pending_restart
@@ -29,12 +36,6 @@ from ....base_model import Result
 from ....restart_service import restart_status_data
 from ....utils import authentication
 from .model import PluginIr, PluginReloadPayload
-from .operation_journal import (
-    begin_operation,
-    current_operation,
-    operation_status,
-    record_operation,
-)
 from .store_receipts import StoreReceiptStore, source_digest
 
 router = APIRouter(prefix="/store")
@@ -323,11 +324,25 @@ def _dependency_packages(install_result: Any) -> dict[str, str]:
 
 @asynccontextmanager
 async def _store_operation(
-    *, operation_id: str | None = None, owner: str | None = None
+    *,
+    operation_id: str | None = None,
+    owner: str | None = None,
+    allow_prepared_repair: bool = False,
 ) -> AsyncIterator[None]:
     async with plugin_store_operation_coordinator.operation(
         operation_id=operation_id, owner=owner
     ):
+        from zhenxun.services.nonebot_store.cleanup import archive_settled
+        from zhenxun.services.nonebot_store.storage import dependency_sync_status
+
+        archive_settled()
+        sync = dependency_sync_status()
+        if (
+            sync.get("status") in {"prepared", "pending", "running"}
+            and not (allow_prepared_repair and sync.get("status") == "prepared")
+            and sync.get("operation_id") != operation_id
+        ):
+            raise StoreOperationBusyError("dependency_transaction_pending")
         yield
 
 
@@ -362,14 +377,6 @@ def _changed_plugin_files(
             if path.name not in {"requirement.txt", "requirements.txt"}
         }
     return changed
-
-
-def _mark_store_content_processed(
-    before: dict[Path, str], after: dict[Path, str]
-) -> None:
-    """Absorb watchfiles events produced by the current store transaction."""
-    for path in before.keys() | after.keys():
-        plugin_runtime_manager.mark_content_processed(path)
 
 
 def _resolve_runtime_module_name(path: Path) -> str:
@@ -469,37 +476,22 @@ async def _apply_store_change(
         after,
         include_requirements=include_requirements,
     )
-    try:
-        if newly_installed:
-            module_name = _resolve_runtime_module_name(path)
-            try:
-                operation = await plugin_runtime_manager.load_new_plugin(
-                    module_name,
-                    path,
-                    changed,
-                    submit_restart=False,
-                    dependencies_verified=dependencies_verified,
-                )
-            except TypeError as error:
-                if "submit_restart" not in str(
-                    error
-                ) and "dependencies_verified" not in str(error):
-                    raise
-                operation = await plugin_runtime_manager.load_new_plugin(
-                    module_name, path, changed
-                )
-        else:
-            operation = (
-                await plugin_runtime_manager.apply_plugin_changes(
-                    changed, submit_restart=False
-                )
-                if changed
-                else None
-            )
-    finally:
-        _mark_store_content_processed(before, after)
-    if operation is None and changed:
-        operation = plugin_runtime_manager.last_operation
+    module_name = _resolve_runtime_module_name(path)
+    if newly_installed:
+        operation = await plugin_host.load_new_plugin(
+            module_name,
+            path,
+            submit_restart=False,
+            dependencies_verified=dependencies_verified,
+        )
+    elif dependency_files := {p for p in changed if p.name in DEPENDENCY_FILES}:
+        operation = await plugin_host.request_dependency_restart(
+            dependency_files, submit_launcher=False
+        )
+    elif changed:
+        operation = await plugin_host.recover_plugin(module_name, submit_restart=False)
+    else:
+        operation = None
     return (
         operation.public_dict()
         if operation
@@ -508,7 +500,7 @@ async def _apply_store_change(
             "status": "completed",
             "changed": [],
             "reason": None,
-            "generation": plugin_runtime_manager.generation,
+            "generation": plugin_host.generation,
         }
     )
 
@@ -522,14 +514,13 @@ def _decorate_operation(operation: dict, store_key: str) -> dict:
         launcher_managed = update_pending_restart(
             source,
             [reason or "plugin_change_requires_restart"],
-            issue_ticket=False,
         )
         if launcher_managed:
             from zhenxun.utils._restart_utils import issue_restart_ticket
 
             issue_restart_ticket("webui.settings", ttl_seconds=10 * 60)
     elif mode != "failed" or operation.get("rolled_back"):
-        update_pending_restart(source, [], issue_ticket=False)
+        update_pending_restart(source, [])
     status = restart_status_data()
     operation.update(
         {
@@ -673,9 +664,7 @@ async def _(refresh: bool = False) -> Result[dict]:
                 else []
             )
             pending_operation = pending_by_key.get(store_key)
-            runtime = plugin_runtime_manager.classification_for(
-                runtime_module or plugin.module
-            )
+            runtime = plugin_host.classification_for(runtime_module or plugin.module)
             plugin_list.append(
                 {
                     **model_dump(plugin),
@@ -794,22 +783,20 @@ async def _(param: PluginIr) -> Result:
                 plugin_info, is_external=is_external
             )
             path_existed = path.exists()
-            async with plugin_runtime_manager.hold_content_changes({path}):
-                before = _snapshot_plugin_files(path)
-                install_result = await StoreManager.add_plugin(
-                    request_value,
-                    source=None
-                    if param.download_source == "auto"
-                    else param.download_source,
-                    install_dependencies=False,
-                    confirm_source_build=param.confirm_source_build,
-                    return_result=True,
-                )
-                after = _snapshot_plugin_files(path)
-                runtime_module = _resolve_runtime_module_name(path)
-                _mark_store_content_processed(before, after)
+            before = _snapshot_plugin_files(path)
+            install_result = await StoreManager.add_plugin(
+                request_value,
+                source=None
+                if param.download_source == "auto"
+                else param.download_source,
+                install_dependencies=False,
+                confirm_source_build=param.confirm_source_build,
+                return_result=True,
+            )
+            after = _snapshot_plugin_files(path)
+            runtime_module = _resolve_runtime_module_name(path)
             if install_result.dependency_changes:
-                runtime_operation = await plugin_runtime_manager.request_restart(
+                runtime_operation = await plugin_host.request_restart(
                     {runtime_module},
                     "plugin_dependencies_changed",
                     submit_launcher=False,
@@ -856,10 +843,7 @@ async def _(param: PluginIr) -> Result:
                     source_build_confirmed=param.confirm_source_build,
                     operation_id=journal_operation_id,
                 )
-                async with plugin_runtime_manager.hold_content_changes({path}):
-                    before_staging = _snapshot_plugin_files(path)
-                    _remove_path(path)
-                    _mark_store_content_processed(before_staging, {})
+                _remove_path(path)
                 operation.update(staged)
             else:
                 _write_receipt(
@@ -946,19 +930,17 @@ async def _(param: PluginIr) -> Result:
             with tempfile.TemporaryDirectory(prefix="zhenxun_plugin_update_") as root:
                 backup = _backup_plugin(path, Path(root))
                 try:
-                    async with plugin_runtime_manager.hold_content_changes({path}):
-                        before = _snapshot_plugin_files(path)
-                        install_result = await StoreManager.update_plugin(
-                            request_value,
-                            source=None
-                            if param.download_source == "auto"
-                            else param.download_source,
-                            install_dependencies=False,
-                            confirm_source_build=param.confirm_source_build,
-                            return_result=True,
-                        )
-                        after = _snapshot_plugin_files(path)
-                        _mark_store_content_processed(before, after)
+                    before = _snapshot_plugin_files(path)
+                    install_result = await StoreManager.update_plugin(
+                        request_value,
+                        source=None
+                        if param.download_source == "auto"
+                        else param.download_source,
+                        install_dependencies=False,
+                        confirm_source_build=param.confirm_source_build,
+                        return_result=True,
+                    )
+                    after = _snapshot_plugin_files(path)
                     if install_result.unchanged:
                         operation = {
                             "apply_mode": "hot_reloaded",
@@ -966,15 +948,13 @@ async def _(param: PluginIr) -> Result:
                             "changed": [],
                             "reason": "already_latest",
                             "unchanged": True,
-                            "generation": plugin_runtime_manager.generation,
+                            "generation": plugin_host.generation,
                         }
                     elif install_result.dependency_changes:
-                        runtime_operation = (
-                            await plugin_runtime_manager.request_restart(
-                                {runtime_module},
-                                "plugin_dependencies_changed",
-                                submit_launcher=False,
-                            )
+                        runtime_operation = await plugin_host.request_restart(
+                            {runtime_module},
+                            "plugin_dependencies_changed",
+                            submit_launcher=False,
                         )
                         operation = runtime_operation.public_dict()
                     else:
@@ -987,12 +967,8 @@ async def _(param: PluginIr) -> Result:
                             include_requirements=False,
                         )
                     if operation.get("apply_mode") == "failed":
-                        async with plugin_runtime_manager.hold_content_changes({path}):
-                            failed = _snapshot_plugin_files(path)
-                            _restore_plugin(path, backup)
-                            restored = _snapshot_plugin_files(path)
-                            _mark_store_content_processed(failed, restored)
-                        recovery = await plugin_runtime_manager.recover_plugin(
+                        _restore_plugin(path, backup)
+                        recovery = await plugin_host.recover_plugin(
                             runtime_module, submit_restart=False
                         )
                         operation["rolled_back"] = True
@@ -1021,11 +997,7 @@ async def _(param: PluginIr) -> Result:
                             source_build_confirmed=param.confirm_source_build,
                             operation_id=journal_operation_id,
                         )
-                        async with plugin_runtime_manager.hold_content_changes({path}):
-                            before_restore = _snapshot_plugin_files(path)
-                            _restore_plugin(path, backup)
-                            restored = _snapshot_plugin_files(path)
-                            _mark_store_content_processed(before_restore, restored)
+                        _restore_plugin(path, backup)
                         operation.update(staged)
                     else:
                         _write_receipt(
@@ -1036,12 +1008,8 @@ async def _(param: PluginIr) -> Result:
                             path=path,
                         )
                 except Exception:
-                    async with plugin_runtime_manager.hold_content_changes({path}):
-                        failed = _snapshot_plugin_files(path)
-                        _restore_plugin(path, backup)
-                        restored = _snapshot_plugin_files(path)
-                        _mark_store_content_processed(failed, restored)
-                    await plugin_runtime_manager.recover_plugin(
+                    _restore_plugin(path, backup)
+                    await plugin_host.recover_plugin(
                         runtime_module, submit_restart=False
                     )
                     raise
@@ -1119,9 +1087,7 @@ async def _(param: PluginIr) -> Result:
                 plugin_info, is_external=is_external
             )
             runtime_module = _resolve_uninstall_runtime_module_name(path)
-            runtime_classification = plugin_runtime_manager.classification_for(
-                runtime_module
-            )
+            runtime_classification = plugin_host.classification_for(runtime_module)
             runtime_was_loaded = "not_loaded" not in runtime_classification.get(
                 "reload_reasons", []
             )
@@ -1166,7 +1132,7 @@ async def _(param: PluginIr) -> Result:
                         "status": "pending_restart",
                         "changed": [plugin_info.module],
                         "reason": reason,
-                        "generation": plugin_runtime_manager.generation,
+                        "generation": plugin_host.generation,
                     }
                 )
                 operation = _decorate_operation(
@@ -1175,15 +1141,12 @@ async def _(param: PluginIr) -> Result:
                 info = _log_store_operation("卸载", plugin_info.name, operation)
                 return Result.ok(operation, info=info)
             pending_runtime_reason = (
-                plugin_runtime_manager.last_operation.reason
-                if not runtime_was_loaded
-                and plugin_runtime_manager.last_operation is not None
+                plugin_host.last_operation.reason
+                if not runtime_was_loaded and plugin_host.last_operation is not None
                 else None
             )
             if runtime_was_loaded:
-                runtime_operation = await plugin_runtime_manager.unload_plugin(
-                    runtime_module
-                )
+                runtime_operation = await plugin_host.unload_plugin(runtime_module)
                 operation = runtime_operation.public_dict()
                 if operation.get("apply_mode") == "failed":
                     operation.setdefault("operation_id", journal_operation_id)
@@ -1199,29 +1162,19 @@ async def _(param: PluginIr) -> Result:
                     "status": "completed",
                     "changed": [],
                     "reason": None,
-                    "generation": plugin_runtime_manager.generation,
+                    "generation": plugin_host.generation,
                 }
             with tempfile.TemporaryDirectory(prefix="zhenxun_plugin_remove_") as root:
                 backup = _backup_plugin(path, Path(root))
                 try:
-                    async with plugin_runtime_manager.hold_content_changes({path}):
-                        before = _snapshot_plugin_files(path)
-                        await StoreManager.remove_plugin(request_value)
-                        after = _snapshot_plugin_files(path)
-                        _mark_store_content_processed(before, after)
+                    await StoreManager.remove_plugin(request_value)
                     if pending_runtime_reason:
-                        plugin_runtime_manager.clear_pending_restart(
-                            pending_runtime_reason
-                        )
+                        plugin_host.clear_pending_restart(pending_runtime_reason)
                     StoreReceiptStore.delete(_store_key(source, plugin_info.module))
                 except Exception:
-                    async with plugin_runtime_manager.hold_content_changes({path}):
-                        failed = _snapshot_plugin_files(path)
-                        _restore_plugin(path, backup)
-                        restored = _snapshot_plugin_files(path)
-                        _mark_store_content_processed(failed, restored)
+                    _restore_plugin(path, backup)
                     if runtime_was_loaded:
-                        await plugin_runtime_manager.recover_plugin(
+                        await plugin_host.recover_plugin(
                             runtime_module, submit_restart=False
                         )
                     raise
@@ -1280,7 +1233,7 @@ async def _(param: PluginReloadPayload) -> Result:
             journal_operation_id = begin_operation(
                 journal_store_key, "reload", param.operation_id
             )
-            operation = await plugin_runtime_manager.reload_plugin(module)
+            operation = await plugin_host.reload_plugin(module)
             operation_data = operation.public_dict()
             operation_data.setdefault("operation_id", journal_operation_id)
             operation_data = _decorate_operation(operation_data, journal_store_key)
@@ -1302,44 +1255,6 @@ async def _(param: PluginReloadPayload) -> Result:
         return Result.fail("plugin_reload_failed")
 
 
-@router.post(
-    "/clear_integrity_freeze",
-    dependencies=[authentication()],
-    response_model=Result,
-    response_class=JSONResponse,
-    description="解除插件完整性冻结",  # type: ignore
-)
-async def _(param: PluginReloadPayload) -> Result:
-    """Re-check a frozen plugin's residual resources and lift the freeze if idle.
-
-    A freeze is evidence-based, so clearing it is too: the manager refuses while
-    anything is still attributed to the old incarnation. Without this the only
-    exit from a failed rollback is a full restart, even after the work it was
-    waiting on has finished.
-    """
-    if not param.module:
-        return Result.fail("plugin_runtime_module_required")
-    try:
-        async with _store_operation(
-            operation_id=param.operation_id, owner="webui.plugin_store"
-        ):
-            outcome = plugin_runtime_manager.clear_integrity_freeze(param.module)
-    except HTTPException:
-        raise
-    except StoreOperationBusyError:
-        return Result.fail("plugin_operation_in_progress", code=409)
-    except Exception as e:
-        logger.error(f"解除插件完整性冻结失败: {_safe_store_error(e)}", "WebUi")
-        return Result.fail("plugin_integrity_clear_failed")
-    if not outcome["cleared"]:
-        # The request itself succeeded; the refusal and its evidence are the answer.
-        return Result.ok(
-            outcome,
-            info=f"未解除完整性冻结: {outcome['reason']}",
-        )
-    return Result.ok(outcome, info=f"插件 {outcome['plugin_id']} 已解除完整性冻结")
-
-
 @router.get(
     "/operations/current",
     dependencies=[authentication()],
@@ -1358,6 +1273,14 @@ async def get_current_store_operation() -> Result[dict]:
 )
 async def get_store_operation(operation_id: str) -> Result[dict]:
     operation = operation_status(operation_id)
+    if operation is None:
+        from .manual_dependencies import active_operation
+
+        operation = active_operation(operation_id)
+    if operation is None:
+        from .nonebot_store import active_operation as active_store_operation
+
+        operation = active_store_operation(operation_id)
     if operation is None:
         return Result.fail("plugin_operation_not_found", code=404)
     return Result.ok(operation)
@@ -1411,7 +1334,6 @@ async def cancel_unified_pending_operation(operation_id: str) -> Result[dict]:
         update_pending_restart(
             f"webui.plugin:{source_operation.get('store_key', '')}",
             [],
-            issue_ticket=False,
         )
         return Result.ok(result, info="待重启插件操作已撤销")
     from .nonebot_store import cancel_pending_operation
@@ -1441,7 +1363,6 @@ async def cancel_unified_transaction() -> Result[dict]:
             update_pending_restart(
                 f"webui.plugin:{operation.get('store_key', '')}",
                 [],
-                issue_ticket=False,
             )
         result = cancel_operation()
         removed.extend(result.get("removed_operation_ids", []))

@@ -41,11 +41,10 @@ class UvicornReadyBanner:
             return False
         coroutine = self._probe(callback, _connect_host(host), port, timeout)
         self._task = (
-            context.spawn_detached(
+            context.spawn_task(
                 coroutine,
-                scope_id="webui-ready-probe",
-                scope="operation",
                 name="zhenxun-webui-ready-probe",
+                degrade_on_error=False,
             )
             if context is not None
             else asyncio.create_task(coroutine, name="zhenxun-webui-ready-probe")

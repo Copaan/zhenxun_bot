@@ -72,17 +72,8 @@ def test_placeholder_provider_keys_are_not_configured() -> None:
             models=[{"model_name": "model"}],
         )
     )
-    assert view["api_key_slots"] == [{"existing_index": 1, "configured": True}]
-
-
-def test_redirect_hostname_accepts_normal_hosts_and_rejects_unsafe_values() -> None:
-    from zhenxun.cli import _safe_redirect_hostname
-
-    assert _safe_redirect_hostname("192.168.1.8:80") == "192.168.1.8"
-    assert _safe_redirect_hostname("[fd00::8]:80") == "[fd00::8]"
-    assert _safe_redirect_hostname("example.com:8080") == "example.com"
-    assert _safe_redirect_hostname("bad_host.example") == "localhost"
-    assert _safe_redirect_hostname("\u4f8b\u5b50.com") == "localhost"
+    # 槽位索引基于过滤占位符后的密钥列表，与保存时 _keys() 的索引口径一致
+    assert view["api_key_slots"] == [{"existing_index": 0, "configured": True}]
 
 
 def test_store_errors_redact_credentials() -> None:

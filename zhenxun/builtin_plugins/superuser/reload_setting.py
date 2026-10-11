@@ -2,6 +2,7 @@ from nonebot.permission import SUPERUSER
 from nonebot.plugin import PluginMetadata
 from nonebot.rule import to_me
 from nonebot_plugin_alconna import Alconna, Arparma, on_alconna
+from nonebot_plugin_apscheduler import scheduler
 from nonebot_plugin_session import EventSession
 
 from zhenxun.configs.config import Config
@@ -11,11 +12,13 @@ from zhenxun.configs.utils import (
     SimpleConfigValidationError,
 )
 from zhenxun.services.log import logger
+from zhenxun.services.plugin_host import ApplyMode, RuntimeOperation
 from zhenxun.services.runtime_config_reload import reload_runtime_config
-from zhenxun.services.runtime_reload.models import ApplyMode, RuntimeOperation
 from zhenxun.utils.enum import PluginType
 from zhenxun.utils.manager.priority_manager import PriorityLifecycle
 from zhenxun.utils.message import MessageUtils
+
+AUTO_RELOAD_JOB_ID = "zhenxun.reload_setting.auto_reload"
 
 __plugin_meta__ = PluginMetadata(
     name="重载配置",
@@ -57,8 +60,43 @@ _matcher = on_alconna(
 )
 
 
+def _get_auto_reload_interval() -> int:
+    value = Config.get_config("reload_setting", "AUTO_RELOAD_TIME", 180)
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError):
+        seconds = 0
+    if seconds <= 0:
+        logger.warning(
+            f"AUTO_RELOAD_TIME 配置无效: {value!r}，已使用默认值 180 秒",
+            "重载配置",
+        )
+        return 180
+    return seconds
+
+
+def _reschedule_auto_reload_job() -> None:
+    """按 AUTO_RELOAD_TIME 设置自动重载配置任务的间隔"""
+    seconds = _get_auto_reload_interval()
+    if scheduler.get_job(AUTO_RELOAD_JOB_ID):
+        scheduler.reschedule_job(
+            AUTO_RELOAD_JOB_ID, trigger="interval", seconds=seconds
+        )
+    else:
+        scheduler.add_job(
+            _auto_reload_config,
+            "interval",
+            seconds=seconds,
+            id=AUTO_RELOAD_JOB_ID,
+            replace_existing=True,
+        )
+    logger.debug(f"自动重载配置任务间隔已设置为 {seconds} 秒", "重载配置")
+
+
 async def _reload_runtime_config() -> RuntimeOperation:
-    return await reload_runtime_config(submit_restart=False)
+    return await reload_runtime_config(
+        _reschedule_auto_reload_job, submit_restart=False
+    )
 
 
 def _validation_error_message(error: Exception) -> str:
@@ -86,11 +124,18 @@ def _operation_message(operation: RuntimeOperation) -> str:
 
 @PriorityLifecycle.on_startup(priority=1)
 def _init_auto_reload_job() -> None:
-    if Config.get_config("reload_setting", "AUTO_RELOAD"):
-        logger.info(
-            "AUTO_RELOAD 已由文件监听接管，旧定时轮询配置不再生效",
-            "重载配置",
-        )
+    _reschedule_auto_reload_job()
+
+
+async def _auto_reload_config() -> None:
+    if not Config.get_config("reload_setting", "AUTO_RELOAD"):
+        return
+    try:
+        await _reload_runtime_config()
+    except Exception as error:
+        logger.warning("自动重载config.yaml失败", "重载配置", e=error)
+        return
+    logger.debug("已自动重载配置文件...", "重载配置")
 
 
 @_matcher.handle()

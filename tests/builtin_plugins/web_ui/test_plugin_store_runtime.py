@@ -1,4 +1,3 @@
-import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -86,7 +85,7 @@ async def test_new_store_plugin_uses_installed_runtime_module_name(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from zhenxun.builtin_plugins.web_ui.api.tabs.plugin_manage import store
-    from zhenxun.services.runtime_reload.models import ApplyMode, RuntimeOperation
+    from zhenxun.services.plugin_host import ApplyMode, RuntimeOperation
 
     monkeypatch.chdir(tmp_path)
     plugin = tmp_path / "zhenxun" / "plugins" / "jitang.py"
@@ -99,9 +98,9 @@ async def test_new_store_plugin_uses_installed_runtime_module_name(
     received: dict[str, object] = {}
 
     async def load_new_plugin(
-        module_name: str, root: Path, changed: set[Path]
+        module_name: str, root: Path, **kwargs: object
     ) -> RuntimeOperation:
-        received.update(module_name=module_name, root=root, changed=changed)
+        received.update(module_name=module_name, root=root, **kwargs)
         return RuntimeOperation(
             ApplyMode.HOT_RELOADED,
             "completed",
@@ -109,15 +108,7 @@ async def test_new_store_plugin_uses_installed_runtime_module_name(
             generation=1,
         )
 
-    monkeypatch.setattr(
-        store.plugin_runtime_manager, "load_new_plugin", load_new_plugin
-    )
-    processed: list[Path] = []
-    monkeypatch.setattr(
-        store.plugin_runtime_manager,
-        "mark_content_processed",
-        lambda path: processed.append(path),
-    )
+    monkeypatch.setattr(store.plugin_host, "load_new_plugin", load_new_plugin)
 
     operation = await store._apply_store_change(
         store_manager,
@@ -129,8 +120,7 @@ async def test_new_store_plugin_uses_installed_runtime_module_name(
 
     assert received["module_name"] == "zhenxun.plugins.jitang"
     assert received["root"] == plugin
-    assert plugin.resolve() in received["changed"]
-    assert processed == [plugin.resolve()]
+    assert received["submit_restart"] is False
     assert plugin_info.module_path == "plugins.jitang"
     assert operation["apply_mode"] == "hot_reloaded"
 
@@ -155,11 +145,11 @@ def test_store_operation_info_follows_apply_mode(mode: str, expected: str) -> No
 
 
 @pytest.mark.asyncio
-async def test_store_change_does_not_wait_on_its_own_content_hold(
+async def test_store_update_reloads_through_plugin_host(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from zhenxun.builtin_plugins.web_ui.api.tabs.plugin_manage import store
-    from zhenxun.services.runtime_reload.models import ApplyMode, RuntimeOperation
+    from zhenxun.services.plugin_host import ApplyMode, RuntimeOperation
 
     monkeypatch.chdir(tmp_path)
     plugin = tmp_path / "zhenxun" / "plugins" / "demo.py"
@@ -169,36 +159,19 @@ async def test_store_change_does_not_wait_on_its_own_content_hold(
     store_manager = SimpleNamespace(
         _resolve_local_plugin_path=lambda *_args, **_kwargs: plugin
     )
+    received: list[str] = []
 
-    async def apply_plugin_changes(
-        changed: set[Path], *, submit_restart: bool
-    ) -> RuntimeOperation:
-        assert plugin.resolve() in changed
+    async def recover_plugin(module: str, *, submit_restart: bool) -> RuntimeOperation:
         assert submit_restart is False
-        return RuntimeOperation(
-            ApplyMode.HOT_RELOADED,
-            "completed",
-            ["demo"],
-            generation=1,
-        )
+        received.append(module)
+        return RuntimeOperation(ApplyMode.HOT_RELOADED, "completed", ["demo"])
 
-    monkeypatch.setattr(
-        store.plugin_runtime_manager,
-        "apply_plugin_changes",
-        apply_plugin_changes,
+    monkeypatch.setattr(store.plugin_host, "recover_plugin", recover_plugin)
+    operation = await store._apply_store_change(
+        store_manager, plugin_info, False, {plugin.resolve(): "old"}
     )
-    before = {plugin.resolve(): "old"}
-    async with store.plugin_runtime_manager.hold_content_changes({plugin}):
-        operation = await asyncio.wait_for(
-            store._apply_store_change(
-                store_manager,
-                plugin_info,
-                False,
-                before,
-            ),
-            timeout=0.5,
-        )
 
+    assert received == ["zhenxun.plugins.demo"]
     assert operation["apply_mode"] == "hot_reloaded"
 
 

@@ -12,8 +12,8 @@ from zhenxun.configs.database import (
     database_error_code,
     inspect_database_tls,
 )
-from zhenxun.migration.database_capabilities import CAPABILITY_POLICY_VERSION
-from zhenxun.migration.inspection import WORKER_GENERATION
+from zhenxun.services.migration.database_capabilities import CAPABILITY_POLICY_VERSION
+from zhenxun.services.migration.inspection import WORKER_GENERATION
 
 
 async def probe_runtime_database() -> dict:
@@ -47,9 +47,12 @@ async def probe_native_database(
     endpoint, project: Path, *, capability="export"
 ) -> dict:
     """Probe official tools with a bounded budget, using no data-changing SQL."""
-    from zhenxun.migration.access import private_directory
-    from zhenxun.migration.native_database import DatabaseEndpoint, native_session
-    from zhenxun.migration.tasks import MigrationBudget
+    from zhenxun.services.migration.access import private_directory
+    from zhenxun.services.migration.native_database import (
+        DatabaseEndpoint,
+        native_session,
+    )
+    from zhenxun.services.migration.tasks import MigrationBudget
 
     started = time.monotonic()
     result = {
@@ -61,7 +64,7 @@ async def probe_native_database(
     }
     diagnostics = []
     try:
-        from zhenxun.migration.errors import MigrationError
+        from zhenxun.services.migration.errors import MigrationError
 
         if capability not in {"export", "restore"}:
             raise MigrationError("migration_database_capability_invalid")
@@ -173,10 +176,13 @@ async def probe_restore_connections(
     project: Path, private: dict, *, restore_tables=None
 ) -> dict:
     """Probe target and candidate restore accounts before worker handoff."""
-    from zhenxun.migration.access import private_directory
-    from zhenxun.migration.errors import MigrationError
-    from zhenxun.migration.native_replacement import clients, verify_account_isolation
-    from zhenxun.migration.tasks import MigrationBudget
+    from zhenxun.services.migration.access import private_directory
+    from zhenxun.services.migration.errors import MigrationError
+    from zhenxun.services.migration.native_replacement import (
+        clients,
+        verify_account_isolation,
+    )
+    from zhenxun.services.migration.tasks import MigrationBudget
 
     result = {"ready": False, "capability": "restore", "connections": {}}
     database = private.get("database") if isinstance(private, dict) else None
@@ -261,8 +267,8 @@ async def probe_restore_connections(
 
 def probe_sqlite_restore_target(project: Path, target_path: str) -> dict:
     """Check SQLite replacement prerequisites without opening a writable DB."""
-    from zhenxun.migration.errors import MigrationError
-    from zhenxun.migration.replacement_database import _quiet_target
+    from zhenxun.services.migration.errors import MigrationError
+    from zhenxun.services.migration.replacement_database import _quiet_target
 
     result = {"ready": False, "capability": "restore", "engine": "sqlite"}
     try:

@@ -5,10 +5,10 @@ import importlib.util
 from io import StringIO
 import json
 from pathlib import Path
+import time
 from types import SimpleNamespace
 from typing import ClassVar
 
-from jose import jwt
 import pytest
 
 
@@ -237,7 +237,12 @@ async def test_websocket_initial_expired_token_uses_auth_expired_code(
         "get_config",
         lambda _module, key, *args: values.get(key),
     )
-    token = jwt.encode({"sub": "admin", "exp": 1}, values["secret"], algorithm="HS256")
+    from zhenxun.utils.webui_session import SESSION_SECONDS, issue_token
+
+    # 按统一会话契约签发一个已过期的令牌
+    token = issue_token(
+        values["secret"], "admin", now=time.time() - SESSION_SECONDS - 60
+    )
 
     class FakeWebSocket:
         scope: ClassVar = {"client": ("127.0.0.1", 12345)}
@@ -280,12 +285,14 @@ async def test_console_jwt_and_websockets_are_scoped_to_current_boot(
     code = await manager.prepare()
     assert code
     boot_id = await manager.claim(code, "127.0.0.1")
-    console_token = jwt.encode(
-        {"sub": "admin", "auth_source": "console", "boot_id": boot_id},
+    from zhenxun.utils.webui_session import issue_token
+
+    console_token = issue_token(
         values["secret"],
-        algorithm="HS256",
+        "admin",
+        claims={"auth_source": "console", "boot_id": boot_id},
     )
-    regular_token = jwt.encode({"sub": "admin"}, values["secret"], algorithm="HS256")
+    regular_token = issue_token(values["secret"], "admin")
 
     assert security.validate_access_token(console_token)
     assert security.validate_access_token(regular_token)
@@ -301,7 +308,10 @@ async def test_console_jwt_and_websockets_are_scoped_to_current_boot(
             self.closed = code == 1008 and reason == "credentials changed"
 
     websocket = FakeWebSocket()
-    security._AUTHENTICATED_WEBSOCKETS.add(websocket)
+    # 已认证连接登记为 WebSocket -> 认证租约 的映射
+    security._AUTHENTICATED_WEBSOCKETS[websocket] = security.WebSocketAuthLease(
+        sid="sid", expires_at=None, send_lock=asyncio.Lock()
+    )
     await security.revoke_authenticated_websockets()
     assert websocket.closed
     assert not security._AUTHENTICATED_WEBSOCKETS
@@ -326,4 +336,5 @@ async def test_hashed_static_assets_receive_immutable_cache_header(tmp_path) -> 
     plain = await static.get_response("plain.js", scope)
 
     assert hashed.headers["cache-control"] == ("public, max-age=31536000, immutable")
-    assert "cache-control" not in plain.headers
+    # 无内容哈希的资源必须每次协商缓存，不能被标记为 immutable
+    assert plain.headers["cache-control"] == "no-cache"

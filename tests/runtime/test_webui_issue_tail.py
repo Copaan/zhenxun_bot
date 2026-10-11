@@ -62,10 +62,10 @@ async def test_launcher_restart_is_delayed_until_response_can_flush(
     assert ok
     state = restart_state.read_restart_state()
     assert state["launcher_not_before"] > time.time()
-    assert restart_state.consume_launcher_restart_signal() is False
+    assert restart_state.consume_launcher_action() is None
     state["launcher_not_before"] = 0
     restart_state.write_restart_state(state)
-    assert restart_state.consume_launcher_restart_signal() is True
+    assert restart_state.consume_launcher_action() is not None
 
 
 @pytest.mark.asyncio

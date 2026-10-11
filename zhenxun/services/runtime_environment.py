@@ -18,7 +18,6 @@ from nonebot.config import Config as NoneBotConfig
 from zhenxun.configs.config import BotConfig, BotSetting
 from zhenxun.services.log import logger
 from zhenxun.services.network_proxy import PROXY_KEYS, proxy_runtime
-from zhenxun.services.runtime_reload.models import ApplyMode
 from zhenxun.utils._restart_utils import (
     clear_restart_pending,
     clear_restart_ticket_if_idle,
@@ -38,8 +37,6 @@ DIRECT_KEYS = {
     "SUPERUSERS",
 }
 DIRECT_KEYS |= PROXY_KEYS
-COMPONENT_KEYS = {"RUNTIME_WATCH_MODE"}
-COMMAND_KEYS = {"COMMAND_START", "COMMAND_SEP", "ALCONNA_USE_COMMAND_START"}
 CACHE_KEYS = {
     "CACHE_MODE",
     "REDIS_EXPIRE",
@@ -47,10 +44,13 @@ CACHE_KEYS = {
     "REDIS_PASSWORD",
     "REDIS_PORT",
 }
-EXT_PATH_KEYS = {"EXT_PATH"}
 RESTART_KEYS = {
+    "ALCONNA_USE_COMMAND_START",
+    "COMMAND_SEP",
+    "COMMAND_START",
     "DB_URL",
     "DRIVER",
+    "EXT_PATH",
     "HOST",
     "ONEBOT_ACCESS_TOKEN",
     "ONEBOT_REVERSE_WS_HOST",
@@ -71,20 +71,10 @@ RESTART_KEYS = {
     "WEBUI_TLS_CERTFILE",
     "WEBUI_TLS_KEYFILE",
 }
-KNOWN_ENV_KEYS = (
-    DIRECT_KEYS
-    | COMPONENT_KEYS
-    | COMMAND_KEYS
-    | CACHE_KEYS
-    | EXT_PATH_KEYS
-    | RESTART_KEYS
-)
+KNOWN_ENV_KEYS = DIRECT_KEYS | CACHE_KEYS | RESTART_KEYS
 
 _CORE_ATTRS = {
     "API_TIMEOUT": "api_timeout",
-    "ALCONNA_USE_COMMAND_START": "alconna_use_command_start",
-    "COMMAND_SEP": "command_sep",
-    "COMMAND_START": "command_start",
     "IMAGE_TO_BYTES": "image_to_bytes",
     "LOG_LEVEL": "log_level",
     "NICKNAME": "nickname",
@@ -92,7 +82,6 @@ _CORE_ATTRS = {
     "SUPERUSERS": "superusers",
 }
 _BOT_ATTRS = {
-    "EXT_PATH": "ext_path",
     "PLATFORM_SUPERUSERS": "platform_superusers",
     "SELF_NICKNAME": "self_nickname",
     "SYSTEM_PROXY": "system_proxy",
@@ -100,7 +89,6 @@ _BOT_ATTRS = {
     "NETWORK_PROXY_PLUGINS": "network_proxy_plugins",
     "NETWORK_PROXY_CORE_ENABLED": "network_proxy_core_enabled",
     "NETWORK_PROXY_BYPASS": "network_proxy_bypass",
-    "RUNTIME_WATCH_MODE": "runtime_watch_mode",
 }
 _CACHE_ATTRS = {
     "CACHE_MODE": "cache_mode",
@@ -109,10 +97,7 @@ _CACHE_ATTRS = {
     "REDIS_PASSWORD": "redis_password",
     "REDIS_PORT": "redis_port",
 }
-_CORE_EXTRA_DEFAULTS = {
-    "alconna_use_command_start": False,
-    "image_to_bytes": False,
-}
+_CORE_EXTRA_DEFAULTS = {"image_to_bytes": False}
 
 
 def normalize_env(content: str) -> dict[str, str | None]:
@@ -148,13 +133,20 @@ _STARTUP_VALUES = _read_startup_env()
 
 
 def environment_effect(key: str) -> str:
+    """环境配置项的生效方式
+
+    参数:
+        key: 配置项
+
+    返回:
+        str: in_place 直接生效，component_restart 重建缓存组件，
+            worker_restart 重启后生效
+    """
     normalized = key.upper()
-    if normalized in DIRECT_KEYS or normalized == "RUNTIME_WATCH_MODE":
+    if normalized in DIRECT_KEYS:
         return "in_place"
-    if normalized in COMPONENT_KEYS or normalized in CACHE_KEYS:
+    if normalized in CACHE_KEYS:
         return "component_restart"
-    if normalized in COMMAND_KEYS or normalized in EXT_PATH_KEYS:
-        return "plugin_reactivate"
     return "worker_restart"
 
 
@@ -179,7 +171,6 @@ class EnvironmentApplyResult:
     field_effects: dict[str, str]
     rolled_back: bool = False
     hot_reloaded: bool = False
-    changed_plugins: list[str] = field(default_factory=list)
     component_effects: dict[str, str] = field(default_factory=dict)
     affected_components: list[str] = field(default_factory=list)
 
@@ -201,7 +192,6 @@ class RuntimeEnvironmentManager:
             self.last_content = _env_source().read_text(encoding="utf-8")
         except OSError:
             self.last_content = ""
-        self.last_contents = {_env_source().resolve(): self.last_content}
 
     @staticmethod
     def _decode(raw: str | None) -> Any:
@@ -349,22 +339,12 @@ class RuntimeEnvironmentManager:
                 )
 
         self._set_process_env(values, keys)
-        if "RUNTIME_WATCH_MODE" in keys:
-            from zhenxun.services.runtime_reload import plugin_runtime_manager
-
-            plugin_runtime_manager.refresh_watcher()
         if "LOG_LEVEL" in keys:
             from zhenxun.services.log import reload_log_level
 
             reload_log_level(getattr(driver_config, "log_level", "INFO"))
         if rebuild_components and keys & CACHE_KEYS:
             await self._reconfigure_cache(values)
-
-    @staticmethod
-    def _path_set(value: Any) -> set[Path]:
-        if not isinstance(value, list | tuple | set):
-            return set()
-        return {Path(str(item)).resolve() for item in value if str(item).strip()}
 
     async def apply(
         self,
@@ -401,43 +381,9 @@ class RuntimeEnvironmentManager:
                 else:
                     pending_keys.discard(key)
 
-            from zhenxun.services.runtime_reload import plugin_runtime_manager
-
-            pending_consumer_keys = {
-                key
-                for key in (hot_candidates | self.pending_keys)
-                if key in DIRECT_KEYS | COMPONENT_KEYS | COMMAND_KEYS
-                and key not in PROXY_KEYS
-            }
-            _, unsafe_consumers = plugin_runtime_manager.environment_consumers(
-                pending_consumer_keys
-            )
-            if unsafe_consumers:
-                unsafe_keys = {
-                    key
-                    for key in pending_consumer_keys
-                    if any(
-                        key in plugin_runtime_manager.units[plugin_id].env_dependencies
-                        for plugin_id in unsafe_consumers
-                    )
-                }
-                hot_candidates -= unsafe_keys
-                pending_keys.update(
-                    key
-                    for key in unsafe_keys
-                    if self.startup_values.get(key) != after.get(key)
-                )
-                for key in unsafe_keys:
-                    field_effects[key] = "worker_restart"
-                    if self.startup_values.get(key) == after.get(key):
-                        pending_keys.discard(key)
-
             runtime_before = dict(self.effective_values)
-            previous_ext_paths = self._path_set(BotConfig.ext_path)
-            hot_operation = None
-            ext_operation = None
             component_operation = None
-            component_candidates = hot_candidates & (COMPONENT_KEYS | CACHE_KEYS)
+            component_candidates = hot_candidates & CACHE_KEYS
             direct_candidates = hot_candidates - component_candidates
             try:
                 if direct_candidates:
@@ -467,40 +413,6 @@ class RuntimeEnvironmentManager:
                             field_effects[key] = "worker_restart"
                     elif component_operation.apply_effect == "rolled_back":
                         raise RuntimeEnvironmentError("component_restart_rolled_back")
-                if "EXT_PATH" in hot_candidates:
-                    target_paths = self._path_set(
-                        self._typed_value(
-                            BotConfig,
-                            self._bot_defaults,
-                            "ext_path",
-                            after.get("EXT_PATH"),
-                        )
-                    )
-                    ext_operation = await plugin_runtime_manager.apply_ext_paths(
-                        previous_ext_paths, target_paths
-                    )
-                    if (
-                        ext_operation
-                        and ext_operation.mode is ApplyMode.RESTART_PENDING
-                    ):
-                        pending_keys.add("EXT_PATH")
-                        field_effects["EXT_PATH"] = "worker_restart"
-                        await self._apply_runtime_values(runtime_before, {"EXT_PATH"})
-                        hot_candidates.discard("EXT_PATH")
-                    elif ext_operation and ext_operation.mode is ApplyMode.FAILED:
-                        raise RuntimeEnvironmentError(
-                            ext_operation.reason or "ext_path_apply_failed"
-                        )
-
-                reload_keys = hot_candidates - CACHE_KEYS - EXT_PATH_KEYS - PROXY_KEYS
-                if reload_keys:
-                    hot_operation = await plugin_runtime_manager.reload_env_consumers(
-                        reload_keys, submit_restart=False
-                    )
-                    if hot_operation and hot_operation.mode is ApplyMode.FAILED:
-                        raise RuntimeEnvironmentError(
-                            hot_operation.reason or "env_consumer_reload_failed"
-                        )
                 if hot_candidates & PROXY_KEYS:
                     await proxy_runtime.apply(after)
                 for key in hot_candidates - pending_keys:
@@ -538,33 +450,16 @@ class RuntimeEnvironmentManager:
             self.pending_keys = pending_keys
 
             if reasons and submit_restart:
-                try:
-                    await plugin_runtime_manager.request_restart(
-                        set(), "environment_changed", submit_launcher=True
-                    )
-                except TypeError as error:
-                    if "submit_launcher" not in str(error):
-                        raise
-                    await plugin_runtime_manager.request_restart(
-                        set(), "environment_changed"
-                    )
+                from zhenxun.services.plugin_host import plugin_host
+
+                await plugin_host.request_restart(set(), "environment_changed")
             mode = (
                 "restart_pending"
                 if reasons
-                else (
-                    "hot_reloaded"
-                    if hot_operation or ext_operation
-                    else "component_restarted"
-                    if component_operation
-                    and component_operation.apply_effect == "component_restarted"
-                    else "config_reloaded"
-                )
-            )
-            changed_plugins = sorted(
-                {
-                    *(hot_operation.changed if hot_operation else []),
-                    *(ext_operation.changed if ext_operation else []),
-                }
+                else "component_restarted"
+                if component_operation
+                and component_operation.apply_effect == "component_restarted"
+                else "config_reloaded"
             )
             logger.info(
                 f"环境配置已协调: changed={len(changed)} "
@@ -573,7 +468,6 @@ class RuntimeEnvironmentManager:
                 "RuntimeEnvironment",
             )
             self.last_content = after_content
-            self.last_contents[_env_source().resolve()] = after_content
             return EnvironmentApplyResult(
                 apply_mode=mode,
                 changed_keys=sorted(changed),
@@ -581,7 +475,6 @@ class RuntimeEnvironmentManager:
                 reason_codes=reasons,
                 field_effects=field_effects,
                 hot_reloaded=bool(hot_candidates - pending_keys),
-                changed_plugins=changed_plugins,
                 component_effects={
                     key: component_operation.apply_effect
                     for key in sorted(component_candidates)
@@ -595,35 +488,11 @@ class RuntimeEnvironmentManager:
                 ),
             )
 
-    async def apply_current_file(
-        self, path: Path | None = None, *, submit_restart: bool = True
-    ) -> EnvironmentApplyResult:
-        path = path or _env_source()
-        path = path.resolve()
-        content = path.read_text(encoding="utf-8") if path.exists() else ""
-        result = await self.apply(
-            self.last_contents.get(path, self.last_content),
-            content,
-            source=ENV_APPLY_SOURCE,
-            submit_restart=submit_restart,
-        )
-        self.last_contents[path] = content
-        return result
-
-    def observe_file(self, path: Path) -> None:
-        resolved = path.resolve()
-        try:
-            content = resolved.read_text(encoding="utf-8")
-        except OSError:
-            content = ""
-        self.last_contents[resolved] = content
-
 
 runtime_environment_manager = RuntimeEnvironmentManager()
 
 
 __all__ = [
-    "COMPONENT_KEYS",
     "ENV_APPLY_SOURCE",
     "KNOWN_ENV_KEYS",
     "EnvironmentApplyResult",

@@ -106,18 +106,16 @@ async def get_startup_report() -> Result[dict[str, Any]]:
     description="获取统一生命周期组件状态",
 )
 async def get_lifecycle_status() -> Result[LifecycleStatus]:
-    from zhenxun.services.lifecycle.launcher import launcher_lifecycle_snapshot
     from zhenxun.services.lifecycle.operations import operation_registry
-    from zhenxun.services.runtime_reload import plugin_runtime_manager
+    from zhenxun.services.plugin_host import plugin_host
     from zhenxun.services.webui_http_sidecar_state import read_http_sidecar_state
     from zhenxun.services.webui_transport import transport_runtime
 
     return Result.ok(
         {
             **lifecycle_kernel.status(),
-            "launcher": launcher_lifecycle_snapshot(),
             "operation_registry": operation_registry.status(),
-            "plugin_runtime": plugin_runtime_manager.status(),
+            "plugin_runtime": plugin_host.status(),
             "transport": transport_runtime.snapshot(),
             "http_sidecar": read_http_sidecar_state(),
             "network": network_configuration_status(),

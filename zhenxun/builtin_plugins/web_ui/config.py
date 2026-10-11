@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import nonebot
 
-from zhenxun.migration.bootstrap_access import allows_bootstrap_mutation
+from zhenxun.services.migration.bootstrap_access import allows_bootstrap_mutation
 from zhenxun.services.startup import startup_coordinator
 
 if sys.version_info >= (3, 11):
@@ -33,7 +33,7 @@ def install_cors_middleware(app: FastAPI | None = None) -> bool:
         allow_origin_regex=PRIVATE_ORIGIN_REGEX,
         allow_credentials=True,
         allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-        allow_headers=["Authorization", "Content-Type", "X-Setup-Token"],
+        allow_headers=["Authorization", "Content-Type"],
     )
     if not getattr(target.state, "zhenxun_startup_guard", False):
 

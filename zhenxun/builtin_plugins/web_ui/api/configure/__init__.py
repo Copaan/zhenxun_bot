@@ -146,6 +146,27 @@ async def apply_setup(
 
 
 async def _apply_setup(payload: ApplyRequest, session: SetupSession) -> Result:
+    from pathlib import Path
+
+    from filelock import Timeout
+
+    from zhenxun.services.migration.restore_flow import setup_restore_lock
+    from zhenxun.services.migration.tasks import TaskStore
+
+    store = TaskStore(Path.cwd())
+    try:
+        with setup_restore_lock(store):
+            if store.active() or setup_access.state() in {
+                "configured",
+                "restart_pending",
+            }:
+                raise HTTPException(409, detail="migration_operation_in_progress")
+            return await _apply_setup_locked(payload, session)
+    except Timeout:
+        raise HTTPException(409, detail="migration_operation_in_progress") from None
+
+
+async def _apply_setup_locked(payload: ApplyRequest, session: SetupSession) -> Result:
     if payload.password != payload.confirm_password:
         raise HTTPException(status_code=422, detail="两次输入的密码不一致。")
     if password_error := validate_new_password(payload.password):
@@ -204,10 +225,10 @@ async def _apply_setup(payload: ApplyRequest, session: SetupSession) -> Result:
 async def restart_setup(
     request: Request,
     payload: RestartRequest,
-    x_setup_token: Annotated[str | None, Header(alias="X-Setup-Token")] = None,
+    authorization: Annotated[str | None, Header(alias="Authorization")] = None,
 ) -> Result:
     session = await setup_access.authorize(
-        x_setup_token,
+        authorization,
         client_ip(request),
         restart_only=True,
     )

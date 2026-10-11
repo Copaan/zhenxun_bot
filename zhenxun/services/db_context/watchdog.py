@@ -180,7 +180,6 @@ async def stop_db_watchdog() -> None:
     component_id="runtime:database_watchdog",
     depends_on=("management:database",),
     pass_context=True,
-    health=db_watchdog_healthy,
 )
 async def _start_db_watchdog(context) -> None:
     start_db_watchdog(context)

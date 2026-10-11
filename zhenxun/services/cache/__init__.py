@@ -57,7 +57,7 @@ from aiocache.serializers import JsonSerializer
 import nonebot
 from nonebot.compat import model_dump
 from nonebot.utils import is_coroutine_callable
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from zhenxun.services.log import logger
 
@@ -139,8 +139,7 @@ class CacheModel(BaseModel):
     key_format: str | None = None
     """键格式"""
 
-    class Config:
-        arbitrary_types_allowed = True
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
 
 class CacheManager:
@@ -721,8 +720,6 @@ class CacheManager:
                 return target_type.model_validate(value)
             elif hasattr(target_type, "from_dict"):
                 return target_type.from_dict(value)
-            elif hasattr(target_type, "parse_obj"):
-                return target_type.parse_obj(value)
             else:
                 return target_type(**value)
 
@@ -951,7 +948,6 @@ from zhenxun.utils.manager.priority_manager import PriorityLifecycle
     priority=2,
     stage="management",
     component_id="management:cache_root",
-    restart_policy="component",
     config_keys=(
         "CACHE_MODE",
         "REDIS_EXPIRE",

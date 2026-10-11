@@ -169,7 +169,7 @@ class RendererService:
                 self._initialization_task = self._context.spawn_task(
                     self._initialize(),
                     name="renderer-service-initialize",
-                    persistent=False,
+                    degrade_on_error=False,
                 )
             else:
                 self._initialization_task = asyncio.create_task(

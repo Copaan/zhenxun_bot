@@ -16,7 +16,6 @@ from zhenxun.services.cache.write import (
     publication_snapshot,
     write_scope,
 )
-from zhenxun.services.lifecycle import ResourceReceipt, RuntimeHandle
 from zhenxun.services.log import logger
 from zhenxun.services.message_load import is_db_unhealthy
 from zhenxun.utils.enum import (
@@ -82,22 +81,18 @@ def _spawn_runtime_task(
     coroutine,
     *,
     name: str,
-    persistent: bool = True,
+    degrade_on_error: bool = True,
 ) -> asyncio.Task[Any]:
     if _LIFECYCLE_CONTEXT is not None:
         return _LIFECYCLE_CONTEXT.spawn_task(
             coroutine,
             name=name,
-            persistent=persistent,
+            degrade_on_error=degrade_on_error,
         )
     return asyncio.create_task(coroutine, name=name)
 
 
 def is_cache_ready() -> bool:
-    return _CACHE_READY_EVENT.is_set()
-
-
-def _runtime_cache_healthy(_value=None) -> bool:
     return _CACHE_READY_EVENT.is_set()
 
 
@@ -754,7 +749,7 @@ class RuntimeCacheSync:
         task = _spawn_runtime_task(
             cls._publish(cache_type, action, data),
             name="runtime-cache-publish",
-            persistent=False,
+            degrade_on_error=False,
         )
         cls._publish_tasks.add(task)
         task.add_done_callback(cls._publish_tasks.discard)
@@ -2452,7 +2447,7 @@ class BanMemoryCache:
             task = _spawn_runtime_task(
                 cls.remove(entry.user_id, entry.group_id),
                 name=f"{cls.__name__}-remove",
-                persistent=False,
+                degrade_on_error=False,
             )
             cls._remove_tasks.add(task)
             task.add_done_callback(cls._remove_tasks.discard)
@@ -2488,7 +2483,7 @@ class BanMemoryCache:
             task = _spawn_runtime_task(
                 cls.remove(entry.user_id, entry.group_id),
                 name=f"{cls.__name__}-remove",
-                persistent=False,
+                degrade_on_error=False,
             )
             cls._remove_tasks.add(task)
             task.add_done_callback(cls._remove_tasks.discard)
@@ -2513,7 +2508,7 @@ class BanMemoryCache:
             task = _spawn_runtime_task(
                 cls.remove(entry.user_id, entry.group_id),
                 name=f"{cls.__name__}-remove",
-                persistent=False,
+                degrade_on_error=False,
             )
             cls._remove_tasks.add(task)
             task.add_done_callback(cls._remove_tasks.discard)
@@ -2752,7 +2747,7 @@ class RuntimeCacheRefreshCoordinator:
                     self._inflight.pop(name, None)
 
             task = _spawn_runtime_task(
-                run(), name=f"runtime-cache-refresh:{name}", persistent=False
+                run(), name=f"runtime-cache-refresh:{name}", degrade_on_error=False
             )
             self._inflight[name] = task
         return await asyncio.shield(task)
@@ -2968,60 +2963,15 @@ async def refresh_all_runtime_caches() -> dict[str, bool]:
     return await runtime_cache_refresh_coordinator.refresh_all()
 
 
-class RuntimeCacheHandle:
-    async def quiesce(self) -> None:
-        _CACHE_READY_EVENT.clear()
-
-    async def close(self) -> None:
-        await _stop_runtime_cache()
-
-    def health(self) -> dict[str, object]:
-        snapshot = health_snapshot()
-        return {
-            "healthy": _CACHE_READY_EVENT.is_set(),
-            "loaded_caches": sum(item["loaded"] for item in snapshot.values()),
-            "total_caches": len(snapshot),
-            "pending_caches": tuple(
-                sorted(name for name, item in snapshot.items() if not item["loaded"])
-            ),
-            "startup_failed_caches": _STARTUP_FAILED_CACHES,
-            "refresh_coordinator": refresh_coordinator_snapshot(),
-        }
-
-    def snapshot(self) -> dict[str, object]:
-        return {
-            "ready": _CACHE_READY_EVENT.is_set(),
-            "redis_sync_ready": RuntimeCacheSync._ready,
-            "caches": health_snapshot(),
-            "refresh_coordinator": refresh_coordinator_snapshot(),
-        }
-
-    def resource_snapshot(self) -> list[ResourceReceipt]:
-        return [
-            ResourceReceipt(
-                receipt_id="runtime-cache:state",
-                provider="cache",
-                resource_type="runtime_cache",
-                owner_id="runtime:runtime_cache",
-                detail={
-                    "ready": _CACHE_READY_EVENT.is_set(),
-                    "redis_sync_ready": RuntimeCacheSync._ready,
-                },
-            )
-        ]
-
-
 @PriorityLifecycle.on_startup(
     priority=6,
-    task_id="runtime:runtime_cache",
+    component_id="runtime:runtime_cache",
     depends_on=(
         "management:cache_root",
         "runtime:reconcile_tasks",
         "runtime:cache_types",
         "runtime:legacy_data",
     ),
-    component_id="runtime:runtime_cache",
-    restart_policy="component",
     config_keys=(
         "CACHE_MODE",
         "REDIS_EXPIRE",
@@ -3030,12 +2980,12 @@ class RuntimeCacheHandle:
         "REDIS_PORT",
     ),
     pass_context=True,
-    health=_runtime_cache_healthy,
 )
 async def _init_runtime_cache(context):
     global _LIFECYCLE_CONTEXT
     global _STARTUP_FAILED_CACHES
     _LIFECYCLE_CONTEXT = context
+    context.add_finalizer(_stop_runtime_cache)
     await RuntimeCacheSync.start()
     await runtime_cache_refresh_coordinator.start()
     outcome = await runtime_cache_refresh_coordinator.refresh_all(startup=True)
@@ -3052,10 +3002,6 @@ async def _init_runtime_cache(context):
         )
     BanMemoryCache.start_cleanup_task()
     _CACHE_READY_EVENT.set()
-    return RuntimeHandle(
-        controller=RuntimeCacheHandle(),
-        metadata={"ownership": "composite"},
-    )
 
 
 async def _stop_runtime_cache():

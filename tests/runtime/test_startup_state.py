@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from types import SimpleNamespace
 
 import pytest
@@ -208,6 +207,9 @@ async def test_renderer_concurrent_warmup_builds_one_generation(monkeypatch) -> 
             self.calls += 1
             return Context()
 
+        def is_connected(self) -> bool:
+            return True
+
     browser = Browser()
 
     async def get_browser():
@@ -239,26 +241,11 @@ async def test_renderer_concurrent_warmup_builds_one_generation(monkeypatch) -> 
     ],
 )
 def test_launcher_runtime_readiness_uses_startup_state(
-    monkeypatch, state: str, expected: bool
+    state: str, expected: bool
 ) -> None:
-    import zhenxun.cli as cli
+    import zhenxun.services.launcher.sidecars as sidecars
 
-    class Response:
-        status = 200
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return None
-
-        def read(self):
-            return json.dumps({"data": {"state": state}}).encode()
-
-    monkeypatch.setattr(cli, "_health_urlopen", lambda _url: Response())
-    settings = SimpleNamespace(worker_connect_host="127.0.0.1", worker_port=8080)
-
-    assert cli._worker_is_ready(settings) is expected
+    assert sidecars.status_is_ready({"state": state}) is expected
 
 
 @pytest.mark.parametrize(
@@ -272,31 +259,17 @@ def test_launcher_runtime_readiness_uses_startup_state(
     ],
 )
 def test_launcher_plugin_verification_waits_for_warmup(
-    monkeypatch, state: str, warmup_state: str | None, expected: bool
+    state: str, warmup_state: str | None, expected: bool
 ) -> None:
-    import zhenxun.cli as cli
+    import zhenxun.services.launcher.sidecars as sidecars
 
-    class Response:
-        status = 200
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return None
-
-        def read(self):
-            stages = {"warmup": {"state": warmup_state}} if warmup_state else {}
-            return json.dumps({"data": {"state": state, "stages": stages}}).encode()
-
-    monkeypatch.setattr(cli, "_health_urlopen", lambda _url: Response())
-    settings = SimpleNamespace(worker_connect_host="127.0.0.1", worker_port=8080)
-
-    assert cli._worker_is_ready(settings, require_warmup=True) is expected
+    stages = {"warmup": {"state": warmup_state}} if warmup_state else {}
+    status = {"state": state, "stages": stages}
+    assert sidecars.status_is_ready(status, require_warmup=True) is expected
 
 
-def test_launcher_stops_waiting_for_management_only_worker(monkeypatch) -> None:
-    import zhenxun.cli as cli
+async def test_launcher_stops_waiting_for_management_only_worker(monkeypatch) -> None:
+    import zhenxun.services.launcher.sidecars as sidecars
 
     worker = SimpleNamespace(poll=lambda: None)
     settings = SimpleNamespace(worker_connect_host="127.0.0.1", worker_port=8080)
@@ -308,12 +281,12 @@ def test_launcher_stops_waiting_for_management_only_worker(monkeypatch) -> None:
         "boot_id": "worker-boot",
     }
     observed = []
-    monkeypatch.setattr(cli, "_read_worker_runtime_status", lambda *_a, **_k: status)
+    monkeypatch.setattr(sidecars, "read_worker_status", lambda *_a, **_k: status)
     monkeypatch.setattr(
-        cli,
-        "_bind_worker_runtime_status",
+        sidecars,
+        "bind_worker_status",
         lambda _worker, value: observed.append(value),
     )
 
-    assert not cli._wait_worker_ready(worker, settings)
+    assert not await sidecars.wait_worker_ready(worker, settings)
     assert observed == [status]

@@ -1,8 +1,11 @@
 """Event-local durable identities, independent of login or connection epochs."""
 
+import asyncio
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from functools import wraps
 from hashlib import sha256
+import time
 
 
 @dataclass
@@ -68,3 +71,52 @@ def operation_key(kind: str, user_id: str) -> str | None:
     ordinal = execution.operations.get(key, 0)
     execution.operations[key] = ordinal + 1
     return sha256(repr((execution.identity, key, ordinal)).encode()).hexdigest()
+
+
+async def _rollback_preconditions(
+    execution: MessageExecution, matcher: object, reason: str
+) -> None:
+    for commit in execution.preconditions:
+        if commit.owner_matcher_id == id(matcher):
+            await commit.rollback_all(reason)
+
+
+def install_matcher_execution() -> None:
+    """包装 Matcher.run：消息已延后时不再执行处理器，并统计处理器等待与执行耗时"""
+    from nonebot.matcher import Matcher
+
+    from zhenxun.services.log import logger
+    from zhenxun.services.pipeline_metrics import pipeline_metrics
+
+    original = Matcher.run
+    if getattr(original, "__zhenxun_execution__", False):
+        return
+
+    @wraps(original)
+    async def run(matcher, *args, **kwargs):
+        execution = current_execution.get()
+        if execution is not None:
+            if execution.deferred_reason:
+                await _rollback_preconditions(execution, matcher, "message_deferred")
+                raise asyncio.CancelledError("message_deferred_before_handler")
+            execution.handlers_started += 1
+            if execution.received_at is not None:
+                pipeline_metrics.observe(
+                    "handler_wait_ms", time.time() - execution.received_at
+                )
+        started = time.monotonic()
+        try:
+            return await original(matcher, *args, **kwargs)
+        except MessageExecutionDeferred as error:
+            if execution is not None:
+                execution.deferred_reason = str(error)
+                await _rollback_preconditions(
+                    execution, matcher, "handler_dependency_unavailable"
+                )
+            logger.debug(f"Matcher deferred: {error}")
+            raise asyncio.CancelledError("matcher_dependency_unavailable") from None
+        finally:
+            pipeline_metrics.observe("handler_execution_ms", time.monotonic() - started)
+
+    run.__zhenxun_execution__ = True  # type: ignore[attr-defined]
+    setattr(Matcher, "run", run)
