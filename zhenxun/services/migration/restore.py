@@ -1,890 +1,500 @@
+"""从备份包恢复与切换数据库
+
+在线阶段解压备份包、导出当前数据库作为回滚点并请求重启；启动器在启动 worker
+前应用依赖与文件；worker 建表后导入数据。导入失败时启动器还原文件，worker 再
+导入回滚点。
+"""
+
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, replace
-import hashlib
+import asyncio
+from collections.abc import Awaitable, Callable
+from datetime import datetime
 import json
-import os
 from pathlib import Path
-import platform
-import sys
-import tempfile
-from typing import Literal
+import shutil
+from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
-from zhenxun.utils.atomic_json import write_json_locked
+STATE_DIR = Path("data/runtime/restore")
+REQUEST = STATE_DIR / "request.json"
+PACKAGE = STATE_DIR / "package"
+ROLLBACK = STATE_DIR / "rollback"
+RUNNING = frozenset({"pending", "importing", "failed_import", "rollback_import"})
 
-from .archive import CHUNK, file_hash, require_space
-from .configuration import (
-    configuration_yaml,
-    merge_env,
-    override_administrator,
-    override_env,
-    replace_env,
-)
-from .discovery import CATEGORIES, SourceBoundary, bounded_walk, category_for
-from .errors import MigrationError, conflict_error
-from .journal import FileJournal
-from .paths import PathIndex, contained_path, is_link, logical_path
-
-FileMode = Literal["missing", "overwrite", "exact"]
-ConfigurationMode = Literal["keep", "missing", "backup"]
-_NATIVE = {".so", ".pyd", ".dll", ".dylib", ".exe"}
-_DATABASE = {".db", ".sqlite", ".sqlite3"}
+Restart = Callable[[], Awaitable[tuple[bool, str]]]
 
 
-def _configuration_read(path: Path) -> bytes:
-    limit = 8 * CHUNK
-    if path.stat().st_size > limit:
-        raise MigrationError("migration_configuration_limit")
-    with path.open("rb") as stream:
-        result = stream.read(limit + 1)
-    if len(result) > limit:
-        raise MigrationError("migration_configuration_limit")
-    return result
+class RestoreError(RuntimeError):
+    """恢复或切换数据库失败"""
 
 
-@dataclass(frozen=True)
-class RestoreOptions:
-    categories: frozenset[str] = CATEGORIES
-    files: FileMode = "missing"
-    configuration: ConfigurationMode = "keep"
-    exact_directories: tuple[str, ...] = ()
-    exact_files: tuple[str, ...] = ()
-    replace_configuration_scope: bool = False
-
-    def __post_init__(self) -> None:
-        if not self.categories <= CATEGORIES:
-            raise MigrationError("migration_categories_invalid")
-        if self.files not in {"missing", "overwrite", "exact"}:
-            raise MigrationError("migration_file_mode_invalid")
-        if self.configuration not in {"keep", "missing", "backup"}:
-            raise MigrationError("migration_configuration_mode_invalid")
-        if self.files == "exact" and not (self.exact_directories or self.exact_files):
-            raise MigrationError("migration_exact_scope_required")
-        for path in self.exact_directories:
-            logical_path(path)
-        for path in self.exact_files:
-            logical_path(path)
-        if self.replace_configuration_scope and self.configuration != "backup":
-            raise MigrationError("migration_configuration_mode_invalid")
+def _now() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
-def _fingerprint(path: Path, checkpoint=lambda: None) -> str | None:
-    checkpoint()
-    if not path.exists():
+def _load() -> dict | None:
+    try:
+        return json.loads(REQUEST.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
         return None
-    if is_link(path) or not path.is_file():
-        raise MigrationError("migration_path_type_conflict")
-    return file_hash(path, checkpoint)
 
 
-def _database_companion(path: Path) -> bool:
-    from .sqlite_resources import sqlite_companion
-
-    return sqlite_companion(path)
-
-
-def _database_file(path: Path) -> bool:
-    from .sqlite_resources import classify_sqlite
-
-    return classify_sqlite(path) == "sqlite"
+def _save(request: dict, **changes) -> dict:
+    request.update(changes, updated_at=_now())
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    temporary = REQUEST.with_suffix(".tmp")
+    temporary.write_text(json.dumps(request, ensure_ascii=False), encoding="utf-8")
+    temporary.replace(REQUEST)
+    return request
 
 
-def _scope_revision(
-    root: Path,
-    scopes: tuple[str, ...],
-    boundary: SourceBoundary,
-    checkpoint=lambda: None,
-    max_entries: int = 600_000,
-) -> str:
-    observed = {}
-    inspected = 0
-    for scope in scopes:
-        directory = contained_path(root, scope)
-        info = directory.stat() if directory.is_dir() else None
-        observed[scope + "/"] = [info.st_dev, info.st_ino] if info else None
-        if not directory.is_dir():
-            continue
-        for current, dirs, names in bounded_walk(directory, checkpoint=checkpoint):
-            checkpoint()
-            inspected += len(dirs) + len(names)
-            if inspected > max_entries:
-                raise MigrationError("migration_scan_work_limit")
-            for name in list(dirs):
-                child = Path(current) / name
-                relative = child.relative_to(root).as_posix()
-                if is_link(child):
-                    raise MigrationError("migration_link_forbidden", path=relative)
-                if boundary.protected(relative):
-                    dirs.remove(name)
-                else:
-                    info = child.stat()
-                    observed[relative + "/"] = [info.st_dev, info.st_ino]
-            for name in names:
-                child = Path(current) / name
-                relative = child.relative_to(root).as_posix()
-                if not boundary.protected(relative):
-                    contained_path(root, relative, regular=True)
-                    if _database_file(child) or _database_companion(child):
-                        continue
-                    observed[relative] = _fingerprint(child, checkpoint)
-    return hashlib.sha256(json.dumps(observed, sort_keys=True).encode()).hexdigest()
+def _mask(url: str | None) -> str | None:
+    if not url:
+        return url
+    parts = urlsplit(url)
+    if not parts.password:
+        return url
+    host = parts.netloc.rsplit("@", 1)[1]
+    return urlunsplit(parts._replace(netloc=f"{parts.username}:***@{host}"))
 
 
-def _configuration_bytes(
-    path: str, incoming: bytes, existing: bytes | None, mode: ConfigurationMode
-) -> bytes:
-    if (
-        mode == "backup"
-        and path.endswith((".yaml", ".yml"))
-        and path.casefold()
-        not in {"data/config.yaml", "data/configs/plugins2config.yaml"}
-    ):
-        return incoming
-    if len(incoming) > 8 * CHUNK or len(existing or b"") > 8 * CHUNK:
-        raise MigrationError("migration_configuration_limit", path=path)
-    try:
-        source = incoming.decode("utf-8-sig")
-        target = (existing or b"").decode("utf-8-sig")
-        name = path.rsplit("/", 1)[-1]
-        if name.startswith(".env"):
-            # Database selection, not the configuration file, owns DB_URL.
-            keys = frozenset({"DB_URL"})
-            result = (
-                merge_env(target, source, preserve=keys)
-                if mode == "missing"
-                else replace_env(source, target, preserve=keys)
-            )
-            return result.encode()
-        if path.endswith((".yaml", ".yml")):
-            return configuration_yaml(
-                path,
-                source,
-                target if existing is not None else None,
-                missing=mode == "missing",
-            ).encode()
-        if mode == "missing" and existing is not None:
-            raise MigrationError("migration_configuration_merge_unsupported", path=path)
-        return incoming
-    except UnicodeError:
-        raise MigrationError("migration_configuration_encoding", path=path) from None
+def _current_db_url() -> str:
+    from zhenxun.configs.config import BotConfig
+
+    return BotConfig.db_url
 
 
-def prepare_files(
-    root: Path,
-    staging: Path,
-    manifest: dict,
-    options: RestoreOptions,
-    *,
-    checkpoint=lambda: None,
-    configuration_overrides: dict | None = None,
-    administrator_overrides: dict | None = None,
-) -> dict:
-    """Prepare candidate bytes without modifying the target instance."""
-    from zhenxun.services.message_store import assert_replaceable_inbox
+def _message(error: BaseException) -> str:
+    code = getattr(error, "code", None)
+    return f"{code}: {error}" if code and str(error) != code else str(error)
 
-    assert_replaceable_inbox(root)
-    boundary = SourceBoundary.read(root)
-    actions, skipped, conflicts = [], [], []
-    directory_candidates = set()
-    removed_directories = []
-    planned = PathIndex()
-    selected = set()
-    source = manifest.get("source", {})
-    native_compatible = (
-        source.get("system") == platform.system()
-        and source.get("architecture") == platform.machine()
-    )
-    prepared = staging / "prepared"
-    if prepared.exists():
-        raise MigrationError("migration_plan_exists", status=409)
-    prepared.mkdir(mode=0o700)
-    for entry in manifest["files"]:
-        checkpoint()
-        path = entry["path"]
-        if entry["category"] not in options.categories:
-            skipped.append({"path": path, "reason": "category_not_selected"})
-            continue
-        if entry["root"] != "project":
-            conflicts.append({"path": path, "reason": "external_root_mapping_required"})
-            continue
-        try:
-            logical_path(path)
-            from .discovery import regenerated_file
 
-            if regenerated_file(path):
-                skipped.append({"path": path, "reason": "regenerated_diagnostic"})
-                continue
-            if boundary.protected(path) or category_for(path) != entry["category"]:
-                raise MigrationError("migration_target_protected", path=path)
-            planned.add(path)
-            target = contained_path(root, path)
-            incoming = contained_path(staging, entry["payload"], regular=True)
-            is_config = entry["category"] == "configuration"
-            incoming_config = None
-            target_config = None
-            if is_config:
-                incoming_config = _configuration_read(incoming)
-                if target.exists():
-                    target_config = _configuration_read(target)
-            if file_hash(incoming, checkpoint) != entry["sha256"]:
-                raise MigrationError("migration_payload_hash_mismatch", path=path)
-            if (
-                _database_file(target)
-                or _database_companion(target)
-                or _database_file(incoming)
-            ):
-                skipped.append(
-                    {"path": path, "reason": "database_requires_separate_plan"}
-                )
-                continue
-            selected.add(path)
-            if Path(path).suffix.lower() in _NATIVE and not native_compatible:
-                raise MigrationError("migration_native_binary_incompatible", path=path)
-            if Path(path).suffix.lower() in {".so", ".pyd"} and (
-                source.get("implementation") != sys.implementation.name
-                or str(source.get("python", "")).split(".")[:2]
-                != platform.python_version().split(".")[:2]
-            ):
-                raise MigrationError("migration_python_binary_incompatible", path=path)
-            fingerprint = _fingerprint(target, checkpoint)
-            if is_config and options.configuration == "keep":
-                baseline = {}
-                if (
-                    path in {"data/config.yaml", "data/configs/plugins2config.yaml"}
-                    and fingerprint is not None
-                ):
-                    retained = prepared / ("preserved-" + Path(path).name)
-                    _atomic_copy(target, retained, checkpoint=checkpoint)
-                    baseline["baseline"] = retained.relative_to(staging).as_posix()
-                skipped.append(
-                    {
-                        "path": path,
-                        "reason": "configuration_keep",
-                        "sha256": fingerprint,
-                        **baseline,
-                    }
-                )
-                continue
-            if not is_config and options.files == "missing" and fingerprint is not None:
-                skipped.append(
-                    {"path": path, "reason": "existing_file", "sha256": fingerprint}
-                )
-                continue
-            candidate = prepared / f"{len(actions):08d}"
-            if is_config:
-                configuration = _configuration_bytes(
-                    path,
-                    incoming_config,
-                    target_config,
-                    options.configuration,
-                )
-                if path in {".env", ".env.dev"} and configuration_overrides:
-                    configuration = override_env(
-                        configuration.decode("utf-8"), configuration_overrides
-                    ).encode("utf-8")
-                candidate.write_bytes(
-                    override_administrator(path, configuration, administrator_overrides)
-                )
-            else:
-                _atomic_copy(incoming, candidate, checkpoint=checkpoint)
-            digest = file_hash(candidate, checkpoint)
-            if fingerprint == digest:
-                baseline = {}
-                if path in {"data/config.yaml", "data/configs/plugins2config.yaml"}:
-                    retained = prepared / ("preserved-" + Path(path).name)
-                    candidate.rename(retained)
-                    baseline["baseline"] = retained.relative_to(staging).as_posix()
-                else:
-                    candidate.unlink()
-                skipped.append(
-                    {"path": path, "reason": "unchanged", "sha256": digest, **baseline}
-                )
-                continue
-            actions.append(
-                {
-                    "path": path,
-                    "action": "replace" if fingerprint is not None else "add",
-                    "before": fingerprint,
-                    "after": digest,
-                    "candidate": candidate.relative_to(staging).as_posix(),
-                    "size": candidate.stat().st_size,
-                }
-            )
-        except MigrationError as error:
-            if error.code in {"migration_cancelled", "migration_budget_exhausted"}:
-                raise
-            conflicts.append({"path": path, "reason": error.code})
-        except OSError:
-            conflicts.append({"path": path, "reason": "migration_file_unreadable"})
-    overrides = {}
-    if configuration_overrides:
-        overrides[".env.dev"] = "environment"
-        if (root / ".env").exists():
-            overrides[".env"] = "environment"
-    if administrator_overrides:
-        overrides["data/config.yaml"] = "administrator"
-        overrides["data/configs/plugins2config.yaml"] = "administrator"
-    if overrides:
-        options = replace(
-            options,
-            exact_files=tuple(sorted(set(options.exact_files) | set(overrides))),
-        )
-    # Explicitly confirmed management values are independent of the package's
-    # category selection. Persist them even when the package omits an env file.
-    for path, kind in overrides.items():
-        if path in selected:
-            continue
-        if boundary.protected(path):
-            conflicts.append({"path": path, "reason": "migration_target_protected"})
-            continue
-        target = contained_path(root, path)
-        before = _fingerprint(target, checkpoint)
-        content = _configuration_read(target) if target.exists() else b""
-        if kind == "environment":
-            content = override_env(
-                content.decode("utf-8-sig"), configuration_overrides
-            ).encode("utf-8")
-        else:
-            content = override_administrator(
-                path, content or b"{}", administrator_overrides
-            )
-        selected.add(path)
-        planned.add(path)
-        after = hashlib.sha256(content).hexdigest()
-        if before == after:
-            continue
-        candidate = prepared / f"{len(actions):08d}"
-        candidate.write_bytes(content)
-        actions.append(
-            {
-                "path": path,
-                "action": "replace" if before is not None else "add",
-                "before": before,
-                "after": after,
-                "candidate": candidate.relative_to(staging).as_posix(),
-                "size": len(content),
-            }
-        )
-    retained_runtime_directories = []
-    if options.files == "exact":
-        inspected = 0
-        removals = set()
-        for directory in options.exact_directories:
-            if (
-                boundary.protected(directory)
-                or category_for(directory + "/x") not in options.categories
-                or (
-                    category_for(directory + "/x") == "configuration"
-                    and not options.replace_configuration_scope
-                )
-            ):
-                conflicts.append(
-                    {"path": directory, "reason": "migration_exact_scope_protected"}
-                )
-                continue
-            target_dir = contained_path(root, directory)
-            if not target_dir.exists():
-                continue
-            for current, dirs, names in bounded_walk(target_dir, checkpoint=checkpoint):
-                checkpoint()
-                inspected += len(dirs) + len(names)
-                if inspected > 600_000:
-                    raise MigrationError("migration_scan_work_limit")
-                for name in list(dirs):
-                    child = Path(current) / name
-                    relative = child.relative_to(root).as_posix()
-                    if is_link(child) or boundary.protected(relative):
-                        dirs.remove(name)
-                    else:
-                        directory_candidates.add(relative)
-                for name in names:
-                    target = Path(current) / name
-                    path = target.relative_to(root).as_posix()
-                    if is_link(target):
-                        conflicts.append(
-                            {"path": path, "reason": "migration_link_forbidden"}
-                        )
-                        continue
-                    if (
-                        path in selected
-                        or path in removals
-                        or boundary.protected(path)
-                        or _database_file(target)
-                        or _database_companion(target)
-                    ):
-                        continue
-                    if category_for(path) not in options.categories:
-                        continue
-                    if (
-                        category_for(path) == "configuration"
-                        and not options.replace_configuration_scope
-                    ):
-                        continue
-                    try:
-                        contained_path(root, path, regular=True)
-                        planned.add(path)
-                        actions.append(
-                            {
-                                "path": path,
-                                "action": "remove",
-                                "before": _fingerprint(target, checkpoint),
-                                "after": None,
-                                "size": target.stat().st_size,
-                            }
-                        )
-                        removals.add(path)
-                    except MigrationError as error:
-                        if error.code in {
-                            "migration_cancelled",
-                            "migration_budget_exhausted",
-                        }:
-                            raise
-                        conflicts.append({"path": path, "reason": error.code})
-        for path in options.exact_files:
-            target = contained_path(root, path)
-            if path in selected or path in removals or not target.exists():
-                continue
-            if boundary.protected(path) or category_for(path) not in options.categories:
-                continue
-            if (
-                category_for(path) == "configuration"
-                and not options.replace_configuration_scope
-            ):
-                continue
-            try:
-                planned.add(path)
-                actions.append(
-                    {
-                        "path": path,
-                        "action": "remove",
-                        "before": _fingerprint(target, checkpoint),
-                        "after": None,
-                        "size": target.stat().st_size,
-                    }
-                )
-                removals.add(path)
-            except MigrationError as error:
-                if error.code in {"migration_cancelled", "migration_budget_exhausted"}:
-                    raise
-                conflicts.append({"path": path, "reason": error.code})
-        removed_files = {a["path"] for a in actions if a["action"] == "remove"}
-        removable = set()
-        selected_parents = {
-            "/".join(parts[:index])
-            for path in selected
-            for parts in (path.split("/"),)
-            for index in range(1, len(parts))
-        }
-        for relative in sorted(directory_candidates, key=lambda p: (-p.count("/"), p)):
-            checkpoint()
-            from .discovery import regenerated_empty_directory
+def status() -> dict:
+    """当前或最近一次恢复 / 切换的状态，数据库密码已隐藏
 
-            if relative in selected_parents:
-                continue
-            if category_for(relative + "/x") not in options.categories:
-                continue
-            if (
-                category_for(relative + "/x") == "configuration"
-                and not options.replace_configuration_scope
-            ):
-                continue
-            directory = contained_path(root, relative)
-            if all(
-                child.relative_to(root).as_posix() in removed_files
-                or child.relative_to(root).as_posix() in removable
-                for child in directory.iterdir()
-            ):
-                info = directory.stat()
-                entry = {"path": relative, "identity": [info.st_dev, info.st_ino]}
-                if regenerated_empty_directory(relative):
-                    retained_runtime_directories.append(entry)
-                else:
-                    removed_directories.append(entry)
-                removable.add(relative)
-    preview = {
-        "package_id": manifest["package_id"],
-        "actions": actions,
-        "skipped": skipped,
-        "conflicts": conflicts,
-        "removed_directories": removed_directories,
-        "retained_runtime_directories": retained_runtime_directories,
-        "options": {**asdict(options), "categories": sorted(options.categories)},
-        "core_revision": boundary.revision,
-        "core_boundary_digest": hashlib.sha256(
-            "\n".join(sorted(boundary.tracked)).encode()
-        ).hexdigest(),
-        "scope_revision": _scope_revision(
-            root, options.exact_directories, boundary, checkpoint
-        ),
-        "exact_file_state": {
-            path: _fingerprint(contained_path(root, path), checkpoint)
-            for path in options.exact_files
-            if not boundary.protected(path)
-        },
+    返回:
+        dict: 状态，没有记录时 state 为 idle
+    """
+    request = _load()
+    if request is None:
+        return {"state": "idle"}
+    return {
+        **request,
+        "db_url": _mask(request.get("db_url")),
+        "previous_db_url": _mask(request.get("previous_db_url")),
     }
-    preview["target_revision"] = hashlib.sha256(
-        json.dumps(preview, sort_keys=True).encode()
-    ).hexdigest()
-    return preview
 
 
-def _prepare_parents(root: Path, relative: str, journal: FileJournal) -> None:
-    parts = relative.split("/")[:-1]
-    for count in range(1, len(parts) + 1):
-        path = "/".join(parts[:count])
-        directory = contained_path(root, path)
-        if directory.exists():
-            continue
-        journal.append("directory_intent", {"path": path})
-        directory.mkdir(mode=0o700)
-        info = directory.stat()
-        journal.append(
-            "directory_created", {"path": path, "identity": [info.st_dev, info.st_ino]}
-        )
+def dismiss() -> None:
+    """清除已结束的恢复记录"""
+    request = _load()
+    if request and request["state"] in RUNNING:
+        raise RestoreError("恢复仍在进行中")
+    shutil.rmtree(STATE_DIR, ignore_errors=True)
 
 
-def _atomic_copy(
-    source: Path,
-    destination: Path,
-    *,
-    before_replace=None,
-    checkpoint=lambda: None,
-) -> None:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    handle, name = tempfile.mkstemp(prefix=".zx-apply-", dir=destination.parent)
-    temporary = Path(name)
+def needs_apply() -> bool:
+    """启动器是否需要在启动 worker 前执行恢复步骤"""
+    request = _load()
+    return bool(request and request["state"] in {"pending", "failed_import"})
+
+
+def importing() -> bool:
+    """worker 是否正在导入恢复数据"""
+    request = _load()
+    return bool(request and request["state"] in {"importing", "rollback_import"})
+
+
+def inspect(path: Path, password: str | None = None) -> dict:
+    """读取备份包摘要，并给出与当前环境的差异提示
+
+    参数:
+        path: 备份包路径
+        password: 加密备份的密码
+
+    返回:
+        dict: 摘要
+    """
+    import platform
+    import sys
+
+    from . import backup
+
+    manifest = backup.read_manifest(path, password)
+    saved = manifest.pop("dependencies")
+    warnings = []
+    python = platform.python_version()
+    if saved["python"].rsplit(".", 1)[0] != python.rsplit(".", 1)[0]:
+        warnings.append(f"备份来自 Python {saved['python']}，当前为 {python}")
+    current = f"{sys.platform}-{platform.machine()}".lower()
+    if saved["platform"] != current:
+        warnings.append(f"备份来自 {saved['platform']}，部分依赖可能需要重新解析")
+    return {
+        **manifest,
+        "plugins": sorted(saved["plugins"]),
+        "manual_requirements": sorted(saved["manual_requirements"]),
+        "extra_requirements": sorted(saved["extra_requirements"]),
+        "python": saved["python"],
+        "platform": saved["platform"],
+        "warnings": warnings,
+        "configuration_preview": (
+            configuration_preview(path, password)
+            if "configuration" in manifest["categories"]
+            else None
+        ),
+    }
+
+
+def configuration_preview(
+    path: Path | None = None, password: str | None = None
+) -> dict:
+    """读取备份中恢复后会生效的 .env 配置与 WebUI 管理员账号
+
+    参数:
+        path: 备份包路径，为空时读取已解压的待恢复备份
+        password: 加密备份的密码
+
+    返回:
+        dict: environment 为 .env 配置项，username 为管理员账号，缺失时为空
+    """
+    import contextlib
+    from io import StringIO
+
+    from dotenv import dotenv_values
+    from ruamel.yaml import YAML
+
+    from . import backup
+
+    names = (".env.dev", ".env", "data/config.yaml", "data/configs/plugins2config.yaml")
+    contents: dict[str, str] = {}
+    if path is None:
+        for name in names:
+            with contextlib.suppress(OSError, UnicodeDecodeError):
+                contents[name] = (PACKAGE / "files" / name).read_text("utf-8")
+    else:
+        with backup._open(path, "r", password) as archive:
+            for name in names:
+                with contextlib.suppress(KeyError, UnicodeDecodeError):
+                    contents[name] = archive.read(f"files/{name}").decode("utf-8")
+
+    def webui(name: str) -> dict:
+        try:
+            data = YAML(typ="safe").load(contents.get(name, "")) or {}
+            return data.get("web-ui") or {}
+        except Exception:
+            return {}
+
+    text = contents.get(".env.dev") or contents.get(".env")
+    environment = dict(dotenv_values(stream=StringIO(text))) if text else {}
+    username = webui("data/config.yaml").get("USERNAME") or (
+        webui("data/configs/plugins2config.yaml").get("USERNAME") or {}
+    ).get("value")
+    return {"environment": environment, "username": username}
+
+
+def _idle() -> None:
+    request = _load()
+    if request and request["state"] in RUNNING:
+        raise RestoreError("已有恢复或切换数据库的任务正在进行")
+    shutil.rmtree(STATE_DIR, ignore_errors=True)
+    STATE_DIR.mkdir(parents=True)
+
+
+async def _export(db_url: str, directory: Path) -> None:
+    from . import data
+
+    client = await data.open_client(db_url, "zx_restore_export")
     try:
-        with os.fdopen(handle, "wb") as writer, source.open("rb") as reader:
-            opened = os.fstat(reader.fileno())
-            copied = 0
-            while data := reader.read(CHUNK):
-                checkpoint()
-                copied += len(data)
-                if copied > opened.st_size:
-                    raise MigrationError("migration_source_changed")
-                writer.write(data)
-            writer.flush()
-            os.fsync(writer.fileno())
-            after = os.fstat(reader.fileno())
-            if copied != opened.st_size or after.st_mtime_ns != opened.st_mtime_ns:
-                raise MigrationError("migration_source_changed")
-        checkpoint()
-        if before_replace is not None:
-            info = temporary.stat()
-            before_replace([info.st_dev, info.st_ino])
-        os.replace(temporary, destination)
+        await data.export_data(directory, client)
     finally:
-        temporary.unlink(missing_ok=True)
+        await client.close()
 
 
-def apply_files(
-    root: Path,
-    staging: Path,
-    plan: dict,
-    journal: Path,
-    *,
-    expected_revision: str,
-    destructive_confirmed: bool = False,
-    checkpoint=lambda: None,
-    rollback_checkpoint=lambda: None,
-    progress=None,
+async def _restart() -> tuple[bool, str]:
+    from zhenxun.utils._restart_utils import request_restart
+
+    return await request_restart("backup-restore")
+
+
+async def _submit(request: dict, restart: Restart | None) -> dict:
+    _save(request)
+    ok, message = await (restart or _restart)()
+    if not ok:
+        shutil.rmtree(STATE_DIR, ignore_errors=True)
+        raise RestoreError(message)
+    return status()
+
+
+async def request_restore(
+    path: Path,
+    password: str | None,
+    categories: list[str],
+    skip_failed: bool = False,
+    restart: Restart | None = None,
 ) -> dict:
-    """Caller must hold the instance lease and keep all business writers stopped."""
-    from zhenxun.services.message_store import assert_replaceable_inbox
+    """准备从备份包恢复并请求重启
 
-    assert_replaceable_inbox(root)
-    if plan["conflicts"]:
-        raise conflict_error(plan["conflicts"], directory=staging)
-    if plan["target_revision"] != expected_revision:
-        raise MigrationError("migration_target_changed", status=409)
-    if (
-        any(a["action"] == "remove" for a in plan["actions"])
-        or plan.get("removed_directories")
-    ) and not destructive_confirmed:
-        raise MigrationError("migration_destructive_confirmation_required")
-    recheck_files(root, staging, plan, checkpoint=checkpoint)
-    if journal.exists():
-        raise MigrationError("migration_journal_exists", status=409)
-    require_space(staging, sum(a["size"] for a in plan["actions"]) * 2)
-    return _apply_checked_files(
-        root,
-        staging,
-        plan,
-        journal,
-        expected_revision=expected_revision,
-        checkpoint=checkpoint,
-        rollback_checkpoint=rollback_checkpoint,
-        progress=progress,
-    )
+    参数:
+        path: 备份包路径
+        password: 加密备份的密码
+        categories: 恢复的文件分类
+        skip_failed: 依赖无法安装时是否跳过对应插件继续
+        restart: 请求重启的函数，默认直接请求启动器重启
 
+    返回:
+        dict: 恢复状态
+    """
+    from . import backup
 
-def recheck_files(root: Path, staging: Path, plan: dict, *, checkpoint=lambda: None):
-    """Revalidate the approved target and candidates before any mutation intent."""
-    boundary = SourceBoundary.read(root)
-    digest = hashlib.sha256("\n".join(sorted(boundary.tracked)).encode()).hexdigest()
-    if (
-        digest != plan["core_boundary_digest"]
-        or boundary.revision != plan["core_revision"]
-    ):
-        raise MigrationError("migration_target_changed", status=409)
-    if {
-        path: _fingerprint(contained_path(root, path), checkpoint)
-        for path in plan["options"].get("exact_files", [])
-        if not boundary.protected(path)
-    } != plan.get("exact_file_state", {}):
-        raise MigrationError("migration_target_changed", status=409)
-    if (
-        _scope_revision(
-            root, tuple(plan["options"]["exact_directories"]), boundary, checkpoint
-        )
-        != plan["scope_revision"]
-    ):
-        raise MigrationError("migration_target_changed", status=409)
-    for action in plan["actions"]:
-        checkpoint()
-        target = contained_path(root, action["path"])
-        if (
-            boundary.protected(action["path"])
-            or _fingerprint(target, checkpoint) != action["before"]
-        ):
-            raise MigrationError(
-                "migration_target_changed", path=action["path"], status=409
-            )
-        if action["action"] != "remove":
-            candidate = contained_path(staging, action["candidate"], regular=True)
-            if file_hash(candidate, checkpoint) != action["after"]:
-                raise MigrationError("migration_candidate_changed", status=409)
-
-
-def _apply_checked_files(
-    root,
-    staging,
-    plan,
-    journal,
-    *,
-    expected_revision,
-    checkpoint,
-    rollback_checkpoint,
-    progress=None,
-):
-    boundary = SourceBoundary.read(root)
-    rollback = staging / "rollback"
-    rollback.mkdir(mode=0o700)
-    log = FileJournal(
-        journal,
+    _idle()
+    try:
+        manifest = await asyncio.to_thread(backup.extract, path, PACKAGE, password)
+        if unknown := set(categories) - set(manifest["categories"]):
+            raise RestoreError(f"备份中没有这些分类: {', '.join(sorted(unknown))}")
+        db_url = _current_db_url()
+        await _export(db_url, ROLLBACK / "database")
+    except BaseException:
+        shutil.rmtree(STATE_DIR, ignore_errors=True)
+        raise
+    return await _submit(
         {
-            "stage": "applying_files",
-            "package_id": plan["package_id"],
-            "target_revision": expected_revision,
-            "retained_runtime_directories": plan.get(
-                "retained_runtime_directories", []
-            ),
+            "kind": "restore",
+            "state": "pending",
+            "name": path.name,
+            "categories": sorted(categories),
+            "skip_failed": skip_failed,
+            "db_url": db_url,
+            "previous_db_url": db_url,
+            "created_at": _now(),
         },
+        restart,
     )
-    state = log.state
+
+
+async def _require_empty(db_url: str) -> None:
+    from . import data
+
     try:
-        for index, action in enumerate(plan["actions"]):
-            checkpoint()
-            target = contained_path(root, action["path"])
-            if _fingerprint(target, checkpoint) != action["before"]:
-                raise MigrationError("migration_target_changed", status=409)
-            backup = rollback / str(index)
-            if action["before"] is not None:
-                _atomic_copy(target, backup, checkpoint=checkpoint)
-            receipt = {
-                **action,
-                "backup": backup.relative_to(staging).as_posix(),
-                "index": index,
-            }
-            # Record the undo intent durably before touching the target.
-            log.append("intent", receipt)
-            if action["action"] == "remove":
-                target.unlink()
-            else:
-                _prepare_parents(root, action["path"], log)
-                _atomic_copy(
-                    contained_path(staging, action["candidate"], regular=True),
-                    target,
-                    before_replace=lambda identity, index=index: log.append(
-                        "materialized", {"index": index, "identity": identity}
-                    ),
-                    checkpoint=checkpoint,
-                )
-            log.append("applied", {"index": index})
-            if progress is not None:
-                progress(
-                    current=index + 1,
-                    total=len(plan["actions"]),
-                    unit="项",
-                    step="应用文件变更",
-                    percent=(index + 1) / len(plan["actions"]) * 100
-                    if plan["actions"]
-                    else 100,
-                )
-        for index, directory in enumerate(plan.get("removed_directories", [])):
-            checkpoint()
-            target = contained_path(root, directory["path"])
-            info = target.stat()
-            if (
-                boundary.protected(directory["path"])
-                or [info.st_dev, info.st_ino] != directory["identity"]
-                or not target.is_dir()
-                or any(target.iterdir())
-            ):
-                raise MigrationError("migration_target_changed", status=409)
-            backup = rollback / f"directory-{index}"
-            log.append(
-                "directory_remove_intent",
-                {
-                    **directory,
-                    "backup": backup.relative_to(staging).as_posix(),
-                },
-            )
-            os.replace(target, backup)
-            log.append("directory_removed", {"path": directory["path"]})
-        log.stage("files_applied_unverified")
-        return state
-    except BaseException as error:
-        original_error = (
-            error.code if isinstance(error, MigrationError) else type(error).__name__
-        )
-        log.stage("applying_files_failed", original_error=original_error)
-        rollback_files(root, staging, journal, checkpoint=rollback_checkpoint)
+        client = await data.open_client(db_url, "zx_switch_check")
+    except Exception as error:
+        raise RestoreError(f"无法连接目标数据库: {error}") from error
+    try:
+        for model in data._models():
+            table = model._meta.db_table
+            query = client.query_class.from_(table).select(1).limit(1).get_sql()
+            try:
+                rows = (await client.execute_query(query))[1]
+            except Exception:
+                continue
+            if rows:
+                raise RestoreError(f"目标数据库已有数据（表 {table}），请使用空数据库")
+    finally:
+        await client.close()
+
+
+async def request_switch(db_url: str, restart: Restart | None = None) -> dict:
+    """把当前数据复制到新数据库，重启后切换 DB_URL
+
+    参数:
+        db_url: 新数据库地址，须为空库
+        restart: 请求重启的函数，默认直接请求启动器重启
+
+    返回:
+        dict: 切换状态
+    """
+    current = _current_db_url()
+    if db_url == current:
+        raise RestoreError("新数据库与当前数据库相同")
+    await _require_empty(db_url)
+    _idle()
+    try:
+        await _export(current, PACKAGE / "database")
+    except BaseException:
+        shutil.rmtree(STATE_DIR, ignore_errors=True)
         raise
+    return await _submit(
+        {
+            "kind": "switch",
+            "state": "pending",
+            "categories": [],
+            "db_url": db_url,
+            "previous_db_url": current,
+            "created_at": _now(),
+        },
+        restart,
+    )
 
 
-def rollback_files(
-    root: Path,
-    staging: Path,
-    journal: Path,
-    *,
-    checkpoint=lambda: None,
-    authorized_runtime_mutations=None,
-) -> dict:
-    boundary = SourceBoundary.read(root)
-    log = FileJournal(journal)
-    state = log.state
-    if state.get("stage") == "files_rolled_back":
-        return state
+class _Files:
+    """恢复文件前记录被覆盖与新建的文件，用于回滚"""
 
-    def stage(name: str, **details) -> None:
-        if state["schema"] == 1:
-            state.update(stage=name, **details)
-            write_json_locked(journal, state)
+    def __init__(self, root: Path):
+        self.root = root
+        self.record = ROLLBACK / "files.json"
+        self.saved: list[str] = []
+        self.created: list[str] = []
+
+    def protect(self, relative: str) -> None:
+        if relative in self.saved or relative in self.created:
+            return
+        target = self.root / relative
+        if target.is_file():
+            backup = ROLLBACK / "files" / relative
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(target, backup)
+            self.saved.append(relative)
         else:
-            log.stage(name, **details)
-
-    stage("rolling_back_files")
-    try:
-        from .discovery import verify_runtime_directories
-
-        verify_runtime_directories(
-            root,
-            state.get("retained_runtime_directories", []),
-            baseline_files={item["path"]: item["before"] for item in state["actions"]},
+            self.created.append(relative)
+        self.record.write_text(
+            json.dumps({"saved": self.saved, "created": self.created}),
+            encoding="utf-8",
         )
-        for directory in reversed(state.get("removed_directories", [])):
-            checkpoint()
-            if directory["state"] == "restored":
-                continue
-            if boundary.protected(directory["path"]):
-                raise MigrationError("migration_rollback_target_protected")
-            target = contained_path(root, directory["path"])
-            backup = contained_path(staging, directory["backup"])
-            if target.exists():
-                info = target.stat()
-                if (
-                    backup.exists()
-                    or not target.is_dir()
-                    or [info.st_dev, info.st_ino] != directory["identity"]
-                ):
-                    raise MigrationError("migration_rollback_directory_conflict")
-            else:
-                if not backup.is_dir():
-                    raise MigrationError("migration_rollback_directory_unconfirmed")
-                info = backup.stat()
-                if [info.st_dev, info.st_ino] != directory["identity"] or any(
-                    backup.iterdir()
-                ):
-                    raise MigrationError("migration_rollback_directory_conflict")
-                os.replace(backup, target)
-            log.append("directory_restored", {"path": directory["path"]})
-        for receipt in reversed(state["actions"]):
-            checkpoint()
-            if receipt["state"] == "rolled_back":
-                continue
-            if boundary.protected(receipt["path"]):
-                raise MigrationError("migration_rollback_target_protected")
-            target = contained_path(root, receipt["path"])
-            current = _fingerprint(target, checkpoint)
-            runtime_mutation = (authorized_runtime_mutations or {}).get(receipt["path"])
-            runtime_authorized = bool(
-                runtime_mutation
-                and runtime_mutation.get("current_sha256") == current
-                and current is not None
-                and runtime_mutation.get("identity")
-                == [target.stat().st_dev, target.stat().st_ino]
-            )
-            if runtime_authorized and current != receipt["after"]:
-                log.stage(
-                    "runtime_mutation_authorized",
-                    path=receipt["path"],
-                    mutation=runtime_mutation,
-                )
+
+    def write(self, relative: str, source: Path) -> None:
+        self.protect(relative)
+        target = self.root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+
+    def rollback(self) -> None:
+        try:
+            record = json.loads(self.record.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        for relative in record["saved"]:
+            target = self.root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(ROLLBACK / "files" / relative, target)
+        for relative in record["created"]:
+            (self.root / relative).unlink(missing_ok=True)
+
+
+def _environment_file(root: Path) -> str:
+    from zhenxun.configs.environment import environment_file
+
+    return environment_file(root=root).relative_to(root).as_posix()
+
+
+def _write_files(request: dict, root: Path, files: _Files) -> None:
+    from dotenv import set_key
+
+    from zhenxun.services.nonebot_store.storage import read_json, write_json
+
+    from . import backup
+    from .deps import RECEIPTS_FILE
+
+    files.protect(_environment_file(root))
+    source = PACKAGE / "files"
+    if source.is_dir():
+        for path in sorted(source.rglob("*")):
+            relative = path.relative_to(source).as_posix()
             if (
-                current != receipt["before"]
-                and current == receipt["after"]
-                and target.exists()
-                and state["schema"] == 2
+                path.is_file()
+                and backup.category_for(relative) in request["categories"]
             ):
-                info = target.stat()
-                if receipt.get("after_identity") != [info.st_dev, info.st_ino]:
-                    raise MigrationError(
-                        "migration_rollback_identity_conflict", path=receipt["path"]
-                    )
-            if current == receipt["before"]:
-                pass
-            elif current != receipt["after"] and not runtime_authorized:
-                raise MigrationError(
-                    "migration_rollback_conflict", path=receipt["path"]
-                )
-            elif receipt["before"] is None:
-                target.unlink()
-            else:
-                backup = contained_path(staging, receipt["backup"], regular=True)
-                if file_hash(backup, checkpoint) != receipt["before"]:
-                    raise MigrationError("migration_rollback_backup_changed")
-                _atomic_copy(backup, target, checkpoint=checkpoint)
-            if state["schema"] == 1:
-                receipt["state"] = "rolled_back"
-                write_json_locked(journal, state)
-            else:
-                log.append("rolled_back", {"index": receipt["index"]})
-        for directory in reversed(state.get("directories", [])):
-            checkpoint()
-            if directory["state"] == "rolled_back":
-                continue
-            path = contained_path(root, directory["path"])
-            if path.exists():
-                info = path.stat()
-                if directory.get("identity") != [info.st_dev, info.st_ino]:
-                    raise MigrationError("migration_rollback_directory_unconfirmed")
-                try:
-                    path.rmdir()
-                except OSError:
-                    raise MigrationError(
-                        "migration_rollback_directory_conflict"
-                    ) from None
-            log.append("directory_rolled_back", {"path": directory["path"]})
-        stage("files_rolled_back")
-    except BaseException as error:
-        rollback_error = (
-            error.code if isinstance(error, MigrationError) else type(error).__name__
+                files.write(relative, path)
+    if "plugins" in request["categories"]:
+        saved = json.loads((PACKAGE / backup.DEPENDENCIES).read_text("utf-8"))
+        files.protect(RECEIPTS_FILE.as_posix())
+        receipts = read_json(root / RECEIPTS_FILE, {})
+        write_json(root / RECEIPTS_FILE, {**receipts, **saved["store_receipts"]})
+    environment = _environment_file(root)
+    files.protect(environment)
+    set_key(root / environment, "DB_URL", request["db_url"], quote_mode="always")
+
+
+def _apply(request: dict, root: Path) -> None:
+    from zhenxun.services.nonebot_store.storage import clear_pending_transaction
+
+    from . import backup, deps
+
+    try:
+        if request["kind"] == "restore":
+            saved = json.loads((PACKAGE / backup.DEPENDENCIES).read_text("utf-8"))
+            report = asyncio.run(deps.stage_restore(saved, request["skip_failed"]))
+            _save(request, dependencies=report)
+    except Exception as error:
+        _save(request, state="failed", error=f"依赖无法安装：{_message(error)}")
+        return
+    files = _Files(root)
+    try:
+        _write_files(request, root, files)
+    except Exception as error:
+        files.rollback()
+        if request.get("dependencies", {}).get("staged"):
+            clear_pending_transaction()
+        _save(request, state="failed", error=f"文件恢复失败：{_message(error)}")
+        return
+    _save(request, state="importing")
+
+
+def apply_pending(root: Path | None = None) -> bool:
+    """启动器在启动 worker 前执行的恢复步骤：应用恢复或回滚导入失败的恢复
+
+    参数:
+        root: 项目根目录
+
+    返回:
+        bool: 是否执行了步骤
+    """
+    root = root or Path.cwd()
+    request = _load()
+    if request is None:
+        return False
+    if request["state"] == "pending":
+        _apply(request, root)
+    elif request["state"] == "failed_import":
+        _Files(root).rollback()
+        _save(
+            request,
+            state="rollback_import" if request["kind"] == "restore" else "rolled_back",
         )
-        stage(
-            "recovery_required",
-            rollback_error=rollback_error,
-            rollback_path=getattr(error, "path", None),
+        if request["kind"] == "switch":
+            shutil.rmtree(PACKAGE, ignore_errors=True)
+    else:
+        return False
+    return True
+
+
+async def import_pending() -> None:
+    """worker 建表后导入待恢复的数据，失败时请求重启以回滚"""
+    request = _load()
+    if request is None or request["state"] not in {"importing", "rollback_import"}:
+        return
+    from tortoise import Tortoise
+
+    from zhenxun.services.log import logger
+    from zhenxun.utils._restart_utils import request_restart
+
+    from . import data
+
+    rollback = request["state"] == "rollback_import"
+    source = (ROLLBACK if rollback else PACKAGE) / "database"
+    progress: dict[str, Any] = {}
+
+    def update(table: str, rows: int):
+        progress.update(table=table, rows=rows)
+        _save(request, progress=progress)
+
+    logger.info("正在导入回滚数据" if rollback else "正在导入恢复数据", "恢复")
+    try:
+        report = await data.import_data(
+            source, Tortoise.get_connection("default"), replace=True, progress=update
         )
-        raise
-    return state
+    except Exception as error:
+        logger.error("恢复数据导入失败", "恢复", e=error)
+        if rollback:
+            _save(request, state="rollback_failed", rollback_error=_message(error))
+            return
+        _save(request, state="failed_import", error=_message(error))
+        await request_restart("backup-restore-rollback")
+        return
+    request.pop("progress", None)
+    if rollback:
+        _save(request, state="rolled_back")
+    else:
+        _save(request, state="done", report=report)
+    shutil.rmtree(PACKAGE, ignore_errors=True)
+    shutil.rmtree(ROLLBACK, ignore_errors=True)
+    logger.info("恢复数据导入完成", "恢复")

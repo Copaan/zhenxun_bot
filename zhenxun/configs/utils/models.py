@@ -2,7 +2,8 @@ from collections.abc import Callable
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from nonebot.log import logger
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from zhenxun.utils.enum import BlockType, LimitWatchType, PluginLimitType, PluginType
 from zhenxun.utils.pydantic_compat import model_dump
@@ -311,7 +312,43 @@ class PluginExtraData(BaseModel):
     def to_dict(self, **kwargs):
         return model_dump(self, **kwargs)
 
+    @classmethod
+    def from_extra(cls, extra: Any, plugin_name: str = "") -> "PluginExtraData":
+        """解析插件元数据中的 extra，无效字段使用默认值
+
+        参数:
+            extra: PluginMetadata.extra
+            plugin_name: 插件名称，用于日志
+
+        返回:
+            PluginExtraData: 插件扩展信息
+        """
+        if not isinstance(extra, dict) or not extra:
+            return cls()
+        try:
+            return cls(**extra)
+        except (ValidationError, TypeError) as error:
+            invalid = (
+                {str(item["loc"][0]) for item in error.errors() if item.get("loc")}
+                if isinstance(error, ValidationError)
+                else set(extra)
+            )
+        key = (plugin_name, tuple(sorted(invalid)))
+        if key not in _INVALID_EXTRA_WARNED:
+            _INVALID_EXTRA_WARNED.add(key)
+            logger.warning(
+                f"插件 {plugin_name or '<unknown>'} 的 extra 字段无效，"
+                f"已使用默认值: {', '.join(sorted(invalid))}"
+            )
+        try:
+            return cls(**{k: v for k, v in extra.items() if str(k) not in invalid})
+        except (ValidationError, TypeError):
+            return cls()
+
     group_config_model: type[BaseModel] | None = None
     """插件的分群配置模型"""
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
+
+
+_INVALID_EXTRA_WARNED: set[tuple[str, tuple[str, ...]]] = set()

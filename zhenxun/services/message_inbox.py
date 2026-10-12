@@ -7,7 +7,7 @@ from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import suppress
 from contextvars import Context
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -665,12 +665,31 @@ class MessageInbox:
                 self._rate_sample = sample
                 last_snapshot = time.monotonic()
             if time.monotonic() >= next_cleanup:
-                await self.io(self.store.cleanup)
+                await self._cleanup()
                 next_cleanup = time.monotonic() + 3600
             wake_at = asyncio.get_running_loop().time() + 0.02
             await asyncio.sleep(0.02)
             pipeline_metrics.observe(
                 "event_loop_lag_ms", asyncio.get_running_loop().time() - wake_at
+            )
+
+    async def _cleanup(self):
+        """清理过期的收件箱记录，以及已结束 7 天以上事件的资产回执"""
+        from zhenxun.models.asset_operation import AssetOperation
+
+        await self.io(self.store.cleanup)
+        query = AssetOperation.filter(
+            event_id__isnull=False,
+            state__in=("committed", "released"),
+            update_time__lt=datetime.now(timezone.utc) - timedelta(days=7),
+        ).exclude(kind="delivery")
+        try:
+            if open_events := await self.io(self.store.open_events):
+                query = query.exclude(event_id__in=open_events)
+            await query.delete()
+        except Exception:
+            self.metrics["receipt_cleanup_failed"] = (
+                self.metrics.get("receipt_cleanup_failed", 0) + 1
             )
 
     async def _execute(self, row):

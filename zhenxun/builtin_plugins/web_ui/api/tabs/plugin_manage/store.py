@@ -1,7 +1,5 @@
-import ast
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import Path
 import shutil
@@ -27,6 +25,13 @@ from zhenxun.services.plugin_store.operation_journal import (
 from zhenxun.services.plugin_store.plugin_store_coordinator import (
     StoreOperationBusyError,
     plugin_store_operation_coordinator,
+)
+from zhenxun.services.plugin_store.plugin_store_receipts import (
+    artifact_version as installed_artifact_version,
+)
+from zhenxun.services.plugin_store.plugin_store_receipts import (
+    store_receipt,
+    write_store_receipt,
 )
 from zhenxun.services.plugin_store.plugin_store_transaction import stage_operation
 from zhenxun.utils.repo_utils.utils import redact_git_output
@@ -134,53 +139,6 @@ def _version_compare(installed: str | None, catalog: str) -> int | None:
     return (current > target) - (current < target)
 
 
-def _artifact_version(path: Path) -> str | None:
-    entrypoint = path / "__init__.py" if path.is_dir() else path
-    try:
-        tree = ast.parse(entrypoint.read_text(encoding="utf-8"))
-    except (OSError, SyntaxError, UnicodeError):
-        return None
-    metadata_values = []
-    for node in tree.body:
-        if isinstance(node, ast.Assign) and any(
-            isinstance(target, ast.Name) and target.id == "__plugin_meta__"
-            for target in node.targets
-        ):
-            metadata_values.append(node.value)
-        elif (
-            isinstance(node, ast.AnnAssign)
-            and isinstance(node.target, ast.Name)
-            and node.target.id == "__plugin_meta__"
-            and node.value is not None
-        ):
-            metadata_values.append(node.value)
-    for metadata in metadata_values:
-        for node in ast.walk(metadata):
-            if not isinstance(node, ast.Call):
-                continue
-            name = (
-                node.func.id
-                if isinstance(node.func, ast.Name)
-                else node.func.attr
-                if isinstance(node.func, ast.Attribute)
-                else ""
-            )
-            if name != "PluginExtraData":
-                continue
-            keyword = next(
-                (item for item in node.keywords if item.arg == "version"), None
-            )
-            if keyword is None:
-                continue
-            try:
-                value = ast.literal_eval(keyword.value)
-            except (ValueError, TypeError):
-                continue
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-    return None
-
-
 def _installed_version_evidence(
     *,
     installed_version: str | None,
@@ -255,71 +213,6 @@ def _runtime_capability(
         "mode": "hot_reloadable" if hot else "restart_required",
         "reason_codes": list(runtime.get("reload_reasons") or []),
     }
-
-
-def _receipt_data(
-    *,
-    source: str,
-    plugin_info: Any,
-    runtime_module: str,
-    path: Path,
-) -> dict[str, Any]:
-    installed_version = _artifact_version(path)
-    return {
-        "source": source,
-        "module": plugin_info.module,
-        "module_path": plugin_info.module_path,
-        "runtime_module": runtime_module,
-        "requested_version": str(plugin_info.version),
-        "installed_version": installed_version,
-        "version_source": "artifact_metadata" if installed_version else "unknown",
-        "catalog_version": str(plugin_info.version),
-        "source_digest": source_digest(path),
-        "installed_at": datetime.now(timezone.utc).isoformat(),
-    }
-
-
-def _write_receipt(
-    *,
-    store_key: str,
-    source: str,
-    plugin_info: Any,
-    runtime_module: str,
-    path: Path,
-) -> None:
-    StoreReceiptStore.set(
-        store_key,
-        _receipt_data(
-            source=source,
-            plugin_info=plugin_info,
-            runtime_module=runtime_module,
-            path=path,
-        ),
-    )
-
-
-def _dependency_inputs(install_result: Any) -> list[str]:
-    plan = install_result.dependency_plan
-    values = plan.get("candidate_inputs") or []
-    return [str(value) for value in values if isinstance(value, str)]
-
-
-def _dependency_packages(install_result: Any) -> dict[str, str]:
-    plan = install_result.dependency_plan
-    changes = plan.get("package_changes") or {}
-    result = {
-        str(item["name"]): str(item["version"])
-        for item in changes.get("added", [])
-        if isinstance(item, dict) and item.get("name") and item.get("version")
-    }
-    result.update(
-        {
-            str(item["name"]): str(item["to"])
-            for item in changes.get("changed", [])
-            if isinstance(item, dict) and item.get("name") and item.get("to")
-        }
-    )
-    return result
 
 
 @asynccontextmanager
@@ -443,6 +336,25 @@ def _store_operation_info(action: str, plugin_name: str, operation: dict) -> str
         return f"插件 {plugin_name} 已{action}，已请求受控重启"
     if mode == "restart_pending":
         return f"插件 {plugin_name} 已{action}，等待重启后生效"
+    if operation.get("rolled_back"):
+        if operation.get("rollback_runtime") in {None, "hot_reloaded"}:
+            return f"插件 {plugin_name} {action}后加载失败，已回滚"
+        return f"插件 {plugin_name} {action}后加载失败，文件已回滚，重启后恢复原版本"
+    reason = operation.get("reason") or ""
+    if reason.startswith("plugin_dependency_missing:"):
+        return (
+            f"插件 {plugin_name} {action}失败，缺少依赖 {reason.partition(':')[2]}，"
+            "请在插件的 requirements.txt 中声明后重启"
+        )
+    if stopped := operation.get("stopped"):
+        return (
+            f"插件 {plugin_name} {action}失败，{'、'.join(stopped)} 已停用，"
+            "修复后再次热重载即可恢复"
+        )
+    if action == "热重载":
+        if operation.get("reason") == "plugin_not_loaded":
+            return f"插件 {plugin_name} 未加载，无法热重载"
+        return f"插件 {plugin_name} 热重载失败，原版本仍在运行"
     return f"插件 {plugin_name} 文件已{action}，但运行时应用失败"
 
 
@@ -632,7 +544,9 @@ async def _(refresh: bool = False) -> Result[dict]:
             installed_version = installed_plugins.get(plugin.module)
             installed = path.exists() or installed_version is not None
             digest = source_digest(path) if installed else None
-            artifact_version = _artifact_version(path) if path.exists() else None
+            artifact_version = (
+                installed_artifact_version(path) if path.exists() else None
+            )
             effective_version, version_source, requested_version = (
                 _installed_version_evidence(
                     installed_version=installed_version,
@@ -821,11 +735,12 @@ async def _(param: PluginIr) -> Result:
                     _remove_path(path)
                 operation["rolled_back"] = True
             elif operation.get("apply_mode") == "restart_pending":
-                receipt = _receipt_data(
+                receipt = store_receipt(
                     source=source,
                     plugin_info=plugin_info,
                     runtime_module=runtime_module,
                     path=path,
+                    dependency_inputs=install_result.dependency_inputs,
                 )
                 staged = stage_operation(
                     action="install",
@@ -838,20 +753,23 @@ async def _(param: PluginIr) -> Result:
                     base_digest="missing",
                     receipt=receipt,
                     reason=str(operation.get("reason") or "plugin_restart_required"),
-                    dependency_inputs=_dependency_inputs(install_result),
-                    dependency_packages=_dependency_packages(install_result),
+                    dependency_inputs=install_result.dependency_inputs,
+                    dependency_packages=install_result.dependency_packages,
                     source_build_confirmed=param.confirm_source_build,
                     operation_id=journal_operation_id,
                 )
                 _remove_path(path)
                 operation.update(staged)
             else:
-                _write_receipt(
-                    store_key=_store_key(source, plugin_info.module),
-                    source=source,
-                    plugin_info=plugin_info,
-                    runtime_module=runtime_module,
-                    path=path,
+                write_store_receipt(
+                    _store_key(source, plugin_info.module),
+                    store_receipt(
+                        source=source,
+                        plugin_info=plugin_info,
+                        runtime_module=runtime_module,
+                        path=path,
+                        dependency_inputs=install_result.dependency_inputs,
+                    ),
                 )
         operation.setdefault("operation_id", journal_operation_id)
         operation["download_source"] = param.download_source
@@ -974,11 +892,12 @@ async def _(param: PluginIr) -> Result:
                         operation["rolled_back"] = True
                         operation["rollback_runtime"] = recovery.mode.value
                     elif operation.get("apply_mode") == "restart_pending":
-                        receipt = _receipt_data(
+                        receipt = store_receipt(
                             source=source,
                             plugin_info=plugin_info,
                             runtime_module=runtime_module,
                             path=path,
+                            dependency_inputs=install_result.dependency_inputs,
                         )
                         staged = stage_operation(
                             action="update",
@@ -992,20 +911,23 @@ async def _(param: PluginIr) -> Result:
                             reason=str(
                                 operation.get("reason") or "plugin_restart_required"
                             ),
-                            dependency_inputs=_dependency_inputs(install_result),
-                            dependency_packages=_dependency_packages(install_result),
+                            dependency_inputs=install_result.dependency_inputs,
+                            dependency_packages=install_result.dependency_packages,
                             source_build_confirmed=param.confirm_source_build,
                             operation_id=journal_operation_id,
                         )
                         _restore_plugin(path, backup)
                         operation.update(staged)
                     else:
-                        _write_receipt(
-                            store_key=_store_key(source, plugin_info.module),
-                            source=source,
-                            plugin_info=plugin_info,
-                            runtime_module=runtime_module,
-                            path=path,
+                        write_store_receipt(
+                            _store_key(source, plugin_info.module),
+                            store_receipt(
+                                source=source,
+                                plugin_info=plugin_info,
+                                runtime_module=runtime_module,
+                                path=path,
+                                dependency_inputs=install_result.dependency_inputs,
+                            ),
                         )
                 except Exception:
                     _restore_plugin(path, backup)
@@ -1170,7 +1092,6 @@ async def _(param: PluginIr) -> Result:
                     await StoreManager.remove_plugin(request_value)
                     if pending_runtime_reason:
                         plugin_host.clear_pending_restart(pending_runtime_reason)
-                    StoreReceiptStore.delete(_store_key(source, plugin_info.module))
                 except Exception:
                     _restore_plugin(path, backup)
                     if runtime_was_loaded:

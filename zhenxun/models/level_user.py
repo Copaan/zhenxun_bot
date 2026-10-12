@@ -3,7 +3,6 @@ from tortoise import fields
 from zhenxun.services.cache.runtime_cache import LevelUserMemoryCache
 from zhenxun.services.db_context import Model
 from zhenxun.services.db_context.schema_ops import AlterColumnType, RenameColumn
-from zhenxun.utils.enum import CacheType
 
 
 class LevelUser(Model):
@@ -22,11 +21,6 @@ class LevelUser(Model):
         table = "level_users"
         table_description = "用户权限数据库"
         unique_together = ("user_id", "group_id")
-
-    cache_type = CacheType.LEVEL
-    """缓存类型"""
-    cache_key_field = ("user_id", "group_id")
-    """缓存键字段"""
 
     @classmethod
     async def get_user_level(cls, user_id: str, group_id: str | None) -> int:

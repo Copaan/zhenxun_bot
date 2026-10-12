@@ -11,34 +11,6 @@ from zhenxun.utils.platform import PlatformUtils
 LOG_COMMAND = "MessageHook"
 
 
-def replace_message(message: Message) -> str:
-    """将消息中的at、image、record、face替换为字符串
-
-    参数:
-        message: Message
-
-    返回:
-        str: 文本消息
-    """
-    result = ""
-    for msg in message:
-        if isinstance(msg, str):
-            result += msg
-        elif msg.type == "at":
-            result += f"@{msg.data['qq']}"
-        elif msg.type == "image":
-            result += "[image]"
-        elif msg.type == "record":
-            result += "[record]"
-        elif msg.type == "face":
-            result += f"[face:{msg.data['id']}]"
-        elif msg.type == "reply":
-            result += ""
-        else:
-            result += str(msg)
-    return result
-
-
 @Bot.on_called_api
 async def handle_api_result(
     bot: Bot, exception: Exception | None, api: str, data: dict[str, Any], result: Any

@@ -7,14 +7,13 @@ from tortoise.backends.base.client import BaseDBAsyncClient
 
 from zhenxun.models.plugin_info import PluginInfo
 from zhenxun.models.task_info import TaskInfo
-from zhenxun.services.cache import CacheRoot
 from zhenxun.services.cache.runtime_cache import GroupMemoryCache
 from zhenxun.services.db_context import Model
 from zhenxun.services.db_context.schema_ops import AlterColumnType, CreateIndex
 from zhenxun.utils.enum import DbLockType, PluginType
 
 if TYPE_CHECKING:
-    from zhenxun.services.cache.runtime_cache import GroupSnapshot
+    from zhenxun.services.cache.runtime_snapshot import GroupSnapshot
 
 
 def add_disable_marker(name: str) -> str:
@@ -136,18 +135,6 @@ class GroupConsole(Model):
         )
 
     @classmethod
-    async def _update_cache(cls, instance):
-        """更新缓存
-
-        参数:
-            instance: 需要更新缓存的实例
-        """
-        if cache_type := cls.get_cache_type():
-            key = cls.get_cache_key(instance)
-            if key is not None:
-                await CacheRoot.invalidate_cache(cache_type, key)
-
-    @classmethod
     async def create(
         cls, using_db: BaseDBAsyncClient | None = None, **kwargs: Any
     ) -> Self:
@@ -160,8 +147,6 @@ class GroupConsole(Model):
         if task_modules or plugin_modules:
             await cls._update_modules(group, task_modules, plugin_modules, using_db)
 
-        # 更新缓存
-        await cls._update_cache(group)
         await GroupMemoryCache.upsert_from_model(group)
 
         return group
@@ -215,10 +200,7 @@ class GroupConsole(Model):
         if task_modules or plugin_modules:
             await cls._update_modules(group, task_modules, plugin_modules, using_db)
 
-        # 更新缓存
-        if is_create:
-            await cls._update_cache(group)
-            await GroupMemoryCache.upsert_from_model(group)
+        await GroupMemoryCache.upsert_from_model(group)
 
         return group, is_create
 
@@ -242,8 +224,6 @@ class GroupConsole(Model):
         if task_modules or plugin_modules:
             await cls._update_modules(group, task_modules, plugin_modules, using_db)
 
-        # 更新缓存
-        await cls._update_cache(group)
         await GroupMemoryCache.upsert_from_model(group)
 
         return group, is_create

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ast
+from collections.abc import Iterable
 from dataclasses import dataclass
 from hashlib import sha256
 import importlib.metadata as metadata
@@ -18,6 +20,8 @@ from packaging.utils import canonicalize_name
 from packaging.version import InvalidVersion, Version
 
 from .storage import LAYER_ROOT, generation_path, load_manifest
+
+SOURCE_PLUGIN_ROOT = Path("zhenxun") / "plugins"
 
 
 def _invalid(owner: str, value: str):
@@ -54,6 +58,219 @@ def distributions(paths=None) -> tuple[dict, dict]:
     return selected, duplicates
 
 
+def dependency_roots(
+    manifest: dict[str, Any], sources: dict[str, list[str]] | None = None
+) -> list[tuple[str, str]]:
+    """收集各依赖来源声明的依赖
+
+    来源包括核心 pyproject.toml、手动依赖、托管的 NoneBot 插件，以及传入的商店插件依赖。
+
+    参数:
+        manifest: 依赖层清单
+        sources: 商店插件依赖，键为 store_key
+
+    返回:
+        list[tuple[str, str]]: (来源, 依赖声明) 列表
+    """
+    from .dependencies import project_requirements
+    from .manual import manual_requirements
+
+    roots = [("pyproject.toml", raw) for raw in project_requirements()]
+    roots.extend(
+        (f"manual:{name}", raw)
+        for name, requirements in manual_requirements(manifest).items()
+        for raw in requirements
+    )
+    for plugin in manifest.get("plugins", {}).values():
+        if plugin.get("state") == "managed":
+            roots.extend(
+                (canonicalize_name(plugin["project_link"]), raw)
+                for raw in (
+                    plugin.get("resolution_inputs")
+                    or [f"{plugin['project_link']}=={plugin['version']}"]
+                )
+            )
+    for key, values in sorted((sources or {}).items()):
+        roots.extend((f"source:{key}", str(raw)) for raw in values)
+    return roots
+
+
+def reachable_packages(roots: Iterable[str], selected: dict) -> set[str]:
+    """从依赖声明出发，沿已安装包的依赖元数据计算可达的包
+
+    参数:
+        roots: 依赖声明
+        selected: 已安装的包
+
+    返回:
+        set[str]: 可达的规范化包名
+    """
+    active: dict[str, set[str]] = {}
+    pending: list[tuple[str, frozenset[str]]] = [
+        (raw, frozenset({""})) for raw in roots
+    ]
+    while pending:
+        raw, contexts = pending.pop()
+        try:
+            requirement = Requirement(raw)
+            if requirement.marker and not any(
+                requirement.marker.evaluate({"extra": extra}) for extra in contexts
+            ):
+                continue
+        except (InvalidRequirement, ValueError):
+            continue
+        name = canonicalize_name(requirement.name)
+        wanted = {""} | {canonicalize_name(extra) for extra in requirement.extras}
+        new = wanted - active.setdefault(name, set())
+        if not new:
+            continue
+        active[name].update(new)
+        if (distribution := selected.get(name)) is not None:
+            pending.extend(
+                (value, frozenset(new)) for value in distribution.requires or []
+            )
+    return set(active)
+
+
+def distribution_modules(distribution) -> set[str]:
+    """读取包提供的顶层模块名
+
+    参数:
+        distribution: 已安装的包
+
+    返回:
+        set[str]: 顶层模块名
+    """
+    text = distribution.read_text("top_level.txt")
+    if text:
+        modules = {line.strip() for line in text.splitlines()}
+    else:
+        modules = set()
+        for file in distribution.files or ():
+            parts = file.parts
+            if not parts or parts[0] == "..":
+                continue
+            if parts[0].endswith((".dist-info", ".data")):
+                continue
+            modules.add(parts[0] if len(parts) > 1 else parts[0].split(".")[0])
+    return {module for module in modules if module.isidentifier()}
+
+
+def imported_modules(
+    paths: Iterable[Path], excluded: Iterable[Path] = ()
+) -> dict[str, str]:
+    """静态扫描源码导入的顶层模块，不执行任何代码
+
+    参数:
+        paths: 源码文件或目录
+        excluded: 跳过的文件或目录
+
+    返回:
+        dict[str, str]: 顶层模块名到首个导入它的文件
+    """
+    skipped = [Path(path).resolve() for path in excluded]
+    result: dict[str, str] = {}
+    for root in paths:
+        root = Path(root)
+        if root.is_file():
+            files = [root]
+        elif root.is_dir():
+            files = sorted(root.rglob("*.py"))
+        else:
+            continue
+        for file in files:
+            resolved = file.resolve()
+            if "__pycache__" in file.parts or any(
+                resolved == item or resolved.is_relative_to(item) for item in skipped
+            ):
+                continue
+            try:
+                tree = ast.parse(file.read_bytes())
+            except (OSError, SyntaxError, ValueError):
+                continue
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    names = [alias.name for alias in node.names]
+                elif isinstance(node, ast.ImportFrom) and not node.level:
+                    names = [node.module or ""]
+                else:
+                    continue
+                for name in names:
+                    if module := name.split(".")[0]:
+                        result.setdefault(module, file.as_posix())
+    return result
+
+
+def released_packages(
+    before: dict[str, Any],
+    after: dict[str, Any],
+    *,
+    sources_before: dict[str, list[str]] | None = None,
+    sources_after: dict[str, list[str]] | None = None,
+    removed_paths: Iterable[Path] = (),
+    added_paths: Iterable[Path] = (),
+) -> tuple[list[str], list[dict[str, Any]]]:
+    """计算依赖来源变化后可以从依赖层释放的包
+
+    只释放变化前有来源需要、变化后不再被任何来源需要的包；变化前就没有来源需要
+    的包及其依赖视为保留来源。仍被源码插件导入的包不会释放。
+
+    参数:
+        before: 变化前的清单
+        after: 变化后的清单
+        sources_before: 变化前的商店插件依赖
+        sources_after: 变化后的商店插件依赖
+        removed_paths: 将被移除的插件源码，不参与导入扫描
+        added_paths: 将被加入的插件源码
+
+    返回:
+        tuple[list[str], list[dict[str, Any]]]: 可释放的包，因仍被导入而保留的包
+    """
+    from .dependencies import protected_core
+    from .policy import ORM_PACKAGES
+
+    snapshot = capture_environment(manifest=before)
+    selected = snapshot.selected
+    layer = set(snapshot.layer)
+
+    def roots(manifest: dict[str, Any], sources) -> list[str]:
+        values = [raw for _, raw in dependency_roots(manifest, sources)]
+        values.extend(
+            str(plugin["project_link"])
+            for plugin in manifest.get("plugins", {}).values()
+            if plugin.get("state") == "managed"
+        )
+        return values
+
+    needed = reachable_packages(roots(before, sources_before), selected)
+    kept = reachable_packages(
+        [*roots(after, sources_after), *sorted(layer - needed)], selected
+    )
+    candidates = (needed - kept) & layer - set(protected_core()) - ORM_PACKAGES
+    if not candidates:
+        return [], []
+    imports = imported_modules(
+        [SOURCE_PLUGIN_ROOT, *added_paths], excluded=removed_paths
+    )
+    released: list[str] = []
+    retained: list[dict[str, Any]] = []
+    for name in sorted(candidates):
+        modules = sorted(distribution_modules(selected[name]) & set(imports))
+        if not modules:
+            released.append(name)
+            continue
+        retained.append(
+            {
+                "name": name,
+                "version": selected[name].version,
+                "owners": [f"插件导入 {module}" for module in modules],
+                "imported_modules": modules,
+                "files": sorted({imports[module] for module in modules}),
+            }
+        )
+    return released, retained
+
+
 @dataclass
 class EnvironmentSnapshot:
     manifest: dict
@@ -78,8 +295,6 @@ def capture_environment(
     *, manifest=None, candidate_path: Path | None = None
 ) -> EnvironmentSnapshot:
     """Read base and selected generation metadata without importing plugins."""
-    from .dependencies import project_requirements
-
     manifest = load_manifest() if manifest is None else manifest
     root = LAYER_ROOT.resolve()
     paths = []
@@ -95,23 +310,9 @@ def capture_environment(
         distributions([str(layer_path)]) if layer_path is not None else ({}, {})
     )
     selected = {**base, **layer}
-    roots = [("pyproject.toml", raw) for raw in project_requirements()]
     from .manual import manual_requirements
 
-    roots.extend(
-        (f"manual:{name}", raw)
-        for name, requirements in manual_requirements(manifest).items()
-        for raw in requirements
-    )
-    for plugin in manifest.get("plugins", {}).values():
-        if plugin.get("state") == "managed":
-            roots.extend(
-                (canonicalize_name(plugin["project_link"]), raw)
-                for raw in (
-                    plugin.get("resolution_inputs")
-                    or [f"{plugin['project_link']}=={plugin['version']}"]
-                )
-            )
+    roots = dependency_roots(manifest)
     requirements = {}
     for name, distribution in selected.items():
         requirements[name] = list(distribution.requires or [])

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 import contextlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import importlib
 from typing import Any
 
@@ -21,7 +21,18 @@ from .auth_activation import (
     matcher_supported_adapters,
 )
 from .auth_patch_guard import validate_handle_event_patch
-from .auth_types import EventDispatchContext
+
+
+@dataclass(slots=True)
+class EventDispatchContext:
+    event_type: str
+    plain_text: str = ""
+    raw_text: str = ""
+    trie_command_text: str = ""
+    trie_raw_command: str = ""
+    text_candidates: tuple[str, ...] = ()
+    to_me: bool = False
+    ai_route_modules: set[str] = field(default_factory=set)
 
 
 @dataclass(slots=True)

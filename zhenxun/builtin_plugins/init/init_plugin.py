@@ -50,7 +50,7 @@ async def _handle_setting(
         """父插件"""
         metadata = PluginMetadata(name=plugin.name, description="", usage="")
     extra = metadata.extra
-    extra_data = PluginExtraData(**extra)
+    extra_data = PluginExtraData.from_extra(extra, plugin.name)
     logger.debug(f"{metadata.name}:{plugin.name} -> {extra}", "初始化插件数据")
     setting = extra_data.setting or PluginSetting()
     if metadata.type == "library":

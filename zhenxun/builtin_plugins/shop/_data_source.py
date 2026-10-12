@@ -41,7 +41,7 @@ from zhenxun.services.hot_query_cache import get_group_user_ids, get_member_name
 from zhenxun.services.log import logger
 from zhenxun.services.message_execution import current_execution, operation_key
 from zhenxun.ui.models import ImageCell, TextCell
-from zhenxun.utils.enum import PropHandle
+from zhenxun.utils.enum import GoldHandle, PropHandle
 from zhenxun.utils.platform import PlatformUtils
 from zhenxun.utils.pydantic_compat import model_dump
 
@@ -110,26 +110,39 @@ class ShopParam(BaseModel):
 
 
 async def gold_rank(session: Uninfo, group_id: str | None, num: int) -> bytes | str:
-    query = UserConsole
+    """金币排行，只查询前 num 名，自身排名按金币更多的人数计算
+
+    参数:
+        session: Uninfo
+        group_id: 群组id
+        num: 排行榜数量
+
+    返回:
+        bytes | str: 构造图片或提示
+    """
+    query = UserConsole.all()
     own_key = await business_user_id(session)
     if group_id:
         if PlatformUtils.get_platform_scope(session) == "qq_api":
             try:
-                uid_list = await official_group_business_keys(session)
+                member_ids = await official_group_business_keys(session)
             except BusinessIdentityError as error:
                 return str(error)
-            query = query.filter(user_id__in=uid_list)
-        elif uid_list := await get_group_user_ids(group_id):
-            query = query.filter(user_id__in=uid_list)
-    user_list = await query.annotate().order_by("-gold").values_list("user_id", "gold")
+        else:
+            member_ids = await get_group_user_ids(group_id)
+        if not member_ids:
+            return "暂无本群成员数据，请稍后再试或使用 '金币总排行'"
+        query = query.filter(user_id__in=member_ids)
+    user_list = (
+        await query.order_by("-gold", "id")
+        .limit(num)
+        .values_list("user_id", "gold", "platform")
+    )
     if not user_list:
         return "当前还没有人拥有金币哦..."
+    own = await query.filter(user_id=own_key).values_list("gold", flat=True)
+    index = await query.filter(gold__gt=own[0]).count() + 1 if own else "-1（未统计）"
     user_id_list = [user[0] for user in user_list]
-    if own_key in user_id_list:
-        index = user_id_list.index(own_key) + 1
-    else:
-        index = "-1（未统计）"
-    user_list = user_list[:num] if num < len(user_list) else user_list
     friend_user = await FriendUser.filter(user_id__in=user_id_list).values_list(
         "user_id", "user_name"
     )
@@ -140,7 +153,7 @@ async def gold_rank(session: Uninfo, group_id: str | None, num: int) -> bytes | 
     data_list = []
     platform = PlatformUtils.get_platform(session)
     for i, user in enumerate(user_list):
-        avatar_path = await avatar_service.get_avatar_path(platform, user[0])
+        avatar_path = await avatar_service.get_avatar_path(user[2] or platform, user[0])
         data_list.append(
             [
                 TextCell(content=f"{i + 1}"),
@@ -152,7 +165,7 @@ async def gold_rank(session: Uninfo, group_id: str | None, num: int) -> bytes | 
                 TextCell(content=uid2name.get(user[0]) or user[0]),
                 TextCell(content=str(user[1]), bold=True),
                 ImageCell(src=platform_path.resolve().as_uri())
-                if (platform_path := PLATFORM_PATH.get(platform))
+                if (platform_path := PLATFORM_PATH.get(user[2] or platform))
                 else TextCell(content=""),
             ]
         )
@@ -538,10 +551,11 @@ class ShopManage:
             goods = next((item for item in matches if item.goods_name == name), None)
             if goods is None:
                 return "道具名称不存在..."
-        user = await UserConsole.get_user(user_id, platform)
-        price = goods.goods_price * num * goods.goods_discount
-        if not math.isfinite(price) or price < 0:
+        unit_price = goods.goods_price * goods.goods_discount
+        if not math.isfinite(unit_price) or unit_price < 0:
             raise ValueError("invalid_goods_price")
+        price = int(unit_price) * num
+        user = await UserConsole.get_user(user_id, platform)
         if user.gold < price:
             return "糟糕! 您的金币好像不太够哦..."
         if goods.daily_limit:
@@ -565,12 +579,10 @@ class ShopManage:
             "购买道具",
             session=user_id,
         )
-        # 使用 UserConsole.reduce_gold 代替直接操作 user.gold，避免并发竞态
-        from zhenxun.utils.enum import GoldHandle as GoldHandleEnum
-
-        await UserConsole.reduce_gold(user_id, int(price), GoldHandleEnum.BUY, "shop")
-        # 重新获取用户对象以更新道具（reduce_gold 在另一个事务中）
-        user = await UserConsole.get_user(user_id, platform)
+        if price:
+            await UserConsole.reduce_gold(
+                user_id, price, GoldHandle.BUY, "shop", platform
+            )
         if goods.uuid not in user.props:
             user.props[goods.uuid] = 0
         if (

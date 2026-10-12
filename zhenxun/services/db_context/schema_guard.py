@@ -2,22 +2,35 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from dataclasses import dataclass
-from dataclasses import field as dataclass_field
-from datetime import datetime
+from dataclasses import dataclass, field
+import hashlib
 import json
 import os
 from pathlib import Path
-from typing import Any, Literal
+import re
+from typing import Any
+from urllib.parse import urlparse
 
+from nonebot.utils import is_coroutine_callable
 from tortoise import Tortoise
 from tortoise.exceptions import OperationalError
 
+from zhenxun.configs.config import BotConfig
+from zhenxun.configs.database import is_sqlite_memory_url, sqlite_path_from_url
 from zhenxun.services.log import logger
 
-from .config import DB_SCHEMA_GUARD_TIMEOUT_SECONDS, LOG_COMMAND
+from .config import DB_SCHEMA_GUARD_TIMEOUT_SECONDS, LOG_COMMAND, db_model
+from .schema_ops import (
+    AddColumn,
+    CreateIndex,
+    SchemaOpRisk,
+    normalize_schema_ops,
+    quote_identifier,
+)
+from .utils import Dialect, db_dialect
 
-Dialect = Literal["sqlite", "postgres", "mysql", "unknown"]
+_SCRIPT_HASH_DIR = Path() / "data" / ".db_script_hashes"
+_TRUE_VALUES = {"1", "true", "yes", "on"}
 
 
 @dataclass(slots=True)
@@ -27,11 +40,7 @@ class SchemaGuardResult:
     repaired_indexes: int = 0
     skipped_columns: int = 0
     skipped_indexes: int = 0
-    type_mismatches: int = 0
     warnings: int = 0
-    drift: list[dict[str, Any]] | None = None
-    failures: list[dict[str, Any]] = dataclass_field(default_factory=list)
-    dialect: Dialect = "unknown"
 
 
 @dataclass(slots=True)
@@ -40,25 +49,6 @@ class ColumnInfo:
     data_type: str
     nullable: bool | None = None
     default: str | None = None
-
-
-def _quote_identifier(identifier: str, dialect: Dialect) -> str:
-    escaped = identifier.replace('"', '""')
-    if dialect == "mysql":
-        return f"`{identifier.replace('`', '``')}`"
-    return f'"{escaped}"'
-
-
-def _connection_dialect(connection: Any) -> Dialect:
-    capabilities = getattr(connection, "capabilities", None)
-    raw = str(getattr(capabilities, "dialect", "") or "").lower()
-    if raw.startswith("sqlite"):
-        return "sqlite"
-    if raw.startswith("postgres"):
-        return "postgres"
-    if raw.startswith("mysql"):
-        return "mysql"
-    return "unknown"
 
 
 def _is_safe_missing_field(field: Any) -> bool:
@@ -88,22 +78,6 @@ def _is_db_field(field: Any, dialect: Dialect) -> bool:
     return _field_sql_type(field, dialect) is not None
 
 
-def _field_default_sql(field: Any, dialect: Dialect) -> str:
-    default = getattr(field, "default", None)
-    if default is None or callable(default):
-        return ""
-    if isinstance(default, bool):
-        if dialect == "postgres":
-            return " DEFAULT TRUE" if default else " DEFAULT FALSE"
-        return " DEFAULT 1" if default else " DEFAULT 0"
-    if isinstance(default, int | float):
-        return f" DEFAULT {default}"
-    if isinstance(default, str):
-        escaped = default.replace("'", "''")
-        return f" DEFAULT '{escaped}'"
-    return ""
-
-
 def _missing_column_sql(
     table: str,
     column: str,
@@ -113,21 +87,13 @@ def _missing_column_sql(
     sql_type = _field_sql_type(field, dialect)
     if not sql_type:
         return None
-    table_sql = _quote_identifier(table, dialect)
-    column_sql = _quote_identifier(column, dialect)
-    null_sql = "" if bool(getattr(field, "null", False)) else " NOT NULL"
-    default_sql = _field_default_sql(field, dialect)
-    if not bool(getattr(field, "null", False)) and not default_sql:
-        return None
-    if dialect == "postgres":
-        return (
-            f"ALTER TABLE {table_sql} ADD COLUMN IF NOT EXISTS "
-            f"{column_sql} {sql_type}{default_sql}{null_sql}"
-        )
-    return (
-        f"ALTER TABLE {table_sql} ADD COLUMN "
-        f"{column_sql} {sql_type}{default_sql}{null_sql}"
-    )
+    default = getattr(field, "default", None)
+    if callable(default) or not isinstance(default, str | int | float):
+        default = None
+    sql = AddColumn(
+        table, column, sql_type, bool(getattr(field, "null", False)), default
+    ).to_sql(dialect)
+    return sql[0] if sql else None
 
 
 async def _table_columns(
@@ -135,7 +101,7 @@ async def _table_columns(
 ) -> dict[str, ColumnInfo] | None:
     if dialect == "sqlite":
         rows = await connection.execute_query_dict(
-            f"PRAGMA table_xinfo({_quote_identifier(table, dialect)})"
+            f"PRAGMA table_xinfo({quote_identifier(table, dialect)})"
         )
         if not rows:
             return None
@@ -197,75 +163,13 @@ async def _table_columns(
     return None
 
 
-def _normalize_type(value: str, dialect: Dialect) -> str:
-    text = value.lower().strip()
-    if not text:
-        return ""
-    if dialect == "sqlite":
-        if "int" in text:
-            return "integer"
-        if any(part in text for part in ("char", "clob", "text", "varchar")):
-            return "text"
-        if any(part in text for part in ("real", "floa", "doub")):
-            return "real"
-        if "blob" in text:
-            return "blob"
-        if "bool" in text:
-            return "integer"
-        if "timestamp" in text or "datetime" in text:
-            return "text"
-        return text
-    if dialect == "postgres":
-        text = text.replace("character varying", "varchar")
-        if text.startswith("timestamp"):
-            return "timestamp"
-        if text in {"boolean", "bool"}:
-            return "boolean"
-        return text
-    if dialect == "mysql":
-        if text.startswith("tinyint(1)") or text == "bool" or text == "boolean":
-            return "boolean"
-        if text.startswith("datetime") or text.startswith("timestamp"):
-            return "datetime"
-        return text
-    return text
-
-
-def _field_type_compatible(field: Any, column: ColumnInfo, dialect: Dialect) -> bool:
-    expected = _field_sql_type(field, dialect)
-    if not expected:
-        return True
-    expected_norm = _normalize_type(expected, dialect)
-    actual_norm = _normalize_type(column.data_type, dialect)
-    if not expected_norm or not actual_norm:
-        return True
-    if expected_norm == actual_norm:
-        return True
-    if dialect == "sqlite":
-        # SQLite affinity is intentionally loose; varchar/text and bool/integer are
-        # compatible enough for startup validation.
-        compatible = {
-            ("varchar", "text"),
-            ("text", "varchar"),
-            ("boolean", "integer"),
-            ("integer", "boolean"),
-        }
-        return (expected_norm, actual_norm) in compatible
-    return False
-
-
-def _index_name(table: str, columns: tuple[str, ...]) -> str:
-    raw = f"idx_{table}_{'_'.join(columns)}"
-    return raw[:62]
-
-
 async def _table_indexes(
     connection: Any, table: str, dialect: Dialect
 ) -> set[tuple[str, ...]]:
     indexes: set[tuple[str, ...]] = set()
     if dialect == "sqlite":
         rows = await connection.execute_query_dict(
-            f"PRAGMA index_list({_quote_identifier(table, dialect)})"
+            f"PRAGMA index_list({quote_identifier(table, dialect)})"
         )
         for row in rows:
             if bool(row.get("unique")):
@@ -274,7 +178,7 @@ async def _table_indexes(
             if not index_name:
                 continue
             info = await connection.execute_query_dict(
-                f"PRAGMA index_info({_quote_identifier(str(index_name), dialect)})"
+                f"PRAGMA index_info({quote_identifier(str(index_name), dialect)})"
             )
             columns = tuple(
                 str(item.get("name"))
@@ -336,19 +240,6 @@ async def _table_indexes(
     return indexes
 
 
-def _index_sql(table: str, columns: tuple[str, ...], dialect: Dialect) -> str | None:
-    if not columns:
-        return None
-    table_sql = _quote_identifier(table, dialect)
-    index_sql = _quote_identifier(_index_name(table, columns), dialect)
-    columns_sql = ", ".join(_quote_identifier(column, dialect) for column in columns)
-    if dialect in {"sqlite", "postgres"}:
-        return f"CREATE INDEX IF NOT EXISTS {index_sql} ON {table_sql}({columns_sql})"
-    if dialect == "mysql":
-        return f"CREATE INDEX {index_sql} ON {table_sql}({columns_sql})"
-    return None
-
-
 def _meta_index_columns(index: Any) -> tuple[str, ...]:
     if isinstance(index, str):
         return (index,)
@@ -360,54 +251,18 @@ def _meta_index_columns(index: Any) -> tuple[str, ...]:
     return ()
 
 
-def _empty_drift(table: str) -> dict[str, Any]:
-    return {
-        "table": table,
-        "missing_columns": [],
-        "extra_columns": [],
-        "type_mismatches": [],
-        "missing_indexes": [],
-        "unsafe_changes": [],
-    }
-
-
-async def _write_schema_report(result: SchemaGuardResult) -> None:
-    report = {
-        "created_at": datetime.now().isoformat(timespec="seconds"),
-        "summary": {
-            "checked_tables": result.checked_tables,
-            "repaired_columns": result.repaired_columns,
-            "repaired_indexes": result.repaired_indexes,
-            "skipped_columns": result.skipped_columns,
-            "skipped_indexes": result.skipped_indexes,
-            "type_mismatches": result.type_mismatches,
-            "warnings": result.warnings,
-            "failures": len(result.failures),
-            "dialect": result.dialect,
-        },
-        "tables": result.drift or [],
-        "failures": result.failures,
-    }
-    path = Path() / "data" / "db" / "schema_report.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(report, ensure_ascii=False, indent=2)
-    temporary = path.with_suffix(f".tmp.{os.getpid()}.json")
-    await asyncio.to_thread(temporary.write_text, payload, "utf-8")
-    await asyncio.to_thread(temporary.replace, path)
-
-
 async def repair_safe_schema_drift() -> SchemaGuardResult:
-    """Repair low-risk missing columns after Tortoise schema creation.
+    """补齐模型与表结构之间的低风险差异
 
-    This guard intentionally avoids type changes, constraints, unique indexes, foreign
-    keys, and SQLite table rebuilds. It is a startup-only safety net for model/schema
-    drift caused by copied databases or skipped legacy script hashes.
+    只补可空或带默认值的缺失字段和普通索引，不改类型、约束、唯一索引、外键，
+    也不重建 SQLite 表。
+
+    返回:
+        SchemaGuardResult: 检查与修复统计
     """
     result = SchemaGuardResult()
-    result.drift = []
     connection = Tortoise.get_connection("default")
-    dialect = _connection_dialect(connection)
-    result.dialect = dialect
+    dialect = db_dialect(connection)
     if dialect == "unknown":
         logger.debug("SchemaGuard 跳过未知数据库方言", LOG_COMMAND)
         return result
@@ -422,208 +277,86 @@ async def repair_safe_schema_drift() -> SchemaGuardResult:
             columns = await _table_columns(connection, table, dialect)
         except Exception as exc:
             result.warnings += 1
-            result.failures.append(
-                {
-                    "kind": "inspect_table",
-                    "table": table,
-                    "error": str(exc),
-                    "dialect": dialect,
-                }
-            )
             logger.debug(f"SchemaGuard 检查表 {table} 失败", LOG_COMMAND, e=exc)
             continue
         if columns is None:
             continue
         result.checked_tables += 1
-        drift = _empty_drift(table)
         fields_map = getattr(meta, "fields_map", {}) or {}
-        expected_sources: set[str] = set()
-        for field_name, field in fields_map.items():
-            if not _is_db_field(field, dialect):
+        for field_name, model_field in fields_map.items():
+            if not _is_db_field(model_field, dialect):
                 continue
-            source = str(getattr(field, "source_field", None) or field_name)
-            expected_sources.add(source)
+            source = str(getattr(model_field, "source_field", None) or field_name)
             if source in columns:
-                if not _field_type_compatible(field, columns[source], dialect):
-                    result.type_mismatches += 1
-                    drift["type_mismatches"].append(
-                        {
-                            "column": source,
-                            "expected": _field_sql_type(field, dialect),
-                            "actual": columns[source].data_type,
-                        }
-                    )
                 continue
-            drift["missing_columns"].append(source)
-            if not _is_safe_missing_field(field):
+            sql = (
+                _missing_column_sql(table, source, model_field, dialect)
+                if _is_safe_missing_field(model_field)
+                else None
+            )
+            if not sql:
                 result.skipped_columns += 1
-                drift["unsafe_changes"].append(
-                    {
-                        "kind": "missing_required_column",
-                        "column": source,
-                    }
-                )
                 logger.debug(
                     f"SchemaGuard 跳过非低风险缺字段: {table}.{source}",
                     LOG_COMMAND,
                 )
                 continue
-            sql = _missing_column_sql(table, source, field, dialect)
-            if not sql:
-                result.skipped_columns += 1
-                logger.debug(
-                    f"SchemaGuard 无法生成补字段 SQL: {table}.{source}",
-                    LOG_COMMAND,
-                )
-                continue
             try:
                 await asyncio.wait_for(
                     connection.execute_query_dict(sql),
                     timeout=DB_SCHEMA_GUARD_TIMEOUT_SECONDS,
                 )
-                columns[source] = ColumnInfo(name=source, data_type="")
                 result.repaired_columns += 1
                 logger.info(f"SchemaGuard 已补齐字段: {table}.{source}", LOG_COMMAND)
-            except OperationalError as exc:
-                err = str(exc).lower()
-                if any(
-                    text in err
-                    for text in ("duplicate column", "already exists", "已存在")
-                ):
-                    columns[source] = ColumnInfo(name=source, data_type="")
-                    continue
-                result.warnings += 1
-                result.failures.append(
-                    {
-                        "kind": "add_column",
-                        "table": table,
-                        "column": source,
-                        "operation": sql,
-                        "error": str(exc),
-                        "dialect": dialect,
-                    }
-                )
-                logger.warning(
-                    f"SchemaGuard 补齐字段失败: {table}.{source}",
-                    LOG_COMMAND,
-                    e=exc,
-                )
             except Exception as exc:
-                result.warnings += 1
-                result.failures.append(
-                    {
-                        "kind": "add_column",
-                        "table": table,
-                        "column": source,
-                        "operation": sql,
-                        "error": str(exc),
-                        "dialect": dialect,
-                    }
-                )
-                logger.warning(
-                    f"SchemaGuard 补齐字段失败: {table}.{source}",
-                    LOG_COMMAND,
-                    e=exc,
-                )
-        drift["extra_columns"] = sorted(
-            column for column in columns.keys() if column not in expected_sources
-        )
+                if not _is_already_exists(exc):
+                    result.warnings += 1
+                    logger.warning(
+                        f"SchemaGuard 补齐字段失败: {table}.{source}",
+                        LOG_COMMAND,
+                        e=exc,
+                    )
+                    continue
+            columns[source] = ColumnInfo(name=source, data_type="")
         try:
             existing_indexes = await _table_indexes(connection, table, dialect)
         except Exception as exc:
             result.warnings += 1
-            result.failures.append(
-                {
-                    "kind": "inspect_indexes",
-                    "table": table,
-                    "error": str(exc),
-                    "dialect": dialect,
-                }
-            )
             logger.debug(f"SchemaGuard 检查索引 {table} 失败", LOG_COMMAND, e=exc)
             existing_indexes = set()
-        indexes = getattr(meta, "indexes", ()) or ()
-        for index in indexes:
+        for index in getattr(meta, "indexes", ()) or ():
             index_columns = _meta_index_columns(index)
             if not index_columns or index_columns in existing_indexes:
                 continue
-            drift["missing_indexes"].append(list(index_columns))
-            if not all(column in columns for column in index_columns):
-                result.skipped_indexes += 1
-                logger.debug(
-                    f"SchemaGuard 跳过缺字段索引: {table}.{index_columns}",
-                    LOG_COMMAND,
-                )
-                continue
-            sql = _index_sql(table, index_columns, dialect)
+            sql = (
+                CreateIndex(table, index_columns).to_sql(dialect)
+                if all(column in columns for column in index_columns)
+                else None
+            )
             if not sql:
                 result.skipped_indexes += 1
                 continue
             try:
                 await asyncio.wait_for(
-                    connection.execute_query_dict(sql),
+                    connection.execute_query_dict(sql[0]),
                     timeout=DB_SCHEMA_GUARD_TIMEOUT_SECONDS,
                 )
-                existing_indexes.add(index_columns)
                 result.repaired_indexes += 1
                 logger.debug(
                     f"SchemaGuard 已补齐索引: {table}.{index_columns}",
                     LOG_COMMAND,
                 )
-            except TimeoutError as exc:
-                result.warnings += 1
-                result.skipped_indexes += 1
-                result.failures.append(
-                    {
-                        "kind": "create_index_timeout",
-                        "table": table,
-                        "columns": list(index_columns),
-                        "operation": sql,
-                        "error": str(exc),
-                        "dialect": dialect,
-                    }
-                )
-                logger.warning(
-                    "SchemaGuard 补齐索引超时，已跳过: "
-                    f"{table}.{index_columns} "
-                    f"({DB_SCHEMA_GUARD_TIMEOUT_SECONDS}s)",
-                    LOG_COMMAND,
-                    e=exc,
-                )
-            except OperationalError as exc:
-                err = str(exc).lower()
-                if any(
-                    text in err for text in ("already exists", "duplicate", "已存在")
-                ):
-                    existing_indexes.add(index_columns)
+            except Exception as exc:
+                if not _is_already_exists(exc):
+                    result.warnings += 1
+                    result.skipped_indexes += 1
+                    logger.warning(
+                        f"SchemaGuard 补齐索引失败: {table}.{index_columns}",
+                        LOG_COMMAND,
+                        e=exc,
+                    )
                     continue
-                result.warnings += 1
-                result.failures.append(
-                    {
-                        "kind": "create_index",
-                        "table": table,
-                        "columns": list(index_columns),
-                        "operation": sql,
-                        "error": str(exc),
-                        "dialect": dialect,
-                    }
-                )
-                logger.warning(
-                    f"SchemaGuard 补齐索引失败: {table}.{index_columns}",
-                    LOG_COMMAND,
-                    e=exc,
-                )
-        if any(
-            drift[key]
-            for key in (
-                "missing_columns",
-                "extra_columns",
-                "type_mismatches",
-                "missing_indexes",
-                "unsafe_changes",
-            )
-        ):
-            result.drift.append(drift)
+            existing_indexes.add(index_columns)
 
     logger.info(
         "SchemaGuard 完成: "
@@ -632,33 +365,246 @@ async def repair_safe_schema_drift() -> SchemaGuardResult:
         f"repaired_indexes={result.repaired_indexes}, "
         f"skipped_columns={result.skipped_columns}, "
         f"skipped_indexes={result.skipped_indexes}, "
-        f"type_mismatches={result.type_mismatches}, "
         f"warnings={result.warnings}",
         LOG_COMMAND,
     )
-    with contextlib.suppress(Exception):
-        await _write_schema_report(result)
     return result
 
 
-async def repair_table_schema(table_name: str) -> SchemaGuardResult:
-    """Repair one table by reusing the startup guard path.
+def _is_already_exists(exc: Exception) -> bool:
+    if not isinstance(exc, OperationalError):
+        return False
+    err = str(exc).lower()
+    return any(
+        text in err
+        for text in ("duplicate column", "duplicate", "already exists", "已存在")
+    )
 
-    The current guard is cheap enough and already table-scoped internally by model
-    metadata, so this helper keeps write-path recovery simple and conservative.
+
+_ID = r'(?:"\w+"|`\w+`|\w+)'
+
+
+def _script_name(value: str) -> str:
+    return value.strip('"`')
+
+
+async def script_action(connection: Any, sql: str, dialect: Dialect) -> str:
+    """预检旧式迁移语句
+
+    参数:
+        connection: 数据库连接
+        sql: 迁移语句
+        dialect: 数据库方言
+
+    返回:
+        str: execute 需要执行，satisfied 已满足，missing_table 表尚未创建，
+            unsupported 当前方言不支持
     """
-    result = SchemaGuardResult()
-    result.drift = []
+    table_match = re.match(
+        rf"\s*(?:ALTER\s+TABLE|UPDATE|INSERT\s+INTO|DELETE\s+FROM)\s+({_ID})(?=\s|;|$)",
+        sql,
+        re.I,
+    )
+    index = re.fullmatch(
+        rf"\s*CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?"
+        rf"({_ID})\s+ON\s+({_ID})\s*\(.*",
+        sql,
+        re.I | re.S,
+    )
+    if not table_match and not index:
+        return "execute"
+    table = _script_name(table_match[1] if table_match else index[2])
+    columns = await _table_columns(connection, table, dialect)
+    if columns is None:
+        return "missing_table"
+    if index:
+        name = _script_name(index[1])
+        if dialect == "sqlite":
+            rows = await connection.execute_query_dict(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='index' AND tbl_name=? AND name=?",
+                [table, name],
+            )
+        elif dialect == "postgres":
+            rows = await connection.execute_query_dict(
+                "SELECT indexname FROM pg_indexes WHERE schemaname=current_schema() "
+                "AND tablename=$1 AND indexname=$2",
+                [table, name],
+            )
+        else:
+            rows = await connection.execute_query_dict(
+                "SELECT INDEX_NAME FROM information_schema.statistics "
+                "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=%s AND INDEX_NAME=%s",
+                [table, name],
+            )
+        return "satisfied" if rows else "execute"
+
+    if not sql.lstrip().upper().startswith("ALTER TABLE"):
+        return "execute"
+    tail = sql[table_match.end() :].strip().rstrip(";").strip()
+    add = re.match(rf"ADD\s+(?:COLUMN\s+)?({_ID})\s+", tail, re.I)
+    if add and _script_name(add[1]) in columns:
+        return "satisfied"
+    rename = re.fullmatch(rf"RENAME\s+COLUMN\s+({_ID})\s+TO\s+({_ID})", tail, re.I)
+    if (
+        rename
+        and _script_name(rename[1]) not in columns
+        and _script_name(rename[2]) in columns
+    ):
+        return "satisfied"
+    drop = re.fullmatch(rf"DROP\s+COLUMN\s+(?:IF\s+EXISTS\s+)?({_ID})", tail, re.I)
+    if drop and _script_name(drop[1]) not in columns:
+        return "satisfied"
+    if dialect == "sqlite" and re.match(r"ALTER\s+COLUMN\s", tail, re.I):
+        return "unsupported"
+    return "execute"
+
+
+@dataclass(slots=True)
+class ScriptMigrations:
+    """模型 _run_script 声明的迁移语句及执行进度"""
+
+    statements: list[tuple[str, str]]
+    receipt: Path | None = None
+    complete: bool = True
+    done: set[int] = field(default_factory=set)
+    failed: set[int] = field(default_factory=set)
+
+
+def _receipt_file(fingerprint: str) -> Path:
+    parsed = urlparse(BotConfig.db_url or "")
+    dialect = parsed.scheme or "unknown"
+    if dialect == "sqlite":
+        db_identity = (
+            ":memory:"
+            if is_sqlite_memory_url(BotConfig.db_url)
+            else str(sqlite_path_from_url(BotConfig.db_url))
+        )
+    else:
+        db_identity = f"{parsed.hostname or ''}:{parsed.port or ''}{parsed.path}"
+    db_hash = hashlib.md5(
+        json.dumps(
+            {"dialect": dialect, "db": db_identity, "script": fingerprint},
+            ensure_ascii=False,
+            sort_keys=True,
+        ).encode()
+    ).hexdigest()
+    return _SCRIPT_HASH_DIR / f"{db_hash}.json"
+
+
+async def collect_script_migrations() -> ScriptMigrations:
+    """收集模型声明的迁移语句，当前数据库已完成过的同一批语句不再执行
+
+    返回:
+        ScriptMigrations: 待执行的迁移
+    """
+    dialect = db_dialect()
+    allow_guarded = (
+        os.getenv("DB_SCHEMA_RUN_GUARDED_OPS", "").strip().lower() in _TRUE_VALUES
+    )
+    statements: list[tuple[str, str]] = []
+    complete = True
+    for module, func in db_model.script_method:
+        owner = f"{module}:{getattr(func, '__qualname__', 'script')}"
+        try:
+            items = await func() if is_coroutine_callable(func) else func()
+            for item in items or ():
+                if not isinstance(item, str) and (
+                    item.risk == SchemaOpRisk.MANUAL
+                    or (item.risk != SchemaOpRisk.SAFE and not allow_guarded)
+                ):
+                    logger.debug(f"{owner} 跳过 {item.risk.value} 迁移动作: {item}")
+                    continue
+                statements.extend(
+                    (owner, sql) for sql in normalize_schema_ops([item], dialect)
+                )
+        except Exception as error:
+            complete = False
+            logger.error(f"迁移脚本生成失败: {owner}", LOG_COMMAND, e=error)
+    if not statements:
+        return ScriptMigrations([], complete=complete)
+    fingerprint = hashlib.md5(
+        json.dumps(sorted(sql for _, sql in statements), ensure_ascii=False).encode()
+    ).hexdigest()
+    receipt = _receipt_file(fingerprint)
+    with contextlib.suppress(OSError, ValueError):
+        saved = json.loads(receipt.read_text(encoding="utf-8"))
+        if saved.get("status") in {None, "completed", "legacy_deferred"}:
+            logger.debug("迁移脚本无变化，跳过执行")
+            return ScriptMigrations([], complete=complete)
+    return ScriptMigrations(statements, receipt, complete)
+
+
+async def run_script_migrations(migrations: ScriptMigrations) -> None:
+    """逐条执行尚未完成的迁移语句，表尚未创建的语句留到下次调用
+
+    失败的语句只记录日志，本次启动不再重试
+
+    参数:
+        migrations: collect_script_migrations 收集的迁移
+    """
     connection = Tortoise.get_connection("default")
-    dialect = _connection_dialect(connection)
-    if dialect == "unknown":
-        return result
-    app = Tortoise.apps.get("models", {})
-    for model in app.values():
-        meta = getattr(model, "_meta", None)
-        table = getattr(meta, "db_table", None) or getattr(meta, "table", None)
-        if table == table_name:
-            # Keep the implementation conservative: repairing all tables is still
-            # startup-style work and avoids a second partial code path.
-            return await repair_safe_schema_drift()
-    return result
+    dialect = db_dialect(connection)
+    for index, (owner, sql) in enumerate(migrations.statements):
+        if index in migrations.done or index in migrations.failed:
+            continue
+        try:
+            action = await asyncio.wait_for(
+                script_action(connection, sql, dialect),
+                DB_SCHEMA_GUARD_TIMEOUT_SECONDS,
+            )
+            if action == "missing_table":
+                continue
+            if action == "unsupported":
+                logger.debug(f"SQLite 不支持，跳过迁移语句: {owner}: {sql}")
+            elif action == "execute":
+                logger.debug(f"执行迁移SQL: {owner}: {sql}")
+                await asyncio.wait_for(
+                    connection.execute_query_dict(sql),
+                    DB_SCHEMA_GUARD_TIMEOUT_SECONDS,
+                )
+            migrations.done.add(index)
+        except Exception as error:
+            migrations.failed.add(index)
+            logger.error(f"迁移语句执行失败: {owner}: {sql}", LOG_COMMAND, e=error)
+
+
+def finish_script_migrations(migrations: ScriptMigrations) -> bool:
+    """全部迁移语句完成时写入完成记录，否则列出未完成的来源，下次启动整批重试
+
+    参数:
+        migrations: 已执行过的迁移
+
+    返回:
+        bool: 是否全部完成
+    """
+    pending = sorted(
+        {
+            owner
+            for index, (owner, _) in enumerate(migrations.statements)
+            if index not in migrations.done
+        }
+    )
+    if pending or not migrations.complete:
+        logger.warning(
+            f"数据库迁移未全部完成，下次启动重试: {', '.join(pending)}", LOG_COMMAND
+        )
+        return False
+    if migrations.receipt is None:
+        return True
+    migrations.receipt.parent.mkdir(parents=True, exist_ok=True)
+    temporary = migrations.receipt.with_suffix(f".tmp.{os.getpid()}")
+    temporary.write_text(
+        json.dumps(
+            {
+                "dialect": urlparse(BotConfig.db_url or "").scheme,
+                "status": "completed",
+                "statements": [sql for _, sql in migrations.statements],
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    os.replace(temporary, migrations.receipt)
+    return True

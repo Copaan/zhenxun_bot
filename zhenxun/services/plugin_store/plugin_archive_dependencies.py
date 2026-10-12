@@ -64,12 +64,19 @@ def archive_dependency_contract() -> dict[str, Any]:
     installed = (
         receipts.StoreReceiptStore.load() if receipts._RECEIPT_FILE.exists() else {}
     )
+    pending = source.pending_transaction() if source.PENDING_FILE.exists() else None
+    uninstalling = {
+        str(operation.get("store_key") or "")
+        for operation in (pending or {}).get("operations", [])
+        if operation.get("action") == "uninstall"
+    }
     for key, receipt in installed.items():
+        if key in uninstalling:
+            continue
         if key.startswith("local_archive:") or (
             isinstance(receipt, dict) and receipt.get("source") == "local_archive"
         ):
             records.append((key, receipt))
-    pending = source.pending_transaction() if source.PENDING_FILE.exists() else None
     for operation in (pending or {}).get("operations", []):
         key = str(operation.get("store_key") or "")
         receipt = operation.get("receipt") or {}

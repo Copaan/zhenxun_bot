@@ -8,25 +8,24 @@ import json
 from pathlib import Path
 from typing import Any
 
-from packaging.requirements import InvalidRequirement, Requirement
-from packaging.utils import canonicalize_name
+from packaging.requirements import Requirement
 
 
 def normalize_requirements(values: list[str], action: str) -> dict[str, list[str]]:
     """Accept package requirements, never installer arguments or direct URLs."""
-    from .dependencies import FORBIDDEN_LAYER_PACKAGES, DependencyAnalysisError
+    from .dependencies import (
+        FORBIDDEN_LAYER_PACKAGES,
+        DependencyAnalysisError,
+        parse_requirement,
+    )
 
     if action not in {"install", "uninstall"} or not values:
         raise DependencyAnalysisError("dependency_request_invalid")
     result: dict[str, list[str]] = {}
     for value in values:
-        try:
-            requirement = Requirement(value.strip())
-        except (InvalidRequirement, AttributeError) as error:
-            raise DependencyAnalysisError("dependency_requirement_invalid") from error
-        name = canonicalize_name(requirement.name)
-        requirement.name = name
-        if requirement.url or name in FORBIDDEN_LAYER_PACKAGES or name == "nonebot":
+        requirement = parse_requirement(value)
+        name = requirement.name
+        if name in FORBIDDEN_LAYER_PACKAGES:
             raise DependencyAnalysisError("dependency_requirement_unsupported", name)
         if action == "uninstall" and (
             requirement.specifier or requirement.extras or requirement.marker
@@ -70,6 +69,9 @@ async def preview_manual_dependencies(
     from zhenxun.services.plugin_store.plugin_archive_dependencies import (
         archive_dependency_contract,
     )
+    from zhenxun.services.plugin_store.plugin_store_receipts import (
+        receipt_dependency_inputs,
+    )
 
     from .dependencies import (
         FORBIDDEN_LAYER_PACKAGES,
@@ -80,7 +82,7 @@ async def preview_manual_dependencies(
         project_requirements,
         protected_core,
     )
-    from .environment import capture_environment
+    from .environment import capture_environment, dependency_roots, released_packages
 
     async def resolve(requirements, constraints, **options):
         active = [
@@ -133,12 +135,8 @@ async def preview_manual_dependencies(
     archive_pins = archive.get("packages", {})
     plugin_roots = [
         raw
-        for item in target.get("plugins", {}).values()
-        if item.get("state") == "managed"
-        for raw in (
-            item.get("resolution_inputs")
-            or [f"{item['project_link']}=={item['version']}"]
-        )
+        for owner, raw in dependency_roots(target)
+        if owner != "pyproject.toml" and not owner.startswith("manual:")
     ]
     root_inputs = [raw for items in roots.values() for raw in items]
     retained = []
@@ -233,6 +231,17 @@ async def preview_manual_dependencies(
                 packages.pop(name, None)
             else:
                 packages[name] = {**packages.get(name, {}), "version": version}
+    if action == "uninstall":
+        try:
+            sources = receipt_dependency_inputs()
+            released, imported = released_packages(
+                original, target, sources_before=sources, sources_after=sources
+            )
+        except (DependencyAnalysisError, OSError, KeyError, TypeError):
+            released, imported = [], []
+        for name in released:
+            packages.pop(name, None)
+        retained.extend(imported)
     wheels, wheel_error = (
         await resolve(
             [f"{name}=={item['version']}" for name, item in packages.items()],
@@ -298,16 +307,9 @@ def stage_requirement_files(files: list[Path]) -> bool:
         bool: 是否写入了待应用的事务
     """
     import asyncio
-    import uuid
 
     from .dependencies import DependencyAnalysisError, read_requirement_files
-    from .storage import (
-        load_manifest,
-        pending_transaction,
-        remove_generation,
-        save_pending_transaction,
-        utc_now,
-    )
+    from .storage import load_manifest, pending_transaction
 
     requirements = read_requirement_files(files)
     if not requirements:
@@ -322,6 +324,32 @@ def stage_requirement_files(files: list[Path]) -> bool:
             manifest=(pending or {}).get("target_manifest") or load_manifest(),
         )
     )
+    return stage_plan(plan, requirements, pending)
+
+
+def stage_plan(
+    plan: dict[str, Any], requirements: list[str], pending: dict | None = None
+) -> bool:
+    """把依赖计划写入待应用的依赖层事务，由启动器在下次启动 worker 前构建
+
+    参数:
+        plan: preview_manual_dependencies 返回的计划
+        requirements: 本次登记的依赖声明
+        pending: 当前待重启的事务，在其基础上追加
+
+    返回:
+        bool: 是否写入了待应用的事务
+    """
+    import uuid
+
+    from .dependencies import DependencyAnalysisError
+    from .storage import (
+        load_manifest,
+        remove_generation,
+        save_pending_transaction,
+        utc_now,
+    )
+
     if plan["no_change"]:
         return False
     if plan["source_build_required"]:

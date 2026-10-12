@@ -112,19 +112,13 @@ async def _carry_daily_claim(db, link, accounts):
         )
 
 
-async def _publish(link_id: str, accounts) -> None:
+async def _publish(link_id: str) -> None:
     from zhenxun.services.log import logger
 
-    targets = [(invalidate_identity, link_id)] + [
-        (UserConsole.invalidate_user_cache, account.user_id)
-        for account in accounts.values()
-    ]
-    for invalidate, key in targets:
-        try:
-            await invalidate(key)
-        except Exception as error:
-            # One failed publication must not skip other affected accounts.
-            logger.error(f"绑定已提交，定向缓存失效失败 key={key}", e=error)
+    try:
+        await invalidate_identity(link_id)
+    except Exception as error:
+        logger.error(f"绑定已提交，定向缓存失效失败 key={link_id}", e=error)
 
 
 async def issue_binding(
@@ -281,7 +275,7 @@ async def _redeem(actor, code, action):
         )
         request.state, request.result = "completed", result
         await request.save(using_db=db, update_fields=["state", "result"])
-    await _publish(request.identity_id, accounts)
+    await _publish(request.identity_id)
     return result
 
 

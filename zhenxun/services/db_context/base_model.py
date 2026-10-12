@@ -14,8 +14,6 @@ from tortoise.models import Model as TortoiseModel
 from tortoise.queryset import QuerySet
 from tortoise.transactions import in_transaction
 
-from zhenxun.services.cache import CacheRoot
-from zhenxun.services.cache.write import WriteQuery, notify_bulk_write, write_boundary
 from zhenxun.services.log import logger
 from zhenxun.services.platform_identity import (
     CURRENT_PLATFORM_SCOPE,
@@ -25,6 +23,7 @@ from zhenxun.utils.enum import DbLockType
 
 from .config import LOG_COMMAND, db_model
 from .utils import with_db_timeout
+from .write import WriteQuery, notify_bulk_write, write_boundary
 
 
 class _PlatformGuardedQuerySet(QuerySet):
@@ -131,49 +130,6 @@ class Model(TortoiseModel):
             db_model.script_method.append((cls.__module__, func))
 
     @classmethod
-    def get_cache_type(cls) -> str | None:
-        """获取缓存类型"""
-        return getattr(cls, "cache_type", None)
-
-    @classmethod
-    def get_cache_key_field(cls) -> str | tuple[str]:
-        """获取缓存键字段"""
-        return getattr(cls, "cache_key_field", "id")
-
-    @classmethod
-    def get_cache_key(cls, instance) -> str | None:
-        """获取缓存键
-
-        参数:
-            instance: 模型实例
-
-        返回:
-            str | None: 缓存键，如果无法获取则返回None
-        """
-        from zhenxun.services.cache.config import COMPOSITE_KEY_SEPARATOR
-
-        key_field = cls.get_cache_key_field()
-
-        if isinstance(key_field, tuple):
-            # 多字段主键
-            key_parts = []
-            for field in key_field:
-                if hasattr(instance, field):
-                    value = getattr(instance, field, None)
-                    key_parts.append(value if value is not None else "")
-                else:
-                    # 如果缺少任何必要的字段，返回None
-                    key_parts.append("")
-
-            # 如果没有有效参数，返回None
-            return COMPOSITE_KEY_SEPARATOR.join(key_parts) if key_parts else None
-        elif hasattr(instance, key_field):
-            value = getattr(instance, key_field, None)
-            return str(value) if value is not None else None
-
-        return None
-
-    @classmethod
     def get_semaphore(cls, lock_type: DbLockType):
         enable_lock = getattr(cls, "enable_lock", None)
         if not enable_lock or lock_type not in enable_lock:
@@ -226,10 +182,7 @@ class Model(TortoiseModel):
         cls._guard_platform_write(kwargs.get("user_id"))
         async with cls._lock_context(DbLockType.CREATE):
             # 直接调用父类的_create方法避免触发save的锁
-            result = await super().create(using_db=using_db, **kwargs)
-            if cache_type := cls.get_cache_type():
-                await CacheRoot.invalidate_cache(cache_type, cls.get_cache_key(result))
-            return result
+            return await super().create(using_db=using_db, **kwargs)
 
     @classmethod
     async def get_or_create(
@@ -281,8 +234,6 @@ class Model(TortoiseModel):
                 if "result" in locals():
                     await connection.execute_query(f"RELEASE SAVEPOINT {savepoint}")
 
-        if result[1] and (cache_type := cls.get_cache_type()):
-            await CacheRoot.invalidate_cache(cache_type, cls.get_cache_key(result[0]))
         return result
 
     @classmethod
@@ -343,33 +294,12 @@ class Model(TortoiseModel):
             )
             if self._meta.db_table in {"group_info_users", "group_plugin_settings"}:
                 await notify_bulk_write(type(self))
-            if cache_type := getattr(self, "cache_type", None):
-                await CacheRoot.invalidate_cache(
-                    cache_type, self.__class__.get_cache_key(self)
-                )
 
     async def delete(self, using_db: BaseDBAsyncClient | None = None):
         self._guard_platform_write(getattr(self, "user_id", None))
-        cache_type = getattr(self, "cache_type", None)
-        key = self.__class__.get_cache_key(self) if cache_type else None
-        # 执行删除操作
         await super().delete(using_db=using_db)
         if self._meta.db_table in {"group_info_users", "group_plugin_settings"}:
             await notify_bulk_write(type(self))
-
-        # 清除缓存
-        if cache_type:
-            await CacheRoot.invalidate_cache(cache_type, key)
-
-    @classmethod
-    def bulk_create(cls, objects, *args, **kwargs):
-        cls._guard_platform_write()
-        return super().bulk_create(objects, *args, **kwargs)
-
-    @classmethod
-    def bulk_update(cls, objects, fields, *args, **kwargs):
-        cls._guard_platform_write()
-        return super().bulk_update(objects, fields, *args, **kwargs)
 
     @classmethod
     async def safe_get_or_none(

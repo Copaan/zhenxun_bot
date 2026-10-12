@@ -22,7 +22,6 @@ from tortoise.transactions import in_transaction
 
 from zhenxun.models.business_identity import (
     AccountBindingChange,
-    BusinessEventAccount,
     BusinessIdentityLink,
 )
 from zhenxun.models.user_console import UserConsole
@@ -61,14 +60,13 @@ class BusinessIdentity:
     storage_key: str
     revision: int
     verified: bool
-    event_snapshot: str | None = None
 
 
 _current: ContextVar[BusinessIdentity | None] = ContextVar(
     "business_identity", default=None
 )
 _links = BoundedTTLCache("BUSINESS_IDENTITY", ttl_seconds=30, max_items=2048)
-_inflight: dict[tuple[str, bool], asyncio.Task] = {}
+_inflight: dict[str, asyncio.Task] = {}
 _resolvers: dict[str, Callable] = {}
 
 
@@ -347,50 +345,12 @@ async def resolve_business_identity(bot, event, session) -> BusinessIdentity:
 
             if current_asset_connection() is not None:
                 raise BusinessIdentityError("请在资产事务开始前解析业务身份")
-            flight_key = (protocol.key, bool(execution))
-            task = _inflight.get(flight_key)
+            task = _inflight.get(protocol.key)
             if task is None:
-                task = asyncio.create_task(
-                    _ensure_link(protocol, evidence)
-                    if execution
-                    else _load_current(protocol, evidence)
-                )
-                _inflight[flight_key] = task
-                task.add_done_callback(lambda done: _finished(flight_key, done))
+                task = asyncio.create_task(_load_current(protocol, evidence))
+                _inflight[protocol.key] = task
+                task.add_done_callback(lambda done: _finished(protocol.key, done))
             resolved = await asyncio.shield(task)
-            if execution:
-                snapshot_id = identity_digest(execution.identity, protocol.key)
-                async with in_transaction() as db:
-                    await acquire_sqlite_identity_write(db, [protocol.key])
-                    link = (
-                        await BusinessIdentityLink.filter(id=protocol.key)
-                        .using_db(db)
-                        .select_for_update()
-                        .get()
-                    )
-                    snapshot, _ = await BusinessEventAccount.get_or_create(
-                        using_db=db,
-                        id=snapshot_id,
-                        defaults={
-                            "event_id": execution.identity,
-                            "identity_id": protocol.key,
-                            "account_id": link.account_id,
-                            "revision": link.revision,
-                        },
-                    )
-                    account = (
-                        await UserConsole.filter(id=snapshot.account_id)
-                        .using_db(db)
-                        .get()
-                    )
-                    resolved = BusinessIdentity(
-                        protocol,
-                        account.id,
-                        account.user_id,
-                        snapshot.revision,
-                        link.verified,
-                        snapshot_id,
-                    )
             cache[protocol.key] = resolved
     _current.set(resolved)
     return resolved
@@ -459,20 +419,7 @@ async def validate_business_write(keys: list[str], db) -> None:
         .select_for_update()
         .get()
     )
-    if identity.event_snapshot:
-        execution = current_execution.get()
-        snapshot = (
-            await BusinessEventAccount.filter(id=identity.event_snapshot)
-            .using_db(db)
-            .get()
-        )
-        if (
-            not execution
-            or snapshot.event_id != execution.identity
-            or snapshot.account_id != identity.account_id
-        ):
-            raise BusinessIdentityError("消息账号快照不匹配")
-    elif link.revision != identity.revision or link.account_id != identity.account_id:
+    if link.revision != identity.revision or link.account_id != identity.account_id:
         raise BusinessIdentityError("账号绑定已变更，请重新发送命令")
 
 

@@ -55,7 +55,6 @@ async def reload_runtime_config(
     reload_consumers: bool = True,
 ) -> RuntimeOperation:
     """Reload config.yaml and the runtime state derived from it."""
-    from zhenxun.builtin_plugins.hooks.auth.auth_limit import LimitManager
     from zhenxun.builtin_plugins.init.manager import manager
     from zhenxun.services.plugin_host import plugin_host
 
@@ -64,7 +63,6 @@ async def reload_runtime_config(
         clear_all_cache()
         manager.init()
         await manager.load_to_db()
-        await LimitManager.update_limits()
         if reschedule is not None:
             with contextlib.suppress(Exception):
                 reschedule()

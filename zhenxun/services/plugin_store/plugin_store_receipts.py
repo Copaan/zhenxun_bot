@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ast
+from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
@@ -62,4 +64,158 @@ class StoreReceiptStore:
         )
 
 
-__all__ = ["StoreReceiptStore", "source_digest"]
+def receipt_dependency_inputs(
+    overrides: dict[str, list[str] | None] | None = None,
+) -> dict[str, list[str]]:
+    """读取商店插件回执中记录的依赖声明
+
+    参数:
+        overrides: 按 store_key 覆盖的依赖声明，None 表示移除
+
+    返回:
+        dict[str, list[str]]: store_key 到依赖声明的映射
+    """
+    result = {
+        key: [str(value) for value in receipt["dependency_inputs"]]
+        for key, receipt in StoreReceiptStore.load().items()
+        if isinstance(receipt, dict)
+        and isinstance(receipt.get("dependency_inputs"), list)
+    }
+    for key, values in (overrides or {}).items():
+        if values is None:
+            result.pop(key, None)
+        else:
+            result[key] = [str(value) for value in values]
+    return result
+
+
+def artifact_version(path: Path) -> str | None:
+    """从插件元数据中静态读取插件版本
+
+    参数:
+        path: 插件源码路径
+
+    返回:
+        str | None: 插件版本
+    """
+    entrypoint = path / "__init__.py" if path.is_dir() else path
+    try:
+        tree = ast.parse(entrypoint.read_text(encoding="utf-8"))
+    except (OSError, SyntaxError, UnicodeError):
+        return None
+    metadata_values = []
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "__plugin_meta__"
+            for target in node.targets
+        ):
+            metadata_values.append(node.value)
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == "__plugin_meta__"
+            and node.value is not None
+        ):
+            metadata_values.append(node.value)
+    for metadata in metadata_values:
+        for node in ast.walk(metadata):
+            if not isinstance(node, ast.Call):
+                continue
+            name = (
+                node.func.id
+                if isinstance(node.func, ast.Name)
+                else node.func.attr
+                if isinstance(node.func, ast.Attribute)
+                else ""
+            )
+            if name != "PluginExtraData":
+                continue
+            keyword = next(
+                (item for item in node.keywords if item.arg == "version"), None
+            )
+            if keyword is None:
+                continue
+            try:
+                value = ast.literal_eval(keyword.value)
+            except (ValueError, TypeError):
+                continue
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
+def store_receipt(
+    *,
+    source: str,
+    plugin_info: Any,
+    runtime_module: str,
+    path: Path,
+    dependency_inputs: list[str] | None = None,
+) -> dict[str, Any]:
+    """生成商店插件安装回执
+
+    参数:
+        source: 插件来源
+        plugin_info: 插件信息
+        runtime_module: 运行时模块名
+        path: 插件源码路径
+        dependency_inputs: 插件声明的依赖
+
+    返回:
+        dict[str, Any]: 安装回执
+    """
+    installed_version = artifact_version(path)
+    receipt = {
+        "source": source,
+        "module": plugin_info.module,
+        "module_path": plugin_info.module_path,
+        "runtime_module": runtime_module,
+        "requested_version": str(plugin_info.version),
+        "installed_version": installed_version,
+        "version_source": "artifact_metadata" if installed_version else "unknown",
+        "catalog_version": str(plugin_info.version),
+        "source_digest": source_digest(path),
+        "installed_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if dependency_inputs is not None:
+        receipt["dependency_inputs"] = sorted(set(dependency_inputs))
+    return receipt
+
+
+def write_store_receipt(store_key: str, receipt: dict[str, Any]) -> None:
+    """写入已生效的商店插件回执，并登记不再需要的旧依赖
+
+    参数:
+        store_key: 商店插件标识
+        receipt: 安装回执
+    """
+    from .plugin_store_transaction import release_source_dependencies
+
+    release_source_dependencies(
+        {store_key: list(receipt.get("dependency_inputs") or [])}
+    )
+    StoreReceiptStore.set(store_key, receipt)
+
+
+def delete_store_receipt(store_key: str, path: Path) -> None:
+    """删除已移除商店插件的回执，并登记不再需要的依赖
+
+    参数:
+        store_key: 商店插件标识
+        path: 已移除的插件源码路径
+    """
+    from .plugin_store_transaction import release_source_dependencies
+
+    release_source_dependencies({store_key: None}, [path])
+    StoreReceiptStore.delete(store_key)
+
+
+__all__ = [
+    "StoreReceiptStore",
+    "artifact_version",
+    "delete_store_receipt",
+    "receipt_dependency_inputs",
+    "source_digest",
+    "store_receipt",
+    "write_store_receipt",
+]

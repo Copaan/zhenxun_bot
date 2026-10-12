@@ -10,6 +10,20 @@ from zhenxun.services.lifecycle.deadline import remaining_timeout, shutdown_budg
 from zhenxun.services.log import logger
 
 
+def browser_gone(error: BaseException) -> bool:
+    """关闭失败是否因为浏览器或 Playwright 驱动已退出
+
+    参数:
+        error: 关闭时的异常
+
+    返回:
+        bool: 资源已随浏览器释放
+    """
+    return type(error).__name__ == "TargetClosedError" or (
+        "Connection closed while reading from the driver" in str(error)
+    )
+
+
 @dataclass
 class ContextResource:
     context: Any
@@ -103,10 +117,10 @@ class BrowserResources:
                 try:
                     await context.close()
                 except BaseException as error:
-                    self.record_failure(context, "context_close", error)
-                    raise
-                else:
-                    self.confirmed(context)
+                    if not browser_gone(error):
+                        self.record_failure(context, "context_close", error)
+                        raise
+                self.confirmed(context)
 
             task = record.cleanup = self.spawn(close(), name="renderer-context-close")
         try:
@@ -124,7 +138,8 @@ class BrowserResources:
                 try:
                     await asyncio.wait_for(page.close(), remaining_timeout(10.0))
                 except BaseException as error:
-                    self.record_failure(context, "page_close", error)
+                    if not browser_gone(error):
+                        self.record_failure(context, "page_close", error)
                     reusable = False
                     if not isinstance(error, Exception):
                         cancelled = error

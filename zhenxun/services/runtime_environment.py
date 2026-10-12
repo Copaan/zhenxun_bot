@@ -39,7 +39,6 @@ DIRECT_KEYS = {
 DIRECT_KEYS |= PROXY_KEYS
 CACHE_KEYS = {
     "CACHE_MODE",
-    "REDIS_EXPIRE",
     "REDIS_HOST",
     "REDIS_PASSWORD",
     "REDIS_PORT",
@@ -92,7 +91,6 @@ _BOT_ATTRS = {
 }
 _CACHE_ATTRS = {
     "CACHE_MODE": "cache_mode",
-    "REDIS_EXPIRE": "redis_expire",
     "REDIS_HOST": "redis_host",
     "REDIS_PASSWORD": "redis_password",
     "REDIS_PORT": "redis_port",
@@ -247,9 +245,9 @@ class RuntimeEnvironmentManager:
                 os.environ[key] = value
 
     async def _reconfigure_cache(self, values: dict[str, str | None]) -> None:
-        from zhenxun.services.cache import CacheRoot, cache_config
+        from zhenxun.services.cache import cache_config
         from zhenxun.services.cache.config import CacheMode
-        from zhenxun.services.cache.runtime_cache import RuntimeCacheSync
+        from zhenxun.services.cache.runtime_sync import RuntimeCacheSync
 
         candidate = type(cache_config)(
             **{
@@ -284,17 +282,13 @@ class RuntimeEnvironmentManager:
         previous = {attr: getattr(cache_config, attr) for attr in _CACHE_ATTRS.values()}
         try:
             await RuntimeCacheSync.stop()
-            await CacheRoot.close()
             for attr in _CACHE_ATTRS.values():
                 setattr(cache_config, attr, getattr(candidate, attr))
-            CacheRoot.enabled = candidate.cache_mode == CacheMode.REDIS
             await asyncio.wait_for(RuntimeCacheSync.start(strict=True), 2)
         except BaseException:
             await RuntimeCacheSync.stop()
-            await CacheRoot.close()
             for attr, value in previous.items():
                 setattr(cache_config, attr, value)
-            CacheRoot.enabled = cache_config.cache_mode == CacheMode.REDIS
             await asyncio.wait_for(RuntimeCacheSync.start(strict=True), 2)
             raise
         finally:

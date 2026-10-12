@@ -213,17 +213,6 @@ class SideEffectCommit:
     async def reserve_limit(self, reservation: ReservationLike) -> None:
         await self.reserve("limit", reservation)
 
-    async def commit_limit(
-        self,
-        reservation: ReservationLike | None = None,
-    ) -> None:
-        if reservation is not None:
-            await self.reserve_limit(reservation)
-        await self.commit("limit")
-
-    async def release_limit(self, reason: str | None = None) -> None:
-        await self.release("limit", reason)
-
     async def reserve_gold(
         self,
         reservation: ReservationLike,
@@ -240,9 +229,6 @@ class SideEffectCommit:
 
     async def commit_gold(self) -> None:
         await self.commit("gold")
-
-    async def rollback_gold(self, reason: str | None = None) -> None:
-        await self.release("gold", reason)
 
     async def rollback_all(self, reason: str | None = None) -> None:
         first_error = None

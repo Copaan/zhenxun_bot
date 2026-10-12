@@ -3,11 +3,13 @@ from __future__ import annotations
 import hashlib
 import json
 from typing import Any
+import uuid
 
 from tortoise import Tortoise, fields
 
 from zhenxun.services.db_context import Model
 from zhenxun.services.db_context.schema_ops import AddColumn
+from zhenxun.services.db_context.utils import db_dialect
 
 
 class GroupPluginSetting(Model):
@@ -213,34 +215,103 @@ async def _populate_scope_keys(connection: Any, dialect: str) -> None:
         raise RuntimeError(f"group_plugin_settings_scope_duplicate:{keys}")
 
 
-async def _rebuild_sqlite_scope_constraint(connection: Any) -> None:
-    """Replace the legacy scope constraint without simplifying existing DDL."""
-    from zhenxun.services.db_context.sqlite_rebuild import replace_unique_constraint
+def _quote_sqlite(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
 
-    await replace_unique_constraint(
-        connection,
-        _GROUP_PLUGIN_TABLE,
-        obsolete={_LEGACY_SCOPE_COLUMNS, _LEGACY_SCOPED_COLUMNS},
-        desired=_SCOPE_KEY_COLUMNS,
-        constraint=_SCOPED_CONSTRAINT,
-    )
+
+async def _rebuild_sqlite_scope_constraint(connection: Any) -> None:
+    """重建 SQLite 表替换作用域唯一约束，保留原有 DDL、索引、触发器与自增序列
+
+    参数:
+        connection: 数据库连接
+    """
+    from zhenxun.utils.sql_tokens import replace_sqlite_unique as replace_unique_sql
+
+    table = _GROUP_PLUGIN_TABLE
+    obsolete = {_LEGACY_SCOPE_COLUMNS, _LEGACY_SCOPED_COLUMNS}
+    desired = _SCOPE_KEY_COLUMNS
+    constraint = _SCOPED_CONSTRAINT
+    async with connection.acquire_connection() as raw:
+        foreign_keys = (await raw.execute_fetchall("PRAGMA foreign_keys"))[0][0]
+        legacy_alter = (await raw.execute_fetchall("PRAGMA legacy_alter_table"))[0][0]
+        await raw.execute("PRAGMA foreign_keys=OFF")
+        await raw.execute("PRAGMA legacy_alter_table=ON")
+        try:
+            await raw.execute("BEGIN IMMEDIATE")
+            rows = await raw.execute_fetchall(
+                "SELECT sql FROM sqlite_schema WHERE type='table' AND name=?", (table,)
+            )
+            if not rows:
+                await raw.rollback()
+                return
+            columns = await raw.execute_fetchall(
+                f"PRAGMA table_xinfo({_quote_sqlite(table)})"
+            )
+            names = [row[1] for row in columns if row[6] == 0]
+            if not set(desired) <= set(names):
+                raise RuntimeError("group_plugin_settings_scope_columns_missing")
+            objects = await raw.execute_fetchall(
+                "SELECT type,name,sql FROM sqlite_schema WHERE "
+                "tbl_name=? AND type IN ('index','trigger') AND "
+                "sql IS NOT NULL ORDER BY type,name",
+                (table,),
+            )
+            obsolete_indexes = set()
+            for index in await raw.execute_fetchall(
+                f"PRAGMA index_list({_quote_sqlite(table)})"
+            ):
+                if not index[2] or index[4]:
+                    continue
+                fields = await raw.execute_fetchall(
+                    f"PRAGMA index_info({_quote_sqlite(index[1])})"
+                )
+                if tuple(field[2] for field in fields) in {*obsolete, desired}:
+                    obsolete_indexes.add(index[1])
+            sequence = []
+            if await raw.execute_fetchall(
+                "SELECT 1 FROM sqlite_schema WHERE name='sqlite_sequence'"
+            ):
+                sequence = await raw.execute_fetchall(
+                    "SELECT seq FROM sqlite_sequence WHERE name=?", (table,)
+                )
+            temporary = table + "__scope_" + uuid.uuid4().hex
+            await raw.execute(
+                replace_unique_sql(rows[0][0], temporary, obsolete, desired, constraint)
+            )
+            selected = ",".join(map(_quote_sqlite, names))
+            await raw.execute(
+                f"INSERT INTO {_quote_sqlite(temporary)} ({selected}) SELECT "
+                f"{selected} FROM {_quote_sqlite(table)}"
+            )
+            await raw.execute(f"DROP TABLE {_quote_sqlite(table)}")
+            await raw.execute(
+                f"ALTER TABLE {_quote_sqlite(temporary)} "
+                f"RENAME TO {_quote_sqlite(table)}"
+            )
+            for object_type, name, sql in objects:
+                if object_type == "index" and name in obsolete_indexes:
+                    continue
+                await raw.execute(sql)
+            if sequence:
+                await raw.execute(
+                    "UPDATE sqlite_sequence SET seq=? WHERE name=?",
+                    (sequence[0][0], table),
+                )
+            if await raw.execute_fetchall("PRAGMA foreign_key_check"):
+                raise RuntimeError("sqlite_schema_reference_invalid")
+            await raw.commit()
+        except BaseException:
+            await raw.rollback()
+            raise
+        finally:
+            await raw.execute(f"PRAGMA legacy_alter_table={int(legacy_alter)}")
+            await raw.execute(f"PRAGMA foreign_keys={int(foreign_keys)}")
 
 
 async def ensure_group_plugin_scope_constraint() -> None:
     """Upgrade setting uniqueness without exceeding MySQL key length limits."""
     connection = Tortoise.get_connection("default")
-    raw_dialect = str(
-        getattr(getattr(connection, "capabilities", None), "dialect", "") or ""
-    ).lower()
-    dialect = (
-        "sqlite"
-        if raw_dialect.startswith("sqlite")
-        else "postgres"
-        if raw_dialect.startswith("postgres")
-        else "mysql"
-        if raw_dialect.startswith("mysql")
-        else "unknown"
-    )
+    dialect = db_dialect(connection)
     if dialect == "unknown":
         return
 

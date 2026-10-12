@@ -53,19 +53,13 @@ def run_worker(project_root: Path) -> None:
         raise WorkerReexec
     sync_env_missing_items(project_root)
 
-    from zhenxun.services.migration.validation import validation_gate
     from zhenxun.services.nonebot_store.runtime import (
         activate_current_generation,
         recovery_required,
     )
 
     store_recovery = recovery_required()
-
-    if validation_gate.task_id:
-        from zhenxun.services.migration.generation import activate_candidate
-
-        activate_candidate(project_root, validation_gate.task_id)
-    elif not store_recovery:
+    if not store_recovery:
         activate_current_generation()
 
     import nonebot
@@ -117,11 +111,6 @@ def run_worker(project_root: Path) -> None:
     from zhenxun.configs.config import BotConfig
 
     driver = nonebot.get_driver()
-    from zhenxun.services.migration.validation_worker import (
-        install as install_validation,
-    )
-
-    install_validation(driver)
     driver.register_adapter(OneBotV11Adapter)
     from zhenxun.services.onebot_endpoint import OneBotHandshakeDiagnostics
 
@@ -237,12 +226,6 @@ def run_worker(project_root: Path) -> None:
             "部分 WebUI 托管的 NoneBot 插件加载失败，已隔离: {}",
             ", ".join(item["store_key"] for item in managed_status["failed"]),
         )
-
-    from zhenxun.services.migration.validation_worker import (
-        register as register_validation,
-    )
-
-    register_validation(driver, managed_status=managed_status)
 
     from zhenxun.configs.webui_tls import (
         bind_runtime_webui_settings,

@@ -2,6 +2,7 @@ import asyncio
 from datetime import datetime, timezone
 
 from zhenxun.models.bot_group_policy import BotGroupMembership, BotGroupPluginPolicy
+from zhenxun.services.db_context.write import CacheUnavailable, on_publication_failed
 from zhenxun.services.log import logger
 from zhenxun.services.plugin_policy import (
     PluginPolicyError,
@@ -99,7 +100,7 @@ class BotGroupPolicyService:
             return False
         key = group_key(bot_id, scope, group_id, channel_id)
         if key in self._stale:
-            raise PluginPolicyError("策略缓存待重新核验")
+            raise CacheUnavailable("plugin_policy_stale")
         state = self._policies.get(key)
         if is_superuser and module in self._superuser_exempt.get(key, ()):
             return False
@@ -441,7 +442,7 @@ class BotGroupPolicyService:
 
     async def _write(self, key, transform, expected_revision=None):
         from zhenxun.models.bot_console import BotConsole
-        from zhenxun.services.cache.write import defer, require_publication
+        from zhenxun.services.db_context.write import defer, require_publication
 
         async with runtime_mutation_coordinator.operation("plugin_policy_scope"):
             try:
@@ -769,7 +770,7 @@ class BotGroupPolicyService:
 
     @staticmethod
     def _publish_policy_revision(key):
-        from zhenxun.services.cache.runtime_cache import RuntimeCacheMutation
+        from zhenxun.services.cache.runtime_sync import RuntimeCacheMutation
 
         return RuntimeCacheMutation.publish(
             "permission", "policy_changed", key_fields(key)
@@ -777,3 +778,9 @@ class BotGroupPolicyService:
 
 
 bot_group_policy_service = BotGroupPolicyService()
+
+
+@on_publication_failed
+def _mark_policy_stale(key: tuple | None) -> None:
+    if key and key[0] == "bot_group_policy":
+        bot_group_policy_service._stale.add(tuple(key[1:]))

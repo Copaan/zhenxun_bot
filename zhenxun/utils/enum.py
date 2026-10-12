@@ -39,29 +39,6 @@ class EventLogType(StrEnum):
     """主动退群"""
 
 
-class CacheType(StrEnum):
-    """
-    缓存类型
-    """
-
-    PLUGINS = "GLOBAL_ALL_PLUGINS"
-    """全局全部插件"""
-    GROUPS = "GLOBAL_ALL_GROUPS"
-    """全局全部群组"""
-    GROUP_PLUGIN_SETTINGS = "GROUP_PLUGIN_SETTINGS"
-    """插件分群配置"""
-    USERS = "GLOBAL_ALL_USERS"
-    """全部用户"""
-    BAN = "GLOBAL_ALL_BAN"
-    """全局ban列表"""
-    BOT = "GLOBAL_BOT"
-    """全局bot信息"""
-    LEVEL = "GLOBAL_USER_LEVEL"
-    """用户权限"""
-    LIMIT = "GLOBAL_LIMIT"
-    """插件限制"""
-
-
 class DbLockType(StrEnum):
     """
     锁类型

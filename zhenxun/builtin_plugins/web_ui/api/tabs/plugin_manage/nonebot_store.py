@@ -49,6 +49,7 @@ from zhenxun.services.nonebot_store.runtime import (
     stage_generation,
 )
 from zhenxun.services.nonebot_store.storage import (
+    PENDING_FILE,
     STARTUP_STATUS_FILE,
     clear_pending_transaction,
     dependency_sync_status,
@@ -58,6 +59,7 @@ from zhenxun.services.nonebot_store.storage import (
     save_dependency_sync_status,
     save_pending_transaction,
     utc_now,
+    write_json,
 )
 from zhenxun.services.plugin_host import plugin_host
 from zhenxun.services.plugin_store.operation_journal import (
@@ -607,7 +609,8 @@ async def _analyze(analysis_id: str) -> None:
                 if item.get("digests", {}).get("sha256")
             }
         )
-        plan["restart_required"] = True
+        plan["hot_apply_expected"] = _hot_candidate(action, plugin, plan, pending)
+        plan["restart_required"] = not plan["hot_apply_expected"]
         plan["summary_revision"] = summary_revision(
             {
                 **plan,
@@ -811,6 +814,60 @@ def _operation_result(
     }
 
 
+def _release_only(transaction: dict[str, Any] | None) -> bool:
+    """待处理事务是否只登记了运行期释放的依赖，可随热处理一并生效"""
+    if not transaction:
+        return False
+    return bool(
+        transaction.get("state") == "pending_restart"
+        and not transaction.get("operations")
+        and not isinstance(transaction.get("generation"), int)
+        and not transaction.get("source_transaction_revision")
+        and not transaction.get("source_build_confirmed")
+        and not transaction.get("database_migration_possible")
+    )
+
+
+def _hot_candidate(
+    action: str,
+    plugin: dict[str, Any],
+    plan: dict[str, Any],
+    pending: dict[str, Any] | None,
+) -> bool:
+    """插件变更能否不重启直接生效，依赖层构建后还需检查插件源码与原生扩展
+
+    参数:
+        action: install / update / uninstall
+        plugin: 商店插件信息
+        plan: 依赖分析结果
+        pending: 当前待处理事务
+
+    返回:
+        bool: 是否可热处理
+    """
+    project = canonicalize_name(str(plugin["project_link"]))
+    dependency_changed = any(
+        canonicalize_name(item["name"]) != project
+        for item in plan["package_changes"]["changed"]
+    )
+    return bool(
+        (pending is None or _release_only(pending))
+        and not plan["source_build_required"]
+        and not dependency_changed
+        and not plan.get("shared_changes")
+        and not plan.get("compatibility_overrides")
+        and not plan.get("database_migration_possible")
+        and plan.get("pure_python_candidate")
+        and (
+            action == "install"
+            or plugin_host.classification_for(str(plugin["module_name"]))[
+                "reload_support"
+            ]
+            == "hot_reloadable"
+        )
+    )
+
+
 def _hot_apply_info(action: str) -> str:
     return {
         "install": "插件已安装并热加载",
@@ -822,11 +879,34 @@ def _hot_apply_info(action: str) -> str:
 async def _apply_hot(
     analysis: dict[str, Any], transaction: dict[str, Any], build: dict[str, Any]
 ) -> dict[str, Any]:
+    """在运行中的进程内切换依赖层并热加载、重载或卸载插件
+
+    事务先以待验证状态落盘，进程中途退出时由 launcher 按启动验证确认或回滚；
+    热处理失败时回滚依赖层并从原依赖层恢复插件。
+
+    参数:
+        analysis: 分析结果
+        transaction: 待提交的依赖事务
+        build: 已构建的依赖层
+
+    返回:
+        dict[str, Any]: 操作结果
+
+    异常:
+        RuntimeError: 热处理失败，依赖层已回滚
+    """
     plugin = analysis["registry_plugin"]
     module_name = str(plugin["module_name"])
     action = analysis["action"]
     previous_manifest = load_manifest()
-    commit_generation(transaction, build, verify_on_start=False)
+    transaction.update(
+        generation=int(build["generation"]),
+        generation_digest=str(build["digest"]),
+        native_extensions=list(build.get("native_extensions") or []),
+        state="verification_pending",
+    )
+    save_pending_transaction(transaction)
+    commit_generation(transaction, build, verify_on_start=True)
     activate_current_generation()
     try:
         if action == "install":
@@ -842,11 +922,27 @@ async def _apply_hot(
             operation = await plugin_host.unload_plugin(module_name)
         if operation.mode.value != "hot_reloaded":
             raise RuntimeError(operation.reason or "plugin_runtime_apply_failed")
-    except Exception:
+    except Exception as error:
         rollback_pending_transaction()
         activate_current_generation()
-        if action in {"update", "uninstall"}:
-            await plugin_host.recover_plugin(module_name, submit_restart=False)
+        failed = read_json(PENDING_FILE, None)
+        if isinstance(failed, dict) and failed.get("revision") == transaction.get(
+            "revision"
+        ):
+            failed["error_code"] = "plugin_hot_apply_failed"
+            failed["failure_reasons"] = [
+                {
+                    "code": str(error) or type(error).__name__,
+                    "store_key": f"nonebot:{plugin['project_link']}",
+                    "module_name": module_name,
+                    "paths": [],
+                }
+            ]
+            write_json(PENDING_FILE, failed)
+        if action != "install" and (root := module_source_path(module_name)):
+            await plugin_host.load_new_plugin(
+                module_name, root, submit_restart=False, dependencies_verified=True
+            )
         raise
     finalize_pending_transaction()
     old_generation = previous_manifest.get("active_generation")
@@ -1566,6 +1662,9 @@ async def _apply_analysis(payload: ApplyPayload, binding: str) -> Result[dict]:
                     "native_extensions", []
                 ),
             }
+            for key in ("released_packages", "retained_imports"):
+                if latest_pending and latest_pending.get(key):
+                    transaction[key] = deepcopy(latest_pending[key])
             if not operations:
                 remove_generation(transaction.get("generation"))
                 finalize_orm_migration()
@@ -1593,7 +1692,9 @@ async def _apply_analysis(payload: ApplyPayload, binding: str) -> Result[dict]:
                 for item in plan["package_changes"]["changed"]
                 if item is not root_change
             ]
-            hot_candidate = False
+            hot_candidate = _hot_candidate(
+                analysis["action"], plugin, plan, latest_pending
+            )
             deferred_source_build = bool(
                 plan["source_build_required"]
                 or (

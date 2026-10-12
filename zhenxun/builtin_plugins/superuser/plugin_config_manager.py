@@ -134,7 +134,7 @@ async def get_plugin_config_model(plugin_name: str) -> type[BaseModel] | None:
     """通过插件名查找其注册的分群配置模型"""
     for p in nonebot.get_loaded_plugins():
         if p.name == plugin_name and p.metadata and p.metadata.extra:
-            extra = PluginExtraData(**p.metadata.extra)
+            extra = PluginExtraData.from_extra(p.metadata.extra, p.name)
             if extra.group_config_model:
                 return extra.group_config_model
     return None
@@ -332,7 +332,7 @@ async def handle_list(arp: Arparma, bot: Bot, event: Event):
         configurable_plugins = []
         for p in nonebot.get_loaded_plugins():
             if p.metadata and p.metadata.extra:
-                extra = PluginExtraData(**p.metadata.extra)
+                extra = PluginExtraData.from_extra(p.metadata.extra, p.name)
                 if extra.group_config_model:
                     configurable_plugins.append(p.name)
 

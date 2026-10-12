@@ -52,30 +52,6 @@ def _message_summary(raw: str | dict | list | None) -> tuple[str, str]:
     return preview or "[无文本内容]", message_type
 
 
-def assert_replaceable_inbox(root: Path):
-    path = root / "data/runtime/message-inbox/inbox.sqlite3"
-    if not path.exists():
-        return
-    from zhenxun.services.migration.errors import MigrationError
-
-    db = None
-    try:
-        db = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=1)
-        pending = db.execute(
-            "SELECT COUNT(*) FROM inbox WHERE state NOT IN ('completed','dismissed')"
-        ).fetchone()[0]
-        pending += db.execute(
-            "SELECT COUNT(*) FROM deliveries WHERE state!='completed'"
-        ).fetchone()[0]
-    except sqlite3.Error:
-        raise MigrationError("migration_message_inbox_unverifiable") from None
-    finally:
-        if db is not None:
-            db.close()
-    if pending:
-        raise MigrationError("migration_message_inbox_unresolved", status=409)
-
-
 class MessageStore:
     def __init__(self, path: Path, max_records=1_000_000, max_bytes=2 * 1024**3):
         self.path = path
@@ -597,6 +573,22 @@ class MessageStore:
             "history": history,
             "oldest_wait_seconds": max(0, time.time() - oldest) if oldest else 0,
         }
+
+    def open_events(self) -> list[str]:
+        """未结束的事件 id，包括仍有待投递消息的事件
+
+        返回:
+            list[str]: 事件 id
+        """
+        with self.connect() as db:
+            return [
+                row[0]
+                for row in db.execute(
+                    "SELECT id FROM inbox WHERE state NOT IN ('completed','dismissed') "
+                    "UNION SELECT event_id FROM deliveries WHERE state!='completed'"
+                )
+                if row[0]
+            ]
 
     def cleanup(self):
         now = time.time()

@@ -8,18 +8,23 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import AsyncExitStack
+from dataclasses import dataclass
 import importlib
+from importlib.util import find_spec
 import os
 from pathlib import Path
 import sys
 from typing import Any
 
 import nonebot
+from nonebot.exception import SkippedException
 from nonebot.matcher import current_matcher
 from nonebot.plugin import (
     Plugin,
     _current_plugin,
     _managers,
+    _module_name_to_plugin_id,
     _new_plugin,
     _plugins,
     _revert_plugin,
@@ -35,6 +40,7 @@ from . import registry
 from .classifier import (
     DEPENDENCY_FILES,
     PluginClassifier,
+    _classification,
     find_plugin,
     plugin_root,
     source_files,
@@ -47,6 +53,68 @@ _DRAIN_TIMEOUT = 10.0
 _CANCEL_TIMEOUT = 5.0
 _HOOK_TIMEOUT = 30.0
 _LOG_COMMAND = "插件热重载"
+
+
+@dataclass
+class _Stopped:
+    """热重载失败后停用的插件"""
+
+    root: Path | None
+    """插件包目录或模块文件"""
+    cause: str
+    """导致停用的插件模块，自身加载失败时为自身"""
+    kept: list[str]
+    """需要恢复登记的子插件模块"""
+    missing: str | None = None
+    """加载失败时缺少的第三方依赖"""
+
+
+_connect_tasks: set[asyncio.Task] = set()
+
+
+def _missing_dependency(error: BaseException, module_name: str) -> str | None:
+    """导入失败原因是缺少插件外部的模块时，返回该模块的顶层包名
+
+    参数:
+        error: 导入时的异常
+        module_name: 插件模块名
+
+    返回:
+        str | None: 缺少的包名
+    """
+    if isinstance(error, ModuleNotFoundError) and error.name:
+        top = error.name.split(".")[0]
+        if top not in {"zhenxun", module_name.split(".")[0]}:
+            return top
+    return None
+
+
+def _dependency_files(root: Path) -> set[Path]:
+    return {root / name for name in DEPENDENCY_FILES if (root / name).is_file()}
+
+
+async def _run_connect_hook(hook: Any, bot: Any) -> None:
+    try:
+        async with AsyncExitStack() as stack:
+            await hook(bot=bot, stack=stack, dependency_cache={})
+    except SkippedException:
+        pass
+    except Exception as error:
+        name = getattr(registry._unwrap(hook), "__name__", "?")
+        logger.error(f"插件 Bot 连接钩子执行失败: {name}", _LOG_COMMAND, e=error)
+
+
+def _connect_bots(hooks: list[Any]) -> None:
+    """对已连接的 Bot 在后台执行插件新注册的连接钩子
+
+    参数:
+        hooks: 连接钩子
+    """
+    for bot in list(nonebot.get_bots().values()):
+        for hook in hooks:
+            task = asyncio.create_task(_run_connect_hook(hook, bot))
+            _connect_tasks.add(task)
+            task.add_done_callback(_connect_tasks.discard)
 
 
 def current_owner() -> str | None:
@@ -187,10 +255,32 @@ class PluginHost:
         self.pending_restart: set[str] = set()
         """需要重启才能生效的变更原因"""
         self.classifier = PluginClassifier()
+        self.stopped: dict[str, _Stopped] = {}
+        """热重载失败而停用的插件模块"""
 
     # ------------------------------------------------------------ 查询
     def classification_for(self, module: str) -> dict[str, Any]:
-        """已加载插件的热处理分类，见 PluginClassifier.classification_for"""
+        """插件的热处理分类
+
+        已加载插件见 PluginClassifier.classification_for；热重载失败而停用的插件
+        按当前源码判定，并标记 stopped。
+
+        参数:
+            module: 插件 id 或模块名
+
+        返回:
+            dict[str, Any]: reload_support 与 reload_reasons
+        """
+        if find_plugin(module) is None and (name := self._stopped_module(module)):
+            root = self.stopped[name].root
+            reasons = (
+                self.classifier.source_reasons(name, root, new=False)
+                if root is not None and source_files(root)
+                else {"plugin_source_missing"}
+            )
+            if self._missing(name):
+                reasons.add("dependency_missing")
+            return {**_classification(reasons), "stopped": True}
         return self.classifier.classification_for(module, self.generation)
 
     def classification_for_source(
@@ -207,6 +297,7 @@ class PluginHost:
             "generation": self.generation,
             "pending_restart": bool(self.pending_restart),
             "pending_restart_reasons": sorted(self.pending_restart),
+            "stopped": sorted(_module_name_to_plugin_id(m) for m in self.stopped),
             "last_operation": (
                 self.last_operation.public_dict() if self.last_operation else None
             ),
@@ -306,16 +397,37 @@ class PluginHost:
         Config.forget_import_readers(own.plugin_ids)
         return kept_plugins
 
-    async def _purge(self, module_name: str, root: Path | None, notes: list[str]):
-        """清理加载失败时已产生的部分登记"""
-        prefix = registry.Ownership.build([module_name], [], [])
+    async def _purge(
+        self,
+        module_name: str,
+        root: Path | None,
+        related: list[str],
+        notes: list[str],
+    ):
+        """清理加载失败时已产生的部分登记
+
+        插件导入期间被一并导入的其它未加载插件，其登记会挂在当前插件名下，
+        因此按模块前缀和这些插件应有的 id 一起清理。
+
+        参数:
+            module_name: 模块名
+            root: 插件包目录或模块文件
+            related: 导入前尚未加载、可能被一并导入的其它插件模块
+            notes: 过程记录
+        """
+        names = [module_name, *related]
+        prefix = registry.Ownership.build(names, [], [])
         plugins = [
             p for p in list(_plugins.values()) if prefix.module_owned(p.module_name)
         ]
+        files = [Path(f) for p in plugins if (f := getattr(p.module, "__file__", None))]
         own = registry.Ownership.build(
-            [module_name, *(p.module_name for p in plugins)],
-            [p.id_ for p in plugins],
-            [root] if root else [],
+            [*names, *(p.module_name for p in plugins)],
+            [
+                *(p.id_ for p in plugins),
+                *(_module_name_to_plugin_id(name) for name in names),
+            ],
+            [root, *files] if root else files,
         )
         try:
             await self._teardown(own, plugins, notes)
@@ -326,18 +438,28 @@ class PluginHost:
             )
 
     async def _load(
-        self, module_name: str, root: Path | None, kept: list[str], notes: list[str]
-    ) -> Plugin:
-        """导入插件并执行其初始化与启动钩子，失败时清理已产生的登记
+        self,
+        module_name: str,
+        root: Path | None,
+        kept: list[str],
+        notes: list[str],
+        related: list[str] | None = None,
+    ) -> list[Plugin]:
+        """导入插件并执行其初始化、启动钩子与已连接 Bot 的连接钩子，
+        失败时清理已产生的登记
+
+        导入期间通过 require 等一并加载的其它插件与本插件一同初始化，
+        失败时一同清理。
 
         参数:
             module_name: 模块名
             root: 插件包目录或模块文件
             kept: 需要恢复登记的子插件模块
             notes: 过程记录
+            related: 同批加载的其它插件模块，失败时其中导入前未加载的一并清理
 
         返回:
-            Plugin: 加载后的插件
+            list[Plugin]: 加载后的插件，一并加载的其它插件在后
         """
         from zhenxun.services.lifecycle import lifecycle_kernel
         from zhenxun.services.plugin_init import PluginInitManager
@@ -348,9 +470,25 @@ class PluginHost:
 
         if module_name in sys.modules:
             raise RuntimeError("plugin_module_still_loaded")
+        driver = nonebot.get_driver()
         before = {
             kind: list(registry.lifespan_funcs(kind)) for kind in ("startup", "ready")
         }
+        connect = set(driver._bot_connection_hook)
+        existing = set(_plugins)
+
+        def new_plugins() -> list[Plugin]:
+            return [
+                p
+                for p in list(_plugins.values())
+                if p.id_ not in existing and p.parent_plugin is None
+            ]
+
+        unloaded = [
+            name
+            for name in related or []
+            if name != module_name and name not in sys.modules
+        ]
         _ensure_manager(module_name, root)
         try:
             module = importlib.import_module(module_name)
@@ -359,7 +497,8 @@ class PluginHost:
                 raise RuntimeError("module_not_loaded_as_plugin")
             for name in kept:
                 _restore_kept_plugin(name)
-            own = registry.Ownership.of(plugin)
+            plugins = [plugin, *(p for p in new_plugins() if p is not plugin)]
+            own = registry.Ownership.of(*plugins)
             for key in list(PluginInitManager.plugins):
                 if own.module_owned(key):
                     await PluginInitManager.install(key, raise_on_error=True)
@@ -372,18 +511,27 @@ class PluginHost:
                         raise RuntimeError(
                             f"plugin_initialization_failed:{component_id}"
                         )
-            lifespan = nonebot.get_driver()._lifespan
             for kind in ("startup", "ready"):
                 if funcs := [
                     func
                     for func in registry.lifespan_funcs(kind)
                     if func not in before[kind] and own.owned(func)
                 ]:
-                    await lifespan._run_lifespan_func(funcs)
+                    await driver._lifespan._run_lifespan_func(funcs)
         except BaseException:
-            await self._purge(module_name, root, notes)
+            unloaded.extend(
+                p.module_name for p in new_plugins() if p.module_name != module_name
+            )
+            await self._purge(module_name, root, unloaded, notes)
             raise
-        return plugin
+        if hooks := [
+            hook
+            for hook in driver._bot_connection_hook
+            if hook not in connect and own.owned(hook)
+        ]:
+            _connect_bots(hooks)
+        self.classifier.hosted.update(p.module_name for p in plugins)
+        return plugins
 
     # ------------------------------------------------------------ 提交
     @staticmethod
@@ -447,6 +595,7 @@ class PluginHost:
         changed: list[str],
         reason: str | None = None,
         notes: list[str] | None = None,
+        modules: list[str] | None = None,
     ) -> RuntimeOperation:
         operation = RuntimeOperation(
             mode,
@@ -455,9 +604,74 @@ class PluginHost:
             reason,
             self.generation,
             notes=notes or [],
+            stopped=[
+                _module_name_to_plugin_id(name)
+                for name in modules or []
+                if name in self.stopped
+            ],
         )
         self.last_operation = operation
         return operation
+
+    @staticmethod
+    def _source_error(roots: list[Path | None]) -> str | None:
+        for root in roots:
+            for path in source_files(root) if root else []:
+                try:
+                    compile(path.read_bytes(), str(path), "exec")
+                except (OSError, SyntaxError, ValueError) as error:
+                    return f"plugin_source_invalid:{type(error).__name__}"
+        return None
+
+    async def _load_batch(
+        self,
+        specs: list[tuple[str, Path | None, list[str]]],
+        dependents: dict[str, set[str]],
+        notes: list[str],
+    ) -> tuple[list[Plugin], str | None]:
+        """按顺序加载一批插件，加载失败的插件及依赖它的插件记为停用
+
+        参数:
+            specs: (模块名, 插件包目录或模块文件, 需恢复登记的子插件模块)，
+                被依赖者在前
+            dependents: 模块名到依赖它的模块名
+            notes: 过程记录
+
+        返回:
+            tuple[list[Plugin], str | None]: 加载成功的插件，首个失败原因
+        """
+        modules = [name for name, _, _ in specs]
+        loaded: list[Plugin] = []
+        reason = None
+        causes: dict[str, str] = {}
+        for name, root, kept in specs:
+            if name in causes:
+                self.stopped[name] = _Stopped(root, causes[name], kept)
+                notes.append(f"dependency_failed:{_module_name_to_plugin_id(name)}")
+                logger.warning(
+                    f"插件 {name} 依赖的插件加载失败，跳过加载", _LOG_COMMAND
+                )
+                continue
+            if find_plugin(name) is not None:
+                # 已在前面的插件导入时一并加载
+                self.stopped.pop(name, None)
+                continue
+            try:
+                loaded.extend(await self._load(name, root, kept, notes, modules))
+            except Exception as error:
+                missing = _missing_dependency(error, name)
+                self.stopped[name] = _Stopped(root, name, kept, missing)
+                for other in dependents.get(name, ()):
+                    causes.setdefault(other, name)
+                reason = reason or (
+                    f"plugin_dependency_missing:{missing}"
+                    if missing
+                    else f"plugin_load_failed:{type(error).__name__}"
+                )
+                logger.error(f"插件 {name} 加载失败，已停用", _LOG_COMMAND, e=error)
+            else:
+                self.stopped.pop(name, None)
+        return loaded, reason
 
     async def _reload(self, targets: list[Plugin]) -> RuntimeOperation:
         closure = self.classifier.closure(targets, self.generation)
@@ -465,16 +679,14 @@ class PluginHost:
         if any(self.classifier.reasons(plugin) for plugin in closure):
             return self._finish(ApplyMode.FAILED, ids, "plugin_not_hot_reloadable")
         specs = [(plugin.module_name, plugin_root(plugin)) for plugin in closure]
-        for _, root in specs:
-            for path in source_files(root) if root else []:
-                try:
-                    compile(path.read_bytes(), str(path), "exec")
-                except (OSError, SyntaxError, ValueError) as error:
-                    return self._finish(
-                        ApplyMode.FAILED,
-                        ids,
-                        f"plugin_source_invalid:{type(error).__name__}",
-                    )
+        if error := self._source_error([root for _, root in specs]):
+            return self._finish(ApplyMode.FAILED, ids, error)
+        dependents = {}
+        for plugin in closure:
+            dependent_ids = self.classifier.dependents(plugin, self.generation)
+            dependents[plugin.module_name] = {
+                item.module_name for item in closure if item.id_ in dependent_ids
+            }
         notes: list[str] = []
         kept: dict[str, list[str]] = {}
         for plugin in reversed(closure):
@@ -483,20 +695,119 @@ class PluginHost:
                 [plugin, *registry.iter_sub_plugins(plugin)],
                 notes,
             )
-        loaded: list[Plugin] = []
-        reason = None
-        for module_name, root in specs:
-            try:
-                loaded.append(
-                    await self._load(module_name, root, kept[module_name], notes)
-                )
-            except Exception as error:
-                reason = reason or f"plugin_load_failed:{type(error).__name__}"
-                logger.error(f"插件 {module_name} 重新加载失败", _LOG_COMMAND, e=error)
+        loaded, reason = await self._load_batch(
+            [(name, root, kept[name]) for name, root in specs], dependents, notes
+        )
         await self._commit(loaded, ids, notes)
         if reason:
-            return self._finish(ApplyMode.FAILED, ids, reason, notes)
+            modules = [name for name, _ in specs]
+            return self._finish(ApplyMode.FAILED, ids, reason, notes, modules)
         logger.info(f"插件已热重载: {', '.join(ids)}", _LOG_COMMAND)
+        return self._finish(ApplyMode.HOT_RELOADED, ids, notes=notes)
+
+    def _stopped_module(self, ref: str) -> str | None:
+        if ref in self.stopped:
+            return ref
+        return next(
+            (name for name in self.stopped if _module_name_to_plugin_id(name) == ref),
+            None,
+        )
+
+    def _missing(self, module_name: str) -> str | None:
+        """停用插件仍未安装的第三方依赖"""
+        missing = self.stopped[module_name].missing
+        if not missing:
+            return None
+        importlib.invalidate_caches()
+        return missing if find_spec(missing) is None else None
+
+    async def _restore(
+        self, module_name: str, *, submit_restart: bool
+    ) -> RuntimeOperation:
+        """重新加载热重载失败后停用的插件，以及因它停用的插件
+
+        因它停用的插件之间的依赖关系已无法得知，按原顺序加载，
+        其中一个失败时其后的插件继续保持停用。缺少第三方依赖时，插件声明了
+        依赖文件则请求同步依赖后重启。
+
+        参数:
+            module_name: 模块名
+            submit_restart: 需要重启时是否直接提交给 launcher
+
+        返回:
+            RuntimeOperation: 操作结果
+        """
+        files: set[Path] = set()
+        reasons: set[str] = set()
+        async with runtime_mutation_coordinator.operation("plugin_reload"):
+            if module_name not in self.stopped:
+                if (plugin := find_plugin(module_name)) is None:
+                    return self._finish(
+                        ApplyMode.FAILED, [module_name], "plugin_not_loaded"
+                    )
+                return self._finish(ApplyMode.HOT_RELOADED, [plugin.id_])
+            batch = [module_name]
+            for name, item in list(self.stopped.items()):
+                if item.cause == module_name and name != module_name:
+                    if item.root is not None and source_files(item.root):
+                        batch.append(name)
+                    else:
+                        self.stopped.pop(name)
+            ids = [_module_name_to_plugin_id(name) for name in batch]
+            root = self.stopped[module_name].root
+            if root is None or not source_files(root):
+                self.stopped.pop(module_name)
+                return self._finish(ApplyMode.FAILED, ids, "plugin_source_missing")
+            roots = [self.stopped[name].root for name in batch]
+            if error := self._source_error(roots):
+                return self._finish(ApplyMode.FAILED, ids, error, modules=batch)
+            if missing := self._missing(module_name):
+                files = _dependency_files(root)
+                if not files:
+                    return self._finish(
+                        ApplyMode.FAILED,
+                        ids,
+                        f"plugin_dependency_missing:{missing}",
+                        modules=batch,
+                    )
+            for name, path in zip(batch, roots, strict=True):
+                if path is not None:
+                    reasons |= self.classifier.source_reasons(name, path, new=False)
+            if not files and not reasons:
+                return await self._restore_batch(batch, ids)
+        if files:
+            return await self.request_dependency_restart(
+                files, submit_launcher=submit_restart
+            )
+        return await self.request_restart(
+            set(ids), sorted(reasons)[0], submit_launcher=submit_restart
+        )
+
+    async def _restore_batch(
+        self, batch: list[str], ids: list[str]
+    ) -> RuntimeOperation:
+        """加载停用插件批次并提交，调用方需持有运行时变更锁
+
+        参数:
+            batch: 模块名，被依赖者在前
+            ids: 插件 id
+
+        返回:
+            RuntimeOperation: 操作结果
+        """
+        notes: list[str] = []
+        loaded, reason = await self._load_batch(
+            [
+                (name, self.stopped[name].root, self.stopped[name].kept)
+                for name in batch
+            ],
+            {name: set(batch[index + 1 :]) for index, name in enumerate(batch)},
+            notes,
+        )
+        await self._commit(loaded, [], notes)
+        if reason:
+            return self._finish(ApplyMode.FAILED, ids, reason, notes, batch)
+        logger.info(f"停用的插件已重新加载: {', '.join(ids)}", _LOG_COMMAND)
         return self._finish(ApplyMode.HOT_RELOADED, ids, notes=notes)
 
     # ------------------------------------------------------------ 公开操作
@@ -509,6 +820,8 @@ class PluginHost:
         返回:
             RuntimeOperation: 操作结果
         """
+        if find_plugin(ref) is None and (stopped := self._stopped_module(ref)):
+            return await self._restore(stopped, submit_restart=False)
         async with runtime_mutation_coordinator.operation("plugin_reload"):
             plugin = find_plugin(ref)
             if plugin is None:
@@ -526,6 +839,11 @@ class PluginHost:
         """
         async with runtime_mutation_coordinator.operation("plugin_unload"):
             plugin = find_plugin(ref)
+            if plugin is None and (stopped := self._stopped_module(ref)):
+                self.stopped.pop(stopped)
+                return self._finish(
+                    ApplyMode.HOT_RELOADED, [_module_name_to_plugin_id(stopped)]
+                )
             if plugin is None:
                 return self._finish(ApplyMode.FAILED, [ref], "plugin_not_loaded")
             closure = self.classifier.closure([plugin], self.generation)
@@ -567,6 +885,8 @@ class PluginHost:
         """
         if find_plugin(module_name) is not None:
             return await self.reload_plugin(module_name)
+        if module_name in self.stopped:
+            return await self._restore(module_name, submit_restart=submit_restart)
         root = root.resolve()
         if not source_files(root):
             return self._finish(
@@ -577,8 +897,7 @@ class PluginHost:
         )
         if "dependencies_changed" in reasons:
             return await self.request_dependency_restart(
-                {root / name for name in DEPENDENCY_FILES if (root / name).is_file()},
-                submit_launcher=submit_restart,
+                _dependency_files(root), submit_launcher=submit_restart
             )
         if reasons:
             return await self.request_restart(
@@ -587,20 +906,23 @@ class PluginHost:
         async with runtime_mutation_coordinator.operation("plugin_load"):
             notes: list[str] = []
             try:
-                plugin = await self._load(module_name, root, [], notes)
+                plugins = await self._load(module_name, root, [], notes)
             except Exception as error:
                 logger.error(f"插件 {module_name} 热加载失败", _LOG_COMMAND, e=error)
                 await self._commit([], [], notes)
+                missing = _missing_dependency(error, module_name)
                 return self._finish(
                     ApplyMode.FAILED,
                     [module_name],
-                    f"plugin_import_failed:{type(error).__name__}",
+                    f"plugin_dependency_missing:{missing}"
+                    if missing
+                    else f"plugin_import_failed:{type(error).__name__}",
                     notes,
                 )
-            self.classifier.hosted.add(module_name)
-            await self._commit([plugin], [], notes)
-            logger.info(f"插件已热加载: {plugin.id_}", _LOG_COMMAND)
-            return self._finish(ApplyMode.HOT_RELOADED, [plugin.id_], notes=notes)
+            await self._commit(plugins, [], notes)
+            ids = [plugin.id_ for plugin in plugins]
+            logger.info(f"插件已热加载: {', '.join(ids)}", _LOG_COMMAND)
+            return self._finish(ApplyMode.HOT_RELOADED, ids, notes=notes)
 
     async def recover_plugin(
         self, module: str, *, submit_restart: bool = True
@@ -620,6 +942,8 @@ class PluginHost:
                     {plugin.id_}, sorted(reasons)[0], submit_launcher=submit_restart
                 )
             return await self.reload_plugin(module)
+        if stopped := self._stopped_module(module):
+            return await self._restore(stopped, submit_restart=submit_restart)
         root = Path.cwd() / Path(*module.split("."))
         if not root.is_dir() and root.with_suffix(".py").is_file():
             root = root.with_suffix(".py")

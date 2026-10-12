@@ -11,10 +11,8 @@ from zhenxun.configs.path_config import IMAGE_PATH
 from zhenxun.models.asset_operation import AssetOperation
 from zhenxun.models.friend_user import FriendUser
 from zhenxun.models.goods_info import GoodsInfo
-from zhenxun.models.sign_log import SignLog
 from zhenxun.models.sign_user import SignUser
 from zhenxun.models.user_console import UserConsole
-from zhenxun.services.account_binding import identity_daily_claimed
 from zhenxun.services.asset_transaction import (
     asset_call,
     asset_transaction,
@@ -51,7 +49,7 @@ class SignManage:
     async def rank(
         cls, session: Uninfo, num: int, group_id: str | None = None
     ) -> bytes | str:
-        """好感度排行
+        """好感度排行，只查询前 num 名，自身排名按好感度更高的人数计算
 
         参数:
             session: Uninfo
@@ -59,32 +57,31 @@ class SignManage:
             group_id: 群组id
 
         返回:
-            bytes: 构造图片
+            bytes | str: 构造图片或提示
         """
-        query = SignUser
+        query = SignUser.all()
         own_key = await business_user_id(session)
         if group_id:
             if PlatformUtils.get_platform_scope(session) == "qq_api":
                 try:
-                    user_list = await official_group_business_keys(session)
+                    member_ids = await official_group_business_keys(session)
                 except BusinessIdentityError as error:
                     return str(error)
-                query = query.filter(user_id__in=user_list)
-            elif user_list := await get_group_user_ids(group_id):
-                query = query.filter(user_id__in=user_list)
+            else:
+                member_ids = await get_group_user_ids(group_id)
+            if not member_ids:
+                return "暂无本群成员数据，请稍后再试或使用 '好感度总排行'"
+            query = query.filter(user_id__in=member_ids)
         user_list = (
-            await query.annotate()
-            .order_by("-impression")
+            await query.order_by("-impression", "id")
+            .limit(num)
             .values_list("user_id", "impression", "sign_count", "platform")
         )
         if not user_list:
             return "当前还没有人签到过哦..."
+        own = await query.filter(user_id=own_key).values_list("impression", flat=True)
+        index = await SignUser.impression_rank(own[0], query) if own else "-1（未统计）"
         user_id_list = [user[0] for user in user_list]
-        if own_key in user_id_list:
-            index = user_id_list.index(own_key) + 1
-        else:
-            index = "-1（未统计）"
-        user_list = user_list[:num] if num < len(user_list) else user_list
         column_name = ["排名", "-", "名称", "好感度", "签到次数", "平台"]
         friend_list = await FriendUser.filter(user_id__in=user_id_list).values_list(
             "user_id", "user_name"
@@ -110,7 +107,7 @@ class SignManage:
                     TextCell(content=str(user[1]), bold=True),
                     TextCell(content=str(user[2])),
                     ImageCell(src=platform_path.resolve().as_uri())
-                    if (platform_path := PLATFORM_PATH.get(platform))
+                    if (platform_path := PLATFORM_PATH.get(user[3] or platform))
                     else TextCell(content=""),
                 ]
             )
@@ -162,24 +159,10 @@ class SignManage:
                 .exists()
             ):
                 return (user, session, nickname, -1, user_console.gold, "")
-            new_log = (
-                await SignLog.filter(user_id=user_id)
-                .using_db(current_asset_connection())
-                .order_by("-create_time")
-                .first()
-            )
-            log_time = (
-                new_log.create_time.astimezone(pytz.timezone("Asia/Shanghai")).date()
-                if new_log
-                else None
-            )
-            if (
-                not is_card_view
-                and log_time != now.date()
-                and not await identity_daily_claimed(current_asset_connection())
-            ):
+            card_args = None
+            if not is_card_view:
                 card_args = await cls._handle_sign_in(user, nickname, session)
-            else:
+            if card_args is None:
                 card_args = (user, session, nickname, -1, user_console.gold, "")
             if receipt_id:
                 await AssetOperation.create(
@@ -199,8 +182,8 @@ class SignManage:
         user: SignUser,
         nickname: str,
         session: Uninfo,
-    ) -> tuple:
-        """签到处理
+    ) -> tuple | None:
+        """签到并发放奖励
 
         参数:
             user: SignUser
@@ -208,7 +191,7 @@ class SignManage:
             session: Uninfo
 
         返回:
-            Path: 卡片路径
+            tuple | None: 卡片参数，当天已签到时返回 None
         """
         platform = PlatformUtils.get_platform(session)
         impression_added = (secrets.randbelow(99) + 1) / 100
@@ -217,7 +200,11 @@ class SignManage:
         specify_probability = float(user.specify_probability)
         if rand + add_probability > 0.97 or rand < specify_probability:
             impression_added *= 2
-        user = await SignUser.sign(user, impression_added, session.self_id, platform)
+        user, signed = await SignUser.sign(
+            user, impression_added, session.self_id, platform
+        )
+        if not signed:
+            return None
         gold = random.randint(1, 100)
         gift = random_event(float(user.impression))
         if isinstance(gift, int):

@@ -19,7 +19,7 @@ from zhenxun.services.asset_transaction import (
 )
 from zhenxun.services.buffered_writers import append_user_gold_log
 from zhenxun.services.db_context import Model
-from zhenxun.utils.enum import CacheType, GoldHandle
+from zhenxun.utils.enum import GoldHandle
 from zhenxun.utils.exception import GoodsNotFound, InsufficientGold
 
 
@@ -74,7 +74,6 @@ class GoldReservation:
                     ).update(gold=F("gold") + amount)
                     if not updated:
                         raise ValueError("fee_refund_balance_out_of_range")
-                    await UserConsole.invalidate_user_cache(self.user_id)
                 record.state = action
                 await record.save(
                     update_fields=["state", "update_time"], **asset_db_kwargs()
@@ -113,11 +112,6 @@ class UserConsole(Model):
         table = "user_console"
         table_description = "用户数据表"
         indexes = [("user_id",), ("uid",)]  # noqa: RUF012
-
-    cache_type = CacheType.USERS
-    """缓存类型"""
-    cache_key_field = "user_id"
-    """缓存键字段"""
 
     _uid_counter: ClassVar[int | None] = None
     _uid_lock: ClassVar[asyncio.Lock] = asyncio.Lock()
@@ -215,7 +209,6 @@ class UserConsole(Model):
                 "superuser_set",
                 current_asset_connection(),
             )
-        await cls.invalidate_user_cache(user_id)
 
     @classmethod
     @account_write
@@ -232,14 +225,12 @@ class UserConsole(Model):
         """
         require_positive_amount(gold)
         # account_write has already created and locked this account.
-        # 原子自增,避免并发 read-modify-write 丢币(A2);filter().update()
-        # 不触发基类 save() 的缓存失效,需手动失效。
+        # 原子自增,避免并发 read-modify-write 丢币(A2)。
         updated = await asset_queryset(
             cls.filter(user_id=user_id, gold__lte=2**31 - 1 - gold)
         ).update(gold=F("gold") + gold)
         if not updated:
             raise ValueError("gold_out_of_range")
-        await cls.invalidate_user_cache(user_id)
         await append_user_gold_log(
             user_id=user_id,
             gold=gold,
@@ -281,7 +272,6 @@ class UserConsole(Model):
         ).update(gold=F("gold") - gold)
         if not updated:
             raise InsufficientGold()
-        await cls.invalidate_user_cache(user_id)
         await append_user_gold_log(
             user_id=user_id,
             gold=gold,
@@ -359,7 +349,6 @@ class UserConsole(Model):
                     "platform": platform,
                 },
             )
-            await cls.invalidate_user_cache(user_id)
         return GoldReservation(
             user_id=user_id,
             gold=gold,
@@ -369,12 +358,6 @@ class UserConsole(Model):
             operation_id=operation_id,
             business_identity=current_business_identity(),
         )
-
-    @classmethod
-    async def invalidate_user_cache(cls, user_id: str) -> None:
-        from zhenxun.services.cache import CacheRoot
-
-        await CacheRoot.invalidate_cache(CacheType.USERS, user_id)
 
     @classmethod
     @account_write

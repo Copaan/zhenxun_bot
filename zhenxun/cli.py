@@ -84,8 +84,8 @@ def main() -> None:
     if not args or args[0] == "run":
         import argparse
 
+        from zhenxun.services.launcher.lease import InstanceLease
         from zhenxun.services.launcher.main import run_launcher
-        from zhenxun.services.migration.lease import InstanceLease
         from zhenxun.services.startup_banner import show_startup_banner
 
         project = _ensure_project_root()
@@ -120,10 +120,9 @@ def main() -> None:
                 else:
                     os.environ["ZHENXUN_INSTANCE_LEASE_ID"] = previous
     elif args[0] == "run-worker":
-        from zhenxun.services.migration.errors import MigrationError
-        from zhenxun.services.migration.lease import (
+        from zhenxun.services.launcher.lease import (
             InstanceLease,
-            require_resolved_restore,
+            LeaseError,
             validate_delegation,
         )
         from zhenxun.worker import WorkerReexec, record_process_crash, run_worker
@@ -133,14 +132,8 @@ def main() -> None:
         if launcher:
             identity = os.environ.get("ZHENXUN_INSTANCE_LEASE_ID")
             if not launcher.isdecimal() or not identity:
-                raise MigrationError("migration_launcher_identity_mismatch")
-            validate_delegation(project, int(launcher), identity=identity)
-            if validation_id := os.getenv("ZHENXUN_MIGRATION_VALIDATION_ID"):
-                from zhenxun.services.migration.validation_worker import authorize
-
-                authorize(project, validation_id)
-            else:
-                require_resolved_restore(project)
+                raise LeaseError("launcher_identity_mismatch")
+            validate_delegation(project, int(launcher), identity)
             try:
                 run_worker(project)
             except Exception as error:
@@ -152,7 +145,6 @@ def main() -> None:
             show_startup_banner(role="worker")
             try:
                 with InstanceLease(project, role="worker"):
-                    require_resolved_restore(project)
                     try:
                         run_worker(project)
                     except Exception as error:

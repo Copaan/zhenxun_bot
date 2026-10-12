@@ -96,14 +96,12 @@ def is_allowed_call() -> Rule:
     """是否允许调用插件"""
 
     async def _rule(session: Uninfo) -> bool:
-        from zhenxun.builtin_plugins.hooks.auth.data_provider import (
-            DEFAULT_PERMISSION_DATA_PROVIDER,
-        )
+        from zhenxun.models.ban_console import BanConsole
 
         group_id = session.group.id if session.group else None
-        if await DEFAULT_PERMISSION_DATA_PROVIDER.is_banned_authoritative(
-            session.user.id, group_id
-        ):
+        if group_id and await BanConsole.is_ban(None, group_id):
+            return False
+        if await BanConsole.is_ban(session.user.id, group_id):
             return False
         if group_id:
             if g := await GroupConsole.get_group(group_id):

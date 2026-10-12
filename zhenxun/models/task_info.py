@@ -2,7 +2,8 @@ from typing import ClassVar
 
 from tortoise import fields
 
-from zhenxun.services.cache.runtime_cache import TaskInfoMemoryCache, TaskInfoSnapshot
+from zhenxun.services.cache.runtime_cache import TaskInfoMemoryCache
+from zhenxun.services.cache.runtime_snapshot import TaskInfoSnapshot
 from zhenxun.services.db_context import Model
 
 

@@ -1,30 +1,139 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import time
 from typing import TYPE_CHECKING
 
 from zhenxun.services.cache.cache_containers import CacheDict
 from zhenxun.services.cache.keyed import KeyedLocks
 from zhenxun.services.cache.runtime_cache import (
+    BotMemoryCache,
+    GroupMemoryCache,
+    LevelUserMemoryCache,
+    PluginInfoMemoryCache,
+    PluginLimitMemoryCache,
+)
+from zhenxun.services.cache.runtime_snapshot import (
     BotSnapshot,
     GroupSnapshot,
     LevelUserSnapshot,
 )
+from zhenxun.services.cache.runtime_sync import (
+    RuntimeCacheMutation,
+    RuntimeMemoryCache,
+)
 from zhenxun.services.db_context import with_db_timeout
 from zhenxun.services.log import logger
 from zhenxun.services.message_load import is_db_unhealthy
+from zhenxun.utils.enum import BlockType, PluginType
 
 from .auth.config import LOGGER_COMMAND
 from .auth.context import EventContext
-from .auth.data_provider import (
-    DEFAULT_PERMISSION_DATA_PROVIDER,
-    PermissionDataProvider,
-)
-from .auth_profile import PluginAuthProfile
 
 if TYPE_CHECKING:
     from nonebot.adapters import Bot
+
+    from zhenxun.models.plugin_info import PluginInfo
+
+
+async def require_cache(cache_cls: type[RuntimeMemoryCache]) -> None:
+    """确保运行态缓存已加载且无待对账的发布失败
+
+    参数:
+        cache_cls: 运行态缓存类
+
+    异常:
+        CacheUnavailable: 缓存不可用，消息延后处理
+    """
+    if not cache_cls.is_loaded():
+        await cache_cls.ensure_loaded()
+    RuntimeCacheMutation.require_fresh(cache_cls)
+
+
+async def get_plugin(module: str) -> PluginInfo | None:
+    """从运行态缓存读取插件信息
+
+    参数:
+        module: 插件模块
+
+    返回:
+        PluginInfo | None: 插件信息
+    """
+    await require_cache(PluginInfoMemoryCache)
+    return await PluginInfoMemoryCache.get_by_module(module)
+
+
+@dataclass(frozen=True, slots=True)
+class PluginAuthProfile:
+    module: str
+    name: str
+    hidden: bool = False
+    status: bool = True
+    block_type: BlockType | None = None
+    plugin_type: PluginType | None = None
+    need_admin: bool = False
+    need_group_check: bool = False
+    has_limit: bool = False
+    cost_gold: int = 0
+    admin_level: int = 0
+    limit_superuser: bool = False
+    level: int = 0
+
+    @property
+    def superuser_only(self) -> bool:
+        return self.plugin_type == PluginType.SUPERUSER
+
+
+def _int_attr(plugin, name: str) -> int:
+    try:
+        return int(getattr(plugin, name, 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def build_plugin_auth_profile(plugin, *, has_limit: bool = False) -> PluginAuthProfile:
+    plugin_type = getattr(plugin, "plugin_type", None)
+    admin_level = _int_attr(plugin, "admin_level")
+    block_type = getattr(plugin, "block_type", None)
+    module = str(getattr(plugin, "module", "") or "")
+    need_admin = bool(admin_level > 0) or plugin_type in {
+        PluginType.ADMIN,
+        PluginType.SUPERUSER,
+        PluginType.SUPER_AND_ADMIN,
+    }
+    return PluginAuthProfile(
+        module=module,
+        name=str(getattr(plugin, "name", "") or module),
+        hidden=plugin_type == PluginType.HIDDEN,
+        status=bool(getattr(plugin, "status", True)),
+        block_type=block_type,
+        plugin_type=plugin_type,
+        need_admin=need_admin,
+        need_group_check=block_type
+        in {BlockType.ALL, BlockType.GROUP, BlockType.PRIVATE},
+        has_limit=bool(has_limit),
+        cost_gold=_int_attr(plugin, "cost_gold"),
+        admin_level=admin_level,
+        limit_superuser=bool(getattr(plugin, "limit_superuser", False)),
+        level=int(getattr(plugin, "level", 0) or 0),
+    )
+
+
+async def get_plugin_auth_profile(plugin) -> PluginAuthProfile:
+    """读取插件限制并构建权限配置
+
+    参数:
+        plugin: 插件信息
+
+    返回:
+        PluginAuthProfile: 插件权限配置
+    """
+    await require_cache(PluginLimitMemoryCache)
+    limits = await PluginLimitMemoryCache.get_limits(
+        str(getattr(plugin, "module", "") or "")
+    )
+    return build_plugin_auth_profile(plugin, has_limit=bool(limits))
+
 
 QQ_CLIENT_GROUP_REPAIR_TTL = 60
 _QQ_CLIENT_GROUP_REPAIR_FAILURES = CacheDict[float](
@@ -73,14 +182,12 @@ def _qq_client_group_repair_on_cooldown(key: tuple[str, str]) -> bool:
 
 async def _repair_missing_qq_client_group(
     context: EventContext,
-    *,
-    provider: PermissionDataProvider,
 ) -> GroupSnapshot | None:
     """Persist a minimal OneBot group when startup group sync returned empty."""
     if is_db_unhealthy():
         return None
     key = _qq_client_group_repair_key(context)
-    if key is None or not provider.group_cache_loaded():
+    if key is None or not GroupMemoryCache.is_loaded():
         return None
     group_id, _ = key
     if _qq_client_group_repair_on_cooldown(key):
@@ -96,10 +203,7 @@ async def _repair_missing_qq_client_group(
         async with _QQ_CLIENT_GROUP_REPAIR_LOCKS.hold(key):
             if _qq_client_group_repair_on_cooldown(key):
                 return None
-            existing = provider.get_group_if_ready(
-                group_id,
-                context.channel_id,
-            )
+            existing = GroupMemoryCache.get_if_ready(group_id, context.channel_id)
             if existing is not None:
                 return existing
             defaults = {
@@ -118,8 +222,6 @@ async def _repair_missing_qq_client_group(
                 operation="GroupConsole.get_or_create_root_group",
                 source="auth_snapshot.repair_missing_group",
             )
-        from zhenxun.services.cache.runtime_cache import GroupMemoryCache
-
         await GroupMemoryCache.upsert_from_model(group)
         return GroupSnapshot.from_model(group)
     except Exception as exc:
@@ -143,12 +245,6 @@ class AuthSnapshot:
     admin_levels: tuple[LevelUserSnapshot | None, LevelUserSnapshot | None] | None = (
         None
     )
-    ban_state: bool | None = None
-    user_balance_loaded: bool = False
-    user_balance: int | None = None
-    db_unhealthy: bool = False
-    cache_misses: frozenset[str] = field(default_factory=frozenset)
-    permission_revision: int = -1
 
     @property
     def module(self) -> str:
@@ -170,140 +266,47 @@ class AuthSnapshot:
     def channel_id(self) -> str | None:
         return self.context.channel_id
 
-    @property
-    def has_ban_cache(self) -> bool:
-        return self.ban_state is not None
-
-    @property
-    def cache_ready(self) -> bool:
-        return not self.cache_misses
-
 
 async def build_auth_snapshot(
     *,
     context: EventContext,
     plugin: object,
     profile: PluginAuthProfile,
-    bot: "Bot",
-    skip_ban: bool = False,
-    allow_cache_load: bool = False,
-    provider: PermissionDataProvider = DEFAULT_PERMISSION_DATA_PROVIDER,
+    bot: Bot,
 ) -> AuthSnapshot:
-    from zhenxun.services.permission_revision import current_revision
+    """从运行态缓存读取 Bot、群组、管理员等级，构建权限快照
 
-    event_cache = context.event_cache
+    参数:
+        context: EventContext
+        plugin: 插件信息
+        profile: 插件权限配置
+        bot: Bot
+
+    异常:
+        CacheUnavailable: 缓存不可用，消息延后处理
+
+    返回:
+        AuthSnapshot: 权限快照
+    """
     entity = context.entity
-    cache_misses: set[str] = set()
-    db_unhealthy = is_db_unhealthy()
-    can_load_cache = allow_cache_load and not db_unhealthy
-
-    bot_data: BotSnapshot | None = None
-    if (
-        event_cache is not None
-        and "bot_data" in event_cache
-        and (event_cache.get("bot_cache_ready") or not can_load_cache)
-    ):
-        bot_data = event_cache.get("bot_data")
-    else:
-        storage_bot_id = context.storage_bot_id or str(bot.self_id)
-        bot_data = provider.get_bot_if_ready(storage_bot_id)
-        if bot_data is None:
-            if can_load_cache:
-                bot_data = await provider.get_bot(storage_bot_id)
-            elif not provider.bot_cache_loaded():
-                cache_misses.add("bot")
-        if event_cache is not None:
-            event_cache["bot_data"] = bot_data
-            event_cache["bot_cache_ready"] = provider.bot_cache_loaded()
+    await require_cache(BotMemoryCache)
+    bot_data = await BotMemoryCache.get(context.storage_bot_id or str(bot.self_id))
 
     group = _build_runtime_group_snapshot(context)
-    if group is not None:
-        cache_misses.discard("group")
-        if event_cache is not None:
-            event_cache["group"] = group
-            event_cache["group_cache_ready"] = True
-            event_cache["group_runtime_virtual"] = True
-    elif entity.group_id:
-        if (
-            event_cache is not None
-            and "group" in event_cache
-            and (event_cache.get("group_cache_ready") or not can_load_cache)
-        ):
-            group = event_cache.get("group")
-        else:
-            group = provider.get_group_if_ready(entity.group_id, entity.channel_id)
-            if group is None and can_load_cache:
-                group = await provider.get_group(entity.group_id, entity.channel_id)
-            if group is None and not provider.group_cache_loaded():
-                cache_misses.add("group")
-            if event_cache is not None:
-                event_cache["group"] = group
-                event_cache["group_cache_ready"] = provider.group_cache_loaded()
-        if group is None and not db_unhealthy:
-            group = await _repair_missing_qq_client_group(
-                context,
-                provider=provider,
-            )
-        if group is None and (runtime_group := _build_runtime_group_snapshot(context)):
-            group = runtime_group
-            cache_misses.discard("group")
-            if event_cache is not None:
-                event_cache["group"] = group
-                event_cache["group_cache_ready"] = True
-                event_cache["group_runtime_virtual"] = True
-        elif group is not None:
-            cache_misses.discard("group")
-            if event_cache is not None:
-                event_cache["group"] = group
-                event_cache["group_cache_ready"] = True
+    if group is None and entity.group_id:
+        await require_cache(GroupMemoryCache)
+        group = await GroupMemoryCache.get(entity.group_id, entity.channel_id)
+        if group is None:
+            group = await _repair_missing_qq_client_group(context)
 
-    admin_levels = (None, None) if context.platform_scope == "qq_api" else None
-    if profile.need_admin and context.platform_scope != "qq_api":
-        if (
-            event_cache is not None
-            and "admin_levels" in event_cache
-            and (event_cache.get("admin_cache_ready") or not can_load_cache)
-        ):
-            admin_levels = event_cache.get("admin_levels")
-        else:
-            admin_levels = provider.get_admin_levels_if_ready(
-                entity.user_id,
-                entity.group_id,
-            )
-            if admin_levels is None:
-                if can_load_cache:
-                    admin_levels = await provider.get_admin_levels(
-                        entity.user_id,
-                        entity.group_id,
-                    )
-                else:
-                    cache_misses.add("admin_levels")
-            if event_cache is not None:
-                event_cache["admin_levels"] = admin_levels
-                event_cache["admin_cache_ready"] = provider.admin_cache_loaded()
-
-    ban_state = False if context.platform_scope == "qq_api" else None
-    if not skip_ban and context.platform_scope != "qq_api":
-        if event_cache is not None and "ban_state" in event_cache:
-            ban_state = event_cache.get("ban_state")
-        elif provider.ban_cache_loaded():
-            ban_state = provider.is_banned(entity.user_id, entity.group_id)
-            if event_cache is not None:
-                event_cache["ban_state"] = ban_state
-        elif can_load_cache:
-            await provider.ensure_ban_loaded()
-            if provider.ban_cache_loaded():
-                ban_state = provider.is_banned(entity.user_id, entity.group_id)
-                if event_cache is not None:
-                    event_cache["ban_state"] = ban_state
-            else:
-                # ensure_ban_loaded 会静默失败（DB 降级 / 退避窗口）。此时
-                # is_banned() 返回 False 是"缓存空"而非"未被 ban"，不能落盘成
-                # 硬 False，否则 _check_ban_from_snapshot 会直接短路。留 None
-                # 交给权威路径复核。
-                cache_misses.add("ban")
-        else:
-            cache_misses.add("ban")
+    admin_levels = None
+    if context.platform_scope == "qq_api":
+        admin_levels = (None, None)
+    elif profile.need_admin:
+        await require_cache(LevelUserMemoryCache)
+        admin_levels = await LevelUserMemoryCache.get_levels(
+            entity.user_id, entity.group_id
+        )
 
     return AuthSnapshot(
         context=context,
@@ -312,51 +315,15 @@ async def build_auth_snapshot(
         bot_data=bot_data,
         group=group,
         admin_levels=admin_levels,
-        ban_state=ban_state,
-        db_unhealthy=db_unhealthy,
-        cache_misses=frozenset(cache_misses),
-        permission_revision=current_revision(),
     )
 
 
-async def get_or_build_auth_snapshot(
-    *,
-    context: EventContext,
-    plugin: object,
-    profile: PluginAuthProfile,
-    bot: "Bot",
-    skip_ban: bool = False,
-    allow_cache_load: bool = False,
-    provider: PermissionDataProvider = DEFAULT_PERMISSION_DATA_PROVIDER,
-) -> AuthSnapshot:
-    from zhenxun.services.permission_revision import (
-        current_revision,
-        refresh_event_revision,
-    )
-
-    event_cache = context.event_cache
-    revision = refresh_event_revision(event_cache)
-    module = profile.module
-    if event_cache is not None:
-        snapshot_cache = event_cache.setdefault("auth_snapshots", {})
-        cached = snapshot_cache.get(module)
-        if isinstance(cached, AuthSnapshot):
-            if cached.permission_revision == revision and not (
-                allow_cache_load and cached.cache_misses
-            ):
-                return cached
-    snapshot = await build_auth_snapshot(
-        context=context,
-        plugin=plugin,
-        profile=profile,
-        bot=bot,
-        skip_ban=skip_ban,
-        allow_cache_load=allow_cache_load,
-        provider=provider,
-    )
-    if event_cache is not None and current_revision() == revision:
-        event_cache.setdefault("auth_snapshots", {})[module] = snapshot
-    return snapshot
-
-
-__all__ = ["AuthSnapshot", "build_auth_snapshot", "get_or_build_auth_snapshot"]
+__all__ = [
+    "AuthSnapshot",
+    "PluginAuthProfile",
+    "build_auth_snapshot",
+    "build_plugin_auth_profile",
+    "get_plugin",
+    "get_plugin_auth_profile",
+    "require_cache",
+]

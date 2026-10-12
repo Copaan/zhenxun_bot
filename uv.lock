@@ -4217,6 +4217,7 @@ dependencies = [
     { name = "python-jose", extra = ["cryptography"] },
     { name = "python-multipart" },
     { name = "pyyaml" },
+    { name = "pyzipper" },
     { name = "redis" },
     { name = "requests" },
     { name = "rich" },
@@ -4229,11 +4230,6 @@ dependencies = [
     { name = "urllib3" },
     { name = "uvloop", marker = "sys_platform != 'win32'" },
     { name = "watchfiles" },
-]
-
-[package.optional-dependencies]
-migration = [
-    { name = "pyzipper" },
 ]
 
 [package.dev-dependencies]
@@ -4285,7 +4281,7 @@ requires-dist = [
     { name = "python-jose", extras = ["cryptography"], specifier = ">=3.3.0,<4.0.0" },
     { name = "python-multipart", specifier = ">=0.0.9,<0.1.0" },
     { name = "pyyaml", specifier = ">=6.0" },
-    { name = "pyzipper", marker = "extra == 'migration'", specifier = ">=0.3.6,<0.4" },
+    { name = "pyzipper", specifier = ">=0.3.6,<0.4" },
     { name = "redis", specifier = ">=5" },
     { name = "requests", specifier = ">=2.31" },
     { name = "rich", specifier = ">=13.0" },
@@ -4299,7 +4295,6 @@ requires-dist = [
     { name = "uvloop", marker = "sys_platform != 'win32'", specifier = ">=0.21.0" },
     { name = "watchfiles", specifier = ">=1.1.1,<2.0.0" },
 ]
-provides-extras = ["migration"]
 
 [package.metadata.requires-dev]
 dev = [

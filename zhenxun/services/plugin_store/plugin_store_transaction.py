@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from copy import deepcopy
 from datetime import datetime, timezone
 from hashlib import sha256
@@ -654,6 +654,95 @@ def _fail_pending(code: str) -> None:
         _write_pending(transaction)
 
 
+def _source_changes(
+    source: dict[str, Any],
+) -> tuple[dict[str, list[str] | None], list[Path], list[Path]]:
+    """汇总源码事务对商店插件依赖与源码的变更
+
+    参数:
+        source: 源码插件事务
+
+    返回:
+        tuple: 按 store_key 的依赖声明覆盖，将移除的源码路径，将加入的源码路径
+    """
+    overrides: dict[str, list[str] | None] = {}
+    removed: list[Path] = []
+    added: list[Path] = []
+    for operation in source.get("operations", []):
+        key = str(operation.get("store_key") or "")
+        if operation.get("action") == "uninstall":
+            overrides[key] = None
+        else:
+            inputs = operation.get("dependency_inputs") or []
+            overrides[key] = [str(raw) for raw in inputs]
+            added.append(ROOT / str(operation["operation_id"]) / "new")
+        if operation.get("action") != "install":
+            removed.append(Path(str(operation["live_path"])))
+    return overrides, removed, added
+
+
+def _released_dependencies(
+    target: dict[str, Any],
+    overrides: dict[str, list[str] | None],
+    removed_paths: list[Path],
+    added_paths: list[Path],
+) -> tuple[list[str], list[dict[str, Any]]]:
+    """计算商店插件依赖变化后可释放的包，分析失败时不释放
+
+    参数:
+        target: 依赖层清单
+        overrides: 按 store_key 的依赖声明覆盖
+        removed_paths: 将移除的源码路径
+        added_paths: 将加入的源码路径
+
+    返回:
+        tuple[list[str], list[dict[str, Any]]]: 可释放的包，因仍被导入而保留的包
+    """
+    from zhenxun.services.nonebot_store.dependencies import DependencyAnalysisError
+    from zhenxun.services.nonebot_store.environment import released_packages
+    from zhenxun.services.plugin_store.plugin_store_receipts import (
+        receipt_dependency_inputs,
+    )
+
+    before = receipt_dependency_inputs()
+    if not any(key in before for key in overrides):
+        return [], []
+    try:
+        return released_packages(
+            target,
+            target,
+            sources_before=before,
+            sources_after=receipt_dependency_inputs(overrides),
+            removed_paths=removed_paths,
+            added_paths=added_paths,
+        )
+    except (DependencyAnalysisError, OSError, KeyError, TypeError):
+        return [], []
+
+
+def release_source_dependencies(
+    overrides: dict[str, list[str] | None], removed_paths: list[Path] | None = None
+) -> list[str]:
+    """商店插件热更新或热卸载后，将不再需要的依赖登记到待应用的依赖层事务
+
+    依赖层在下次重启时重建，不会主动请求重启；分析失败或已有事务不可修改时跳过。
+
+    参数:
+        overrides: 按 store_key 的依赖声明覆盖，None 表示移除
+        removed_paths: 已移除的源码路径
+
+    返回:
+        list[str]: 登记释放的包
+    """
+    with suppress(Exception):
+        transaction = _merge_dependency_transaction(
+            {}, overrides, removed_paths or [], [], source=None, wheels_only=False
+        )
+        if isinstance(transaction, dict):
+            return list(transaction.get("released_packages") or [])
+    return []
+
+
 def prepare_dependency_transaction() -> bool:
     """Merge source-store dependency changes into the managed generation."""
     source = pending_transaction()
@@ -665,12 +754,56 @@ def prepare_dependency_transaction() -> bool:
         _fail_pending(error.code)
         return False
     packages = dependency_packages()
-    if not packages:
-        return True
+    layer_packages: dict[str, str] = {}
+    if packages:
+        from zhenxun.services.nonebot_store.dependencies import protected_core
 
-    from packaging.utils import canonicalize_name
+        core = protected_core()
+        for raw_name, version in packages.items():
+            name = canonicalize_name(raw_name)
+            if name in core:
+                if core[name] != version:
+                    _fail_pending("core_dependency_conflict")
+                    return False
+                continue
+            layer_packages[name] = version
+    overrides, removed_paths, added_paths = _source_changes(source)
+    result = _merge_dependency_transaction(
+        layer_packages,
+        overrides,
+        removed_paths,
+        added_paths,
+        source=source,
+        wheels_only=wheels_only,
+    )
+    if isinstance(result, str):
+        _fail_pending(result)
+        return False
+    return True
 
-    from zhenxun.services.nonebot_store.dependencies import protected_core
+
+def _merge_dependency_transaction(
+    layer_packages: dict[str, str],
+    overrides: dict[str, list[str] | None],
+    removed_paths: list[Path],
+    added_paths: list[Path],
+    *,
+    source: dict[str, Any] | None,
+    wheels_only: bool,
+) -> dict[str, Any] | str | None:
+    """把商店插件的新增依赖与可释放依赖合并进 NoneBot 依赖层事务
+
+    参数:
+        layer_packages: 需要写入依赖层的包版本
+        overrides: 按 store_key 的依赖声明覆盖
+        removed_paths: 将移除的源码路径
+        added_paths: 将加入的源码路径
+        source: 源码插件事务
+        wheels_only: 是否只允许 wheel
+
+    返回:
+        dict[str, Any] | str | None: 写入的事务，失败时为错误码，无变化时为 None
+    """
     from zhenxun.services.nonebot_store.storage import (
         load_manifest,
         save_pending_transaction,
@@ -680,23 +813,17 @@ def prepare_dependency_transaction() -> bool:
         pending_transaction as nonebot_pending,
     )
 
-    core = protected_core()
-    layer_packages: dict[str, str] = {}
-    for raw_name, version in packages.items():
-        name = canonicalize_name(raw_name)
-        if name in core:
-            if core[name] != version:
-                _fail_pending("core_dependency_conflict")
-                return False
-            continue
-        layer_packages[name] = version
-
     current = nonebot_pending()
     if current and current.get("state") != "pending_restart":
-        _fail_pending("cross_store_transaction_not_mutable")
-        return False
+        return "cross_store_transaction_not_mutable" if layer_packages else None
     base = deepcopy(current.get("base_manifest") if current else load_manifest())
-    target = deepcopy(current.get("target_manifest") if current else base)
+    target = deepcopy(current.get("target_manifest") if current else base) or {}
+    released, retained = _released_dependencies(
+        target, overrides, removed_paths, added_paths
+    )
+    released = [name for name in released if name not in layer_packages]
+    if not layer_packages and not released:
+        return None
     target_packages = target.setdefault("packages", {})
     base_packages = base.get("packages", {})
     for name, version in layer_packages.items():
@@ -713,21 +840,21 @@ def prepare_dependency_transaction() -> bool:
             and existing_version != version
             and existing_version != base_version
         ):
-            _fail_pending("cross_store_dependency_conflict")
-            return False
+            return "cross_store_dependency_conflict"
         target_packages[name] = {"version": version}
+    for name in released:
+        target_packages.pop(name, None)
 
+    source_build_confirmed = any(
+        operation.get("source_build_confirmed")
+        for operation in (source or {}).get("operations", [])
+    )
     if current:
         transaction = deepcopy(current)
         transaction["target_manifest"] = target
         transaction["source_build_confirmed"] = bool(
-            transaction.get("source_build_confirmed")
-            or any(
-                operation.get("source_build_confirmed")
-                for operation in source.get("operations", [])
-            )
+            transaction.get("source_build_confirmed") or source_build_confirmed
         )
-        transaction["source_transaction_revision"] = source.get("revision")
         transaction["updated_at"] = utc_now()
     else:
         transaction = {
@@ -736,18 +863,21 @@ def prepare_dependency_transaction() -> bool:
             "base_manifest": base,
             "operations": [],
             "target_manifest": target,
-            "source_build_confirmed": any(
-                operation.get("source_build_confirmed")
-                for operation in source.get("operations", [])
-            ),
+            "source_build_confirmed": source_build_confirmed,
             "database_migration_confirmed": False,
             "database_migration_possible": False,
             "database_type": "none",
             "state": "pending_restart",
             "created_at": utc_now(),
             "updated_at": utc_now(),
-            "source_transaction_revision": source.get("revision"),
         }
+    if source is not None:
+        transaction["source_transaction_revision"] = source.get("revision")
+    transaction["released_packages"] = sorted(
+        set(transaction.get("released_packages") or []) | set(released)
+    )
+    if retained:
+        transaction["retained_imports"] = retained
     if wheels_only:
         transaction["archive_wheels_only"] = True
     else:
@@ -755,9 +885,8 @@ def prepare_dependency_transaction() -> bool:
     try:
         save_pending_transaction(transaction)
     except (ArchiveSourceBuildConflict, ArchiveDependencyConflict) as error:
-        _fail_pending(error.code)
-        return False
-    return True
+        return error.code
+    return transaction
 
 
 def apply_pending_transaction() -> bool:
@@ -912,6 +1041,7 @@ __all__ = [
     "preflight_archive_dependency_policy",
     "prepare_dependency_transaction",
     "public_transaction",
+    "release_source_dependencies",
     "rollback_pending_transaction",
     "stage_operation",
     "startup_verification",

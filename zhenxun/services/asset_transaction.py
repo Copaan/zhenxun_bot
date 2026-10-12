@@ -46,6 +46,10 @@ def locked_asset_keys() -> frozenset[str]:
 @asynccontextmanager
 async def asset_transactions(user_ids, platform: str | None = None):
     from zhenxun.models.user_console import UserConsole
+    from zhenxun.services.business_identity import (
+        current_business_identity,
+        validate_business_write,
+    )
 
     identities = sorted(set(map(str, user_ids)))
     active = _scope.get()
@@ -57,11 +61,11 @@ async def asset_transactions(user_ids, platform: str | None = None):
             raise RuntimeError("asset_transaction_account_not_locked")
         yield {identity: active.users[identity] for identity in identities}
         return
+    business = current_business_identity()
     for identity in identities:
-        await UserConsole._get_user_for_write(identity, platform)
+        if business is None or identity != business.storage_key:
+            await UserConsole._get_user_for_write(identity, platform)
     async with in_transaction() as connection:
-        from zhenxun.services.business_identity import validate_business_write
-
         await validate_business_write(identities, connection)
         users = {}
         for identity in identities:

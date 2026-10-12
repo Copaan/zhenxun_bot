@@ -11,7 +11,6 @@ import nonebot
 
 from zhenxun.services.lifecycle import ComponentSpec, LifecycleError, lifecycle_kernel
 from zhenxun.services.log import logger
-from zhenxun.services.migration.mutation import migration_startup_scope
 from zhenxun.services.startup import StartupStage, startup_coordinator
 from zhenxun.utils.enum import PriorityLifecycleType
 from zhenxun.utils.exception import HookPriorityException
@@ -395,7 +394,6 @@ async def _run_stage(
 _post_management_task: asyncio.Task[None] | None = None
 
 
-@migration_startup_scope
 async def _run_post_management() -> None:
     await startup_coordinator.wait_server_bound()
     startup_coordinator.begin_stage("runtime")
@@ -434,7 +432,6 @@ async def _run_post_management() -> None:
 
 
 @driver.on_startup
-@migration_startup_scope
 async def _start_application_lifecycle() -> None:
     global _post_management_task
     from zhenxun.services.runtime_mutation import runtime_mutation_coordinator
@@ -452,7 +449,7 @@ async def _start_application_lifecycle() -> None:
     try:
         await _run_stage(
             "management",
-            excluded_components={"management:database"}
+            excluded_components={"management:database", "management:restore-import"}
             if setup_required or store_recovery
             else None,
         )

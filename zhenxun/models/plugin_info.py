@@ -5,7 +5,7 @@ from tortoise import fields
 from zhenxun.models.plugin_limit import PluginLimit  # noqa: F401
 from zhenxun.services.cache.runtime_cache import PluginInfoMemoryCache
 from zhenxun.services.db_context import Model
-from zhenxun.utils.enum import BlockType, CacheType, PluginType
+from zhenxun.utils.enum import BlockType, PluginType
 
 
 class PluginInfo(Model):
@@ -65,11 +65,6 @@ class PluginInfo(Model):
         table = "plugin_info"
         table_description = "插件基本信息"
         indexes: ClassVar = [("module",), ("module_path",)]
-
-    cache_type = CacheType.PLUGINS
-    """缓存类型"""
-    cache_key_field = "module"
-    """缓存键字段"""
 
     @classmethod
     async def create(cls, *args, **kwargs):

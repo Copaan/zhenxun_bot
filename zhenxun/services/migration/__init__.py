@@ -1,5 +1,1 @@
-"""Instance migration primitives, independent of the running Bot application."""
-
-from .errors import MigrationError
-
-__all__ = ["MigrationError"]
+"""备份导出、从备份恢复与切换数据库"""

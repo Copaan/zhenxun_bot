@@ -14,8 +14,12 @@ from tortoise.functions import Count
 
 from zhenxun.services.cache.bounded_ttl import BoundedTTLCache
 from zhenxun.services.cache.keyed import KeyedLocks
-from zhenxun.services.cache.write import CacheUnavailable, in_write_transaction
 from zhenxun.services.db_context import with_db_timeout
+from zhenxun.services.db_context.write import (
+    CacheUnavailable,
+    in_write_transaction,
+    on_publication_failed,
+)
 from zhenxun.services.message_load import is_db_unhealthy
 
 _revision = 0
@@ -530,8 +534,11 @@ async def invalidate_group_members(
         await _GROUP_MEMBER_BY_ID_CACHE.delete(f"{group_key}:{user_id}")
 
 
-def mark_members_stale() -> None:
+@on_publication_failed
+def _mark_members_stale(key: tuple | None) -> None:
     global _revision
+    if not key or key[:2] != ("bulk", "group_info_users"):
+        return
     _revision += 1
     _DISPLAY_NAME_CACHE._publication_failed = True
     for cache in (

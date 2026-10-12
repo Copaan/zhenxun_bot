@@ -5,8 +5,8 @@ from nonebot_plugin_alconna import At
 from nonebot_plugin_uninfo import Uninfo
 
 from zhenxun.configs.config import Config
-from zhenxun.models.ban_console import BanConsole
 from zhenxun.models.plugin_info import PluginInfo
+from zhenxun.services.cache.runtime_cache import BanMemoryCache
 from zhenxun.services.db_context import DB_TIMEOUT_SECONDS
 from zhenxun.services.log import logger
 from zhenxun.utils.enum import PluginType
@@ -14,7 +14,6 @@ from zhenxun.utils.utils import EntityIDs, get_entity_ids
 
 from .config import LOGGER_COMMAND, WARNING_THRESHOLD
 from .context import PermissionContext
-from .data_provider import DEFAULT_PERMISSION_DATA_PROVIDER
 from .exception import SkipPluginException
 from .utils import freq
 
@@ -26,29 +25,6 @@ Config.add_plugin_config(
 )
 
 
-async def calculate_ban_time(ban_record: BanConsole | None) -> int:
-    """根据ban记录计算剩余ban时间
-
-    参数:
-        ban_record: BanConsole记录
-
-    返回:
-        int: ban剩余时长，-1时为永久ban，0表示未被ban
-    """
-    if not ban_record:
-        return 0
-
-    if ban_record.duration == -1:
-        return -1
-
-    _time = time.time() - (ban_record.ban_time + ban_record.duration)
-    if _time < 0:
-        return int(abs(_time))
-    # 过期记录的清理由 BanMemoryCache.cleanup_expired 后台任务负责，
-    # 权限读路径不落写操作。
-    return 0
-
-
 async def is_ban(user_id: str | None, group_id: str | None) -> int:
     """检查用户或群组是否被ban
 
@@ -56,17 +32,17 @@ async def is_ban(user_id: str | None, group_id: str | None) -> int:
         user_id: 用户ID
         group_id: 群组ID
 
+    异常:
+        CacheUnavailable: ban 缓存不可用，消息延后处理
+
     返回:
         int: ban剩余时长，-1时为永久ban，0表示未被ban
     """
     if not user_id and not group_id:
         return 0
-    provider = DEFAULT_PERMISSION_DATA_PROVIDER
-    if provider.ban_cache_loaded():
-        return provider.get_ban_remaining_time(user_id, group_id)
-    # 缓存未就绪时走模型层：它会补加载，失败则读库。这里直接返回 0 等于
-    # 把一次缓存故障变成全员解封。
-    return await BanConsole.check_ban_time(user_id, group_id)
+    if not BanMemoryCache.is_loaded():
+        await BanMemoryCache.ensure_loaded()
+    return BanMemoryCache.remaining_time(user_id, group_id)
 
 
 def check_plugin_type(matcher: Matcher) -> bool:

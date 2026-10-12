@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from functools import wraps
@@ -66,6 +66,22 @@ def _decode_modules(value: str | None) -> list[str]:
     return _normalize_modules(BotConsole.convert_module_format(value or ""))
 
 
+def _module_set(obj: Any, name: str) -> Collection[str]:
+    """读取模块列表字段，运行态快照优先使用预解析的集合
+
+    参数:
+        obj: 模型或运行态快照
+        name: 字段名
+
+    返回:
+        Collection[str]: 模块集合
+    """
+    parsed = getattr(obj, f"{name}_set", None)
+    if parsed is not None:
+        return parsed
+    return _decode_modules(getattr(obj, name, ""))
+
+
 def _encode_modules(values: Iterable[str]) -> str:
     return str(BotConsole.convert_module_format(_normalize_modules(values)))
 
@@ -79,7 +95,10 @@ def _revision(payload: dict[str, Any]) -> str:
 
 @asynccontextmanager
 async def policy_transaction():
-    from zhenxun.services.cache.write import current_connection, in_write_transaction
+    from zhenxun.services.db_context.write import (
+        current_connection,
+        in_write_transaction,
+    )
 
     if in_write_transaction():
         connection = current_connection()
@@ -145,9 +164,7 @@ class PluginPolicyService:
         )
         if not getattr(profile, "load_status", True):
             return "not_loaded"
-        if bot is not None and module in _decode_modules(
-            getattr(bot, f"block_{kind}", "")
-        ):
+        if bot is not None and module in _module_set(bot, f"block_{kind}"):
             return "account_disabled"
         scope = platform_scope if group_id else "private"
         scene = group_id or scoped.PRIVATE_KEY
@@ -180,21 +197,17 @@ class PluginPolicyService:
             bot_id, platform_scope, group_id, channel_id
         ):
             suffix = "task" if task else "plugin"
-            if module in _decode_modules(
-                getattr(group, f"superuser_block_{suffix}", "")
-            ):
+            if module in _module_set(group, f"superuser_block_{suffix}"):
                 return "administrator_disabled"
-            if module in _decode_modules(getattr(group, f"block_{suffix}", "")):
+            if module in _module_set(group, f"block_{suffix}"):
                 return "group_disabled"
         return None
 
     @staticmethod
     def global_switch_values():
-        from zhenxun.services.cache.runtime_cache import (
-            PluginInfoMemoryCache,
-            RuntimeCacheMutation,
-        )
-        from zhenxun.services.cache.write import CacheUnavailable
+        from zhenxun.services.cache.runtime_cache import PluginInfoMemoryCache
+        from zhenxun.services.cache.runtime_sync import RuntimeCacheMutation
+        from zhenxun.services.db_context.write import CacheUnavailable
 
         try:
             RuntimeCacheMutation.require_fresh(PluginInfoMemoryCache)
@@ -673,7 +686,7 @@ class PluginPolicyService:
             await BotConsole.filter(id=bot.id).using_db(connection).update(**defaults)
 
     async def _publish_accounts(self, bot_ids: Iterable[str]) -> None:
-        from zhenxun.services.cache.write import defer, require_publication
+        from zhenxun.services.db_context.write import defer, require_publication
 
         for bot in await BotConsole.filter(bot_id__in=list(set(bot_ids))):
 

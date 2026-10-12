@@ -39,9 +39,6 @@ class MessageExecutionDeferred(RuntimeError):
 
 
 def defer_execution(reason: str) -> None:
-    from .cache.diagnostics import record_availability_fallback
-
-    record_availability_fallback("permission_deferred")
     execution = current_execution.get()
     if execution is not None and execution.deferred_reason is None:
         execution.deferred_reason = reason

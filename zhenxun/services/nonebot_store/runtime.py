@@ -178,7 +178,7 @@ def _scan_native_extensions(root: Path) -> list[str]:
     ]
 
 
-def _layer_digest(root: Path) -> str:
+def layer_digest(root: Path) -> str:
     digest = sha256()
     for path in sorted(item for item in root.rglob("*") if item.is_file()):
         if path.suffix == ".pyc":
@@ -231,6 +231,27 @@ def _package_runtime_details(
             "runtime_role": "python_dependency",
         }
     return details
+
+
+def generation_packages(root: Path) -> dict[str, dict[str, Any]]:
+    """读取依赖层中实际安装的包，生成清单中的包记录
+
+    参数:
+        root: 依赖层目录
+
+    返回:
+        dict[str, dict[str, Any]]: 规范化包名到包记录的映射
+    """
+    from importlib import metadata
+
+    packages: dict[str, dict[str, Any]] = {
+        canonicalize_name(dist.metadata["Name"]): {"version": dist.version}
+        for dist in metadata.distributions(path=[str(root)])
+        if dist.metadata["Name"]
+    }
+    for name, detail in _package_runtime_details(root, packages).items():
+        packages[name].update(detail)
+    return dict(sorted(packages.items()))
 
 
 def build_generation(
@@ -491,7 +512,7 @@ def _build_generation(
         (staging / ".zhenxun-generation.json").write_text(
             json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
         )
-        digest = _layer_digest(staging)
+        digest = layer_digest(staging)
         staging.replace(final_path)
     return {
         "generation": generation,
@@ -507,7 +528,7 @@ def _validate_archive_generation(
     from .environment import validate_candidate
 
     path = generation_path(int(build["generation"]))
-    if _layer_digest(path) != build.get("digest"):
+    if layer_digest(path) != build.get("digest"):
         raise LayerBuildError("dependency_layer_state_mismatch")
     validate_candidate(path, transaction)
     if not transaction.get("archive_wheels_only"):
@@ -523,7 +544,7 @@ def _validate_archive_generation(
     if (
         not isinstance(metadata, dict)
         or metadata.get("packages") != expected
-        or _layer_digest(path) != build.get("digest")
+        or layer_digest(path) != build.get("digest")
     ):
         raise LayerBuildError("archive_dependency_conflict")
 
@@ -860,7 +881,7 @@ def startup_verification() -> tuple[bool, dict[str, Any]]:
         transaction = read_json(PENDING_FILE, {})
         if isinstance(expected, int):
             transaction = {**transaction, "target_manifest": manifest}
-            if _layer_digest(generation_path(expected)) != manifest.get(
+            if layer_digest(generation_path(expected)) != manifest.get(
                 "generation_digest"
             ):
                 raise DependencyAnalysisError("dependency_layer_state_mismatch")

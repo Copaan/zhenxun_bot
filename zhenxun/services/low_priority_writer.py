@@ -49,7 +49,6 @@ _WRITERS: dict[str, _WriterState] = {}
 _WORKER_TASK: asyncio.Task[None] | None = None
 _WAKE_EVENT: asyncio.Event | None = None
 _FLUSH_LOCK = asyncio.Lock()
-_ACTIVE_FLUSHES = 0
 _STOPPING = False
 _LIFECYCLE_ACTIVE = False
 _LIFECYCLE_CONTEXT: Any | None = None
@@ -263,12 +262,7 @@ async def _write_batch(
     batch: list[Any],
     reason: str,
 ) -> None:
-    global _ACTIVE_FLUSHES
-    _ACTIVE_FLUSHES += 1
-    try:
-        await state.config.write_batch(batch, reason)
-    finally:
-        _ACTIVE_FLUSHES = max(_ACTIVE_FLUSHES - 1, 0)
+    await state.config.write_batch(batch, reason)
 
 
 def _mark_failure(state: _WriterState, reason: str, exc: Exception) -> None:
@@ -309,10 +303,6 @@ def _mark_uncertain_timeout(
         state.config.log_command,
         e=log_exc,
     )
-
-
-def low_priority_writer_active_count() -> int:
-    return _ACTIVE_FLUSHES
 
 
 def low_priority_writer_backlog() -> dict[str, int]:

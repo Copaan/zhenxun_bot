@@ -11,7 +11,6 @@ from ruamel.yaml import YAML
 from ruamel.yaml.scanner import ScannerError
 
 from zhenxun.configs.path_config import DATA_PATH
-from zhenxun.services.permission_revision import advance_revision
 from zhenxun.utils.pydantic_compat import (
     _dump_pydantic_obj,
     _is_pydantic_type,
@@ -475,7 +474,6 @@ class ConfigsManager:
             else:
                 self.add_plugin_config(module, key, value)
             self._simple_data[module][key] = value
-            advance_revision()
             if auto_save:
                 self.save(save_simple_data=True)
 
@@ -620,7 +618,6 @@ class ConfigsManager:
         if not self._load_simple_data(raise_on_error=strict):
             return
         self._apply_simple_data(warn_unknown=True)
-        advance_revision()
         self.save()
 
     def load_data(self):

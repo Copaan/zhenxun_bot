@@ -5,20 +5,8 @@
 # 日志标识
 LOG_COMMAND = "CacheRoot"
 
-# 缓存获取超时时间（秒）
-CACHE_TIMEOUT = 10
-
-# 默认缓存过期时间（秒）
-DEFAULT_EXPIRE = 600
-
 # 缓存键前缀
 CACHE_KEY_PREFIX = "ZHENXUN"
-
-# 缓存键分隔符
-CACHE_KEY_SEPARATOR = ":"
-
-# 复合键分隔符（用于分隔tuple类型的cache_key_field）
-COMPOSITE_KEY_SEPARATOR = "_"
 
 
 # 缓存模式
@@ -37,10 +25,3 @@ def normalize_cache_mode(value: str | None) -> str:
     if mode not in {CacheMode.NONE, CacheMode.MEMORY, CacheMode.REDIS}:
         raise ValueError("CACHE_MODE must be NONE, MEMORY or REDIS")
     return mode
-
-
-SPECIAL_KEY_FORMATS = {
-    "LEVEL": "{user_id}" + COMPOSITE_KEY_SEPARATOR + "{group_id}",
-    "BAN": "{user_id}" + COMPOSITE_KEY_SEPARATOR + "{group_id}",
-    "GROUPS": "{group_id}" + COMPOSITE_KEY_SEPARATOR + "{channel_id}",
-}

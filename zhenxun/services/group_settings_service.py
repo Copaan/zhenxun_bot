@@ -14,8 +14,13 @@ from zhenxun.configs.config import Config
 from zhenxun.models.group_plugin_setting import GroupPluginSetting
 from zhenxun.services.cache import BoundedTTLCache
 from zhenxun.services.cache.keyed import KeyedLocks
-from zhenxun.services.cache.write import CacheUnavailable, defer, in_write_transaction
 from zhenxun.services.db_context import with_db_timeout
+from zhenxun.services.db_context.write import (
+    CacheUnavailable,
+    defer,
+    in_write_transaction,
+    on_publication_failed,
+)
 from zhenxun.services.log import logger
 from zhenxun.utils.pydantic_compat import model_dump, parse_as
 
@@ -560,3 +565,12 @@ class GroupSettingsService:
 
 
 group_settings_service = GroupSettingsService()
+
+
+@on_publication_failed
+def _mark_settings_stale(key: tuple | None) -> None:
+    if key and (
+        key[0] in {"group_settings", "group_settings_all"}
+        or key[:2] == ("bulk", "group_plugin_settings")
+    ):
+        group_settings_service.mark_stale()

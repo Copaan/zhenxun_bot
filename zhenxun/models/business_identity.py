@@ -36,6 +36,10 @@ class BusinessIdentityLink(Model):
             ("domain", "app_id", "scene", "group_scope"),
         )
 
+    @classmethod
+    def _run_script(cls):
+        return ["DROP TABLE IF EXISTS business_event_accounts"]
+
 
 class AccountBindingRequest(Model):
     id = fields.CharField(64, pk=True)
@@ -73,25 +77,6 @@ class AccountBindingChange(Model):
 
     class Meta:
         table = "account_binding_changes"
-        indexes = (("identity_id", "created_at"),)
-
-
-class BusinessEventAccount(Model):
-    """Pin the account before the first business operation, including after restart."""
-
-    id = fields.CharField(64, pk=True)
-    event_id = fields.CharField(64, index=True)
-    identity = fields.ForeignKeyField(
-        "models.BusinessIdentityLink", related_name="events", on_delete=fields.RESTRICT
-    )
-    account = fields.ForeignKeyField(
-        "models.UserConsole", related_name="business_events", on_delete=fields.RESTRICT
-    )
-    revision = fields.IntField()
-    created_at = fields.DatetimeField(auto_now_add=True)
-
-    class Meta:
-        table = "business_event_accounts"
         indexes = (("identity_id", "created_at"),)
 
 

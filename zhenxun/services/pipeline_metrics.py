@@ -18,14 +18,6 @@ STAGES = (
     "reply_wait_ms",
     "background_delivery_wait_ms",
     "event_loop_lag_ms",
-    "queue_wait_ms",
-    "connection_wait_ms",
-    "lock_wait_ms",
-    "execution_ms",
-    "database_operation_ms",
-    "transaction_enter_ms",
-    "commit_ms",
-    "rollback_ms",
 )
 BUCKETS_MS = (1, 5, 10, 25, 50, 100, 250, 500, 1000, 5000, 30000)
 

@@ -1,7 +1,8 @@
 from typing_extensions import Self
 
 from tortoise import fields
-from tortoise.expressions import Q
+from tortoise.expressions import Q, RawSQL
+from tortoise.queryset import QuerySet
 
 from zhenxun.services.asset_transaction import (
     asset_call,
@@ -66,6 +67,28 @@ class SignUser(Model):
         return user
 
     @classmethod
+    async def impression_rank(
+        cls, impression, query: QuerySet["SignUser"] | None = None
+    ) -> int:
+        """好感度排名，按好感度更高的人数计算
+
+        参数:
+            impression: 好感度
+            query: 排名范围，默认全部用户
+
+        返回:
+            int: 排名
+        """
+        query = cls.all() if query is None else query
+        if cls._meta.db.capabilities.dialect == "sqlite":
+            query = query.annotate(
+                score=RawSQL('CAST("impression" AS NUMERIC)')
+            ).filter(score__gt=float(impression))
+        else:
+            query = query.filter(impression__gt=impression)
+        return await query.count() + 1
+
+    @classmethod
     @asset_call
     async def sign(
         cls,
@@ -73,15 +96,23 @@ class SignUser(Model):
         impression: float,
         bot_id: str | None = None,
         platform: str | None = None,
-    ) -> Self:
-        """签到
+    ) -> tuple["SignUser", bool]:
+        """签到，当天已签到时不重复记录
 
         参数:
-            user_id: 用户id
+            user_id: 用户id，或调用方已在当前资产事务中取得的 SignUser
             impression: 好感度
             bot_id: bot Id
             platform: 平台
+
+        返回:
+            tuple[SignUser, bool]: 签到用户，本次是否签到成功
         """
+        locked = (
+            user_id
+            if isinstance(user_id, SignUser) and current_asset_connection()
+            else None
+        )
         identity = user_id.user_id if isinstance(user_id, SignUser) else user_id
         async with asset_transaction(identity, platform):
             from datetime import datetime
@@ -98,7 +129,7 @@ class SignUser(Model):
 
             today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
             key = sha256(f"daily-sign:{identity}:{today}".encode()).hexdigest()
-            user = await cls.get_user(identity, platform)
+            user = locked or await cls.get_user(identity, platform)
             connection = current_asset_connection()
             previous_query = SignLog.filter(user_id=identity).order_by("-create_time")
             operation_filter = Q(id=key)
@@ -112,17 +143,17 @@ class SignUser(Model):
                 operation_query = operation_query.using_db(connection)
             previous = await previous_query.first()
             if (
-                (await identity_daily_claimed(connection))
-                or (await operation_query.exists())
-                or (
+                (
                     previous
                     and previous.create_time.astimezone(
                         ZoneInfo("Asia/Shanghai")
                     ).date()
                     == today
                 )
+                or (await identity_daily_claimed(connection))
+                or (await operation_query.exists())
             ):
-                return user
+                return user, False
             user.impression = float(user.impression) + impression
             user.add_probability = 0
             user.specify_probability = 0
@@ -147,4 +178,4 @@ class SignUser(Model):
                 payload={"date": str(today)},
             )
             await record_identity_daily_claim(connection)
-            return user
+            return user, True

@@ -1,6 +1,16 @@
 from nonebot.permission import SUPERUSER
 from nonebot.plugin import PluginMetadata
-from nonebot_plugin_alconna import Alconna, Args, Match, Option, Subcommand, on_alconna
+from nonebot_plugin_alconna import (
+    Alconna,
+    AlconnaQuery,
+    Args,
+    Match,
+    Option,
+    Query,
+    Subcommand,
+    on_alconna,
+    store_true,
+)
 from nonebot_plugin_session import EventSession
 
 from zhenxun.configs.utils import PluginExtraData
@@ -16,16 +26,19 @@ __plugin_meta__ = PluginMetadata(
     description="插件商店",
     usage="""
     插件商店        : 查看当前的插件商店
-    添加插件 id或module或插件名称 ?[-s [git, ali]]: 添加插件
+    添加插件 id或module或插件名称 ?[-s [git, ali]] ?[--build]: 添加插件
         使用-s时指定源，git为github，ali为阿里云
+        使用--build时允许依赖从源码构建
+        依赖有变化时，插件与依赖在重启后一并安装
     移除插件 id或module: 移除插件
     搜索插件 name或author: 搜索插件
-    更新插件 id或module ?[-s [git, ali]]: 更新插件
-    更新全部插件 ?[-s [git, ali]]: 更新全部插件
+    更新插件 id或module ?[-s [git, ali]] ?[--build]: 更新插件
+    更新全部插件 ?[-s [git, ali]] ?[--build]: 更新全部插件
 
     示例：
         添加插件 pix
         添加插件 真寻日报 -s git
+        添加插件 pix --build
     """.strip(),
     extra=PluginExtraData(
         author="HibiKier",
@@ -41,11 +54,21 @@ _matcher = on_alconna(
             "add",
             Args["plugin_id", str],
             Option("-s", Args["source", str]),
+            Option("--build", action=store_true),
         ),
         Subcommand("remove", Args["plugin_id", str]),
         Subcommand("search", Args["plugin_name_or_author", str]),
-        Subcommand("update", Args["plugin_id", str], Option("-s", Args["source", str])),
-        Subcommand("update_all", Option("-s", Args["source", str])),
+        Subcommand(
+            "update",
+            Args["plugin_id", str],
+            Option("-s", Args["source", str]),
+            Option("--build", action=store_true),
+        ),
+        Subcommand(
+            "update_all",
+            Option("-s", Args["source", str]),
+            Option("--build", action=store_true),
+        ),
     ),
     permission=SUPERUSER,
     priority=1,
@@ -100,7 +123,12 @@ async def _(session: EventSession):
 
 
 @_matcher.assign("add")
-async def _(session: EventSession, plugin_id: str, source: Match[str]):
+async def _(
+    session: EventSession,
+    plugin_id: str,
+    source: Match[str],
+    build: Query[bool] = AlconnaQuery("add.build.value", False),
+):
     source_str = await _command_source(source)
     if is_number(plugin_id):
         await MessageUtils.build_message(f"正在添加插件 Id: {plugin_id}").send()
@@ -109,7 +137,9 @@ async def _(session: EventSession, plugin_id: str, source: Match[str]):
             f"正在添加插件 Module/名称: {plugin_id}"
         ).send()
     try:
-        result = await StoreManager.add_plugin(plugin_id, source_str)
+        result = await StoreManager.add_plugin(
+            plugin_id, source_str, confirm_source_build=build.result
+        )
     except Exception as e:
         logger.error(f"添加插件 Id: {plugin_id}失败", "插件商店", session=session, e=e)
         await MessageUtils.build_message(
@@ -151,14 +181,21 @@ async def _(session: EventSession, plugin_name_or_author: str):
 
 
 @_matcher.assign("update")
-async def _(session: EventSession, plugin_id: str, source: Match[str]):
+async def _(
+    session: EventSession,
+    plugin_id: str,
+    source: Match[str],
+    build: Query[bool] = AlconnaQuery("update.build.value", False),
+):
     source_str = await _command_source(source)
     try:
         if is_number(plugin_id):
             await MessageUtils.build_message(f"正在更新插件 Id: {plugin_id}").send()
         else:
             await MessageUtils.build_message(f"正在更新插件 Module: {plugin_id}").send()
-        result = await StoreManager.update_plugin(plugin_id, source_str)
+        result = await StoreManager.update_plugin(
+            plugin_id, source_str, confirm_source_build=build.result
+        )
     except Exception as e:
         logger.error(f"更新插件 Id: {plugin_id}失败", "插件商店", session=session, e=e)
         await MessageUtils.build_message(
@@ -169,11 +206,17 @@ async def _(session: EventSession, plugin_id: str, source: Match[str]):
 
 
 @_matcher.assign("update_all")
-async def _(session: EventSession, source: Match[str]):
+async def _(
+    session: EventSession,
+    source: Match[str],
+    build: Query[bool] = AlconnaQuery("update_all.build.value", False),
+):
     source_str = await _command_source(source)
     try:
         await MessageUtils.build_message("正在更新全部插件").send()
-        result = await StoreManager.update_all_plugin(source_str)
+        result = await StoreManager.update_all_plugin(
+            source_str, confirm_source_build=build.result
+        )
     except Exception as e:
         logger.error("更新全部插件失败", "插件商店", session=session, e=e)
         await MessageUtils.build_message(f"更新全部插件失败 e: {e}").finish()

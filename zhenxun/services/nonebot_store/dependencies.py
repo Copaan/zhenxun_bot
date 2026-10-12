@@ -1069,24 +1069,12 @@ async def solve_install(
             details=blocking_drift,
         )
     manifest = manifest or load_manifest()
-    managed_requirements: list[str] = []
-    from .manual import manual_requirements
+    from .environment import dependency_roots
 
-    managed_requirements.extend(
-        raw for values in manual_requirements(manifest).values() for raw in values
-    )
-    for item in manifest.get("plugins", {}).values():
-        if (
-            not isinstance(item, dict)
-            or item.get("state") != "managed"
-            or item.get("project_link") == plugin["project_link"]
-        ):
-            continue
-        resolution_inputs = item.get("resolution_inputs")
-        if isinstance(resolution_inputs, list) and resolution_inputs:
-            managed_requirements.extend(str(value) for value in resolution_inputs)
-        else:
-            managed_requirements.append(f"{item['project_link']}=={item['version']}")
+    excluded_owners = {"pyproject.toml", canonicalize_name(plugin["project_link"])}
+    managed_requirements = [
+        raw for owner, raw in dependency_roots(manifest) if owner not in excluded_owners
+    ]
     candidate = f"{plugin['project_link']}=={plugin['version']}"
     current = snapshot.versions
     base = {name: dist.version for name, dist in snapshot.base.items()}
@@ -1556,6 +1544,42 @@ async def solve_install(
     }
 
 
+def _plugin_released_packages(
+    manifest: dict[str, Any], project: str
+) -> tuple[list[str], list[dict[str, Any]]]:
+    """计算卸载 NoneBot 插件后可释放的依赖，分析失败时不释放
+
+    参数:
+        manifest: 依赖层清单
+        project: 规范化的插件包名
+
+    返回:
+        tuple[list[str], list[dict[str, Any]]]: 可释放的包，因仍被导入而保留的包
+    """
+    from copy import deepcopy
+
+    from zhenxun.services.plugin_store.plugin_store_receipts import (
+        receipt_dependency_inputs,
+    )
+
+    from .environment import released_packages
+
+    after = deepcopy(manifest)
+    after["plugins"] = {
+        key: item
+        for key, item in manifest.get("plugins", {}).items()
+        if canonicalize_name(str(item.get("project_link") or "")) != project
+    }
+    try:
+        sources = receipt_dependency_inputs()
+        released, imported = released_packages(
+            manifest, after, sources_before=sources, sources_after=sources
+        )
+    except (DependencyAnalysisError, OSError, KeyError, TypeError):
+        return [], []
+    return [name for name in released if name != project], imported
+
+
 def uninstall_plan(
     plugin: dict[str, Any], *, manifest: dict[str, Any] | None = None
 ) -> dict[str, Any]:
@@ -1586,6 +1610,9 @@ def uninstall_plan(
     )
     if not owners:
         packages.pop(project, None)
+    released, imported = _plugin_released_packages(manifest, project)
+    for name in released:
+        packages.pop(canonicalize_name(name), None)
     core = protected_core()
     for name, version in archive["packages"].items():
         if name in packages and packages[name] != version:
@@ -1607,13 +1634,25 @@ def uninstall_plan(
         "package_changes": {
             "added": [],
             "changed": [],
-            "removed": []
-            if owners
-            else [
+            "removed": (
+                []
+                if owners
+                else [
+                    {
+                        "name": project,
+                        "version": str(plugin["version"]),
+                        "reason": "plugin",
+                    }
+                ]
+            )
+            + [
                 {
-                    "name": canonicalize_name(str(plugin["project_link"])),
-                    "version": str(plugin["version"]),
+                    "name": name,
+                    "version": snapshot.versions.get(name),
+                    "reason": "released",
                 }
+                for name in released
+                if name not in packages
             ],
         },
         "core_changes": [],
@@ -1621,15 +1660,18 @@ def uninstall_plan(
         "shared_changes": [],
         "private_changes": [],
         "compatibility_overrides": [],
-        "retained": [
-            {
-                "name": project,
-                "owners": owners,
-                "version": snapshot.versions.get(project),
-            }
-        ]
-        if owners
-        else [],
+        "retained": (
+            [
+                {
+                    "name": project,
+                    "owners": owners,
+                    "version": snapshot.versions.get(project),
+                }
+            ]
+            if owners
+            else []
+        )
+        + imported,
         "remaining_conflicts": retained_conflicts(
             snapshot, set() if owners else {project}
         ),
@@ -1667,26 +1709,42 @@ def read_requirement_files(files: list[Path]) -> list[str]:
     for path in files:
         for raw_line in path.read_text(encoding="utf-8-sig").splitlines():
             line = re.sub(r"\s+#.*$", "", raw_line).strip()
-            if not line or line.startswith("#"):
-                continue
-            if line.startswith("-"):
-                raise DependencyAnalysisError(
-                    "source_plugin_requirement_option_forbidden", line[:160]
-                )
-            try:
-                requirement = Requirement(line)
-            except InvalidRequirement as error:
-                raise DependencyAnalysisError(
-                    "source_plugin_requirement_unsupported", line[:160]
-                ) from error
-            if requirement.url:
-                raise DependencyAnalysisError(
-                    "source_plugin_direct_url_forbidden", requirement.name
-                )
-            if canonicalize_name(requirement.name) == "nonebot":
-                raise DependencyAnalysisError("nonebot1_plugin")
-            requirements.append(line)
+            if line and not line.startswith("#"):
+                requirements.append(str(parse_requirement(line)))
     return requirements
+
+
+def parse_requirement(value: str) -> Requirement:
+    """解析单条依赖声明，拒绝安装器参数、直链依赖和 NoneBot 1
+
+    参数:
+        value: 依赖声明
+
+    返回:
+        Requirement: 包名已规范化的依赖
+
+    异常:
+        DependencyAnalysisError: 依赖声明无效或不受支持
+    """
+    line = str(value).strip()
+    if line.startswith("-"):
+        raise DependencyAnalysisError(
+            "dependency_requirement_option_forbidden", line[:160]
+        )
+    try:
+        requirement = Requirement(line)
+    except InvalidRequirement as error:
+        raise DependencyAnalysisError(
+            "dependency_requirement_invalid", line[:160]
+        ) from error
+    requirement.name = canonicalize_name(requirement.name)
+    if requirement.url:
+        raise DependencyAnalysisError(
+            "dependency_requirement_direct_url", requirement.name
+        )
+    if requirement.name == "nonebot":
+        raise DependencyAnalysisError("nonebot1_plugin")
+    return requirement
 
 
 async def preflight_source_requirements(files: list[Path]) -> dict[str, Any]:

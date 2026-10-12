@@ -109,7 +109,7 @@ class BotProfileManager:
             extra = metadata.extra
             if not extra:
                 continue
-            extra_data = PluginExtraData(**extra)
+            extra_data = PluginExtraData.from_extra(extra, plugin.name)
             if extra_data.introduction or extra_data.precautions:
                 cls._plugin_data[plugin.name] = PluginProfile(
                     name=metadata.name,

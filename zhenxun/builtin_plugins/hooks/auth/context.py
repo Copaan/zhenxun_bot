@@ -12,7 +12,7 @@ from nonebot_plugin_alconna import UniMsg
 from nonebot_plugin_uninfo import Uninfo
 
 from zhenxun.services.cache.cache_containers import CacheDict
-from zhenxun.services.permission_revision import current_revision
+from zhenxun.services.cache.runtime_sync import RuntimeCacheMutation
 from zhenxun.utils.platform import PlatformUtils
 from zhenxun.utils.utils import EntityIDs, get_entity_ids
 
@@ -84,7 +84,7 @@ class EventContext:
 
 @dataclass
 class PermissionSideEffectCache:
-    revision: int = field(default_factory=current_revision)
+    revision: int = field(default_factory=lambda: RuntimeCacheMutation.revision)
     auth_results: dict[str, tuple[bool, str | None]] = field(default_factory=dict)
     module_locks: dict[str, asyncio.Lock] = field(default_factory=dict)
     commits: dict[str, "SideEffectCommit"] = field(default_factory=dict)

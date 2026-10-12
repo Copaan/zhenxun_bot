@@ -4,6 +4,10 @@
 ``__module__`` 以及协程代码所在文件，不安装任何全局拦截。
 每种核心注册表对应一个 ``Adapter``：``collect`` 找出属于插件的条目，
 ``remove`` 移除这些条目。
+
+新增允许插件写入的注册表时，若条目会在重载后重复累积，或重复登记会报错，
+必须在 ``ADAPTERS`` 中补上对应的 ``Adapter``；以名称为键、重载时直接覆盖的
+注册表可以不处理。
 """
 
 from __future__ import annotations
@@ -56,16 +60,16 @@ class Ownership:
     plugin_ids: frozenset[str]
 
     @classmethod
-    def of(cls, plugin: Plugin) -> Ownership:
+    def of(cls, *tops: Plugin) -> Ownership:
         """根据已加载的插件构造归属
 
         参数:
-            plugin: 插件
+            tops: 插件，子插件一并归入
 
         返回:
             Ownership: 归属
         """
-        plugins = [plugin, *iter_sub_plugins(plugin)]
+        plugins = [p for top in tops for p in (top, *iter_sub_plugins(top))]
         files = [getattr(p.module, "__file__", None) for p in plugins]
         return cls.build(
             {p.module_name for p in plugins},
@@ -170,7 +174,11 @@ def _list_adapter(name: str, getter: Callable[[], list]) -> Adapter:
 
 def _remove_keyed(items: list[Any]) -> None:
     for container, key in items:
-        container.pop(key, None)
+        if isinstance(container, list):
+            while key in container:
+                container.remove(key)
+        else:
+            container.pop(key, None)
 
 
 def _matchers(own: Ownership) -> list[Any]:
@@ -184,7 +192,33 @@ def _matchers(own: Ownership) -> list[Any]:
     ]
 
 
+def _commands(matcher: Any) -> set[tuple[str, ...]]:
+    from nonebot.rule import CommandRule, ShellCommandRule
+
+    return {
+        cmd
+        for checker in matcher.rule.checkers
+        if isinstance(checker.call, CommandRule | ShellCommandRule)
+        for cmd in checker.call.cmds
+    }
+
+
+def _release_prefixes(commands: set[tuple[str, ...]]) -> None:
+    """从 NoneBot 的指令前缀表中删除不再有 matcher 使用的指令"""
+    from nonebot.matcher import matchers
+    from nonebot.rule import TrieRule
+
+    used = set()
+    for group in list(matchers.values()):
+        for matcher in list(group):
+            used |= _commands(matcher)
+    for key, value in list(TrieRule.prefix.items()):
+        if value.command in commands - used:
+            del TrieRule.prefix[key]
+
+
 def _remove_matchers(items: list[Any]) -> None:
+    commands = set().union(*(_commands(matcher) for matcher in items))
     executors = []
     for matcher in items:
         with contextlib.suppress(KeyError, ValueError):
@@ -194,6 +228,7 @@ def _remove_matchers(items: list[Any]) -> None:
             else:
                 matcher.destroy()
     _release_executors(executors)
+    _release_prefixes(commands)
 
 
 def _release_executors(executors: list[Any]) -> None:
@@ -319,11 +354,23 @@ def _scheduler_tasks(own: Ownership) -> list[Any]:
     registry = getattr(module, "scheduler_registry", None) if module else None
     if registry is None:
         return []
-    return [
+    items: list[Any] = [
         (registry.tasks, key)
         for key, value in list(registry.tasks.items())
         if own.owned(value.get("func"))
     ]
+    owned_names = {key for _, key in items}
+    items.extend(
+        (registry.persistent_declarations, item)
+        for item in list(registry.persistent_declarations)
+        if item.plugin_name in owned_names
+    )
+    items.extend(
+        (registry.ephemeral_declarations, item)
+        for item in list(registry.ephemeral_declarations)
+        if own.owned(item.func)
+    )
+    return items
 
 
 def _asgi_routes(own: Ownership) -> list[Any]:
@@ -459,8 +506,65 @@ def _low_priority_writers(own: Ownership) -> list[Any]:
     ]
 
 
+def _ai_tools(own: Ownership) -> list[Any]:
+    module = sys.modules.get("zhenxun.services.ai.tools.engine.registry")
+    if module is None:
+        return []
+    manager = module.tool_provider_manager
+    items: list[Any] = []
+    for tools in list(manager.local_provider._namespaced_tools.values()):
+        for item in list(tools):
+            # @tool 生成的 FunctionTool 记录原函数，matcher 工具记录 matcher
+            target = getattr(item, "_original_func", None) or getattr(
+                item, "matcher", item
+            )
+            if own.owned(target):
+                items.append((tools, item))
+    items.extend(
+        (container, item)
+        for container in (manager._providers, manager._resolvers)
+        for item in list(container)
+        if own.owned(item)
+    )
+    return items
+
+
+def _remove_ai_tools(items: list[Any]) -> None:
+    _remove_keyed(items)
+    module = sys.modules.get("zhenxun.services.ai.tools.engine.registry")
+    if module is not None:
+        tools = module.tool_provider_manager.local_provider._namespaced_tools
+        for namespace in [name for name, items in tools.items() if not items]:
+            del tools[namespace]
+
+
+def _ai_capabilities(own: Ownership) -> list[Any]:
+    module = sys.modules.get("zhenxun.services.ai.capabilities.manager")
+    if module is None:
+        return []
+    entries = module.capability_manager._entries
+    return [(entries, entry) for entry in list(entries) if own.owned(entry.cls)]
+
+
+def _business_identity_resolvers(own: Ownership) -> list[Any]:
+    module = sys.modules.get("zhenxun.services.business_identity")
+    if module is None:
+        return []
+    resolvers = module._resolvers
+    return [
+        (resolvers, scope)
+        for scope, resolver in list(resolvers.items())
+        if own.owned(resolver)
+    ]
+
+
+def _publication_reconcilers() -> list:
+    module = sys.modules.get("zhenxun.services.db_context.write")
+    return module._RECONCILERS if module is not None else []
+
+
 def _activation_index(own: Ownership) -> list[Any]:
-    module = sys.modules.get("zhenxun.builtin_plugins.hooks.auth_checker")
+    module = sys.modules.get("zhenxun.builtin_plugins.hooks.auth_dispatch")
     if module is None or own.module_owned(module.__name__):
         return []
     index = module._HANDLER_ACTIVATION_INDEX
@@ -501,6 +605,10 @@ ADAPTERS: list[Adapter] = [
     Adapter("shop_goods", _shop_goods, _remove_shop_goods),
     Adapter("shop_manage_goods", _shop_manage_goods, _remove_keyed),
     Adapter("low_priority_writer", _low_priority_writers, _remove_keyed),
+    Adapter("ai_tool", _ai_tools, _remove_ai_tools),
+    Adapter("ai_capability", _ai_capabilities, _remove_keyed),
+    Adapter("business_identity_resolver", _business_identity_resolvers, _remove_keyed),
+    _list_adapter("publication_reconciler", _publication_reconcilers),
     # 依赖 matcher 已移除，必须放在最后
     Adapter("activation_index", _activation_index, _rebuild_activation_index),
 ]

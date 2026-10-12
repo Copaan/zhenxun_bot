@@ -23,24 +23,19 @@ from zhenxun.services.message_load import is_overloaded, mark_activity
 from zhenxun.services.runtime_bootstrap import register_runtime_bootstrap
 from zhenxun.utils.manager.priority_manager import PriorityLifecycle
 
+from .auth.auth_limit import LimitManager
 from .auth.config import LOGGER_COMMAND
 from .auth.context import (
     get_event_context,
     get_or_create_event_context,
     get_permission_side_effect_cache,
-    resolve_actor_user_id,
     resolve_event_channel_id,
     resolve_event_group_id,
     set_route_modules,
 )
 from .auth_activation import adapter_contract_matches, matcher_supported_adapters
-from .auth_checker import (
-    LimitManager,
-    _get_route_context,
-    auth,
-    start_auth_runtime_tasks,
-    stop_auth_runtime_tasks,
-)
+from .auth_checker import auth
+from .auth_dispatch import get_route_context, install_dispatch, uninstall_dispatch
 
 _SKIP_AUTH_PLUGINS = {"chat_history", "chat_message"}
 
@@ -68,18 +63,17 @@ async def _mark_bot_disconnected(bot: Bot):
     priority=7,
     component_id="runtime:auth_tasks",
     depends_on=("runtime:runtime_cache",),
-    pass_context=True,
 )
-async def _start_auth_runtime_tasks(context):
-    await start_auth_runtime_tasks(context)
+async def _install_dispatch():
+    await install_dispatch()
 
 
 @PriorityLifecycle.on_shutdown(priority=7, component_id="runtime:auth_tasks")
-async def _stop_auth_runtime_tasks():
+async def _uninstall_dispatch():
     from zhenxun.services.uninfo_patch import clear_uninfo_sessions
 
     try:
-        await stop_auth_runtime_tasks()
+        uninstall_dispatch()
     finally:
         connection_epochs.clear()
         await clear_uninfo_sessions()
@@ -241,7 +235,7 @@ async def _auth_preprocessor(
     )
 
     if not event_context.route_modules_loaded:
-        route_modules = await _get_route_context(
+        route_modules = await get_route_context(
             event_context.plain_text,
             event_context.event_cache,
         )
@@ -278,60 +272,36 @@ async def _auth_preprocessor(
 @run_postprocessor
 async def _unblock_after_matcher(
     matcher: Matcher,
-    session: Uninfo,
-    event: Event,
     state: T_State,
     exception: Exception | None = None,
 ):
+    """matcher 结束后提交或回滚本 matcher 预留的金币与限制，并解除其 block
+
+    参数:
+        matcher: Matcher
+        state: T_State
+        exception: matcher 异常
+    """
+    if not matcher.plugin:
+        return
     context = get_event_context(state)
-    if context is not None:
-        limit_entity = context.limit_entity
-        user_id = limit_entity.user_id
-        group_id = limit_entity.group_id
-        channel_id = limit_entity.channel_id
+    module = matcher.plugin.name
+    side_effects = get_permission_side_effect_cache(
+        state=state,
+        event_cache=context.event_cache if context is not None else None,
+    )
+    commit = side_effects.commits.get(module)
+    if commit is None or commit.committed or commit.owner_matcher_id != id(matcher):
+        return
+    side_effects.commits.pop(module, None)
+    if exception is None:
+        try:
+            await commit.commit_all()
+            side_effects.auth_results[module] = (True, None)
+        except Exception as exc:
+            await commit.rollback_all("commit_failed")
+            logger.error("auth side effect commit failed", LOGGER_COMMAND, e=exc)
     else:
-        user_id = resolve_actor_user_id(event, session.user.id)
-        group_id = resolve_event_group_id(event, None)
-        channel_id = resolve_event_channel_id(event, None)
-        if session.group:
-            if session.group.parent:
-                group_id = session.group.parent.id
-                channel_id = session.group.id
-            else:
-                group_id = session.group.id
-    if user_id and matcher.plugin:
-        module = matcher.plugin.name
-        side_effects = get_permission_side_effect_cache(
-            state=state,
-            event_cache=context.event_cache if context is not None else None,
-        )
-        commit = side_effects.commits.get(module)
-        if (
-            commit is not None
-            and not commit.committed
-            and commit.owner_matcher_id == id(matcher)
-        ):
-            side_effects.commits.pop(module, None)
-            if exception is None:
-                try:
-                    await commit.commit_all()
-                    side_effects.auth_results[module] = (True, None)
-                except Exception as exc:
-                    await commit.rollback_all("commit_failed")
-                    logger.error(
-                        "auth side effect commit failed",
-                        LOGGER_COMMAND,
-                        e=exc,
-                    )
-            else:
-                await commit.rollback_all("matcher_exception")
-            if commit.limit_should_auto_unblock:
-                limit_entity = commit.limit_entity
-                LimitManager.unblock(
-                    module,
-                    limit_entity.user_id if limit_entity else user_id,
-                    limit_entity.group_id if limit_entity else group_id,
-                    limit_entity.channel_id if limit_entity else channel_id,
-                )
-        else:
-            LimitManager.unblock(module, user_id, group_id, channel_id)
+        await commit.rollback_all("matcher_exception")
+    if commit.limit_should_auto_unblock and (entity := commit.limit_entity):
+        LimitManager.unblock(module, entity.user_id, entity.group_id, entity.channel_id)

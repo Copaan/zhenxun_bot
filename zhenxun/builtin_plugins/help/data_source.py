@@ -62,7 +62,9 @@ def _create_plugin_menu_item(
     has_superuser_help = False
     nb_plugin = nonebot.get_plugin_by_module_name(plugin.module_path)
     if nb_plugin and nb_plugin.metadata and nb_plugin.metadata.extra:
-        extra_data = PluginExtraData(**nb_plugin.metadata.extra)
+        extra_data = PluginExtraData.from_extra(
+            nb_plugin.metadata.extra, nb_plugin.name
+        )
         if extra_data.superuser_help:
             has_superuser_help = True
 
@@ -84,7 +86,9 @@ def _create_plugin_menu_item(
 
     commands = []
     if is_detail and nb_plugin and nb_plugin.metadata and nb_plugin.metadata.extra:
-        extra_data = PluginExtraData(**nb_plugin.metadata.extra)
+        extra_data = PluginExtraData.from_extra(
+            nb_plugin.metadata.extra, nb_plugin.name
+        )
         commands = [cmd.command for cmd in extra_data.commands]
 
     return {
@@ -230,7 +234,9 @@ async def get_plugin_help(
     ):
         _plugin = nonebot.get_plugin_by_module_name(plugin.module_path)
         if _plugin and _plugin.metadata:
-            extra_data = PluginExtraData(**_plugin.metadata.extra)
+            extra_data = PluginExtraData.from_extra(
+                _plugin.metadata.extra, _plugin.name
+            )
 
             try:
                 call_count = await _read_db(

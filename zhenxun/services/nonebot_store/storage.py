@@ -69,10 +69,21 @@ def generation_path(generation: int | str) -> Path:
     return LAYER_ROOT / f"generation-{generation}"
 
 
-def next_generation(manifest: dict[str, Any] | None = None) -> int:
-    manifest = manifest or load_manifest()
+def next_generation(
+    manifest: dict[str, Any] | None = None, layer_root: Path = LAYER_ROOT
+) -> int:
+    """计算下一个依赖层编号，取已有目录与清单当前层中的最大值加一
+
+    参数:
+        manifest: 依赖层清单，默认读取当前清单
+        layer_root: 依赖层根目录
+
+    返回:
+        int: 新依赖层编号
+    """
+    manifest = load_manifest() if manifest is None else manifest
     generations = []
-    for path in LAYER_ROOT.glob("generation-*"):
+    for path in layer_root.glob("generation-*"):
         try:
             generations.append(int(path.name.rsplit("-", 1)[1]))
         except (IndexError, ValueError):

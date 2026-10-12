@@ -22,7 +22,7 @@ from zhenxun.configs.config import Config
 from zhenxun.services.lifecycle.deadline import remaining_timeout, shutdown_budget
 from zhenxun.services.log import logger
 
-from .resources import browser_resources
+from .resources import browser_gone, browser_resources
 from .types import BaseScreenshotEngine
 
 _PLAYWRIGHT_DISCONNECT_ERROR = "Connection closed while reading from the driver"
@@ -410,14 +410,15 @@ async def _close_browser_resources(browser_obj, playwright_obj) -> None:
         try:
             await _await_if_needed(close_func())
         except Exception as error:
-            if browser_obj.is_connected():
+            if browser_obj.is_connected() and not browser_gone(error):
                 failures.append(error)
     stop_func = getattr(playwright_obj, "stop", None) if playwright_obj else None
     if callable(stop_func):
         try:
             await _await_if_needed(stop_func())
         except Exception as error:
-            failures.append(error)
+            if not browser_gone(error):
+                failures.append(error)
     if failures:
         raise RuntimeError("renderer_browser_cleanup_failed") from failures[0]
     browser_resources.confirm_browser_closed(browser_obj)

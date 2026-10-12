@@ -9,11 +9,10 @@ from nonebot.drivers import Driver
 from packaging.specifiers import SpecifierSet
 from packaging.version import Version
 from tortoise import Tortoise
-from tortoise.exceptions import IntegrityError, OperationalError
+from tortoise.exceptions import OperationalError
 import ujson as json
 
 from zhenxun.models.bot_connect_log import BotConnectLog
-from zhenxun.models.bot_console import BotConsole
 from zhenxun.models.goods_info import GoodsInfo
 from zhenxun.models.group_member_info import GroupInfoUser
 from zhenxun.models.sign_user import SignUser
@@ -41,13 +40,6 @@ async def _(bot: Bot):
         connect_time=datetime.now(),
         type=1,
     )
-    if not await BotConsole.exists(bot_id=storage_bot_id):
-        try:
-            await BotConsole.create(
-                bot_id=storage_bot_id, platform=PlatformUtils.get_platform(bot)
-            )
-        except IntegrityError as e:
-            logger.warning(f"记录bot: {bot.self_id} 数据已存在...", e=e)
 
 
 @driver.on_bot_disconnect

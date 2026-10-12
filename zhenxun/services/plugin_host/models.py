@@ -34,6 +34,8 @@ class RuntimeOperation:
     affected_components: list[str] = field(default_factory=list)
     rollback_state: str = "none"
     notes: list[str] = field(default_factory=list)
+    stopped: list[str] = field(default_factory=list)
+    """加载失败而停用、可修复后重新加载的插件"""
 
     def public_dict(self) -> dict[str, Any]:
         return {
@@ -47,5 +49,6 @@ class RuntimeOperation:
             "affected_components": list(self.affected_components),
             "rollback_state": self.rollback_state,
             "notes": list(self.notes),
+            "stopped": list(self.stopped),
             "reason_codes": [self.reason] if self.reason else [],
         }

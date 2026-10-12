@@ -20,7 +20,7 @@ from .startup import startup_coordinator
 
 _INDEX_PATH = Path("data/runtime/startup-load-index-v1.json")
 _RECORD_VERSION = 6
-_CORE_BUILTINS = {"hooks", "init", "migration", "nonebot_store", "web_ui"}
+_CORE_BUILTINS = {"hooks", "init", "nonebot_store", "web_ui"}
 _PREBIND_HOOK_PREFIXES = (
     "nonebot_plugin_orm",
     "nonebot.drivers",

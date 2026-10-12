@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import os
@@ -140,17 +141,11 @@ class StartupCoordinator:
 
     @property
     def runtime_ready(self) -> bool:
-        return self._business_allowed() and self.state in {
+        return self.state in {
             "runtime_ready",
             "warmup_ready",
             "degraded",
         }
-
-    @staticmethod
-    def _business_allowed() -> bool:
-        from zhenxun.services.migration.validation import validation_gate
-
-        return validation_gate.business_allowed
 
     def begin_stage(self, stage: StartupStage) -> None:
         with self._lock:
@@ -423,6 +418,29 @@ class StartupCoordinator:
     async def wait_runtime_ready(self) -> None:
         await self._event("runtime").wait()
 
+    async def wait_bot_admission(self, timeout: float | None = None) -> bool:
+        """等待运行时阶段结束（完成或失败），此后接入的 Bot 会执行全部插件的连接钩子
+
+        参数:
+            timeout: 最长等待秒数，None 为一直等待
+
+        返回:
+            bool: 是否可以接入 Bot，首次配置模式下直接返回 True
+        """
+        loop = asyncio.get_running_loop()
+        deadline = None if timeout is None else loop.time() + timeout
+        event = self._event("runtime")
+        while not event.is_set():
+            with self._lock:
+                if self._setup_required:
+                    return True
+            step = 1.0 if deadline is None else min(1.0, deadline - loop.time())
+            if step <= 0:
+                return False
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(asyncio.shield(event.wait()), step)
+        return True
+
     async def wait_final_available(self) -> bool:
         """Wait until startup reaches its final user-facing usable state."""
         with self._lock:
@@ -515,9 +533,7 @@ class StartupCoordinator:
                 else None,
                 "server_bound": self._server_bound,
                 "operating_mode": (
-                    "migration_validation"
-                    if not self._business_allowed()
-                    else "management_only"
+                    "management_only"
                     if self._state == "failed"
                     else "setup_only"
                     if self._setup_required

@@ -1,7 +1,7 @@
 """插件能否热处理的判定
 
-内置插件、库插件、导入期注册路由/适配器/线程、修改外部对象、模型变化等
-情况无法安全热处理，需要重启；依赖它们的插件同样需要重启。
+内置插件、库插件、导入期注册路由/适配器、创建线程或进程、修改外部对象、
+模型变化等情况无法安全热处理，需要重启；依赖它们的插件同样需要重启。
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from nonebot.plugin import Plugin, _plugins
 from . import registry
 from .models import ReloadClassification
 
-DEPENDENCY_FILES = ("requirements.txt", "requirement.txt", "pyproject.toml")
+DEPENDENCY_FILES = ("requirements.txt", "requirement.txt")
 _RESTART_FILE_REASONS = {
     "adapter_registration",
     "dynamic_import",
@@ -26,7 +26,10 @@ _RESTART_FILE_REASONS = {
     "import_time_thread_or_process",
     "nonebot_plugin_orm",
     "source_unreadable",
+    "thread_or_process",
 }
+_THREAD_MODULES = {"_thread", "multiprocessing", "threading"}
+_THREAD_NAMES = {"Pool", "Process", "Thread", "Timer", "start_new_thread"}
 _BUILTIN_PREFIX = "zhenxun.builtin_plugins."
 _SOURCE_PREFIX = "zhenxun.plugins."
 
@@ -66,12 +69,24 @@ def plugin_root(plugin: Plugin) -> Path | None:
     return path.parent if path.name == "__init__.py" else path
 
 
-def _patches_external(path: Path, root_module: str) -> bool:
-    """源码中是否给外部模块导入的对象赋值属性（如 ``Bot.send = ...``）"""
+def _source_hazards(path: Path, root_module: str) -> set[str]:
+    """源码中无法随卸载撤销的行为
+
+    给外部模块导入的对象赋值属性（如 ``Bot.send = ...``）记为 external_patch；
+    在任意位置使用线程或进程（threading / multiprocessing / _thread）记为
+    thread_or_process，这些线程不属于事件循环，卸载时无法结束。
+
+    参数:
+        path: 源码文件
+        root_module: 插件顶层模块名
+
+    返回:
+        set[str]: 原因
+    """
     try:
         tree = ast.parse(path.read_bytes().decode("utf-8"), filename=str(path))
     except (OSError, UnicodeError, SyntaxError):
-        return False
+        return set()
     imported: dict[str, str] = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -87,7 +102,20 @@ def _patches_external(path: Path, root_module: str) -> bool:
         module = imported[node.id]
         return not (module == root_module or module.startswith(f"{root_module}."))
 
+    def threaded(node: ast.AST) -> bool:
+        if isinstance(node, ast.Name):
+            return node.id in _THREAD_NAMES and imported.get(node.id) in _THREAD_MODULES
+        return (
+            isinstance(node, ast.Attribute)
+            and node.attr in _THREAD_NAMES
+            and isinstance(node.value, ast.Name)
+            and imported.get(node.value.id) in _THREAD_MODULES
+        )
+
+    reasons = set()
     for node in ast.walk(tree):
+        if threaded(node):
+            reasons.add("thread_or_process")
         if isinstance(node, ast.Assign):
             targets = node.targets
         elif isinstance(node, ast.AugAssign | ast.AnnAssign):
@@ -99,15 +127,16 @@ def _patches_external(path: Path, root_module: str) -> bool:
             and node.args
             and external(node.args[0])
         ):
-            return True
+            reasons.add("external_patch")
+            continue
         else:
             continue
         if any(
             isinstance(target, ast.Attribute) and external(target.value)
             for target in targets
         ):
-            return True
-    return False
+            reasons.add("external_patch")
+    return reasons
 
 
 def _classification(reasons: set[str]) -> dict[str, Any]:
@@ -145,8 +174,8 @@ class PluginClassifier:
             path, module_name, startup_load_planner.runtime_file_record(path)
         )
         reasons = set(record.get("reasons", []))
-        if "source_unreadable" not in reasons and _patches_external(path, root_module):
-            reasons.add("external_patch")
+        if "source_unreadable" not in reasons:
+            reasons |= _source_hazards(path, root_module)
         info = {
             "reasons": reasons,
             "digest": record.get("digest"),
@@ -309,18 +338,41 @@ class PluginClassifier:
             list[Plugin]: 顶层插件
         """
         graph = self._graph(generation)
-        result: list[Plugin] = []
-        seen: set[str] = set()
+        found: list[str] = []
         queue = [plugin.id_ for plugin in plugins]
         while queue:
             plugin_id = queue.pop(0)
-            if plugin_id in seen:
+            if plugin_id in found or plugin_id not in _plugins:
                 continue
-            seen.add(plugin_id)
-            if (plugin := _plugins.get(plugin_id)) is not None:
-                result.append(plugin)
-                queue.extend(sorted(graph.get(plugin_id, ())))
-        return result
+            found.append(plugin_id)
+            queue.extend(sorted(graph.get(plugin_id, ())))
+        requires = {
+            plugin_id: {other for other in found if plugin_id in graph.get(other, ())}
+            for plugin_id in found
+        }
+        ordered: list[str] = []
+        while len(ordered) < len(found):
+            pending = [plugin_id for plugin_id in found if plugin_id not in ordered]
+            # 循环依赖时按发现顺序取第一个打破循环
+            ordered.append(
+                next(
+                    (p for p in pending if requires[p] <= set(ordered)),
+                    pending[0],
+                )
+            )
+        return [_plugins[plugin_id] for plugin_id in ordered]
+
+    def dependents(self, plugin: Plugin, generation: int) -> set[str]:
+        """直接或间接依赖插件的顶层插件 id
+
+        参数:
+            plugin: 顶层插件
+            generation: 当前插件代际
+
+        返回:
+            set[str]: 插件 id
+        """
+        return {p.id_ for p in self.closure([plugin], generation)} - {plugin.id_}
 
     def restart_reasons(self, plugin: Plugin, generation: int) -> set[str]:
         """插件及其依赖方中阻止热处理的原因

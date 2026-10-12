@@ -167,10 +167,6 @@ async def require_setup_token(
     request: Request,
     authorization: str | None = Header(default=None, alias="Authorization"),
 ) -> SetupSession:
-    if request.headers.get("x-setup-token") or request.headers.get(
-        "x-migration-session"
-    ):
-        raise HTTPException(410, "migration_session_protocol_obsolete")
     return await setup_access.authorize(authorization, client_ip(request))
 
 

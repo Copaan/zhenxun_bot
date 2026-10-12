@@ -1,7 +1,6 @@
 import asyncio
 from datetime import timedelta
 import json
-from pathlib import Path
 import secrets
 import time
 
@@ -173,13 +172,7 @@ async def renew_session_activity(
             session = await setup_access.authorize(token, _client_key(request))
             claims = session.claims
         except HTTPException:
-            from zhenxun.services.migration.errors import MigrationError
-            from zhenxun.services.migration.session import continuation_session
-
-            try:
-                claims = continuation_session(Path.cwd(), token).claims
-            except MigrationError:
-                pass
+            pass
     if claims is None:
         raise HTTPException(
             status_code=401,

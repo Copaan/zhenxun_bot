@@ -3,6 +3,7 @@ from hashlib import sha256
 import os
 from pathlib import Path
 import random
+from zoneinfo import ZoneInfo
 
 import aiofiles
 import nonebot
@@ -13,6 +14,7 @@ from zhenxun import ui
 from zhenxun.configs.config import BotConfig, Config
 from zhenxun.configs.path_config import THEMES_PATH
 from zhenxun.models.sign_user import SignUser
+from zhenxun.models.user_console import UserConsole
 from zhenxun.services.avatar_service import avatar_service
 from zhenxun.utils.manager.priority_manager import PriorityLifecycle
 
@@ -47,6 +49,28 @@ LG_MESSAGE = [
     "请尽早休息吧！",
     "不要熬夜啦！",
 ]
+
+
+def _now() -> datetime:
+    """签到日期使用的北京时间"""
+    return datetime.now(ZoneInfo("Asia/Shanghai"))
+
+
+def _cached(card_file: Path) -> bool:
+    """卡片缓存是否可用，模板更新后的旧缓存会被删除
+
+    参数:
+        card_file: 卡片路径
+
+    返回:
+        bool: 是否可直接使用缓存
+    """
+    if not card_file.exists():
+        return False
+    if not _is_sign_card_cache_stale(card_file):
+        return True
+    card_file.unlink(missing_ok=True)
+    return False
 
 
 def _get_sign_template_files() -> list[Path]:
@@ -132,14 +156,14 @@ async def get_card(
     is_double: bool = False,
     is_card_view: bool = False,
 ) -> Path:
-    """获取好感度卡片
+    """获取好感度卡片，签到卡片当天复用，查看卡片在数据变化后重新生成
 
     参数:
         user: SignUser
         session: Uninfo
         nickname: 用户昵称
-        impression: 新增的好感度
-        gold: 金币
+        add_impression: 新增的好感度，-1 表示本次未签到
+        gold: 本次获得的金币，未签到时为当前金币
         gift: 礼物
         is_double: 是否触发双倍.
         is_card_view: 是否展示好感度卡片.
@@ -147,28 +171,32 @@ async def get_card(
     返回:
         Path: 卡片路径
     """
-    user_id = _card_cache_key(user, session)
-    date = datetime.now().date()
-    _type = "view" if is_card_view else "sign"
-    file_name = f"{user_id}_{_type}_{date}.png"
-    card_file = SIGN_TODAY_CARD_PATH / file_name
-
-    if card_file.exists():
-        if not _is_sign_card_cache_stale(card_file):
+    key = _card_cache_key(user, session)
+    date = _now().date()
+    if not is_card_view:
+        card_file = SIGN_TODAY_CARD_PATH / f"{key}_sign_{date}.png"
+        if _cached(card_file):
             return card_file
-        card_file.unlink(missing_ok=True)
-
-    if add_impression == -1:
-        view_name = f"{user_id}_view_{date}.png"
-        view_card_file = SIGN_TODAY_CARD_PATH / view_name
-        if view_card_file.exists():
-            if not _is_sign_card_cache_stale(view_card_file):
-                return view_card_file
-            view_card_file.unlink(missing_ok=True)
-        is_card_view = True
-
+        if add_impression != -1:
+            return await _generate_html_card(
+                card_file,
+                user,
+                await user.user_console,
+                session,
+                nickname,
+                reward=(add_impression, gold or 0, gift, is_double),
+            )
+    rank = await SignUser.impression_rank(user.impression)
+    digest = sha256(
+        f"{user.impression}:{user.sign_count}:{gold}:{rank}".encode()
+    ).hexdigest()[:12]
+    card_file = SIGN_TODAY_CARD_PATH / f"{key}_view_{date}_{digest}.png"
+    if _cached(card_file):
+        return card_file
+    for old in SIGN_TODAY_CARD_PATH.glob(f"{key}_view_*.png"):
+        old.unlink(missing_ok=True)
     return await _generate_html_card(
-        user, session, nickname, add_impression, gold, gift, is_double, is_card_view
+        card_file, user, await user.user_console, session, nickname, rank=rank
     )
 
 
@@ -205,50 +233,39 @@ def clear_sign_data_pic():
     """
     清空当前签到图片数据
     """
-    date = datetime.now().date()
+    date = _now().date()
     for file in os.listdir(SIGN_TODAY_CARD_PATH):
         if str(date) not in file:
             os.remove(SIGN_TODAY_CARD_PATH / file)
 
 
 async def _generate_html_card(
+    card_file: Path,
     user: SignUser,
+    user_console: UserConsole | None,
     session: Uninfo,
     nickname: str,
-    add_impression: float,
-    gold: int | None,
-    gift: str,
-    is_double: bool = False,
-    is_card_view: bool = False,
+    *,
+    reward: tuple[float, int, str, bool] | None = None,
+    rank: int | None = None,
 ) -> Path:
     """使用渲染服务生成签到卡片
 
     参数:
+        card_file: 卡片保存路径
         user: SignUser
+        user_console: 用户数据
         session: Uninfo
         nickname: 用户昵称
-        add_impression: 新增的好感度
-        gold: 金币
-        gift: 礼物
-        is_double: 是否触发双倍.
-        is_card_view: 是否为卡片视图.
+        reward: 签到奖励（好感度、金币、礼物、是否双倍），为 None 时生成查看卡片
+        rank: 查看卡片中的好感度排名
 
     返回:
         Path: 卡片路径
     """
-    now = datetime.now()
-    date = now.date()
-    _type = "view" if is_card_view else "sign"
-    file_name = f"{_card_cache_key(user, session)}_{_type}_{date}.png"
-    card_file = SIGN_TODAY_CARD_PATH / file_name
-
-    if card_file.exists():
-        if not _is_sign_card_cache_stale(card_file):
-            return card_file
-        card_file.unlink(missing_ok=True)
-
+    now = _now()
+    is_card_view = reward is None
     impression = float(user.impression)
-    user_console = await user.user_console
     if user_console and user_console.uid is not None:
         uid = f"{user_console.uid}".rjust(12, "0")
         uid_formatted = f"{uid[:4]} {uid[4:8]} {uid[8:]}"
@@ -307,33 +324,16 @@ async def _generate_html_card(
         "previous_level_at": previous_impression,
     }
 
-    reward_info = None
-    rank = None
     total_gold = None
-
+    add_impression, gold, gift, is_double = reward or (0, 0, "", False)
+    reward_info = {
+        "impression_added": add_impression,
+        "gold_added": gold,
+        "gift_received": gift,
+        "is_double": is_double,
+    }
     if is_card_view:
-        value_list = (
-            await SignUser.annotate()
-            .order_by("-impression")
-            .values_list("user_id", flat=True)
-        )
-        rank = value_list.index(user.user_id) + 1 if user.user_id in value_list else 0
         total_gold = user_console.gold if user_console else 0
-
-        reward_info = {
-            "impression_added": 0,
-            "gold_added": 0,
-            "gift_received": "",
-            "is_double": False,
-        }
-
-    else:
-        reward_info = {
-            "impression_added": add_impression,
-            "gold_added": gold or 0,
-            "gift_received": gift,
-            "is_double": is_double,
-        }
 
     page_info = {
         "date_str": str(now.replace(microsecond=0)),

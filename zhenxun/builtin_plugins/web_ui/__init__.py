@@ -24,13 +24,13 @@ from .api.logs import router as ws_log_routes
 from .api.menu import router as menu_router
 from .api.protocol import router as protocol_router
 from .api.tabs.ai import router as ai_router
+from .api.tabs.backup import router as backup_router
 from .api.tabs.dashboard import router as dashboard_router
 from .api.tabs.database import router as database_router
 from .api.tabs.main import router as main_router
 from .api.tabs.main import ws_router as status_routes
 from .api.tabs.manage import router as manage_router
 from .api.tabs.manage.chat import ws_router as chat_routes
-from .api.tabs.migration import router as migration_router
 from .api.tabs.network_proxy import router as network_proxy_router
 from .api.tabs.plugin_manage import router as plugin_router
 from .api.tabs.plugin_manage.nonebot_store import router as nonebot_store_router
@@ -104,7 +104,7 @@ BaseApiRouter.include_router(database_router)
 BaseApiRouter.include_router(plugin_router)
 BaseApiRouter.include_router(plugin_policy_router)
 BaseApiRouter.include_router(network_proxy_router)
-BaseApiRouter.include_router(migration_router)
+BaseApiRouter.include_router(backup_router)
 BaseApiRouter.include_router(system_router)
 BaseApiRouter.include_router(menu_router)
 BaseApiRouter.include_router(configure_router)

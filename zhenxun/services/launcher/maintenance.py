@@ -18,7 +18,7 @@ from .supervisor import launcher_supervisor
 
 
 def execute(action: str) -> None:
-    from zhenxun.services.migration.lease import validate_delegation
+    from .lease import validate_delegation
 
     if os.getenv("ZHENXUN_MAINTENANCE_CHILD") != "1":
         raise RuntimeError("maintenance_requires_launcher")
@@ -26,7 +26,7 @@ def execute(action: str) -> None:
     identity = os.environ.get("ZHENXUN_INSTANCE_LEASE_ID")
     if not launcher.isdecimal() or not identity:
         raise RuntimeError("maintenance_requires_launcher_identity")
-    validate_delegation(Path.cwd(), int(launcher), identity=identity)
+    validate_delegation(Path.cwd(), int(launcher), identity)
 
     interruption_requested = False
 
@@ -70,6 +70,10 @@ def execute(action: str) -> None:
 
             paths = json.loads(os.environ.get("ZHENXUN_MAINTENANCE_PATHS", "[]"))
             result["value"] = stage_requirement_files([Path(path) for path in paths])
+        elif action == "restore-apply":
+            from zhenxun.services.migration.restore import apply_pending
+
+            result["value"] = apply_pending()
         elif action == "verify-dependencies":
             from zhenxun.services.nonebot_store.environment import (
                 verify_effective_environment,

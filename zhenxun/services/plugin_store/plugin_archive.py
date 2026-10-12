@@ -32,7 +32,6 @@ try:
 except ModuleNotFoundError:  # Python 3.10
     import tomli as tomllib
 
-from packaging.requirements import InvalidRequirement, Requirement
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
 
 from zhenxun.services.plugin_store import plugin_store_transaction as transaction
@@ -396,6 +395,12 @@ def identify_plugin(root: Path) -> tuple[Path, list[Path], dict[str, Any]]:
 def static_requirements(
     scopes: list[Path], metadata: dict[str, Any] | None = None
 ) -> list[str]:
+    from zhenxun.services.nonebot_store.dependencies import (
+        DependencyAnalysisError,
+        parse_requirement,
+        read_requirement_files,
+    )
+
     requirements: list[str] = []
     for scope in scopes:
         for name in ("requirements.txt", "requirement.txt"):
@@ -403,11 +408,10 @@ def static_requirements(
             if path.is_file():
                 if path.stat().st_size > 1024 * 1024:
                     raise ArchiveError("archive_dependency_metadata_limit")
-                requirements.extend(
-                    line.strip()
-                    for line in path.read_text(encoding="utf-8-sig").splitlines()
-                    if line.strip() and not line.lstrip().startswith("#")
-                )
+                try:
+                    requirements.extend(read_requirement_files([path]))
+                except DependencyAnalysisError as error:
+                    raise ArchiveError("archive_requirement_unsupported") from error
         path = scope / "pyproject.toml"
         if path.is_file():
             if path.stat().st_size > 1024 * 1024:
@@ -462,11 +466,9 @@ def static_requirements(
         raise ArchiveError("archive_dependency_metadata_limit")
     for value in requirements:
         try:
-            requirement = Requirement(value)
-        except InvalidRequirement as error:
+            parse_requirement(value)
+        except DependencyAnalysisError as error:
             raise ArchiveError("archive_requirement_unsupported") from error
-        if requirement.url or requirement.name.lower() == "nonebot":
-            raise ArchiveError("archive_requirement_unsupported")
     return sorted(set(requirements))
 
 

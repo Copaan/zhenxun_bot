@@ -5,7 +5,6 @@ from tortoise import fields
 from zhenxun.services.cache.runtime_cache import BotMemoryCache
 from zhenxun.services.db_context import Model
 from zhenxun.services.db_context.schema_ops import AlterColumnType, RenameColumn
-from zhenxun.utils.enum import CacheType
 
 
 class BotConsole(Model):
@@ -32,11 +31,6 @@ class BotConsole(Model):
     class Meta:  # pyright: ignore [reportIncompatibleVariableOverride]
         table = "bot_console"
         table_description = "Bot数据表"
-
-    cache_type = CacheType.BOT
-    """缓存类型"""
-    cache_key_field = "bot_id"
-    """缓存键字段"""
 
     @staticmethod
     def format(name: str) -> str:

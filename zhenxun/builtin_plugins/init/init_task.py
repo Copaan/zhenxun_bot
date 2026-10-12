@@ -40,7 +40,7 @@ async def _handle_setting(
     if not metadata:
         return
     extra = metadata.extra
-    extra_data = PluginExtraData(**extra)
+    extra_data = PluginExtraData.from_extra(extra, plugin.name)
     if extra_data.tasks:
         task_info_list.extend(
             (

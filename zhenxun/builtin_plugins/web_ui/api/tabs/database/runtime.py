@@ -24,7 +24,6 @@ from zhenxun.services.cache.runtime_cache import (
     health_snapshot,
     refresh_all_runtime_caches,
 )
-from zhenxun.services.data_access import DataAccess
 from zhenxun.services.runtime_environment import runtime_environment_manager
 from zhenxun.utils._restart_utils import issue_restart_ticket
 from zhenxun.utils.pydantic_compat import model_copy
@@ -160,9 +159,40 @@ def _cache_public(config: CacheConfig) -> dict:
 
 
 async def _database_status() -> dict:
-    from zhenxun.services.database_probe import probe_runtime_database
+    """用当前 ORM 连接检查数据库可用性与 TLS 状态，不另开连接池
 
-    return await probe_runtime_database()
+    返回:
+        dict: 检查结果
+    """
+    from tortoise import Tortoise
+
+    from zhenxun.configs.database import (
+        applied_database_connection,
+        database_error_code,
+        inspect_database_tls,
+    )
+
+    started = time.monotonic()
+    result = {"status": "error", "checked_at": time.time(), "source": "runtime"}
+    try:
+        endpoint = applied_database_connection()
+        result.update(connection=endpoint.public(), fingerprint=endpoint.fingerprint())
+        connection = Tortoise.get_connection("default")
+
+        async def check():
+            await connection.execute_query("SELECT 1")
+            return await inspect_database_tls(endpoint, connection)
+
+        result.update(
+            status="ok",
+            code="database_ready",
+            observed_tls=await asyncio.wait_for(check(), 2),
+        )
+    except Exception as error:
+        result["code"] = database_error_code(error)
+        result["error_type"] = type(error).__name__
+    result["latency_ms"] = round((time.monotonic() - started) * 1000)
+    return result
 
 
 async def _redis_metrics(config: CacheConfig) -> dict:
@@ -206,7 +236,6 @@ def _runtime_health() -> dict:
         name: {
             "loaded": bool(item.get("loaded")),
             "entry_count": int(item.get("entry_count", 0)),
-            "negative_count": int(item.get("negative_count", 0)),
             "last_refresh": item.get("last_refresh", 0),
             "has_error": bool(item.get("last_error")),
         }
@@ -258,7 +287,6 @@ async def database_runtime() -> Result:
                 "redis": redis_metrics,
                 "runtime": _runtime_health(),
                 "bounded": bounded_stats,
-                "data_access": DataAccess.get_cache_stats(),
             },
         }
     )

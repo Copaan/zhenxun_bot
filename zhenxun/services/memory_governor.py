@@ -8,9 +8,6 @@ import sys
 import time
 from typing import Any
 
-from aiocache import SimpleMemoryCache
-
-from zhenxun.services.cache import CacheRoot
 from zhenxun.services.cache.bounded_ttl import BoundedTTLCache
 from zhenxun.services.cache.cache_containers import CacheDict
 from zhenxun.services.log import logger
@@ -91,12 +88,8 @@ async def _should_reclaim() -> bool:
 
 
 async def _has_active_auth_work() -> bool:
-    module = sys.modules.get("zhenxun.builtin_plugins.hooks.auth_checker")
-    if module is None:
-        return False
-    hooks_active = int(getattr(module, "HOOKS_ACTIVE_COUNT", 0) or 0)
-    db_active = int(getattr(module, "DB_ACTIVE_COUNT", 0) or 0)
-    return hooks_active > 0 or db_active > 0
+    module = sys.modules.get("zhenxun.builtin_plugins.hooks.auth_dispatch")
+    return module is not None and module.has_active_dispatch()
 
 
 async def _has_active_render_work() -> bool:
@@ -148,12 +141,9 @@ async def _run_reclaim() -> None:
     cleared["user_gold_logs"] = await _flush_user_gold_log_buffer()
     cleared["bounded_ttl_clear"] = await BoundedTTLCache.clear_all()
     cleared["cache_dict_clear"] = CacheDict.clear_all()
-    cleared["runtime_negative"] = _clear_runtime_negative_caches()
-    cleared["auth_local"] = _clear_auth_local_caches()
     cleared["avatar_l1"] = _clear_avatar_memory_cache()
     cleared["renderer_runtime"] = await _clear_renderer_runtime_caches()
     cleared["message_manager"] = _clear_message_manager_cache()
-    cleared["aiocache_memory"] = await _clear_simple_memory_backend()
 
     collected = gc.collect(2)
     malloc_trimmed = _malloc_trim()
@@ -192,52 +182,6 @@ async def _flush_user_gold_log_buffer() -> int:
         return 0
     result = await flush("内存回收")
     return int(result or 0)
-
-
-async def _clear_simple_memory_backend() -> bool:
-    backend = getattr(CacheRoot, "_cache_backend", None)
-    if not isinstance(backend, SimpleMemoryCache):
-        return False
-    await backend.clear()
-    return True
-
-
-def _clear_runtime_negative_caches() -> dict[str, int]:
-    module = sys.modules.get("zhenxun.services.cache.runtime_cache")
-    if module is None:
-        return {}
-    result: dict[str, int] = {}
-    for name in (
-        "BotMemoryCache",
-        "GroupMemoryCache",
-        "LevelUserMemoryCache",
-        "TaskInfoMemoryCache",
-        "PluginLimitMemoryCache",
-        "BanMemoryCache",
-    ):
-        cache_cls = getattr(module, name, None)
-        negative = getattr(cache_cls, "_negative", None)
-        if isinstance(negative, dict) and negative:
-            result[name] = len(negative)
-            negative.clear()
-    return result
-
-
-def _clear_auth_local_caches() -> dict[str, int]:
-    module = sys.modules.get("zhenxun.builtin_plugins.hooks.auth_checker")
-    if module is None:
-        return {}
-    result: dict[str, int] = {}
-    for name in (
-        "_MATCHER_COMMAND_TYPE_CACHE",
-        "_MATCHER_COMMAND_LITERAL_CACHE",
-        "_MATCHER_ALCONNA_SHORTCUT_CACHE",
-    ):
-        cache = getattr(module, name, None)
-        if isinstance(cache, dict) and cache:
-            result[name] = len(cache)
-            cache.clear()
-    return result
 
 
 def _clear_avatar_memory_cache() -> int:

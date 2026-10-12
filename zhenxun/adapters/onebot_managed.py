@@ -19,6 +19,9 @@ from nonebot.exception import WebSocketClosed
 from nonebot.utils import DataclassEncoder, escape_tag
 
 from zhenxun.services.message_inbox import message_inbox
+from zhenxun.services.startup import startup_coordinator
+
+_ADMISSION_TIMEOUT = 30.0
 
 
 class ManagedResultStore(ResultStore):
@@ -75,6 +78,24 @@ class ManagedOneBotAdapter(Adapter):
     def bot_connect(self, bot):
         super().bot_connect(bot)
         message_inbox.register_bot(bot, self.json_to_event, bot.handle_event)
+
+    async def _admit(self, self_id: str, timeout: float | None = _ADMISSION_TIMEOUT):
+        """等待运行时插件加载完成后再接入 Bot
+
+        参数:
+            self_id: Bot id
+            timeout: 最长等待秒数，None 为一直等待
+
+        返回:
+            bool: 是否可以接入
+        """
+        if await startup_coordinator.wait_bot_admission(0):
+            return True
+        log("INFO", f"<y>Bot {escape_tag(self_id)}</y> 等待运行时插件加载完成后接入")
+        if await startup_coordinator.wait_bot_admission(timeout):
+            return True
+        log("WARNING", f"Bot {escape_tag(self_id)} 接入超时，等待协议端重连")
+        return False
 
     def __init__(self, *args, **kwargs):
         self._control_tasks = set()
@@ -137,7 +158,10 @@ class ManagedOneBotAdapter(Adapter):
             json_data = json.loads(data)
             if event := self.json_to_event(json_data):
                 if not (bot := self.bots.get(self_id, None)):
-                    bot = Bot(self, self_id)
+                    if not await self._admit(self_id):
+                        return Response(503, content="Runtime starting")
+                    bot = self.bots.get(self_id) or Bot(self, self_id)
+                if self_id not in self.bots:
                     self.bot_connect(bot)
                     log("INFO", f"<y>Bot {escape_tag(self_id)}</y> connected")
                 bot = cast(Bot, bot)
@@ -156,7 +180,10 @@ class ManagedOneBotAdapter(Adapter):
             log("WARNING", "Missing X-Self-ID Header")
             await websocket.close(1008, "Missing X-Self-ID Header")
             return
-        elif self_id in self.bots:
+        if not await self._admit(self_id):
+            await websocket.close(1013, "Runtime starting")
+            return
+        if self_id in self.bots:
             log("WARNING", f"There's already a bot {self_id}, ignored")
             await websocket.close(1008, "Duplicate X-Self-ID")
             return
@@ -227,6 +254,7 @@ class ManagedOneBotAdapter(Adapter):
                                 ):
                                     continue
                                 self_id = event.self_id
+                                await self._admit(str(self_id), None)
                                 bot = Bot(self, str(self_id))
                                 self.bot_connect(bot)
                                 self.connections[str(self_id)] = ws

@@ -269,7 +269,7 @@ def main() -> int:
             or transaction.get("state") != "migration_blocked"
         ):
             raise RuntimeError("orm_manual_transaction_changed")
-        from zhenxun.services.migration.lease import InstanceLease
+        from zhenxun.services.launcher.lease import InstanceLease
 
         with InstanceLease(Path.cwd(), role="migration"):
             from .runtime import _staged_build

@@ -145,25 +145,16 @@ async def apply_setup(
     return await _apply_setup(payload, session)
 
 
+_setup_lock = asyncio.Lock()
+
+
 async def _apply_setup(payload: ApplyRequest, session: SetupSession) -> Result:
-    from pathlib import Path
-
-    from filelock import Timeout
-
-    from zhenxun.services.migration.restore_flow import setup_restore_lock
-    from zhenxun.services.migration.tasks import TaskStore
-
-    store = TaskStore(Path.cwd())
-    try:
-        with setup_restore_lock(store):
-            if store.active() or setup_access.state() in {
-                "configured",
-                "restart_pending",
-            }:
-                raise HTTPException(409, detail="migration_operation_in_progress")
-            return await _apply_setup_locked(payload, session)
-    except Timeout:
-        raise HTTPException(409, detail="migration_operation_in_progress") from None
+    if _setup_lock.locked():
+        raise HTTPException(409, detail="首次配置正在提交，请稍候。")
+    async with _setup_lock:
+        if setup_access.state() in {"configured", "restart_pending"}:
+            raise HTTPException(409, detail="首次配置已完成，请重启真寻。")
+        return await _apply_setup_locked(payload, session)
 
 
 async def _apply_setup_locked(payload: ApplyRequest, session: SetupSession) -> Result:
