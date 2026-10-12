@@ -84,7 +84,7 @@ def main() -> None:
     if not args or args[0] == "run":
         import argparse
 
-        from zhenxun.services.launcher.lease import InstanceLease
+        from zhenxun.services.launcher.lease import InstanceLease, LeaseError
         from zhenxun.services.launcher.main import run_launcher
         from zhenxun.services.startup_banner import show_startup_banner
 
@@ -109,16 +109,20 @@ def main() -> None:
             else None
         )
         show_startup_banner()
-        with InstanceLease(project, role="launcher") as lease:
-            previous = os.environ.get("ZHENXUN_INSTANCE_LEASE_ID")
-            os.environ["ZHENXUN_INSTANCE_LEASE_ID"] = lease.identity
-            try:
-                run_launcher(project, webui_dev_source)
-            finally:
-                if previous is None:
-                    os.environ.pop("ZHENXUN_INSTANCE_LEASE_ID", None)
-                else:
-                    os.environ["ZHENXUN_INSTANCE_LEASE_ID"] = previous
+        try:
+            with InstanceLease(project, role="launcher") as lease:
+                previous = os.environ.get("ZHENXUN_INSTANCE_LEASE_ID")
+                os.environ["ZHENXUN_INSTANCE_LEASE_ID"] = lease.identity
+                try:
+                    run_launcher(project, webui_dev_source)
+                finally:
+                    if previous is None:
+                        os.environ.pop("ZHENXUN_INSTANCE_LEASE_ID", None)
+                    else:
+                        os.environ["ZHENXUN_INSTANCE_LEASE_ID"] = previous
+        except LeaseError as error:
+            sys.stderr.write(f"错误: {error}\n")
+            sys.exit(1)
     elif args[0] == "run-worker":
         from zhenxun.services.launcher.lease import (
             InstanceLease,

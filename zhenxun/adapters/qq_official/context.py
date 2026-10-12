@@ -23,8 +23,8 @@ from nonebot.adapters.qq.event import (
 )
 from tortoise.exceptions import IntegrityError
 
-from zhenxun.services.message_execution import MessageExecutionDeferred
 from zhenxun.services.platform_identity import CURRENT_PLATFORM_SCOPE
+from zhenxun.utils.exception import DependencyUnavailable
 
 from .cache import (
     IDENTITY_CACHE,
@@ -283,7 +283,7 @@ async def _resolve_principal(
 
 
 async def prepare_event_context(
-    app_id: str, event: Event, *, received_at: datetime | None = None
+    app_id: str, event: Event
 ) -> OfficialQQEventContext | None:
     validate_official_event(app_id, event)
     if isinstance(event, GroupMemberEvent):
@@ -311,7 +311,7 @@ async def prepare_event_context(
     interaction = isinstance(event, InteractionCreateEvent)
     if interaction:
         source_id, source_kind = str(event.event_id), "event_id"
-    received_at = received_at or datetime.now(timezone.utc)
+    received_at = datetime.now(timezone.utc)
     window = timedelta(minutes=60 if scene == "c2c" else 5)
     context = OfficialQQEventContext(
         app_id=app_id,
@@ -380,7 +380,7 @@ class OfficialReplyUnavailable(RuntimeError):
     pass
 
 
-class OfficialReplyExpired(OfficialReplyUnavailable, MessageExecutionDeferred):
+class OfficialReplyExpired(OfficialReplyUnavailable, DependencyUnavailable):
     """The passive reply capability expired; no protocol request was sent."""
 
 

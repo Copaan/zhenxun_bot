@@ -1,21 +1,39 @@
 import asyncio
-import contextlib
+from contextlib import AsyncExitStack, suppress
+from contextvars import ContextVar
+from functools import wraps
+import importlib
 import re
+import sys
 import time
+from typing import Any
 from urllib.parse import urlparse
 
+import anyio
+from exceptiongroup import catch
 from nonebot import get_loaded_plugins
 from nonebot.adapters import Bot, Event
 from nonebot.consts import CMD_ARG_KEY, CMD_KEY, PREFIX_KEY, RAW_CMD_KEY
-from nonebot.matcher import Matcher
+from nonebot.exception import NoLogException, StopPropagation
+from nonebot.log import logger as nb_logger
+from nonebot.matcher import Matcher, matchers
 import nonebot.message as nb_message
+from nonebot.rule import TrieRule
+from nonebot.utils import escape_tag
 
+from zhenxun.adapters.qq_official.context import with_official_event_context
 from zhenxun.configs.config import BotConfig
 from zhenxun.configs.utils import PluginExtraData
-from zhenxun.services.cache.cache_containers import CacheDict
+from zhenxun.services.log import logger
 from zhenxun.services.message_load import signal_overload
-from zhenxun.services.message_resources import matcher_resource_lane, resource_lanes
+from zhenxun.services.message_resources import (
+    ResourceLanes,
+    combined_lease,
+    matcher_resource_lane,
+    resource_lanes,
+)
 
+from .auth.config import LOGGER_COMMAND
 from .auth.context import (
     STATE_PLAIN_TEXT,
     get_event_context,
@@ -25,15 +43,46 @@ from .auth.context import (
 from .auth_activation import (
     ActivationContext,
     HandlerActivationIndex,
-    classify_matcher_lane,
+    adapter_contract_matches,
+    matcher_supported_adapters,
     text_match_candidates,
 )
-from .auth_event_selector import (
-    EventDispatchContext,
-    HandleEventSelectorDependencies,
-    install_handle_event_selector,
-    uninstall_handle_event_selector,
-)
+
+_dispatch_lease: ContextVar = ContextVar("dispatch_lease", default=None)
+_waiter_bridge: tuple | None = None
+
+
+def _install_waiter_bridge() -> None:
+    """让 nonebot_plugin_waiter 等待用户输入期间释放 matcher 占用的分发通道"""
+    global _waiter_bridge
+    module = sys.modules.get("nonebot_plugin_waiter")
+    if module is None or _waiter_bridge is not None:
+        return
+    original = module.Waiter.wait
+
+    @wraps(original)
+    async def wait(waiter, *args, **kwargs):
+        lease = _dispatch_lease.get()
+        if lease is None:
+            return await original(waiter, *args, **kwargs)
+        lease()
+        result = await original(waiter, *args, **kwargs)
+        await lease.reacquire()
+        return result
+
+    module.Waiter.wait = wait
+    _waiter_bridge = module.Waiter, original, wait
+
+
+def _uninstall_waiter_bridge() -> None:
+    """恢复 nonebot_plugin_waiter 原始的等待方法"""
+    global _waiter_bridge
+    if _waiter_bridge is None:
+        return
+    cls, original, wrapper = _waiter_bridge
+    if cls.wait is wrapper:
+        cls.wait = original
+    _waiter_bridge = None
 
 
 def _passive_db_limit() -> int:
@@ -57,18 +106,13 @@ DISPATCH_LANE_LIMITS: dict[str, int] = {
     "passive_ai": 2,
     "passive_render": 2,
 }
-# 单个事件选中 matcher 数超过该值时视为过载
+# 单个优先级选中 matcher 数超过该值时视为过载
 OVERLOAD_SELECTED_THRESHOLD = 48
 # 通道等待超过该毫秒数时视为过载
 OVERLOAD_LANE_WAIT_MS = 200.0
-# 事件路由结果缓存秒数
-ROUTE_CACHE_TTL = 2
 
-_DISPATCH_LANE_SEMAPHORES = {
-    lane: asyncio.Semaphore(limit) for lane, limit in DISPATCH_LANE_LIMITS.items()
-}
+_DISPATCH_LANES = ResourceLanes(DISPATCH_LANE_LIMITS)
 _HANDLER_ACTIVATION_INDEX = HandlerActivationIndex()
-_ROUTE_CACHE = CacheDict("AUTH_MATCHER_ROUTE_CACHE", expire=ROUTE_CACHE_TTL)
 
 _ROUTE_INDEX_LOCK = asyncio.Lock()
 _ROUTE_INDEX_READY = False
@@ -76,6 +120,13 @@ _ROUTE_COMMAND_MAP: dict[str, set[str]] = {}
 _ROUTE_PREFIX_MAP: dict[str, set[str]] = {}
 
 _LEADING_PLACEHOLDER_PATTERN = re.compile(r"^(?:\s*(?:\[[^\]]*]|\<[^>]*>))+\s*")
+_PATCHED_MODULES = (
+    "nonebot.adapters.onebot.v11.bot",
+    "nonebot.adapters.onebot.v12.bot",
+    "nonebot.adapters.qq.bot",
+    "onebug.mixin.process",
+)
+_original_handle_events: dict[Any, Any] = {}
 
 
 def _normalize_command(command: str) -> str:
@@ -185,33 +236,12 @@ async def get_route_context(text: str, event_cache: dict | None) -> set[str]:
     return matched
 
 
-def _collect_ai_route_values(
-    event: Event, state: dict | None, attr: str, *, casefold: bool
-) -> set[str]:
-    state_key = f"_zx{attr}"
-    if state is not None:
-        cached = state.get(state_key)
-        if isinstance(cached, set):
-            return cached
-    raw_value = getattr(event, attr, None)
-    if isinstance(raw_value, str):
-        raw_value = (raw_value,)
-    result: set[str] = set()
-    if isinstance(raw_value, set | frozenset | list | tuple):
-        for item in raw_value:
-            if isinstance(item, str) and (normalized := item.strip()):
-                result.add(normalized.casefold() if casefold else normalized)
-    if state is not None and result:
-        state[state_key] = result
-    return result
-
-
 def _normalize_dispatch_text(text: str) -> str:
     return _LEADING_PLACEHOLDER_PATTERN.sub("", text.strip()).strip()
 
 
 def _event_plain_text(event: Event) -> str:
-    with contextlib.suppress(Exception):
+    with suppress(Exception):
         # OneBot v11 的 raw_message 保留昵称前缀，保证“真寻日报”等命令能被匹配
         raw = getattr(event, "raw_message", None)
         if isinstance(raw, str) and raw:
@@ -220,9 +250,7 @@ def _event_plain_text(event: Event) -> str:
     return ""
 
 
-def _state_plain_text(state: dict | None) -> str:
-    if state is None:
-        return ""
+def _state_plain_text(state: dict) -> str:
     context = get_event_context(state)
     if context is not None:
         return context.plain_text.strip()
@@ -230,28 +258,28 @@ def _state_plain_text(state: dict | None) -> str:
     return text.strip() if isinstance(text, str) else ""
 
 
-def _trie_prefix(state: dict | None) -> dict:
-    prefix = state.get(PREFIX_KEY) if state is not None else None
+def _trie_prefix(state: dict) -> dict:
+    prefix = state.get(PREFIX_KEY)
     return prefix if isinstance(prefix, dict) else {}
 
 
-def _trie_command_text(state: dict | None) -> str:
+def _trie_command_text(state: dict) -> str:
     command = _trie_prefix(state).get(CMD_KEY)
     if isinstance(command, tuple):
         return _normalize_dispatch_text(" ".join(str(item) for item in command))
     return _normalize_dispatch_text(command) if isinstance(command, str) else ""
 
 
-def _trie_raw_command(state: dict | None) -> str:
+def _trie_raw_command(state: dict) -> str:
     raw_command = _trie_prefix(state).get(RAW_CMD_KEY)
     return _normalize_dispatch_text(raw_command) if isinstance(raw_command, str) else ""
 
 
-def _trie_command_arg_text(state: dict | None) -> str:
+def _trie_command_arg_text(state: dict) -> str:
     message = _trie_prefix(state).get(CMD_ARG_KEY)
     if message is None:
         return ""
-    with contextlib.suppress(Exception):
+    with suppress(Exception):
         extractor = getattr(message, "extract_plain_text", None)
         if callable(extractor):
             return _normalize_dispatch_text(str(extractor() or ""))
@@ -259,7 +287,7 @@ def _trie_command_arg_text(state: dict | None) -> str:
 
 
 def _event_raw_message_text(event: Event) -> str:
-    with contextlib.suppress(Exception):
+    with suppress(Exception):
         message = getattr(event, "message", None)
         if message is not None:
             return str(message)
@@ -267,10 +295,7 @@ def _event_raw_message_text(event: Event) -> str:
 
 
 def _event_text_candidates(
-    event: Event,
-    state: dict | None,
-    plain_text: str = "",
-    raw_text: str = "",
+    event: Event, state: dict, plain_text: str, raw_text: str
 ) -> tuple[str, ...]:
     candidates: list[str] = []
 
@@ -288,7 +313,7 @@ def _event_text_candidates(
     if trie_raw and trie_arg:
         add(f"{trie_raw} {trie_arg}")
     add(plain_text)
-    with contextlib.suppress(Exception):
+    with suppress(Exception):
         getter = getattr(event, "get_plaintext", None)
         if callable(getter):
             add(getter())
@@ -297,158 +322,132 @@ def _event_text_candidates(
 
 
 def _event_to_me(event: Event) -> bool:
-    with contextlib.suppress(Exception):
+    with suppress(Exception):
         getter = getattr(event, "is_tome", None)
         if callable(getter):
             return bool(getter())
     return bool(getattr(event, "to_me", False))
 
 
-def _route_cache_key(event: Event) -> str:
-    msg_id = getattr(event, "message_id", None)
-    if msg_id is None:
-        msg_id = getattr(event, "id", None)
-    if msg_id is None:
-        msg_id = id(event)
-    user_id = getattr(event, "user_id", "")
-    group_id = getattr(event, "group_id", "")
-    channel_id = getattr(event, "channel_id", "")
-    return f"{msg_id}:{user_id}:{group_id}:{channel_id}"
+async def _prepare_dispatch_state(
+    bot: Bot, event: Event, state: dict
+) -> ActivationContext:
+    """写入事件纯文本与命中的插件模块，并生成 matcher 预筛上下文
 
+    参数:
+        bot: Bot
+        event: Event
+        state: 事件 state
 
-def _get_route_modules_for_event(event: Event, state: dict | None = None) -> set[str]:
-    if state is not None:
-        context = get_event_context(state)
-        if context is not None and context.route_modules_loaded:
-            return context.route_modules
-        route_modules = state.get("_zx_route_modules")
-        if isinstance(route_modules, set):
-            return route_modules
-    key = _route_cache_key(event)
-    try:
-        route_modules = _ROUTE_CACHE[key]
-    except KeyError:
-        raw_text = _event_raw_message_text(event)
-        plain_text = _state_plain_text(state) or _event_plain_text(event)
-        route_modules = set()
-        for text in _event_text_candidates(event, state, plain_text, raw_text):
-            route_modules.update(_match_route_modules(text))
-        _ROUTE_CACHE[key] = route_modules
-    if state is not None:
-        context = get_event_context(state)
-        if context is not None:
-            set_route_modules(state, context, route_modules)
-        else:
-            state["_zx_route_modules"] = route_modules
-    return route_modules
-
-
-async def _build_dispatch_context(
-    event: Event, state: dict | None = None
-) -> EventDispatchContext:
-    if state is not None:
-        context = state.get("_zx_dispatch_context")
-        if isinstance(context, EventDispatchContext):
-            return context
+    返回:
+        ActivationContext: matcher 预筛上下文
+    """
     await ensure_route_index()
+    get_permission_side_effect_cache(state=state)
     plain_text = _state_plain_text(state)
     if not plain_text:
         plain_text = _event_plain_text(event)
-        if state is not None and plain_text:
+        if plain_text:
             state[STATE_PLAIN_TEXT] = plain_text
-    _get_route_modules_for_event(event, state)
-    ai_route_modules = _collect_ai_route_values(
-        event, state, "_ai_route_modules", casefold=False
-    )
     raw_text = _event_raw_message_text(event)
-    trie_command_text = _trie_command_text(state)
-    trie_raw_command = _trie_raw_command(state)
-    context = EventDispatchContext(
-        event_type=event.get_type(),
-        plain_text=plain_text,
-        raw_text=raw_text,
-        trie_command_text=trie_command_text,
-        trie_raw_command=trie_raw_command,
-        text_candidates=_event_text_candidates(event, state, plain_text, raw_text),
-        to_me=_event_to_me(event),
-        ai_route_modules=ai_route_modules,
-    )
-    if state is not None:
-        state["_zx_dispatch_context"] = context
-    return context
-
-
-def _dispatch_lane_for_matcher(
-    matcher_cls: type[Matcher], context: EventDispatchContext
-) -> str:
-    descriptor = _HANDLER_ACTIVATION_INDEX.descriptor_for(matcher_cls)
-    if descriptor is not None:
-        return descriptor.lane
-    if getattr(matcher_cls, "temp", False):
-        return "system"
-    matcher_type = getattr(matcher_cls, "type", "") or ""
-    if (
-        isinstance(matcher_type, str)
-        and matcher_type
-        and matcher_type != (context.event_type)
-    ):
-        return "system"
-    return classify_matcher_lane(
-        matcher_cls,
-        ai_route_modules=context.ai_route_modules,
-    )
-
-
-def _activation_context_from_dispatch(
-    context: EventDispatchContext,
-    event: Event,
-) -> ActivationContext:
+    texts = _event_text_candidates(event, state, plain_text, raw_text)
+    route_modules: set[str] = set()
+    for text in texts:
+        route_modules.update(_match_route_modules(text))
+    if (context := get_event_context(state)) is not None:
+        set_route_modules(state, context, route_modules)
+    else:
+        state["_zx_route_modules"] = route_modules
     return ActivationContext(
+        event_type=event.get_type(),
         event=event,
-        event_type=context.event_type,
-        plain_text=context.text_candidates[0]
-        if context.text_candidates
-        else context.plain_text,
-        raw_text="\n".join(context.text_candidates)
-        if context.text_candidates
-        else context.raw_text,
-        to_me=context.to_me,
+        plain_text=texts[0] if texts else plain_text,
+        raw_text="\n".join(texts) if texts else raw_text,
+        to_me=_event_to_me(event),
+        adapter=bot.adapter,
     )
 
 
-def _new_dispatch_budget() -> dict[str, int]:
-    return dict(DISPATCH_LANE_LIMITS)
+def _trim_leading_text(message: Any) -> None:
+    if not message:
+        return
+    segment = message[0]
+    if getattr(segment, "type", None) != "text":
+        return
+    data = getattr(segment, "data", None)
+    if not isinstance(data, dict):
+        return
+    data["text"] = str(data.get("text", "")).lstrip("\xa0").lstrip()
+    if not data["text"]:
+        del message[0]
 
 
-def _merge_dispatch_budget(target: dict[str, int], source: dict[str, int]) -> None:
-    for lane in DISPATCH_LANE_LIMITS:
-        target[lane] = source.get(lane, target.get(lane, 0))
+def _is_self_mention_segment(segment: Any, bot: Bot) -> bool:
+    if getattr(segment, "type", None) not in {"mention_user", "group_mention_user"}:
+        return False
+    data = getattr(segment, "data", None)
+    if not isinstance(data, dict):
+        return False
+    if data.get("is_you") or data.get("is_bot"):
+        return True
+    user_id = data.get("user_id")
+    return user_id is not None and str(user_id) == str(bot.self_id)
 
 
-async def _acquire_dispatch_lane(lane: str):
-    semaphore = _DISPATCH_LANE_SEMAPHORES.get(lane)
-    if semaphore is None:
-        return lambda: None
-    started = time.perf_counter()
-    await semaphore.acquire()
-    if (time.perf_counter() - started) * 1000 >= OVERLOAD_LANE_WAIT_MS:
-        signal_overload(2.0)
-    released = False
+def _normalize_qq_self_at_message(bot: Bot, event: Event) -> None:
+    """去掉 QQ 官方 @ 事件开头指向 bot 自身的提及段，使命令头能被正常匹配
 
-    def release():
-        nonlocal released
-        if not released:
-            released = True
-            semaphore.release()
+    参数:
+        bot: Bot
+        event: Event
+    """
+    if event.__class__.__name__ not in {
+        "AtMessageCreateEvent",
+        "GroupAtMessageCreateEvent",
+    }:
+        return
+    with suppress(Exception):
+        if str(bot.adapter.get_name()).lower() != "qq":
+            return
+        message = event.get_message()
+        if not message or not _is_self_mention_segment(message[0], bot):
+            return
+        message.pop(0)
+        setattr(event, "to_me", True)
+        _trim_leading_text(message)
+        if not message:
+            segment = importlib.import_module("nonebot.adapters.qq.message")
+            message.append(segment.MessageSegment.text(""))
 
-    async def reacquire():
-        nonlocal released
-        if released:
-            await semaphore.acquire()
-            released = False
 
-    setattr(release, "reacquire", reacquire)
-    return release
+def _is_account_binding_command(event: Event, bot: Bot) -> bool:
+    """账号绑定指令不交给 ChatInter 兜底 matcher 处理
+
+    参数:
+        event: Event
+        bot: Bot
+
+    返回:
+        bool: 是否为账号绑定指令
+    """
+    from zhenxun.services.account_binding_routing import (
+        bare_binding_code,
+        binding_command,
+    )
+
+    return (
+        binding_command(event) is not None or bare_binding_code(bot, event) is not None
+    )
+
+
+def _is_chatinter_matcher(matcher: type[Matcher]) -> bool:
+    plugin = getattr(matcher, "plugin", None)
+    module = str(
+        getattr(plugin, "module_name", "") or getattr(plugin, "module", "") or ""
+    )
+    return module == "zhenxun.plugins.chatinter" or module.startswith(
+        "zhenxun.plugins.chatinter."
+    )
 
 
 def has_active_dispatch() -> bool:
@@ -457,95 +456,225 @@ def has_active_dispatch() -> bool:
     返回:
         bool: 是否有正在执行的 matcher
     """
-    return any(
-        semaphore._value < DISPATCH_LANE_LIMITS[lane]
-        for lane, semaphore in _DISPATCH_LANE_SEMAPHORES.items()
-    )
+    return _DISPATCH_LANES.busy()
 
 
-def _prepare_handle_event_state(event: Event, state: dict) -> None:
-    get_permission_side_effect_cache(state=state)
-    if event.get_type() != "message":
-        return
-    plain_text = _event_plain_text(event)
-    text_candidates = _event_text_candidates(
-        event, state, plain_text, _event_raw_message_text(event)
-    )
-    if text_candidates:
-        state["_zx_text_candidates"] = text_candidates
-    if plain_text and not _state_plain_text(state):
-        state[STATE_PLAIN_TEXT] = plain_text
+def _select_matchers(
+    priority: int,
+    priority_matchers: list[type[Matcher]],
+    context: ActivationContext,
+    bot: Bot,
+    indexed: bool,
+    reserve_binding: bool,
+) -> list[type[Matcher]]:
+    selected = None
+    if indexed:
+        try:
+            selected = _HANDLER_ACTIVATION_INDEX.select_priority(
+                priority, priority_matchers, context
+            )
+        except Exception as exc:
+            logger.warning(
+                "matcher 预筛失败，当前优先级按适配器筛选", LOGGER_COMMAND, e=exc
+            )
+        else:
+            if len(selected) > OVERLOAD_SELECTED_THRESHOLD:
+                signal_overload(3.0)
+    if selected is None:
+        selected = [
+            matcher
+            for matcher in priority_matchers
+            if adapter_contract_matches(
+                matcher_supported_adapters(matcher), bot.adapter
+            )
+        ]
+    if reserve_binding:
+        selected = [m for m in selected if not _is_chatinter_matcher(m)]
+    return selected
 
 
-def _build_matcher_state(base_state: dict) -> dict:
-    # 副作用缓存先写入 base_state，copy 后各 matcher 共享同一对象
-    get_permission_side_effect_cache(state=base_state)
-    return base_state.copy()
-
-
-async def _run_admitted_matcher(
-    matcher: type[Matcher],
+async def _dispatch_priority(
+    selected: list[type[Matcher]],
     bot: Bot,
     event: Event,
     state: dict,
-    stack,
-    dependency_cache,
-    lane: str,
+    stack: AsyncExitStack,
+    dependency_cache: dict,
+    on_stop,
 ) -> None:
-    from zhenxun.services.message_execution import current_dispatch_lease
+    """按通道限流并发执行同一优先级选中的 matcher
 
-    state["_zx_dispatch_lane"] = lane
-    token = current_dispatch_lease.set(state.get("_zx_dispatch_lease"))
+    参数:
+        selected: 选中的 matcher
+        bot: Bot
+        event: Event
+        state: 事件 state
+        stack: 事件 AsyncExitStack
+        dependency_cache: 依赖缓存
+        on_stop: 阻断事件传播时的回调
+    """
+    groups: dict[tuple[str, str], list[type[Matcher]]] = {}
+    for matcher in selected:
+        descriptor = _HANDLER_ACTIVATION_INDEX.descriptor_for(matcher)
+        lane = descriptor.lane if descriptor is not None else "system"
+        groups.setdefault((lane, matcher_resource_lane(matcher)), []).append(matcher)
+    leases = set()
+
+    async def run(matcher: type[Matcher], lane: str, release) -> None:
+        _install_waiter_bridge()
+        matcher_state = state.copy()
+        matcher_state["_zx_dispatch_lane"] = lane
+        token = _dispatch_lease.set(release)
+        try:
+            # 异常在子任务内处理，避免一个 matcher 失败取消同级 matcher
+            with catch(
+                {
+                    StopPropagation: on_stop,
+                    Exception: nb_message._handle_exception(
+                        "Error when checking Matcher."
+                    ),
+                }
+            ):
+                await nb_message.check_and_run_matcher(
+                    matcher, bot, event, matcher_state, stack, dependency_cache
+                )
+        finally:
+            _dispatch_lease.reset(token)
+            release()
+            leases.discard(release)
+
+    async def admit(tg, lane: str, resource: str, matchers: list[type[Matcher]]):
+        # 每个通道一个排队者，数据库通道饱和不会阻塞其他通道
+        for matcher in matchers:
+            started = time.perf_counter()
+            resource_release = await resource_lanes.acquire(resource)
+            try:
+                lane_release = await _DISPATCH_LANES.acquire(lane)
+            except BaseException:
+                resource_release()
+                raise
+            if (time.perf_counter() - started) * 1000 >= OVERLOAD_LANE_WAIT_MS:
+                signal_overload(2.0)
+            release = combined_lease(resource_release, lane_release)
+            leases.add(release)
+            tg.start_soon(run, matcher, lane, release)
+
     try:
-        await nb_message.check_and_run_matcher(
-            matcher, bot, event, state, stack, dependency_cache
-        )
+        async with anyio.create_task_group() as tg:
+            for (lane, resource), matchers in groups.items():
+                tg.start_soon(admit, tg, lane, resource, matchers)
     finally:
-        current_dispatch_lease.reset(token)
+        for release in list(leases):
+            release()
 
 
-async def _run_selected_matcher(
-    matcher: type[Matcher],
-    bot: Bot,
-    event: Event,
-    state: dict,
-    stack,
-    dependency_cache,
-    lane: str = "command_exact",
-) -> None:
-    release = await _acquire_dispatch_lane(lane)
+@with_official_event_context
+async def handle_event(bot: Bot, event: Event) -> None:
+    """处理事件：按命令文本预筛 matcher，再按通道限流执行
+
+    参数:
+        bot: Bot
+        event: Event
+    """
+    _normalize_qq_self_at_message(bot, event)
+    reserve_binding = _is_account_binding_command(event, bot)
+    show_log = True
+    log_msg = f"<m>{escape_tag(bot.type)} {escape_tag(bot.self_id)}</m> | "
     try:
-        await _run_admitted_matcher(
-            matcher, bot, event, state, stack, dependency_cache, lane
+        log_msg += event.get_log_string()
+    except NoLogException:
+        show_log = False
+    if show_log:
+        nb_logger.opt(colors=True).success(log_msg)
+
+    state: dict[Any, Any] = {}
+    dependency_cache = {}
+    async with AsyncExitStack() as stack:
+        if not await nb_message._apply_event_preprocessors(
+            bot=bot,
+            event=event,
+            state=state,
+            stack=stack,
+            dependency_cache=dependency_cache,
+        ):
+            return
+        try:
+            TrieRule.get_value(bot, event, state)
+        except Exception as e:
+            nb_logger.opt(colors=True, exception=e).warning(
+                "Error while parsing command for event"
+            )
+        context = await _prepare_dispatch_state(bot, event, state)
+        indexed = True
+        try:
+            _HANDLER_ACTIVATION_INDEX.ensure_fresh(matchers)
+        except Exception as exc:
+            indexed = False
+            logger.warning(
+                "matcher 预筛索引构建失败，按适配器筛选", LOGGER_COMMAND, e=exc
+            )
+
+        break_flag = False
+
+        def _handle_stop_propagation(_exc_group) -> None:
+            nonlocal break_flag
+            break_flag = True
+            nb_logger.debug("Stop event propagation")
+
+        for priority in sorted(matchers.keys()):
+            if break_flag:
+                break
+            if show_log:
+                nb_logger.debug(f"Checking for matchers in priority {priority}...")
+            if not (priority_matchers := matchers[priority]):
+                continue
+            with catch(
+                {
+                    StopPropagation: _handle_stop_propagation,
+                    Exception: nb_message._handle_exception(
+                        "<r><bg #f8bbd0>Error when checking Matcher.</bg #f8bbd0></r>"
+                    ),
+                }
+            ):
+                selected = _select_matchers(
+                    priority, priority_matchers, context, bot, indexed, reserve_binding
+                )
+                if selected:
+                    await _dispatch_priority(
+                        selected,
+                        bot,
+                        event,
+                        state,
+                        stack,
+                        dependency_cache,
+                        _handle_stop_propagation,
+                    )
+
+        if show_log:
+            nb_logger.debug("Checking for matchers completed")
+        await nb_message._apply_event_postprocessors(
+            bot, event, state, stack, dependency_cache
         )
-    finally:
-        release()
-
-
-_SELECTOR_DEPS = HandleEventSelectorDependencies(
-    activation_index=_HANDLER_ACTIVATION_INDEX,
-    overload_selected_threshold=OVERLOAD_SELECTED_THRESHOLD,
-    prepare_handle_event_state=_prepare_handle_event_state,
-    build_dispatch_context=_build_dispatch_context,
-    activation_context_from_dispatch=_activation_context_from_dispatch,
-    new_dispatch_budget=_new_dispatch_budget,
-    dispatch_lane_for_matcher=_dispatch_lane_for_matcher,
-    merge_dispatch_budget=_merge_dispatch_budget,
-    build_matcher_state=_build_matcher_state,
-    run_selected_matcher=_run_selected_matcher,
-    acquire_dispatch_lane=_acquire_dispatch_lane,
-    resource_lane_for_matcher=matcher_resource_lane,
-    acquire_resource_lane=resource_lanes.acquire,
-    run_admitted_matcher=_run_admitted_matcher,
-)
 
 
 async def install_dispatch() -> None:
     """建立路由索引并接管 NoneBot 事件分发"""
     await ensure_route_index()
-    install_handle_event_selector(_SELECTOR_DEPS)
+    if _original_handle_events:
+        return
+    _original_handle_events[nb_message] = nb_message.handle_event
+    nb_message.handle_event = handle_event
+    for name in _PATCHED_MODULES:
+        with suppress(Exception):
+            module = importlib.import_module(name)
+            if hasattr(module, "handle_event"):
+                _original_handle_events[module] = module.handle_event
+                setattr(module, "handle_event", handle_event)
 
 
 def uninstall_dispatch() -> None:
     """恢复 NoneBot 原生事件分发"""
-    uninstall_handle_event_selector()
+    for module, original in _original_handle_events.items():
+        setattr(module, "handle_event", original)
+    _original_handle_events.clear()
+    _uninstall_waiter_bridge()

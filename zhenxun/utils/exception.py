@@ -106,3 +106,9 @@ class RenderingError(Exception):
     """
 
     pass
+
+
+class DependencyUnavailable(RuntimeError):
+    """
+    数据库、缓存或发送队列暂不可用，本条消息跳过处理。
+    """

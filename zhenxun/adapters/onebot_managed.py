@@ -5,7 +5,6 @@ import contextlib
 import hashlib
 import inspect
 import json
-import time
 from typing import Any, cast
 
 from nonebot.adapters.onebot.store import ResultStore
@@ -18,7 +17,6 @@ from nonebot.drivers import URL, Request, Response, WebSocket
 from nonebot.exception import WebSocketClosed
 from nonebot.utils import DataclassEncoder, escape_tag
 
-from zhenxun.services.message_inbox import message_inbox
 from zhenxun.services.startup import startup_coordinator
 
 _ADMISSION_TIMEOUT = 30.0
@@ -75,10 +73,6 @@ class ManagedOneBotAdapter(Adapter):
             if not future.done():
                 future.cancel()
 
-    def bot_connect(self, bot):
-        super().bot_connect(bot)
-        message_inbox.register_bot(bot, self.json_to_event, bot.handle_event)
-
     async def _admit(self, self_id: str, timeout: float | None = _ADMISSION_TIMEOUT):
         """等待运行时插件加载完成后再接入 Bot
 
@@ -98,8 +92,6 @@ class ManagedOneBotAdapter(Adapter):
         return False
 
     def __init__(self, *args, **kwargs):
-        self._control_tasks = set()
-        self._last_rejection_warning = float("-inf")
         for name, expected in _UPSTREAM_HASHES.items():
             source = inspect.getsource(getattr(Adapter, name)).rstrip()
             if hashlib.sha256(source.encode()).hexdigest() != expected:
@@ -110,36 +102,10 @@ class ManagedOneBotAdapter(Adapter):
                 raise RuntimeError(f"onebot_receipt_version_unsupported:{name}")
         super().__init__(*args, **kwargs)
 
-    def _offer_event(self, bot, event):
-        if event.get_type() == "message":
-            future = message_inbox.observe(bot, event)
-            future.add_done_callback(self._observe_receipt)
-            return future
-        future = asyncio.get_running_loop().create_future()
-        if len(self._control_tasks) >= 64:
-            future.set_result({"accepted": False, "reason": "control_capacity"})
-            return future
+    def _offer_event(self, bot: Bot, event):
         task = asyncio.create_task(bot.handle_event(event))
-        self._control_tasks.add(task)
-        self.tasks.add(task)
-        task.add_done_callback(self._control_tasks.discard)
         task.add_done_callback(self.tasks.discard)
-        future.set_result({"accepted": True})
-        return future
-
-    def _observe_receipt(self, future):
-        if future.cancelled():
-            return
-        try:
-            receipt = future.result()
-        except Exception:
-            receipt = {"accepted": False, "reason": "persistence_unconfirmed"}
-        if (
-            not receipt["accepted"]
-            and time.monotonic() - self._last_rejection_warning >= 10
-        ):
-            self._last_rejection_warning = time.monotonic()
-            log("WARNING", "Managed message ingress rejected: " + receipt["reason"])
+        self.tasks.add(task)
 
     async def _handle_http(self, request: Request) -> Response:
         self_id = request.headers.get("x-self-id")
@@ -164,10 +130,7 @@ class ManagedOneBotAdapter(Adapter):
                 if self_id not in self.bots:
                     self.bot_connect(bot)
                     log("INFO", f"<y>Bot {escape_tag(self_id)}</y> connected")
-                bot = cast(Bot, bot)
-                receipt = await self._offer_event(bot, event)
-                if not receipt["accepted"]:
-                    return Response(503, content="Message persistence unavailable")
+                self._offer_event(cast(Bot, bot), event)
         else:
             return Response(400, content="Invalid request body")
         return Response(204)

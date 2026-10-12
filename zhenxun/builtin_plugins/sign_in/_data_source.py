@@ -1,14 +1,11 @@
-from datetime import datetime
 from pathlib import Path
 import random
 import secrets
 
 from nonebot_plugin_uninfo import Uninfo
-import pytz
 
 from zhenxun import ui
 from zhenxun.configs.path_config import IMAGE_PATH
-from zhenxun.models.asset_operation import AssetOperation
 from zhenxun.models.friend_user import FriendUser
 from zhenxun.models.goods_info import GoodsInfo
 from zhenxun.models.sign_user import SignUser
@@ -26,7 +23,6 @@ from zhenxun.services.business_identity import (
 )
 from zhenxun.services.hot_query_cache import get_group_user_ids, get_member_names
 from zhenxun.services.log import logger
-from zhenxun.services.message_execution import current_execution, operation_key
 from zhenxun.ui.models import ImageCell, TextCell
 from zhenxun.utils.exception import GoodsNotFound
 from zhenxun.utils.platform import PlatformUtils
@@ -143,37 +139,18 @@ class SignManage:
     @asset_call
     async def _commit_sign(cls, session, nickname, is_card_view):
         platform = PlatformUtils.get_platform(session)
-        now = datetime.now(pytz.timezone("Asia/Shanghai"))
         user_id = await business_user_id(session)
-        receipt_id = None if is_card_view else operation_key("sign.reward", user_id)
         async with asset_transaction(user_id, platform) as user_console:
             user, _ = await SignUser.get_or_create(
                 using_db=current_asset_connection(),
                 user_id=user_id,
                 defaults={"user_console": user_console, "platform": platform},
             )
-            if (
-                receipt_id
-                and await AssetOperation.filter(id=receipt_id)
-                .using_db(current_asset_connection())
-                .exists()
-            ):
-                return (user, session, nickname, -1, user_console.gold, "")
             card_args = None
             if not is_card_view:
                 card_args = await cls._handle_sign_in(user, nickname, session)
             if card_args is None:
                 card_args = (user, session, nickname, -1, user_console.gold, "")
-            if receipt_id:
-                await AssetOperation.create(
-                    using_db=current_asset_connection(),
-                    id=receipt_id,
-                    user_id=user_id,
-                    event_id=current_execution.get().identity,
-                    kind="sign_reward",
-                    state="committed",
-                    payload={"day": str(now.date()), "rewarded": card_args[3] != -1},
-                )
         return card_args
 
     @classmethod

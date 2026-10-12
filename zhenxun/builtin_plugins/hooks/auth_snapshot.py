@@ -43,7 +43,7 @@ async def require_cache(cache_cls: type[RuntimeMemoryCache]) -> None:
         cache_cls: 运行态缓存类
 
     异常:
-        CacheUnavailable: 缓存不可用，消息延后处理
+        CacheUnavailable: 缓存不可用，跳过本条消息
     """
     if not cache_cls.is_loaded():
         await cache_cls.ensure_loaded()
@@ -195,10 +195,6 @@ async def _repair_missing_qq_client_group(
 
     try:
         from zhenxun.models.group_console import GroupConsole
-        from zhenxun.services.message_execution import current_execution
-
-        if execution := current_execution.get():
-            execution.retry_blocked = True
 
         async with _QQ_CLIENT_GROUP_REPAIR_LOCKS.hold(key):
             if _qq_client_group_repair_on_cooldown(key):
@@ -283,7 +279,7 @@ async def build_auth_snapshot(
         bot: Bot
 
     异常:
-        CacheUnavailable: 缓存不可用，消息延后处理
+        CacheUnavailable: 缓存不可用，跳过本条消息
 
     返回:
         AuthSnapshot: 权限快照

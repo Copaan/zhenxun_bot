@@ -9,7 +9,6 @@ from types import TracebackType
 from typing import Any, ClassVar
 
 from nonebot_plugin_uninfo import Uninfo
-import pypinyin
 
 from zhenxun.configs.config import Config
 from zhenxun.services.log import logger
@@ -73,6 +72,8 @@ def cn2py(word: str) -> str:
     参数:
         word: 文本
     """
+    import pypinyin
+
     return "".join("".join(i) for i in pypinyin.pinyin(word, style=pypinyin.NORMAL))
 
 

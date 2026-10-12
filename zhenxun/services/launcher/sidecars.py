@@ -13,7 +13,7 @@ import time
 import urllib.error
 import uuid
 
-from .supervisor import launcher_supervisor
+from .supervisor import launcher_log, launcher_supervisor
 
 WORKER_READY_TIMEOUT = 120.0
 WORKER_READY_POLL_INTERVAL = 0.25
@@ -22,11 +22,6 @@ HTTP_SIDECAR_START_TIMEOUT = 7.0
 
 certificate_pin: str | None = None
 """当前 worker HTTPS 证书指纹，探测 worker 时用于固定证书"""
-
-
-def launcher_log(message: str) -> None:
-    sys.stderr.write(f"[zx launcher] {message}\n")
-    sys.stderr.flush()
 
 
 def creationflags() -> int:

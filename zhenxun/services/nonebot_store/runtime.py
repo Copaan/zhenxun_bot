@@ -779,15 +779,16 @@ def load_managed_plugins() -> dict[str, Any]:
         "failed": failed,
         "checked_at": utc_now(),
     }
-    from .dependencies import DependencyAnalysisError
-    from .environment import capture_environment
+    if manifest.get("pending_verification"):
+        from .dependencies import DependencyAnalysisError
+        from .environment import capture_environment
 
-    try:
-        snapshot = capture_environment(manifest=manifest)
-        status["loaded_mismatches"] = snapshot.loaded_mismatches
-        status["environment_snapshot"] = snapshot.digest
-    except DependencyAnalysisError as error:
-        status["environment_error"] = {"code": error.code, "details": error.details}
+        try:
+            snapshot = capture_environment(manifest=manifest)
+            status["loaded_mismatches"] = snapshot.loaded_mismatches
+            status["environment_snapshot"] = snapshot.digest
+        except DependencyAnalysisError as error:
+            status["environment_error"] = {"code": error.code, "details": error.details}
     write_json(STARTUP_STATUS_FILE, status)
     return status
 

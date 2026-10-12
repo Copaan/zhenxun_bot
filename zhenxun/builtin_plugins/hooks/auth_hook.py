@@ -11,16 +11,12 @@ from nonebot.typing import T_State
 from nonebot_plugin_alconna import UniMsg
 from nonebot_plugin_uninfo import Uninfo
 
-from zhenxun.services.cache.runtime_cache import is_cache_ready
+from zhenxun.services.cache.runtime_cache import is_cache_ready, wait_cache_ready
 from zhenxun.services.log import logger
 from zhenxun.services.message_admission import connection_epochs
-from zhenxun.services.message_execution import (
-    MessageExecutionDeferred,
-    current_execution,
-    defer_execution,
-)
 from zhenxun.services.message_load import is_overloaded, mark_activity
 from zhenxun.services.runtime_bootstrap import register_runtime_bootstrap
+from zhenxun.utils.exception import DependencyUnavailable
 from zhenxun.utils.manager.priority_manager import PriorityLifecycle
 
 from .auth.auth_limit import LimitManager
@@ -111,24 +107,34 @@ def _enforce_platform_contract(
         raise IgnoredException("plugin platform capability unavailable")
 
 
-def _defer_unavailable(function):
+def _skip_unavailable(function):
+    """数据库或缓存不可用、超时时跳过本条消息并记录日志
+
+    参数:
+        function: 事件或运行前处理函数
+
+    返回:
+        包装后的处理函数
+    """
+
     @wraps(function)
     async def wrapped(*args, **kwargs):
         try:
             return await function(*args, **kwargs)
-        except (MessageExecutionDeferred, TimeoutError, asyncio.TimeoutError) as error:
+        except (DependencyUnavailable, TimeoutError, asyncio.TimeoutError) as error:
             reason = str(error) or "permission_dependency_timeout"
-            defer_execution(reason)
-            logger.debug(reason, LOGGER_COMMAND)
-            raise IgnoredException("permission_deferred") from None
+            logger.warning(f"依赖不可用，跳过本条消息: {reason}", LOGGER_COMMAND)
+            raise IgnoredException("permission_dependency_unavailable") from None
 
     return wrapped
 
 
 @event_preprocessor
-@_defer_unavailable
+@_skip_unavailable
 async def _drop_message_before_cache_ready(event: Event, bot: Bot):
     mark_activity()
+    if event.get_type() == "message" and not await wait_cache_ready(10):
+        raise IgnoredException("cache not ready ignore")
     if is_cache_ready():
         from zhenxun.services.bot_group_policy import bot_group_policy_service
         from zhenxun.utils.platform import PlatformUtils
@@ -151,13 +157,9 @@ async def _drop_message_before_cache_ready(event: Event, bot: Bot):
         )
     if event.get_type() != "message":
         return
-    if not is_cache_ready():
-        defer_execution("cache_starting")
-        raise IgnoredException("cache not ready ignore")
-    from zhenxun.services.message_execution import current_execution
     from zhenxun.utils.platform import PlatformUtils
 
-    if current_execution.get() is None and connection_epochs.is_backlog(
+    if connection_epochs.is_backlog(
         bot, PlatformUtils.get_platform_scope(bot), getattr(event, "time", None)
     ):
         raise IgnoredException("drop backlog message")
@@ -186,7 +188,7 @@ def _admit_plugin(matcher: Matcher) -> None:
 
 
 @run_preprocessor
-@_defer_unavailable
+@_skip_unavailable
 async def _auth_preprocessor(
     matcher: Matcher,
     event: Event,
@@ -196,11 +198,7 @@ async def _auth_preprocessor(
     message: UniMsg | None = None,
 ):
     if event.get_type() == "message" and not is_cache_ready():
-        defer_execution("cache_starting")
         raise IgnoredException("cache not ready ignore")
-    if execution := current_execution.get():
-        if execution.deferred_reason:
-            raise IgnoredException("message_deferred")
     _admit_plugin(matcher)
 
     if not adapter_contract_matches(matcher_supported_adapters(matcher), bot.adapter):
@@ -253,7 +251,7 @@ async def _auth_preprocessor(
         )
     except IgnoredException:
         raise
-    except (MessageExecutionDeferred, TimeoutError, asyncio.TimeoutError):
+    except (DependencyUnavailable, TimeoutError, asyncio.TimeoutError):
         raise
     except Exception as exc:
         logger.error("auth check failed", LOGGER_COMMAND, e=exc)

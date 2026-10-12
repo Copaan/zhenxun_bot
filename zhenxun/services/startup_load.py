@@ -569,15 +569,37 @@ class StartupLoadPlanner:
             if entry.phase == "critical_preload":
                 self._load_entry(entry)
 
+    def _uses_library(self, library: str) -> bool:
+        """是否有待加载插件导入或依赖指定的库插件
+
+        参数:
+            library: 库插件模块名
+
+        返回:
+            bool: 是否被使用
+        """
+        return any(
+            any(
+                imported == library or imported.startswith(f"{library}.")
+                for record in entry.file_records.values()
+                for imported in record.get("imports", [])
+            )
+            or library in entry.requires
+            for entry in self.entries.values()
+        )
+
     def prepare_library_plugins(self) -> None:
-        # Some third-party plugins import localstore directly while ORM uses
-        # require() internally. Register both library plugins before any
-        # external module can execute, so import order does not decide whether
-        # NoneBot considers localstore a loaded plugin.
+        """在外部插件执行前注册库插件
+
+        localstore 总是预加载，避免插件直接导入后 NoneBot 不再视其为插件；
+        ORM 仅在有插件使用时预加载。
+        """
         import nonebot
 
         for library in ("nonebot_plugin_localstore", "nonebot_plugin_orm"):
             if importlib.util.find_spec(library) is None:
+                continue
+            if library == "nonebot_plugin_orm" and not self._uses_library(library):
                 continue
             try:
                 nonebot.require(library)
@@ -586,17 +608,7 @@ class StartupLoadPlanner:
                     f"核心依赖插件预加载失败: {library} ({type(error).__name__})"
                 )
 
-        needs_htmlrender = any(
-            any(
-                imported == "nonebot_plugin_htmlrender"
-                or imported.startswith("nonebot_plugin_htmlrender.")
-                for record in entry.file_records.values()
-                for imported in record.get("imports", [])
-            )
-            or "nonebot_plugin_htmlrender" in entry.requires
-            for entry in self.entries.values()
-        )
-        if not needs_htmlrender:
+        if not self._uses_library("nonebot_plugin_htmlrender"):
             return
 
         driver = nonebot.get_driver()
@@ -749,7 +761,7 @@ class StartupLoadPlanner:
 
     def summary(self) -> dict[str, Any]:
         counts = defaultdict(int)
-        status_counts = {"loaded": 0, "failed": 0, "pending": 0}
+        status_counts = {"loaded": 0, "failed": 0, "pending": 0, "unloaded": 0}
         completed = 0
         for entry in self.entries.values():
             counts[entry.phase] += 1
@@ -757,8 +769,8 @@ class StartupLoadPlanner:
             state = (
                 "failed"
                 if entry.plugin_id in self.failed_plugins or entry.status == "failed"
-                else "loaded"
-                if entry.status == "loaded"
+                else entry.status
+                if entry.status in {"loaded", "unloaded"}
                 else "pending"
             )
             status_counts[state] += 1

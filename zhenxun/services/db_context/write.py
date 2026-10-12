@@ -15,7 +15,7 @@ from typing import Any
 from tortoise.backends.base.client import TransactionContext, TransactionContextPooled
 from tortoise.connection import connections
 
-from zhenxun.services.message_execution import MessageExecutionDeferred
+from zhenxun.utils.exception import DependencyUnavailable
 
 Effect = Callable[[], Awaitable[Any]]
 _scope: ContextVar[WriteBatch | None] = ContextVar("cache_write_batch", default=None)
@@ -25,7 +25,7 @@ _RECONCILERS: list[Callable[[tuple | None], None]] = []
 _UNCERTAIN_INVALIDATIONS = {"group_settings", "group_settings_all"}
 
 
-class CacheUnavailable(MessageExecutionDeferred):
+class CacheUnavailable(DependencyUnavailable):
     """No authoritative value is available; this is not a cache miss."""
 
 

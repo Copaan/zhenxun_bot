@@ -503,11 +503,6 @@ class PlatformUtils:
         返回:
             Receipt | None: 是否发送成功
         """
-        from zhenxun.services.message_execution import current_execution
-
-        # Protocol-independent fence, including sends from custom auth hooks.
-        if execution := current_execution.get():
-            execution.retry_blocked = True
         send_message = (
             MessageUtils.build_message(message) if isinstance(message, str) else message
         )

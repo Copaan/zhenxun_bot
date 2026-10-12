@@ -27,6 +27,19 @@ def write_restart_state(state: dict[str, Any]) -> None:
     write_json_locked(_RESTART_STATE_FILE, state)
 
 
+def restart_state_signature() -> tuple[int, int] | None:
+    """重启状态文件的修改时间与大小，用于判断文件是否变化
+
+    返回:
+        tuple[int, int] | None: 修改时间与大小，文件不存在时为 None
+    """
+    try:
+        stat = _RESTART_STATE_FILE.stat()
+    except OSError:
+        return None
+    return stat.st_mtime_ns, stat.st_size
+
+
 def mutate_restart_state(
     mutator, *, write_if: Callable[[Any], bool] | None = None
 ) -> Any:
@@ -143,5 +156,6 @@ __all__ = [
     "issue_restart_ticket",
     "mutate_restart_state",
     "read_restart_state",
+    "restart_state_signature",
     "write_restart_state",
 ]

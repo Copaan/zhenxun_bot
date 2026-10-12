@@ -4,7 +4,7 @@ import asyncio
 from collections.abc import Callable
 import json
 import re
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from pydantic import BaseModel, Field
 
@@ -19,7 +19,9 @@ from zhenxun.services.ai.tools.models import ResolvedToolPayload
 from zhenxun.services.ai.utils.logger import log_tool as logger
 from zhenxun.utils.pydantic_compat import model_dump, model_validate, model_validator
 
-from .toolkit import MCPToolkit
+if TYPE_CHECKING:
+    from .toolkit import MCPToolkit
+
 
 MCP_PATH = DATA_PATH / "ai" / "mcp.json"
 
@@ -215,6 +217,8 @@ class GlobalMCPProvider(ToolProvider):
 
     def _setup_toolkit(self, name: str, conf: MCPServerConfig) -> None:
         """辅助方法：装载单个 MCP Toolkit"""
+        from .toolkit import MCPToolkit
+
         clean_name = re.sub(r"[^a-zA-Z0-9]", "_", name)
         prefix = f"mcp_{clean_name}_"
         self._toolkits[name] = MCPToolkit(
@@ -363,6 +367,8 @@ class MCPSource(BaseModel):
 
         elif self.config:
             import uuid
+
+            from .toolkit import MCPToolkit
 
             temp_server_name = self.server_name or f"inline_mcp_{uuid.uuid4().hex[:8]}"
             inline_toolkit = MCPToolkit(

@@ -131,10 +131,7 @@ def run_worker(project_root: Path) -> None:
         driver.register_adapter(ZhenxunQQAdapter)
         enabled_adapters.append("<c>QQ_Official</c>")
 
-    from zhenxun.services.message_execution import install_matcher_execution
     from zhenxun.services.runtime_bootstrap import register_runtime_bootstrap
-
-    install_matcher_execution()
 
     # Core library plugins are process infrastructure, not side effects of
     # importing zhenxun.services. HTMLRender is loaded lazily by the renderer.

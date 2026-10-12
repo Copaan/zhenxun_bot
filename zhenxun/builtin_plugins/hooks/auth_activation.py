@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 import contextlib
 from dataclasses import dataclass
 import html
@@ -123,12 +123,6 @@ class ActivationContext:
         return self.texts
 
 
-@dataclass(slots=True)
-class ActivationResult:
-    selected: list[type[Matcher]]
-    candidate_count: int = 0
-
-
 class HandlerActivationIndex:
     """In-memory matcher activation index.
 
@@ -148,7 +142,7 @@ class HandlerActivationIndex:
     def compiled(self) -> bool:
         return self._compiled
 
-    def rebuild(self, matchers: dict[int, list[type[Matcher]]]) -> None:
+    def rebuild(self, matchers: Mapping[int, list[type[Matcher]]]) -> None:
         self._matcher_map.clear()
         source_keys: set[tuple[int, tuple[int, ...]]] = set()
         for priority, priority_matchers in matchers.items():
@@ -161,7 +155,7 @@ class HandlerActivationIndex:
         self._shortcut_signature = _alconna_shortcut_signature()
         self._compiled = True
 
-    def ensure_fresh(self, matchers: dict[int, list[type[Matcher]]]) -> None:
+    def ensure_fresh(self, matchers: Mapping[int, list[type[Matcher]]]) -> None:
         source_keys = {
             (int(priority), tuple(id(matcher) for matcher in items))
             for priority, items in matchers.items()
@@ -181,9 +175,18 @@ class HandlerActivationIndex:
         priority: int,
         priority_matchers: list[type[Matcher]],
         context: ActivationContext,
-        budget: dict[str, int],
-    ) -> ActivationResult:
-        result = ActivationResult(selected=[])
+    ) -> list[type[Matcher]]:
+        """选出本优先级中可能命中当前事件的 matcher
+
+        参数:
+            priority: 优先级
+            priority_matchers: 该优先级的 matcher
+            context: 预筛上下文
+
+        返回:
+            list[type[Matcher]]: 选中的 matcher
+        """
+        selected = []
         for matcher in priority_matchers:
             descriptor = self._matcher_map.get(matcher) or self._build_descriptor(
                 matcher, priority
@@ -194,9 +197,8 @@ class HandlerActivationIndex:
                 logger.debug("plugin adapter unsupported: {}", descriptor.module)
                 continue
             if self._select_descriptor(descriptor, context):
-                result.selected.append(matcher)
-        result.candidate_count = len(result.selected)
-        return result
+                selected.append(matcher)
+        return selected
 
     def _select_descriptor(
         self,
@@ -364,39 +366,6 @@ def matcher_has_custom_rule(matcher_cls: type[Matcher]) -> bool:
             continue
         return True
     return False
-
-
-def classify_matcher_lane(
-    matcher_cls: type[Matcher],
-    *,
-    ai_route_modules: set[str] | None = None,
-) -> ActivationLane:
-    module = matcher_module_name(matcher_cls)
-    if ai_route_modules and any(
-        module.casefold() == route_module.casefold()
-        for route_module in ai_route_modules
-    ):
-        return "passive_ai"
-    rules = extract_matcher_rule_descriptors(matcher_cls)
-    command_like = any(rule.command_like for rule in rules)
-    deterministic = any(rule.deterministic_text for rule in rules)
-    if hasattr(matcher_cls, "command"):
-        command_like = True
-    commands = extract_matcher_command_literals(matcher_cls) or ()
-    alconna_descriptors = extract_matcher_alconna_descriptors(matcher_cls)
-    shortcuts = extract_matcher_alconna_shortcuts(matcher_cls)
-    if alconna_descriptors:
-        command_like = True
-    if shortcuts is not None:
-        command_like = True
-    return classify_lane(
-        matcher_cls,
-        module=module,
-        command_like=command_like,
-        deterministic_text=deterministic,
-        shortcuts=shortcuts,
-        commands=commands,
-    )
 
 
 def extract_matcher_rule_descriptors(
@@ -1313,11 +1282,9 @@ PASSIVE_RENDER_HINTS = (
 __all__ = [
     "ActivationContext",
     "ActivationDecision",
-    "ActivationResult",
     "ActivationRuleDescriptor",
     "HandlerActivationIndex",
     "HandlerDescriptor",
-    "classify_matcher_lane",
     "command_matches",
     "extract_matcher_alconna_shortcuts",
     "extract_matcher_command_literals",

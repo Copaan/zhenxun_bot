@@ -293,36 +293,10 @@ class UserConsole(Model):
         """预扣金币；插件最终未执行时可 release 补偿。"""
         from zhenxun.models.asset_operation import AssetOperation
         from zhenxun.services.business_identity import current_business_identity
-        from zhenxun.services.message_execution import current_execution, operation_key
 
         require_positive_amount(gold)
-        operation_id = operation_key(f"fee:{plugin_module}", user_id) or uuid4().hex
+        operation_id = uuid4().hex
         async with asset_transaction(user_id, platform) as user:
-            existing = await asset_queryset(
-                AssetOperation.filter(id=operation_id)
-            ).get_or_none()
-            if existing:
-                if {
-                    key: existing.payload.get(key)
-                    for key in ("gold", "handle", "plugin_module", "platform")
-                } != {
-                    "gold": gold,
-                    "handle": handle.value,
-                    "plugin_module": plugin_module,
-                    "platform": platform,
-                }:
-                    raise RuntimeError("fee_reservation_input_conflict")
-                return GoldReservation(
-                    user_id=user_id,
-                    gold=gold,
-                    handle=handle,
-                    plugin_module=plugin_module,
-                    platform=platform,
-                    operation_id=operation_id,
-                    committed=existing.state == "committed",
-                    released=existing.state == "released",
-                    business_identity=current_business_identity(),
-                )
             if user.gold < gold:
                 raise InsufficientGold()
             updated = await asset_queryset(
@@ -336,13 +310,7 @@ class UserConsole(Model):
                 user_id=user_id,
                 kind="fee",
                 state="reserved",
-                event_id=current_execution.get().identity
-                if current_execution.get()
-                else None,
                 payload={
-                    "event": current_execution.get().identity
-                    if current_execution.get()
-                    else None,
                     "gold": gold,
                     "handle": handle.value,
                     "plugin_module": plugin_module,

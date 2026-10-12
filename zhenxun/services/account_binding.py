@@ -121,31 +121,24 @@ async def _publish(link_id: str) -> None:
         logger.error(f"绑定已提交，定向缓存失效失败 key={link_id}", e=error)
 
 
-async def issue_binding(
-    identity: BusinessIdentity, target_qq: str, *, operation_id: str | None = None
-) -> str:
+async def issue_binding(identity: BusinessIdentity, target_qq: str) -> str:
     if identity.protocol.domain != "qq_api":
         raise BusinessIdentityError("请先在官方 QQ 或频道发送：绑定QQ 目标QQ号码")
-    return await _issue(
-        identity, identity.protocol.key, _qq(target_qq), "bind", operation_id
-    )
+    return await _issue(identity, identity.protocol.key, _qq(target_qq), "bind")
 
 
 async def issue_unbind(
-    identity: BusinessIdentity,
-    linked_identity: str | None = None,
-    *,
-    operation_id: str | None = None,
+    identity: BusinessIdentity, linked_identity: str | None = None
 ) -> str:
     key = linked_identity or identity.protocol.key
     if identity.protocol.domain == "qq_client" and not linked_identity:
         raise BusinessIdentityError("请先查询绑定状态，再发送：解绑QQ 关联身份ID")
-    return await _issue(identity, key, "", "unbind", operation_id)
+    return await _issue(identity, key, "", "unbind")
 
 
-async def _issue(actor, key, target, action, operation_id):
+async def _issue(actor, key, target, action):
     code = "ZX-" + "".join(secrets.choice(_ALPHABET) for _ in range(12))
-    request_id = identity_digest("binding-request", operation_id or uuid4().hex)
+    request_id = identity_digest("binding-request", uuid4().hex)
     async with in_transaction() as db:
         links = await _lock_links(db, actor.protocol.key, key)
         link, acting = links[key], links[actor.protocol.key]
@@ -165,8 +158,6 @@ async def _issue(actor, key, target, action, operation_id):
             target = (
                 await UserConsole.filter(id=link.account_id).using_db(db).get()
             ).user_id
-        if await AccountBindingRequest.filter(id=request_id).using_db(db).exists():
-            raise BusinessIdentityError("此操作已登记；请查询绑定状态或重新发送申请")
         await (
             AccountBindingRequest.filter(identity_id=key, state="pending")
             .using_db(db)

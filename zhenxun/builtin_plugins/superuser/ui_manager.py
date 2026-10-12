@@ -65,6 +65,15 @@ __plugin_meta__ = PluginMetadata(
                 default_value=False,
                 type=bool,
             ),
+            RegisterConfig(
+                module="UI",
+                key="BROWSER_IDLE_CLOSE",
+                value=10,
+                help="渲染浏览器空闲多少分钟后关闭以释放内存，下次渲染时自动启动，"
+                "0 为不关闭",
+                default_value=10,
+                type=int,
+            ),
         ],
     ).to_dict(),
 )

@@ -350,6 +350,10 @@ class PluginPolicyService:
                     row.policy_revision += 1
                     fields.append("policy_revision")
                     await row.save(using_db=connection, update_fields=fields)
+        if not default:
+            from zhenxun.services.plugin_host import plugin_host
+
+            plugin_host.schedule_sync_disabled()
         return await self.global_state(task=task)
 
     async def catalog(self) -> dict[str, list[dict[str, Any]]]:

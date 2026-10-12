@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from dataclasses import dataclass
 from functools import partial
 import logging
@@ -19,17 +20,20 @@ from zhenxun.configs.environment import sync_env_missing_items
 from zhenxun.utils.restart_state import (
     clear_launcher_restart_signal,
     consume_launcher_action,
+    restart_state_signature,
 )
 
 from . import sidecars
 from .maintenance import run as run_maintenance
 from .maintenance import sync_dependencies
-from .sidecars import launcher_log, stop_process
-from .supervisor import launcher_supervisor
+from .sidecars import stop_process
+from .supervisor import launcher_log, launcher_supervisor
 from .transactions import PluginTransactions
 
-WORKER_POLL_INTERVAL = 0.1
+WORKER_POLL_INTERVAL = 0.5
 RESTART_POLL_INTERVAL = 0.5
+# 重启状态文件变化后持续读取的秒数，覆盖重启请求的延迟生效时间
+RESTART_SIGNAL_WINDOW = 2.0
 
 
 @dataclass
@@ -66,6 +70,8 @@ class Launcher:
         self.desired_http_signature: tuple | None = None
         self.desired_ingress_signature: tuple | None = None
         self.next_restart_check = 0.0
+        self.restart_signature: tuple[int, int] | None = None
+        self.restart_window_until = 0.0
 
     @property
     def stopping(self) -> bool:
@@ -374,6 +380,21 @@ class Launcher:
             f"{qq.config.qq_webhook_listen_host}:{qq.config.qq_webhook_listen_port}"
         )
 
+    def _restart_state_changed(self, now: float) -> bool:
+        """重启状态文件是否在最近变化过，未变化时无需加锁读取
+
+        参数:
+            now: 当前 monotonic 时间
+
+        返回:
+            bool: 是否需要读取重启请求
+        """
+        signature = restart_state_signature()
+        if signature != self.restart_signature:
+            self.restart_signature = signature
+            self.restart_window_until = now + RESTART_SIGNAL_WINDOW
+        return now < self.restart_window_until
+
     async def _supervise_step(self, state: _Round) -> bool:
         """监管循环的一次检查
 
@@ -407,7 +428,9 @@ class Launcher:
         now = time.monotonic()
         if now >= self.next_restart_check:
             self.next_restart_check = now + RESTART_POLL_INTERVAL
-            if action := consume_launcher_action():
+            if self._restart_state_changed(now) and (
+                action := consume_launcher_action()
+            ):
                 launcher_supervisor.begin_shutdown(restarting=True)
                 state.restart_requested = True
                 state.restart_action = action
@@ -435,11 +458,13 @@ class Launcher:
         """
         state = _Round(worker)
         self.next_restart_check = 0.0
+        self.restart_signature = None
         try:
             while True:
                 if await self._supervise_step(state):
                     break
-                await asyncio.sleep(WORKER_POLL_INTERVAL)
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(self.stop_event.wait(), WORKER_POLL_INTERVAL)
         finally:
             await self.stop_sidecars()
             if self.webui_tls.http_sidecar_enabled:
@@ -478,7 +503,11 @@ class Launcher:
                 await run_maintenance("update-apply") if pending_job() else False
             )
             return
-        raise SystemExit(state.return_code if state.return_code is not None else 1)
+        if self.stopping:
+            raise self.stop_exit()
+        code = state.return_code if state.return_code is not None else 1
+        launcher_log(f"worker exited unexpectedly (code={code}), launcher exiting")
+        raise SystemExit(code)
 
     async def run(self) -> None:
         await self.startup()

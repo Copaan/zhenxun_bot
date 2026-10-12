@@ -102,7 +102,10 @@ def _files(root: Path):
         pending = [entry]
         while pending:
             path = pending.pop()
-            _safe(path)
+            if path.is_symlink() or (
+                getattr(path.lstat(), "st_file_attributes", 0) & 0x400
+            ):
+                raise ResourceInstallError(f"resource_link_forbidden: {path.name}")
             count += 1
             if count > 200_000:
                 raise ResourceInstallError("resource_entry_limit")

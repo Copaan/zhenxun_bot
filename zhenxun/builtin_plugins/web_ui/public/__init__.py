@@ -12,7 +12,7 @@ router = APIRouter(dependencies=[Depends(require_private_request)])
 
 @router.get("/")
 async def index():
-    snapshot = webui_resources.snapshot
+    snapshot = await webui_resources.refresh()
     if not snapshot.ready:
         return HTMLResponse(
             '<meta charset="utf-8"><meta http-equiv="refresh" content="3">'
@@ -26,7 +26,7 @@ async def index():
 @router.get("/version.json")
 async def version_manifest():
     return JSONResponse(
-        webui_resources.snapshot.public(),
+        (await webui_resources.refresh()).public(),
         headers={"Cache-Control": "no-store"},
     )
 
@@ -52,9 +52,7 @@ async def init_public(app: FastAPI, context=None) -> bool:
     try:
         if not ZhenxunRepoManager.check_webui_exists():
             await ZhenxunRepoManager.webui_update(branch="dist")
-        if context is None:
-            raise RuntimeError("WebUI resource watcher requires lifecycle ownership")
-        await webui_resources.start(context, ZhenxunRepoManager.config.WEBUI_PATH)
+        await webui_resources.start(ZhenxunRepoManager.config.WEBUI_PATH)
         folders = [
             x.name for x in ZhenxunRepoManager.config.WEBUI_PATH.iterdir() if x.is_dir()
         ]

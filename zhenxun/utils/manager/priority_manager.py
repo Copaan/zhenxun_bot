@@ -401,9 +401,10 @@ async def _run_post_management() -> None:
         from zhenxun.services.startup_load import startup_load_planner
 
         if startup_load_planner.prepared:
-            await startup_load_planner.load_runtime()
             from zhenxun.services.plugin_host import plugin_host
 
+            await plugin_host.park_disabled_entries()
+            await startup_load_planner.load_runtime()
             plugin_host.write_index()
         await _run_stage("runtime")
     except asyncio.CancelledError:
@@ -427,8 +428,11 @@ async def _run_post_management() -> None:
             fatal=False,
             error=error,
         )
-        return
-    startup_coordinator.finish_stage("warmup")
+    else:
+        startup_coordinator.finish_stage("warmup")
+    from zhenxun.services.plugin_host import plugin_host
+
+    plugin_host.schedule_sync_disabled()
 
 
 @driver.on_startup

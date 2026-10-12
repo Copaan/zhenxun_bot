@@ -19,7 +19,6 @@ from zhenxun.services.business_identity import (
     BusinessIdentityError,
     resolve_business_identity,
 )
-from zhenxun.services.message_execution import current_execution
 from zhenxun.utils.message import MessageUtils
 
 __plugin_meta__ = PluginMetadata(
@@ -68,10 +67,7 @@ async def bind_account(bot: Bot, event: Event, session: Uninfo, state: T_State):
             if result.get("superseded"):
                 message = "该申请此前已完成，关联关系此后有变化，请发送绑定状态查询。"
         else:
-            execution = current_execution.get()
-            code = await issue_binding(
-                actor, argument, operation_id=execution.identity if execution else None
-            )
+            code = await issue_binding(actor, argument)
             message = (
                 f"请使用 QQ {argument} 在 OneBot 私聊直接发送：\n{code}\n"
                 "群聊请 @当前 Bot 后发送同一绑定码，无需命令头。\n"
@@ -117,12 +113,7 @@ async def unbind_account(bot: Bot, event: Event, session: Uninfo, value: Match[s
                     "该解绑申请此前已完成，关联关系此后有变化，请发送绑定状态查询。"
                 )
         else:
-            execution = current_execution.get()
-            code = await issue_unbind(
-                actor,
-                argument or None,
-                operation_id=execution.identity if execution else None,
-            )
+            code = await issue_unbind(actor, argument or None)
             message = (
                 f"请在当前身份发送：解绑QQ {code}\n5 分钟内有效。"
                 "解绑不返还或拆分绑定期间资产，也不重置签到和领取记录。"

@@ -1,17 +1,13 @@
-"""Bound resource classes while preserving native matcher dispatch and quotas."""
+"""matcher 执行的并发通道"""
 
 import asyncio
-import time
 
 RESOURCE_LIMITS = {
-    "chat": 16,
     "light_plugin": 16,
     "database_read": 8,
     "database_write": 4,
     "render": 2,
     "external_io": 8,
-    "interactive_wait": 64,
-    "delivery": 1,
 }
 _BUILTIN_LANES = {
     "about": "light_plugin",
@@ -36,65 +32,55 @@ def matcher_resource_lane(matcher):
     plugin = getattr(matcher, "plugin", None)
     extra = getattr(getattr(plugin, "metadata", None), "extra", None)
     lane = extra.get("resource_lane") if isinstance(extra, dict) else None
-    if lane in RESOURCE_LIMITS and lane not in {"interactive_wait", "delivery"}:
+    if lane in RESOURCE_LIMITS:
         return lane
     return "external_io"
 
 
 class ResourceLanes:
-    def __init__(self):
+    def __init__(self, limits: dict[str, int] | None = None):
+        self.limits = dict(RESOURCE_LIMITS if limits is None else limits)
         self.semaphores = {
-            lane: asyncio.Semaphore(limit) for lane, limit in RESOURCE_LIMITS.items()
+            lane: asyncio.Semaphore(limit) for lane, limit in self.limits.items()
         }
-        self.stats = {
-            lane: {
-                "active": 0,
-                "waiting": 0,
-                "acquired": 0,
-                "wait_ms": 0.0,
-                "execution_ms": 0.0,
-            }
-            for lane in RESOURCE_LIMITS
-        }
+
+    def busy(self) -> bool:
+        """是否有通道正被占用
+
+        返回:
+            bool: 是否有通道正被占用
+        """
+        return any(
+            gate._value < self.limits[lane] for lane, gate in self.semaphores.items()
+        )
 
     async def acquire(self, lane):
-        gate, stats = self.semaphores[lane], self.stats[lane]
+        """占用一个资源通道
+
+        参数:
+            lane: 资源通道名
+
+        返回:
+            可重复调用的释放函数，带 reacquire 重新占用方法
+        """
+        gate = self.semaphores[lane]
         released = True
-        acquired_at = 0.0
 
         async def reacquire():
-            nonlocal released, acquired_at
-            if not released:
-                return
-            started = time.perf_counter()
-            stats["waiting"] += 1
-            try:
+            nonlocal released
+            if released:
                 await gate.acquire()
-            finally:
-                stats["waiting"] -= 1
-                stats["wait_ms"] += (time.perf_counter() - started) * 1000
-            released = False
-            acquired_at = time.perf_counter()
-            stats["active"] += 1
-            stats["acquired"] += 1
+                released = False
 
         def release():
             nonlocal released
             if not released:
                 released = True
-                stats["active"] -= 1
-                stats["execution_ms"] += (time.perf_counter() - acquired_at) * 1000
                 gate.release()
 
-        release.reacquire = reacquire
+        setattr(release, "reacquire", reacquire)
         await reacquire()
         return release
-
-    def snapshot(self):
-        return {
-            lane: {**values, "limit": RESOURCE_LIMITS[lane]}
-            for lane, values in self.stats.items()
-        }
 
 
 def combined_lease(resource, dispatch):
@@ -110,7 +96,7 @@ def combined_lease(resource, dispatch):
             resource()
             raise
 
-    release.reacquire = reacquire
+    setattr(release, "reacquire", reacquire)
     return release
 
 

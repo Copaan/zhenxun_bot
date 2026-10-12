@@ -1,6 +1,9 @@
 """Durable evidence for account operations and fee reservations."""
 
+from datetime import datetime, timedelta, timezone
+
 from tortoise import fields
+from tortoise.expressions import Q
 
 from zhenxun.services.db_context import Model
 
@@ -17,6 +20,22 @@ class AssetOperation(Model):
 
     class Meta:
         table = "asset_operations"
+
+    @classmethod
+    async def clear_expired(cls, days: int = 7) -> int:
+        """清理已结束超过指定天数的金币预扣、每日签到及旧版事件回执
+
+        参数:
+            days: 保留天数
+
+        返回:
+            int: 删除数量
+        """
+        return await cls.filter(
+            Q(kind__in=["fee", "daily_sign"]) | Q(event_id__isnull=False),
+            state__in=["committed", "released"],
+            update_time__lt=datetime.now(timezone.utc) - timedelta(days=days),
+        ).delete()
 
     @classmethod
     async def _run_script(cls):

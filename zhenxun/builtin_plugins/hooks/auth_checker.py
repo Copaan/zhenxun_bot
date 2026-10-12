@@ -13,14 +13,9 @@ from zhenxun.models.plugin_info import PluginInfo
 from zhenxun.models.user_console import UserConsole
 from zhenxun.services.cache.runtime_sync import RuntimeCacheMutation
 from zhenxun.services.log import logger
-from zhenxun.services.message_execution import (
-    MessageExecutionDeferred,
-    current_execution,
-    defer_execution,
-)
 from zhenxun.services.message_load import is_db_unhealthy
 from zhenxun.utils.enum import GoldHandle, PluginType
-from zhenxun.utils.exception import InsufficientGold
+from zhenxun.utils.exception import DependencyUnavailable, InsufficientGold
 from zhenxun.utils.platform import PlatformUtils
 
 from .auth.auth_ban import auth_ban
@@ -158,7 +153,7 @@ async def _prepare_auth_state(
         state: matcher state
 
     异常:
-        CacheUnavailable: 缓存不可用，消息延后处理
+        CacheUnavailable: 缓存不可用，跳过本条消息
         PermissionExemption: 插件未注册或为隐藏插件，跳过权限检查
 
     返回:
@@ -270,13 +265,13 @@ async def _reserve_gold(
         commit: 副作用提交器
 
     异常:
-        MessageExecutionDeferred: 数据库不可用，消息延后处理
+        DependencyUnavailable: 数据库不可用，跳过本条消息
         SkipPluginException: 金币不足
     """
     from zhenxun.services.business_identity import business_user_id
 
     if is_db_unhealthy():
-        raise MessageExecutionDeferred("cost_database_unavailable")
+        raise DependencyUnavailable("cost_database_unavailable")
     module = prep.profile.module
     try:
         reservation = await UserConsole.reserve_gold(
@@ -361,10 +356,8 @@ async def auth(
         state: matcher state
 
     异常:
-        IgnoredException: 权限不足或需要延后执行
+        IgnoredException: 权限不足或依赖不可用
     """
-    from zhenxun.services.pipeline_metrics import pipeline_metrics
-
     module = matcher.plugin_name or ""
     if not module or _is_hidden_plugin(matcher):
         return
@@ -392,9 +385,6 @@ async def auth(
                 if not cached[0]:
                     raise SkipPluginException(cached[1] or "auth cached skip")
                 return
-            if execution := current_execution.get():
-                if execution.deferred_reason:
-                    raise MessageExecutionDeferred(execution.deferred_reason)
             await _run_auth(
                 matcher, event, bot, session, context, skip_ban, state, commit
             )
@@ -402,15 +392,18 @@ async def auth(
                 side_effect_cache.commits[module] = commit
             else:
                 result = (True, None)
-        except (MessageExecutionDeferred, TimeoutError, asyncio.TimeoutError) as error:
+        except (DependencyUnavailable, TimeoutError, asyncio.TimeoutError) as error:
             reason = (
                 str(error)
-                if isinstance(error, MessageExecutionDeferred)
+                if isinstance(error, DependencyUnavailable)
                 else "permission_timeout"
             )
-            defer_execution(reason)
-            await commit.rollback_all("auth_deferred")
-            logger.debug(reason, LOGGER_COMMAND, session=session)
+            await commit.rollback_all("auth_unavailable")
+            logger.warning(
+                f"权限检查依赖不可用，跳过本条消息: {reason}",
+                LOGGER_COMMAND,
+                session=session,
+            )
             raise IgnoredException("权限检测 ignore") from None
         except SkipPluginException as e:
             await commit.rollback_all("auth_skip")
@@ -442,7 +435,6 @@ async def auth(
             if result is not None and revision == RuntimeCacheMutation.revision:
                 side_effect_cache.auth_results[module] = result
             elapsed = time.time() - start_time
-            pipeline_metrics.observe("permission_wait_ms", elapsed)
             if elapsed > WARNING_THRESHOLD:
                 logger.warning(
                     f"权限检查耗时过长: {elapsed:.3f}s, 模块: {module}",

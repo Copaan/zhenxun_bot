@@ -26,7 +26,6 @@ from zhenxun.models.business_identity import (
 )
 from zhenxun.models.user_console import UserConsole
 from zhenxun.services.cache.bounded_ttl import BoundedTTLCache
-from zhenxun.services.message_execution import current_execution
 from zhenxun.services.platform_identity import business_write_scope
 
 
@@ -326,14 +325,7 @@ async def resolve_business_identity(bot, event, session) -> BusinessIdentity:
         if protocol.domain == "qq_client"
         else None
     )
-    execution = current_execution.get()
-    # The shared execution belongs to one durable event, unlike a ContextVar
-    # copied into each matcher task. Its lock coalesces their first resolution.
-    cache = (
-        execution.business_identities
-        if execution
-        else getattr(event, "_zx_business_identities", None)
-    )
+    cache = getattr(event, "_zx_business_identities", None)
     if cache is None:
         cache = {}
         object.__setattr__(event, "_zx_business_identities", cache)

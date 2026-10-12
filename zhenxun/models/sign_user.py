@@ -1,7 +1,7 @@
 from typing_extensions import Self
 
 from tortoise import fields
-from tortoise.expressions import Q, RawSQL
+from tortoise.expressions import RawSQL
 from tortoise.queryset import QuerySet
 
 from zhenxun.services.asset_transaction import (
@@ -123,7 +123,6 @@ class SignUser(Model):
                 identity_daily_claimed,
                 record_identity_daily_claim,
             )
-            from zhenxun.services.message_execution import current_execution
 
             from .asset_operation import AssetOperation
 
@@ -132,12 +131,7 @@ class SignUser(Model):
             user = locked or await cls.get_user(identity, platform)
             connection = current_asset_connection()
             previous_query = SignLog.filter(user_id=identity).order_by("-create_time")
-            operation_filter = Q(id=key)
-            if execution := current_execution.get():
-                operation_filter |= Q(
-                    user_id=identity, event_id=execution.identity, kind="daily_sign"
-                )
-            operation_query = AssetOperation.filter(operation_filter)
+            operation_query = AssetOperation.filter(id=key)
             if connection is not None:
                 previous_query = previous_query.using_db(connection)
                 operation_query = operation_query.using_db(connection)
@@ -170,9 +164,6 @@ class SignUser(Model):
                 using_db=connection,
                 id=key,
                 user_id=identity,
-                event_id=current_execution.get().identity
-                if current_execution.get()
-                else None,
                 kind="daily_sign",
                 state="committed",
                 payload={"date": str(today)},

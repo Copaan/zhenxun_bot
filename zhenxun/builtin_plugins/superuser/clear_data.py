@@ -1,4 +1,5 @@
 import os
+import shutil
 import time
 
 from nonebot.permission import SUPERUSER
@@ -9,10 +10,12 @@ from nonebot_plugin_alconna import Alconna, on_alconna
 from nonebot_plugin_apscheduler import scheduler
 from nonebot_plugin_session import EventSession
 
-from zhenxun.configs.path_config import TEMP_PATH
+from zhenxun.configs.path_config import DATA_PATH, TEMP_PATH
 from zhenxun.configs.utils import PluginExtraData
+from zhenxun.models.asset_operation import AssetOperation
 from zhenxun.services.log import logger
 from zhenxun.utils.enum import PluginType
+from zhenxun.utils.manager.priority_manager import PriorityLifecycle
 from zhenxun.utils.message import MessageUtils
 from zhenxun.utils.utils import ResourceDirManager
 
@@ -40,6 +43,15 @@ _matcher = on_alconna(
 
 
 ResourceDirManager.add_temp_dir(TEMP_PATH, True)
+
+
+@PriorityLifecycle.on_startup(priority=5)
+async def _remove_legacy_inbox():
+    """删除旧版消息收件箱遗留的数据目录"""
+    path = DATA_PATH / "runtime" / "message-inbox"
+    if path.exists():
+        await run_sync(shutil.rmtree)(path, ignore_errors=True)
+        logger.info("已删除旧版消息收件箱数据目录", "清理临时数据")
 
 
 @_matcher.handle()
@@ -94,3 +106,8 @@ async def _():
         f"自动清理临时数据完成，共清理了 {size / 1024 / 1024:.2f}MB 的数据...",
         "定时任务",
     )
+    try:
+        count = await AssetOperation.clear_expired()
+        logger.info(f"自动清理过期资产回执完成，共 {count} 条", "定时任务")
+    except Exception as e:
+        logger.error("自动清理过期资产回执失败", "定时任务", e=e)

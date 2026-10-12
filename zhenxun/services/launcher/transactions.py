@@ -10,7 +10,7 @@ from zhenxun.services.plugin_store import plugin_store_transaction as source_sto
 from zhenxun.utils.restart_state import clear_pending_restart_state
 
 from .maintenance import run as run_maintenance
-from .sidecars import launcher_log
+from .supervisor import launcher_log
 
 
 class PluginTransactions:

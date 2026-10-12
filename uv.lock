@@ -4229,7 +4229,6 @@ dependencies = [
     { name = "ujson" },
     { name = "urllib3" },
     { name = "uvloop", marker = "sys_platform != 'win32'" },
-    { name = "watchfiles" },
 ]
 
 [package.dev-dependencies]
@@ -4293,7 +4292,6 @@ requires-dist = [
     { name = "ujson", specifier = ">=5.9.0" },
     { name = "urllib3", specifier = ">=2.0.0,<3.0.0" },
     { name = "uvloop", marker = "sys_platform != 'win32'", specifier = ">=0.21.0" },
-    { name = "watchfiles", specifier = ">=1.1.1,<2.0.0" },
 ]
 
 [package.metadata.requires-dev]

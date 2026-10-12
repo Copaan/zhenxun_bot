@@ -1,17 +1,16 @@
 import base64
 import contextlib
 import sys
-from typing import ClassVar, Protocol
+from typing import TYPE_CHECKING, ClassVar, Protocol
 
 from aiocache import cached
-from alibabacloud_devops20210625 import models as devops_20210625_models
-from alibabacloud_devops20210625.client import Client as devops20210625Client
-from alibabacloud_tea_openapi import models as open_api_models
-from alibabacloud_tea_util import models as util_models
 from nonebot.compat import model_dump
 from pydantic import BaseModel, ConfigDict, Field
 
 from zhenxun.utils.http_utils import AsyncHttpx
+
+if TYPE_CHECKING:
+    from alibabacloud_devops20210625.client import Client as devops20210625Client
 
 if sys.version_info >= (3, 11):
     from enum import StrEnum
@@ -321,8 +320,13 @@ class AliyunFileInfo:
     _dynamic_repo_cache: ClassVar[dict[str, str]] = {}
 
     @classmethod
-    async def get_client(cls) -> devops20210625Client:
+    async def get_client(cls) -> "devops20210625Client":
         """获取阿里云客户端"""
+        from alibabacloud_devops20210625.client import (
+            Client as devops20210625Client,
+        )
+        from alibabacloud_tea_openapi import models as open_api_models
+
         config = open_api_models.Config(
             access_key_id=Aliyun_AccessKey_ID,
             access_key_secret=base64.b64decode(
@@ -347,6 +351,9 @@ class AliyunFileInfo:
         """
         try:
             client = await cls.get_client()
+            from alibabacloud_devops20210625 import models as devops_20210625_models
+            from alibabacloud_tea_util import models as util_models
+
             result = []
             page = 1
             per_page = 100
@@ -457,6 +464,9 @@ class AliyunFileInfo:
         """
         try:
             client = await cls.get_client()
+            from alibabacloud_devops20210625 import models as devops_20210625_models
+            from alibabacloud_tea_util import models as util_models
+
             result = []
 
             request = devops_20210625_models.ListRepositoriesRequest(
@@ -525,6 +535,7 @@ class AliyunFileInfo:
             repository_id = await cls._get_repository_id_or_raise(repo)
 
             client = await cls.get_client()
+            from alibabacloud_devops20210625 import models as devops_20210625_models
 
             request = devops_20210625_models.GetFileBlobsRequest(
                 organization_id=ALIYUN_ORG_ID,
@@ -575,6 +586,8 @@ class AliyunFileInfo:
             repository_id = await cls._get_repository_id_or_raise(repo)
 
             client = await cls.get_client()
+            from alibabacloud_devops20210625 import models as devops_20210625_models
+            from alibabacloud_tea_util import models as util_models
 
             request = devops_20210625_models.ListRepositoryTreeRequest(
                 organization_id=ALIYUN_ORG_ID,
@@ -619,6 +632,8 @@ class AliyunFileInfo:
             repository_id = await cls._get_repository_id_or_raise(repo)
 
             client = await cls.get_client()
+            from alibabacloud_devops20210625 import models as devops_20210625_models
+            from alibabacloud_tea_util import models as util_models
 
             request = devops_20210625_models.GetRepositoryCommitRequest(
                 organization_id=ALIYUN_ORG_ID,

@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import signal
 import subprocess
+import sys
 from threading import Event
 import time
 from typing import Any
@@ -20,6 +21,11 @@ from zhenxun.services.lifecycle.deadline import (
     shutdown_budget,
 )
 from zhenxun.utils.process_tree import verified_descendants
+
+
+def launcher_log(message: str) -> None:
+    sys.stderr.write(f"[zx launcher] {message}\n")
+    sys.stderr.flush()
 
 
 @dataclass(slots=True)
@@ -415,6 +421,10 @@ class LauncherSupervisor:
                     force_budget = self._force_budget
                 else:
                     force_budget = ShutdownBudget.start(5.0)
+                launcher_log(
+                    f"{handle.role} (pid={process.pid}) did not exit in time, "
+                    "terminating process tree"
+                )
                 await handle.force_close(force_budget)
             self.release(process, handle.exit_reason or "exited")
         finally:

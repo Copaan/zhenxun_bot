@@ -98,12 +98,6 @@ def register_low_priority_writer(config: LowPriorityWriterConfig) -> None:
 
 async def append_low_priority_record(name: str, record: Any) -> bool:
     """Append a record without doing DB work in the caller's hot path."""
-    from .message_execution import current_execution
-
-    if name in {"chat_history", "statistics"} and current_execution.get() is not None:
-        from .message_inbox import message_inbox
-
-        return await message_inbox.enqueue_delivery(name, record)
     state = _WRITERS.get(name)
     if state is None:
         raise KeyError(f"low priority writer not registered: {name}")
@@ -115,7 +109,9 @@ async def append_low_priority_record(name: str, record: Any) -> bool:
             state.dropped += 1
             _log_drop_if_needed(state)
         state.buffer.append(record)
-        should_wake = len(state.buffer) >= state.config.trigger_size
+        should_wake = (
+            len(state.buffer) == 1 or len(state.buffer) >= state.config.trigger_size
+        )
     if should_wake:
         _wake()
     return True
@@ -158,17 +154,41 @@ async def flush_all_low_priority_writers(
     return total
 
 
+def _next_wait() -> float | None:
+    """距离下一次需要写入的秒数
+
+    返回:
+        float | None: 等待秒数，没有待写入数据时为 None
+    """
+    if should_pause_db_tasks():
+        return _POLL_INTERVAL_SECONDS
+    due = []
+    for state in _WRITERS.values():
+        if not state.buffer:
+            continue
+        if len(state.buffer) >= state.config.trigger_size:
+            due.append(state.backoff_until)
+        else:
+            due.append(
+                max(
+                    state.backoff_until,
+                    state.last_flush_at + state.config.flush_interval_seconds,
+                )
+            )
+    if not due:
+        return None
+    return max(0.0, min(due) - time.monotonic())
+
+
 async def _worker_loop() -> None:
     while not _STOPPING:
         event = _WAKE_EVENT
+        timeout = _next_wait()
         if event is None:
-            await asyncio.sleep(_POLL_INTERVAL_SECONDS)
+            await asyncio.sleep(_POLL_INTERVAL_SECONDS if timeout is None else timeout)
         else:
             try:
-                await asyncio.wait_for(
-                    event.wait(),
-                    timeout=_POLL_INTERVAL_SECONDS,
-                )
+                await asyncio.wait_for(event.wait(), timeout=timeout)
             except asyncio.TimeoutError:
                 pass
             event.clear()

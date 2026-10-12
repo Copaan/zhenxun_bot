@@ -3,7 +3,6 @@ from collections import defaultdict
 from collections.abc import Callable
 from datetime import datetime, timedelta
 import inspect
-import json
 import math
 import time
 from types import MappingProxyType
@@ -19,7 +18,6 @@ from tortoise.timezone import localtime
 
 from zhenxun import ui
 from zhenxun.configs.config import BotConfig
-from zhenxun.models.asset_operation import AssetOperation
 from zhenxun.models.friend_user import FriendUser
 from zhenxun.models.goods_info import GoodsInfo
 from zhenxun.models.user_console import UserConsole
@@ -27,19 +25,16 @@ from zhenxun.models.user_props_log import UserPropsLog
 from zhenxun.services.asset_transaction import (
     account_write,
     asset_transaction,
-    current_asset_connection,
 )
 from zhenxun.services.avatar_service import avatar_service
 from zhenxun.services.business_identity import (
     BusinessIdentityError,
     business_user_id,
-    identity_digest,
     official_group_business_keys,
     resolve_business_identity,
 )
 from zhenxun.services.hot_query_cache import get_group_user_ids, get_member_names
 from zhenxun.services.log import logger
-from zhenxun.services.message_execution import current_execution, operation_key
 from zhenxun.ui.models import ImageCell, TextCell
 from zhenxun.utils.enum import GoldHandle, PropHandle
 from zhenxun.utils.platform import PlatformUtils
@@ -377,24 +372,8 @@ class ShopManage:
             str | MessageFactory | None: 使用完成后返回信息
         """
         identity = await resolve_business_identity(bot, event, session)
-        receipt_id = operation_key("shop.use", identity.storage_key)
         at_user_ids = [at.target for at in at_users]
-        fingerprint = identity_digest(goods_name, num, text, at_user_ids)
         async with asset_transaction(identity.storage_key):
-            db = current_asset_connection()
-            if receipt_id and (
-                receipt := await AssetOperation.filter(id=receipt_id)
-                .using_db(db)
-                .get_or_none()
-            ):
-                if receipt.payload["fingerprint"] != fingerprint:
-                    raise RuntimeError("asset_operation_input_conflict")
-                saved = receipt.payload["result"]
-                return (
-                    UniMessage.load(saved["value"])
-                    if saved["type"] == "message"
-                    else saved["value"]
-                )
             if goods_name.isdigit():
                 try:
                     user = await UserConsole.get_user(user_id=identity.storage_key)
@@ -452,25 +431,6 @@ class ShopManage:
             )
             if not result and param.send_success_msg:
                 result = f"使用道具 {goods.name} {num} 次成功！"
-            if receipt_id:
-                saved = {"type": "plain", "value": result}
-                if isinstance(result, UniMessage):
-                    # Inline media avoids creating files during a DB transaction.
-                    saved = {
-                        "type": "message",
-                        "value": json.loads(
-                            result.dump(media_save_dir=True, json=True)
-                        ),
-                    }
-                await AssetOperation.create(
-                    using_db=db,
-                    id=receipt_id,
-                    user_id=identity.storage_key,
-                    event_id=current_execution.get().identity,
-                    kind="shop.use",
-                    state="committed",
-                    payload={"fingerprint": fingerprint, "result": saved},
-                )
             return result
 
     @classmethod

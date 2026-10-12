@@ -13,8 +13,7 @@ import uuid
 
 from zhenxun.utils.atomic_json import read_json_locked, write_json_locked
 
-from .sidecars import launcher_log
-from .supervisor import launcher_supervisor
+from .supervisor import launcher_log, launcher_supervisor
 
 
 def execute(action: str) -> None:

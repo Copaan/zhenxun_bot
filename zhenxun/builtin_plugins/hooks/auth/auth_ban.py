@@ -33,7 +33,7 @@ async def is_ban(user_id: str | None, group_id: str | None) -> int:
         group_id: 群组ID
 
     异常:
-        CacheUnavailable: ban 缓存不可用，消息延后处理
+        CacheUnavailable: ban 缓存不可用，跳过本条消息
 
     返回:
         int: ban剩余时长，-1时为永久ban，0表示未被ban

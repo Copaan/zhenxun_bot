@@ -7,13 +7,10 @@ from dataclasses import dataclass, field, replace
 from hashlib import sha256
 from html.parser import HTMLParser
 import json
-import logging
 from pathlib import Path
 import re
 import time
 from urllib.parse import unquote, urljoin, urlsplit
-
-from watchfiles import Change, awatch
 
 _EXTENSIONS = {
     ".html",
@@ -43,7 +40,10 @@ _EXTENSIONS = {
     ".ogg",
     ".wav",
 }
-_LOGGER = logging.getLogger(__name__)
+# 入口文件，变化时重新扫描全部资源
+_ENTRY_FILES = ("index.html", "version.json")
+# 资源未就绪时两次扫描的最小间隔秒数
+_RESCAN_INTERVAL = 2.0
 
 
 class _References(HTMLParser):
@@ -57,9 +57,9 @@ class _References(HTMLParser):
         if tag == "base" and values.get("href"):
             self.base = urljoin(self.base, values["href"])
         if tag in {"script", "img", "source", "video", "audio", "iframe"}:
-            if values.get("src"):
-                self.references.append(values["src"])
-        if tag == "link" and values.get("href"):
+            if src := values.get("src"):
+                self.references.append(src)
+        if tag == "link" and (href := values.get("href")):
             if set((values.get("rel") or "").split()) & {
                 "stylesheet",
                 "icon",
@@ -69,7 +69,7 @@ class _References(HTMLParser):
                 "prefetch",
                 "manifest",
             }:
-                self.references.append(values["href"])
+                self.references.append(href)
 
 
 @dataclass(frozen=True)
@@ -93,13 +93,11 @@ class WebUIResources:
     """Publish a stable content fingerprint and the matching entry document."""
 
     def __init__(self, root: Path | None = None):
-        self.root = root.resolve() if root else None
+        self.root = (root or Path("data/web_ui/public")).resolve()
+        self._started = False
         self.snapshot = ResourceSnapshot()
-        self.stop_event = asyncio.Event()
-
-    def contains(self, path: Path) -> bool:
-        root = self.root or Path("data/web_ui/public").resolve()
-        return path.resolve().is_relative_to(root)
+        self._lock = asyncio.Lock()
+        self._scanned_at = 0.0
 
     def _included(self, path: Path) -> bool:
         relative = path.relative_to(self.root)
@@ -173,13 +171,46 @@ class WebUIResources:
         except (OSError, ValueError, UnicodeError):
             return None
 
-    async def start(self, context, root: Path) -> None:
+    async def start(self, root: Path) -> None:
+        """扫描 WebUI 资源目录
+
+        参数:
+            root: 资源目录
+        """
         self.root = root.resolve()
-        self.stop_event = asyncio.Event()
+        self._started = True
+        self._scanned_at = time.monotonic()
         self.snapshot = await asyncio.to_thread(self.scan) or ResourceSnapshot()
-        context.spawn_task(
-            self.watch(), name="webui-published-resources", cancel=self.stop_event.set
-        )
+
+    def _entry_changed(self, snapshot: ResourceSnapshot) -> bool:
+        for name in _ENTRY_FILES:
+            try:
+                current = self._stat(self.root / name)
+            except OSError:
+                current = None
+            if current != snapshot.stats.get(name):
+                return True
+        return False
+
+    async def refresh(self) -> ResourceSnapshot:
+        """入口文件变化或资源未就绪时重新扫描，返回最新快照
+
+        返回:
+            ResourceSnapshot: 资源快照
+        """
+        if not self._started:
+            return self.snapshot
+        async with self._lock:
+            snapshot = self.snapshot
+            if snapshot.ready and not self._entry_changed(snapshot):
+                return snapshot
+            if time.monotonic() - self._scanned_at < _RESCAN_INTERVAL:
+                return snapshot
+            self._scanned_at = time.monotonic()
+            self.snapshot = await asyncio.to_thread(self.scan) or replace(
+                snapshot, ready=False
+            )
+            return self.snapshot
 
     def etag(self, path: Path) -> str | None:
         snapshot = self.snapshot
@@ -191,52 +222,6 @@ class WebUIResources:
         except (OSError, ValueError, TypeError):
             pass
         return None
-
-    async def watch(self) -> None:
-        pending = True
-        changed_at = time.monotonic()
-        while not self.stop_event.is_set():
-            # The parent survives replacement of the complete public directory.
-            try:
-                async for changes in awatch(
-                    self.root.parent,
-                    watch_filter=None,
-                    debounce=100,
-                    step=50,
-                    rust_timeout=500,
-                    yield_on_timeout=True,
-                    stop_event=self.stop_event,
-                ):
-                    relevant = any(
-                        self.contains(path := Path(raw_path))
-                        and (
-                            self._included(path)
-                            or (change != Change.modified and path.suffix == "")
-                        )
-                        for change, raw_path in changes
-                    )
-                    if relevant:
-                        pending = True
-                        changed_at = time.monotonic()
-                        self.snapshot = replace(self.snapshot, ready=False)
-                    if pending and time.monotonic() - changed_at >= 2:
-                        snapshot = await asyncio.to_thread(self.scan)
-                        if snapshot is not None:
-                            self.snapshot = snapshot
-                            pending = False
-                        else:
-                            self.snapshot = replace(self.snapshot, ready=False)
-                            changed_at = time.monotonic()
-            except asyncio.CancelledError:
-                raise
-            except OSError as error:
-                self.snapshot = replace(self.snapshot, ready=False)
-                _LOGGER.warning("WebUI resource watch unavailable: %s", error)
-                try:
-                    await asyncio.wait_for(self.stop_event.wait(), timeout=5)
-                except asyncio.TimeoutError:
-                    pending = True
-                    changed_at = time.monotonic()
 
 
 webui_resources = WebUIResources()

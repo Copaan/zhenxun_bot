@@ -54,6 +54,24 @@ def is_cache_ready() -> bool:
     return _CACHE_READY_EVENT.is_set()
 
 
+async def wait_cache_ready(timeout: float) -> bool:
+    """等待运行时缓存预热完成
+
+    参数:
+        timeout: 最长等待秒数
+
+    返回:
+        bool: 缓存是否已就绪
+    """
+    if _CACHE_READY_EVENT.is_set():
+        return True
+    try:
+        await asyncio.wait_for(_CACHE_READY_EVENT.wait(), timeout)
+    except asyncio.TimeoutError:
+        return False
+    return True
+
+
 class PluginInfoMemoryCache(RuntimeMemoryCache):
     label = "plugin"
     table = "plugin_info"

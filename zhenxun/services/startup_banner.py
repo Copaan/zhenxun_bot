@@ -154,6 +154,7 @@ def ready_summary(status: dict) -> str:
     plugins = (
         f"loaded={counts.get('loaded', 0)} failed={counts.get('failed', 0)} "
         f"pending={counts.get('pending', 0)}"
+        + (f" unloaded={counts['unloaded']}" if counts.get("unloaded") else "")
         if counts is not None
         else "not observed"
     )

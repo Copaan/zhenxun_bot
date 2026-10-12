@@ -101,9 +101,7 @@ register_low_priority_writer(
 @chat_history.handle()
 async def _(message: UniMsg, session: Uninfo):
     entity = get_entity_ids(session)
-    from zhenxun.services.message_execution import current_execution
-
-    if is_overloaded() and current_execution.get() is None:
+    if is_overloaded():
         return
     try:
         from zhenxun.adapters.qq_official.context import get_current_official_context
@@ -129,6 +127,4 @@ async def _(message: UniMsg, session: Uninfo):
             )
         await append_low_priority_record(_WRITER_NAME, record)
     except Exception as e:
-        if current_execution.get() is not None:
-            current_execution.get().errors.append("chat_history_delivery_failed")
         logger.warning("存储聊天记录失败", "chat_history", e=e)

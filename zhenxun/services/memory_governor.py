@@ -54,7 +54,23 @@ async def stop_memory_governor() -> None:
             await task
 
 
+def freeze_heap() -> int:
+    """全量回收后冻结存活对象，之后的分代回收不再扫描这些对象
+
+    返回:
+        int: 回收的对象数
+    """
+    gc.unfreeze()
+    collected = gc.collect(2)
+    gc.freeze()
+    return collected
+
+
 async def _idle_reclaim_loop() -> None:
+    from zhenxun.services.startup import startup_coordinator
+
+    await startup_coordinator.wait_final_available()
+    freeze_heap()
     while True:
         await asyncio.sleep(IDLE_CHECK_INTERVAL_SECONDS)
         if not await _should_reclaim():
@@ -114,17 +130,7 @@ async def _has_active_render_work() -> bool:
         return True
     if snapshot.get("htmlrender_active_tasks", 0):
         return True
-    active_generation = snapshot.get("active_generation")
-    if isinstance(active_generation, dict) and active_generation.get(
-        "active_leases", 0
-    ):
-        return True
-    retiring = snapshot.get("retiring_generations", [])
-    if isinstance(retiring, list):
-        return any(
-            isinstance(item, dict) and item.get("active_leases", 0) for item in retiring
-        )
-    return False
+    return bool(snapshot.get("active_leases", 0))
 
 
 async def _run_reclaim() -> None:
@@ -145,7 +151,7 @@ async def _run_reclaim() -> None:
     cleared["renderer_runtime"] = await _clear_renderer_runtime_caches()
     cleared["message_manager"] = _clear_message_manager_cache()
 
-    collected = gc.collect(2)
+    collected = freeze_heap()
     malloc_trimmed = _malloc_trim()
     after_rss = _get_total_rss()
     _last_reclaim_at = time.monotonic()

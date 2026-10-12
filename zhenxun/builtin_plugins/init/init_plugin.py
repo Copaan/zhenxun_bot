@@ -166,6 +166,14 @@ async def reconcile_plugin_runtime():
             load_plugin.append(plugin.module_name)
         await _handle_setting(plugin, plugin_list, limit_list)
     manager.init()
+    from zhenxun.services.plugin_host import plugin_host
+
+    if plugin_host.parked:
+        load_plugin.extend(
+            path
+            for path in await PluginInfo.all().values_list("module_path", flat=True)
+            if plugin_host.is_parked(str(path))
+        )
     plugin_payload = {
         "plugins": sorted(
             (_plugin_payload(plugin) for plugin in plugin_list),

@@ -73,24 +73,33 @@ async def _launcher_watchdog_loop(launcher_pid: int) -> None:
     except Exception:
         return
     current_pid = os.getpid()
-    while True:
-        await asyncio.sleep(2)
-        if psutil.pid_exists(launcher_pid):
-            continue
-        logger.warning(
-            f"检测到 launcher 进程 {launcher_pid} 已退出，worker 将主动结束...",
-            "RuntimeBootstrap",
-        )
-        timer = threading.Timer(15, os._exit, args=(1,))
-        timer.daemon = True
-        _launcher_force_exit_timer = timer
-        timer.start()
-        with contextlib.suppress(Exception):
-            if os.name == "nt":
-                signal.raise_signal(signal.SIGINT)
-            else:
-                os.kill(current_pid, signal.SIGTERM)
-        await asyncio.Event().wait()
+    loop = asyncio.get_running_loop()
+    exited = loop.create_future()
+
+    def wait_launcher() -> None:
+        with contextlib.suppress(psutil.Error):
+            psutil.Process(launcher_pid).wait()
+        with contextlib.suppress(RuntimeError):
+            loop.call_soon_threadsafe(lambda: exited.done() or exited.set_result(None))
+
+    threading.Thread(
+        target=wait_launcher, name="launcher-watchdog", daemon=True
+    ).start()
+    await exited
+    logger.warning(
+        f"检测到 launcher 进程 {launcher_pid} 已退出，worker 将主动结束...",
+        "RuntimeBootstrap",
+    )
+    timer = threading.Timer(15, os._exit, args=(1,))
+    timer.daemon = True
+    _launcher_force_exit_timer = timer
+    timer.start()
+    with contextlib.suppress(Exception):
+        if os.name == "nt":
+            signal.raise_signal(signal.SIGINT)
+        else:
+            os.kill(current_pid, signal.SIGTERM)
+    await asyncio.Event().wait()
 
 
 def _start_launcher_watchdog(context=None) -> None:
@@ -235,14 +244,7 @@ def register_runtime_bootstrap(_driver) -> None:
     _runtime_hooks_registered = True
 
     from nonebot.exception import IgnoredException
-    from nonebot.message import event_preprocessor, run_postprocessor
-
-    @run_postprocessor
-    async def _record_message_failure(exception: Exception | None) -> None:
-        from zhenxun.services.message_execution import current_execution
-
-        if exception is not None and (execution := current_execution.get()):
-            execution.errors.append(f"matcher:{type(exception).__name__}")
+    from nonebot.message import event_preprocessor
 
     @event_preprocessor
     async def _reject_events_until_runtime_ready() -> None:
@@ -268,24 +270,6 @@ def register_runtime_bootstrap(_driver) -> None:
         with contextlib.suppress(Exception):
             limiter = anyio.to_thread.current_default_thread_limiter()
             limiter.total_tokens = _get_anyio_tokens(workers)
-
-    @PriorityLifecycle.on_startup(
-        priority=-98,
-        stage="management",
-        component_id="management:message_inbox",
-        depends_on=("management:runtime_concurrency",),
-        pass_context=True,
-    )
-    async def _setup_message_inbox(context):
-        from zhenxun.services.message_inbox import message_inbox
-
-        await message_inbox.start(context)
-
-    @PriorityLifecycle.on_shutdown(priority=98, component_id="management:message_inbox")
-    async def _stop_message_inbox():
-        from zhenxun.services.message_inbox import message_inbox
-
-        await message_inbox.close()
 
     @PriorityLifecycle.on_startup(
         priority=-99,
