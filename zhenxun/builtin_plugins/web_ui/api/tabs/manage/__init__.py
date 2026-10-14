@@ -8,7 +8,7 @@ from zhenxun.models.group_console import GroupConsole
 from zhenxun.services.log import logger
 from zhenxun.services.plugin_policy import PluginPolicyError
 from zhenxun.utils.enum import RequestHandleType, RequestType
-from zhenxun.utils.exception import NotFoundError
+from zhenxun.utils.exception import NotFoundError, RequestHandledError
 from zhenxun.utils.platform import PlatformUtils
 
 from ....base_model import Result
@@ -181,6 +181,8 @@ async def _(param: HandleRequest) -> Result:
             return Result.warning_("请求失败，可能该请求已失效或请求数据错误...")
         except NotFoundError:
             return Result.warning_("未找到此Id请求...")
+        except RequestHandledError:
+            return Result.warning_("该请求已被处理或已过期...")
         return Result.ok(info="成功处理了请求!")
     except (ValueError, KeyError):
         return Result.warning_("指定Bot未连接...")
@@ -197,7 +199,12 @@ async def _(param: HandleRequest) -> Result:
     description="忽略请求",
 )
 async def _(param: HandleRequest) -> Result:
-    await FgRequest.ignore(param.id)
+    try:
+        await FgRequest.ignore(param.id)
+    except NotFoundError:
+        return Result.warning_("未找到此Id请求...")
+    except RequestHandledError:
+        return Result.warning_("该请求已被处理或已过期...")
     return Result.ok(info="成功处理了请求!")
 
 
@@ -229,6 +236,8 @@ async def _(param: HandleRequest) -> Result:
         except ActionFailed:
             await FgRequest.expire(param.id)
             return Result.warning_("请求失败，可能该请求已失效或请求数据错误...")
+        except RequestHandledError:
+            return Result.warning_("该请求已被处理或已过期...")
     except (ValueError, KeyError):
         return Result.warning_("指定Bot未连接...")
     except Exception as e:

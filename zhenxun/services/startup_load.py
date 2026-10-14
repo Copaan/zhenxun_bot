@@ -334,6 +334,9 @@ class StartupLoadPlanner:
         entry.duration_ms = round((time.monotonic() - started) * 1000, 2)
         entry.status = "loaded" if result is not None else "failed"
         if result is None:
+            from zhenxun.services.plugin_host.host import purge_failed_import
+
+            purge_failed_import(entry.module_name)
             self.mark_failed(
                 entry.plugin_id, "plugin_import_failed", error=import_error
             )

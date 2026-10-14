@@ -148,7 +148,13 @@ async def gold_rank(session: Uninfo, group_id: str | None, num: int) -> bytes | 
     data_list = []
     platform = PlatformUtils.get_platform(session)
     for i, user in enumerate(user_list):
-        avatar_path = await avatar_service.get_avatar_path(user[2] or platform, user[0])
+        # 身份层记录的是协议域 qq_client / qq_api，头像与图标按 qq 平台处理
+        user_platform = user[2] or platform
+        avatar_path = await avatar_service.get_avatar_path(
+            "qq" if user_platform == "qq_client" else user_platform, user[0]
+        )
+        if user_platform.startswith("qq"):
+            user_platform = "qq"
         data_list.append(
             [
                 TextCell(content=f"{i + 1}"),
@@ -160,7 +166,7 @@ async def gold_rank(session: Uninfo, group_id: str | None, num: int) -> bytes | 
                 TextCell(content=uid2name.get(user[0]) or user[0]),
                 TextCell(content=str(user[1]), bold=True),
                 ImageCell(src=platform_path.resolve().as_uri())
-                if (platform_path := PLATFORM_PATH.get(user[2] or platform))
+                if (platform_path := PLATFORM_PATH.get(user_platform))
                 else TextCell(content=""),
             ]
         )

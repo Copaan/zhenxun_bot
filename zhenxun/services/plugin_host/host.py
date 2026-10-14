@@ -30,6 +30,7 @@ from nonebot.plugin import (
     _revert_plugin,
 )
 from nonebot.plugin.manager import PluginManager
+from nonebot.utils import run_coro_with_catch
 
 from zhenxun.services.log import logger
 from zhenxun.services.memory_governor import freeze_heap
@@ -93,6 +94,36 @@ def _missing_dependency(error: BaseException, module_name: str) -> str | None:
     return None
 
 
+def purge_failed_import(module_name: str) -> None:
+    """清理启动期导入失败的插件已产生的登记与模块
+
+    NoneBot 导入失败时只撤销插件登记，导入过程中已注册的响应器、钩子、
+    定时任务等仍会生效，这里按模块前缀一并移除；定义 Tortoise 模型的模块保留。
+
+    参数:
+        module_name: 插件模块名
+    """
+    prefix = registry.Ownership.build([module_name], [], [])
+    plugins = [p for p in list(_plugins.values()) if prefix.module_owned(p.module_name)]
+    files = [Path(f) for p in plugins if (f := getattr(p.module, "__file__", None))]
+    own = registry.Ownership.build(
+        [module_name, *(p.module_name for p in plugins)],
+        [*(p.id_ for p in plugins), _module_name_to_plugin_id(module_name)],
+        files,
+    )
+    notes: list[str] = []
+    try:
+        registry.remove(registry.collect(own), notes)
+        for plugin in sorted(plugins, key=lambda p: p.id_.count(":"), reverse=True):
+            if _plugins.get(plugin.id_) is plugin:
+                _revert_plugin(plugin)
+        registry.drop_modules(own, registry.model_modules(own))
+    except Exception as error:
+        logger.error(
+            f"插件 {module_name} 加载失败后的清理未完成", _LOG_COMMAND, e=error
+        )
+
+
 def _dependency_files(root: Path) -> set[Path]:
     return {root / name for name in DEPENDENCY_FILES if (root / name).is_file()}
 
@@ -100,9 +131,9 @@ def _dependency_files(root: Path) -> set[Path]:
 async def _run_connect_hook(hook: Any, bot: Any) -> None:
     try:
         async with AsyncExitStack() as stack:
-            await hook(bot=bot, stack=stack, dependency_cache={})
-    except SkippedException:
-        pass
+            await run_coro_with_catch(
+                hook(bot=bot, stack=stack, dependency_cache={}), (SkippedException,)
+            )
     except Exception as error:
         name = getattr(registry._unwrap(hook), "__name__", "?")
         logger.error(f"插件 Bot 连接钩子执行失败: {name}", _LOG_COMMAND, e=error)
@@ -987,12 +1018,19 @@ class PluginHost:
             except Exception as error:
                 logger.error(f"插件 {module_name} 热加载失败", _LOG_COMMAND, e=error)
                 await self._commit([], [], notes)
+                from zhenxun.services.nonebot_store.runtime import (
+                    missing_config_key,
+                )
+
                 missing = _missing_dependency(error, module_name)
+                config_key = missing_config_key(error)
                 return self._finish(
                     ApplyMode.FAILED,
                     [module_name],
                     f"plugin_dependency_missing:{missing}"
                     if missing
+                    else f"plugin_configuration_required:{config_key}"
+                    if config_key
                     else f"plugin_import_failed:{type(error).__name__}",
                     notes,
                 )

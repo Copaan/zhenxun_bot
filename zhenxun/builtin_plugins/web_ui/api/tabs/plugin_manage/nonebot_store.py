@@ -39,6 +39,7 @@ from zhenxun.services.nonebot_store.runtime import (
     generation_native_extensions,
     module_source_path,
     prepare_generation,
+    probe_missing_config,
     record_manual_operations,
     rollback_pending_transaction,
     stage_generation,
@@ -193,11 +194,17 @@ def _registry_warnings(plugin: dict[str, Any]) -> list[dict[str, str]]:
     reasons = []
     if not plugin.get("valid"):
         reasons.append(
-            {"code": "registry_plugin_invalid", "message": "Registry 标记为无效"}
+            {
+                "code": "registry_plugin_invalid",
+                "message": "NoneBot 官方商店的自动加载测试未通过",
+            }
         )
     if plugin.get("skip_test"):
         reasons.append(
-            {"code": "registry_plugin_untested", "message": "Registry 未测试此版本"}
+            {
+                "code": "registry_plugin_untested",
+                "message": "NoneBot 官方商店未测试此版本",
+            }
         )
     supported = plugin.get("supported_adapters")
     if isinstance(supported, list) and supported:
@@ -284,27 +291,28 @@ def _external_version(
         return None
 
 
-def _plugin_transaction(project_link: str) -> dict[str, Any] | None:
-    """查找最近一次包含该插件且已确认回滚的事务
-
-    参数:
-        project_link: 插件包名
+def _plugin_transactions() -> dict[str, dict[str, Any] | None]:
+    """按插件索引最近一次包含它的事务，只保留已确认回滚的事务
 
     返回:
-        dict[str, Any] | None: 需要在商店中展示失败信息的事务
+        dict[str, dict[str, Any] | None]: 插件包名到需要在商店中展示失败信息的事务
     """
     from zhenxun.services.nonebot_store.storage import (
         pending_transaction as recorded_transaction,
     )
     from zhenxun.services.nonebot_store.storage import settled_transactions
 
+    result: dict[str, dict[str, Any] | None] = {}
     for record in (recorded_transaction(), *settled_transactions()):
-        if record and any(
-            item.get("project_link") == project_link
-            for item in record.get("operations", [])
-        ):
-            return record if record.get("rollback_confirmed") else None
-    return None
+        if not record:
+            continue
+        for item in record.get("operations", []):
+            project_link = item.get("project_link")
+            if project_link and project_link not in result:
+                result[project_link] = (
+                    record if record.get("rollback_confirmed") else None
+                )
+    return result
 
 
 def _failure_reasons(transaction: dict[str, Any], project_link: str) -> list[dict]:
@@ -350,10 +358,13 @@ def _catalog_item(
     manifest: dict[str, Any] | None = None,
     inventory: dict[str, str] | None = None,
     pending: dict[str, Any] | None = None,
+    transactions: dict[str, dict[str, Any] | None] | None = None,
 ) -> dict[str, Any]:
     project_link = str(plugin["project_link"])
     if pending is None:
-        pending = _plugin_transaction(project_link)
+        if transactions is None:
+            transactions = _plugin_transactions()
+        pending = transactions.get(project_link)
     managed = _managed_plugin(project_link, manifest)
     if (
         pending
@@ -815,13 +826,15 @@ async def _apply_hot(
         if isinstance(failed, dict) and failed.get("revision") == transaction.get(
             "revision"
         ):
+            code, _, config_key = (str(error) or type(error).__name__).partition(":")
+            config_required = code == "plugin_configuration_required"
             failed["error_code"] = "plugin_hot_apply_failed"
             failed["failure_reasons"] = [
                 {
-                    "code": str(error) or type(error).__name__,
+                    "code": code if config_required else str(error) or code,
                     "store_key": f"nonebot:{plugin['project_link']}",
                     "module_name": module_name,
-                    "paths": [],
+                    "paths": [config_key] if config_required else [],
                 }
             ]
             write_json(PENDING_FILE, failed)
@@ -1104,6 +1117,35 @@ async def _perform_environment_repair(
     )
 
 
+def _catalog_items(
+    entries: list[dict[str, Any]],
+    manifest: dict[str, Any],
+    pending: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """生成商店列表条目，事务记录与已安装包只读取一次
+
+    参数:
+        entries: Registry 与本地托管插件条目
+        manifest: 当前生效的托管清单
+        pending: 待处理事务
+
+    返回:
+        list[dict[str, Any]]: 商店列表条目
+    """
+    inventory = installed_inventory()
+    transactions = None if pending is not None else _plugin_transactions()
+    return [
+        _catalog_item(
+            entry,
+            manifest=manifest,
+            inventory=inventory,
+            pending=pending,
+            transactions=transactions,
+        )
+        for entry in entries
+    ]
+
+
 @router.get(
     "/plugins",
     dependencies=[authentication()],
@@ -1121,19 +1163,13 @@ async def list_plugins(
     refresh: bool = False,
 ) -> Result[dict]:
     try:
-        pending = pending_transaction()
-        manifest = _effective_manifest(pending)
+        pending = await asyncio.to_thread(pending_transaction)
+        manifest = await asyncio.to_thread(_effective_manifest, pending)
         entries, meta = await _catalog_sources(manifest, refresh=refresh)
-        inventory = installed_inventory()
+        catalog = await asyncio.to_thread(_catalog_items, entries, manifest, pending)
         keyword = search.strip().casefold()
         items = []
-        for entry in entries:
-            item = _catalog_item(
-                entry,
-                manifest=manifest,
-                inventory=inventory,
-                pending=pending,
-            )
+        for item in catalog:
             if (
                 item["blocked_reasons"]
                 and not item["managed"]
@@ -1187,7 +1223,8 @@ async def list_plugins(
 )
 async def plugin_detail(project_link: str) -> Result[dict]:
     try:
-        local = _managed_plugin(project_link, _effective_manifest())
+        manifest = await asyncio.to_thread(_effective_manifest)
+        local = _managed_plugin(project_link, manifest)
         try:
             plugin, _ = await get_registry_plugin(project_link)
         except Exception:
@@ -1201,14 +1238,11 @@ async def plugin_detail(project_link: str) -> Result[dict]:
                 raise
             metadata = {"info": {}, "urls": []}
         info = metadata["info"]
+        pending = await asyncio.to_thread(pending_transaction)
+        item = await asyncio.to_thread(_catalog_items, [plugin], manifest, pending)
         return Result.ok(
             {
-                **_catalog_item(
-                    plugin,
-                    manifest=_effective_manifest(),
-                    inventory=installed_inventory(),
-                    pending=pending_transaction(),
-                ),
+                **item[0],
                 "pypi": {
                     "summary": info.get("summary") or "",
                     "requires_python": info.get("requires_python") or "",
@@ -1562,6 +1596,13 @@ async def _apply_analysis(payload: ApplyPayload, binding: str) -> Result[dict]:
                 return _completed(
                     analysis, operation_id, binding, result, _hot_apply_info(action)
                 )
+            # 需要重启才能生效时，先试导入一次，缺少配置则不进入待重启
+            if action != "uninstall" and (
+                config_key := await asyncio.to_thread(
+                    probe_missing_config, module_name, build["path"]
+                )
+            ):
+                raise RuntimeError(f"plugin_configuration_required:{config_key}")
             stage_generation(transaction, build)
             staged = True
             return _completed(
@@ -1612,15 +1653,17 @@ async def _apply_analysis(payload: ApplyPayload, binding: str) -> Result[dict]:
         code = (getattr(error, "code", "") if build_error else "") or (
             "nonebot_plugin_apply_failed"
         )
+        stage = "dependency_build" if build_error else "dependency_transaction"
+        reason, _, config_key = str(error).partition(":")
+        if reason == "plugin_configuration_required":
+            code, stage, diagnostic = reason, "plugin_load", f"缺少配置项 {config_key}"
         logger.error(f"NoneBot 插件应用失败: {code}", "WebUi", e=error)
         _record_failure(analysis, operation_id, binding, code, diagnostic)
         return Result.fail(
             code,
-            code=400 if build_error else 500,
+            code=500 if stage == "dependency_transaction" else 400,
             details={
-                "stage": "dependency_build"
-                if build_error
-                else "dependency_transaction",
+                "stage": stage,
                 "diagnostic": diagnostic,
                 "issues": getattr(error, "details", None),
             },

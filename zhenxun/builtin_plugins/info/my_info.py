@@ -17,6 +17,7 @@ from zhenxun.services.business_identity import business_user_id
 from zhenxun.services.db_context import with_db_timeout
 from zhenxun.services.log import logger
 from zhenxun.services.message_load import is_db_unhealthy
+from zhenxun.utils.common_utils import SqlUtils
 from zhenxun.utils.platform import PlatformUtils
 
 RACE = [
@@ -144,7 +145,10 @@ async def get_chat_history(
             group_id=group_id,
             create_time__gte=filter_date,
         )
-        .annotate(date=RawSQL("DATE(create_time)"), count=Count("id"))
+        .annotate(
+            date=RawSQL(SqlUtils.local_date_sql("create_time")),
+            count=Count("id"),
+        )
         .group_by("date")
         .values("date", "count"),
         "MyInfo.chat_history_chart",

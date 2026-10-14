@@ -724,6 +724,11 @@ def load_managed_plugins() -> dict[str, Any]:
                 _load_managed_plugin(module_name)
                 loaded.append(module_name)
             except Exception as error:
+                from nonebot import logger
+
+                logger.opt(exception=error).error(
+                    f"WebUI 托管的 NoneBot 插件 {module_name} 加载失败"
+                )
                 failure = _safe_plugin_import_failure(error)
                 failed.append(
                     {
@@ -752,7 +757,7 @@ def load_managed_plugins() -> dict[str, Any]:
     return status
 
 
-def _load_managed_plugin(module_name: str) -> None:
+def _load_managed_plugin(module_name: str, *, purge: bool = True) -> None:
     """Load with NoneBot's finder while preserving the original import error."""
     from nonebot.plugin import _managers
     from nonebot.plugin.manager import PluginManager
@@ -768,11 +773,112 @@ def _load_managed_plugin(module_name: str) -> None:
     except BaseException:
         with contextlib.suppress(ValueError):
             _managers.remove(manager)
+        if purge:
+            from zhenxun.services.plugin_host.host import purge_failed_import
+
+            purge_failed_import(module_name)
         raise
+
+
+def missing_config_key(error: BaseException) -> str | None:
+    """导入失败原因是读取了未配置的 NoneBot 全局配置项时，返回对应的环境变量名
+
+    参数:
+        error: 导入时的异常
+
+    返回:
+        str | None: 环境变量名
+    """
+    from nonebot.config import Config
+
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if (
+            isinstance(current, AttributeError)
+            and isinstance(getattr(current, "obj", None), Config)
+            and current.name
+        ):
+            return current.name.upper()
+        current = current.__cause__ or current.__context__
+    return None
+
+
+_PROBE_MARKER = "ZX_CONFIG_PROBE "
+
+
+def probe_missing_config(module_name: str, layer: Path) -> str | None:
+    """在独立子进程中按正式启动的配置试导入候选依赖层里的插件，返回缺少的配置项
+
+    试导入出现其它错误、超时或子进程异常时不作判断，交由重启后的启动验证处理。
+
+    参数:
+        module_name: 插件模块名
+        layer: 候选依赖层目录
+
+    返回:
+        str | None: 缺少的环境变量名
+    """
+    code = (
+        "import sys;"
+        "from zhenxun.services.nonebot_store.runtime import _probe_config_main;"
+        "_probe_config_main(sys.argv[1], sys.argv[2])"
+    )
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", code, module_name, str(layer)],
+            cwd=str(Path.cwd()),
+            env={**os.environ, "PYTHONPATH": subprocess_pythonpath()},
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=120,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    for line in reversed((completed.stdout or "").splitlines()):
+        if line.startswith(_PROBE_MARKER):
+            with contextlib.suppress(ValueError):
+                missing = json.loads(line[len(_PROBE_MARKER) :]).get("missing")
+                return str(missing) if missing else None
+    return None
+
+
+def _probe_config_main(module_name: str, layer: str) -> None:
+    """试导入子进程入口，结果以标记行写入标准输出后立即退出
+
+    参数:
+        module_name: 插件模块名
+        layer: 候选依赖层目录
+    """
+    missing = None
+    try:
+        sys.path.insert(0, layer)
+        import nonebot
+
+        from zhenxun.configs.environment import environment_file
+
+        nonebot.init(
+            _env_file=environment_file(),
+            htmlrender_browser_channel=None,
+            render_backend="playwright",
+            render_playwright={"channel": None},
+        )
+        _load_managed_plugin(module_name, purge=False)
+    except Exception as error:
+        missing = missing_config_key(error)
+    sys.stdout.write(f"\n{_PROBE_MARKER}{json.dumps({'missing': missing})}\n")
+    sys.stdout.flush()
+    os._exit(0)
 
 
 def _safe_plugin_import_failure(error: Exception) -> dict[str, Any]:
     """Reduce an import failure to stable diagnostics without exception contents."""
+    if key := missing_config_key(error):
+        return {"code": "plugin_configuration_required", "paths": [key]}
     current: BaseException | None = error
     seen: set[int] = set()
     for _ in range(8):

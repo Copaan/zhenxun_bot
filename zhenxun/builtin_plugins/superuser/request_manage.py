@@ -25,7 +25,7 @@ from zhenxun.configs.utils import PluginExtraData
 from zhenxun.models.fg_request import FgRequest
 from zhenxun.services.log import logger
 from zhenxun.utils.enum import PluginType, RequestHandleType, RequestType
-from zhenxun.utils.exception import NotFoundError
+from zhenxun.utils.exception import NotFoundError, RequestHandledError
 from zhenxun.utils.image_utils import BuildImage
 from zhenxun.utils.message import MessageUtils
 from zhenxun.utils.utils import get_user_avatar
@@ -145,7 +145,17 @@ async def _(
             await MessageUtils.build_message("请引用消息处理或添加处理Id.").finish()
     handle_id = id.result
     if reply:
-        db_data = await FgRequest.get_or_none(message_ids__contains=reply.id)
+        reply_id = str(reply.id)
+        db_data = next(
+            (
+                req
+                for req in await FgRequest.filter(
+                    message_ids__contains=reply_id
+                ).order_by("-id")
+                if reply_id in (req.message_ids or "").split(",")
+            ),
+            None,
+        )
         if not db_data:
             await MessageUtils.build_message(
                 "未发现此消息的Id，请使用Id进行处理..."
@@ -162,6 +172,10 @@ async def _(
             req = await FgRequest.ignore(handle_id)
     except NotFoundError:
         await MessageUtils.build_message("未发现此id的请求...").finish(reply_to=True)
+    except RequestHandledError:
+        await MessageUtils.build_message("该请求已被处理或已过期...").finish(
+            reply_to=True
+        )
     except Exception as e:
         logger.error(f"处理请求失败 ID: {handle_id}", session=session, e=e)
         await MessageUtils.build_message(f"其他错误, 可能flag已失效...: {e}").finish(
@@ -176,12 +190,15 @@ async def _(
         and req.request_type == RequestType.GROUP
         and handle_type == RequestHandleType.APPROVE
     ):
-        await bot.send_private_msg(
-            user_id=req.user_id,
-            message=f"管理员已同意此次群组邀请，请不要让{BotConfig.self_nickname}受委屈哦（狠狠监控）"
-            "\n在群组中 群组管理员与群主 允许使用管理员帮助"
-            "（包括ban与功能开关等）\n请在群组中发送 '管理员帮助'",
-        )
+        try:
+            await bot.send_private_msg(
+                user_id=req.user_id,
+                message=f"管理员已同意此次群组邀请，请不要让{BotConfig.self_nickname}受委屈哦（狠狠监控）"
+                "\n在群组中 群组管理员与群主 允许使用管理员帮助"
+                "（包括ban与功能开关等）\n请在群组中发送 '管理员帮助'",
+            )
+        except Exception as e:
+            logger.warning("通知邀请人失败", session=req.user_id, e=e)
 
 
 @_read_matcher.handle()

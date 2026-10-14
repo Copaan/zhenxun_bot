@@ -555,13 +555,19 @@ class StoreManager:
             return f"插件 {plugin_name} 已{action}，已请求受控重启"
         if mode == "restart_pending":
             return f"插件 {plugin_name} 已{action}，等待重启后生效"
+        reason = operation.get("reason") or ""
+        if reason.startswith("plugin_configuration_required:"):
+            key = reason.partition(":")[2]
+            return (
+                f"插件 {plugin_name} {action}失败，缺少配置项 {key}，"
+                "请在 系统设置 → 配置中心 → 环境配置 中填写并保存，重启生效后重试"
+            )
         if operation.get("rolled_back"):
             if operation.get("rollback_runtime") in {None, "hot_reloaded"}:
                 return f"插件 {plugin_name} {action}后加载失败，已回滚"
             return (
                 f"插件 {plugin_name} {action}后加载失败，文件已回滚，重启后恢复原版本"
             )
-        reason = operation.get("reason") or ""
         if reason.startswith("plugin_dependency_missing:"):
             missing = reason.partition(":")[2]
             return (

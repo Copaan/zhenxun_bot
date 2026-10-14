@@ -176,6 +176,25 @@ class SqlUtils:
         return query
 
     @classmethod
+    def local_date_sql(cls, column: str, sql_type: str | None = None) -> str:
+        """按 ORM 时区（Asia/Shanghai）取日期的 SQL 表达式
+
+        参数:
+            column: 时间列名
+            sql_type: 数据库类型，默认读取当前配置
+
+        返回:
+            str: SQL 表达式
+        """
+        sql_type = sql_type or BotConfig.get_sql_type()
+        if "sqlite" in sql_type:
+            # SQLite 存的是带偏移的本地时间字符串，DATE() 会先换算成 UTC
+            return f"DATE(SUBSTR({column}, 1, 10))"
+        if "postgres" in sql_type:
+            return f"DATE({column} AT TIME ZONE 'Asia/Shanghai')"
+        return f"DATE({column})"
+
+    @classmethod
     def add_column(
         cls,
         table_name: str,

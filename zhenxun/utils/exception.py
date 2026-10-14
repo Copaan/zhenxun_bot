@@ -32,6 +32,14 @@ class NotFoundError(Exception):
     pass
 
 
+class RequestHandledError(Exception):
+    """
+    请求已被处理
+    """
+
+    pass
+
+
 class GroupConsoleNotFound(Exception):
     """
     群组未找到

@@ -245,6 +245,31 @@ class PlatformUtils:
             )
 
     @classmethod
+    def _qq_superusers(cls, bot: Bot) -> list[str]:
+        """从 SUPERUSERS 中取出可用于该 QQ Bot 的超级用户id
+
+        参数:
+            bot: Bot
+
+        返回:
+            list[str]: 裸 id 与 `适配器:id` 形式中的 id
+        """
+        adapter = _adapter_name(bot).split(maxsplit=1)
+        prefix = f"{adapter[0]}:" if adapter else None
+        result = []
+        for item in bot.config.superusers:
+            item = str(item).strip()
+            if ":" not in item:
+                user_id = item
+            elif prefix and item.startswith(prefix):
+                user_id = item[len(prefix) :]
+            else:
+                continue
+            if user_id and user_id not in result:
+                result.append(user_id)
+        return result
+
+    @classmethod
     async def send_superuser(
         cls,
         bot: Bot | None,
@@ -272,9 +297,12 @@ class PlatformUtils:
         if superuser_id:
             superuser_ids.append(superuser_id)
         elif platform := cls.get_platform(bot):
-            if platform_superusers := BotConfig.get_superuser(platform):
-                superuser_ids = platform_superusers
-            else:
+            superuser_ids = [
+                uid for uid in BotConfig.get_superuser(platform) if str(uid).strip()
+            ]
+            if not superuser_ids and platform == "qq":
+                superuser_ids = cls._qq_superusers(bot)
+            if not superuser_ids:
                 raise NotFindSuperuser()
         if isinstance(message, str):
             message = MessageUtils.build_message(message)

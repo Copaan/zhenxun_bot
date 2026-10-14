@@ -6,6 +6,7 @@ from tortoise.functions import Count
 from zhenxun.models.bot_connect_log import BotConnectLog
 from zhenxun.models.chat_history import ChatHistory
 from zhenxun.models.statistics import Statistics
+from zhenxun.utils.common_utils import SqlUtils
 
 from ....base_model import BaseResultModel, QueryModel
 from ....utils import webui_db_call
@@ -36,14 +37,20 @@ class ApiDataSource:
             call_query = call_query.filter(bot_id=bot_id)
         chat_date_list = await webui_db_call(
             chat_query.filter(create_time__gte=filter_date)
-            .annotate(date=RawSQL("DATE(create_time)"), count=Count("id"))
+            .annotate(
+                date=RawSQL(SqlUtils.local_date_sql("create_time")),
+                count=Count("id"),
+            )
             .group_by("date")
             .values("date", "count"),
             "Dashboard.chat_month_series",
         )
         call_date_list = await webui_db_call(
             call_query.filter(create_time__gte=filter_date)
-            .annotate(date=RawSQL("DATE(create_time)"), count=Count("id"))
+            .annotate(
+                date=RawSQL(SqlUtils.local_date_sql("create_time")),
+                count=Count("id"),
+            )
             .group_by("date")
             .values("date", "count"),
             "Dashboard.call_month_series",

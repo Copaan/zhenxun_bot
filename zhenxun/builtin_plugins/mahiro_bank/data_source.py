@@ -20,6 +20,7 @@ from zhenxun.services.asset_transaction import (
 from zhenxun.services.avatar_service import avatar_service
 from zhenxun.services.business_identity import business_user_id
 from zhenxun.services.log import logger
+from zhenxun.utils.common_utils import SqlUtils
 from zhenxun.utils.enum import BankHandleType, GoldHandle
 
 base_config = Config.get("mahiro_bank")
@@ -273,7 +274,10 @@ class BankManager:
                     create_time__gte=now_start - timedelta(days=7),
                     handle_type=BankHandleType.DEPOSIT,
                 )
-                .annotate(date=RawSQL("DATE(create_time)"), total_amount=Sum("amount"))
+                .annotate(
+                    date=RawSQL(SqlUtils.local_date_sql("create_time")),
+                    total_amount=Sum("amount"),
+                )
                 .group_by("date")
                 .values("date", "total_amount"),
             ]
