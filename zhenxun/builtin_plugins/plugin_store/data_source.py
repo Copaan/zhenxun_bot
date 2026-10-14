@@ -1,12 +1,12 @@
 import asyncio
 from copy import deepcopy
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 import os
 from pathlib import Path
 import shutil
 import tempfile
 import time
-from typing import Any, ClassVar, Literal, overload
+from typing import Any, ClassVar
 
 import ujson as json
 
@@ -16,16 +16,15 @@ from zhenxun.services.cache.bounded_ttl import BoundedTTLCache
 from zhenxun.services.log import logger
 from zhenxun.services.network_proxy import core_network_operation
 from zhenxun.services.plugin_init import PluginInitManager
-from zhenxun.services.plugin_store.plugin_store_coordinator import (
-    coordinated_store_operation,
-)
 from zhenxun.services.plugin_store.plugin_store_receipts import (
-    StoreReceiptStore,
     delete_store_receipt,
     store_receipt,
     write_store_receipt,
 )
 from zhenxun.services.plugin_store.plugin_store_transaction import stage_operation
+from zhenxun.services.runtime_mutation import (
+    coordinated_store_operation,
+)
 from zhenxun.utils.enum import PluginType
 from zhenxun.utils.image_utils import BuildImage, ImageTemplate, RowStyle
 from zhenxun.utils.repo_utils import RepoFileManager
@@ -55,8 +54,6 @@ _PLUGIN_STORE_GENERATION = 0
 class StoreInstallResult:
     dependency_plan: dict[str, Any] = field(default_factory=dict)
     download_source: str = "auto"
-    unchanged: bool = False
-    restart_pending: bool = False
 
     @property
     def dependency_changes(self) -> bool:
@@ -87,10 +84,6 @@ class StoreInstallResult:
         )
         return result
 
-    @property
-    def source_build_required(self) -> bool:
-        return bool(self.dependency_plan.get("source_build_required"))
-
 
 def row_style(column: str, text: str) -> RowStyle:
     """被动技能文本风格
@@ -109,7 +102,6 @@ def row_style(column: str, text: str) -> RowStyle:
 
 
 class StoreManager:
-    _catalog_warnings: ClassVar[list[dict[str, Any]]] = []
     _catalog_health: ClassVar[dict[str, dict[str, Any]]] = {}
     _catalog_health_checked_at: ClassVar[float] = 0.0
     _SOURCE_NAMES: ClassVar[dict[RepoType, str]] = {
@@ -117,57 +109,14 @@ class StoreManager:
         RepoType.GITHUB: "GitHub",
     }
     _BINARY_EXTENSIONS: ClassVar[frozenset[str]] = frozenset(
-        {
-            ".7z",
-            ".avi",
-            ".bin",
-            ".bmp",
-            ".class",
-            ".dat",
-            ".db",
-            ".dll",
-            ".doc",
-            ".docx",
-            ".dylib",
-            ".eot",
-            ".exe",
-            ".flv",
-            ".gif",
-            ".gz",
-            ".ico",
-            ".jpeg",
-            ".jpg",
-            ".mov",
-            ".mp3",
-            ".mp4",
-            ".otf",
-            ".pdf",
-            ".png",
-            ".ppt",
-            ".pptx",
-            ".pyc",
-            ".rar",
-            ".so",
-            ".svg",
-            ".tar",
-            ".tif",
-            ".tiff",
-            ".ttf",
-            ".webp",
-            ".wmv",
-            ".woff",
-            ".woff2",
-            ".xls",
-            ".xlsx",
-            ".xz",
-            ".zip",
-        }
+        ".7z .avi .bin .bmp .class .dat .db .dll .doc .docx .dylib .eot .exe .flv "
+        ".gif .gz .ico .jpeg .jpg .mov .mp3 .mp4 .otf .pdf .png .ppt .pptx .pyc "
+        ".rar .so .svg .tar .tif .tiff .ttf .webp .wmv .woff .woff2 .xls .xlsx .xz "
+        ".zip".split()
     )
 
     @classmethod
-    def _resolve_local_plugin_path(
-        cls, plugin_info: StorePluginInfo, *, is_external: bool
-    ) -> Path:
+    def _resolve_local_plugin_path(cls, plugin_info: StorePluginInfo) -> Path:
         """将商店插件信息映射到本地插件文件/目录路径。"""
         module_parts = plugin_info.module_path.replace("/", ".").split(".")
         plugin_name = next(
@@ -179,6 +128,19 @@ class StoreManager:
             return BASE_PATH / "plugins" / plugin_name
 
         return BASE_PATH / "plugins" / f"{plugin_name}.py"
+
+    @classmethod
+    def runtime_module(cls, plugin_info: StorePluginInfo) -> str:
+        """插件安装后的运行时模块名
+
+        参数:
+            plugin_info: 插件信息
+
+        返回:
+            str: 模块名
+        """
+        path = cls._resolve_local_plugin_path(plugin_info)
+        return ".".join(path.with_suffix("").parts)
 
     @classmethod
     @core_network_operation
@@ -195,7 +157,6 @@ class StoreManager:
 
         cache_key = "plugins_json"
         requested_generation = _PLUGIN_STORE_GENERATION
-        warnings: list[dict[str, Any]] = []
 
         def parse_entries(content: str, source: str) -> list[StorePluginInfo]:
             try:
@@ -209,13 +170,9 @@ class StoreManager:
                 try:
                     entries.append(StorePluginInfo(**raw))
                 except Exception as error:
-                    warnings.append(
-                        {
-                            "source": source,
-                            "index": index,
-                            "code": "catalog_entry_invalid",
-                            "error_type": type(error).__name__,
-                        }
+                    logger.warning(
+                        f"{source} 插件列表第 {index} 项无效: {type(error).__name__}",
+                        LOG_COMMAND,
                     )
             return entries
 
@@ -241,7 +198,6 @@ class StoreManager:
                 parse_entries(plugins, "official"),
                 parse_entries(extra_plugins, "community"),
             )
-            cls._catalog_warnings = warnings
             await _PLUGIN_STORE_DATA_CACHE.set(cache_key, result)
             _PLUGIN_STORE_GENERATION += 1
             return deepcopy(result)
@@ -471,9 +427,7 @@ class StoreManager:
         def is_installed(info: StorePluginInfo) -> bool:
             return (
                 info.module in installed_modules
-                or cls._resolve_local_plugin_path(
-                    info, is_external=is_external
-                ).exists()
+                or cls._resolve_local_plugin_path(info).exists()
             )
 
         if is_remove:
@@ -527,159 +481,225 @@ class StoreManager:
 
         return plugin_info, is_external
 
-    @overload
     @classmethod
     async def add_plugin(
         cls,
         index_or_module: str,
         source: str | None = None,
         *,
-        install_dependencies: bool = True,
         confirm_source_build: bool = False,
-        return_result: Literal[False] = False,
-    ) -> str: ...
-
-    @overload
-    @classmethod
-    async def add_plugin(
-        cls,
-        index_or_module: str,
-        source: str | None = None,
-        *,
-        install_dependencies: bool = True,
-        confirm_source_build: bool = False,
-        return_result: Literal[True],
-    ) -> StoreInstallResult: ...
-
-    @classmethod
-    async def add_plugin(
-        cls,
-        index_or_module: str,
-        source: str | None = None,
-        *,
-        install_dependencies: bool = True,
-        confirm_source_build: bool = False,
-        return_result: bool = False,
-    ) -> str | StoreInstallResult:
+    ) -> str:
         """添加插件
 
         参数:
             index_or_module: 插件id或模块名
             source: 下载源
-            install_dependencies: 是否由商店直接应用安装结果
             confirm_source_build: 是否允许从源码构建依赖
-            return_result: 是否返回安装结果
 
         返回:
-            str | StoreInstallResult: 返回消息或安装结果
+            str: 返回消息
         """
         cls._get_source_order(source)
         plugin_info, is_external = await cls.get_plugin_by_value(index_or_module)
-        if plugin_info.github_url is None:
-            plugin_info.github_url = DEFAULT_GITHUB_URL
-        version_split = plugin_info.version.split("-")
-        if len(version_split) > 1:
-            github_url_split = plugin_info.github_url.split("/tree/")
-            plugin_info.github_url = f"{github_url_split[0]}/tree/{version_split[1]}"
         logger.info(f"正在安装插件 {plugin_info.name}...", LOG_COMMAND)
-        if return_result:
-            return await cls.install_plugin_with_repo(
-                plugin_info,
-                is_external,
-                source,
-                install_dependencies=install_dependencies,
-                confirm_source_build=confirm_source_build,
-            )
-        install_result, runtime = await cls._install_and_apply(
-            plugin_info, is_external, source, confirm_source_build
+        operation = await cls.apply_plugin(
+            plugin_info,
+            is_external,
+            source,
+            confirm_source_build=confirm_source_build,
         )
-        if runtime is None:
-            from zhenxun.utils._restart_utils import request_restart
-
-            _, message = await request_restart("plugin_store")
-            return (
-                f"插件 {plugin_info.name} 已下载，将在重启后与依赖一并安装\n- {message}"
-            )
-        return f"插件 {plugin_info.name} 安装完成\n- 依赖已满足\n- {runtime}"
+        return await cls._command_message("安装", plugin_info.name, operation)
 
     @classmethod
-    async def _install_and_apply(
+    async def _command_message(
+        cls, action: str, plugin_name: str, operation: dict[str, Any]
+    ) -> str:
+        """生成指令回复，需要重启时提交重启请求
+
+        参数:
+            action: 操作名称
+            plugin_name: 插件名称
+            operation: 操作结果
+
+        返回:
+            str: 返回消息
+        """
+        message = cls.operation_info(action, plugin_name, operation)
+        if operation.get("apply_mode") == "restart_pending":
+            from zhenxun.utils._restart_utils import request_restart
+
+            _, restart = await request_restart("plugin_store")
+            message += f"\n- {restart}"
+        return message
+
+    @staticmethod
+    def operation_info(action: str, plugin_name: str, operation: dict) -> str:
+        """商店操作结果说明
+
+        参数:
+            action: 操作名称
+            plugin_name: 插件名称
+            operation: 操作结果
+
+        返回:
+            str: 结果说明
+        """
+        if operation.get("unchanged"):
+            return f"插件 {plugin_name} 已是最新版本"
+        mode = operation.get("apply_mode")
+        if mode == "hot_reloaded":
+            if action in {"热重载", "卸载"}:
+                return f"插件 {plugin_name} 已{action}"
+            return f"插件 {plugin_name} 已{action}并热加载"
+        if mode == "restart_requested":
+            return f"插件 {plugin_name} 已{action}，已请求受控重启"
+        if mode == "restart_pending":
+            return f"插件 {plugin_name} 已{action}，等待重启后生效"
+        if operation.get("rolled_back"):
+            if operation.get("rollback_runtime") in {None, "hot_reloaded"}:
+                return f"插件 {plugin_name} {action}后加载失败，已回滚"
+            return (
+                f"插件 {plugin_name} {action}后加载失败，文件已回滚，重启后恢复原版本"
+            )
+        reason = operation.get("reason") or ""
+        if reason.startswith("plugin_dependency_missing:"):
+            missing = reason.partition(":")[2]
+            return (
+                f"插件 {plugin_name} {action}失败，缺少依赖 {missing}，"
+                "请在插件的 requirements.txt 中声明后重启"
+            )
+        if stopped := operation.get("stopped"):
+            return (
+                f"插件 {plugin_name} {action}失败，{'、'.join(stopped)} 已停用，"
+                "修复后再次热重载即可恢复"
+            )
+        if action == "热重载":
+            if operation.get("reason") == "plugin_not_loaded":
+                return f"插件 {plugin_name} 未加载，无法热重载"
+            return f"插件 {plugin_name} 热重载失败，原版本仍在运行"
+        return f"插件 {plugin_name} 文件已{action}，但运行时应用失败"
+
+    @classmethod
+    @coordinated_store_operation
+    async def apply_plugin(
         cls,
         plugin_info: StorePluginInfo,
         is_external: bool,
-        source: str | None,
-        confirm_source_build: bool,
-    ) -> tuple[StoreInstallResult, str | None]:
-        """安装插件并在运行中生效，加载失败时撤销安装或回滚到原版本
+        source: str | None = None,
+        *,
+        confirm_source_build: bool = False,
+        operation_id: str | None = None,
+    ) -> dict[str, Any]:
+        """下载插件并在运行中生效
+
+        依赖无变化时部署并热加载，加载失败时恢复原文件与原版本；依赖有变化或需要
+        重启时，插件源码写入待重启事务，重启后经启动验证生效。
 
         参数:
             plugin_info: 插件信息
             is_external: 是否是第三方插件
-            source: 下载源
+            source: 下载源，ali 为阿里云，git 为 GitHub，不指定时优先阿里云
             confirm_source_build: 是否允许从源码构建依赖
+            operation_id: 操作 id
 
         返回:
-            tuple[StoreInstallResult, str | None]: 安装结果与生效情况，
-                依赖有变化、待重启安装时生效情况为 None
+            dict[str, Any]: 操作结果
         """
         from zhenxun.services.plugin_host import ApplyMode, plugin_host
 
-        path = cls._resolve_local_plugin_path(plugin_info, is_external=False)
-        module = ".".join(path.with_suffix("").parts)
+        if plugin_info.github_url is None:
+            plugin_info.github_url = DEFAULT_GITHUB_URL
+        if len(version_split := plugin_info.version.split("-")) > 1:
+            repo_url = plugin_info.github_url.split("/tree/")[0]
+            plugin_info.github_url = f"{repo_url}/tree/{version_split[1]}"
+        path = cls._resolve_local_plugin_path(plugin_info)
+        module = cls.runtime_module(plugin_info)
         store_key = cls.store_key(plugin_info, is_external)
-        receipt = StoreReceiptStore.load().get(store_key)
-        with tempfile.TemporaryDirectory(prefix="zhenxun_plugin_backup_") as root:
-            backup = Path(root) / path.name if path.exists() else None
-            if backup is not None:
-                if path.is_dir():
-                    shutil.copytree(path, backup)
+        update = path.exists()
+        with tempfile.TemporaryDirectory(prefix="zhenxun_plugin_store_") as temp_dir:
+            root = Path(temp_dir)
+            candidate, result = await cls._download_plugin(
+                plugin_info, source, root, confirm_source_build
+            )
+            receipt = store_receipt(
+                source="community" if is_external else "official",
+                plugin_info=plugin_info,
+                runtime_module=module,
+                path=candidate,
+                dependency_inputs=result.dependency_inputs,
+            )
+
+            def stage(reason: str) -> dict[str, Any]:
+                return stage_operation(
+                    action="update" if update else "install",
+                    store_key=store_key,
+                    module=plugin_info.module,
+                    runtime_module=module,
+                    live_path=path,
+                    candidate_path=candidate,
+                    receipt=receipt,
+                    reason=reason,
+                    dependency_inputs=result.dependency_inputs,
+                    dependency_packages=result.dependency_packages,
+                    source_build_confirmed=confirm_source_build,
+                    operation_id=operation_id,
+                )
+
+            if result.dependency_changes:
+                reason = "plugin_dependencies_changed"
+                runtime = await plugin_host.request_restart(
+                    {module}, reason, submit_launcher=False
+                )
+                operation = {**runtime.public_dict(), **stage(reason)}
+                logger.info(
+                    f"插件 {plugin_info.name} 及其依赖将在重启时安装", LOG_COMMAND
+                )
+                return {**operation, "actual_download_source": result.download_source}
+            backup = root / "backup" / path.name
+            if update:
+                cls._copy(path, backup)
+            try:
+                cls._deploy(candidate, path)
+                if update:
+                    runtime = await plugin_host.recover_plugin(
+                        module, submit_restart=False
+                    )
                 else:
-                    shutil.copy2(path, backup)
-            result = await cls.install_plugin_with_repo(
-                plugin_info,
-                is_external,
-                source,
-                confirm_source_build=confirm_source_build,
-            )
-            if result.restart_pending:
-                return result, None
-            if backup is None:
-                operation = await plugin_host.load_new_plugin(
-                    module, path, submit_restart=False, dependencies_verified=True
+                    runtime = await plugin_host.load_new_plugin(
+                        module, path, submit_restart=False, dependencies_verified=True
+                    )
+            except Exception:
+                cls._restore(path, backup)
+                if update:
+                    await plugin_host.recover_plugin(module, submit_restart=False)
+                raise
+            operation = runtime.public_dict()
+            if runtime.mode is ApplyMode.HOT_RELOADED:
+                write_store_receipt(store_key, receipt)
+            elif runtime.mode is ApplyMode.FAILED:
+                logger.warning(
+                    f"插件 {plugin_info.name} 加载失败: {runtime.reason}，撤销本次安装",
+                    LOG_COMMAND,
                 )
+                cls._restore(path, backup)
+                operation["rolled_back"] = True
+                if update:
+                    recovery = await plugin_host.recover_plugin(
+                        module, submit_restart=False
+                    )
+                    operation["rollback_runtime"] = recovery.mode.value
             else:
-                operation = await plugin_host.recover_plugin(
-                    module, submit_restart=False
-                )
-            if operation.mode is not ApplyMode.FAILED:
-                return result, cls._runtime_message(operation.mode)
-            logger.warning(
-                f"插件 {plugin_info.name} 加载失败: {operation.reason}，撤销本次安装",
-                LOG_COMMAND,
-            )
-            cls._remove_local(path)
-            if receipt is None:
-                StoreReceiptStore.delete(store_key)
-            else:
-                StoreReceiptStore.set(store_key, receipt)
-            if backup is None:
-                return result, "加载失败，已撤销安装，请查看日志"
-            if backup.is_dir():
-                shutil.copytree(backup, path)
-            else:
-                shutil.copy2(backup, path)
-        recovery = await plugin_host.recover_plugin(module, submit_restart=False)
-        if recovery.mode is ApplyMode.HOT_RELOADED:
-            return result, "新版本加载失败，已回滚到原版本"
-        return result, "新版本加载失败，已回滚文件，重启后恢复原版本"
+                cls._restore(path, backup)
+                operation.update(stage(runtime.reason or "plugin_restart_required"))
+        return {**operation, "actual_download_source": result.download_source}
 
     @staticmethod
-    def _runtime_message(mode: str) -> str:
-        if mode == "hot_reloaded":
-            return "已热加载生效"
-        if mode in {"restart_pending", "restart_requested"}:
-            return "需要重启后生效"
-        return "未能热加载，请查看日志"
+    def _copy(source: Path, target: Path) -> None:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if source.is_dir():
+            shutil.copytree(source, target)
+        else:
+            shutil.copy2(source, target)
 
     @staticmethod
     def _remove_local(path: Path) -> None:
@@ -690,118 +710,122 @@ class StoreManager:
             path.unlink()
 
     @classmethod
-    @coordinated_store_operation
-    async def install_plugin_with_repo(
+    def _deploy(cls, candidate: Path, path: Path) -> None:
+        """将候选源码复制到暂存目录后整体替换插件目录或文件
+
+        参数:
+            candidate: 候选源码
+            path: 插件路径
+        """
+        staging = BASE_PATH.parent / "data" / "runtime" / "plugin-store-staging"
+        staging.mkdir(parents=True, exist_ok=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=f"{path.name}.", dir=staging) as root:
+            new, old = Path(root) / "new", Path(root) / "old"
+            cls._copy(candidate, new)
+            if path.exists():
+                os.replace(path, old)
+            try:
+                os.replace(new, path)
+            except Exception:
+                if old.exists() and not path.exists():
+                    os.replace(old, path)
+                raise
+            cls._remove_local(old)
+
+    @classmethod
+    def _restore(cls, path: Path, backup: Path) -> None:
+        """恢复插件原文件，没有备份时删除插件
+
+        参数:
+            path: 插件路径
+            backup: 备份路径
+        """
+        if backup.exists():
+            cls._deploy(backup, path)
+        else:
+            cls._remove_local(path)
+
+    @classmethod
+    async def _download_plugin(
         cls,
         plugin_info: StorePluginInfo,
-        is_external: bool = False,
-        source: str | None = None,
-        branch: str = "main",
-        *,
-        install_dependencies: bool = True,
+        source: str | None,
+        root: Path,
         confirm_source_build: bool = False,
-    ) -> StoreInstallResult:
-        """安装插件
-
-        依赖无变化时直接部署插件并写入回执；依赖有变化时插件源码与依赖一起写入
-        待重启事务，重启后经启动验证生效。install_dependencies 为 False 时只部署
-        插件，由调用方处理回执与依赖。
+        branch: str = "main",
+    ) -> tuple[Path, StoreInstallResult]:
+        """下载插件到候选目录并预检依赖
 
         参数:
             plugin_info: 插件信息
-            is_external: 是否是第三方插件
             source: 强制使用的源，ali 为阿里云，git 为 GitHub；
                 不指定时优先阿里云，失败后回退 GitHub
-            branch: 默认分支
-            install_dependencies: 是否由商店直接应用安装结果
+            root: 临时目录
             confirm_source_build: 是否允许从源码构建依赖
+            branch: 默认分支
 
         返回:
-            StoreInstallResult: 安装结果
+            tuple[Path, StoreInstallResult]: 候选源码路径与依赖预检结果
         """
         source_order = cls._get_source_order(source)
         errors: list[str] = []
-
-        with tempfile.TemporaryDirectory(prefix="zhenxun_plugin_store_") as temp_dir:
-            staged_result: tuple[list[tuple[Path, Path]], list[Path]] | None = None
-            selected_source: RepoType | None = None
-
-            for repo_type in source_order:
-                source_name = cls._SOURCE_NAMES[repo_type]
-                staging_root = Path(temp_dir) / repo_type.value
-                try:
-                    staged_result = await cls._download_plugin_to_staging(
-                        plugin_info,
-                        repo_type,
-                        branch,
-                        staging_root,
-                    )
-                    selected_source = repo_type
-                    logger.info(
-                        f"插件 {plugin_info.name} 使用{source_name}下载成功",
+        staged_result: tuple[list[tuple[Path, Path]], list[Path]] | None = None
+        selected_source: RepoType | None = None
+        for repo_type in source_order:
+            source_name = cls._SOURCE_NAMES[repo_type]
+            try:
+                staged_result = await cls._download_plugin_to_staging(
+                    plugin_info, repo_type, branch, root / repo_type.value
+                )
+                selected_source = repo_type
+                logger.info(
+                    f"插件 {plugin_info.name} 使用{source_name}下载成功", LOG_COMMAND
+                )
+                break
+            except Exception as e:
+                errors.append(f"{source_name}: {e}")
+                if repo_type != source_order[-1]:
+                    logger.warning(
+                        f"插件 {plugin_info.name} 使用{source_name}下载失败，"
+                        "尝试 GitHub",
                         LOG_COMMAND,
+                        e=e,
                     )
-                    break
-                except Exception as e:
-                    errors.append(f"{source_name}: {e}")
-                    if repo_type != source_order[-1]:
-                        logger.warning(
-                            f"插件 {plugin_info.name} 使用{source_name}下载失败，"
-                            "尝试 GitHub",
-                            LOG_COMMAND,
-                            e=e,
-                        )
-
-            if staged_result is None or selected_source is None:
-                raise PluginStoreException(
-                    f"插件 {plugin_info.name} 下载失败（{'；'.join(errors)}）"
-                )
-
-            deploy_files, requirement_files = staged_result
-            dependency_plan: dict[str, Any] = {
-                "resolved_packages": {},
-                "package_changes": {"added": [], "changed": [], "removed": []},
-                "candidate_inputs": [],
-            }
-            dependency_changes = False
-            if requirement_files:
-                from zhenxun.services.nonebot_store.dependencies import (
-                    DependencyAnalysisError,
-                    preflight_source_requirements,
-                )
-
-                try:
-                    dependency_plan = await preflight_source_requirements(
-                        requirement_files
-                    )
-                except DependencyAnalysisError as error:
-                    raise PluginStoreException(error.code) from error
-                changes = dependency_plan.get("package_changes", {})
-                dependency_changes = bool(
-                    changes.get("added") or changes.get("changed")
-                )
-                if (
-                    dependency_changes
-                    and dependency_plan.get("source_build_required")
-                    and not confirm_source_build
-                ):
-                    raise PluginStoreException("source_build_confirmation_required")
-                if not dependency_changes:
-                    logger.info(
-                        f"插件 {plugin_info.module_path} 的依赖已满足，跳过安装",
-                        LOG_COMMAND,
-                    )
-
-            result = StoreInstallResult(
-                dependency_plan=dependency_plan,
-                download_source="ali" if selected_source == RepoType.ALIYUN else "git",
+        if staged_result is None or selected_source is None:
+            raise PluginStoreException(
+                f"插件 {plugin_info.name} 下载失败（{'；'.join(errors)}）"
             )
-            if not install_dependencies:
-                cls._deploy_staged_plugin(plugin_info, deploy_files)
-                return result
-            return cls._apply_install(
-                plugin_info, is_external, deploy_files, result, confirm_source_build
+
+        deploy_files, requirement_files = staged_result
+        dependency_plan: dict[str, Any] = {}
+        if requirement_files:
+            from zhenxun.services.nonebot_store.dependencies import (
+                DependencyAnalysisError,
             )
+            from zhenxun.services.plugin_store.plugin_store_transaction import (
+                preflight_source_requirements,
+            )
+
+            try:
+                dependency_plan = await preflight_source_requirements(requirement_files)
+            except DependencyAnalysisError as error:
+                raise PluginStoreException(error.code) from error
+        result = StoreInstallResult(
+            dependency_plan=dependency_plan,
+            download_source="ali" if selected_source == RepoType.ALIYUN else "git",
+        )
+        if (
+            result.dependency_changes
+            and dependency_plan.get("source_build_required")
+            and not confirm_source_build
+        ):
+            raise PluginStoreException("source_build_confirmation_required")
+        local_path = cls._resolve_local_plugin_path(plugin_info)
+        candidate = root / "candidate" / local_path.name
+        for staged_path, destination_path in deploy_files:
+            cls._copy(staged_path, candidate / destination_path.relative_to(local_path))
+        return candidate, result
 
     @classmethod
     def store_key(cls, plugin_info: StorePluginInfo, is_external: bool) -> str:
@@ -815,130 +839,6 @@ class StoreManager:
             str: 商店插件标识
         """
         return f"{'community' if is_external else 'official'}:{plugin_info.module}"
-
-    @classmethod
-    def _apply_install(
-        cls,
-        plugin_info: StorePluginInfo,
-        is_external: bool,
-        deploy_files: list[tuple[Path, Path]],
-        result: StoreInstallResult,
-        confirm_source_build: bool,
-    ) -> StoreInstallResult:
-        """应用下载好的插件，依赖有变化时与源码一起写入待重启事务
-
-        参数:
-            plugin_info: 插件信息
-            is_external: 是否是第三方插件
-            deploy_files: 暂存文件与部署路径
-            result: 安装结果
-            confirm_source_build: 是否允许从源码构建依赖
-
-        返回:
-            StoreInstallResult: 安装结果
-        """
-        local_path = cls._resolve_local_plugin_path(plugin_info, is_external=False)
-        store_key = cls.store_key(plugin_info, is_external)
-        source = "community" if is_external else "official"
-        runtime_module = ".".join(local_path.with_suffix("").parts)
-        if not result.dependency_changes:
-            cls._deploy_staged_plugin(plugin_info, deploy_files)
-            write_store_receipt(
-                store_key,
-                store_receipt(
-                    source=source,
-                    plugin_info=plugin_info,
-                    runtime_module=runtime_module,
-                    path=local_path,
-                    dependency_inputs=result.dependency_inputs,
-                ),
-            )
-            return result
-        installed = local_path.exists()
-        with tempfile.TemporaryDirectory(prefix="zhenxun_plugin_candidate_") as root:
-            candidate = Path(root) / local_path.name
-            for staged_path, destination_path in deploy_files:
-                target = candidate / destination_path.relative_to(local_path)
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(staged_path, target)
-            stage_operation(
-                action="update" if installed else "install",
-                store_key=store_key,
-                module=plugin_info.module,
-                runtime_module=runtime_module,
-                live_path=local_path,
-                candidate_path=candidate,
-                base_source_path=None
-                if installed
-                else local_path.parent / f".{local_path.name}.missing",
-                base_digest=None if installed else "missing",
-                receipt=store_receipt(
-                    source=source,
-                    plugin_info=plugin_info,
-                    runtime_module=runtime_module,
-                    path=candidate,
-                    dependency_inputs=result.dependency_inputs,
-                ),
-                reason="plugin_dependencies_changed",
-                dependency_inputs=result.dependency_inputs,
-                dependency_packages=result.dependency_packages,
-                source_build_confirmed=confirm_source_build,
-            )
-        logger.info(
-            f"插件 {plugin_info.module_path} 及其依赖将在重启时安装", LOG_COMMAND
-        )
-        return replace(result, restart_pending=True)
-
-    @classmethod
-    def _deploy_staged_plugin(
-        cls,
-        plugin_info: StorePluginInfo,
-        deploy_files: list[tuple[Path, Path]],
-    ) -> None:
-        local_path = cls._resolve_local_plugin_path(plugin_info, is_external=False)
-        local_path.parent.mkdir(parents=True, exist_ok=True)
-        if not plugin_info.is_dir:
-            if len(deploy_files) != 1:
-                raise PluginStoreException("单文件插件下载结果不唯一")
-            staged_path = deploy_files[0][0]
-            fd, temp_name = tempfile.mkstemp(
-                prefix=f".{local_path.name}.", dir=local_path.parent
-            )
-            os.close(fd)
-            temp_path = Path(temp_name)
-            try:
-                shutil.copy2(staged_path, temp_path)
-                os.replace(temp_path, local_path)
-            finally:
-                temp_path.unlink(missing_ok=True)
-            return
-
-        transaction_root = (
-            BASE_PATH.parent / "data" / "runtime" / "plugin-store-staging"
-        )
-        transaction_root.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(
-            prefix=f"{local_path.name}.", dir=transaction_root
-        ) as transaction_dir:
-            transaction_path = Path(transaction_dir)
-            staged_deploy = transaction_path / "new"
-            old_path = transaction_path / "old"
-            staged_deploy.mkdir()
-            for staged_path, destination_path in deploy_files:
-                relative = destination_path.relative_to(local_path)
-                target = staged_deploy / relative
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(staged_path, target)
-            if local_path.exists():
-                os.replace(local_path, old_path)
-            try:
-                os.replace(staged_deploy, local_path)
-            except Exception:
-                if old_path.exists() and not local_path.exists():
-                    os.replace(old_path, local_path)
-                raise
-            if old_path.exists():
-                shutil.rmtree(old_path, onerror=win_on_rm_error)
 
     @staticmethod
     def _get_source_order(source: str | None) -> tuple[RepoType, ...]:
@@ -1023,9 +923,7 @@ class StoreManager:
                 f"仓库中未找到插件目录: {plugin_info.module_path}"
             )
 
-        local_plugin_path = cls._resolve_local_plugin_path(
-            plugin_info, is_external=repo_type != RepoType.GITHUB
-        )
+        local_plugin_path = cls._resolve_local_plugin_path(plugin_info)
         target_root = (
             local_plugin_path if plugin_info.is_dir else local_plugin_path.parent
         )
@@ -1097,7 +995,6 @@ class StoreManager:
         return deploy_files, requirement_files
 
     @classmethod
-    @coordinated_store_operation
     async def remove_plugin(cls, index_or_module: str) -> str:
         """移除插件
 
@@ -1107,37 +1004,107 @@ class StoreManager:
         返回:
             str: 返回消息
         """
-        plugin_info, is_store_external = await cls.get_plugin_by_value(
+        plugin_info, is_external = await cls.get_plugin_by_value(
             index_or_module, is_remove=True
         )
-        is_external = not plugin_info.module_path.startswith("zhenxun.")
-        path = cls._resolve_local_plugin_path(plugin_info, is_external=is_external)
-        if not path.exists():
-            return f"插件 {plugin_info.name} 不存在..."
+        operation = await cls.uninstall_plugin(plugin_info, is_external)
+        return await cls._command_message("卸载", plugin_info.name, operation)
+
+    @classmethod
+    @coordinated_store_operation
+    async def uninstall_plugin(
+        cls,
+        plugin_info: StorePluginInfo,
+        is_external: bool,
+        *,
+        operation_id: str | None = None,
+    ) -> dict[str, Any]:
+        """卸载并删除插件，无法热卸载的插件写入待重启事务，重启后删除
+
+        参数:
+            plugin_info: 插件信息
+            is_external: 是否是第三方插件
+            operation_id: 操作 id
+
+        返回:
+            dict[str, Any]: 操作结果
+        """
         from zhenxun.services.plugin_host import ApplyMode, plugin_host
 
-        module = ".".join(path.with_suffix("").parts)
-        operation = await plugin_host.unload_plugin(module)
-        unloaded = operation.mode is ApplyMode.HOT_RELOADED
+        path = cls._resolve_local_plugin_path(plugin_info)
+        if not path.exists():
+            raise PluginStoreException(f"插件 {plugin_info.name} 不存在...")
+        module = cls.runtime_module(plugin_info)
+        store_key = cls.store_key(plugin_info, is_external)
+        classification = plugin_host.classification_for(module)
+        reasons = classification.get("reload_reasons") or []
+        loaded = "not_loaded" not in reasons
+        if loaded and classification.get("reload_support") != "hot_reloadable":
+            if any(
+                registered == module or registered.startswith(f"{module}.")
+                for registered, model in PluginInitManager.plugins.items()
+                if model.remove
+            ):
+                raise PluginStoreException("legacy_lifecycle_not_transactional")
+            reason = str((reasons or ["plugin_not_hot_reloadable"])[0])
+            operation = stage_operation(
+                action="uninstall",
+                store_key=store_key,
+                module=plugin_info.module,
+                runtime_module=module,
+                live_path=path,
+                candidate_path=None,
+                receipt=None,
+                reason=reason,
+                operation_id=operation_id,
+            )
+            return {
+                **operation,
+                "status": "pending_restart",
+                "changed": [plugin_info.module],
+                "reason": reason,
+                "generation": plugin_host.generation,
+            }
+        pending_reason = (
+            plugin_host.last_operation.reason
+            if not loaded and plugin_host.last_operation is not None
+            else None
+        )
+        operation = {
+            "apply_mode": "hot_reloaded",
+            "status": "completed",
+            "changed": [],
+            "reason": None,
+            "generation": plugin_host.generation,
+        }
+        if loaded:
+            runtime = await plugin_host.unload_plugin(module)
+            operation = runtime.public_dict()
+            if runtime.mode is ApplyMode.FAILED:
+                operation["rolled_back"] = True
+                return operation
         logger.debug(f"尝试移除插件 {plugin_info.name} 文件: {path}", LOG_COMMAND)
-        try:
-            cls._remove_local(path)
-        except Exception:
-            if unloaded:
-                await plugin_host.recover_plugin(module, submit_restart=False)
-            raise
-        delete_store_receipt(cls.store_key(plugin_info, is_store_external), path)
+        with tempfile.TemporaryDirectory(prefix="zhenxun_plugin_remove_") as root:
+            backup = Path(root) / path.name
+            cls._copy(path, backup)
+            try:
+                cls._remove_local(path)
+            except Exception:
+                cls._restore(path, backup)
+                if loaded:
+                    await plugin_host.recover_plugin(module, submit_restart=False)
+                raise
+        if pending_reason:
+            plugin_host.clear_pending_restart(pending_reason)
+        delete_store_receipt(store_key, path)
         await PluginInitManager.remove(plugin_info.module_path)
-        plugin_records = await PluginInfo.get_plugins(
+        for plugin_record in await PluginInfo.get_plugins(
             load_status=None,
             filter_parent=False,
             module_path=plugin_info.module_path,
-        )
-        for plugin_record in plugin_records:
+        ):
             await plugin_record.delete()
-        if unloaded or operation.reason == "plugin_not_loaded":
-            return f"插件 {plugin_info.name} 移除成功，已卸载"
-        return f"插件 {plugin_info.name} 移除成功! 重启后生效"
+        return operation
 
     @classmethod
     async def search_plugin(cls, plugin_name_or_author: str) -> BuildImage | str:
@@ -1182,29 +1149,18 @@ class StoreManager:
             text_style=row_style,
         )
 
-    @overload
     @classmethod
-    async def update_plugin(
-        cls,
-        index_or_module: str,
-        source: str | None = None,
-        *,
-        install_dependencies: bool = True,
-        confirm_source_build: bool = False,
-        return_result: Literal[False] = False,
-    ) -> str: ...
+    async def is_latest(cls, plugin_info: StorePluginInfo) -> bool:
+        """插件是否已是商店中的版本
 
-    @overload
-    @classmethod
-    async def update_plugin(
-        cls,
-        index_or_module: str,
-        source: str | None = None,
-        *,
-        install_dependencies: bool = True,
-        confirm_source_build: bool = False,
-        return_result: Literal[True],
-    ) -> StoreInstallResult: ...
+        参数:
+            plugin_info: 插件信息
+
+        返回:
+            bool: 是否已是最新版本
+        """
+        installed = await cls.get_installed_plugins()
+        return bool(cls.check_version_is_new(plugin_info, installed))
 
     @classmethod
     async def update_plugin(
@@ -1212,59 +1168,36 @@ class StoreManager:
         index_or_module: str,
         source: str | None = None,
         *,
-        install_dependencies: bool = True,
         confirm_source_build: bool = False,
-        return_result: bool = False,
-    ) -> str | StoreInstallResult:
+    ) -> str:
         """更新插件
 
         参数:
             index_or_module: 插件id或模块名
             source: 下载源
-            install_dependencies: 是否由商店直接应用安装结果
             confirm_source_build: 是否允许从源码构建依赖
-            return_result: 是否返回安装结果
 
         返回:
-            str | StoreInstallResult: 返回消息或安装结果
+            str: 返回消息
         """
         cls._get_source_order(source)
         plugin_info, is_external = await cls.get_plugin_by_value(index_or_module, True)
         logger.info(f"尝试更新插件 {plugin_info.name}", LOG_COMMAND)
-        suc_plugin = await cls.get_installed_plugins()
-        logger.debug(f"当前插件列表: {suc_plugin}", LOG_COMMAND)
-        if cls.check_version_is_new(plugin_info, suc_plugin):
-            result = StoreInstallResult(unchanged=True)
-            if return_result:
-                return result
+        if await cls.is_latest(plugin_info):
             return f"插件 {plugin_info.name} 已是最新版本"
-        if plugin_info.github_url is None:
-            plugin_info.github_url = DEFAULT_GITHUB_URL
-        if return_result:
-            return await cls.install_plugin_with_repo(
-                plugin_info,
-                is_external,
-                source,
-                install_dependencies=install_dependencies,
-                confirm_source_build=confirm_source_build,
-            )
-        _, runtime = await cls._install_and_apply(
-            plugin_info, is_external, source, confirm_source_build
+        operation = await cls.apply_plugin(
+            plugin_info,
+            is_external,
+            source,
+            confirm_source_build=confirm_source_build,
         )
-        if runtime is None:
-            from zhenxun.utils._restart_utils import request_restart
-
-            _, message = await request_restart("plugin_store")
-            return (
-                f"插件 {plugin_info.name} 已下载，将在重启后与依赖一并更新\n- {message}"
-            )
-        return f"插件 {plugin_info.name} 更新成功!\n- {runtime}"
+        return await cls._command_message("更新", plugin_info.name, operation)
 
     @classmethod
     async def update_all_plugin(
         cls, source: str | None = None, *, confirm_source_build: bool = False
     ) -> str:
-        """更新全部已安装插件并在运行中生效，依赖有变化的插件在重启后一并生效
+        """更新全部已安装插件并在运行中生效，需要重启的插件在重启后一并生效
 
         参数:
             source: 下载源
@@ -1303,17 +1236,11 @@ class StoreManager:
                     f"正在更新插件 {plugin_info.name}({plugin_info.module})",
                     LOG_COMMAND,
                 )
-                if plugin_info.github_url is None:
-                    plugin_info.github_url = DEFAULT_GITHUB_URL
-                _, runtime = await cls._install_and_apply(
+                operation = await cls.apply_plugin(
                     plugin_info,
                     plugin_info.module in external_modules,
                     source,
-                    confirm_source_build,
-                )
-                restart_pending |= runtime is None
-                update_success_list.append(
-                    f"{plugin_info.name}: {runtime or '依赖待重启安装'}"
+                    confirm_source_build=confirm_source_build,
                 )
             except Exception as e:
                 logger.error(
@@ -1322,6 +1249,12 @@ class StoreManager:
                     e=e,
                 )
                 update_failed_list.append(plugin_info.name)
+                continue
+            if operation.get("apply_mode") == "failed":
+                update_failed_list.append(plugin_info.name)
+                continue
+            restart_pending |= operation.get("apply_mode") == "restart_pending"
+            update_success_list.append(plugin_info.name)
         if not update_success_list and not update_failed_list:
             return "全部插件已是最新版本"
         if update_success_list:
@@ -1341,7 +1274,7 @@ class StoreManager:
             from zhenxun.utils._restart_utils import request_restart
 
             _, message = await request_restart("plugin_store")
-            result += f"\n- 部分插件依赖有变化，将在重启后一并安装\n- {message}"
+            result += f"\n- 部分插件需要重启后生效\n- {message}"
         return result
 
     @classmethod

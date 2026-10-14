@@ -86,8 +86,6 @@ def get_config(endpoint=None) -> dict:
     stage="management",
     timeout=60,
     component_id="management:database",
-    restart_policy="worker",
-    config_keys=("DB_URL", "DATABASE_MODELS", "DATABASE_SCHEMA"),
 )
 async def init():
     """连接数据库，执行模型迁移脚本并生成表结构"""

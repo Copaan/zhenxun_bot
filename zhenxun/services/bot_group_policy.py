@@ -39,13 +39,6 @@ class BotGroupPolicyService:
         self._queue = asyncio.Queue(maxsize=1000)
         self.context = None
         self.loaded = False
-        self.write_counts = {
-            "queued": 0,
-            "capacity_skipped": 0,
-            "shutdown_pending": 0,
-            "write_failed": 0,
-            "written": 0,
-        }
 
     async def start(self, context):
         self._epoch += 1
@@ -72,7 +65,6 @@ class BotGroupPolicyService:
         for task in self._refresh_tasks.values():
             task.cancel()
         self._refresh_tasks.clear()
-        self.write_counts["shutdown_pending"] += len(self._pending)
         self.loaded = False
         self.context = None
         self._pending.clear()
@@ -172,9 +164,8 @@ class BotGroupPolicyService:
         try:
             self._queue.put_nowait(key)
             self._pending.add(key)
-            self.write_counts["queued"] += 1
         except asyncio.QueueFull:
-            self.write_counts["capacity_skipped"] += 1
+            pass
 
     async def _write_memberships(self):
         while True:
@@ -185,9 +176,7 @@ class BotGroupPolicyService:
                 await self.record_memberships(
                     [key_fields(key) for key in batch], source="event"
                 )
-                self.write_counts["written"] += len(batch)
             except Exception:
-                self.write_counts["write_failed"] += len(batch)
                 logger.warning(
                     "Bot群关联写入失败 | code=group_membership_write_failed",
                     "PluginPolicy",
@@ -762,6 +751,171 @@ class BotGroupPolicyService:
         if state["migration_version"]:
             return await self._view(key)
         return await self._write(key, lambda current: current, expected_revision)
+
+    async def export_document(self) -> dict:
+        """导出全部插件策略
+
+        返回:
+            dict: 群/私聊作用域、账号、共享策略与全局开关，修订号作为 expected_revision
+        """
+
+        def expected(state: dict) -> dict:
+            state["expected_revision"] = state.pop("revision")
+            return state
+
+        scopes = []
+        for row in await BotGroupPluginPolicy.all().order_by(
+            "bot_id", "platform_scope", "group_id", "channel_id"
+        ):
+            _, state = await self._state(
+                group_key(row.bot_id, row.platform_scope, row.group_id, row.channel_id)
+            )
+            scopes.append(expected(state))
+        accounts = [
+            expected(await plugin_policy_service.get_account(account["bot_id"]))
+            for account in await plugin_policy_service.list_accounts()
+        ]
+        return {
+            "version": 1,
+            "scopes": scopes,
+            "accounts": accounts,
+            "policies": [
+                expected(policy)
+                for policy in await plugin_policy_service.list_policies()
+            ],
+            "global_policy": expected(await plugin_policy_service.global_state()),
+            "global_tasks": expected(
+                await plugin_policy_service.global_state(task=True)
+            ),
+            "authority": "database",
+        }
+
+    async def import_document(self, document) -> int:
+        """在同一事务内导入插件策略，任一修订号不匹配则整体回滚
+
+        参数:
+            document: 导出格式的策略文档
+
+        返回:
+            int: 写入的群/私聊作用域数量
+        """
+        from tortoise.transactions import in_transaction
+
+        from zhenxun.models.bot_console import BotConsole
+        from zhenxun.models.plugin_info import PluginInfo
+        from zhenxun.models.plugin_policy import PluginPolicy
+        from zhenxun.models.task_info import TaskInfo
+
+        service = plugin_policy_service
+        scopes = sorted(
+            document.scopes,
+            key=lambda row: (
+                row.bot_id,
+                row.platform_scope,
+                row.group_id,
+                row.channel_id,
+            ),
+        )
+        keys = [
+            group_key(row.bot_id, row.platform_scope, row.group_id, row.channel_id)
+            for row in scopes
+        ]
+        if len(set(keys)) != len(keys):
+            raise PluginPolicyError("策略作用域重复")
+        if len({row.bot_id for row in document.accounts}) != len(
+            document.accounts
+        ) or len({row.id for row in document.policies}) != len(document.policies):
+            raise PluginPolicyError("重复的账号或模板")
+        async with runtime_mutation_coordinator.operation("plugin_policy_import"):
+            async with in_transaction() as connection:
+                locked = [PluginPolicy, BotConsole]
+                if document.global_policy:
+                    locked.append(PluginInfo)
+                if document.global_tasks:
+                    locked.append(TaskInfo)
+                for model in locked:
+                    await (
+                        model.all()
+                        .using_db(connection)
+                        .select_for_update()
+                        .order_by("id")
+                    )
+                for row in document.accounts:
+                    current = await service.get_account(row.bot_id)
+                    service._check_revision(row.expected_revision, current["revision"])
+                if document.global_policy:
+                    state = await service.global_state()
+                    service._check_revision(
+                        document.global_policy.expected_revision, state["revision"]
+                    )
+                    for module, values in sorted(
+                        document.global_policy.plugins.items()
+                    ):
+                        await service.set_global_settings(
+                            module,
+                            default_status=values.default_status,
+                            block_type=values.block_type
+                            or (None if values.status else "ALL"),
+                        )
+                if document.global_tasks:
+                    state = await service.global_state(task=True)
+                    service._check_revision(
+                        document.global_tasks.expected_revision, state["revision"]
+                    )
+                    for module, values in sorted(document.global_tasks.tasks.items()):
+                        await service.set_global(module, values.status, task=True)
+                        await service.set_global(
+                            module, values.default_status, task=True, default=True
+                        )
+                for row in sorted(document.policies, key=lambda item: item.id):
+                    await service.update_policy(
+                        row.id,
+                        expected_revision=row.expected_revision,
+                        name=row.name,
+                        description=row.description,
+                        block_plugins=row.block_plugins,
+                        block_tasks=row.block_tasks,
+                    )
+                for row in sorted(document.accounts, key=lambda item: item.bot_id):
+                    current = await service.get_account(row.bot_id)
+                    if row.policy_id is not None:
+                        await service.bind_accounts(
+                            policy_id=row.policy_id,
+                            bot_ids=[row.bot_id],
+                            expected_revisions={row.bot_id: current["revision"]},
+                        )
+                    else:
+                        await service.update_account(
+                            row.bot_id,
+                            expected_revision=current["revision"],
+                            block_plugins=row.block_plugins,
+                            block_tasks=row.block_tasks,
+                        )
+                for row in scopes:
+                    if row.platform_scope == "private":
+                        if row.group_id != self.PRIVATE_KEY or row.channel_id:
+                            raise PluginPolicyError("私聊策略范围无效")
+                    else:
+                        await self.get_group(
+                            row.bot_id, row.platform_scope, row.group_id, row.channel_id
+                        )
+                    await self._write(
+                        group_key(
+                            await service._resolve_bot_id(row.bot_id),
+                            row.platform_scope,
+                            row.group_id,
+                            row.channel_id,
+                        ),
+                        lambda state, item=row: {
+                            **state,
+                            "block_plugins": item.block_plugins,
+                            "block_tasks": item.block_tasks,
+                            "forced_plugins": item.forced_plugins,
+                            "forced_tasks": item.forced_tasks,
+                        },
+                        row.expected_revision,
+                    )
+        return len(scopes)
 
     @staticmethod
     def _publish_policy_revision(key):

@@ -30,9 +30,6 @@ class RuntimeOperation:
     reason: str | None = None
     generation: int = 0
     config_keys: list[str] = field(default_factory=list)
-    component_effects: dict[str, str] = field(default_factory=dict)
-    affected_components: list[str] = field(default_factory=list)
-    rollback_state: str = "none"
     notes: list[str] = field(default_factory=list)
     stopped: list[str] = field(default_factory=list)
     """加载失败而停用、可修复后重新加载的插件"""
@@ -45,9 +42,6 @@ class RuntimeOperation:
             "reason": self.reason,
             "generation": self.generation,
             "config_keys": self.config_keys,
-            "component_effects": dict(self.component_effects),
-            "affected_components": list(self.affected_components),
-            "rollback_state": self.rollback_state,
             "notes": list(self.notes),
             "stopped": list(self.stopped),
             "reason_codes": [self.reason] if self.reason else [],

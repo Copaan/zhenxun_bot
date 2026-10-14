@@ -4,6 +4,7 @@ from datetime import datetime
 from fastapi import APIRouter
 import nonebot
 from nonebot import on_message
+from nonebot.adapters import Bot
 from nonebot.adapters.onebot.v11 import MessageEvent
 from nonebot_plugin_alconna import At, Hyper, Image, Text, UniMsg
 from nonebot_plugin_uninfo import Uninfo
@@ -16,7 +17,7 @@ from ....config import AVA_URL
 from ....security import (
     authenticate_websocket,
     close_authenticated_websocket,
-    record_websocket_disconnect,
+    is_websocket_disconnect_error,
     send_authenticated_json,
     unregister_authenticated_websocket,
 )
@@ -69,7 +70,7 @@ async def _(websocket: WebSocket):
         while websocket.client_state == WebSocketState.CONNECTED:
             await websocket.receive()
     except (WebSocketDisconnect, OSError) as error:
-        if not record_websocket_disconnect(error):
+        if not is_websocket_disconnect_error(error):
             raise
     finally:
         unregister_authenticated_websocket(websocket)
@@ -112,7 +113,11 @@ async def message_handle(
 
 @matcher.handle()
 async def _(
-    message: UniMsg, event: MessageEvent, session: Uninfo, uname: str = UserName()
+    bot: Bot,
+    message: UniMsg,
+    event: MessageEvent,
+    session: Uninfo,
+    uname: str = UserName(),
 ):
     global ID2NAME, ID_LIST
     if _CHAT_CONNECTIONS:
@@ -125,6 +130,7 @@ async def _(
         gid = session.group.id if session.group else None
         messages = await message_handle(message, gid)
         data = Message(
+            bot_id=str(bot.self_id),
             object_id=gid or session.user.id,
             user_id=session.user.id,
             group_id=gid,

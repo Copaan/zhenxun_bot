@@ -54,6 +54,32 @@ def _scope_name(scope: object) -> str:
     return text
 
 
+_VERIFIED_SCOPE_ADAPTERS = {"qq_client": "onebot_v11", "qq_api": "qq"}
+
+
+def _adapter_key(adapter: object) -> str:
+    text = str(getattr(adapter, "value", adapter) or "").strip().lower()
+    return text.replace("-", "_").replace(" ", "_")
+
+
+def _qualified_scope(scope: str, adapter: object) -> str:
+    """为非验证适配器上报的 QQ 作用域加上适配器名
+
+    参数:
+        scope: uninfo 上报的作用域
+        adapter: 适配器名称
+
+    返回:
+        str: qq_client 只属于 OneBot V11、qq_api 只属于 QQ 官方适配器，
+            其他适配器返回 `作用域_适配器名`
+    """
+    expected = _VERIFIED_SCOPE_ADAPTERS.get(scope)
+    name = _adapter_key(adapter)
+    if expected is None or name == expected:
+        return scope
+    return f"{scope}_{name or 'unknown'}"
+
+
 class UserData(BaseModel):
     name: str
     """昵称"""
@@ -75,12 +101,46 @@ class UserData(BaseModel):
 
 class PlatformUtils:
     @classmethod
-    def get_storage_bot_id(cls, bot: Bot) -> str:
+    def storage_bot_id(cls, scope: str, bot_id: str) -> str:
+        """按平台作用域生成持久化使用的 Bot id
+
+        参数:
+            scope: 平台作用域
+            bot_id: 适配器中的 Bot id
+
+        返回:
+            str: qq_client 为原始 id，其余平台带作用域前缀
+        """
+        bot_id = str(bot_id)
+        return bot_id if scope == "qq_client" else f"{scope}:{bot_id}"
+
+    @classmethod
+    def get_storage_bot_id(cls, bot: Bot | Uninfo) -> str:
         """Return a persistence-safe bot ID without changing adapter routing IDs."""
-        bot_id = str(bot.self_id)
-        if cls.get_platform_scope(bot) == "qq_api":
-            return f"qq_api:{bot_id}"
-        return bot_id
+        return cls.storage_bot_id(cls.get_platform_scope(bot), str(bot.self_id))
+
+    @classmethod
+    def is_superuser(cls, bot: Bot, user_id: str | None) -> bool:
+        """判断用户是否为该 Bot 所在平台的超级用户
+
+        参数:
+            bot: Bot
+            user_id: 用户id
+
+        返回:
+            bool: SUPERUSERS 中的 `适配器:id` 均可匹配；裸 id 只在 QQ 作用域
+                匹配 SUPERUSERS，其余平台匹配 PLATFORM_SUPERUSERS 对应平台
+        """
+        if not user_id:
+            return False
+        user_id = str(user_id)
+        superusers = bot.config.superusers
+        if adapter := _adapter_name(bot).split(maxsplit=1):
+            if f"{adapter[0]}:{user_id}" in superusers:
+                return True
+        if cls.get_platform_scope(bot) in ("qq_client", "qq_api"):
+            return user_id in superusers
+        return user_id in BotConfig.get_superuser(cls.get_platform(bot))
 
     @classmethod
     def _resolve_unique_qq_client_bot(cls, log_cmd: str | None = None) -> Bot | None:
@@ -499,6 +559,7 @@ class PlatformUtils:
             user_id: 用户id
             group_id: 群组id或频道id
             message: 消息文本
+            official_context: QQ 官方事件上下文，被动回复不可用时按配置改用主动消息
 
         返回:
             Receipt | None: 是否发送成功
@@ -510,9 +571,9 @@ class PlatformUtils:
             from zhenxun.adapters.qq_official.context import (
                 OfficialQQEventContext,
                 OfficialReplyUnavailable,
-                allocate_reply_sequence,
                 finish_reply,
                 get_current_official_context,
+                reserve_passive_reply,
             )
 
             context = official_context or get_current_official_context()
@@ -534,22 +595,25 @@ class PlatformUtils:
                 # A DM event's guild_id is the existing private session, not
                 # the source guild required by Target's post_dms() path.
                 return await send_message.send(target=context.guild_event, bot=bot)
-            state, sequence = await allocate_reply_sequence(context)
+            reserved = await reserve_passive_reply(context)
+            target = Target(
+                id=(
+                    context.actor_openid
+                    if context.scene == "c2c"
+                    else context.group_openid
+                ),
+                private=context.scene == "c2c",
+                source=context.source_id if reserved else "",
+                self_id=str(bot.self_id),
+                adapter="QQ",
+                scope=SupportScope.qq_api,
+                extra={"qq.reply_seq": reserved[1] - 1} if reserved else None,
+            )
+            if reserved is None:
+                return await send_message.send(target=target, bot=bot)
+            state = reserved[0]
             successful = False
             try:
-                target = Target(
-                    id=(
-                        context.actor_openid
-                        if context.scene == "c2c"
-                        else context.group_openid
-                    ),
-                    private=context.scene == "c2c",
-                    source=context.source_id,
-                    self_id=str(bot.self_id),
-                    adapter="QQ",
-                    scope=SupportScope.qq_api,
-                    extra={"qq.reply_seq": sequence - 1},
-                )
                 receipt = await send_message.send(target=target, bot=bot)
                 successful = True
                 return receipt
@@ -667,12 +731,16 @@ class PlatformUtils:
             if interface := get_interface(t):
                 scope = _scope_name(interface.basic_info().get("scope"))
                 if scope:
-                    return scope
+                    return _qualified_scope(scope, _adapter_name(t))
             return "unknown"
         scope = _scope_name(getattr(t, "scope", "") or "")
+        adapter = getattr(t, "adapter", None)
         basic = getattr(t, "basic", None)
         if not scope and isinstance(basic, dict):
             scope = _scope_name(basic.get("scope"))
+            adapter = basic.get("adapter")
+        if scope and adapter:
+            return _qualified_scope(scope, adapter)
         return scope or "unknown"
 
     @classmethod

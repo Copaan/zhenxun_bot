@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import shutil
 import tempfile
+from typing import TYPE_CHECKING
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import psutil
@@ -19,6 +20,9 @@ from zhenxun.services.log import logger
 
 from .config import LOG_COMMAND, RepoConfig
 from .exceptions import GitUnavailableError
+
+if TYPE_CHECKING:
+    from zhenxun.services.network_proxy import ProxyPolicy
 
 _SENSITIVE_QUERY_KEYS = {
     "access_token",
@@ -366,7 +370,6 @@ async def sparse_checkout_clone(
     authenticated_url = repo_url
     repo_url = canonicalize_git_url(repo_url)
     git_env = git_auth_environment(authenticated_url, repo_url)
-    from zhenxun.services.git_proxy import git_download_environment
     from zhenxun.services.network_proxy import proxy_runtime
 
     policy = proxy_runtime.policy_snapshot()
@@ -546,3 +549,83 @@ async def get_aliyun_group_for_repo(repo_name: str) -> str | None:
             continue
 
     return None
+
+
+def git_download_environment(
+    policy: "ProxyPolicy", url: str, authentication: dict[str, str] | None = None
+) -> tuple[dict[str, str], str]:
+    """生成插件商店受管 HTTP Git 下载的隔离环境与代理设置
+
+    参数:
+        policy: 代理策略快照
+        url: 仓库地址
+        authentication: 认证用的 Git 配置环境变量
+
+    返回:
+        tuple[dict[str, str], str]: Git 子进程环境, 代理路线
+    """
+    from zhenxun.services.network_proxy import ProxyPolicyError
+
+    parsed = urlsplit(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ProxyPolicyError("proxy_git_protocol_unmanaged")
+    bypass = policy.bypasses(parsed.hostname)
+    forced = policy.selected(None) and not bypass
+    proxy = policy.proxy if (forced or policy.mode == "legacy") and not bypass else None
+    if forced and not proxy:
+        raise ProxyPolicyError("proxy_configuration_unavailable")
+    if proxy and proxy.startswith("socks5://"):
+        proxy = "socks5h://" + proxy[len("socks5://") :]
+    # Neither user-wide Git settings nor inherited NO_PROXY may defeat a forced route.
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not (
+            key.upper().endswith("_PROXY")
+            or key.upper().startswith("GIT_CONFIG")
+            or key.upper()
+            in {"GIT_SSL_NO_VERIFY", "GIT_PROXY_COMMAND", "GIT_ASKPASS", "SSH_ASKPASS"}
+        )
+    }
+    environment.update(
+        {
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_TERMINAL_PROMPT": "0",
+        }
+    )
+    config = []
+    if authentication:
+        for i in range(int(authentication.get("GIT_CONFIG_COUNT", "0"))):
+            config.append(
+                (
+                    authentication[f"GIT_CONFIG_KEY_{i}"],
+                    authentication[f"GIT_CONFIG_VALUE_{i}"],
+                )
+            )
+    config.extend(
+        [
+            ("http.proxy", proxy or ""),
+            ("remote.origin.proxy", proxy or ""),
+            ("http.sslVerify", "true"),
+            ("http.followRedirects", "false"),
+            ("credential.helper", ""),
+            ("protocol.allow", "never"),
+            ("protocol.http.allow", "always"),
+            ("protocol.https.allow", "always"),
+        ]
+    )
+    environment["GIT_CONFIG_COUNT"] = str(len(config))
+    for i, (key, value) in enumerate(config):
+        environment[f"GIT_CONFIG_KEY_{i}"] = key
+        environment[f"GIT_CONFIG_VALUE_{i}"] = value
+    route = (
+        "local_direct"
+        if bypass
+        else "forced_proxy"
+        if forced
+        else "legacy_proxy"
+        if proxy
+        else "direct"
+    )
+    return environment, route

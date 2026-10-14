@@ -8,12 +8,7 @@ from copy import deepcopy
 from hashlib import sha256
 import json
 import os
-import time
-import uuid
 
-from zhenxun.services.nonebot_store.cleanup import (
-    active_transaction as pending_transaction,
-)
 from zhenxun.services.nonebot_store.dependencies import (
     DependencyAnalysisError,
     environment_report_async,
@@ -28,39 +23,31 @@ from zhenxun.services.nonebot_store.runtime import (
     stage_generation,
 )
 from zhenxun.services.nonebot_store.storage import (
+    active_transaction as pending_transaction,
+)
+from zhenxun.services.nonebot_store.storage import (
+    defer_transaction,
+    draft_transaction,
     load_manifest,
     remove_generation,
     save_manifest,
-    save_pending_transaction,
     utc_now,
 )
-from zhenxun.services.plugin_store.operation_journal import (
-    operation_status,
-    record_operation,
-)
+from zhenxun.services.plugin_store.operation_journal import record_operation
 
 from ....apply_result import update_pending_restart
 from ....base_model import Result
 from .model import InstallDependenciesPayload
-from .store import StoreOperationBusyError, _store_operation
+from .store import (
+    PreviewStore,
+    StoreOperationBusyError,
+    _store_operation,
+    replayed_bound_operation,
+    run_bound_operation,
+)
 
-_PREVIEWS: dict[str, dict] = {}
-_ACTIVE: dict[str, tuple[str, asyncio.Task]] = {}
-_TTL = 1200
+_PREVIEWS = PreviewStore()
 _OWNER = "dependencies:manual"
-
-
-def active_operation(identity: str) -> dict | None:
-    """Expose accepted requests while their durable journal entry is being prepared."""
-    active = _ACTIVE.get(identity)
-    if active is None or active[1].done():
-        return None
-    return {
-        "operation_id": identity,
-        "store_key": _OWNER,
-        "status": "running",
-        "result": {"status": "running", "apply_mode": "preparing"},
-    }
 
 
 def _revision(transaction: dict | None) -> str:
@@ -81,12 +68,6 @@ def _failure(error: Exception) -> Result:
 
 async def preview(payload: InstallDependenciesPayload) -> Result:
     """Bind a read-only package plan to the active and pending generations."""
-    now = time.monotonic()
-    for key, item in list(_PREVIEWS.items()):
-        if now - item["created_at"] > _TTL:
-            _PREVIEWS.pop(key, None)
-    if len(_PREVIEWS) >= 64:
-        _PREVIEWS.pop(next(iter(_PREVIEWS)))
     try:
         from zhenxun.services.nonebot_store.storage import dependency_sync_status
 
@@ -110,12 +91,7 @@ async def preview(payload: InstallDependenciesPayload) -> Result:
             return Result.fail("environment_analysis_stale", code=409)
         if (await environment_report_async())["fingerprint"] != plan["fingerprint"]:
             return Result.fail("environment_analysis_stale", code=409)
-        identity = uuid.uuid4().hex
-        _PREVIEWS[identity] = {
-            **plan,
-            "created_at": now,
-            "pending_revision": _revision(pending),
-        }
+        identity = _PREVIEWS.put({**plan, "pending_revision": _revision(pending)})
         return Result.ok(
             {
                 **{
@@ -124,7 +100,6 @@ async def preview(payload: InstallDependenciesPayload) -> Result:
                     if key != "target_manifest"
                 },
                 "preview_id": identity,
-                "dependency_workflow_version": 2,
             }
         )
     except Exception as error:
@@ -157,16 +132,9 @@ async def apply(payload: InstallDependenciesPayload) -> Result:
         binding = _binding(payload)
     except DependencyAnalysisError as error:
         return _failure(error)
-    identity = payload.operation_id
-    active = _ACTIVE.get(identity)
-    if active:
-        if active[0] != binding:
-            return Result.fail("dependency_operation_input_changed", code=409)
-        return await asyncio.shield(active[1])
-    task = asyncio.create_task(_apply(payload, binding))
-    _ACTIVE[identity] = (binding, task)
-    task.add_done_callback(lambda _: _ACTIVE.pop(identity, None))
-    return await asyncio.shield(task)
+    return await run_bound_operation(
+        payload.operation_id, binding, lambda: _apply(payload, binding)
+    )
 
 
 async def _apply(payload: InstallDependenciesPayload, binding: str) -> Result:
@@ -186,18 +154,11 @@ async def _apply(payload: InstallDependenciesPayload, binding: str) -> Result:
         async with _store_operation(
             operation_id=identity, owner="webui.manual-dependencies"
         ):
-            previous = operation_status(identity)
-            if previous:
-                result = previous.get("result") or {}
-                if (
-                    previous.get("store_key") != _OWNER
-                    or result.get("request_binding") != binding
-                ):
-                    return Result.fail("dependency_operation_input_changed", code=409)
-                return Result.ok(result, info="已复用原依赖操作，请查看任务状态")
+            if replayed := replayed_bound_operation(identity, binding):
+                return replayed
             plan = _PREVIEWS.get(str(payload.preview_id))
             pending = pending_transaction()
-            if not plan or time.monotonic() - plan["created_at"] > _TTL:
+            if not plan:
                 return Result.fail("environment_analysis_stale", code=409)
             if (
                 plan["request_digest"]
@@ -258,7 +219,7 @@ async def _apply(payload: InstallDependenciesPayload, binding: str) -> Result:
                         "code": "operation_receipt_pending",
                         "diagnostic": safe_process_error(str(error)),
                     }
-                _PREVIEWS.pop(str(payload.preview_id), None)
+                _PREVIEWS.pop(str(payload.preview_id))
                 return Result.ok(result, info="托管声明已保存，依赖未改变，无需重启")
             if not os.environ.get("ZHENXUN_LAUNCHER_PID"):
                 return Result.fail("dependency_repair_requires_launcher", code=409)
@@ -270,28 +231,15 @@ async def _apply(payload: InstallDependenciesPayload, binding: str) -> Result:
                 }
             )
             recorded = True
-            transaction = (
-                deepcopy(pending)
-                if pending
-                else {
-                    "version": 2,
-                    "base_manifest": load_manifest(),
-                    "operations": [],
-                    "database_migration_possible": False,
-                    "database_migration_confirmed": False,
-                    "created_at": utc_now(),
-                }
-            )
-            transaction.update(
-                revision=uuid.uuid4().hex,
+            transaction = draft_transaction(
+                pending,
+                plan["target_manifest"],
                 action="manual_dependencies",
-                updated_at=utc_now(),
-                target_manifest=deepcopy(plan["target_manifest"]),
                 remaining_conflicts=deepcopy(plan.get("remaining_conflicts", [])),
                 state="pending_restart",
                 source_build_confirmed=bool(
                     payload.confirm_source_build
-                    or transaction.get("source_build_confirmed")
+                    or (pending or {}).get("source_build_confirmed")
                 ),
             )
             operation = {
@@ -310,12 +258,8 @@ async def _apply(payload: InstallDependenciesPayload, binding: str) -> Result:
             if plan["source_build_required"] or (
                 pending and not isinstance(pending.get("generation"), int)
             ):
-                transaction.pop("generation", None)
-                transaction.pop("generation_digest", None)
-                save_pending_transaction(transaction)
+                defer_transaction(transaction)
                 staged = True
-                if pending:
-                    remove_generation(pending.get("generation"))
             else:
                 built = await prepare_generation(transaction)
                 if (await environment_report_async())["fingerprint"] != plan[
@@ -338,7 +282,7 @@ async def _apply(payload: InstallDependenciesPayload, binding: str) -> Result:
                 retained=plan["retained"],
             )
             record(result)
-            _PREVIEWS.pop(str(payload.preview_id), None)
+            _PREVIEWS.pop(str(payload.preview_id))
             return Result.ok(result, info="依赖事务已准备，重启验证后生效")
     except StoreOperationBusyError:
         return Result.fail("plugin_operation_in_progress", code=409)

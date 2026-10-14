@@ -10,7 +10,7 @@ from zhenxun.services.update.update_service import (
     UpdateServiceError,
     check_updates,
     create_update_job,
-    read_job,
+    job_status,
     request_update_apply,
 )
 
@@ -103,7 +103,7 @@ async def start_update(payload: UpdateJobRequest) -> Result:
 )
 async def update_job(job_id: str) -> Result:
     try:
-        return Result.ok(read_job(job_id))
+        return Result.ok(job_status(job_id))
     except UpdateServiceError as error:
         raise _service_error(error) from error
 

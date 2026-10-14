@@ -30,6 +30,10 @@ class BotSetting(BaseModel):
     """第三方插件路径"""
     qq_adapter_load: bool = False
     """是否加载 QQ 官方适配器"""
+    telegram_adapter_load: bool = False
+    """是否加载 Telegram 适配器"""
+    business_identity_scopes: list[str] = Field(default_factory=lambda: ["telegram"])
+    """按平台全局解析业务身份（金币、签到等）的平台作用域"""
 
     def get_qbot_uid(self, qbot_id: str) -> str | None:
         """获取官bot账号id

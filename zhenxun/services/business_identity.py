@@ -76,6 +76,58 @@ def register_business_identity_resolver(scope: str, resolver: Callable) -> None:
     _resolvers[scope] = resolver
 
 
+def platform_identity(bot, event, session) -> ProtocolIdentity:
+    """按平台全局解析业务身份，同一平台用户 id 对应同一业务账号
+
+    参数:
+        bot: Bot
+        event: Event
+        session: Uninfo
+
+    异常:
+        BusinessIdentityError: 发送者与事件不一致或为 Bot 自身
+
+    返回:
+        ProtocolIdentity: 协议身份
+    """
+    from zhenxun.utils.platform import PlatformUtils
+
+    scope = PlatformUtils.get_platform_scope(bot)
+    raw = str(session.user.id or "")
+    try:
+        sender = str(event.get_user_id())
+    except ValueError:
+        sender = ""
+    if not raw or sender != raw or raw == str(bot.self_id):
+        raise BusinessIdentityError("只接受真实入站消息的发送者")
+    subject = sha256(raw.encode()).hexdigest()
+    key = identity_digest(scope, "", "user", "", subject)
+    return ProtocolIdentity(key, scope, "", "user", "", subject, raw, f"identity:{key}")
+
+
+def _resolver(scope: str) -> Callable | None:
+    from zhenxun.configs.config import BotConfig
+    from zhenxun.services.platform_identity import is_namespaced_scope
+
+    if resolver := _resolvers.get(scope):
+        return resolver
+    if is_namespaced_scope(scope) and scope in BotConfig.business_identity_scopes:
+        return platform_identity
+    return None
+
+
+def supports_business_identity(scope: str) -> bool:
+    """判断平台作用域能否解析业务身份
+
+    参数:
+        scope: 平台作用域
+
+    返回:
+        bool: QQ 两个作用域、已注册解析器或配置为按平台全局解析的作用域为 True
+    """
+    return scope in {"qq_api", "qq_client"} or _resolver(scope) is not None
+
+
 @contextmanager
 def business_event_scope():
     token = _current.set(None)
@@ -133,7 +185,7 @@ def protocol_identity(bot, event, session) -> ProtocolIdentity:
             raise BusinessIdentityError("只接受真实 OneBot 入站消息的发送者")
         domain, app, scene, group, original = "qq_client", "", "user", "", raw
     else:
-        if resolver := _resolvers.get(scope):
+        if resolver := _resolver(scope):
             resolved = resolver(bot, event, session)
             if (
                 not isinstance(resolved, ProtocolIdentity)
@@ -397,10 +449,13 @@ async def validate_business_write(keys: list[str], db) -> None:
     """Lock identity before accounts, the same order used by binding changes."""
     identity = current_business_identity()
     if identity is None:
-        from zhenxun.services.platform_identity import CURRENT_PLATFORM_SCOPE
+        from zhenxun.services.platform_identity import (
+            CURRENT_PLATFORM_SCOPE,
+            is_isolated_scope,
+        )
 
-        if CURRENT_PLATFORM_SCOPE.get() == "qq_api":
-            raise BusinessIdentityError("官方账号资产操作必须先解析业务身份")
+        if is_isolated_scope(CURRENT_PLATFORM_SCOPE.get()):
+            raise BusinessIdentityError("该平台账号资产操作必须先解析业务身份")
         return
     if set(keys) != {identity.storage_key}:
         raise BusinessIdentityError("业务账号与当前身份不一致")

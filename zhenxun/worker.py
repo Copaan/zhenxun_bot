@@ -112,9 +112,6 @@ def run_worker(project_root: Path) -> None:
 
     driver = nonebot.get_driver()
     driver.register_adapter(OneBotV11Adapter)
-    from zhenxun.services.onebot_endpoint import OneBotHandshakeDiagnostics
-
-    nonebot.get_app().add_middleware(OneBotHandshakeDiagnostics)
     enabled_adapters = ["OneBot V11"]
     if BotConfig.qq_adapter_load:
         from zhenxun.adapters.qq_official.config import validate_qq_official_config
@@ -130,6 +127,16 @@ def run_worker(project_root: Path) -> None:
 
         driver.register_adapter(ZhenxunQQAdapter)
         enabled_adapters.append("<c>QQ_Official</c>")
+    if BotConfig.telegram_adapter_load:
+        try:
+            from nonebot.adapters.telegram import Adapter as TelegramAdapter
+        except ModuleNotFoundError as e:
+            raise RuntimeError(
+                "TELEGRAM_ADAPTER_LOAD=True 需要先安装可选依赖: "
+                "uv sync --extra telegram"
+            ) from e
+        driver.register_adapter(TelegramAdapter)
+        enabled_adapters.append("Telegram")
 
     from zhenxun.services.runtime_bootstrap import register_runtime_bootstrap
 
@@ -231,10 +238,7 @@ def run_worker(project_root: Path) -> None:
     )
 
     webui_tls = load_webui_tls_settings(project_root)
-    validate_webui_tls_settings(
-        webui_tls,
-        launcher_managed=bool(os.environ.get("ZHENXUN_LAUNCHER_PID")),
-    )
+    validate_webui_tls_settings(webui_tls)
     from dataclasses import replace
 
     webui_tls = replace(
@@ -249,31 +253,18 @@ def run_worker(project_root: Path) -> None:
         if webui_tls.enabled
         else {}
     )
-    from zhenxun.services.webui_transport import transport_runtime
+    from zhenxun.services.webui_transport import (
+        install_uvicorn_shutdown_hook,
+        install_websocket_drain_lock,
+    )
 
-    transport_runtime.install_uvicorn_signal_bridge()
-    proxy_options: dict[str, object] = {}
-    if os.environ.get("ZHENXUN_LAUNCHER_PID") and webui_tls.http_sidecar_enabled:
-        import ipaddress
-
-        trusted_proxy_ips = ["127.0.0.1", "::1"]
-        normalized_host = webui_tls.host.strip().strip("[]")
-        with contextlib.suppress(ValueError):
-            bound_address = ipaddress.ip_address(normalized_host)
-            if not bound_address.is_unspecified:
-                trusted_proxy_ips.append(str(bound_address))
-        proxy_options = {
-            "proxy_headers": True,
-            "forwarded_allow_ips": ",".join(dict.fromkeys(trusted_proxy_ips)),
-        }
+    install_websocket_drain_lock()
+    install_uvicorn_shutdown_hook()
     from zhenxun.services.lifecycle import lifecycle_kernel
-
-    exit_signals: list[int] = []
 
     def after_server_signal(signum, frame):
         # Uvicorn replays captured signals after lifespan shutdown. SIG_DFL on
         # Windows SIGBREAK exits in the C runtime, bypassing Python finally.
-        exit_signals.append(signum)
         if not lifecycle_kernel.shutdown_requested:
             signal.default_int_handler(signum, frame)
 
@@ -294,18 +285,12 @@ def run_worker(project_root: Path) -> None:
             backlog=WORKER_BACKLOG,
             timeout_keep_alive=WORKER_KEEP_ALIVE_TIMEOUT,
             timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_TIMEOUT,
-            **proxy_options,
             **tls_options,
         )
     finally:
-        transport_runtime.restore_uvicorn_signal_bridge()
-        transport_runtime.restore()
         proxy_clients.restore()
         from zhenxun.services.runtime_bootstrap import finalize_runtime_executor
 
         finalize_runtime_executor()
-        try:
-            lifecycle_kernel.finalize_terminal_receipt(exit_signals=exit_signals)
-        finally:
-            for sig, handler in original_signals.items():
-                signal.signal(sig, handler)
+        for sig, handler in original_signals.items():
+            signal.signal(sig, handler)

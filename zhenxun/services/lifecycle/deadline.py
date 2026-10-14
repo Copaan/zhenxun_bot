@@ -8,10 +8,6 @@ import time
 WORKER_SHUTDOWN_SECONDS = 13.0
 
 
-class BudgetExpired(TimeoutError):
-    pass
-
-
 @dataclass
 class ShutdownBudget:
     deadline: float
@@ -26,10 +22,6 @@ class ShutdownBudget:
         if self.parent is not None:
             remaining = min(remaining, self.parent.remaining())
         return remaining if maximum is None else min(remaining, max(0.0, maximum))
-
-    def check(self) -> None:
-        if not self.remaining():
-            raise BudgetExpired("shutdown_budget_exhausted")
 
     def tighten(self, parent: ShutdownBudget) -> None:
         self.deadline = min(self.deadline, parent.deadline)
@@ -56,9 +48,3 @@ def shutdown_budget(seconds: float):
 def remaining_timeout(maximum: float) -> float:
     budget = current_budget.get()
     return maximum if budget is None else budget.remaining(maximum)
-
-
-def check_budget() -> None:
-    budget = current_budget.get()
-    if budget is not None:
-        budget.check()

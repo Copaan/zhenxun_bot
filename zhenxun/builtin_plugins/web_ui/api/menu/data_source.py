@@ -47,9 +47,16 @@ default_menus = [
         router="/database",
         icon="database",
     ),
-    MenuItem(name="系统信息", module="system", router="/system", icon="system"),
-    MenuItem(name="关于我们", module="about", router="/about", icon="about"),
+    MenuItem(name="系统设置", module="system", router="/system", icon="system"),
+    MenuItem(name="更新与维护", module="about", router="/about", icon="about"),
 ]
+
+LEGACY_NAMES = {
+    "database": "数据库管理",
+    "protocol": "协议端设置",
+    "system": "系统信息",
+    "about": "关于我们",
+}
 
 
 class MenuManager:
@@ -64,18 +71,10 @@ class MenuManager:
                     for item in stored_menu
                     if isinstance(item, dict) and item.get("module")
                 }
-                database_menu = stored_by_module.get("database")
-                if (
-                    isinstance(database_menu, dict)
-                    and database_menu.get("name") == "数据库管理"
-                ):
-                    database_menu["name"] = "数据与缓存"
-                protocol_menu = stored_by_module.get("protocol")
-                if (
-                    isinstance(protocol_menu, dict)
-                    and protocol_menu.get("name") == "协议端设置"
-                ):
-                    protocol_menu["name"] = "机器人接入"
+                for item in default_menus:
+                    stored = stored_by_module.get(item.module)
+                    if stored and stored.get("name") == LEGACY_NAMES.get(item.module):
+                        stored["name"] = item.name
                 self.menu = [
                     MenuItem(**stored_by_module.get(item.module, item.to_dict()))
                     for item in default_menus

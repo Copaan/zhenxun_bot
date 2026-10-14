@@ -7,17 +7,7 @@ from typing import Any, Literal
 from urllib.parse import urlsplit
 
 import httpx
-
-try:
-    from nonebot.adapters.qq.exception import ActionFailed, NetworkError
-except ModuleNotFoundError:
-    # The optional official adapter is not installed in every test/runtime env.
-    class NetworkError(Exception):
-        pass
-
-    class ActionFailed(Exception):
-        pass
-
+from nonebot.adapters.qq.exception import ActionFailed, NetworkError
 
 QQConnectionState = Literal[
     "authorizing",

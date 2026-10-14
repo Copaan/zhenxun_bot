@@ -41,6 +41,7 @@ __plugin_meta__ = PluginMetadata(
     extra=PluginExtraData(
         author="HibiKier",
         version="0.1",
+        required_platform_capabilities={"business_identity"},
         commands=[
             Command(command="签到"),
             Command(command="我的签到"),

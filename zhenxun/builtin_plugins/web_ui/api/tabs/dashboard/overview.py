@@ -21,8 +21,7 @@ from zhenxun.builtin_plugins.web_ui.security import authenticated_websocket_coun
 from zhenxun.services.cache import cache_config
 from zhenxun.services.cache.config import CacheMode, normalize_cache_mode
 from zhenxun.services.cache.runtime_cache import health_snapshot
-from zhenxun.services.lifecycle import LifecycleError
-from zhenxun.services.lifecycle.operations import operation_registry
+from zhenxun.services.lifecycle import lifecycle_kernel
 from zhenxun.services.log import logger
 from zhenxun.services.message_load import is_db_unhealthy
 
@@ -304,18 +303,9 @@ async def _get_probes(
                 return _probe_results
             generation = _probe_generation
             if _probe_task is None:
-                try:
-                    _, _probe_task = operation_registry.start(
-                        "dashboard_probe",
-                        _run_probes(),
-                        owner_component_id="management:webui",
-                        recovery_policy="discard",
-                        name="webui-dashboard-probe",
-                    )
-                except LifecycleError:
-                    _probe_task = asyncio.create_task(
-                        _run_probes(), name="webui-dashboard-probe"
-                    )
+                _probe_task = lifecycle_kernel.spawn_task(
+                    "management:webui", _run_probes(), name="webui-dashboard-probe"
+                )
             task = _probe_task
         try:
             results = await asyncio.shield(task)
@@ -360,7 +350,7 @@ async def build_runtime_overview(force: bool = False) -> RuntimeOverview:
     from dotenv import dotenv_values
 
     from zhenxun.configs.environment import environment_file
-    from zhenxun.services.runtime_environment import runtime_environment_manager
+    from zhenxun.services.runtime_config import runtime_environment_manager
 
     configured = next(
         (

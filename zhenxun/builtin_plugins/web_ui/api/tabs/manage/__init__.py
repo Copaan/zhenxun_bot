@@ -106,7 +106,7 @@ async def _(bot_id: str) -> Result[list[Friend]]:
     except (ValueError, KeyError):
         return Result.warning_("指定Bot未连接...")
     except Exception as e:
-        logger.error("调用API错误", "/get_group_list", e=e)
+        logger.error("调用API错误", "/get_friend_list", e=e)
         return Result.fail(f"{type(e)}: {e}")
 
 
@@ -161,7 +161,7 @@ async def _(cr: ClearRequest) -> Result:
     await FgRequest.filter(
         handle_type__isnull=True, request_type=cr.request_type
     ).update(handle_type=RequestHandleType.IGNORE)
-    return Result.ok(info="成功清除了数据!")
+    return Result.ok(info="已忽略全部未处理请求")
 
 
 @router.post(
@@ -252,7 +252,7 @@ async def _(param: LeaveGroup) -> Result:
         if param.group_id not in [g.group_id for g in group_list]:
             return Result.warning_("Bot未在该群聊中...")
         await bot.set_group_leave(group_id=param.group_id)
-        return Result.ok(info="成功处理了请求!")
+        return Result.ok(info="已退出群聊")
     except (ValueError, KeyError):
         return Result.warning_("指定Bot未连接...")
     except Exception as e:
@@ -276,7 +276,7 @@ async def _(param: DeleteFriend) -> Result:
         if param.user_id not in [f.user_id for f in friend_list]:
             return Result.warning_("Bot未有其好友...")
         await bot.delete_friend(user_id=param.user_id)
-        return Result.ok(info="成功处理了请求!")
+        return Result.ok(info="已删除好友")
     except (ValueError, KeyError):
         return Result.warning_("指定Bot未连接...")
     except Exception as e:
@@ -317,8 +317,11 @@ async def _(bot_id: str, user_id: str) -> Result[UserDetail]:
 )
 async def _(group_id: str, bot_id: str | None = None) -> Result[GroupDetail]:
     try:
-        return Result.ok(
-            await ApiDataSource.get_group_detail(group_id, bot_id), "拿到信息啦!"
+        result = await ApiDataSource.get_group_detail(group_id, bot_id)
+        return (
+            Result.ok(result, "拿到信息啦!")
+            if result
+            else Result.warning_("未找到该群资料...")
         )
     except TimeoutError:
         return Result.fail(DB_BUSY_MESSAGE)
@@ -340,7 +343,7 @@ async def _(param: SendMessageParam) -> Result:
         await PlatformUtils.send_message(
             bot, param.user_id, param.group_id, param.message
         )
-        return Result.ok("发送成功!")
+        return Result.ok(info="发送成功!")
     except (ValueError, KeyError):
         return Result.warning_("指定Bot未连接...")
     except Exception as e:

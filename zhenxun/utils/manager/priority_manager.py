@@ -5,7 +5,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 import inspect
 import time
-from typing import ClassVar, Literal
+from typing import ClassVar, Literal, cast
 
 import nonebot
 
@@ -28,7 +28,6 @@ class HookSpec:
     failure_policy: FailurePolicy = "fatal"
     depends_on: tuple[str, ...] = ()
     component_id: str | None = None
-    restart_policy: str = "worker"
     config_keys: tuple[str, ...] = ()
     pass_context: bool = False
 
@@ -51,7 +50,6 @@ class PriorityLifecycle:
         failure_policy: FailurePolicy | None = None,
         depends_on: tuple[str, ...] = (),
         component_id: str | None = None,
-        restart_policy: str = "worker",
         config_keys: tuple[str, ...] = (),
         pass_context: bool = False,
     ):
@@ -68,7 +66,6 @@ class PriorityLifecycle:
             or ("degrade" if stage == "warmup" else "fatal"),
             depends_on=depends_on,
             component_id=component_id,
-            restart_policy=restart_policy,
             config_keys=config_keys,
             pass_context=pass_context,
         )
@@ -84,7 +81,6 @@ class PriorityLifecycle:
         failure_policy: FailurePolicy | None = None,
         depends_on: tuple[str, ...] = (),
         component_id: str | None = None,
-        restart_policy: str = "worker",
         config_keys: tuple[str, ...] = (),
         pass_context: bool = False,
     ):
@@ -99,7 +95,6 @@ class PriorityLifecycle:
                 failure_policy=failure_policy,
                 depends_on=depends_on,
                 component_id=component_id,
-                restart_policy=restart_policy,
                 config_keys=config_keys,
                 pass_context=pass_context,
             )
@@ -176,54 +171,68 @@ async def _run_hook(
         )
 
 
+def _hooks(hook_type: PriorityLifecycleType) -> list[tuple[int, Callable, HookSpec]]:
+    priority_data = PriorityLifecycle._data.get(hook_type, {})
+    return [
+        (priority, func, PriorityLifecycle._metadata.get(func, HookSpec()))
+        for priority in sorted(priority_data)
+        for func in list(priority_data[priority])
+    ]
+
+
+def _keyed(
+    hooks: list[tuple[int, Callable, HookSpec]], stage: str | None = None
+) -> dict[str, tuple[int, Callable, HookSpec]]:
+    """以组件 ID 为键整理钩子，未声明 ID 的钩子按阶段、模块与函数名生成
+
+    参数:
+        hooks: 优先级、函数与声明
+        stage: 生成 ID 使用的阶段，缺省时取钩子声明的阶段
+
+    返回:
+        dict[str, tuple[int, Callable, HookSpec]]: 组件 ID 到钩子
+    """
+    result: dict[str, tuple[int, Callable, HookSpec]] = {}
+    for item in hooks:
+        base = (
+            item[2].component_id
+            or f"legacy:{stage or item[2].stage}:{_hook_name(item[1])}"
+        )
+        component_id, suffix = base, 2
+        while component_id in result:
+            component_id = f"{base}#{suffix}"
+            suffix += 1
+        result[component_id] = item
+    return result
+
+
 def _stage_hooks() -> dict[str, tuple[int, Callable, HookSpec]]:
-    priority_data = PriorityLifecycle._data.get(PriorityLifecycleType.STARTUP, {})
-    pending: dict[str, tuple[int, Callable, HookSpec]] = {}
-    for priority in sorted(priority_data):
-        for func in list(priority_data[priority]):
-            spec = PriorityLifecycle._metadata.get(func, HookSpec())
-            base_id = spec.component_id or f"legacy:{spec.stage}:{_hook_name(func)}"
-            task_id = base_id
-            suffix = 2
-            while task_id in pending:
-                task_id = f"{base_id}#{suffix}"
-                suffix += 1
-            pending[task_id] = (priority, func, spec)
-
-    return pending
+    return _keyed(_hooks(PriorityLifecycleType.STARTUP))
 
 
-def _paired_shutdown_hooks() -> dict[str, tuple[int, Callable, HookSpec]]:
-    result: dict[str, tuple[int, Callable, HookSpec]] = {}
-    priority_data = PriorityLifecycle._data.get(PriorityLifecycleType.SHUTDOWN, {})
-    for priority in sorted(priority_data):
-        for func in list(priority_data[priority]):
-            spec = PriorityLifecycle._metadata.get(func, HookSpec())
-            if spec.component_id:
-                if spec.component_id in result:
-                    raise LifecycleError(
-                        f"component_shutdown_duplicate:{spec.component_id}"
-                    )
-                result[spec.component_id] = (priority, func, spec)
-    return result
+def _shutdown_hooks() -> dict[str, tuple[int, Callable, HookSpec]]:
+    """关闭钩子：声明了组件 ID 的与同 ID 的启动钩子配对，其余单独作为组件
+
+    返回:
+        dict[str, tuple[int, Callable, HookSpec]]: 组件 ID 到钩子
+    """
+    hooks = _hooks(PriorityLifecycleType.SHUTDOWN)
+    paired: dict[str, tuple[int, Callable, HookSpec]] = {}
+    for item in hooks:
+        if component_id := item[2].component_id:
+            if component_id in paired:
+                raise LifecycleError(f"component_shutdown_duplicate:{component_id}")
+            paired[component_id] = item
+    alone = _keyed([item for item in hooks if not item[2].component_id], "shutdown")
+    return {**paired, **alone}
 
 
-def _shutdown_only_hooks() -> dict[str, tuple[int, Callable, HookSpec]]:
-    result: dict[str, tuple[int, Callable, HookSpec]] = {}
-    priority_data = PriorityLifecycle._data.get(PriorityLifecycleType.SHUTDOWN, {})
-    for priority in sorted(priority_data):
-        for func in list(priority_data[priority]):
-            spec = PriorityLifecycle._metadata.get(func, HookSpec())
-            if spec.component_id:
-                continue
-            base_id = f"legacy:shutdown:{_hook_name(func)}"
-            component_id = base_id
-            suffix = 2
-            while component_id in result:
-                component_id = f"{base_id}#{suffix}"
-                suffix += 1
-            result[component_id] = (priority, func, spec)
-    return result
+def _shutdown_only() -> dict[str, tuple[int, Callable, HookSpec]]:
+    return {
+        component_id: item
+        for component_id, item in _shutdown_hooks().items()
+        if not item[2].component_id
+    }
 
 
 def _build_start_component(
@@ -246,13 +255,10 @@ def _build_start_component(
                 f"执行启动钩子失败: {_hook_name(func)} ({type(error).__name__})",
                 e=error if isinstance(error, Exception) else None,
             )
-            error._startup_trace_logged = True
-            from zhenxun.services.startup_load import startup_load_planner
+            setattr(error, "_startup_trace_logged", True)
+            if owner := _plugin_owner(func):
+                from zhenxun.services.startup_load import startup_load_planner
 
-            owner = startup_load_planner.owner_for_module(
-                str(getattr(func, "__module__", ""))
-            )
-            if owner and not startup_load_planner.is_core_plugin(owner):
                 startup_load_planner.mark_failed(
                     owner, f"plugin_lifecycle_failed:{type(error).__name__}"
                 )
@@ -269,11 +275,7 @@ def _build_start_component(
     return start_component
 
 
-def _build_stop_component(
-    func: Callable,
-    priority: int,
-    spec: HookSpec,
-) -> Callable:
+def _build_stop_component(priority: int, func: Callable, spec: HookSpec) -> Callable:
     async def stop_component() -> None:
         await _run_hook(
             func,
@@ -286,93 +288,75 @@ def _build_stop_component(
     return stop_component
 
 
-def _sync_kernel_declarations() -> set[Callable]:
-    hooks = _stage_hooks()
-    shutdowns = _paired_shutdown_hooks()
-    shutdown_only = _shutdown_only_hooks()
-    paired: set[Callable] = {
-        item[1] for item in [*shutdowns.values(), *shutdown_only.values()]
-    }
+def _plugin_owner(func: Callable) -> str | None:
+    """钩子所属的非核心插件
 
-    for component_id, (priority, func, spec) in hooks.items():
+    参数:
+        func: 钩子函数
+
+    返回:
+        str | None: 插件 id，核心代码或核心插件时为 None
+    """
+    from zhenxun.services.startup_load import startup_load_planner
+
+    owner = startup_load_planner.owner_for_module(str(getattr(func, "__module__", "")))
+    return owner if owner and not startup_load_planner.is_core_plugin(owner) else None
+
+
+def _sync_kernel_declarations() -> None:
+    """把优先级钩子同步为生命周期组件，运行中的组件保持不变
+
+    关闭钩子与同 ID 的启动钩子配对；单独注册的关闭钩子作为空启动的组件，
+    随 runtime 阶段启动、在关闭时执行。
+    """
+    shutdowns = _shutdown_hooks()
+    declarations = [
+        (component_id, item, shutdowns.get(component_id))
+        for component_id, item in _stage_hooks().items()
+    ] + [(component_id, None, item) for component_id, item in _shutdown_only().items()]
+    for component_id, start, stop in declarations:
         status = lifecycle_kernel.component_status(component_id)
         if status and status["state"] not in {"declared", "stopped", "failed"}:
             continue
-
-        start_component = _build_start_component(func, priority, spec, component_id)
-
-        stop_item = shutdowns.get(component_id)
-        stop_component = None
-        if stop_item:
-            stop_priority, stop_func, stop_spec = stop_item
-            stop_component = _build_stop_component(stop_func, stop_priority, stop_spec)
-
-        failure_policy = spec.failure_policy
-        try:
-            from zhenxun.services.startup_load import startup_load_planner
-
-            owner = startup_load_planner.owner_for_module(
-                str(getattr(func, "__module__", ""))
-            )
-            if owner and not startup_load_planner.is_core_plugin(owner):
-                failure_policy = "degrade"
-        except Exception:
-            pass
+        priority, func, spec = cast(tuple[int, Callable, HookSpec], start or stop)
         lifecycle_kernel.register(
             ComponentSpec(
                 component_id=component_id,
                 stage=spec.stage,
                 depends_on=spec.depends_on,
                 timeout=spec.timeout,
-                failure_policy=failure_policy,
-                restart_policy=spec.restart_policy,  # type: ignore[arg-type]
+                failure_policy="degrade"
+                if _plugin_owner(func)
+                else spec.failure_policy,
                 config_keys=spec.config_keys,
                 priority=priority,
-                stop_priority=stop_item[0] if stop_item else None,
+                stop_priority=stop[0] if stop else None,
                 parallel_safe=spec.parallel_safe,
-                source="priority_lifecycle",
             ),
-            start_component,
-            stop=stop_component,
+            _build_start_component(func, priority, spec, component_id)
+            if start
+            else lambda: None,
+            stop=_build_stop_component(*stop) if stop else None,
             pass_context=spec.pass_context,
             replace=status is not None,
         )
-    for component_id, (priority, func, spec) in shutdown_only.items():
-        status = lifecycle_kernel.component_status(component_id)
-        if status and status["state"] not in {"declared", "stopped", "failed"}:
-            continue
-        lifecycle_kernel.register(
-            ComponentSpec(
-                component_id=component_id,
-                stage="runtime",
-                timeout=spec.timeout,
-                failure_policy="degrade",
-                priority=priority,
-                stop_priority=priority,
-                source="priority_lifecycle_shutdown_only",
-            ),
-            lambda: None,
-            stop=_build_stop_component(func, priority, spec),
-            replace=status is not None,
-        )
-    return paired
 
 
-def lifecycle_component_index() -> dict[str, set[str]]:
-    result: dict[str, set[str]] = {}
-    for hooks in (_stage_hooks(), _shutdown_only_hooks()):
-        for component_id, (_, func, _) in hooks.items():
-            module = str(getattr(func, "__module__", ""))
-            result.setdefault(module, set()).add(component_id)
-    return result
+def lifecycle_component_ids(module_names: set[str]) -> set[str]:
+    """模块注册的生命周期组件
 
+    参数:
+        module_names: 模块名
 
-def lifecycle_component_ids(
-    module_names: set[str], *, index: dict[str, set[str]] | None = None
-) -> set[str]:
-    if index is None:
-        index = lifecycle_component_index()
-    return {item for module in module_names for item in index.get(module, ())}
+    返回:
+        set[str]: 组件 ID
+    """
+    hooks = {**_stage_hooks(), **_shutdown_only()}
+    return {
+        component_id
+        for component_id, (_, func, _) in hooks.items()
+        if str(getattr(func, "__module__", "")) in module_names
+    }
 
 
 async def _run_stage(
@@ -384,9 +368,8 @@ async def _run_stage(
         for component_id, (_, _, spec) in _stage_hooks().items()
         if spec.stage == stage
     }
-    component_ids.update(lifecycle_kernel.native_component_ids_for_stage(stage))
     if stage == "runtime":
-        component_ids.update(_shutdown_only_hooks())
+        component_ids.update(_shutdown_only())
     component_ids.difference_update(excluded_components or set())
     await lifecycle_kernel.start_components(component_ids)
 
@@ -486,37 +469,29 @@ async def _start_application_lifecycle() -> None:
 
 
 @driver.on_shutdown
-async def _():
+async def _shutdown_application_lifecycle():
+    """在关闭预算内排空运行时变更、取消启动编排并停止全部组件"""
+    global _post_management_task
     from zhenxun.services.lifecycle.deadline import (
         WORKER_SHUTDOWN_SECONDS,
+        remaining_timeout,
         shutdown_budget,
     )
-
-    with shutdown_budget(lifecycle_kernel.shutdown_remaining(WORKER_SHUTDOWN_SECONDS)):
-        await _shutdown_with_budget()
-
-
-async def _shutdown_with_budget():
-    global _post_management_task
-    from zhenxun.services.lifecycle.deadline import remaining_timeout
     from zhenxun.services.runtime_mutation import runtime_mutation_coordinator
 
-    mutation_drained = await runtime_mutation_coordinator.quiesce(
-        timeout=remaining_timeout(10)
-    )
-    if not mutation_drained:
-        logger.error("运行时变更事务未能在关闭前排空，将要求 worker 恢复。")
-    task = _post_management_task
-    _post_management_task = None
-    if task is not None and not task.done():
-        task.cancel()
-        done, pending = await asyncio.wait({task}, timeout=remaining_timeout(2.0))
-        if pending:
-            lifecycle_kernel.require_recovery("runtime_bootstrap")
-        for completed in done:
-            if not completed.cancelled():
-                completed.exception()
-
-    _sync_kernel_declarations()
-    await lifecycle_kernel.stop_all()
+    with shutdown_budget(lifecycle_kernel.shutdown_remaining(WORKER_SHUTDOWN_SECONDS)):
+        if not await runtime_mutation_coordinator.quiesce(
+            timeout=remaining_timeout(10)
+        ):
+            logger.error("运行时变更事务未能在关闭前排空。")
+        task = _post_management_task
+        _post_management_task = None
+        if task is not None and not task.done():
+            task.cancel()
+            done, _ = await asyncio.wait({task}, timeout=remaining_timeout(2.0))
+            for completed in done:
+                if not completed.cancelled():
+                    completed.exception()
+        _sync_kernel_declarations()
+        await lifecycle_kernel.stop_all()
     runtime_mutation_coordinator.close()

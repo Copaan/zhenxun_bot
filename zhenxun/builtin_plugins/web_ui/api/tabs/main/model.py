@@ -2,19 +2,7 @@ from typing import Any
 
 from nonebot.adapters import Bot
 from nonebot.compat import model_dump
-from nonebot.config import Config
 from pydantic import BaseModel, ConfigDict, Field
-
-
-class BotManageUpdateParam(BaseModel):
-    """bot更新参数"""
-
-    bot_id: str
-    """bot id"""
-    block_plugins: list[str]
-    """禁用插件"""
-    block_tasks: list[str]
-    """禁用被动"""
 
 
 class BotStatusParam(BaseModel):
@@ -70,8 +58,6 @@ class BaseInfo(BaseModel):
     """好友数量"""
     group_count: int = 0
     """群聊数量"""
-    received_messages: int = 0
-    """今日 累计接收消息"""
     connect_time: int = 0
     """连接时间"""
     connect_date: str | None = None
@@ -83,10 +69,6 @@ class BaseInfo(BaseModel):
 
     is_select: bool = False
     """当前选择"""
-    day_call: int = 0
-    """今日调用插件次数"""
-    version: str = "unknown"
-    """真寻版本"""
     bot_key: str = ""
     runtime_bot_id: str = ""
     storage_bot_id: str = ""
@@ -141,6 +123,17 @@ class ActiveGroup(BaseModel):
     """群组头像"""
 
 
+class ChatCallCount(BaseModel):
+    """
+    聊天与调用次数
+    """
+
+    chat: QueryCount
+    """聊天记录数量"""
+    call: QueryCount
+    """调用记录数量"""
+
+
 class HotPlugin(BaseModel):
     """
     热门插件
@@ -152,10 +145,3 @@ class HotPlugin(BaseModel):
     """插件名称"""
     count: int
     """调用次数"""
-
-
-class NonebotData(BaseModel):
-    config: Config
-    """nb配置"""
-    run_time: int
-    """运行时间"""

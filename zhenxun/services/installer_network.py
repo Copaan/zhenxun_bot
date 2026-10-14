@@ -278,7 +278,7 @@ def _apply_proxy(environment):
 def resolver_failure(text):
     """Classify before redaction; never infer a missing wheel from any failure."""
     lowered = text.lower()
-    code = "archive_dependency_resolution_failed"
+    code = "dependency_resolution_failed"
     for needles, candidate in (
         (
             (
@@ -287,12 +287,12 @@ def resolver_failure(text):
                 "unrecognized option",
                 "unknown option",
             ),
-            "archive_dependency_resolver_configuration",
+            "dependency_resolver_configuration",
         ),
-        (("no space left", "disk full"), "archive_dependency_disk_full"),
-        (("407", "proxy authentication"), "archive_dependency_proxy_auth"),
-        (("401", "403", "unauthorized", "forbidden"), "archive_dependency_index_auth"),
-        (("certificate", "tls", "ssl"), "archive_dependency_tls"),
+        (("no space left", "disk full"), "dependency_disk_full"),
+        (("407", "proxy authentication"), "dependency_proxy_auth"),
+        (("401", "403", "unauthorized", "forbidden"), "dependency_index_auth"),
+        (("certificate", "tls", "ssl"), "dependency_tls"),
         (
             (
                 "failed to connect",
@@ -302,11 +302,11 @@ def resolver_failure(text):
                 "failed to fetch",
                 "network",
             ),
-            "archive_dependency_network",
+            "dependency_network",
         ),
         (
             ("requires-python", "python version", "requires python"),
-            "archive_dependency_python",
+            "dependency_python",
         ),
         (
             (
@@ -316,11 +316,11 @@ def resolver_failure(text):
                 "building is disabled",
                 "building source distributions is disabled",
             ),
-            "archive_dependency_source_required",
+            "dependency_source_required",
         ),
         (
             ("no solution", "incompatible", "conflict", "unsatisfiable"),
-            "archive_dependency_conflict",
+            "dependency_conflict",
         ),
     ):
         if any(needle in lowered for needle in needles):
@@ -334,7 +334,7 @@ def resolver_failure(text):
         "detail": safe_process_error(detail),
         "source_build_available": code
         in {
-            "archive_dependency_source_required",
-            "archive_dependency_resolution_failed",
+            "dependency_source_required",
+            "dependency_resolution_failed",
         },
     }

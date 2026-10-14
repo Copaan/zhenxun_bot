@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
+from functools import cache
 import hashlib
 from importlib import import_module
 from io import StringIO
@@ -17,7 +18,6 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 import httpx
 from pydantic import BaseModel, Field
-from ruamel.yaml import YAML
 
 from zhenxun.configs.config import Config
 from zhenxun.services.ai.config import get_llm_config
@@ -27,6 +27,7 @@ from zhenxun.services.ai.core.exceptions import (
     ConfigurationException,
     InvalidRequestException,
     LLMException,
+    LocationNotSupportedException,
     QuotaExceededException,
     RateLimitException,
     ResponseParseException,
@@ -52,7 +53,7 @@ from zhenxun.services.ai.llm.system.capabilities import get_model_capabilities
 from zhenxun.services.ai.llm.system.network import health_manager, http_client_manager
 from zhenxun.services.log import logger
 from zhenxun.services.plugin_host import RuntimeOperation
-from zhenxun.services.runtime_config_reload import reload_runtime_config
+from zhenxun.services.runtime_config import reload_runtime_config
 from zhenxun.utils._restart_utils import issue_restart_ticket
 from zhenxun.utils.pydantic_compat import (
     model_dump,
@@ -69,6 +70,7 @@ from ....apply_result import (
     update_pending_restart,
 )
 from ....base_model import Result
+from ....config_validation import _yaml_parser
 from ....restart_service import restart_status_data
 from ....utils import authentication
 from ...configure.persistence import _write_transaction
@@ -78,28 +80,17 @@ router = APIRouter()
 _CONFIG_FILE = Path("data/config.yaml")
 _SECTIONS = {
     "default_models": "default_models",
-    "model_groups": "MODEL_GROUPS",
     "context": "context_settings",
     "agent": "agent_settings",
     "sandbox": "sandbox",
     "advanced": None,
 }
 _ADVANCED_KEYS = {"client_settings", "debug_log", "provider_settings"}
-_OPENAI_DISCOVERY_TYPES = {
-    "openai",
-    "openai_responses",
-    "deepseek",
-    "openrouter",
-}
+_DISCOVERY_TYPES = {"openai", "openai_responses", "deepseek", "openrouter", "gemini"}
 _DISCOVERY_TIMEOUT = 12.0
 _PERSIST_LOCK = asyncio.Lock()
 _SANDBOX_STARTUP_VALUES = model_dump(get_llm_config().sandbox)
 _SANDBOX_STARTUP_KEYS = {"enable_sandbox", "sandbox_type"}
-
-
-class SecretSlot(BaseModel):
-    existing_index: int | None = Field(default=None, ge=0)
-    value: str | None = None
 
 
 class ProviderSettingsUpdate(BaseModel):
@@ -110,7 +101,7 @@ class ProviderSettingsUpdate(BaseModel):
     timeout: int = Field(default=180, ge=1, le=1800)
     temperature: float | None = Field(default=None, ge=0, le=2)
     max_output_tokens: int | None = Field(default=None, ge=1)
-    api_keys: list[SecretSlot] | None = None
+    api_keys: list[str] | None = None
     models: list[dict[str, Any]] | None = None
 
 
@@ -178,13 +169,6 @@ class PersonaUpdate(BaseModel):
     enabled: bool = True
 
 
-def _yaml() -> YAML:
-    parser = YAML()
-    parser.preserve_quotes = True
-    parser.indent(mapping=2, sequence=4, offset=2)
-    return parser
-
-
 def _read() -> str:
     return _CONFIG_FILE.read_text(encoding="utf-8") if _CONFIG_FILE.exists() else ""
 
@@ -226,7 +210,7 @@ def _persona_view(persona: Any) -> dict[str, Any]:
 
 
 def _load(content: str) -> dict[str, Any]:
-    data = _yaml().load(StringIO(content)) or {}
+    data = _yaml_parser().load(StringIO(content)) or {}
     if not isinstance(data, dict):
         raise _configuration_error(
             "yaml_top_level_mapping_required", "config.yaml 顶层必须是映射。"
@@ -239,7 +223,7 @@ def _load(content: str) -> dict[str, Any]:
 
 def _dump(data: dict[str, Any]) -> str:
     stream = StringIO()
-    _yaml().dump(data, stream)
+    _yaml_parser().dump(data, stream)
     return stream.getvalue()
 
 
@@ -450,29 +434,36 @@ def _validate_full(ai: dict[str, Any], *, strict_references: bool = True) -> LLM
     return config
 
 
-def _find_provider(ai: dict[str, Any], name: str) -> tuple[int, dict[str, Any]]:
-    providers = _ai_get(ai, "PROVIDERS", [])
-    for index, provider in enumerate(providers):
-        if (
-            isinstance(provider, dict)
-            and str(provider.get("name", "")).casefold() == name.casefold()
-        ):
-            return index, provider
-    raise HTTPException(
-        status_code=404,
-        detail={"code": "provider_not_found", "message": "未找到该 AI 服务商。"},
+def _provider_index(providers: Any, name: str) -> int | None:
+    """按名称查找服务商下标，名称不区分大小写
+
+    参数:
+        providers: 原始服务商列表
+        name: 服务商名称
+
+    返回:
+        int | None: 下标，未找到时为 None
+    """
+    return next(
+        (
+            index
+            for index, item in enumerate(providers or [])
+            if isinstance(item, dict)
+            and str(item.get("name", "")).casefold() == name.strip().casefold()
+        ),
+        None,
     )
 
 
-def _keys(provider: dict[str, Any]) -> list[str]:
-    value = provider.get("api_key", [])
-    if isinstance(value, str):
-        candidates = [value]
-    elif isinstance(value, list):
-        candidates = [str(item) for item in value]
-    else:
-        candidates = []
-    return [item for item in candidates if not _is_placeholder_secret(item)]
+def _find_provider(ai: dict[str, Any], name: str) -> tuple[int, dict[str, Any]]:
+    providers = _ai_get(ai, "PROVIDERS", [])
+    index = _provider_index(providers, name)
+    if index is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "provider_not_found", "message": "未找到该 AI 服务商。"},
+        )
+    return index, providers[index]
 
 
 _PLACEHOLDER_SECRETS = {
@@ -495,6 +486,21 @@ def _is_placeholder_secret(value: Any) -> bool:
         or re.fullmatch(r"\$\{[^{}]+\}", normalized)
         or re.fullmatch(r"<[^<>]+>", normalized)
     )
+
+
+def _keys(value: Any) -> list[str]:
+    """整理 API Key 列表，去掉空值与占位符
+
+    参数:
+        value: 单个密钥或密钥列表
+
+    返回:
+        list[str]: 有效密钥
+    """
+    candidates = [value] if isinstance(value, str) else value or []
+    return [
+        str(item).strip() for item in candidates if not _is_placeholder_secret(item)
+    ]
 
 
 def _rename_provider_references(ai: dict[str, Any], old: str, new: str) -> None:
@@ -521,118 +527,98 @@ def _rename_provider_references(ai: dict[str, Any], old: str, new: str) -> None:
                 ]
 
 
-def _apply_secret_slots(
-    existing: list[str], slots: list[SecretSlot] | None
-) -> list[str]:
-    if slots is None:
-        return existing
-    result: list[str] = []
-    used: set[int] = set()
-    for slot in slots:
-        replacement = (slot.value or "").strip()
-        if replacement and _is_placeholder_secret(replacement):
-            replacement = ""
-        if slot.existing_index is None:
-            if replacement:
-                result.append(replacement)
-            continue
-        if slot.existing_index >= len(existing) or slot.existing_index in used:
-            raise _configuration_error(
-                "secret_slot_invalid",
-                "密钥列表已变化，请重新加载后再保存。",
-                "AI.PROVIDERS.api_key",
-            )
-        used.add(slot.existing_index)
-        result.append(replacement or existing[slot.existing_index])
-    return result
+def _merge_models(
+    provider: dict[str, Any], models: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """用提交的模型列表覆盖服务商模型，保留同名模型中未提交的字段
 
+    参数:
+        provider: 原始服务商配置
+        models: 提交的模型列表
 
-async def _persist_unlocked(
-    expected_revision: str,
-    mutate: Any,
-    *,
-    reload_consumers: bool = True,
-) -> tuple[str, LLMConfig, RuntimeOperation | None]:
-    current = _read()
-    if _revision(current) != expected_revision:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "code": "configuration_revision_conflict",
-                "message": "配置文件已被外部修改，请重新加载。",
-            },
-        )
-    data = _load(current)
-    baseline = _validate_full(data["AI"], strict_references=False)
-    baseline_issues = {
-        (item["code"], item["path"], item["message"])
-        for item in _reference_issues(baseline)
+    返回:
+        list[dict[str, Any]]: 合并后的模型列表
+    """
+    existing = {
+        str(item.get("model_name")): item
+        for item in provider.get("models") or []
+        if isinstance(item, dict) and item.get("model_name")
     }
-    candidate = deepcopy(data)
-    mutate(candidate["AI"])
-    config = _validate_full(candidate["AI"], strict_references=False)
-    candidate_issues = _reference_issues(config)
-    new_issues = [
-        item
-        for item in candidate_issues
-        if (item["code"], item["path"], item["message"]) not in baseline_issues
+    return [
+        {**deepcopy(existing.get(str(model.get("model_name", "")), {})), **model}
+        for model in models
     ]
-    if new_issues:
-        _raise_reference_issue(new_issues[0])
-    content = _dump(candidate)
-    if content == current:
-        return _revision(content), config, None
-    original = _CONFIG_FILE.read_bytes() if _CONFIG_FILE.exists() else None
-    try:
-        _write_transaction([(_CONFIG_FILE, content.encode("utf-8"))])
-        if reload_consumers:
-            operation = await reload_runtime_config(submit_restart=False)
-        else:
-            try:
-                operation = await reload_runtime_config(
-                    submit_restart=False,
-                    reload_consumers=False,
-                )
-            except TypeError as error:
-                if "reload_consumers" not in str(error):
-                    raise
-                operation = await reload_runtime_config(submit_restart=False)
-    except Exception as error:
-        if original is None:
-            _CONFIG_FILE.unlink(missing_ok=True)
-        else:
-            _write_transaction([(_CONFIG_FILE, original)])
-        try:
-            await reload_runtime_config(submit_restart=False)
-        except Exception:
-            pass
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "code": "ai_reload_failed",
-                "message": "AI 配置保存或热加载失败，已恢复原配置。",
-            },
-        ) from error
-    return _revision(content), config, operation
 
 
-async def _persist_with_operation(
+async def _persist(
     expected_revision: str,
     mutate: Any,
     *,
     reload_consumers: bool = True,
 ) -> tuple[str, LLMConfig, RuntimeOperation | None]:
+    """校验修订号后修改 AI 配置并热加载，失败时恢复原文件
+
+    参数:
+        expected_revision: 前端持有的配置修订号
+        mutate: 修改 AI 配置组的函数
+        reload_consumers: 是否重载配置消费者
+
+    返回:
+        tuple[str, LLMConfig, RuntimeOperation | None]: 新修订号、配置与重载结果
+    """
     async with _PERSIST_LOCK:
-        return await _persist_unlocked(
-            expected_revision,
-            mutate,
-            reload_consumers=reload_consumers,
-        )
-
-
-async def _persist(expected_revision: str, mutate: Any) -> tuple[str, LLMConfig]:
-    revision, config, _ = await _persist_with_operation(expected_revision, mutate)
-    return revision, config
+        current = _read()
+        if _revision(current) != expected_revision:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "configuration_revision_conflict",
+                    "message": "配置文件已被外部修改，请重新加载。",
+                },
+            )
+        data = _load(current)
+        baseline = {
+            (item["code"], item["path"], item["message"])
+            for item in _reference_issues(
+                _validate_full(data["AI"], strict_references=False)
+            )
+        }
+        candidate = deepcopy(data)
+        mutate(candidate["AI"])
+        config = _validate_full(candidate["AI"], strict_references=False)
+        new_issues = [
+            item
+            for item in _reference_issues(config)
+            if (item["code"], item["path"], item["message"]) not in baseline
+        ]
+        if new_issues:
+            _raise_reference_issue(new_issues[0])
+        content = _dump(candidate)
+        if content == current:
+            return _revision(content), config, None
+        original = _CONFIG_FILE.read_bytes() if _CONFIG_FILE.exists() else None
+        try:
+            _write_transaction([(_CONFIG_FILE, content.encode("utf-8"))])
+            operation = await reload_runtime_config(
+                submit_restart=False, reload_consumers=reload_consumers
+            )
+        except Exception as error:
+            if original is None:
+                _CONFIG_FILE.unlink(missing_ok=True)
+            else:
+                _write_transaction([(_CONFIG_FILE, original)])
+            try:
+                await reload_runtime_config(submit_restart=False)
+            except Exception:
+                pass
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "code": "ai_reload_failed",
+                    "message": "AI 配置保存或热加载失败，已恢复原配置。",
+                },
+            ) from error
+        return _revision(content), config, operation
 
 
 def _restore_sandbox_startup_runtime() -> None:
@@ -662,130 +648,88 @@ def _apply_response(
     *,
     apply_mode: str | None = None,
     changed_keys: list[str] | None = None,
-    restart_required: bool | None = None,
     reason_codes: list[str] | None = None,
     pending_source: str = "webui.ai",
 ) -> dict[str, Any]:
-    status = restart_status_data()
+    """生成保存结果，需要重启时登记待重启原因
+
+    参数:
+        config: 保存后的 AI 配置
+        revision: 新修订号
+        operation: 配置重载结果
+        apply_mode: 指定的生效方式，为空时取重载结果
+        changed_keys: 指定的变更键，为空时取重载结果
+        reason_codes: 指定的重启原因，为空时取重载结果
+        pending_source: 待重启原因的来源
+
+    返回:
+        dict[str, Any]: 生效结果与最新配置视图
+    """
     mode = apply_mode or (
         operation.mode.value if operation is not None else APPLY_NO_CHANGE
     )
-    required = (
-        mode == APPLY_RESTART_PENDING if restart_required is None else restart_required
-    )
-    reasons = reason_codes or (
-        [operation.reason] if operation is not None and operation.reason else []
-    )
-    if required:
-        launcher_managed = update_pending_restart(
-            pending_source,
-            reasons or ["ai_runtime_restart_required"],
-        )
-        if launcher_managed:
-            issue_restart_ticket("webui.settings", ttl_seconds=10 * 60)
+    required = mode == APPLY_RESTART_PENDING
+    if reason_codes is None:
+        reason_codes = [operation.reason] if operation and operation.reason else []
+    if changed_keys is None:
+        changed_keys = operation.config_keys if operation is not None else []
+    if required and update_pending_restart(
+        pending_source, reason_codes or ["ai_runtime_restart_required"]
+    ):
+        issue_restart_ticket("webui.settings", ttl_seconds=10 * 60)
+    status = restart_status_data()
     return apply_result_data(
         apply_mode=mode,
-        changed_keys=(
-            changed_keys
-            if changed_keys is not None
-            else operation.config_keys
-            if operation is not None
-            else []
-        ),
+        changed_keys=changed_keys,
         restart_required=required,
-        reason_codes=reasons,
+        reason_codes=reason_codes,
         access_urls=status["access_urls"],
         access_targets=status["access_targets"],
         **_configuration_view(config, revision),
     )
 
 
-def _safe_model_data(value: Any) -> dict[str, Any]:
-    if not isinstance(value, dict):
-        return {}
-
-    def sensitive(key: Any) -> bool:
-        normalized = str(key).strip().lower().replace("-", "_")
-        return normalized in {
-            "api_key",
-            "apikey",
-            "token",
-            "access_token",
-            "secret",
-            "password",
-            "credential",
-            "credentials",
-        } or normalized.endswith(("_api_key", "_token", "_secret", "_password"))
-
-    def clean(item: Any) -> Any:
-        if isinstance(item, dict):
-            return {
-                str(key): clean(child)
-                for key, child in item.items()
-                if not sensitive(key)
-            }
-        if isinstance(item, list):
-            return [clean(child) for child in item]
-        return jsonable_encoder(item)
-
-    return clean(value)
-
-
 def _provider_view(
     provider: ProviderConfig, raw_provider: dict[str, Any] | None = None
 ) -> dict[str, Any]:
-    data = model_dump(provider, exclude={"api_key"})
-    keys = (
-        provider.api_key if isinstance(provider.api_key, list) else [provider.api_key]
-    )
-    valid_keys = [value for value in keys if not _is_placeholder_secret(value)]
-    data["api_key_slots"] = [
-        {"existing_index": index, "configured": True}
-        for index, _value in enumerate(valid_keys)
-    ]
-    raw_models = (
-        raw_provider.get("models", []) if isinstance(raw_provider, dict) else []
-    )
-    raw_by_name = {
+    """生成服务商视图，包含密钥、模型能力与自动发现状态
+
+    参数:
+        provider: 服务商配置
+        raw_provider: 配置文件中的原始服务商数据，用于保留未声明的模型字段
+
+    返回:
+        dict[str, Any]: 服务商视图
+    """
+    keys = _keys(provider.api_key)
+    raw_models = {
         str(item.get("model_name")): item
-        for item in raw_models
+        for item in (raw_provider or {}).get("models") or []
         if isinstance(item, dict) and item.get("model_name")
     }
-    data["models"] = []
-    for model in provider.models:
-        raw_model = raw_by_name.get(model.model_name, {})
-        data["models"].append(
+    if provider.api_type not in _DISCOVERY_TYPES:
+        discovery_status = "manual_only"
+    elif not (provider.api_base or get_default_api_base_for_type(provider.api_type)):
+        discovery_status = "missing_base"
+    elif not keys:
+        discovery_status = "missing_credentials"
+    else:
+        discovery_status = "ready"
+    return {
+        **model_dump(provider),
+        "api_key": keys,
+        "models": [
             {
-                **_safe_model_data(raw_model),
+                **jsonable_encoder(raw_models.get(model.model_name, {})),
                 **model_dump(model),
                 "capabilities": jsonable_encoder(
                     model_dump(get_model_capabilities(model.model_name))
                 ),
             }
-        )
-    discovery_supported = (
-        provider.api_type in _OPENAI_DISCOVERY_TYPES or provider.api_type == "gemini"
-    )
-    effective_base = provider.api_base or get_default_api_base_for_type(
-        provider.api_type
-    )
-    if not discovery_supported:
-        discovery_status = "manual_only"
-        discovery_reason_code = "model_discovery_unsupported"
-    elif not effective_base:
-        discovery_status = "missing_base"
-        discovery_reason_code = "provider_api_base_incomplete"
-    elif not valid_keys:
-        discovery_status = "missing_credentials"
-        discovery_reason_code = "provider_credentials_incomplete"
-    else:
-        discovery_status = "ready"
-        discovery_reason_code = None
-    data["discovery_supported"] = discovery_supported
-    data["credential_status"] = "configured" if valid_keys else "missing"
-    data["discovery_status"] = discovery_status
-    data["discovery_reason_code"] = discovery_reason_code
-    return data
+            for model in provider.models
+        ],
+        "discovery_status": discovery_status,
+    }
 
 
 def _normalize_model_groups(value: Any) -> dict[str, list[str]]:
@@ -840,7 +784,21 @@ def _normalize_model_groups(value: Any) -> dict[str, list[str]]:
     return groups
 
 
+@cache
+def _schema() -> dict[str, Any]:
+    return model_json_schema(LLMConfig)
+
+
 def _configuration_view(config: LLMConfig, revision: str) -> dict[str, Any]:
+    """生成 AI 配置页面数据
+
+    参数:
+        config: AI 配置
+        revision: 配置修订号
+
+    返回:
+        dict[str, Any]: 服务商、各分区配置与引用问题
+    """
     try:
         raw_ai = _load(_read())["AI"]
     except Exception:
@@ -848,33 +806,24 @@ def _configuration_view(config: LLMConfig, revision: str) -> dict[str, Any]:
     raw_providers = _ai_get(raw_ai, "PROVIDERS", [])
 
     def raw_provider(name: str) -> dict[str, Any] | None:
-        return next(
-            (
-                item
-                for item in raw_providers
-                if isinstance(item, dict)
-                and str(item.get("name", "")).casefold() == name.casefold()
-            ),
-            None,
-        )
+        index = _provider_index(raw_providers, name)
+        return None if index is None else raw_providers[index]
 
     def section(key: str, normalized: Any) -> Any:
         value = _ai_get(raw_ai, key)
-        if isinstance(value, dict):
-            return _safe_model_data(value)
         return jsonable_encoder(value) if value is not None else normalized
 
     api_types = sorted(LLMAdapterFactory.list_supported_types())
     return {
         "revision": revision,
-        "schema": model_json_schema(LLMConfig),
+        "schema": _schema(),
         "api_types": api_types,
         "default_api_bases": {
             api_type: default_base
             for api_type in api_types
             if (default_base := get_default_api_base_for_type(api_type))
         },
-        "discovery_api_types": sorted((*_OPENAI_DISCOVERY_TYPES, "gemini")),
+        "discovery_api_types": sorted(_DISCOVERY_TYPES),
         "providers": [
             _provider_view(provider, raw_provider(provider.name))
             for provider in config.providers
@@ -897,19 +846,6 @@ def _configuration_view(config: LLMConfig, revision: str) -> dict[str, Any]:
                 ),
             },
         },
-        "effects": {
-            "providers": "hot_reload",
-            "models": "hot_reload",
-            "default_models": "hot_reload",
-            "model_groups": "hot_reload",
-            "context": "hot_reload",
-            "agent": "hot_reload",
-            "sandbox": "new_session",
-            "sandbox.enable_sandbox": "restart_required",
-            "sandbox.sandbox_type": "restart_required",
-            "advanced": "hot_reload",
-        },
-        "runtime": {"hot_reload_available": True},
         "validation_issues": _reference_issues(config),
     }
 
@@ -927,6 +863,43 @@ async def get_configuration() -> Result:
     return Result.ok(_configuration_view(config, _revision(content)))
 
 
+def _provider_fields(payload: ProviderSettingsUpdate, keys: Any) -> dict[str, Any]:
+    """校验密钥并生成要写入的服务商字段
+
+    参数:
+        payload: 提交的服务商设置
+        keys: 要保存的 API Key
+
+    返回:
+        dict[str, Any]: 服务商字段
+    """
+    keys = _keys(keys)
+    if not keys:
+        raise _configuration_error(
+            "provider_key_required",
+            "服务商必须填写至少一个 API Key。",
+            "AI.PROVIDERS.api_key",
+        )
+    return {
+        "name": payload.name.strip(),
+        "api_key": keys,
+        "api_base": payload.api_base or None,
+        "api_type": payload.api_type,
+        "temperature": payload.temperature,
+        "max_output_tokens": payload.max_output_tokens,
+        "timeout": payload.timeout,
+    }
+
+
+def _check_provider_name(
+    ai: dict[str, Any], name: str, own_index: int | None = None
+) -> None:
+    if _provider_index(_ai_get(ai, "PROVIDERS", []), name) not in (None, own_index):
+        raise _configuration_error(
+            "provider_name_duplicate", "服务商名称已存在。", "AI.PROVIDERS"
+        )
+
+
 @router.post(
     "/providers",
     dependencies=[authentication()],
@@ -935,41 +908,19 @@ async def get_configuration() -> Result:
 )
 async def create_provider(payload: ProviderSettingsUpdate) -> Result:
     def mutate(ai: dict[str, Any]) -> None:
+        _check_provider_name(ai, payload.name)
         providers = _ai_get(ai, "PROVIDERS")
         if providers is None:
             providers = []
             _ai_set(ai, "PROVIDERS", providers)
-        if any(
-            str(item.get("name", "")).casefold() == payload.name.casefold()
-            for item in providers
-            if isinstance(item, dict)
-        ):
-            raise _configuration_error(
-                "provider_name_duplicate", "服务商名称已存在。", "AI.PROVIDERS"
-            )
-        keys = _apply_secret_slots([], payload.api_keys)
-        if not keys:
-            raise _configuration_error(
-                "provider_key_required",
-                "新增服务商必须填写至少一个 API Key。",
-                "AI.PROVIDERS.api_key",
-            )
         providers.append(
             {
-                "name": payload.name.strip(),
-                "api_key": keys,
-                "api_base": payload.api_base or None,
-                "api_type": payload.api_type,
-                "temperature": payload.temperature,
-                "max_output_tokens": payload.max_output_tokens,
-                "timeout": payload.timeout,
+                **_provider_fields(payload, payload.api_keys),
                 "models": deepcopy(payload.models or []),
             }
         )
 
-    revision, config, operation = await _persist_with_operation(
-        payload.expected_revision, mutate
-    )
+    revision, config, operation = await _persist(payload.expected_revision, mutate)
     return Result.ok(
         _apply_response(config, revision, operation),
         info="AI 服务商已保存并热加载。",
@@ -987,50 +938,17 @@ async def update_provider(
 ) -> Result:
     def mutate(ai: dict[str, Any]) -> None:
         index, provider = _find_provider(ai, provider_name)
-        for other_index, other in enumerate(_ai_get(ai, "PROVIDERS", [])):
-            if (
-                other_index != index
-                and str(other.get("name", "")).casefold() == payload.name.casefold()
-            ):
-                raise _configuration_error(
-                    "provider_name_duplicate", "服务商名称已存在。", "AI.PROVIDERS"
-                )
-        keys = _apply_secret_slots(_keys(provider), payload.api_keys)
-        if not keys:
-            raise _configuration_error(
-                "provider_key_required",
-                "服务商必须保留至少一个 API Key。",
-                "AI.PROVIDERS.api_key",
-            )
-        _rename_provider_references(ai, str(provider.get("name", "")), payload.name)
-        provider.update(
-            {
-                "name": payload.name.strip(),
-                "api_key": keys,
-                "api_base": payload.api_base or None,
-                "api_type": payload.api_type,
-                "temperature": payload.temperature,
-                "max_output_tokens": payload.max_output_tokens,
-                "timeout": payload.timeout,
-            }
+        _check_provider_name(ai, payload.name, index)
+        fields = _provider_fields(
+            payload,
+            provider.get("api_key") if payload.api_keys is None else payload.api_keys,
         )
+        _rename_provider_references(ai, str(provider.get("name", "")), fields["name"])
+        provider.update(fields)
         if payload.models is not None:
-            existing = {
-                str(item.get("model_name")): item
-                for item in provider.get("models", [])
-                if isinstance(item, dict) and item.get("model_name")
-            }
-            provider["models"] = [
-                {
-                    **deepcopy(existing.get(str(model.get("model_name", "")), {})),
-                    **model,
-                }
-                for model in payload.models
-            ]
+            provider["models"] = _merge_models(provider, payload.models)
 
-    revision, config, operation = await _persist_with_operation(
-        payload.expected_revision, mutate
-    )
+    revision, config, operation = await _persist(payload.expected_revision, mutate)
     return Result.ok(
         _apply_response(config, revision, operation),
         info="AI 服务商已保存并热加载。",
@@ -1048,9 +966,7 @@ async def delete_provider(provider_name: str, expected_revision: str) -> Result:
         index, _ = _find_provider(ai, provider_name)
         _ai_get(ai, "PROVIDERS", []).pop(index)
 
-    revision, config, operation = await _persist_with_operation(
-        expected_revision, mutate
-    )
+    revision, config, operation = await _persist(expected_revision, mutate)
     return Result.ok(
         _apply_response(config, revision, operation),
         info="AI 服务商已删除并热加载。",
@@ -1066,25 +982,47 @@ async def delete_provider(provider_name: str, expected_revision: str) -> Result:
 async def update_models(provider_name: str, payload: ProviderModelsUpdate) -> Result:
     def mutate(ai: dict[str, Any]) -> None:
         _, provider = _find_provider(ai, provider_name)
-        existing = {
-            str(item.get("model_name")): item
-            for item in provider.get("models", [])
-            if isinstance(item, dict) and item.get("model_name")
-        }
-        provider["models"] = [
-            {
-                **deepcopy(existing.get(str(model.get("model_name", "")), {})),
-                **model,
-            }
-            for model in payload.models
-        ]
+        provider["models"] = _merge_models(provider, payload.models)
 
-    revision, config, operation = await _persist_with_operation(
-        payload.expected_revision, mutate
-    )
+    revision, config, operation = await _persist(payload.expected_revision, mutate)
     return Result.ok(
         _apply_response(config, revision, operation),
         info="模型列表已保存并热加载。",
+    )
+
+
+def _sandbox_apply_mode(before: dict[str, Any], after: dict[str, Any]) -> tuple:
+    """判断沙箱设置的生效方式，启动期字段的运行态保持启动时的值
+
+    参数:
+        before: 保存前的沙箱设置
+        after: 保存后的沙箱设置
+
+    返回:
+        tuple: 生效方式、变更键与重启原因
+    """
+    changed = sorted(
+        key for key in before.keys() | after.keys() if before.get(key) != after.get(key)
+    )
+    deferred = sorted(
+        key
+        for key in _SANDBOX_STARTUP_KEYS
+        if after.get(key) != _SANDBOX_STARTUP_VALUES.get(key)
+    )
+    if deferred:
+        _restore_sandbox_startup_runtime()
+    if not changed:
+        mode = APPLY_NO_CHANGE
+    elif deferred and _SANDBOX_STARTUP_KEYS.intersection(changed):
+        mode = APPLY_RESTART_PENDING
+    elif set(changed) - _SANDBOX_STARTUP_KEYS:
+        mode = APPLY_NEW_SESSION
+    else:
+        mode = APPLY_CONFIG_RELOADED
+    return (
+        mode,
+        [f"AI.SANDBOX.{key}" for key in changed],
+        [f"ai.sandbox.{key}" for key in deferred],
     )
 
 
@@ -1104,22 +1042,20 @@ async def update_section(section: str, payload: SectionUpdate) -> Result:
             },
         )
 
-    before_config = _validate_full(_load(_read())["AI"], strict_references=False)
+    def update_value(ai: dict[str, Any], key: str, value: Any) -> None:
+        existing_key = _existing_key(ai, key)
+        existing = ai.get(existing_key) if existing_key is not None else None
+        if isinstance(existing, dict) and isinstance(value, dict):
+            for item_key, item_value in value.items():
+                current = existing.get(item_key)
+                if isinstance(current, dict) and isinstance(item_value, dict):
+                    current.update(item_value)
+                else:
+                    existing[item_key] = item_value
+        else:
+            _ai_set(ai, key, value)
 
     def mutate(ai: dict[str, Any]) -> None:
-        def update_value(key: str, value: Any) -> None:
-            existing_key = _existing_key(ai, key)
-            existing = ai.get(existing_key) if existing_key is not None else None
-            if isinstance(existing, dict) and isinstance(value, dict):
-                for item_key, item_value in value.items():
-                    current = existing.get(item_key)
-                    if isinstance(current, dict) and isinstance(item_value, dict):
-                        current.update(item_value)
-                    else:
-                        existing[item_key] = item_value
-            else:
-                _ai_set(ai, key, value)
-
         key = _SECTIONS[section]
         if section == "advanced":
             if (
@@ -1129,82 +1065,40 @@ async def update_section(section: str, payload: SectionUpdate) -> Result:
                 raise _configuration_error(
                     "advanced_section_invalid", "高级设置包含不支持的字段。", "AI"
                 )
-            for advanced_key in _ADVANCED_KEYS:
-                if advanced_key in payload.value:
-                    update_value(advanced_key, payload.value[advanced_key])
-        elif section == "model_groups" and key:
-            _ai_set(ai, key, deepcopy(_normalize_model_groups(payload.value)))
-        elif section == "default_models" and key:
-            _ai_set(ai, key, _normalize_defaults(payload.value))
+            for advanced_key in _ADVANCED_KEYS & set(payload.value):
+                update_value(ai, advanced_key, payload.value[advanced_key])
+        elif section == "default_models":
+            _ai_set(ai, "default_models", _normalize_defaults(payload.value))
         elif key:
-            update_value(key, payload.value)
+            update_value(ai, key, payload.value)
 
-    revision, config, operation = await _persist_with_operation(
-        payload.expected_revision,
-        mutate,
-        reload_consumers=section != "sandbox",
+    if section != "sandbox":
+        revision, config, operation = await _persist(payload.expected_revision, mutate)
+        return Result.ok(
+            _apply_response(config, revision, operation), info="AI 配置已保存。"
+        )
+    before = _validate_full(_load(_read())["AI"], strict_references=False)
+    revision, config, operation = await _persist(
+        payload.expected_revision, mutate, reload_consumers=False
     )
-    effect = "hot_reload"
-    apply_mode: str | None = None
-    restart_required: bool | None = None
-    changed_keys: list[str] | None = None
-    reason_codes: list[str] | None = None
-    pending_source = "webui.ai"
-    if section == "sandbox":
-        before_sandbox = model_dump(before_config.sandbox)
-        after_sandbox = model_dump(config.sandbox)
-        changed_fields = sorted(
-            key
-            for key in before_sandbox.keys() | after_sandbox.keys()
-            if before_sandbox.get(key) != after_sandbox.get(key)
-        )
-        deferred_fields = sorted(
-            key
-            for key in _SANDBOX_STARTUP_KEYS
-            if after_sandbox.get(key) != _SANDBOX_STARTUP_VALUES.get(key)
-        )
-        changed_startup_fields = sorted(set(changed_fields) & _SANDBOX_STARTUP_KEYS)
-        changed_new_session_fields = sorted(set(changed_fields) - _SANDBOX_STARTUP_KEYS)
-        if deferred_fields:
-            _restore_sandbox_startup_runtime()
-        pending_source = "webui.ai-sandbox"
-        reason_codes = [f"ai.sandbox.{key}" for key in deferred_fields]
-        update_pending_restart(pending_source, reason_codes)
-        if changed_startup_fields and deferred_fields:
-            apply_mode = APPLY_RESTART_PENDING
-            restart_required = True
-            changed_keys = [f"AI.SANDBOX.{key}" for key in changed_fields]
-            effect = "restart_required"
-        elif changed_new_session_fields:
-            apply_mode = APPLY_NEW_SESSION
-            restart_required = False
-            changed_keys = [f"AI.SANDBOX.{key}" for key in changed_fields]
-            effect = "new_session"
-        elif changed_startup_fields:
-            apply_mode = APPLY_CONFIG_RELOADED
-            restart_required = False
-            changed_keys = [f"AI.SANDBOX.{key}" for key in changed_fields]
-            effect = "hot_reload"
-        else:
-            apply_mode = APPLY_NO_CHANGE
-            restart_required = False
-            changed_keys = []
+    mode, changed_keys, reason_codes = _sandbox_apply_mode(
+        model_dump(before.sandbox), model_dump(config.sandbox)
+    )
+    update_pending_restart("webui.ai-sandbox", reason_codes)
     return Result.ok(
-        {
-            **_apply_response(
-                config,
-                revision,
-                operation,
-                apply_mode=apply_mode,
-                changed_keys=changed_keys,
-                restart_required=restart_required,
-                reason_codes=reason_codes,
-                pending_source=pending_source,
-            ),
-            "effect": effect,
-        },
+        _apply_response(
+            config,
+            revision,
+            operation,
+            apply_mode=mode,
+            changed_keys=changed_keys,
+            reason_codes=reason_codes,
+            pending_source="webui.ai-sandbox",
+        ),
         info=(
-            "AI 配置已保存，需要重启后生效。" if restart_required else "AI 配置已保存。"
+            "AI 配置已保存，需要重启后生效。"
+            if mode == APPLY_RESTART_PENDING
+            else "AI 配置已保存。"
         ),
     )
 
@@ -1216,9 +1110,10 @@ async def update_section(section: str, payload: SectionUpdate) -> Result:
     response_class=JSONResponse,
 )
 async def validate_routing(payload: RoutingValidationRequest) -> Result:
-    if payload.expected_revision and payload.expected_revision != _revision(_read()):
+    content = _read()
+    if payload.expected_revision and payload.expected_revision != _revision(content):
         raise HTTPException(409, detail={"code": "configuration_revision_conflict"})
-    data = _load(_read())
+    data = _load(content)
     candidate = deepcopy(data)
     _ai_set(candidate["AI"], "MODEL_GROUPS", _normalize_model_groups(payload.value))
     if payload.default_models is not None:
@@ -1228,16 +1123,9 @@ async def validate_routing(payload: RoutingValidationRequest) -> Result:
             _normalize_defaults(payload.default_models),
         )
     config = _validate_full(candidate["AI"], strict_references=False)
-    issues = _reference_issues(config)
     baseline = _reference_issues(_validate_full(data["AI"], strict_references=False))
-    blockers = [issue for issue in issues if issue not in baseline]
-    return Result.ok(
-        {
-            "valid": not blockers,
-            "issues": blockers,
-            "warnings": [issue for issue in issues if issue in baseline],
-        }
-    )
+    blockers = [issue for issue in _reference_issues(config) if issue not in baseline]
+    return Result.ok({"valid": not blockers, "issues": blockers})
 
 
 def _normalize_defaults(value: Any) -> dict[str, str | None]:
@@ -1265,9 +1153,7 @@ async def update_routing(payload: RoutingUpdate) -> Result:
         _ai_set(ai, "MODEL_GROUPS", _normalize_model_groups(payload.model_groups))
         _ai_set(ai, "default_models", _normalize_defaults(payload.default_models))
 
-    revision, config, operation = await _persist_with_operation(
-        payload.expected_revision, mutate
-    )
+    revision, config, operation = await _persist(payload.expected_revision, mutate)
     return Result.ok(
         _apply_response(config, revision, operation), info="模型路由与默认模型已保存。"
     )
@@ -1279,12 +1165,7 @@ def _repair_references(
     config = _validate_full(ai, strict_references=False)
     groups = deepcopy(config.model_groups)
     defaults = _normalize_defaults(model_dump(config.default_models))
-    models = {
-        f"{p.name}/{m.model_name}"
-        for p in config.providers
-        for m in p.models
-        if m.is_available
-    }
+    models = {f"{p.name}/{m.model_name}" for p in config.providers for m in p.models}
     changes = []
     while True:
         changed = False
@@ -1292,22 +1173,20 @@ def _repair_references(
             kept = [
                 target for target in targets if target in models or target in groups
             ]
-            if kept != targets:
-                changes.append(
-                    {
-                        "path": f"AI.MODEL_GROUPS.{group}",
-                        "before": targets,
-                        "after": kept,
-                    }
-                )
+            if kept and kept == targets:
+                continue
+            if kept:
                 groups[group] = kept
-                changed = True
-            if not kept:
+            else:
                 groups.pop(group)
-                changes.append(
-                    {"path": f"AI.MODEL_GROUPS.{group}", "before": [], "after": None}
-                )
-                changed = True
+            changes.append(
+                {
+                    "path": f"AI.MODEL_GROUPS.{group}",
+                    "before": targets,
+                    "after": kept or None,
+                }
+            )
+            changed = True
         if not changed:
             break
     result = deepcopy(ai)
@@ -1365,9 +1244,7 @@ async def apply_reference_repair(payload: ReferenceRepairRequest) -> Result:
         _ai_set(ai, "MODEL_GROUPS", _ai_get(candidate, "MODEL_GROUPS"))
         _ai_set(ai, "default_models", _ai_get(candidate, "default_models"))
 
-    revision, config, operation = await _persist_with_operation(
-        payload.expected_revision, mutate
-    )
+    revision, config, operation = await _persist(payload.expected_revision, mutate)
     return Result.ok(
         _apply_response(config, revision, operation),
         info="失效引用已修复，服务商和密钥保持不变。",
@@ -1423,62 +1300,117 @@ async def update_chat_plugin_switch(payload: ChatPluginSwitchRequest) -> Result:
     )
 
 
-def _discovery_url(api_type: str, api_base: str) -> str:
-    endpoint = "v1beta/models" if api_type == "gemini" else "v1/models"
-    return join_api_url(api_base, endpoint)
-
-
-def _saved_provider(name: str | None) -> ProviderConfig | None:
-    if not name:
-        return None
-    return next(
-        (
-            item
-            for item in get_llm_config().providers
-            if item.name.casefold() == name.casefold()
-        ),
-        None,
+def _probe_error(status_code: int, code: str, message: str) -> HTTPException:
+    return HTTPException(
+        status_code=status_code, detail={"code": code, "message": message}
     )
 
 
-def _persisted_saved_provider(
+_PROBE_ERRORS: tuple[tuple[Any, int, str, str], ...] = (
+    (
+        LocationNotSupportedException,
+        422,
+        "provider_location_unsupported",
+        "服务商不支持当前出口所在地区。",
+    ),
+    (
+        AuthenticationException,
+        422,
+        "provider_credentials_invalid",
+        "服务商拒绝了当前凭据。",
+    ),
+    (
+        RateLimitException | QuotaExceededException,
+        429,
+        "provider_rate_limited",
+        "服务商当前限流或额度不可用。",
+    ),
+    (
+        asyncio.TimeoutError | httpx.TimeoutException,
+        504,
+        "provider_timeout",
+        "连接服务商超时。",
+    ),
+    (httpx.NetworkError, 502, "provider_unreachable", "无法连接到服务商。"),
+    (
+        ResponseParseException,
+        502,
+        "provider_response_parse_failed",
+        "服务商响应与所选 API 协议不匹配。",
+    ),
+    (
+        ConfigurationException,
+        422,
+        "provider_protocol_mismatch",
+        "所选 API 协议、地址或模型配置不匹配。",
+    ),
+)
+
+
+def _map_probe_error(error: Exception) -> HTTPException:
+    """把服务商探测异常转换为前端可读的错误
+
+    参数:
+        error: 探测异常
+
+    返回:
+        HTTPException: 带错误码与说明的异常
+    """
+    from zhenxun.services.network_proxy import ProxyPolicyError, ProxyRequestError
+
+    if isinstance(error, ProxyPolicyError | ProxyRequestError):
+        return _probe_error(
+            502, error.code, "代理配置、连接或认证失败，请检查网络代理设置。"
+        )
+    if isinstance(error, InvalidRequestException):
+        fields = [
+            name
+            for name in ("maxOutputTokens", "thinkingConfig", "safetySettings", "tools")
+            if name in str(error) or name in str(getattr(error, "details", {}))
+        ]
+        return _probe_error(
+            422,
+            "provider_request_invalid",
+            "服务商拒绝了请求参数，请检查模型参数及服务商限制。"
+            + (f" 涉及字段：{', '.join(fields)}。" if fields else ""),
+        )
+    for types, status_code, code, message in _PROBE_ERRORS:
+        if isinstance(error, types):
+            return _probe_error(status_code, code, message)
+    return _probe_error(
+        502, "provider_request_failed", "服务商请求失败，请查看后台脱敏日志。"
+    )
+
+
+def _saved_provider(
     name: str | None, expected_revision: str | None
 ) -> ProviderConfig | None:
-    content = _read()
-    if expected_revision is not None and _revision(content) != expected_revision:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "code": "configuration_revision_conflict",
-                "message": "AI 配置已变化，请重新加载后再测试。",
-            },
-        )
+    """查找已保存的服务商，提供修订号时读取配置文件并校验修订号
+
+    参数:
+        name: 服务商名称
+        expected_revision: 前端持有的配置修订号
+
+    返回:
+        ProviderConfig | None: 已保存的服务商
+    """
+    if expected_revision is None:
+        config = get_llm_config()
+    else:
+        content = _read()
+        if _revision(content) != expected_revision:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "configuration_revision_conflict",
+                    "message": "AI 配置已变化，请重新加载后再测试。",
+                },
+            )
+        config = _validate_full(_load(content)["AI"], strict_references=False)
     if not name:
         return None
-    data = _load(content)
-    config = _validate_full(data["AI"], strict_references=False)
     return next(
         (item for item in config.providers if item.name.casefold() == name.casefold()),
-        None,
-    )
-
-
-def _provider_keys(provider: ProviderConfig | None) -> list[str]:
-    if provider is None:
-        return []
-    keys = (
-        provider.api_key if isinstance(provider.api_key, list) else [provider.api_key]
-    )
-    return [str(key) for key in keys if not _is_placeholder_secret(key)]
-
-
-def _credential_slot(provider: ProviderConfig | None, selected_key: str) -> int | None:
-    return next(
-        (
-            index
-            for index, value in enumerate(_provider_keys(provider))
-            if value == selected_key
-        ),
         None,
     )
 
@@ -1487,51 +1419,57 @@ def _normalized_api_base(api_type: str, api_base: str | None) -> str:
     return str(api_base or get_default_api_base_for_type(api_type) or "").rstrip("/")
 
 
-def _resolve_probe_provider(
+async def _probe_target(
     *,
     provider_name: str | None,
-    saved_provider_name: str | None = None,
+    saved_provider_name: str | None,
     api_type: str | None,
     api_base: str | None,
     api_key: str | None,
+    expected_revision: str | None,
     timeout: int | None = None,
-    saved_provider: ProviderConfig | None = None,
-    saved_provider_resolved: bool = False,
-) -> tuple[ProviderConfig, str, bool, str | None]:
-    saved = (
-        saved_provider
-        if saved_provider_resolved
-        else _saved_provider(saved_provider_name or provider_name)
-    )
+) -> tuple[ProviderConfig, list[str], str | None]:
+    """确定探测使用的服务商与候选密钥
+
+    已保存的密钥只会发往该服务商保存的 API 类型和地址；使用已保存密钥时
+    按健康状态排序全部密钥，否则只使用临时密钥。
+
+    参数:
+        provider_name: 草稿中的服务商名称
+        saved_provider_name: 已保存的服务商名称
+        api_type: 草稿中的 API 类型
+        api_base: 草稿中的 API 地址
+        api_key: 临时密钥
+        expected_revision: 前端持有的配置修订号
+        timeout: 请求超时
+
+    返回:
+        tuple[ProviderConfig, list[str], str | None]: 服务商、候选密钥，
+            以及使用已保存密钥时用于记录健康状态的服务商名称
+    """
+    saved = _saved_provider(saved_provider_name or provider_name, expected_revision)
     resolved_type = str(api_type or (saved.api_type if saved else "")).strip()
     resolved_base = _normalized_api_base(
         resolved_type,
         api_base if api_base is not None else (saved.api_base if saved else None),
     )
     temporary_key = str(api_key or "").strip()
-    saved_base = (
-        _normalized_api_base(saved.api_type, saved.api_base)
-        if saved is not None
-        else ""
-    )
     scope_matches = bool(
         saved is not None
         and resolved_type == saved.api_type
-        and resolved_base == saved_base
+        and resolved_base == _normalized_api_base(saved.api_type, saved.api_base)
     )
     if saved is not None and not temporary_key and not scope_matches:
         raise _probe_error(
             422,
-            "credentials",
             "provider_credentials_scope_mismatch",
             "修改 API 类型或地址后，请填写临时 API Key 再测试。",
         )
-    saved_keys = _provider_keys(saved) if scope_matches else []
+    saved_keys = _keys(saved.api_key) if saved is not None and scope_matches else []
     selected_key = temporary_key or next(iter(saved_keys), "")
     if not resolved_type or not resolved_base or not selected_key:
         raise _probe_error(
             422,
-            "configuration",
             "provider_credentials_incomplete",
             "请填写 API 类型、API 地址和有效 API Key。",
         )
@@ -1545,82 +1483,42 @@ def _resolve_probe_provider(
         max_output_tokens=saved.max_output_tokens if saved else None,
         models=[],
     )
-    return (
-        provider,
-        selected_key,
-        selected_key in saved_keys,
-        (saved.name if saved is not None else None),
+    if saved is None or selected_key not in saved_keys:
+        return provider, [selected_key], None
+    preferred = await health_manager.get_next_available_key(
+        saved.name, saved_keys, strict_mode=False
     )
+    keys = [selected_key]
+    if preferred:
+        keys = [preferred, *(key for key in saved_keys if key != preferred)]
+    return provider, keys, saved.name
 
 
-def _probe_error(
-    status_code: int, phase: str, code: str, message: str
-) -> HTTPException:
-    return HTTPException(
-        status_code=status_code,
-        detail={"phase": phase, "code": code, "message": message},
-    )
+async def _try_keys(
+    keys: list[str], health_name: str | None, call: Any
+) -> tuple[str, Any]:
+    """依次用候选密钥发起请求，凭据被拒绝时换下一个
 
+    参数:
+        keys: 候选密钥
+        health_name: 记录密钥健康状态的服务商名称，为空时不记录
+        call: 接收密钥并发起请求的协程函数
 
-def _map_probe_error(error: Exception, phase: str) -> HTTPException:
-    from zhenxun.services.ai.core.exceptions import LocationNotSupportedException
-    from zhenxun.services.network_proxy import ProxyPolicyError, ProxyRequestError
-
-    if isinstance(error, ProxyPolicyError | ProxyRequestError):
-        return _probe_error(
-            502, "proxy", error.code, "代理配置、连接或认证失败，请检查网络代理设置。"
-        )
-    if isinstance(error, LocationNotSupportedException):
-        return _probe_error(
-            422,
-            "upstream",
-            "provider_location_unsupported",
-            "服务商不支持当前出口所在地区。",
-        )
-    if isinstance(error, AuthenticationException):
-        return _probe_error(
-            422, phase, "provider_credentials_invalid", "服务商拒绝了当前凭据。"
-        )
-    if isinstance(error, RateLimitException | QuotaExceededException):
-        return _probe_error(
-            429, phase, "provider_rate_limited", "服务商当前限流或额度不可用。"
-        )
-    if isinstance(error, asyncio.TimeoutError | httpx.TimeoutException):
-        return _probe_error(504, phase, "provider_timeout", "连接服务商超时。")
-    if isinstance(error, httpx.NetworkError):
-        return _probe_error(502, phase, "provider_unreachable", "无法连接到服务商。")
-    if isinstance(error, ResponseParseException):
-        return _probe_error(
-            502,
-            "response_parse",
-            "provider_response_parse_failed",
-            "服务商响应与所选 API 协议不匹配。",
-        )
-    if isinstance(error, InvalidRequestException):
-        fields = [
-            name
-            for name in ("maxOutputTokens", "thinkingConfig", "safetySettings", "tools")
-            if name in str(error) or name in str(getattr(error, "details", {}))
-        ]
-        mapped = _probe_error(
-            422,
-            phase,
-            "provider_request_invalid",
-            "服务商拒绝了请求参数，请检查模型参数及服务商限制。"
-            + (f" 涉及字段：{', '.join(fields)}。" if fields else ""),
-        )
-        mapped.detail["parameter_fields"] = fields
-        return mapped
-    if isinstance(error, ConfigurationException):
-        return _probe_error(
-            422,
-            "request_build",
-            "provider_protocol_mismatch",
-            "所选 API 协议、地址或模型配置不匹配。",
-        )
-    return _probe_error(
-        502, phase, "provider_request_failed", "服务商请求失败，请查看后台脱敏日志。"
-    )
+    返回:
+        tuple[str, Any]: 成功的密钥与请求结果
+    """
+    rejected: AuthenticationException | None = None
+    for key in keys:
+        try:
+            return key, await call(key)
+        except LLMException as error:
+            if health_name:
+                await health_manager.record_key_failure(health_name, key, error)
+            if not isinstance(error, AuthenticationException):
+                raise
+            rejected = error
+    assert rejected is not None
+    raise rejected
 
 
 def _minimal_model_request(task: str, *, api_type: str | None = None):
@@ -1683,7 +1581,7 @@ async def _run_exact_model_probe(
         kwargs["content"] = json.dumps(request_data.body, ensure_ascii=False)
     response = await client.request(request_data.method, request_data.url, **kwargs)
     if response.status_code == 404:
-        raise _probe_error(404, "upstream", "model_not_found", "服务商未找到指定模型。")
+        raise _probe_error(404, "model_not_found", "服务商未找到指定模型。")
     if exception := adapter.handle_http_error(response):
         raise exception
     await adapter.parse_payload(identity, request, response)
@@ -1697,140 +1595,82 @@ async def _run_exact_model_probe(
     response_class=JSONResponse,
 )
 async def discover_models(payload: ProviderDiscoveryRequest) -> Result:
-    saved_name = payload.saved_provider_name or payload.provider_name
-    saved_provider = None
-    saved_provider_resolved = False
-    if payload.expected_revision is not None:
-        async with _PERSIST_LOCK:
-            saved_provider = _persisted_saved_provider(
-                saved_name, payload.expected_revision
-            )
-        saved_provider_resolved = True
-    provider, api_key, uses_saved_key, health_provider_name = _resolve_probe_provider(
+    provider, keys, health_name = await _probe_target(
         provider_name=payload.provider_name,
         saved_provider_name=payload.saved_provider_name,
         api_type=payload.api_type,
         api_base=payload.api_base,
         api_key=payload.api_key,
-        saved_provider=saved_provider,
-        saved_provider_resolved=saved_provider_resolved,
+        expected_revision=payload.expected_revision,
     )
-    if not saved_provider_resolved:
-        saved_provider = _saved_provider(saved_name)
     api_type = provider.api_type
-    api_base = provider.api_base or ""
-    try:
-        get_adapter_for_api_type(api_type)
-    except Exception as error:
-        raise _map_probe_error(error, "configuration") from error
-    if api_type not in _OPENAI_DISCOVERY_TYPES and api_type != "gemini":
+    if api_type not in _DISCOVERY_TYPES:
         raise _probe_error(
             422,
-            "configuration",
             "model_discovery_unsupported",
             "该 API 类型不支持安全的模型自动发现，请手动添加模型。",
         )
-    keys = [api_key]
-    saved_keys: list[str] = []
-    credential_slot: int | None = None
-    if uses_saved_key:
-        saved_keys = _provider_keys(saved_provider)
-        selected = await health_manager.get_next_available_key(
-            health_provider_name or provider.name,
-            saved_keys,
-            strict_mode=False,
+    endpoint = "v1beta/models" if api_type == "gemini" else "v1/models"
+    url = join_api_url(provider.api_base or "", endpoint)
+
+    async def request(key: str) -> httpx.Response:
+        client = await http_client_manager.get_client(provider)
+        response = await client.request(
+            "GET",
+            url,
+            headers=(
+                {"x-goog-api-key": key}
+                if api_type == "gemini"
+                else {"Authorization": f"Bearer {key}"}
+            ),
+            timeout=min(float(provider.timeout), _DISCOVERY_TIMEOUT),
         )
-        if selected:
-            keys = [selected, *(key for key in saved_keys if key != selected)]
+        if response.status_code in {401, 403}:
+            raise AuthenticationException("provider rejected credential")
+        return response
+
     started = time.monotonic()
     try:
-        client = await http_client_manager.get_client(provider)
-        response = None
-        selected_key = api_key
-        for candidate_key in keys:
-            headers = (
-                {"x-goog-api-key": candidate_key}
-                if api_type == "gemini"
-                else {"Authorization": f"Bearer {candidate_key}"}
-            )
-            response = await client.request(
-                "GET",
-                _discovery_url(api_type, api_base),
-                headers=headers,
-                timeout=min(float(provider.timeout), _DISCOVERY_TIMEOUT),
-            )
-            selected_key = candidate_key
-            if response.status_code not in {401, 403}:
-                break
-            if uses_saved_key:
-                await health_manager.record_key_failure(
-                    health_provider_name or provider.name,
-                    candidate_key,
-                    AuthenticationException("provider rejected credential"),
-                )
-        assert response is not None
-        if response.status_code in {401, 403}:
-            raise _probe_error(
-                422,
-                "authentication",
-                "provider_credentials_invalid",
-                "服务商拒绝了当前凭据。",
-            )
+        key, response = await _try_keys(keys, health_name, request)
         if response.status_code == 429:
             raise _probe_error(
                 429,
-                "upstream",
                 "provider_rate_limited",
                 "服务商暂时限制了模型查询，请稍后重试。",
             )
         if response.status_code >= 400:
             raise _probe_error(
                 502,
-                "upstream",
                 "provider_discovery_failed",
                 f"服务商模型查询失败（HTTP {response.status_code}）。",
             )
         body = response.json()
         if not isinstance(body, dict):
             raise ValueError("model discovery response is not an object")
-        raw_models = (
-            body.get("models", []) if api_type == "gemini" else body.get("data", [])
-        )
-        names = []
-        for item in raw_models:
-            raw_name = item.get("name") if api_type == "gemini" else item.get("id")
-            if raw_name:
-                names.append(str(raw_name).removeprefix("models/"))
-        latency = round((time.monotonic() - started) * 1000)
-        if uses_saved_key:
-            await health_manager.record_key_success(
-                health_provider_name or provider.name, selected_key
-            )
-            credential_slot = _credential_slot(saved_provider, selected_key)
-        logger.info(
-            "AI Provider 探测成功 | "
-            f"api_type={api_type} | models={len(names)} | latency={latency}ms",
-            "WebUi",
-        )
-        return Result.ok(
-            {
-                "models": sorted(set(names)),
-                "latency_ms": latency,
-                "authenticated": True,
-                "phase": "completed",
-                "credential_source": "saved" if uses_saved_key else "temporary",
-                "credential_slot": credential_slot,
-            }
-        )
+        raw_models = body.get("models" if api_type == "gemini" else "data", [])
+        names = {
+            str(raw_name).removeprefix("models/")
+            for item in raw_models
+            if (raw_name := item.get("name" if api_type == "gemini" else "id"))
+        }
     except HTTPException:
         raise
-    except (httpx.HTTPError, ValueError) as error:
+    except (LLMException, httpx.HTTPError, ValueError) as error:
         logger.warning(
             "AI Provider 探测失败 | "
             f"api_type={api_type} | error={error.__class__.__name__}",
             "WebUi",
         )
-        raise _map_probe_error(error, "model_discovery") from error
+        raise _map_probe_error(error) from error
+    latency = round((time.monotonic() - started) * 1000)
+    if health_name:
+        await health_manager.record_key_success(health_name, key)
+    logger.info(
+        "AI Provider 探测成功 | "
+        f"api_type={api_type} | models={len(names)} | latency={latency}ms",
+        "WebUi",
+    )
+    return Result.ok({"models": sorted(names), "latency_ms": latency})
 
 
 @router.post(
@@ -1857,85 +1697,24 @@ async def test_model(payload: ModelTestRequest) -> Result:
             },
         )
     model_provider_name, model_name = payload.model.split("/", 1)
-    provider_name = payload.provider_name or model_provider_name
-    saved_name = payload.saved_provider_name or provider_name
-    saved_provider = None
-    saved_provider_resolved = False
-    if payload.expected_revision is not None:
-        async with _PERSIST_LOCK:
-            saved_provider = _persisted_saved_provider(
-                saved_name, payload.expected_revision
-            )
-        saved_provider_resolved = True
-    provider, api_key, uses_saved_key, health_provider_name = _resolve_probe_provider(
-        provider_name=provider_name,
+    provider, keys, health_name = await _probe_target(
+        provider_name=payload.provider_name or model_provider_name,
         saved_provider_name=payload.saved_provider_name,
         api_type=payload.api_type,
         api_base=payload.api_base,
         api_key=payload.api_key,
+        expected_revision=payload.expected_revision,
         timeout=payload.timeout,
-        saved_provider=saved_provider,
-        saved_provider_resolved=saved_provider_resolved,
     )
-    if not saved_provider_resolved:
-        saved_provider = _saved_provider(saved_name)
-    keys = [api_key]
-    if uses_saved_key:
-        saved_keys = _provider_keys(saved_provider)
-        selected = await health_manager.get_next_available_key(
-            health_provider_name or provider.name,
-            saved_keys,
-            strict_mode=False,
-        )
-        if selected:
-            keys = [selected, *(key for key in saved_keys if key != selected)]
-    selected_key = api_key
+    route = f"{health_name}/{model_name}"
     try:
-        last_authentication_error: AuthenticationException | None = None
-        latency_ms = 0.0
-        for candidate_key in keys:
-            selected_key = candidate_key
-            try:
-                latency_ms = await _run_exact_model_probe(
-                    provider,
-                    model_name,
-                    payload.model_settings,
-                    payload.task,
-                    candidate_key,
-                )
-                break
-            except AuthenticationException as error:
-                last_authentication_error = error
-                if uses_saved_key:
-                    await health_manager.record_key_failure(
-                        health_provider_name or provider.name,
-                        candidate_key,
-                        error,
-                    )
-        else:
-            assert last_authentication_error is not None
-            raise last_authentication_error
-        if uses_saved_key:
-            health_name = health_provider_name or provider.name
-            await health_manager.record_key_success(health_name, selected_key)
-            await health_manager.record_route_success(
-                f"{health_name}/{model_name}", latency_ms
-            )
-        credential_slot = (
-            _credential_slot(saved_provider, selected_key) if uses_saved_key else None
+        key, latency_ms = await _try_keys(
+            keys,
+            health_name,
+            lambda key: _run_exact_model_probe(
+                provider, model_name, payload.model_settings, payload.task, key
+            ),
         )
-        return Result.ok(
-            {
-                "ok": True,
-                "latency_ms": round(latency_ms),
-                "task": payload.task,
-                "phase": "completed",
-                "credential_source": "saved" if uses_saved_key else "temporary",
-                "credential_slot": credential_slot,
-            }
-        )
-    except asyncio.CancelledError:
-        raise
     except HTTPException:
         raise
     except Exception as error:
@@ -1943,19 +1722,15 @@ async def test_model(payload: ModelTestRequest) -> Result:
             f"AI 模型测试失败 | task={payload.task} | error={error.__class__.__name__}",
             "WebUi",
         )
-        mapped = _map_probe_error(error, "model_test")
-        if uses_saved_key and isinstance(error, LLMException | httpx.HTTPError):
-            health_name = health_provider_name or provider.name
-            await health_manager.record_route_failure(
-                f"{health_name}/{model_name}", error
-            )
-            if isinstance(error, LLMException) and not isinstance(
-                error, AuthenticationException
-            ):
-                await health_manager.record_key_failure(
-                    health_name, selected_key, error
-                )
-        raise mapped from error
+        if health_name and isinstance(error, LLMException | httpx.HTTPError):
+            await health_manager.record_route_failure(route, error)
+        raise _map_probe_error(error) from error
+    if health_name:
+        await health_manager.record_key_success(health_name, key)
+        await health_manager.record_route_success(route, latency_ms)
+    return Result.ok(
+        {"ok": True, "latency_ms": round(latency_ms), "task": payload.task}
+    )
 
 
 @router.get(

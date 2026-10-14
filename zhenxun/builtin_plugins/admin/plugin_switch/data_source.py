@@ -2,6 +2,7 @@ from nonebot.adapters import Bot
 
 from zhenxun.models.group_console import GroupConsole
 from zhenxun.services.cache.runtime_cache import GroupMemoryCache
+from zhenxun.services.platform_identity import scoped_group_id
 from zhenxun.utils.common_utils import CommonUtils
 from zhenxun.utils.enum import BlockType
 from zhenxun.utils.platform import PlatformUtils
@@ -221,6 +222,8 @@ class PluginManager:
             target_groups, status, is_whitelist_mode, bot
         )
 
+        groups_to_wake = {scoped_group_id(gid) for gid in groups_to_wake}
+        groups_to_sleep = {scoped_group_id(gid) for gid in groups_to_sleep}
         affected_ids = groups_to_wake | groups_to_sleep
         if not affected_ids:
             return "没有目标群组需要操作。"

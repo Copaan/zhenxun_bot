@@ -3,9 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-import json
 import os
-from pathlib import Path
 import signal
 import subprocess
 import sys
@@ -32,7 +30,6 @@ def launcher_log(message: str) -> None:
 class ProcessHandle:
     role: str
     process: subprocess.Popen[Any]
-    launcher_boot_id: str
     accepting: bool = True
     exit_reason: str | None = None
     runtime_pid: int | None = None
@@ -280,36 +277,6 @@ class ProcessHandle:
         except RuntimeError:
             return self.process.poll() is None, False
 
-    def runtime_shutdown_receipt(self) -> dict[str, Any] | None:
-        """读取本 worker 写下的关闭收据，身份不匹配时返回 None
-
-        返回:
-            dict[str, Any] | None: 关闭收据
-        """
-        if self.role != "worker" or not self.worker_boot_id:
-            return None
-        path = Path(
-            os.getenv(
-                "ZHENXUN_SHUTDOWN_RECEIPT_PATH",
-                "data/runtime/worker-shutdown-receipt.json",
-            )
-        )
-        try:
-            receipt = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return None
-        if not isinstance(receipt, dict):
-            return None
-        identity = receipt.get("identity") or {}
-        if (
-            identity.get("boot_id") != self.worker_boot_id
-            or identity.get("startup_id") != self.startup_id
-            or identity.get("launcher_boot_id") != self.launcher_boot_id
-            or identity.get("pid") != self.runtime_pid
-        ):
-            return None
-        return receipt
-
 
 class LauncherSupervisor:
     def __init__(self) -> None:
@@ -371,7 +338,7 @@ class LauncherSupervisor:
         if self.shutdown_deadline is not None:
             raise OSError("launcher_startup_interrupted")
         process = factory()
-        handle = ProcessHandle(role, process, self.boot_id)
+        handle = ProcessHandle(role, process)
         handle.completion_expected = completion_expected
         if startup_id:
             handle.startup_id = startup_id
@@ -432,9 +399,9 @@ class LauncherSupervisor:
 
     async def shutdown(self) -> None:
         self.begin_shutdown()
-        extra_roles = set(self._role_pids) - {"qq_ingress", "http_sidecar", "worker"}
+        extra_roles = set(self._role_pids) - {"qq_ingress", "worker"}
         first_error = None
-        for role in ("qq_ingress", "http_sidecar", *sorted(extra_roles), "worker"):
+        for role in ("qq_ingress", *sorted(extra_roles), "worker"):
             pid = self._role_pids.get(role)
             if pid in self._handles:
                 try:
@@ -469,7 +436,7 @@ class LauncherSupervisor:
             previous = self._handles[previous_pid]
             if previous.process.poll() is None:
                 raise RuntimeError(f"launcher_process_already_running:{role}")
-        handle = ProcessHandle(role, process, self.boot_id)
+        handle = ProcessHandle(role, process)
         self._handles[process.pid] = handle
         self._role_pids[role] = process.pid
         return handle

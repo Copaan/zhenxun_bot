@@ -15,6 +15,7 @@ from nonebot_plugin_session import EventSession, SessionLevel
 from zhenxun.configs.utils import PluginExtraData
 from zhenxun.models.level_user import LevelUser
 from zhenxun.services.log import logger
+from zhenxun.services.platform_identity import scoped_group_id, scoped_user_id
 from zhenxun.utils.enum import PluginType
 from zhenxun.utils.message import MessageUtils
 
@@ -35,6 +36,7 @@ __plugin_meta__ = PluginMetadata(
     extra=PluginExtraData(
         author="HibiKier",
         version="0.1",
+        required_platform_capabilities={"scoped_management"},
         plugin_type=PluginType.SUPERUSER,
     ).to_dict(),
 )
@@ -83,7 +85,9 @@ async def _(
     if group_id:
         if isinstance(uid, At):
             uid = uid.target
-        user = await LevelUser.get_or_none(user_id=uid, group_id=group_id)
+        user = await LevelUser.get_or_none(
+            user_id=scoped_user_id(uid), group_id=scoped_group_id(group_id)
+        )
         old_level = user.user_level if user else 0
         await LevelUser.set_level(uid, group_id, level, 1)
         logger.info(
@@ -115,7 +119,9 @@ async def _(
     if group_id:
         if isinstance(uid, At):
             uid = uid.target
-        if user := await LevelUser.get_or_none(user_id=uid, group_id=group_id):
+        if user := await LevelUser.get_or_none(
+            user_id=scoped_user_id(uid), group_id=scoped_group_id(group_id)
+        ):
             await user.delete()
             if session.level in [SessionLevel.LEVEL2, SessionLevel.LEVEL3]:
                 logger.info(

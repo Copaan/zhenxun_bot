@@ -98,7 +98,7 @@ async def _(
     session: Uninfo,
     arparma: Arparma,
 ):
-    if session.user.id in bot.config.superusers:
+    if PlatformUtils.is_superuser(bot, session.user.id):
         image = await build_plugin()
         logger.info(
             "查看功能列表",
@@ -404,6 +404,11 @@ async def _(
                 reply_to=True
             )
         return
+
+    if PlatformUtils.get_platform_scope(bot) == "qq_api":
+        await MessageUtils.build_message(
+            "当前平台暂不支持群休眠，可使用功能开关管理本群功能"
+        ).finish(reply_to=True)
 
     targets = await get_target_groups(
         bot,

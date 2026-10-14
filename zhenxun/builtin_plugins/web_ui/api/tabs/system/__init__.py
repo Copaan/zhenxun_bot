@@ -4,55 +4,54 @@ import shutil
 from typing import Any
 
 import aiofiles
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from zhenxun.services.lifecycle import lifecycle_kernel
 from zhenxun.services.startup import startup_coordinator
 from zhenxun.utils._build_image import BuildImage
 
-from ....base_model import Result, SystemFolderSize
+from ....base_model import Result
 from ....restart_service import (
     network_configuration_status,
     transaction_verification_status,
 )
-from ....utils import authentication, get_system_disk, validate_filename, validate_path
+from ....utils import (
+    authentication,
+    public_startup_status,
+    request_authenticated,
+    validate_filename,
+    validate_path,
+)
 from .configuration import router as configuration_router
 from .model import (
     AddFile,
     DeleteFile,
     DirFile,
-    LifecycleComponentStatus,
     LifecycleStatus,
     RenameFile,
     SaveFile,
 )
 from .restart import router as restart_router
-from .runtime import router as runtime_router
 from .update import router as update_router
 
 router = APIRouter(prefix="/system")
 router.include_router(configuration_router)
 router.include_router(update_router)
 router.include_router(restart_router)
-router.include_router(runtime_router)
 
 
-def _with_http_sidecar_degradation(value: dict[str, Any]) -> dict[str, Any]:
-    from zhenxun.services.webui_http_sidecar_state import read_http_sidecar_state
+def _with_http_compat_degradation(value: dict[str, Any]) -> dict[str, Any]:
+    from zhenxun.services.webui_http import http_compat_state
 
-    if not os.getenv("ZHENXUN_LAUNCHER_PID"):
-        return value
-    sidecar = read_http_sidecar_state()
-    if sidecar.get("state") != "degraded" or sidecar.get("mode") == "disabled":
+    if http_compat_state().get("state") != "degraded":
         return value
     reason = {
         "stage": "management",
         "source_type": "component",
-        "source_id": "launcher:http_sidecar",
+        "source_id": "management:webui-http",
         "display_name": "HTTP兼容入口",
-        "code": "http_sidecar_unavailable",
-        "occurred_at": sidecar.get("updated_at"),
+        "code": "http_compat_unavailable",
     }
     reasons = list(value.get("degraded_reasons") or [])
     if not any(
@@ -79,12 +78,13 @@ def _with_http_sidecar_degradation(value: dict[str, Any]) -> dict[str, Any]:
     response_class=JSONResponse,
     description="获取worker分级启动状态",
 )
-async def get_startup_status() -> Result[dict[str, Any]]:
-    return Result.ok(
-        _with_http_sidecar_degradation(
-            {**startup_coordinator.snapshot(), **transaction_verification_status()}
-        )
+async def get_startup_status(request: Request) -> Result[dict[str, Any]]:
+    status = _with_http_compat_degradation(
+        {**startup_coordinator.snapshot(), **transaction_verification_status()}
     )
+    if not request_authenticated(request):
+        status = public_startup_status(status)
+    return Result.ok(status)
 
 
 @router.get(
@@ -95,7 +95,7 @@ async def get_startup_status() -> Result[dict[str, Any]]:
     description="获取worker完整启动事务报告",
 )
 async def get_startup_report() -> Result[dict[str, Any]]:
-    return Result.ok(_with_http_sidecar_degradation(startup_coordinator.report()))
+    return Result.ok(_with_http_compat_degradation(startup_coordinator.report()))
 
 
 @router.get(
@@ -106,69 +106,18 @@ async def get_startup_report() -> Result[dict[str, Any]]:
     description="获取统一生命周期组件状态",
 )
 async def get_lifecycle_status() -> Result[LifecycleStatus]:
-    from zhenxun.services.lifecycle.operations import operation_registry
     from zhenxun.services.plugin_host import plugin_host
-    from zhenxun.services.webui_http_sidecar_state import read_http_sidecar_state
-    from zhenxun.services.webui_transport import transport_runtime
 
     return Result.ok(
         {
             **lifecycle_kernel.status(),
-            "operation_registry": operation_registry.status(),
             "plugin_runtime": plugin_host.status(),
-            "transport": transport_runtime.snapshot(),
-            "http_sidecar": read_http_sidecar_state(),
             "network": network_configuration_status(),
         }
     )
 
 
-@router.get(
-    "/lifecycle/components/{component_id:path}",
-    dependencies=[authentication()],
-    response_model=Result[LifecycleComponentStatus],
-    response_class=JSONResponse,
-    description="获取生命周期组件详情",
-)
-async def get_lifecycle_component(
-    component_id: str,
-) -> Result[LifecycleComponentStatus]:
-    component = lifecycle_kernel.component_status(component_id)
-    if component is None:
-        return Result.fail("生命周期组件不存在。", code=404)
-    return Result.ok(component)
-
-
-@router.get(
-    "/lifecycle/operations",
-    dependencies=[authentication()],
-    response_model=Result[dict[str, Any]],
-    response_class=JSONResponse,
-    description="获取生命周期后台操作",
-)
-async def get_lifecycle_operations() -> Result[dict[str, Any]]:
-    from zhenxun.services.lifecycle.operations import operation_registry
-
-    return Result.ok(operation_registry.status())
-
-
-@router.get(
-    "/lifecycle/operations/{operation_id}",
-    dependencies=[authentication()],
-    response_model=Result[dict[str, Any]],
-    response_class=JSONResponse,
-    description="获取生命周期后台操作详情",
-)
-async def get_lifecycle_operation(operation_id: str) -> Result[dict[str, Any]]:
-    from zhenxun.services.lifecycle.operations import operation_registry
-
-    operation = operation_registry.get(operation_id)
-    if operation is None:
-        return Result.fail("lifecycle_operation_not_found", code=404)
-    return Result.ok(operation)
-
-
-IMAGE_TYPE = ["jpg", "jpeg", "png", "gif", "bmp", "webp", "svg"]
+IMAGE_TYPE = ["jpg", "jpeg", "png", "gif", "bmp", "webp"]
 
 
 @router.get(
@@ -205,17 +154,6 @@ async def _(path: str | None = None) -> Result[list[DirFile]]:
         return Result.fail(f"获取文件列表失败: {e!s}")
 
 
-@router.get(
-    "/get_resources_size",
-    dependencies=[authentication()],
-    response_model=Result[list[SystemFolderSize]],
-    response_class=JSONResponse,
-    description="获取文件列表",
-)
-async def _(full_path: str | None = None) -> Result[list[SystemFolderSize]]:
-    return Result.ok(await get_system_disk(full_path))
-
-
 @router.post(
     "/delete_file",
     dependencies=[authentication()],
@@ -233,7 +171,7 @@ async def _(param: DeleteFile) -> Result:
         return Result.warning_("文件不存在...")
     try:
         path.unlink()
-        return Result.ok("删除成功!")
+        return Result.ok(info="删除成功!")
     except Exception as e:
         return Result.warning_(f"删除失败: {e!s}")
 
@@ -255,7 +193,7 @@ async def _(param: DeleteFile) -> Result:
         return Result.warning_("文件夹不存在...")
     try:
         shutil.rmtree(path.absolute())
-        return Result.ok("删除成功!")
+        return Result.ok(info="删除成功!")
     except Exception as e:
         return Result.warning_(f"删除失败: {e!s}")
 
@@ -290,7 +228,7 @@ async def _(param: RenameFile) -> Result:
         if not str(dest).startswith(root + os.sep):
             return Result.fail("目标路径超出允许范围")
         path.rename(dest)
-        return Result.ok("重命名成功!")
+        return Result.ok(info="重命名成功!")
     except Exception as e:
         return Result.warning_(f"重命名失败: {e!s}")
 
@@ -325,7 +263,7 @@ async def _(param: RenameFile) -> Result:
         if not str(dest).startswith(root + os.sep):
             return Result.fail("目标路径超出允许范围")
         shutil.move(path.absolute(), dest)
-        return Result.ok("重命名成功!")
+        return Result.ok(info="重命名成功!")
     except Exception as e:
         return Result.warning_(f"重命名失败: {e!s}")
 
@@ -357,7 +295,7 @@ async def _(param: AddFile) -> Result:
         return Result.warning_("文件已存在...")
     try:
         path.touch()
-        return Result.ok("新建文件成功!")
+        return Result.ok(info="新建文件成功!")
     except Exception as e:
         return Result.warning_(f"新建文件失败: {e!s}")
 
@@ -389,7 +327,7 @@ async def _(param: AddFile) -> Result:
         return Result.warning_("文件夹已存在...")
     try:
         path.mkdir()
-        return Result.ok("新建文件夹成功!")
+        return Result.ok(info="新建文件夹成功!")
     except Exception as e:
         return Result.warning_(f"新建文件夹失败: {e!s}")
 
@@ -421,7 +359,7 @@ async def _(full_path: str) -> Result:
     dependencies=[authentication()],
     response_model=Result[str],
     response_class=JSONResponse,
-    description="读取文件",
+    description="保存文件",
 )
 async def _(param: SaveFile) -> Result[str]:
     path, error = validate_path(param.full_path)
@@ -432,7 +370,7 @@ async def _(param: SaveFile) -> Result[str]:
     try:
         async with aiofiles.open(str(path), "w", encoding="utf-8") as f:
             await f.write(param.content)
-        return Result.ok("更新成功!")
+        return Result.ok(info="更新成功!")
     except Exception as e:
         return Result.warning_(f"保存文件失败: {e!s}")
 

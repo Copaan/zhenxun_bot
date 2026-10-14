@@ -2,7 +2,7 @@ import nonebot
 from nonebot_plugin_apscheduler import scheduler
 
 from zhenxun.services.log import logger
-from zhenxun.services.message_load import should_pause_tasks
+from zhenxun.services.message_load import should_pause_db_tasks
 from zhenxun.services.tags import tag_manager
 from zhenxun.utils.platform import PlatformUtils
 
@@ -14,7 +14,7 @@ from zhenxun.utils.platform import PlatformUtils
     minute=1,
 )
 async def _():
-    if should_pause_tasks():
+    if should_pause_db_tasks():
         return
     bots = nonebot.get_bots()
     for bot in bots.values():
@@ -34,7 +34,7 @@ async def _():
     minute=1,
 )
 async def _():
-    if should_pause_tasks():
+    if should_pause_db_tasks():
         return
     bots = nonebot.get_bots()
     for bot in bots.values():

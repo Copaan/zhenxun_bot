@@ -24,6 +24,7 @@ from zhenxun.configs.utils import (
 from zhenxun.services.log import logger
 from zhenxun.utils.enum import PluginType
 from zhenxun.utils.message import MessageUtils
+from zhenxun.utils.platform import PlatformUtils
 from zhenxun.utils.rules import admin_check
 
 from ._data_source import BanManage, call_ban
@@ -47,6 +48,7 @@ __plugin_meta__ = PluginMetadata(
     extra=PluginExtraData(
         author="HibiKier",
         version="0.1",
+        required_platform_capabilities={"scoped_management"},
         plugin_type=PluginType.SUPER_AND_ADMIN,
         superuser_help="""
         超级管理员额外命令
@@ -200,20 +202,19 @@ async def _(
     user_id = ""
     if not session.id1:
         await MessageUtils.build_message("用户id为空...").finish(reply_to=True)
+    is_superuser = PlatformUtils.is_superuser(bot, session.id1)
     if user.available:
         if isinstance(user.result, At):
             user_id = user.result.target
         else:
-            if session.id1 not in bot.config.superusers:
+            if not is_superuser:
                 await MessageUtils.build_message("权限不足捏...").finish(reply_to=True)
             user_id = user.result
     _duration = duration.result * 60 if duration.available else -1
     _duration_text = f"{duration.result} 分钟" if duration.available else " 到世界湮灭"
     ban_reason = reason.result if reason.available else None
     if (gid := session.id3 or session.id2) and not group_id.available:
-        if not user_id or (
-            user_id == bot.self_id and session.id1 not in bot.config.superusers
-        ):
+        if not user_id or (user_id == bot.self_id and not is_superuser):
             _duration = 0.5
             await MessageUtils.build_message("倒反天罡，小小管理速速退下！").send()
             await BanManage.ban(session.id1, gid, ban_reason, 30, session, True)
@@ -237,7 +238,7 @@ async def _(
             ban_reason,
             _duration,
             session,
-            session.id1 in bot.config.superusers,
+            is_superuser,
         )
         logger.info(
             "管理员Ban",
@@ -257,7 +258,7 @@ async def _(
                 f" 在里面乖乖呆 {_duration_text} 吧!",
             ]
         ).finish(reply_to=True)
-    elif session.id1 in bot.config.superusers:
+    elif is_superuser:
         _group_id = group_id.result if group_id.available else None
         await BanManage.ban(user_id, _group_id, ban_reason, _duration, session, True)
         logger.info(
@@ -283,18 +284,19 @@ async def _(
 ):
     user_id = ""
     _idx = idx.result if idx.available else None
+    is_superuser = PlatformUtils.is_superuser(bot, session.id1)
     if user.available:
         if isinstance(user.result, At):
             user_id = user.result.target
         else:
-            if session.id1 not in bot.config.superusers:
+            if not is_superuser:
                 await MessageUtils.build_message("权限不足捏...").finish(reply_to=True)
             user_id = user.result
     if gid := session.id3 or session.id2:
         if group_id.available:
             gid = group_id.result
         is_unban, result = await BanManage.unban(
-            user_id, gid, session, _idx, session.id1 in bot.config.superusers
+            user_id, gid, session, _idx, is_superuser
         )
         if not is_unban:
             await MessageUtils.build_message(result).finish(reply_to=True)
@@ -315,7 +317,7 @@ async def _(
                 " 从黑屋中拉了出来并急救了一下!",
             ]
         ).finish(reply_to=True)
-    elif session.id1 in bot.config.superusers:
+    elif is_superuser:
         _group_id = group_id.result if group_id.available else None
         is_unban, result = await BanManage.unban(
             user_id, _group_id, session, _idx, True

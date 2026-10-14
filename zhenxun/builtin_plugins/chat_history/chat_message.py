@@ -13,8 +13,8 @@ from zhenxun.services.low_priority_writer import (
     append_low_priority_record,
     register_low_priority_writer,
 )
-from zhenxun.services.message_load import is_overloaded
 from zhenxun.utils.enum import PluginType
+from zhenxun.utils.platform import PlatformUtils
 from zhenxun.utils.utils import get_entity_ids
 
 __plugin_meta__ = PluginMetadata(
@@ -25,7 +25,6 @@ __plugin_meta__ = PluginMetadata(
         author="HibiKier",
         version="0.1",
         plugin_type=PluginType.HIDDEN,
-        supported_platform_scopes={"qq_client"},
         configs=[
             RegisterConfig(
                 module="chat_history",
@@ -101,22 +100,13 @@ register_low_priority_writer(
 @chat_history.handle()
 async def _(message: UniMsg, session: Uninfo):
     entity = get_entity_ids(session)
-    if is_overloaded():
-        return
     try:
-        from zhenxun.adapters.qq_official.context import get_current_official_context
-
-        official_context = get_current_official_context()
         record = ChatHistory(
             user_id=entity.user_id,
             group_id=entity.group_id,
             text=str(message),
             plain_text=message.extract_plain_text(),
-            bot_id=(
-                official_context.storage_bot_id
-                if official_context is not None
-                else session.self_id
-            ),
+            bot_id=PlatformUtils.get_storage_bot_id(session),
             platform=session.platform,
         )
         sanitized = _sanitize_chat_history(record)

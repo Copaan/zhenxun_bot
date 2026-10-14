@@ -338,7 +338,6 @@ async def _shutdown_ai_runtime() -> None:
     parallel_safe=True,
     failure_policy="degrade",
     component_id="warmup:ai",
-    restart_policy="component",
     config_keys=("AI", "LLM", "AI_PROVIDER", "AI_TOOLS", "MCP"),
     pass_context=True,
 )
@@ -365,8 +364,6 @@ async def _init_llm_config_on_startup(context):
     stage="warmup",
     component_id="warmup:ai_sandbox",
     failure_policy="degrade",
-    restart_policy="worker",
-    config_keys=("ENABLE_SANDBOX", "SANDBOX_TYPE"),
     pass_context=True,
 )
 async def _start_ai_sandbox(context) -> None:

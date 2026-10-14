@@ -11,7 +11,7 @@ from typing import Any
 from zhenxun.services.cache.bounded_ttl import BoundedTTLCache
 from zhenxun.services.cache.cache_containers import CacheDict
 from zhenxun.services.log import logger
-from zhenxun.services.message_load import idle_seconds, is_overloaded
+from zhenxun.services.message_load import idle_seconds
 
 LOG_COMMAND = "MemoryGovernor"
 
@@ -96,8 +96,6 @@ async def _should_reclaim() -> bool:
         return False
     if idle_seconds() < IDLE_RECLAIM_SECONDS:
         return False
-    if is_overloaded():
-        return False
     if await _has_active_auth_work():
         return False
     return not await _has_active_render_work()
@@ -120,17 +118,8 @@ async def _has_active_render_work() -> bool:
         return True
     manager = getattr(module, "engine_manager", None)
     engine = getattr(manager, "_instance", None)
-    if engine is None:
-        return False
-    try:
-        snapshot = await asyncio.wait_for(engine.get_runtime_snapshot(), timeout=1.0)
-    except Exception:
-        return True
-    if snapshot.get("active_renders", 0):
-        return True
-    if snapshot.get("htmlrender_active_tasks", 0):
-        return True
-    return bool(snapshot.get("active_leases", 0))
+    busy = getattr(engine, "busy", None)
+    return bool(busy and busy())
 
 
 async def _run_reclaim() -> None:
@@ -144,7 +133,6 @@ async def _run_reclaim() -> None:
     }
 
     cleared["statistics"] = await _flush_statistics_buffer()
-    cleared["user_gold_logs"] = await _flush_user_gold_log_buffer()
     cleared["bounded_ttl_clear"] = await BoundedTTLCache.clear_all()
     cleared["cache_dict_clear"] = CacheDict.clear_all()
     cleared["avatar_l1"] = _clear_avatar_memory_cache()
@@ -173,17 +161,6 @@ async def _flush_statistics_buffer() -> int:
     if module is None:
         return 0
     flush = getattr(module, "_flush_statistics_buffer", None)
-    if flush is None:
-        return 0
-    result = await flush("内存回收")
-    return int(result or 0)
-
-
-async def _flush_user_gold_log_buffer() -> int:
-    module = sys.modules.get("zhenxun.services.buffered_writers")
-    if module is None:
-        return 0
-    flush = getattr(module, "flush_user_gold_log_buffer", None)
     if flush is None:
         return 0
     result = await flush("内存回收")

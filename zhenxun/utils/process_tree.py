@@ -1,5 +1,7 @@
 """Discover descendants only through verified immediate parent generations."""
 
+import contextlib
+
 import psutil
 
 
@@ -64,3 +66,22 @@ def verified_descendants(root: psutil.Process) -> list[psutil.Process]:
             except (psutil.NoSuchProcess, psutil.ZombieProcess):
                 continue
     return found
+
+
+def kill_tree(
+    processes: list[psutil.Process], timeout: float = 5
+) -> list[psutil.Process]:
+    """逆序结束进程（先后代、后根进程）并等待退出
+
+    参数:
+        processes: 根进程在前、后代在后的进程列表
+        timeout: 等待退出的秒数
+
+    返回:
+        list[psutil.Process]: 超时后仍存活的进程
+    """
+    for item in reversed(processes):
+        with contextlib.suppress(psutil.NoSuchProcess):
+            if item.is_running():
+                item.kill()
+    return psutil.wait_procs(processes, timeout=timeout)[1]

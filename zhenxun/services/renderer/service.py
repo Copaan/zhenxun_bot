@@ -2,7 +2,6 @@ import asyncio
 from collections.abc import Awaitable, Callable
 import hashlib
 from pathlib import Path
-import time
 from typing import Any, ClassVar
 
 import aiofiles
@@ -57,7 +56,6 @@ class RendererService:
         self._init_lock = asyncio.Lock()
         self._initialization_task: asyncio.Task | None = None
         self._closed = False
-        self._context = None
         self._custom_filters: dict[str, Callable] = {}
         self._custom_globals: dict[str, Callable] = {}
 
@@ -152,29 +150,15 @@ class RendererService:
         except TemplateNotFound:
             return f"<!-- Asset not found: {namespaced_path} -->"
 
-    def bind_context(self, context) -> None:
-        self._context = context
-        if self._closed:
-            engine_manager.reopen()
-            self._closed = False
-            self._initialization_task = None
-
     async def initialize(self):
         if self._closed:
             raise RuntimeError("renderer_closing")
         if self._initialized:
             return
         if self._initialization_task is None:
-            if self._context:
-                self._initialization_task = self._context.spawn_task(
-                    self._initialize(),
-                    name="renderer-service-initialize",
-                    degrade_on_error=False,
-                )
-            else:
-                self._initialization_task = asyncio.create_task(
-                    self._initialize(), name="renderer-service-initialize"
-                )
+            self._initialization_task = asyncio.create_task(
+                self._initialize(), name="renderer-service-initialize"
+            )
         await asyncio.shield(self._initialization_task)
 
     async def close(self) -> None:
@@ -185,7 +169,6 @@ class RendererService:
         self._initialization_task = None
 
     async def _prepare_theme(self) -> None:
-        started = time.monotonic()
         current_theme_name = Config.get_config("UI", "THEME", "default")
         await self._theme_manager.load_theme(current_theme_name)
         if self._theme_manager.current_theme:
@@ -197,11 +180,6 @@ class RendererService:
         )
         self._template_engine.set_global(
             "default_theme_palette", self._theme_manager.current_default_palette
-        )
-        from zhenxun.services.startup import startup_coordinator
-
-        startup_coordinator.record_operation(
-            "renderer:theme", "warmup", "completed", (time.monotonic() - started) * 1000
         )
 
     async def _initialize(self):

@@ -545,15 +545,6 @@ class PluginPolicyService:
             by_policy.setdefault(int(binding.policy_id), []).append(binding.bot_id)
         return [self._policy_view(p, by_policy.get(int(p.id), [])) for p in policies]
 
-    async def get_policy(self, policy_id: int) -> dict[str, Any]:
-        policy = await PluginPolicy.get_or_none(id=policy_id)
-        if policy is None:
-            raise PluginPolicyNotFound("策略不存在")
-        bot_ids = await BotPluginPolicyBinding.filter(policy_id=policy_id).values_list(
-            "bot_id", flat=True
-        )
-        return self._policy_view(policy, bot_ids)
-
     async def _state_for_bot(
         self, bot_id: str
     ) -> tuple[BotConsole | None, BotPluginPolicyBinding | None, PluginPolicy | None]:

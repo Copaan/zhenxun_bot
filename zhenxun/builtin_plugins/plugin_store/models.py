@@ -1,5 +1,3 @@
-from typing import Any, Literal
-
 from nonebot.compat import model_dump
 from pydantic import BaseModel, Field
 
@@ -13,25 +11,6 @@ type2name: dict[str, str] = {
     "DEPENDANT": "依赖插件",
     "HIDDEN": "其他插件",
 }
-
-
-class GiteeContents(BaseModel):
-    """Gitee Api内容"""
-
-    type: Literal["file", "dir"]
-    """类型"""
-    size: Any
-    """文件大小"""
-    name: str
-    """文件名"""
-    path: str
-    """文件路径"""
-    url: str
-    """文件链接"""
-    html_url: str
-    """文件html链接"""
-    download_url: str
-    """文件raw链接"""
 
 
 class StorePluginInfo(BaseModel):

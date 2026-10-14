@@ -15,7 +15,8 @@ from zhenxun.services.nonebot_store.storage import (
     load_manifest as load_nonebot_manifest,
 )
 from zhenxun.services.plugin_host import ApplyMode, RuntimeOperation
-from zhenxun.services.runtime_config_reload import reload_runtime_config
+from zhenxun.services.plugin_store.plugin_store_receipts import StoreReceiptStore
+from zhenxun.services.runtime_config import reload_runtime_config
 from zhenxun.services.runtime_mutation import managed_mutation
 from zhenxun.utils.enum import BlockType, PluginType
 
@@ -27,7 +28,6 @@ from .model import (
     PluginInfo,
     UpdatePlugin,
 )
-from .store_receipts import StoreReceiptStore
 
 
 def _loaded_metadata(runtime_module: str, module: str) -> tuple[str, str | None]:
@@ -98,10 +98,13 @@ class ApiDataSource:
                 (
                     key
                     for key, receipt in receipts.items()
-                    if str(receipt.get("runtime_module") or "")
-                    in {runtime_module, plugin.module}
-                    or str(receipt.get("runtime_module") or "").endswith(
-                        f".{plugin.module}"
+                    if not key.startswith("local_archive:")
+                    and (
+                        str(receipt.get("runtime_module") or "")
+                        in {runtime_module, plugin.module}
+                        or str(receipt.get("runtime_module") or "").endswith(
+                            f".{plugin.module}"
+                        )
                     )
                 ),
                 None,
@@ -310,7 +313,10 @@ class ApiDataSource:
                 plugin_changed_other = False
                 plugin_changed_block = False
 
-                if db_plugin.block_type != item.block_type:
+                if (
+                    "block_type" in item.model_fields_set
+                    and db_plugin.block_type != item.block_type
+                ):
                     db_plugin.block_type = item.block_type
                     db_plugin.status = item.block_type != BlockType.ALL
                     plugin_changed_block = True

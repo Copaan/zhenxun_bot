@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
+import contextlib
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import timedelta
 from io import StringIO
 import json
@@ -15,9 +17,12 @@ import nonebot
 from nonebot.compat import model_fields, type_validate_python
 from nonebot.config import Config as NoneBotConfig
 
-from zhenxun.configs.config import BotConfig, BotSetting
+from zhenxun.configs.config import BotConfig, BotSetting, Config
+from zhenxun.services.ai.config import get_llm_config
+from zhenxun.services.ai.llm.manager import clear_all_cache
 from zhenxun.services.log import logger
 from zhenxun.services.network_proxy import PROXY_KEYS, proxy_runtime
+from zhenxun.services.plugin_host import ApplyMode, RuntimeOperation
 from zhenxun.utils._restart_utils import (
     clear_restart_pending,
     clear_restart_ticket_if_idle,
@@ -37,14 +42,9 @@ DIRECT_KEYS = {
     "SUPERUSERS",
 }
 DIRECT_KEYS |= PROXY_KEYS
-CACHE_KEYS = {
-    "CACHE_MODE",
-    "REDIS_HOST",
-    "REDIS_PASSWORD",
-    "REDIS_PORT",
-}
 RESTART_KEYS = {
     "ALCONNA_USE_COMMAND_START",
+    "CACHE_MODE",
     "COMMAND_SEP",
     "COMMAND_START",
     "DB_URL",
@@ -63,6 +63,9 @@ RESTART_KEYS = {
     "QQ_WEBHOOK_PUBLIC_BASE_URL",
     "QQ_WEBHOOK_TLS_CERTFILE",
     "QQ_WEBHOOK_TLS_KEYFILE",
+    "REDIS_HOST",
+    "REDIS_PASSWORD",
+    "REDIS_PORT",
     "WEBUI_HTTPS_ENABLED",
     "WEBUI_HTTP_MODE",
     "WEBUI_HTTP_REDIRECT_ENABLED",
@@ -70,7 +73,7 @@ RESTART_KEYS = {
     "WEBUI_TLS_CERTFILE",
     "WEBUI_TLS_KEYFILE",
 }
-KNOWN_ENV_KEYS = DIRECT_KEYS | CACHE_KEYS | RESTART_KEYS
+KNOWN_ENV_KEYS = DIRECT_KEYS | RESTART_KEYS
 
 _CORE_ATTRS = {
     "API_TIMEOUT": "api_timeout",
@@ -88,12 +91,6 @@ _BOT_ATTRS = {
     "NETWORK_PROXY_PLUGINS": "network_proxy_plugins",
     "NETWORK_PROXY_CORE_ENABLED": "network_proxy_core_enabled",
     "NETWORK_PROXY_BYPASS": "network_proxy_bypass",
-}
-_CACHE_ATTRS = {
-    "CACHE_MODE": "cache_mode",
-    "REDIS_HOST": "redis_host",
-    "REDIS_PASSWORD": "redis_password",
-    "REDIS_PORT": "redis_port",
 }
 _CORE_EXTRA_DEFAULTS = {"image_to_bytes": False}
 
@@ -137,27 +134,13 @@ def environment_effect(key: str) -> str:
         key: 配置项
 
     返回:
-        str: in_place 直接生效，component_restart 重建缓存组件，
-            worker_restart 重启后生效
+        str: in_place 直接生效，worker_restart 重启后生效
     """
-    normalized = key.upper()
-    if normalized in DIRECT_KEYS:
-        return "in_place"
-    if normalized in CACHE_KEYS:
-        return "component_restart"
-    return "worker_restart"
+    return "in_place" if key.upper() in DIRECT_KEYS else "worker_restart"
 
 
 def is_known_env_key(key: str) -> bool:
     return key.upper() in KNOWN_ENV_KEYS
-
-
-def is_sensitive_env_key(key: str) -> bool:
-    normalized = key.upper()
-    return normalized == "SYSTEM_PROXY" or any(
-        marker in normalized
-        for marker in ("TOKEN", "SECRET", "PASSWORD", "COOKIE", "API_KEY", "APIKEY")
-    )
 
 
 @dataclass(slots=True)
@@ -169,12 +152,6 @@ class EnvironmentApplyResult:
     field_effects: dict[str, str]
     rolled_back: bool = False
     hot_reloaded: bool = False
-    component_effects: dict[str, str] = field(default_factory=dict)
-    affected_components: list[str] = field(default_factory=list)
-
-
-class RuntimeEnvironmentError(RuntimeError):
-    pass
 
 
 class RuntimeEnvironmentManager:
@@ -244,68 +221,8 @@ class RuntimeEnvironmentManager:
             else:
                 os.environ[key] = value
 
-    async def _reconfigure_cache(self, values: dict[str, str | None]) -> None:
-        from zhenxun.services.cache import cache_config
-        from zhenxun.services.cache.config import CacheMode
-        from zhenxun.services.cache.runtime_sync import RuntimeCacheSync
-
-        candidate = type(cache_config)(
-            **{
-                attr: self._typed_value(
-                    cache_config, type(cache_config)(), attr, values.get(key)
-                )
-                for key, attr in _CACHE_ATTRS.items()
-            }
-        )
-        if candidate.cache_mode == CacheMode.REDIS:
-            if not candidate.redis_host:
-                raise RuntimeEnvironmentError("redis_host_required")
-            import redis.asyncio as redis_async
-            from redis.asyncio.retry import Retry
-            from redis.backoff import NoBackoff
-
-            probe = redis_async.Redis(
-                host=candidate.redis_host,
-                port=candidate.redis_port or 6379,
-                password=candidate.redis_password or None,
-                socket_connect_timeout=2,
-                socket_timeout=2,
-                retry=Retry(NoBackoff(), 0),
-            )
-            try:
-                await asyncio.wait_for(probe.ping(), 2)
-            except Exception as error:
-                raise RuntimeEnvironmentError("redis_probe_failed") from error
-            finally:
-                await asyncio.wait_for(probe.aclose(), 2)
-
-        previous = {attr: getattr(cache_config, attr) for attr in _CACHE_ATTRS.values()}
-        try:
-            await RuntimeCacheSync.stop()
-            for attr in _CACHE_ATTRS.values():
-                setattr(cache_config, attr, getattr(candidate, attr))
-            await asyncio.wait_for(RuntimeCacheSync.start(strict=True), 2)
-        except BaseException:
-            await RuntimeCacheSync.stop()
-            for attr, value in previous.items():
-                setattr(cache_config, attr, value)
-            await asyncio.wait_for(RuntimeCacheSync.start(strict=True), 2)
-            raise
-        finally:
-            import sys
-
-            overview = sys.modules.get(
-                "zhenxun.builtin_plugins.web_ui.api.tabs.dashboard.overview"
-            )
-            if overview is not None:
-                await overview.invalidate_probes()
-
-    async def _apply_runtime_values(
-        self,
-        values: dict[str, str | None],
-        keys: set[str],
-        *,
-        rebuild_components: bool = True,
+    def _apply_runtime_values(
+        self, values: dict[str, str | None], keys: set[str]
     ) -> None:
         driver_config = nonebot.get_driver().config
         for key in keys:
@@ -337,8 +254,6 @@ class RuntimeEnvironmentManager:
             from zhenxun.services.log import reload_log_level
 
             reload_log_level(getattr(driver_config, "log_level", "INFO"))
-        if rebuild_components and keys & CACHE_KEYS:
-            await self._reconfigure_cache(values)
 
     async def apply(
         self,
@@ -361,14 +276,14 @@ class RuntimeEnvironmentManager:
 
         async with self._lock:
             hot_candidates = {
-                key.upper()
+                key
                 for key in changed
-                if environment_effect(key) != "worker_restart"
+                if environment_effect(key) == "in_place"
                 and self.effective_values.get(key) != after.get(key)
             }
             pending_keys = set(self.pending_keys)
             for key in changed:
-                if environment_effect(key) != "worker_restart":
+                if environment_effect(key) == "in_place":
                     continue
                 if self.startup_values.get(key) != after.get(key):
                     pending_keys.add(key)
@@ -376,64 +291,15 @@ class RuntimeEnvironmentManager:
                     pending_keys.discard(key)
 
             runtime_before = dict(self.effective_values)
-            component_operation = None
-            component_candidates = hot_candidates & CACHE_KEYS
-            direct_candidates = hot_candidates - component_candidates
             try:
-                if direct_candidates:
-                    await self._apply_runtime_values(after, direct_candidates)
-                if component_candidates:
-                    from zhenxun.services.lifecycle import lifecycle_kernel
-
-                    component_operation = await lifecycle_kernel.restart_for_config(
-                        component_candidates,
-                        apply_change=lambda: self._apply_runtime_values(
-                            after,
-                            component_candidates,
-                            rebuild_components=False,
-                        ),
-                        rollback_change=lambda: self._apply_runtime_values(
-                            runtime_before,
-                            component_candidates,
-                            rebuild_components=False,
-                        ),
-                    )
-                    if component_operation.apply_effect == "no_change":
-                        await self._apply_runtime_values(after, component_candidates)
-                    elif component_operation.apply_effect == "restart_pending":
-                        pending_keys.update(component_candidates)
-                        hot_candidates -= component_candidates
-                        for key in component_candidates:
-                            field_effects[key] = "worker_restart"
-                    elif component_operation.apply_effect == "rolled_back":
-                        raise RuntimeEnvironmentError("component_restart_rolled_back")
+                self._apply_runtime_values(after, hot_candidates)
                 if hot_candidates & PROXY_KEYS:
                     await proxy_runtime.apply(after)
-                for key in hot_candidates - pending_keys:
-                    self.effective_values[key] = after.get(key)
             except (Exception, asyncio.CancelledError):
-                if (
-                    component_operation
-                    and component_operation.apply_effect == "component_restarted"
-                ):
-                    from zhenxun.services.lifecycle import lifecycle_kernel
-
-                    await lifecycle_kernel.restart_for_config(
-                        component_candidates,
-                        apply_change=lambda: self._apply_runtime_values(
-                            runtime_before,
-                            component_candidates,
-                            rebuild_components=False,
-                        ),
-                        rollback_change=lambda: self._apply_runtime_values(
-                            after,
-                            component_candidates,
-                            rebuild_components=False,
-                        ),
-                    )
-                await self._apply_runtime_values(runtime_before, direct_candidates)
-                self.effective_values = runtime_before
+                self._apply_runtime_values(runtime_before, hot_candidates)
                 raise
+            for key in hot_candidates:
+                self.effective_values[key] = after.get(key)
 
             reasons = [f"environment:{key}" for key in sorted(pending_keys)]
             if reasons:
@@ -447,53 +313,190 @@ class RuntimeEnvironmentManager:
                 from zhenxun.services.plugin_host import plugin_host
 
                 await plugin_host.request_restart(set(), "environment_changed")
-            mode = (
-                "restart_pending"
-                if reasons
-                else "component_restarted"
-                if component_operation
-                and component_operation.apply_effect == "component_restarted"
-                else "config_reloaded"
-            )
             logger.info(
                 f"环境配置已协调: changed={len(changed)} "
-                f"hot={len(hot_candidates - pending_keys)} "
+                f"hot={len(hot_candidates)} "
                 f"pending={len(pending_keys)}",
                 "RuntimeEnvironment",
             )
             self.last_content = after_content
             return EnvironmentApplyResult(
-                apply_mode=mode,
+                apply_mode="restart_pending" if reasons else "config_reloaded",
                 changed_keys=sorted(changed),
                 restart_required=bool(reasons),
                 reason_codes=reasons,
                 field_effects=field_effects,
-                hot_reloaded=bool(hot_candidates - pending_keys),
-                component_effects={
-                    key: component_operation.apply_effect
-                    for key in sorted(component_candidates)
-                }
-                if component_operation
-                else {},
-                affected_components=(
-                    component_operation.affected_components
-                    if component_operation
-                    else []
-                ),
+                hot_reloaded=bool(hot_candidates),
             )
 
 
 runtime_environment_manager = RuntimeEnvironmentManager()
 
 
+ConfigDependency = tuple[str, str]
+_STARTUP_SIMPLE_DATA = deepcopy(Config._simple_data)
+
+
+class RuntimeConfigReloadError(RuntimeError):
+    """Raised when the runtime cannot commit a validated config generation."""
+
+
+def _flatten_simple_config(data: Any) -> dict[ConfigDependency, Any]:
+    flattened: dict[ConfigDependency, Any] = {}
+    if not isinstance(data, dict):
+        return flattened
+    for raw_module, raw_values in data.items():
+        module = str(raw_module)
+        if not isinstance(raw_values, dict):
+            flattened[(module, "*")] = raw_values
+            continue
+        for raw_key, value in raw_values.items():
+            flattened[(module, str(raw_key).upper())] = value
+    return flattened
+
+
+def changed_config_dependencies(before: Any, after: Any) -> set[ConfigDependency]:
+    previous = _flatten_simple_config(before)
+    current = _flatten_simple_config(after)
+    return {
+        dependency
+        for dependency in previous.keys() | current.keys()
+        if previous.get(dependency, _MISSING) != current.get(dependency, _MISSING)
+    }
+
+
+_MISSING = object()
+
+
+async def reload_runtime_config(
+    reschedule: Callable[[], None] | None = None,
+    *,
+    submit_restart: bool = True,
+    previous_simple_data: Any | None = None,
+    reload_consumers: bool = True,
+) -> RuntimeOperation:
+    """Reload config.yaml and the runtime state derived from it."""
+    from zhenxun.builtin_plugins.init.manager import manager
+    from zhenxun.services.plugin_host import plugin_host
+
+    async def refresh_derived_state() -> None:
+        get_llm_config.cache_clear()
+        clear_all_cache()
+        manager.init()
+        await manager.load_to_db()
+        if reschedule is not None:
+            with contextlib.suppress(Exception):
+                reschedule()
+
+    async def apply_new_runtime() -> None:
+        Config.reload(strict=True)
+        await refresh_derived_state()
+
+    async def apply_previous_runtime() -> None:
+        Config.restore_runtime_values(snapshot)
+        await refresh_derived_state()
+
+    snapshot = Config.snapshot_runtime_values()
+    component_result = None
+    lifecycle_keys: set[str] = set()
+    before = deepcopy(
+        Config._simple_data if previous_simple_data is None else previous_simple_data
+    )
+    try:
+        Config.reload(strict=True)
+        changed_dependencies = changed_config_dependencies(before, Config._simple_data)
+        startup_changed_dependencies = changed_config_dependencies(
+            _STARTUP_SIMPLE_DATA, Config._simple_data
+        )
+        changed_paths = sorted(
+            f"{module}.{key}" for module, key in changed_dependencies
+        )
+        if changed_paths:
+            logger.debug(f"运行时配置变更键: {', '.join(changed_paths)}")
+        else:
+            logger.debug("config.yaml 语义内容未变化，跳过配置消费者重载")
+        Config.restore_runtime_values(snapshot)
+        lifecycle_keys = {
+            value
+            for module, key in changed_dependencies
+            for value in (module.upper(), f"{module}.{key}".upper())
+        }
+        from zhenxun.services.lifecycle import lifecycle_kernel
+
+        component_result = await lifecycle_kernel.restart_for_config(
+            lifecycle_keys,
+            apply_change=apply_new_runtime,
+            rollback_change=apply_previous_runtime,
+        )
+        if component_result.apply_effect == "no_change":
+            await apply_new_runtime()
+        elif component_result.apply_effect == "restart_pending":
+            operation = await plugin_host.request_restart(
+                set(component_result.affected_components),
+                "component_rollback_failed",
+                submit_launcher=submit_restart,
+            )
+            operation.config_keys = changed_paths
+            return operation
+        elif component_result.apply_effect == "rolled_back":
+            raise RuntimeConfigReloadError("component_restart_rolled_back")
+        operation = None
+        if reload_consumers:
+            operation = await plugin_host.reload_config_consumers(
+                changed_dependencies,
+                restart_dependencies=startup_changed_dependencies,
+                submit_restart=submit_restart,
+            )
+        if operation is not None and operation.mode is ApplyMode.FAILED:
+            raise RuntimeConfigReloadError(
+                operation.reason or "config_consumer_reload_failed"
+            )
+        if operation is None:
+            operation = RuntimeOperation(
+                ApplyMode.COMPONENT_RESTARTED
+                if component_result.apply_effect == "component_restarted"
+                else ApplyMode.CONFIG_RELOADED,
+                "completed",
+                changed_paths,
+                generation=plugin_host.generation,
+            )
+            plugin_host.last_operation = operation
+        operation.config_keys = changed_paths
+        return operation
+    except (Exception, asyncio.CancelledError):
+        try:
+            if (
+                component_result is not None
+                and component_result.apply_effect == "component_restarted"
+            ):
+                from zhenxun.services.lifecycle import lifecycle_kernel
+
+                await lifecycle_kernel.restart_for_config(
+                    lifecycle_keys,
+                    apply_change=apply_previous_runtime,
+                    rollback_change=apply_new_runtime,
+                )
+            else:
+                Config.restore_runtime_values(snapshot)
+        except Exception as component_rollback_error:
+            logger.error("配置组件回滚失败，需要重启worker", e=component_rollback_error)
+        try:
+            Config.save()
+            await refresh_derived_state()
+        except Exception as rollback_error:
+            logger.error("运行时配置回滚后的派生状态刷新失败", e=rollback_error)
+        raise
+
+
 __all__ = [
     "ENV_APPLY_SOURCE",
     "KNOWN_ENV_KEYS",
     "EnvironmentApplyResult",
-    "RuntimeEnvironmentError",
+    "RuntimeConfigReloadError",
+    "changed_config_dependencies",
     "environment_effect",
     "is_known_env_key",
-    "is_sensitive_env_key",
     "normalize_env",
+    "reload_runtime_config",
     "runtime_environment_manager",
 ]

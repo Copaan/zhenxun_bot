@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import re
 import secrets
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
+from nonebot.adapters import Bot, Event
+from nonebot.adapters.onebot.v11 import Bot as OneBot
+from nonebot.adapters.onebot.v11 import MessageEvent as OneBotMessage
 from tortoise.transactions import in_transaction
 
 from zhenxun.models.asset_operation import AssetOperation
@@ -345,3 +349,85 @@ async def verify_legacy_identity(key: str, *, evidence: str, reviewer: str) -> N
             evidence={"provenance": evidence, "reviewer": reviewer},
         )
     await invalidate_identity(key)
+
+
+_COMMAND = re.compile(
+    r"^\s*(绑定\s*qq|qq\s*绑定|绑定\s*状态|解绑\s*qq)(?:\s+(.*))?\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+_CODE = re.compile(r"ZX-[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{12}", re.IGNORECASE)
+
+
+def binding_command(event: Event) -> tuple[str, str] | None:
+    """解析绑定、解绑、绑定状态指令
+
+    参数:
+        event: Event
+
+    返回:
+        tuple[str, str] | None: 指令类型与参数，不是绑定指令时为 None
+    """
+    if event.get_type() != "message":
+        return None
+    match = _COMMAND.fullmatch(event.get_plaintext())
+    if match is None:
+        return None
+    head = re.sub(r"\s", "", match[1]).upper()
+    kind = "status" if head == "绑定状态" else "unbind" if head == "解绑QQ" else "bind"
+    return kind, (match[2] or "").strip()
+
+
+def bare_binding_code(bot: Bot, event: Event) -> str | None:
+    """识别 OneBot 私聊或 @Bot 时单独发送的绑定码
+
+    参数:
+        bot: Bot
+        event: Event
+
+    返回:
+        str | None: 绑定码
+    """
+    if not isinstance(bot, OneBot) or not isinstance(event, OneBotMessage):
+        return None
+    if (
+        str(event.self_id) != str(bot.self_id)
+        or event.user_id <= 0
+        or str(event.user_id) == str(bot.self_id)
+        or getattr(event, "anonymous", None) is not None
+        or event.reply is not None
+    ):
+        return None
+    text = []
+    mentions = 0
+    for segment in event.original_message:
+        if segment.type == "text":
+            text.append(str(segment.data.get("text", "")))
+        elif (
+            segment.type == "at"
+            and event.message_type == "group"
+            and str(segment.data.get("qq")) == str(bot.self_id)
+        ):
+            mentions += 1
+            text.append(" ")
+        else:
+            return None
+    if event.message_type == "group" and mentions != 1:
+        return None
+    code = "".join(text).strip()
+    return code.upper() if _CODE.fullmatch(code) else None
+
+
+def binding_argument(bot: Bot, event: Event) -> str | None:
+    """取得绑定指令的参数或单独发送的绑定码
+
+    参数:
+        bot: Bot
+        event: Event
+
+    返回:
+        str | None: 绑定参数
+    """
+    command = binding_command(event)
+    if command is not None and command[0] == "bind":
+        return command[1]
+    return bare_binding_code(bot, event)

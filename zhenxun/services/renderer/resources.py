@@ -1,26 +1,32 @@
 from __future__ import annotations
 
 import asyncio
-from collections import deque
 from dataclasses import dataclass
-import time
 from typing import Any
 
 from zhenxun.services.lifecycle.deadline import remaining_timeout, shutdown_budget
 from zhenxun.services.log import logger
 
+_BROWSER_GONE_MARKERS = (
+    "Connection closed while reading from the driver",
+    "Target page, context or browser has been closed",
+    "browser has been closed",
+    "BrowserContext.new_page",
+)
+
 
 def browser_gone(error: BaseException) -> bool:
-    """关闭失败是否因为浏览器或 Playwright 驱动已退出
+    """异常是否因为页面、上下文、浏览器或 Playwright 驱动已关闭
 
     参数:
-        error: 关闭时的异常
+        error: 操作时的异常
 
     返回:
-        bool: 资源已随浏览器释放
+        bool: 目标已随浏览器释放
     """
-    return type(error).__name__ == "TargetClosedError" or (
-        "Connection closed while reading from the driver" in str(error)
+    message = str(error)
+    return type(error).__name__ == "TargetClosedError" or any(
+        marker in message for marker in _BROWSER_GONE_MARKERS
     )
 
 
@@ -29,7 +35,6 @@ class ContextResource:
     context: Any
     browser: Any
     owner: str
-    generation: int | None
     cleanup: asyncio.Task | None = None
     failed: bool = False
 
@@ -40,7 +45,6 @@ class BrowserResources:
     def __init__(self) -> None:
         self.contexts: dict[Any, ContextResource] = {}
         self.tasks: set[asyncio.Task] = set()
-        self.failures: deque[dict[str, Any]] = deque(maxlen=128)
 
     def spawn(self, coroutine, *, name: str) -> asyncio.Task:
         task = asyncio.create_task(coroutine, name=name)
@@ -58,30 +62,15 @@ class BrowserResources:
         record = self.contexts.get(resource)
         if record is not None:
             record.failed = True
-        self.failures.append(
-            {
-                "resource_id": id(resource),
-                "generation": record.generation if record else None,
-                "owner": record.owner if record else "renderer",
-                "phase": phase,
-                "error_type": type(error).__name__,
-                "at": time.time(),
-                "released_at": None,
-            }
-        )
         logger.warning(
             f"browser resource cleanup: phase={phase} error={type(error).__name__}",
             "RendererResources",
         )
 
-    async def create_context(
-        self, browser: Any, *, owner: str, generation: int | None = None, **options
-    ) -> Any:
+    async def create_context(self, browser: Any, *, owner: str, **options) -> Any:
         async def create():
             context = await browser.new_context(**options)
-            self.contexts[context] = ContextResource(
-                context, browser, owner, generation
-            )
+            self.contexts[context] = ContextResource(context, browser, owner)
             return context
 
         task = self.spawn(create(), name="renderer-context-create")
@@ -98,9 +87,6 @@ class BrowserResources:
 
     def confirmed(self, context: Any) -> None:
         self.contexts.pop(context, None)
-        for failure in self.failures:
-            if failure["resource_id"] == id(context) and not failure["released_at"]:
-                failure["released_at"] = time.time()
 
     async def close_context(self, context: Any) -> None:
         record = self.contexts.get(context)
@@ -172,31 +158,10 @@ class BrowserResources:
         if any(isinstance(result, BaseException) for result in results):
             raise RuntimeError("renderer_context_cleanup_failed")
 
-    async def retry_failed(self) -> None:
-        with shutdown_budget(10.0):
-            results = await asyncio.gather(
-                *(
-                    self.close_context(context)
-                    for context, record in tuple(self.contexts.items())
-                    if record.failed
-                ),
-                return_exceptions=True,
-            )
-        if any(isinstance(result, BaseException) for result in results):
-            raise RuntimeError("renderer_context_cleanup_failed")
-
     def confirm_browser_closed(self, browser: Any) -> None:
         for context, record in tuple(self.contexts.items()):
             if record.browser is browser:
                 self.confirmed(context)
-
-    def snapshot(self) -> dict[str, Any]:
-        return {
-            "owned_context_count": len(self.contexts),
-            "pending_context_count": sum(r.failed for r in self.contexts.values()),
-            "cleanup_task_count": sum(not task.done() for task in self.tasks),
-            "cleanup_failures": list(self.failures),
-        }
 
 
 browser_resources = BrowserResources()

@@ -2,7 +2,6 @@ import asyncio
 from datetime import timedelta
 import json
 import secrets
-import time
 
 import aiofiles
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -25,7 +24,6 @@ from ..passwords import (
     verify_password,
 )
 from ..security import (
-    decode_access_token_status,
     login_attempt_limiter,
     revoke_authenticated_websockets,
 )
@@ -34,7 +32,6 @@ from ..utils import (
     authentication,
     create_token,
     get_user,
-    oauth2_scheme,
     token_data,
     token_file,
 )
@@ -53,15 +50,6 @@ class ConsoleConnectRequest(BaseModel):
 class PasswordResetRequest(BaseModel):
     password: str = Field(min_length=8, max_length=1024)
     confirm_password: str = Field(min_length=8, max_length=1024)
-
-
-class SessionActivityResponse(BaseModel):
-    access_token: str
-    token_type: str = "bearer"
-    expires_in: int
-    absolute_expires_in: int
-    expires_at: int
-    session_auth_version: int
 
 
 def _client_key(request: Request) -> str:
@@ -159,31 +147,6 @@ async def console_connect(request: Request, payload: ConsoleConnectRequest) -> R
             ),
         },
         "已通过本次启动的控制台链接临时登录。",
-    )
-
-
-@router.post("/auth/activity", response_model=Result[SessionActivityResponse])
-async def renew_session_activity(
-    request: Request, token: str = Depends(oauth2_scheme)
-) -> Result:
-    claims, status = decode_access_token_status(token)
-    if claims is None:
-        try:
-            session = await setup_access.authorize(token, _client_key(request))
-            claims = session.claims
-        except HTTPException:
-            pass
-    if claims is None:
-        raise HTTPException(
-            status_code=401,
-            detail=("登录会话已过期。" if status == "expired" else "登录验证失败。"),
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    return Result.ok(
-        {
-            **session_response(token, claims),
-            "absolute_expires_in": max(0, int(claims["exp"] - time.time())),
-        }
     )
 
 

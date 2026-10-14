@@ -10,7 +10,7 @@ from zhenxun.configs.webui_tls import (
     load_webui_tls_settings,
     runtime_webui_settings,
 )
-from zhenxun.services.webui_http_sidecar_state import read_http_sidecar_state
+from zhenxun.services.webui_http import http_compat_state
 from zhenxun.utils._restart_utils import (
     get_pending_restart_items,
     get_pending_restart_reasons,
@@ -26,19 +26,18 @@ def preferred_access_targets(
     port: int,
     *,
     settings: WebUITLSSettings | None = None,
-    sidecar_available: bool | None = None,
+    http_available: bool | None = None,
 ) -> list[AccessUrl]:
     tls = settings or runtime_webui_settings()
     urls = local_access_urls(host, port, tls.scheme)
-    if sidecar_available is None:
-        sidecar = read_http_sidecar_state()
-        sidecar_available = bool(
-            os.getenv("ZHENXUN_LAUNCHER_PID")
-            and sidecar.get("state") == "ready"
-            and sidecar.get("port") == tls.redirect_port
-            and sidecar.get("mode") == tls.effective_http_mode
+    if http_available is None:
+        state = http_compat_state()
+        http_available = (
+            state.get("state") == "ready"
+            and state.get("port") == tls.redirect_port
+            and state.get("mode") == tls.effective_http_mode
         )
-    if tls.enabled and tls.http_sidecar_enabled and sidecar_available:
+    if tls.http_compat_enabled and http_available:
         urls.extend(local_access_urls(host, tls.redirect_port, "http"))
     if host.strip().strip("[]") in {"0.0.0.0", "::"}:
         urls.sort(key=lambda item: item.label != "Network")
@@ -50,7 +49,7 @@ def preferred_access_urls(
     port: int,
     *,
     settings: WebUITLSSettings | None = None,
-    sidecar_available: bool | None = None,
+    http_available: bool | None = None,
 ) -> list[str]:
     return [
         item.url
@@ -58,7 +57,7 @@ def preferred_access_urls(
             host,
             port,
             settings=settings,
-            sidecar_available=sidecar_available,
+            http_available=http_available,
         )
     ]
 
@@ -106,39 +105,17 @@ def transaction_verification_status() -> dict[str, Any]:
 def network_configuration_status() -> dict[str, Any]:
     tls = runtime_webui_settings()
     desired = load_webui_tls_settings()
-    managed = bool(os.getenv("ZHENXUN_LAUNCHER_PID"))
-    sidecar = read_http_sidecar_state() if managed else {}
+    http = http_compat_state() if tls.http_compat_enabled else {}
     return {
         "network_runtime": {
             "scheme": tls.scheme,
             "port": tls.port,
-            "http_mode": tls.effective_http_mode if managed else "disabled",
-            "http_port": tls.redirect_port
-            if managed and tls.http_sidecar_enabled
-            else None,
-            "http_state": sidecar.get("state", "unknown")
-            if managed and tls.http_sidecar_enabled
-            else "disabled",
-            "http_error": sidecar.get("last_error")
-            if managed and tls.http_sidecar_enabled
-            else None,
+            "http_mode": tls.effective_http_mode,
+            "http_port": tls.redirect_port if tls.http_compat_enabled else None,
+            "http_state": http.get("state", "disabled"),
             **{
-                f"http_{key}": sidecar.get(key)
-                if managed and tls.http_sidecar_enabled
-                else None
-                for key in (
-                    "error_code",
-                    "stage",
-                    "errno",
-                    "first_error",
-                    "latest_error",
-                    "first_error_at",
-                    "latest_error_at",
-                    "retry_count",
-                    "retry_in_seconds",
-                    "next_retry_at",
-                    "total_retries",
-                )
+                f"http_{key}": http.get(key)
+                for key in ("error_code", "errno", "retry_count", "retry_in_seconds")
             },
         },
         "network_configured": {
@@ -146,12 +123,27 @@ def network_configuration_status() -> dict[str, Any]:
             "port": getattr(desired, "port", 8080),
             "http_mode": getattr(desired, "effective_http_mode", "disabled"),
             "http_port": getattr(desired, "redirect_port", 0)
-            if getattr(desired, "http_sidecar_enabled", False)
+            if getattr(desired, "http_compat_enabled", False)
             else None,
             "pending_restart": desired != tls,
         },
         "access_urls": _current_access_urls(),
     }
+
+
+def access_targets(urls: list[str]) -> list[dict[str, str]]:
+    """整理前端使用的访问目标
+
+    参数:
+        urls: 访问地址列表
+
+    返回:
+        list[dict[str, str]]: 访问目标
+    """
+    return [
+        {"kind": _target_kind(url), "url": url, "scheme": urlsplit(url).scheme}
+        for url in urls
+    ]
 
 
 def restart_status_data(*, access_urls: list[str] | None = None) -> dict[str, Any]:
@@ -166,30 +158,12 @@ def restart_status_data(*, access_urls: list[str] | None = None) -> dict[str, An
                     getattr(desired, "host", "127.0.0.1"),
                     getattr(desired, "port", 8080),
                     settings=desired,
-                    sidecar_available=bool(os.getenv("ZHENXUN_LAUNCHER_PID")),
+                    http_available=True,
                 ),
             ]
         )
     )
-    access_targets = [
-        {
-            "kind": _target_kind(url),
-            "url": url,
-            "scheme": urlsplit(url).scheme,
-        }
-        for url in urls
-    ]
-    http_mode = getattr(tls, "effective_http_mode", None)
-    if not isinstance(http_mode, str):
-        http_mode = (
-            "redirect"
-            if tls.enabled and getattr(tls, "redirect_enabled", False)
-            else "disabled"
-        )
-    http_sidecar_enabled = bool(
-        getattr(tls, "http_sidecar_enabled", http_mode != "disabled")
-    )
-    http_sidecar = read_http_sidecar_state()
+    targets = access_targets(urls)
     pending_reasons = set(get_pending_restart_reasons())
     pending_items = get_pending_restart_items()
     try:
@@ -282,21 +256,15 @@ def restart_status_data(*, access_urls: list[str] | None = None) -> dict[str, An
         "launcher_managed": bool(os.getenv("ZHENXUN_LAUNCHER_PID")),
         "boot_id": console_access.current_boot_id(),
         "access_urls": urls,
-        "access_targets": access_targets,
+        "access_targets": targets,
         "preferred_url": urls[0] if urls else None,
         "scheme": tls.scheme,
         "https_enabled": tls.enabled,
-        "http_mode": http_mode,
-        "http_port": tls.redirect_port if http_sidecar_enabled else None,
-        "http_sidecar": http_sidecar,
+        "http_mode": tls.effective_http_mode,
+        "http_port": tls.redirect_port if tls.http_compat_enabled else None,
         **network_configuration_status(),
         "target_access_urls": target_urls,
-        "target_access_targets": [
-            {"url": url, "scheme": urlsplit(url).scheme, "kind": _target_kind(url)}
-            for url in target_urls
-        ],
-        "http_redirect_enabled": http_mode == "redirect",
-        "http_redirect_port": tls.redirect_port if http_sidecar_enabled else None,
+        "target_access_targets": access_targets(target_urls),
         "pending_restart": bool(pending_reasons),
         "pending_reasons": sorted(pending_reasons),
         "pending_count": len(pending_items),
@@ -330,14 +298,14 @@ async def request_webui_restart(
             environment_report_async,
             guard_orm_sync,
         )
-        from zhenxun.services.plugin_store.plugin_store_coordinator import (
+        from zhenxun.services.runtime_mutation import (
             StoreOperationBusyError,
-            plugin_store_operation_coordinator,
+            store_operation,
         )
         from zhenxun.utils._restart_utils import request_dependency_restart
 
         try:
-            async with plugin_store_operation_coordinator.operation(
+            async with store_operation(
                 operation_id=sync.get("operation_id"), owner="webui.dependency-restart"
             ):
                 report = await environment_report_async()
@@ -366,6 +334,7 @@ async def request_webui_restart(
 
 
 __all__ = [
+    "access_targets",
     "preferred_access_targets",
     "preferred_access_urls",
     "request_webui_restart",

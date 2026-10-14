@@ -105,20 +105,4 @@ class SystemStatus(BaseModel):
     check_time: datetime
     runtime_generation: int = 0
     webui_revision: str = ""
-    resource_revision: str = ""
     resources_ready: bool = False
-
-
-class SystemFolderSize(BaseModel):
-    """
-    资源文件占比
-    """
-
-    name: str
-    """名称"""
-    size: float
-    """大小"""
-    full_path: str | None
-    """完整路径"""
-    is_dir: bool
-    """是否为文件夹"""

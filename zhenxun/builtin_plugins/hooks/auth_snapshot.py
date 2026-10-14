@@ -25,6 +25,7 @@ from zhenxun.services.cache.runtime_sync import (
 from zhenxun.services.db_context import with_db_timeout
 from zhenxun.services.log import logger
 from zhenxun.services.message_load import is_db_unhealthy
+from zhenxun.services.platform_identity import is_namespaced_scope
 from zhenxun.utils.enum import BlockType, PluginType
 
 from .auth.config import LOGGER_COMMAND
@@ -135,15 +136,22 @@ async def get_plugin_auth_profile(plugin) -> PluginAuthProfile:
     return build_plugin_auth_profile(plugin, has_limit=bool(limits))
 
 
-QQ_CLIENT_GROUP_REPAIR_TTL = 60
-_QQ_CLIENT_GROUP_REPAIR_FAILURES = CacheDict[float](
-    "AUTH_GROUP_REPAIR_FAILURES", expire=QQ_CLIENT_GROUP_REPAIR_TTL, max_items=4096
+GROUP_REPAIR_TTL = 60
+_GROUP_REPAIR_FAILURES = CacheDict[float](
+    "AUTH_GROUP_REPAIR_FAILURES", expire=GROUP_REPAIR_TTL, max_items=4096
 )
-_QQ_CLIENT_GROUP_REPAIR_LOCKS = KeyedLocks(capacity=4096)
+_GROUP_REPAIR_LOCKS = KeyedLocks(capacity=4096)
 
 
 def _build_runtime_group_snapshot(context: EventContext) -> GroupSnapshot | None:
-    """Provide a non-persistent default group for QQ official runtime auth."""
+    """QQ 官方适配器使用不落库的默认群配置
+
+    参数:
+        context: EventContext
+
+    返回:
+        GroupSnapshot | None: QQ 官方群事件的默认群配置，其余为 None
+    """
     if context.platform_scope != "qq_api" or not context.group_id:
         return None
     return GroupSnapshot(
@@ -164,42 +172,53 @@ def _build_runtime_group_snapshot(context: EventContext) -> GroupSnapshot | None
     )
 
 
-def _qq_client_group_repair_key(context: EventContext) -> tuple[str, str] | None:
-    if context.platform_scope != "qq_client" or not context.group_id:
+def _group_repair_key(context: EventContext) -> tuple[str, str] | None:
+    if not context.group_id:
         return None
-    return (context.group_id, context.channel_id or "")
+    if context.platform_scope == "qq_client":
+        return (context.group_id, context.channel_id or "")
+    if is_namespaced_scope(context.platform_scope) and context.storage_group_id:
+        return (context.storage_group_id, "")
+    return None
 
 
-def _qq_client_group_repair_on_cooldown(key: tuple[str, str]) -> bool:
-    expire_at = _QQ_CLIENT_GROUP_REPAIR_FAILURES.get(key)
+def _group_repair_on_cooldown(key: tuple[str, str]) -> bool:
+    expire_at = _GROUP_REPAIR_FAILURES.get(key)
     if not expire_at:
         return False
     if expire_at <= time.time():
-        _QQ_CLIENT_GROUP_REPAIR_FAILURES.pop(key, None)
+        _GROUP_REPAIR_FAILURES.pop(key, None)
         return False
     return True
 
 
-async def _repair_missing_qq_client_group(
+async def _repair_missing_group(
     context: EventContext,
 ) -> GroupSnapshot | None:
-    """Persist a minimal OneBot group when startup group sync returned empty."""
+    """为缺少群记录的 OneBot 群或前缀作用域群补建最小群记录
+
+    参数:
+        context: EventContext
+
+    返回:
+        GroupSnapshot | None: 补建后的群配置，失败或不支持时为 None
+    """
     if is_db_unhealthy():
         return None
-    key = _qq_client_group_repair_key(context)
+    key = _group_repair_key(context)
     if key is None or not GroupMemoryCache.is_loaded():
         return None
-    group_id, _ = key
-    if _qq_client_group_repair_on_cooldown(key):
+    group_id, channel_id = key
+    if _group_repair_on_cooldown(key):
         return None
 
     try:
         from zhenxun.models.group_console import GroupConsole
 
-        async with _QQ_CLIENT_GROUP_REPAIR_LOCKS.hold(key):
-            if _qq_client_group_repair_on_cooldown(key):
+        async with _GROUP_REPAIR_LOCKS.hold(key):
+            if _group_repair_on_cooldown(key):
                 return None
-            existing = GroupMemoryCache.get_if_ready(group_id, context.channel_id)
+            existing = GroupMemoryCache.get_if_ready(group_id, channel_id or None)
             if existing is not None:
                 return existing
             defaults = {
@@ -221,7 +240,7 @@ async def _repair_missing_qq_client_group(
         await GroupMemoryCache.upsert_from_model(group)
         return GroupSnapshot.from_model(group)
     except Exception as exc:
-        _QQ_CLIENT_GROUP_REPAIR_FAILURES[key] = time.time() + QQ_CLIENT_GROUP_REPAIR_TTL
+        _GROUP_REPAIR_FAILURES[key] = time.time() + GROUP_REPAIR_TTL
         logger.warning(
             "协议端群记录缺失自愈失败，已短期跳过重复修复",
             LOGGER_COMMAND,
@@ -291,9 +310,12 @@ async def build_auth_snapshot(
     group = _build_runtime_group_snapshot(context)
     if group is None and entity.group_id:
         await require_cache(GroupMemoryCache)
-        group = await GroupMemoryCache.get(entity.group_id, entity.channel_id)
+        if is_namespaced_scope(context.platform_scope):
+            group = await GroupMemoryCache.get(context.storage_group_id)
+        else:
+            group = await GroupMemoryCache.get(entity.group_id, entity.channel_id)
         if group is None:
-            group = await _repair_missing_qq_client_group(context)
+            group = await _repair_missing_group(context)
 
     admin_levels = None
     if context.platform_scope == "qq_api":
@@ -301,7 +323,8 @@ async def build_auth_snapshot(
     elif profile.need_admin:
         await require_cache(LevelUserMemoryCache)
         admin_levels = await LevelUserMemoryCache.get_levels(
-            entity.user_id, entity.group_id
+            context.storage_user_id or entity.user_id,
+            context.storage_group_id or entity.group_id,
         )
 
     return AuthSnapshot(

@@ -5,7 +5,6 @@ from __future__ import annotations
 import ast
 from collections.abc import Iterable
 from dataclasses import dataclass
-from hashlib import sha256
 import importlib.metadata as metadata
 import json
 from pathlib import Path
@@ -282,7 +281,6 @@ class EnvironmentSnapshot:
     sources: dict
     duplicates: dict
     loaded_mismatches: list[dict]
-    digest: str
 
     @property
     def versions(self) -> dict[str, str]:
@@ -310,7 +308,6 @@ def capture_environment(
         distributions([str(layer_path)]) if layer_path is not None else ({}, {})
     )
     selected = {**base, **layer}
-    from .manual import manual_requirements
 
     roots = dependency_roots(manifest)
     requirements = {}
@@ -431,19 +428,6 @@ def capture_environment(
                         "expected_path": str(expected_path),
                     }
                 )
-    evidence = {
-        "sources": sources,
-        "declarations": [declarations[key] for key in sorted(declarations)],
-        "requires_python": {
-            name: dist.metadata.get("Requires-Python")
-            for name, dist in selected.items()
-        },
-        "generation": manifest.get("active_generation"),
-        "manual_requirements": manual_requirements(manifest),
-        "duplicates": {**duplicates, **layer_duplicates},
-        "environment": default_environment(),
-        "executable": sys.executable,
-    }
     return EnvironmentSnapshot(
         manifest,
         base,
@@ -454,7 +438,6 @@ def capture_environment(
         sources,
         {**duplicates, **layer_duplicates},
         loaded,
-        sha256(json.dumps(evidence, sort_keys=True).encode()).hexdigest(),
     )
 
 
@@ -621,5 +604,4 @@ def validate_candidate(path: Path, transaction: dict[str, Any]) -> dict:
     return {
         "state": "partial" if snapshot.conflicts or remaining_core else "passed",
         "remaining_conflicts": [*snapshot.conflicts, *remaining_core],
-        "snapshot_digest": snapshot.digest,
     }

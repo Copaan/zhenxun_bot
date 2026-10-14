@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager
 from copy import deepcopy
 from datetime import datetime, timezone
-from hashlib import sha256
 import os
 from pathlib import Path
 import shutil
@@ -13,12 +12,9 @@ from typing import Any
 import uuid
 
 from filelock import FileLock, Timeout
-from packaging.requirements import InvalidRequirement, Requirement
 from packaging.utils import canonicalize_name
 
-from zhenxun.services.plugin_store.plugin_archive_dependencies import (
-    ArchiveDependencyConflict,
-)
+from zhenxun.services.plugin_store.plugin_store_receipts import source_digest
 from zhenxun.utils.atomic_json import (
     AtomicJsonLockTimeout,
     read_json_locked,
@@ -30,280 +26,6 @@ ROOT = Path("data/runtime/plugin-store-transaction")
 PENDING_FILE = ROOT / "pending-v1.json"
 LOADED_PLUGINS_INDEX = Path("data/runtime/loaded-plugins-v1.json")
 _TRANSACTION_LOCK = ROOT / ".transaction.lock"
-
-
-class ArchiveSourceBuildConflict(RuntimeError):
-    code = "archive_source_build_transaction_conflict"
-
-    def __init__(self, *, details: dict[str, Any] | None = None) -> None:
-        self.details = details or {}
-        message = self.code
-        if self.details:
-            import json
-
-            message = f"{self.code}: {json.dumps(self.details, sort_keys=True)}"
-        super().__init__(message)
-
-
-def _archive_wheels_only(transaction: dict[str, Any] | None) -> bool:
-    transaction = transaction or {}
-    return bool(transaction.get("archive_wheels_only")) or any(
-        str(operation.get("store_key") or "").startswith("local_archive:")
-        or (operation.get("receipt") or {}).get("source") == "local_archive"
-        for operation in transaction.get("operations", [])
-    )
-
-
-def _source_build_enabled(transaction: dict[str, Any] | None) -> bool:
-    transaction = transaction or {}
-    return bool(transaction.get("source_build_confirmed")) or any(
-        operation.get("source_build_confirmed")
-        for operation in transaction.get("operations", [])
-    )
-
-
-def _nonebot_pending() -> dict[str, Any] | None:
-    from zhenxun.services.nonebot_store import storage
-
-    return storage.pending_transaction() if storage.PENDING_FILE.exists() else None
-
-
-def _transaction_packages(
-    transaction: dict[str, Any] | None,
-) -> set[str]:
-    if not transaction:
-        return set()
-    names: set[str] = set()
-    operations = transaction.get("operations", [])
-    if not isinstance(operations, list):
-        operations = []
-    for operation in operations:
-        if not isinstance(operation, dict):
-            continue
-        scope = operation.get("candidate_packages")
-        if isinstance(scope, list):
-            names.update(canonicalize_name(str(name)) for name in scope)
-        packages = operation.get("dependency_packages")
-        if isinstance(packages, dict):
-            for name in packages:
-                names.add(canonicalize_name(str(name)))
-        roots = operation.get("dependency_inputs")
-        if roots is None:
-            manifest = operation.get("target_manifest") or {}
-            record = manifest.get("plugins", {}).get(
-                f"nonebot:{operation.get('project_link')}", {}
-            )
-            roots = record.get("resolution_inputs")
-        if isinstance(roots, list):
-            for raw in roots:
-                try:
-                    names.add(canonicalize_name(Requirement(str(raw)).name))
-                except (InvalidRequirement, TypeError, ValueError):
-                    continue
-    # Old transactions may not carry per-operation dependency evidence.
-    base = (transaction.get("base_manifest") or {}).get("packages", {})
-    target = (transaction.get("target_manifest") or {}).get("packages", {})
-    for name in set(base) | set(target):
-        if base.get(name) != target.get(name):
-            names.add(canonicalize_name(str(name)))
-    return names
-
-
-def _is_archive_transaction(transaction: dict[str, Any] | None) -> bool:
-    if not transaction:
-        return False
-    if _archive_wheels_only(transaction):
-        return True
-    operations = transaction.get("operations", [])
-    return any(
-        str(operation.get("store_key") or "").startswith("local_archive:")
-        or (operation.get("receipt") or {}).get("source") == "local_archive"
-        for operation in operations
-        if isinstance(operation, dict)
-    )
-
-
-def _archive_conflict_details(
-    contract: dict[str, Any], packages: set[str]
-) -> dict[str, Any]:
-    owners = contract.get("package_owners", {})
-    from zhenxun.services.nonebot_store.storage import load_manifest
-
-    return {
-        "packages": sorted(packages),
-        "archive_owners": sorted(
-            {owner for package in packages for owner in owners.get(package, [])}
-        ),
-        "source_build_packages": sorted(contract.get("source_build_packages", [])),
-        "source_revisions": sorted(contract.get("source_revisions", [])),
-        "versions": {
-            name: contract.get("packages", {}).get(name) for name in sorted(packages)
-        },
-        "active_generation": load_manifest().get("active_generation"),
-        "conflict_source": "shared_dependency_scope",
-    }
-
-
-def _relevant_archive_packages(
-    contract: dict[str, Any], transactions: tuple[dict[str, Any] | None, ...]
-) -> set[str]:
-    candidate_packages = set().union(
-        *(_transaction_packages(item) for item in transactions)
-    )
-    archive_packages = set(contract.get("packages", {}))
-    relevant_packages = candidate_packages & archive_packages
-    if (
-        any(_is_archive_transaction(item) for item in transactions)
-        and not relevant_packages
-    ):
-        relevant_packages = set(contract.get("source_build_packages", [])) | set(
-            contract.get("wheels_only_packages", [])
-        )
-    return relevant_packages
-
-
-def _archive_binary_packages(
-    contract: dict[str, Any], transactions: tuple[dict[str, Any] | None, ...]
-) -> set[str]:
-    from zhenxun.services.nonebot_store.dependencies import protected_core
-
-    # Core packages never enter the rebuilt layer. Other exemptions are promises
-    # enforced as --only-binary at build time, not permission to execute source.
-    binary = set(protected_core())
-    for transaction in transactions:
-        for operation in (transaction or {}).get("operations", []):
-            evidence = operation.get("archive_binary_packages", {})
-            if isinstance(evidence, dict):
-                binary.update(
-                    name
-                    for name, version in evidence.items()
-                    if contract.get("packages", {}).get(name) == version
-                )
-    return binary
-
-
-def _validate_archive_build_policy(*transactions: dict[str, Any] | None) -> bool:
-    from zhenxun.services.plugin_store.plugin_archive_dependencies import (
-        archive_dependency_contract,
-    )
-
-    contract = archive_dependency_contract()
-    relevant_packages = _relevant_archive_packages(contract, transactions)
-    relevant = bool(relevant_packages)
-    wheels_only = relevant and (
-        bool(contract.get("store_keys"))
-        or any(_archive_wheels_only(item) for item in transactions)
-    )
-    related_source = (
-        relevant_packages & set(contract.get("source_build_packages", []))
-    ) - _archive_binary_packages(contract, transactions)
-    if related_source:
-        from zhenxun.services.installer_network import source_revision
-
-        revisions = {
-            revision
-            for package in related_source
-            for revision in contract.get("package_source_revisions", {}).get(
-                package, contract.get("source_revisions", [])
-            )
-        }
-        if any(revision != source_revision() for revision in revisions):
-            raise ArchiveSourceBuildConflict(
-                details=_archive_conflict_details(contract, relevant_packages)
-            )
-        return False
-    if wheels_only and any(_source_build_enabled(item) for item in transactions):
-        approved = [
-            operation
-            for item in transactions
-            if item
-            for operation in item.get("operations", [])
-            if (operation.get("receipt") or {}).get("dependency_source_build") is True
-            and operation.get("source_build_confirmed") is True
-        ]
-        candidate_approved = any(
-            operation.get("source_build_confirmed") is True
-            and bool(operation.get("candidate_packages"))
-            and not str(operation.get("store_key") or "").startswith("local_archive:")
-            and (operation.get("receipt") or {}).get("source") != "local_archive"
-            for item in transactions
-            if item
-            for operation in item.get("operations", [])
-        )
-        if not approved and not candidate_approved:
-            raise ArchiveSourceBuildConflict(
-                details=_archive_conflict_details(contract, relevant_packages)
-            )
-        from zhenxun.services.installer_network import source_revision
-
-        if any(
-            operation["receipt"].get("dependency_source_revision") != source_revision()
-            for operation in approved
-        ):
-            raise ArchiveSourceBuildConflict(
-                details=_archive_conflict_details(contract, relevant_packages)
-            )
-        # Legacy archive dependencies remain wheel-only individually; consent
-        # for this operation does not grant build rights to their packages.
-        return False
-    return wheels_only
-
-
-@contextmanager
-def archive_dependency_policy(transaction: dict[str, Any]) -> Iterator[None]:
-    """Serialize cross-store policy checks with source staging and layer builds."""
-    from zhenxun.services.plugin_store.plugin_archive_dependencies import (
-        archive_dependency_contract,
-        preserve_archive_dependencies,
-    )
-
-    with _locked_transaction():
-        pending = _read_pending()
-        nonebot_pending = _nonebot_pending()
-        policy_transactions = (pending, nonebot_pending, transaction)
-        if _validate_archive_build_policy(*policy_transactions):
-            # Keep the constraint after source cancellation: the layer may still
-            # contain dependencies already merged from that archive operation.
-            transaction["archive_wheels_only"] = True
-            transaction["source_build_confirmed"] = False
-        else:
-            contract = archive_dependency_contract()
-            if contract.get("source_build_packages") and _relevant_archive_packages(
-                contract, policy_transactions
-            ):
-                transaction.pop("archive_wheels_only", None)
-                transaction["source_build_confirmed"] = True
-                allowed = set(
-                    contract["source_build_packages"]
-                ) & _relevant_archive_packages(contract, policy_transactions)
-                allowed -= _archive_binary_packages(contract, policy_transactions)
-                for item in policy_transactions:
-                    for operation in (item or {}).get("operations", []):
-                        if operation.get("source_build_confirmed"):
-                            allowed.update(operation.get("candidate_packages") or [])
-                transaction["archive_build_allowlist"] = sorted(allowed)
-        contract = archive_dependency_contract()
-        # Consent for a new plugin never authorizes rebuilding unrelated archives.
-        transaction["archive_binary_only_packages"] = sorted(
-            _archive_binary_packages(contract, policy_transactions)
-            | (
-                set(contract.get("packages", {}))
-                - (
-                    set(contract.get("source_build_packages", []))
-                    & _relevant_archive_packages(contract, policy_transactions)
-                )
-            )
-        )
-        target = transaction.get("target_manifest")
-        if isinstance(target, dict):
-            preserve_archive_dependencies(target)
-        yield
-
-
-def preflight_archive_dependency_policy(transaction: dict[str, Any]) -> None:
-    """Run the apply gate on a disposable proposal; never persist approval."""
-    with archive_dependency_policy(deepcopy(transaction)):
-        pass
 
 
 def _now() -> str:
@@ -320,59 +42,23 @@ def _locked_transaction(timeout: float = 30.0) -> Iterator[None]:
         raise AtomicJsonLockTimeout(str(_TRANSACTION_LOCK)) from error
 
 
-def _digest(path: Path) -> str:
-    if not path.exists():
-        return "missing"
-    digest = sha256()
-    files = (
-        [path]
-        if path.is_file()
-        else sorted(item for item in path.rglob("*") if item.is_file())
-    )
-    root = path.parent if path.is_file() else path
-    for item in files:
-        if "__pycache__" in item.parts or item.suffix in {".pyc", ".pyo"}:
-            continue
-        try:
-            payload = item.read_bytes()
-        except OSError as error:
-            raise RuntimeError("plugin_transaction_source_unreadable") from error
-        digest.update(item.relative_to(root).as_posix().encode())
-        digest.update(b"\0")
-        digest.update(payload)
-        digest.update(b"\0")
-    return digest.hexdigest()
+def _digest(path: Path, *, python_only: bool = False) -> str:
+    """计算插件源码摘要，路径不存在时为 missing
 
+    参数:
+        path: 插件目录或文件
+        python_only: 只计入 .py/.pyi 文件；待重启卸载期间插件仍会在目录内写数据，
+            只核对源码
 
-def _source_digest(path: Path) -> str:
-    """Digest only the importable source of a plugin.
-
-    A staged uninstall has to tolerate the live directory changing while it waits
-    for the restart: a running plugin writes its own state there. Its ``.py``
-    files are a different matter -- if those changed, the code about to be
-    deleted is not the code the operation was reviewed against.
+    返回:
+        str: 摘要
     """
     if not path.exists():
         return "missing"
-    digest = sha256()
-    files = (
-        [path]
-        if path.is_file()
-        else sorted(item for item in path.rglob("*") if item.is_file())
-    )
-    root = path.parent if path.is_file() else path
-    for item in files:
-        if "__pycache__" in item.parts or item.suffix not in {".py", ".pyi"}:
-            continue
-        try:
-            payload = item.read_bytes()
-        except OSError as error:
-            raise RuntimeError("plugin_transaction_source_unreadable") from error
-        digest.update(item.relative_to(root).as_posix().encode())
-        digest.update(b"\0")
-        digest.update(payload)
-        digest.update(b"\0")
-    return digest.hexdigest()
+    digest = source_digest(path, python_only=python_only)
+    if digest is None:
+        raise RuntimeError("plugin_transaction_source_unreadable")
+    return digest
 
 
 def _copy(source: Path, target: Path) -> None:
@@ -491,14 +177,7 @@ def stage_operation(
             if existing_id:
                 if existing_id.get("store_key") != store_key:
                     raise RuntimeError("plugin_operation_id_conflict")
-                return {
-                    "operation_id": operation_id,
-                    "apply_mode": "restart_pending",
-                    "transaction_revision": transaction.get("revision"),
-                    "pending_operations": [
-                        _public_operation(item) for item in operations
-                    ],
-                }
+                return {"operation_id": operation_id, "apply_mode": "restart_pending"}
         previous_index = next(
             (
                 index
@@ -521,26 +200,8 @@ def stage_operation(
             return {
                 "operation_id": previous["operation_id"],
                 "apply_mode": "rolled_back",
-                "removed_operation_ids": [previous["operation_id"]],
-                "pending_operations": [_public_operation(item) for item in operations],
             }
         else:
-            prospective = {
-                **transaction,
-                "operations": [
-                    item for item in operations if item.get("store_key") != store_key
-                ]
-                + [
-                    {
-                        "store_key": store_key,
-                        "receipt": receipt,
-                        "dependency_inputs": dependency_inputs or [],
-                        "dependency_packages": dependency_packages or {},
-                        "source_build_confirmed": source_build_confirmed,
-                    }
-                ],
-            }
-            _validate_archive_build_policy(prospective, _nonebot_pending())
             operation_id = operation_id or uuid.uuid4().hex
             bundle = ROOT / operation_id
             old_path = bundle / "old"
@@ -559,10 +220,7 @@ def stage_operation(
                     "runtime_module": runtime_module,
                     "live_path": _workspace_relative(live_path),
                     "base_digest": base_digest or _digest(old_source),
-                    "base_source_digest": _source_digest(old_source),
-                    "candidate_digest": (
-                        _digest(candidate_path) if candidate_path else "missing"
-                    ),
+                    "base_source_digest": _digest(old_source, python_only=True),
                     "receipt": receipt,
                     "reason": reason,
                     "dependency_inputs": sorted(set(dependency_inputs or [])),
@@ -588,8 +246,6 @@ def stage_operation(
         return {
             "operation_id": operation["operation_id"],
             "apply_mode": "restart_pending",
-            "transaction_revision": transaction["revision"],
-            "pending_operations": [_public_operation(item) for item in operations],
         }
 
 
@@ -681,78 +337,11 @@ def _source_changes(
     return overrides, removed, added
 
 
-def _released_dependencies(
-    target: dict[str, Any],
-    overrides: dict[str, list[str] | None],
-    removed_paths: list[Path],
-    added_paths: list[Path],
-) -> tuple[list[str], list[dict[str, Any]]]:
-    """计算商店插件依赖变化后可释放的包，分析失败时不释放
-
-    参数:
-        target: 依赖层清单
-        overrides: 按 store_key 的依赖声明覆盖
-        removed_paths: 将移除的源码路径
-        added_paths: 将加入的源码路径
-
-    返回:
-        tuple[list[str], list[dict[str, Any]]]: 可释放的包，因仍被导入而保留的包
-    """
-    from zhenxun.services.nonebot_store.dependencies import DependencyAnalysisError
-    from zhenxun.services.nonebot_store.environment import released_packages
-    from zhenxun.services.plugin_store.plugin_store_receipts import (
-        receipt_dependency_inputs,
-    )
-
-    before = receipt_dependency_inputs()
-    if not any(key in before for key in overrides):
-        return [], []
-    try:
-        return released_packages(
-            target,
-            target,
-            sources_before=before,
-            sources_after=receipt_dependency_inputs(overrides),
-            removed_paths=removed_paths,
-            added_paths=added_paths,
-        )
-    except (DependencyAnalysisError, OSError, KeyError, TypeError):
-        return [], []
-
-
-def release_source_dependencies(
-    overrides: dict[str, list[str] | None], removed_paths: list[Path] | None = None
-) -> list[str]:
-    """商店插件热更新或热卸载后，将不再需要的依赖登记到待应用的依赖层事务
-
-    依赖层在下次重启时重建，不会主动请求重启；分析失败或已有事务不可修改时跳过。
-
-    参数:
-        overrides: 按 store_key 的依赖声明覆盖，None 表示移除
-        removed_paths: 已移除的源码路径
-
-    返回:
-        list[str]: 登记释放的包
-    """
-    with suppress(Exception):
-        transaction = _merge_dependency_transaction(
-            {}, overrides, removed_paths or [], [], source=None, wheels_only=False
-        )
-        if isinstance(transaction, dict):
-            return list(transaction.get("released_packages") or [])
-    return []
-
-
 def prepare_dependency_transaction() -> bool:
     """Merge source-store dependency changes into the managed generation."""
     source = pending_transaction()
     if not source or source.get("state") != "pending_restart":
         return True
-    try:
-        wheels_only = _validate_archive_build_policy(source, _nonebot_pending())
-    except (ArchiveSourceBuildConflict, ArchiveDependencyConflict) as error:
-        _fail_pending(error.code)
-        return False
     packages = dependency_packages()
     layer_packages: dict[str, str] = {}
     if packages:
@@ -767,126 +356,20 @@ def prepare_dependency_transaction() -> bool:
                     return False
                 continue
             layer_packages[name] = version
+    from zhenxun.services.nonebot_store.storage import merge_source_dependencies
+
     overrides, removed_paths, added_paths = _source_changes(source)
-    result = _merge_dependency_transaction(
+    result = merge_source_dependencies(
         layer_packages,
         overrides,
         removed_paths,
         added_paths,
         source=source,
-        wheels_only=wheels_only,
     )
     if isinstance(result, str):
         _fail_pending(result)
         return False
     return True
-
-
-def _merge_dependency_transaction(
-    layer_packages: dict[str, str],
-    overrides: dict[str, list[str] | None],
-    removed_paths: list[Path],
-    added_paths: list[Path],
-    *,
-    source: dict[str, Any] | None,
-    wheels_only: bool,
-) -> dict[str, Any] | str | None:
-    """把商店插件的新增依赖与可释放依赖合并进 NoneBot 依赖层事务
-
-    参数:
-        layer_packages: 需要写入依赖层的包版本
-        overrides: 按 store_key 的依赖声明覆盖
-        removed_paths: 将移除的源码路径
-        added_paths: 将加入的源码路径
-        source: 源码插件事务
-        wheels_only: 是否只允许 wheel
-
-    返回:
-        dict[str, Any] | str | None: 写入的事务，失败时为错误码，无变化时为 None
-    """
-    from zhenxun.services.nonebot_store.storage import (
-        load_manifest,
-        save_pending_transaction,
-        utc_now,
-    )
-    from zhenxun.services.nonebot_store.storage import (
-        pending_transaction as nonebot_pending,
-    )
-
-    current = nonebot_pending()
-    if current and current.get("state") != "pending_restart":
-        return "cross_store_transaction_not_mutable" if layer_packages else None
-    base = deepcopy(current.get("base_manifest") if current else load_manifest())
-    target = deepcopy(current.get("target_manifest") if current else base) or {}
-    released, retained = _released_dependencies(
-        target, overrides, removed_paths, added_paths
-    )
-    released = [name for name in released if name not in layer_packages]
-    if not layer_packages and not released:
-        return None
-    target_packages = target.setdefault("packages", {})
-    base_packages = base.get("packages", {})
-    for name, version in layer_packages.items():
-        existing = target_packages.get(name)
-        existing_version = (
-            str(existing.get("version")) if isinstance(existing, dict) else None
-        )
-        base_info = base_packages.get(name) if isinstance(base_packages, dict) else None
-        base_version = (
-            str(base_info.get("version")) if isinstance(base_info, dict) else None
-        )
-        if (
-            existing_version is not None
-            and existing_version != version
-            and existing_version != base_version
-        ):
-            return "cross_store_dependency_conflict"
-        target_packages[name] = {"version": version}
-    for name in released:
-        target_packages.pop(name, None)
-
-    source_build_confirmed = any(
-        operation.get("source_build_confirmed")
-        for operation in (source or {}).get("operations", [])
-    )
-    if current:
-        transaction = deepcopy(current)
-        transaction["target_manifest"] = target
-        transaction["source_build_confirmed"] = bool(
-            transaction.get("source_build_confirmed") or source_build_confirmed
-        )
-        transaction["updated_at"] = utc_now()
-    else:
-        transaction = {
-            "version": 2,
-            "revision": uuid.uuid4().hex,
-            "base_manifest": base,
-            "operations": [],
-            "target_manifest": target,
-            "source_build_confirmed": source_build_confirmed,
-            "database_migration_confirmed": False,
-            "database_migration_possible": False,
-            "database_type": "none",
-            "state": "pending_restart",
-            "created_at": utc_now(),
-            "updated_at": utc_now(),
-        }
-    if source is not None:
-        transaction["source_transaction_revision"] = source.get("revision")
-    transaction["released_packages"] = sorted(
-        set(transaction.get("released_packages") or []) | set(released)
-    )
-    if retained:
-        transaction["retained_imports"] = retained
-    if wheels_only:
-        transaction["archive_wheels_only"] = True
-    else:
-        transaction.pop("archive_wheels_only", None)
-    try:
-        save_pending_transaction(transaction)
-    except (ArchiveSourceBuildConflict, ArchiveDependencyConflict) as error:
-        return error.code
-    return transaction
 
 
 def apply_pending_transaction() -> bool:
@@ -903,7 +386,6 @@ def apply_pending_transaction() -> bool:
             return False
         switched: list[dict[str, Any]] = []
         try:
-            _validate_archive_build_policy(transaction, _nonebot_pending())
             for operation in transaction.get("operations", []):
                 live = Path(str(operation["live_path"]))
                 if operation.get("action") != "uninstall":
@@ -920,7 +402,7 @@ def apply_pending_transaction() -> bool:
                 expected_source = operation.get("base_source_digest")
                 if expected_source is None:
                     continue
-                current_source = _source_digest(live)
+                current_source = _digest(live, python_only=True)
                 if current_source not in {expected_source, "missing"}:
                     raise RuntimeError("plugin_transaction_stale")
             transaction["state"] = "applying"
@@ -947,20 +429,9 @@ def apply_pending_transaction() -> bool:
                 raise
             return False
         transaction["state"] = "verification_pending"
-        compile_warnings = []
         for operation in switched:
-            if operation.get("action") == "uninstall":
-                continue
-            live = Path(str(operation["live_path"]))
-            if not precompile_path(live):
-                compile_warnings.append(
-                    {
-                        "code": "bytecode_precompile_failed",
-                        "store_key": operation.get("store_key"),
-                    }
-                )
-        if compile_warnings:
-            transaction["warnings"] = compile_warnings
+            if operation.get("action") != "uninstall":
+                precompile_path(Path(str(operation["live_path"])))
         transaction["updated_at"] = _now()
         _write_pending(transaction)
         return True
@@ -1031,18 +502,73 @@ def rollback_pending_transaction(
 
 
 __all__ = [
-    "ArchiveSourceBuildConflict",
     "apply_pending_transaction",
-    "archive_dependency_policy",
     "cancel_operation",
     "dependency_packages",
     "finalize_pending_transaction",
     "pending_transaction",
-    "preflight_archive_dependency_policy",
     "prepare_dependency_transaction",
     "public_transaction",
-    "release_source_dependencies",
     "rollback_pending_transaction",
     "stage_operation",
     "startup_verification",
 ]
+
+
+async def preflight_source_requirements(files: list[Path]) -> dict[str, Any]:
+    """按依赖层规则预检商店插件的 requirements 文件，确认可解析且不改动核心依赖
+
+    参数:
+        files: 插件源码中的 requirements 文件
+
+    返回:
+        dict[str, Any]: 解析出的包版本、包变化与是否需要源码构建
+
+    异常:
+        DependencyAnalysisError: 依赖声明无效、环境漂移或与核心依赖冲突
+    """
+    from zhenxun.services.nonebot_store import dependencies
+    from zhenxun.services.nonebot_store.dependencies import DependencyAnalysisError
+    from zhenxun.services.nonebot_store.manual import manual_requirements
+
+    requirements = dependencies.read_requirement_files(files)
+    if not requirements:
+        return {
+            "resolved_packages": {},
+            "package_changes": {"added": [], "changed": [], "removed": []},
+            "candidate_inputs": [],
+        }
+    if dependencies.environment_drift():
+        raise DependencyAnalysisError("environment_drift")
+    current = dependencies.installed_inventory()
+    core = dependencies.protected_core()
+    candidate_inputs = list(requirements)
+    requirements.extend(
+        raw
+        for values in manual_requirements(dependencies.load_manifest()).values()
+        for raw in values
+    )
+    resolved, error = await dependencies._compile(
+        requirements, current, wheels_only=False
+    )
+    if resolved is None:
+        resolved, error = await dependencies._compile(
+            requirements, core, wheels_only=False
+        )
+    if resolved is None:
+        raise DependencyAnalysisError("core_dependency_conflict", error)
+    for name, version in resolved.items():
+        if name in core and core[name] != version:
+            raise DependencyAnalysisError("core_dependency_conflict")
+    wheel_resolved, _ = await dependencies._compile(
+        requirements,
+        resolved,
+        wheels_only=False,
+        restricted_packages=tuple(sorted(resolved)),
+    )
+    return {
+        "resolved_packages": resolved,
+        "package_changes": dependencies._package_changes(resolved, current),
+        "candidate_inputs": candidate_inputs,
+        "source_build_required": wheel_resolved is None,
+    }

@@ -1118,12 +1118,6 @@ async def refresh_all_runtime_caches() -> dict[str, bool]:
         "runtime:reconcile_tasks",
         "runtime:legacy_data",
     ),
-    config_keys=(
-        "CACHE_MODE",
-        "REDIS_HOST",
-        "REDIS_PASSWORD",
-        "REDIS_PORT",
-    ),
     pass_context=True,
 )
 async def _init_runtime_cache(context):

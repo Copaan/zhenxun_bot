@@ -8,6 +8,7 @@ from tortoise.exceptions import IntegrityError
 from tortoise.expressions import F
 
 from zhenxun.models.goods_info import GoodsInfo
+from zhenxun.models.user_gold_log import UserGoldLog
 from zhenxun.services.asset_transaction import (
     account_write,
     asset_call,
@@ -17,10 +18,34 @@ from zhenxun.services.asset_transaction import (
     current_asset_connection,
     require_positive_amount,
 )
-from zhenxun.services.buffered_writers import append_user_gold_log
 from zhenxun.services.db_context import Model
 from zhenxun.utils.enum import GoldHandle
 from zhenxun.utils.exception import GoodsNotFound, InsufficientGold
+
+
+async def append_user_gold_log(
+    user_id: str,
+    gold: int,
+    handle: GoldHandle,
+    source: str | None = None,
+    using_db=None,
+) -> None:
+    """在调用方的事务中写入金币变动记录
+
+    参数:
+        user_id: 用户id
+        gold: 金币数量
+        handle: 金币处理方式
+        source: 来源
+        using_db: 数据库连接
+    """
+    await UserGoldLog.create(
+        using_db=using_db,
+        user_id=user_id,
+        gold=gold,
+        handle=handle,
+        source=source,
+    )
 
 
 @dataclass(slots=True)

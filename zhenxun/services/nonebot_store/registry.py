@@ -103,7 +103,6 @@ async def get_registry(
             except ValueError:
                 pass
 
-        errors: list[str] = []
         headers = {"Accept": "application/json"}
         if meta.get("etag"):
             headers["If-None-Match"] = str(meta["etag"])
@@ -137,19 +136,14 @@ async def get_registry(
                         **_validation_meta(entries),
                         "cached": False,
                     }
-                except (httpx.HTTPError, ValueError, json.JSONDecodeError) as error:
-                    errors.append(type(error).__name__)
+                except (httpx.HTTPError, ValueError, json.JSONDecodeError):
+                    continue
 
         try:
             entries = _validate_entries(cached)
         except ValueError as error:
             raise RegistryUnavailableError("registry_unavailable") from error
-        fallback = {
-            **meta,
-            "stale": True,
-            "fallback_errors": errors,
-            "last_refresh_failed_at": utc_now(),
-        }
+        fallback = {**meta, "stale": True}
         write_json(REGISTRY_META_FILE, fallback)
         return entries, {**fallback, **_validation_meta(entries), "cached": True}
 

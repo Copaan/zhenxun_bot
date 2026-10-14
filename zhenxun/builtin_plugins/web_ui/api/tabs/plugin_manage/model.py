@@ -17,24 +17,6 @@ class PluginSwitch(BaseModel):
     """开关状态"""
 
 
-class ArchiveResolvePayload(BaseModel):
-    archive_digest: str = Field(..., pattern=r"^[0-9a-f]{64}$")
-    confirm_dependency_source_build: bool = False
-
-
-class ArchiveConfirmPayload(BaseModel):
-    archive_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
-    replace: bool = False
-    confirm_third_party_code: bool = False
-
-
-class ArchiveActionPayload(BaseModel):
-    store_key: str = Field(pattern=r"^local_archive:[A-Za-z_][A-Za-z0-9_]*$")
-    operation_id: str = Field(pattern=r"^[0-9a-f]{32}$")
-    expected_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
-    confirmed: bool = False
-
-
 class UpdateConfig(BaseModel):
     """
     配置项修改参数
@@ -90,7 +72,6 @@ class PluginInfo(BaseModel):
     management_source: str = "manual"
     management_route: str | None = None
     management_key: str | None = None
-    archive_digest: str | None = None
     """插件id"""
     module: str
     """模块"""

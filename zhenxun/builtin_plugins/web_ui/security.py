@@ -4,26 +4,20 @@ import asyncio
 from collections.abc import Coroutine
 import contextlib
 import json
-from pathlib import Path
 import time
 from typing import Any
 
-from fastapi import HTTPException, Request
-from fastapi.responses import PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 from jose import JWTError
 from jose.exceptions import ExpiredSignatureError
-from starlette.types import Receive, Scope, Send
+from starlette.types import Scope
 from starlette.websockets import WebSocket, WebSocketDisconnect, WebSocketState
 
 from zhenxun.configs.config import Config
 from zhenxun.services.cache import BoundedTTLCache
-from zhenxun.services.webui_transport import transport_runtime
-from zhenxun.utils.network import is_private_client
 
 from .console_access import console_access
 
-PRIVATE_ACCESS_DENIED = "WebUI is available only from this host or a private network"
 WEBSOCKET_AUTH_TIMEOUT = 5.0
 WEBSOCKET_AUTH_EXPIRED = 4401
 MAX_LOGIN_FAILURES = 5
@@ -85,18 +79,6 @@ def is_websocket_disconnect_error(error: BaseException) -> bool:
     return isinstance(error, OSError) and getattr(error, "winerror", None) in (
         _WINDOWS_DISCONNECT_ERRORS
     )
-
-
-def record_websocket_disconnect(error: BaseException) -> bool:
-    expected = is_websocket_disconnect_error(error)
-    if expected and isinstance(error, ConnectionResetError | BrokenPipeError | OSError):
-        transport_runtime.record("websocket_reset")
-    return expected
-
-
-def is_private_scope(scope: Scope) -> bool:
-    client = scope.get("client")
-    return bool(client and is_private_client(str(client[0])))
 
 
 def decode_access_token_status(
@@ -191,11 +173,8 @@ async def close_authenticated_websocket(
             await websocket.close(code=code, reason=reason)
         except Exception as error:
             if isinstance(error, RuntimeError) or is_websocket_disconnect_error(error):
-                record_websocket_disconnect(error)
                 return False
             raise
-        if code == 1012:
-            transport_runtime.record("cooperative_close")
         return True
 
 
@@ -211,8 +190,6 @@ async def send_authenticated_text(websocket: WebSocket, text: str) -> bool:
         except Exception as error:
             if isinstance(error, RuntimeError) or is_websocket_disconnect_error(error):
                 lease.closing = True
-                transport_runtime.record("websocket_send_failure")
-                record_websocket_disconnect(error)
                 unregister_authenticated_websocket(websocket)
                 return False
             raise
@@ -220,23 +197,9 @@ async def send_authenticated_text(websocket: WebSocket, text: str) -> bool:
 
 
 async def send_authenticated_json(websocket: WebSocket, data: Any) -> bool:
-    lease = _AUTHENTICATED_WEBSOCKETS.get(websocket)
-    if lease is None:
-        return False
-    async with lease.send_lock:
-        if lease.closing or not _websocket_connected(websocket):
-            return False
-        try:
-            await websocket.send_json(data)
-        except Exception as error:
-            if isinstance(error, RuntimeError) or is_websocket_disconnect_error(error):
-                lease.closing = True
-                transport_runtime.record("websocket_send_failure")
-                record_websocket_disconnect(error)
-                unregister_authenticated_websocket(websocket)
-                return False
-            raise
-        return True
+    return await send_authenticated_text(
+        websocket, json.dumps(data, separators=(",", ":"), ensure_ascii=False)
+    )
 
 
 def renew_authenticated_websockets(sid: str, expires_at: float) -> int:
@@ -262,20 +225,7 @@ def _websocket_connected(websocket: WebSocket) -> bool:
     )
 
 
-async def require_private_request(request: Request) -> None:
-    if not is_private_scope(request.scope):
-        raise HTTPException(status_code=403, detail=PRIVATE_ACCESS_DENIED)
-
-
-class PrivateNetworkStaticFiles(StaticFiles):
-    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if not is_private_scope(scope):
-            await PlainTextResponse(PRIVATE_ACCESS_DENIED, status_code=403)(
-                scope, receive, send
-            )
-            return
-        await super().__call__(scope, receive, send)
-
+class WebUIStaticFiles(StaticFiles):
     async def get_response(self, path: str, scope: Scope):
         filename = path.rsplit("/", 1)[-1]
         parts = filename.split(".")
@@ -284,42 +234,15 @@ class PrivateNetworkStaticFiles(StaticFiles):
             and all(character in "0123456789abcdef" for character in part.lower())
             for part in parts[1:-1]
         )
-        if has_content_hash:
-            response = await super().get_response(path, scope)
-        else:
-            from zhenxun.services.webui_resources import webui_resources
-
-            headers = dict(scope.get("headers", []))
-            unconditional = {
-                **scope,
-                "headers": [
-                    (key, value)
-                    for key, value in scope.get("headers", [])
-                    if key.lower() not in {b"if-none-match", b"if-modified-since"}
-                ],
-            }
-            response = await super().get_response(path, unconditional)
+        response = await super().get_response(path, scope)
+        if not has_content_hash:
             response.headers["Cache-Control"] = "no-cache"
-            etag = webui_resources.etag(Path(self.directory) / path)
-            if etag and response.status_code == 200:
-                response.headers["ETag"] = etag
-                if headers.get(b"if-none-match", b"").decode("latin-1") == etag:
-                    return Response(
-                        status_code=304,
-                        headers={
-                            "ETag": etag,
-                            "Cache-Control": "no-cache",
-                        },
-                    )
-        if has_content_hash and response.status_code == 200:
+        elif response.status_code in {200, 304}:
             response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
         return response
 
 
 async def authenticate_websocket(websocket: WebSocket) -> bool:
-    if not is_private_scope(websocket.scope):
-        await websocket.close(code=1008, reason=PRIVATE_ACCESS_DENIED)
-        return False
     await websocket.accept()
     try:
         raw_message = await asyncio.wait_for(
@@ -332,7 +255,6 @@ async def authenticate_websocket(websocket: WebSocket) -> bool:
     except OSError as error:
         if not is_websocket_disconnect_error(error):
             raise
-        record_websocket_disconnect(error)
         return False
 
     decoded, auth_status = (
@@ -340,12 +262,7 @@ async def authenticate_websocket(websocket: WebSocket) -> bool:
         if isinstance(token, str)
         else (None, "invalid")
     )
-    valid = decoded is not None or (
-        auth_status != "expired"
-        and isinstance(token, str)
-        and validate_access_token(token)
-    )
-    if not valid:
+    if decoded is None:
         if auth_status == "expired":
             await close_authenticated_websocket(
                 websocket,
@@ -357,8 +274,6 @@ async def authenticate_websocket(websocket: WebSocket) -> bool:
                 websocket, code=1008, reason="authentication required"
             )
         return False
-    if decoded is None:
-        decoded = {}
     sid = str(decoded.get("sid") or "")
     expires_at = decoded.get("exp") if decoded is not None else None
     lease = WebSocketAuthLease(
@@ -421,21 +336,16 @@ async def quiesce_authenticated_websockets(
 
 
 __all__ = [
-    "PRIVATE_ACCESS_DENIED",
     "WEBSOCKET_AUTH_EXPIRED",
-    "PrivateNetworkStaticFiles",
+    "WebUIStaticFiles",
     "authenticate_websocket",
     "authenticated_websocket_count",
     "close_authenticated_websocket",
     "decode_access_token_status",
-    "is_private_client",
-    "is_private_scope",
     "is_websocket_disconnect_error",
     "login_attempt_limiter",
     "quiesce_authenticated_websockets",
-    "record_websocket_disconnect",
     "renew_authenticated_websockets",
-    "require_private_request",
     "revoke_authenticated_websockets",
     "send_authenticated_json",
     "send_authenticated_text",

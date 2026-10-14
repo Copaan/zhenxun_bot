@@ -13,33 +13,28 @@ from zhenxun.utils._restart_utils import issue_restart_ticket
 from zhenxun.utils.network import private_ipv4_addresses
 
 from ...base_model import Result
+from ...console_access import console_access
 from ...passwords import validate_new_password
 from ...restart_service import (
     preferred_access_targets,
     preferred_access_urls,
     request_webui_restart,
     restart_status_data,
+    transaction_verification_status,
 )
+from ...utils import public_startup_status, request_authenticated
 from .data_source import (
     log_probe_result,
     probe_cache,
     probe_database,
     probe_network,
-    test_db_connection,
-    test_redis_connection,
 )
 from .model import (
     ApplyRequest,
-    CacheConfig,
     CacheProbeRequest,
-    DatabaseConfig,
     DatabaseProbeRequest,
-    DatabaseTest,
-    NetworkConfig,
     NetworkProbeRequest,
-    RedisTest,
     RestartRequest,
-    Setting,
 )
 from .persistence import (
     _quote_env as _quote_env,
@@ -66,7 +61,16 @@ def _current_listener() -> tuple[str, int]:
 
 
 @router.get("/status", response_model=Result, response_class=JSONResponse)
-async def configure_status() -> Result:
+async def configure_status(request: Request) -> Result:
+    if not request_authenticated(request):
+        return Result.ok(
+            {
+                "state": setup_access.state(),
+                "startup": public_startup_status(startup_coordinator.snapshot()),
+                "boot_id": console_access.current_boot_id(),
+                **transaction_verification_status(),
+            }
+        )
     return Result.ok(
         {
             "state": setup_access.state(),
@@ -230,78 +234,3 @@ async def restart_setup(
     if not ok:
         return Result.fail(message)
     return Result.ok(data, info=message)
-
-
-# Compatibility endpoints remain protected by the one-time setup session.
-@router.get(
-    "/test_db",
-    response_model=Result,
-    response_class=JSONResponse,
-    dependencies=[Depends(require_setup_token)],
-)
-async def legacy_test_db_get(db_url: str) -> Result:
-    result = await test_db_connection(db_url)
-    return Result.ok(info="数据库连接成功。") if result is True else Result.fail(result)
-
-
-@router.post(
-    "/test_db",
-    response_model=Result,
-    response_class=JSONResponse,
-    dependencies=[Depends(require_setup_token)],
-)
-async def legacy_test_db(payload: DatabaseTest) -> Result:
-    return await legacy_test_db_get(payload.db_url)
-
-
-@router.post(
-    "/test_redis",
-    response_model=Result,
-    response_class=JSONResponse,
-    dependencies=[Depends(require_setup_token)],
-)
-async def legacy_test_redis(payload: RedisTest) -> Result:
-    result = await test_redis_connection(
-        payload.redis_host, payload.redis_port, payload.redis_password
-    )
-    return Result.ok(info="Redis 连接成功。") if result is True else Result.fail(result)
-
-
-@router.post(
-    "/set_configure",
-    response_model=Result,
-    response_class=JSONResponse,
-)
-async def legacy_apply(
-    payload: Setting,
-    session: Annotated[SetupSession, Depends(require_setup_token)],
-) -> Result:
-    database = DatabaseConfig(mode="url", url=payload.db_url)
-    cache = CacheConfig(
-        mode=payload.cache_mode,
-        host=payload.redis_host,
-        port=payload.redis_port,
-        password=payload.redis_password,
-    )
-    network_mode = (
-        "local"
-        if payload.host.strip() == "127.0.0.1"
-        else "lan"
-        if payload.host.strip() == "0.0.0.0"
-        else "custom"
-    )
-    return await _apply_setup(
-        ApplyRequest(
-            username=payload.username,
-            password=payload.password,
-            confirm_password=payload.password,
-            superusers=payload.superusers,
-            database=database,
-            cache=cache,
-            network=NetworkConfig(
-                mode=network_mode, host=payload.host, port=payload.port
-            ),
-            accept_warnings=True,
-        ),
-        session,
-    )

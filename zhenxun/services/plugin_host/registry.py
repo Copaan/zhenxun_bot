@@ -29,6 +29,8 @@ import weakref
 import nonebot
 from nonebot.plugin import Plugin, _managers
 
+from zhenxun.services.log import logger
+
 
 def _unwrap(obj: Any) -> Any:
     for _ in range(8):
@@ -439,15 +441,6 @@ def _kernel_registrations(own: Ownership) -> list[Any]:
     ]
 
 
-def _operation_recovery(own: Ownership) -> list[Any]:
-    from zhenxun.services.lifecycle.operations import operation_registry
-
-    handlers = operation_registry._recovery_handlers
-    return [
-        (handlers, key) for key, value in list(handlers.items()) if own.owned(value)
-    ]
-
-
 def _plugin_init(own: Ownership) -> list[Any]:
     from zhenxun.services.plugin_init import PluginInitManager
 
@@ -546,37 +539,9 @@ def _ai_capabilities(own: Ownership) -> list[Any]:
     return [(entries, entry) for entry in list(entries) if own.owned(entry.cls)]
 
 
-def _business_identity_resolvers(own: Ownership) -> list[Any]:
-    module = sys.modules.get("zhenxun.services.business_identity")
-    if module is None:
-        return []
-    resolvers = module._resolvers
-    return [
-        (resolvers, scope)
-        for scope, resolver in list(resolvers.items())
-        if own.owned(resolver)
-    ]
-
-
 def _publication_reconcilers() -> list:
     module = sys.modules.get("zhenxun.services.db_context.write")
     return module._RECONCILERS if module is not None else []
-
-
-def _activation_index(own: Ownership) -> list[Any]:
-    module = sys.modules.get("zhenxun.builtin_plugins.hooks.auth_dispatch")
-    if module is None or own.module_owned(module.__name__):
-        return []
-    index = module._HANDLER_ACTIVATION_INDEX
-    matchers = list(index._matcher_map)
-    return [index] if any(own.owned(matcher) for matcher in matchers) else []
-
-
-def _rebuild_activation_index(items: list[Any]) -> None:
-    from nonebot.matcher import matchers
-
-    for index in items:
-        index.rebuild(matchers)
 
 
 ADAPTERS: list[Adapter] = [
@@ -600,22 +565,18 @@ ADAPTERS: list[Adapter] = [
     Adapter("plugin_manager", _sub_managers, _remove_managers),
     Adapter("native_hook", _native_hooks, _remove_native_hooks),
     Adapter("kernel_registration", _kernel_registrations, _remove_keyed),
-    Adapter("operation_recovery", _operation_recovery, _remove_keyed),
     Adapter("plugin_init", _plugin_init, _remove_keyed),
     Adapter("shop_goods", _shop_goods, _remove_shop_goods),
     Adapter("shop_manage_goods", _shop_manage_goods, _remove_keyed),
     Adapter("low_priority_writer", _low_priority_writers, _remove_keyed),
     Adapter("ai_tool", _ai_tools, _remove_ai_tools),
     Adapter("ai_capability", _ai_capabilities, _remove_keyed),
-    Adapter("business_identity_resolver", _business_identity_resolvers, _remove_keyed),
     _list_adapter("publication_reconciler", _publication_reconcilers),
-    # 依赖 matcher 已移除，必须放在最后
-    Adapter("activation_index", _activation_index, _rebuild_activation_index),
 ]
 
 
 def collect(own: Ownership) -> dict[str, list[Any]]:
-    """收集插件在各注册表中的登记
+    """收集插件在各注册表中的登记，单个注册表读取失败时视为没有登记
 
     参数:
         own: 归属
@@ -629,24 +590,30 @@ def collect(own: Ownership) -> dict[str, list[Any]]:
             result[adapter.name] = adapter.collect(own)
         except (ImportError, AttributeError, AssertionError, ValueError):
             result[adapter.name] = []
+        except Exception as error:
+            result[adapter.name] = []
+            logger.warning(f"读取插件登记失败: {adapter.name}", "插件热重载", e=error)
     return result
 
 
-def remove(collected: dict[str, list[Any]]) -> dict[str, int]:
-    """按注册表移除已收集的登记
+def remove(collected: dict[str, list[Any]], notes: list[str]) -> None:
+    """按注册表移除已收集的登记，单个注册表移除失败时记录后继续
 
     参数:
         collected: collect 的结果
-
-    返回:
-        dict[str, int]: 各注册表移除的条目数
+        notes: 过程记录
     """
-    removed = {}
     for adapter in ADAPTERS:
         if items := collected.get(adapter.name):
-            adapter.remove(items)
-            removed[adapter.name] = len(items)
-    return removed
+            try:
+                adapter.remove(items)
+            except Exception as error:
+                notes.append(
+                    f"registry_remove_failed:{adapter.name}:{type(error).__name__}"
+                )
+                logger.warning(
+                    f"移除插件登记失败: {adapter.name}", "插件热重载", e=error
+                )
 
 
 def _task_files(task: asyncio.Task) -> list[str]:

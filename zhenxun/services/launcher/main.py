@@ -49,25 +49,18 @@ class _Round:
 class Launcher:
     """launcher 进程的主控制器"""
 
-    def __init__(self, cwd: Path, webui_dev_source: Path | None) -> None:
+    def __init__(self, cwd: Path) -> None:
         self.cwd = cwd
-        self.webui_dev_source = webui_dev_source
-        self.webui_dev = None
         self.boot_id = ""
         self.stop_event = asyncio.Event()
         self.worker: subprocess.Popen | None = None
         self.ingress: subprocess.Popen | None = None
         self.ingress_signature: tuple | None = None
-        self.http_sidecar: subprocess.Popen | None = None
-        self.http_sidecar_signature: tuple | None = None
-        self.http_retry_index = 0
-        self.next_http_retry = 0.0
         self.transactions = PluginTransactions()
         self.pending_bot_verification = False
         self.qq_settings: Any = None
         self.webui_tls: Any = None
         self.builtin_ingress = False
-        self.desired_http_signature: tuple | None = None
         self.desired_ingress_signature: tuple | None = None
         self.next_restart_check = 0.0
         self.restart_signature: tuple[int, int] | None = None
@@ -90,15 +83,11 @@ class Launcher:
         launcher_log(f"received signal {signum}, scheduling worker shutdown")
 
     async def stop_sidecars(self) -> None:
-        """停止 QQ ingress 与 WebUI HTTP 兼容入口"""
+        """停止 QQ ingress"""
         if self.ingress is not None:
             await stop_process(self.ingress, "QQ HTTPS ingress")
             self.ingress = None
             self.ingress_signature = None
-        if self.http_sidecar is not None:
-            await stop_process(self.http_sidecar, "WebUI HTTP sidecar")
-            self.http_sidecar = None
-            self.http_sidecar_signature = None
 
     async def startup(self) -> None:
         """初始化 launcher：应用待处理的恢复与更新、补齐环境配置"""
@@ -116,10 +105,6 @@ class Launcher:
             )
         sync_env_missing_items(self.cwd)
         clear_launcher_restart_signal()
-        if self.webui_dev_source is not None:
-            from zhenxun.services.webui_dev import WebUIDevServer
-
-            self.webui_dev = WebUIDevServer(self.webui_dev_source, launcher_supervisor)
 
     async def apply_restore(self) -> None:
         """执行待处理的备份恢复或切换数据库步骤"""
@@ -168,10 +153,6 @@ class Launcher:
             validate_webui_tls_settings,
         )
 
-        if self.worker is None and self.http_sidecar is not None:
-            await stop_process(self.http_sidecar, "WebUI HTTP sidecar")
-            self.http_sidecar = None
-            self.http_sidecar_signature = None
         await self.transactions.apply()
         qq = self.qq_settings = load_qq_launcher_settings(self.cwd)
         tls = self.webui_tls = load_webui_tls_settings(self.cwd)
@@ -188,26 +169,7 @@ class Launcher:
             qq_https_port=(
                 qq.config.qq_webhook_listen_port if self.builtin_ingress else None
             ),
-            launcher_managed=True,
-            check_redirect_port=self.http_sidecar is None,
         )
-        self.desired_http_signature = sidecars.http_sidecar_signature(tls)
-        if (
-            self.http_sidecar is not None
-            and self.http_sidecar_signature != self.desired_http_signature
-        ):
-            await stop_process(self.http_sidecar, "WebUI HTTP sidecar")
-            self.http_sidecar = None
-            self.http_sidecar_signature = None
-        if not tls.http_sidecar_enabled:
-            sidecars.publish_http_sidecar_state(
-                mode="disabled",
-                port=None,
-                pid=None,
-                state="disabled",
-                active_connections=0,
-                last_error=None,
-            )
         self.desired_ingress_signature = (
             (
                 qq.config.qq_webhook_listen_host,
@@ -238,11 +200,6 @@ class Launcher:
             subprocess.Popen: worker 进程
         """
         env = os.environ.copy()
-        env.pop("ZHENXUN_WEBUI_DEV_PORT", None)
-        env.pop("ZHENXUN_WEBUI_DEV_TOKEN", None)
-        if self.webui_dev is not None:
-            env.update(self.webui_dev.worker_environment())
-            await self.webui_dev.start()
         startup_id = uuid.uuid4().hex
         env["ZHENXUN_LAUNCHER_PID"] = str(os.getpid())
         env["ZHENXUN_LAUNCHER_BOOT_ID"] = self.boot_id
@@ -260,59 +217,6 @@ class Launcher:
             ),
             startup_id=startup_id,
         )
-
-    def _http_sidecar_failed(self, delay: float) -> None:
-        self.next_http_retry = time.monotonic() + delay
-        sidecars.publish_http_sidecar_state(
-            state="degraded",
-            active_connections=0,
-            retry_in_seconds=delay,
-            next_retry_at=time.time() + delay,
-            retry_count=self.http_retry_index,
-        )
-
-    async def start_http_sidecar(self, worker: subprocess.Popen) -> None:
-        """worker 的 WebUI 可访问后启动 HTTP 兼容入口"""
-        tls = self.webui_tls
-        if not await sidecars.wait_worker_webui_ready(
-            worker, self.qq_settings, scheme=tls.scheme
-        ):
-            sidecars.publish_http_sidecar_state(
-                mode=tls.effective_http_mode,
-                port=tls.redirect_port,
-                pid=None,
-                last_error="https_worker_not_ready",
-                error_code="https_worker_not_ready",
-                stage="upstream_readiness",
-                errno=None,
-            )
-            self._http_sidecar_failed(1.0)
-            launcher_log("WebUI HTTP sidecar is degraded: HTTPS worker is not ready")
-            return
-        self.http_sidecar = await sidecars.start_http_sidecar(tls, self.cwd)
-        if self.http_sidecar is None:
-            self._http_sidecar_failed(1.0)
-        else:
-            self.http_sidecar_signature = self.desired_http_signature
-            self.http_retry_index = 0
-
-    async def retry_http_sidecar(self, worker: subprocess.Popen) -> None:
-        if await sidecars.worker_webui_ready_once(
-            worker, self.qq_settings, scheme=self.webui_tls.scheme
-        ):
-            self.http_sidecar = await sidecars.start_http_sidecar(
-                self.webui_tls, self.cwd
-            )
-        if self.http_sidecar is not None:
-            self.http_sidecar_signature = self.desired_http_signature
-            self.http_retry_index = 0
-            self.next_http_retry = 0.0
-            return
-        delay = sidecars.HTTP_SIDECAR_RETRY_DELAYS[
-            min(self.http_retry_index, len(sidecars.HTTP_SIDECAR_RETRY_DELAYS) - 1)
-        ]
-        self.http_retry_index += 1
-        self._http_sidecar_failed(delay)
 
     async def verify_worker(self, worker: subprocess.Popen) -> bool:
         """验证插件事务与更新后的 worker，失败时停止 worker 并回滚
@@ -412,14 +316,6 @@ class Launcher:
             launcher_log("QQ HTTPS ingress exited unexpectedly")
             await stop_process(worker)
             raise SystemExit(code or 1)
-        if self.http_sidecar is not None and self.http_sidecar.poll() is not None:
-            delay = sidecars.http_sidecar_exited(
-                self.http_sidecar, self.http_retry_index
-            )
-            self.http_sidecar = None
-            self.http_sidecar_signature = None
-            self.http_retry_index += 1
-            self.next_http_retry = time.monotonic() + delay
         if self.stopping:
             clear_launcher_restart_signal()
             await self.stop_sidecars()
@@ -439,12 +335,6 @@ class Launcher:
                 await stop_process(worker)
                 state.return_code = worker.poll()
                 return True
-        if (
-            self.webui_tls.http_sidecar_enabled
-            and self.http_sidecar is None
-            and now >= self.next_http_retry
-        ):
-            await self.retry_http_sidecar(worker)
         return False
 
     async def supervise(self, worker: subprocess.Popen) -> _Round:
@@ -467,13 +357,6 @@ class Launcher:
                     await asyncio.wait_for(self.stop_event.wait(), WORKER_POLL_INTERVAL)
         finally:
             await self.stop_sidecars()
-            if self.webui_tls.http_sidecar_enabled:
-                sidecars.publish_http_sidecar_state(
-                    state="stopped",
-                    pid=None,
-                    active_connections=0,
-                    retry_in_seconds=None,
-                )
             launcher_supervisor.release(
                 worker, "restart" if state.restart_requested else "worker_exit"
             )
@@ -517,8 +400,6 @@ class Launcher:
             await self.prepare_round()
             worker = self.worker = await self.spawn_worker()
             await self.wait_restore_import(worker)
-            if self.webui_tls.http_sidecar_enabled and self.http_sidecar is None:
-                await self.start_http_sidecar(worker)
             if not await self.verify_worker(worker):
                 continue
             if self.builtin_ingress and self.ingress is None:
@@ -526,8 +407,8 @@ class Launcher:
             await self.finish_round(await self.supervise(worker))
 
 
-async def _launcher_entry(cwd: Path, webui_dev_source: Path | None) -> None:
-    launcher = Launcher(cwd, webui_dev_source)
+async def _launcher_entry(cwd: Path) -> None:
+    launcher = Launcher(cwd)
     signals = [signal.SIGINT, signal.SIGTERM]
     if hasattr(signal, "SIGBREAK"):
         signals.append(signal.SIGBREAK)
@@ -552,15 +433,14 @@ async def _launcher_entry(cwd: Path, webui_dev_source: Path | None) -> None:
                 signal.signal(sig, handler)
 
 
-def run_launcher(cwd: Path, webui_dev_source: Path | None = None) -> None:
+def run_launcher(cwd: Path) -> None:
     """运行 launcher 直到退出
 
     参数:
         cwd: 项目目录
-        webui_dev_source: 前端源码目录，为 None 时不启用前端热更新
     """
     try:
-        asyncio.run(_launcher_entry(cwd, webui_dev_source))
+        asyncio.run(_launcher_entry(cwd))
     except (asyncio.CancelledError, OSError) as error:
         if launcher_supervisor.shutdown_signal is not None:
             launcher_log(

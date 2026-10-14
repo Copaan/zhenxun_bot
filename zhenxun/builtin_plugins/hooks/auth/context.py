@@ -13,6 +13,7 @@ from nonebot_plugin_uninfo import Uninfo
 
 from zhenxun.services.cache.cache_containers import CacheDict
 from zhenxun.services.cache.runtime_sync import RuntimeCacheMutation
+from zhenxun.services.platform_identity import is_isolated_scope
 from zhenxun.utils.platform import PlatformUtils
 from zhenxun.utils.utils import EntityIDs, get_entity_ids
 
@@ -73,12 +74,15 @@ class EventContext:
 
     @property
     def limit_entity(self) -> EntityIDs:
-        if self.platform_scope != "qq_api":
+        if self.platform_scope == "qq_client":
             return self.entity
+        channel_id = self.entity.channel_id
         return EntityIDs(
             user_id=self.storage_user_id or self.entity.user_id,
             group_id=self.storage_group_id,
-            channel_id=self.entity.channel_id,
+            channel_id=f"{self.platform_scope}:channel:{channel_id}"
+            if channel_id
+            else None,
         )
 
 
@@ -327,6 +331,11 @@ def get_or_create_event_context(
     storage_bot_id = getattr(official_context, "storage_bot_id", None)
     storage_user_id = getattr(official_context, "storage_user_id", None)
     storage_group_id = getattr(official_context, "storage_group_id", None)
+    if official_context is None and is_isolated_scope(platform_scope):
+        storage_bot_id = PlatformUtils.storage_bot_id(platform_scope, bot_id)
+        storage_user_id = f"{platform_scope}:{entity.user_id}"
+        if entity.group_id:
+            storage_group_id = f"{platform_scope}:group:{entity.group_id}"
     event_cache = state.get(STATE_EVENT_CACHE)
     if not isinstance(event_cache, dict):
         event_cache = get_event_cache(
@@ -359,7 +368,7 @@ def get_or_create_event_context(
 
     is_superuser = state.get(STATE_IS_SUPERUSER)
     if not isinstance(is_superuser, bool):
-        is_superuser = entity.user_id in bot.config.superusers
+        is_superuser = PlatformUtils.is_superuser(bot, entity.user_id)
 
     context = EventContext(
         bot_id=storage_bot_id or bot_id,

@@ -55,8 +55,8 @@ router = APIRouter()
 
 _ENV_FILE = Path(".env.dev")
 _ENV_TEMPLATE = Path(".env.example")
-_AUTH_URL = "https://bots.qq.com/app/getAppAccessToken"
-_ME_URL = "https://api.sgroup.qq.com/users/@me"
+_AUTH_URL = "https://api.bot.qq.com/app/getAppAccessToken"
+_ME_URL = "https://api.bot.qq.com/users/@me"
 _TIMEOUT = httpx.Timeout(10.0, connect=5.0)
 _PROTOCOL_ENV_KEYS = {
     "ONEBOT_REVERSE_WS_HOST",
@@ -88,13 +88,11 @@ _PROTOCOL_DEFAULTS: dict[str, Any] = {
 
 class QQCredentialProbe(BaseModel):
     id: str = Field(min_length=1, max_length=128)
-    token: str | None = Field(default=None, max_length=512)
     secret: str | None = Field(default=None, max_length=512)
 
 
 class QQBotForm(BaseModel):
     id: str = Field(min_length=1, max_length=128)
-    token: str | None = Field(default=None, max_length=512)
     secret: str | None = Field(default=None, max_length=512)
     use_websocket: bool = False
     intent: QQOfficialIntent | None = None
@@ -105,7 +103,6 @@ class ProtocolConfigurationUpdate(BaseModel):
     expected_revision: str = Field(min_length=64, max_length=64)
     onebot_access_token: str | None = Field(default=None, max_length=1024)
     onebot_reverse_ws_host: str | None = Field(default=None, max_length=253)
-    clear_onebot_access_token: bool = False
     qq_enabled: bool
     qq_bots: list[QQBotForm] = Field(default_factory=list)
     qq_webhook_mode: Literal["external", "builtin_https"] = "external"
@@ -222,7 +219,15 @@ def _callback_url(base_url: str) -> str | None:
     return f"{base_url.rstrip('/')}/qq/webhook" if base_url else None
 
 
-def _masked_configuration(content: str) -> dict[str, Any]:
+def _public_configuration(content: str) -> dict[str, Any]:
+    """读取协议配置，凭据按原值返回
+
+    参数:
+        content: 环境配置文件内容
+
+    返回:
+        dict[str, Any]: 页面展示用的协议配置
+    """
     values = dotenv_values(stream=StringIO(content))
     raw_bots = _parse_bots(values.get("QQ_BOTS"))
     bots = []
@@ -232,8 +237,7 @@ def _masked_configuration(content: str) -> dict[str, Any]:
         bots.append(
             {
                 "id": str(item.get("id") or ""),
-                "has_token": bool(str(item.get("token") or "").strip()),
-                "has_secret": bool(str(item.get("secret") or "").strip()),
+                "secret": str(item.get("secret") or ""),
                 "intent": item.get("intent", {}),
                 "shard": item.get("shard"),
             }
@@ -249,9 +253,7 @@ def _masked_configuration(content: str) -> dict[str, Any]:
         "launcher_managed": bool(os.getenv("ZHENXUN_LAUNCHER_PID")),
         "onebot": {
             "reverse_ws_host": str(values.get("ONEBOT_REVERSE_WS_HOST") or ""),
-            "has_access_token": bool(
-                str(values.get("ONEBOT_ACCESS_TOKEN") or "").strip()
-            ),
+            "access_token": str(values.get("ONEBOT_ACCESS_TOKEN") or ""),
         },
         "qq": {
             "enabled": str(values.get("QQ_ADAPTER_LOAD") or "").lower()
@@ -263,12 +265,8 @@ def _masked_configuration(content: str) -> dict[str, Any]:
             "callback_url": _callback_url(base_url),
             "listen_host": str(values.get("QQ_WEBHOOK_LISTEN_HOST") or "0.0.0.0"),
             "listen_port": int(values.get("QQ_WEBHOOK_LISTEN_PORT") or 443),
-            "has_tls_certfile": bool(
-                str(values.get("QQ_WEBHOOK_TLS_CERTFILE") or "").strip()
-            ),
-            "has_tls_keyfile": bool(
-                str(values.get("QQ_WEBHOOK_TLS_KEYFILE") or "").strip()
-            ),
+            "tls_certfile": str(values.get("QQ_WEBHOOK_TLS_CERTFILE") or ""),
+            "tls_keyfile": str(values.get("QQ_WEBHOOK_TLS_KEYFILE") or ""),
         },
     }
 
@@ -283,15 +281,15 @@ def _resolve_bots(
     for index, form in enumerate(forms):
         app_id = form.id.strip()
         old = existing_by_id.get(app_id, {})
-        token = (form.token or "").strip() or str(old.get("token") or "").strip()
-        secret = (form.secret or "").strip() or str(old.get("secret") or "").strip()
+        secret = (old.get("secret") or "") if form.secret is None else form.secret
+        secret = str(secret).strip()
         if not secret:
             raise HTTPException(
                 status_code=422,
                 detail=f"QQ Bot第{index + 1}项缺少Secret。",
             )
         changes = model_dump(form, exclude_unset=True)
-        changes.update(id=app_id, token=token, secret=secret)
+        changes.update(id=app_id, secret=secret)
         try:
             result.append(merge_qq_bot_config(old, changes))
         except ValueError as exc:
@@ -376,7 +374,7 @@ async def protocol_configuration(response: Response, request: Request) -> Result
         current_reverse_ws_diagnostic,
     )
 
-    result = _masked_configuration(content)
+    result = _public_configuration(content)
     result["onebot"]["endpoint"] = current_reverse_ws_diagnostic(
         request.url.hostname or ""
     )
@@ -440,10 +438,8 @@ async def save_protocol_configuration(
             )
         except ValueError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
-    if payload.clear_onebot_access_token:
-        changed["ONEBOT_ACCESS_TOKEN"] = ""
-    elif payload.onebot_access_token is not None and payload.onebot_access_token:
-        changed["ONEBOT_ACCESS_TOKEN"] = payload.onebot_access_token
+    if payload.onebot_access_token is not None:
+        changed["ONEBOT_ACCESS_TOKEN"] = payload.onebot_access_token.strip()
 
     bots: list[QQOfficialBotConfig] = []
     base_url = ""
@@ -534,7 +530,9 @@ async def save_protocol_configuration(
         info=(
             "协议配置已保存，需要重启后生效。"
             if restart_required
-            else "协议配置没有需要应用的运行时变化。"
+            else "协议配置已保存。"
+            if changed_keys
+            else "协议配置没有变化。"
         ),
     )
 

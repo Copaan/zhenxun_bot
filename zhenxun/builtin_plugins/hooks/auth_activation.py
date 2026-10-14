@@ -14,17 +14,6 @@ from nonebot.matcher import Matcher
 
 ActivationDecision = Literal["match", "miss", "unknown"]
 ALCONNA_SHORTCUT_TOKEN_LIMIT = 16
-ActivationLane = Literal[
-    "command_exact",
-    "command_shortcut",
-    "command_regex",
-    "system",
-    "passive_light",
-    "passive_db",
-    "passive_http",
-    "passive_ai",
-    "passive_render",
-]
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,7 +32,6 @@ class HandlerDescriptor:
     module: str
     matcher_type: str
     priority: int
-    lane: ActivationLane
     temp: bool = False
     block: bool = False
     command_like: bool = False
@@ -267,21 +255,11 @@ class HandlerActivationIndex:
             command_like = True
         if shortcuts is not None:
             command_like = True
-        module = matcher_module_name(matcher)
-        lane = classify_lane(
-            matcher,
-            module=module,
-            command_like=command_like,
-            deterministic_text=deterministic,
-            shortcuts=shortcuts,
-            commands=commands,
-        )
         return HandlerDescriptor(
             matcher=matcher,
-            module=module,
+            module=matcher_module_name(matcher),
             matcher_type=getattr(matcher, "type", "") or "",
             priority=priority,
-            lane=lane,
             temp=bool(getattr(matcher, "temp", False)),
             block=bool(getattr(matcher, "block", False)),
             command_like=command_like,
@@ -316,40 +294,6 @@ def matcher_module_name(matcher_cls: type[Matcher]) -> str:
     if not plugin:
         return ""
     return (getattr(plugin, "name", "") or "").strip()
-
-
-def classify_lane(
-    matcher_cls: type[Matcher],
-    *,
-    module: str,
-    command_like: bool,
-    deterministic_text: bool,
-    shortcuts: tuple[str, ...] | None,
-    commands: tuple[str, ...],
-) -> ActivationLane:
-    if getattr(matcher_cls, "temp", False):
-        return "system"
-    if command_like:
-        if shortcuts:
-            return "command_shortcut"
-        has_regex_command = any(
-            is_regex_like_command_literal(item) for item in commands
-        )
-        if deterministic_text or has_regex_command:
-            return "command_regex"
-        return "command_exact"
-    module_l = (module or "").casefold()
-    if any(hint in module_l for hint in PASSIVE_AI_HINTS):
-        return "passive_ai"
-    if any(hint in module_l for hint in PASSIVE_RENDER_HINTS):
-        return "passive_render"
-    if any(hint in module_l for hint in PASSIVE_HTTP_HINTS):
-        return "passive_http"
-    if matcher_has_custom_rule(matcher_cls):
-        return "passive_light"
-    if any(hint in module_l for hint in PASSIVE_DB_HINTS):
-        return "passive_db"
-    return "passive_light"
 
 
 def matcher_has_custom_rule(matcher_cls: type[Matcher]) -> bool:
@@ -1138,15 +1082,6 @@ def command_matches(text: str, command: str) -> bool:
     return False
 
 
-def is_regex_like_command_literal(command: str) -> bool:
-    text = command.strip()
-    if not text:
-        return False
-    if text.startswith("re:"):
-        return True
-    return any(token in text for token in ("\\", "(", ")", "[", "]", "|", "^", "$"))
-
-
 def normalize_shortcut_pattern(pattern: str) -> str:
     text = str(pattern or "").strip()
     if not text:
@@ -1225,58 +1160,6 @@ def _placeholder_shortcut_decision(text: str, pattern: str) -> ActivationDecisio
 
 def is_regex_like_shortcut(pattern: str) -> bool:
     return any(token in pattern for token in ("\\", "(", ")", "[", "]", "|", "^", "$"))
-
-
-PASSIVE_DB_HINTS = (
-    "word_bank",
-    "black_word",
-    "history",
-    "statistics",
-    "sign",
-    "gold",
-    "redbag",
-    "mute",
-    "group",
-    "user",
-    "admin",
-    "ban",
-    "limit",
-    "check",
-)
-PASSIVE_HTTP_HINTS = (
-    "http",
-    "translate",
-    "bilibili",
-    "music",
-    "comment",
-    "nbnhhsh",
-    "quote",
-    "search",
-    "jitang",
-    "poetry",
-    "anime",
-    "cover",
-)
-PASSIVE_AI_HINTS = (
-    "chatinter",
-    "dialogue",
-    "ai",
-    "llm",
-    "fudu",
-    "bym_ai",
-)
-PASSIVE_RENDER_HINTS = (
-    "render",
-    "image",
-    "meme",
-    "memes",
-    "word_cloud",
-    "wordcloud",
-    "pic",
-    "picture",
-    "coser",
-    "luxun",
-)
 
 
 __all__ = [

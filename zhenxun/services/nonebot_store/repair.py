@@ -62,15 +62,6 @@ def select_repair_groups(preview: dict, selected: list[str] | None) -> dict:
 
 async def preview_layer_repair(report: dict[str, Any]) -> dict[str, Any]:
     """Solve connected repair components, keeping unrelated versions fixed."""
-    from zhenxun.services.plugin_store.plugin_archive_dependencies import (
-        ArchiveDependencyConflict,
-        archive_dependency_contract,
-    )
-    from zhenxun.services.plugin_store.plugin_store_transaction import (
-        ArchiveSourceBuildConflict,
-        preflight_archive_dependency_policy,
-    )
-
     snapshot = capture_environment()
     from .policy import ORM_PACKAGES, guard_orm_changes, retained_conflicts
 
@@ -115,7 +106,6 @@ async def preview_layer_repair(report: dict[str, Any]) -> dict[str, Any]:
                     break
             if changed:
                 break
-    archive = archive_dependency_contract()
     groups = []
     for group_roots, scope in components:
         group = {
@@ -148,15 +138,9 @@ async def preview_layer_repair(report: dict[str, Any]) -> dict[str, Any]:
                 f"{name}=={core[name]}" if name in core else name
                 for name in group_roots
             )
-            inputs.extend(
-                raw
-                for raw in archive.get("requirements", [])
-                if canonicalize_name(Requirement(raw).name) in scope
-            )
             constraints = {
                 name: version for name, version in current.items() if name not in scope
             }
-            constraints.update(archive.get("packages", {}))
             constraints.update(fixed)
             resolved, detail = await _compile(
                 inputs, constraints, wheels_only=True, preferences=current
@@ -168,7 +152,6 @@ async def preview_layer_repair(report: dict[str, Any]) -> dict[str, Any]:
                     constraints,
                     wheels_only=False,
                     preferences=current,
-                    restricted_packages=tuple(archive.get("wheels_only_packages", [])),
                 )
                 if resolved is not None:
                     group["source_build_required"] = True
@@ -209,27 +192,8 @@ async def preview_layer_repair(report: dict[str, Any]) -> dict[str, Any]:
                 )
             if not group["changes"]:
                 raise DependencyAnalysisError("dependency_environment_not_repairable")
-            target = deepcopy(manifest)
-            for name, value in group["package_updates"].items():
-                if value is None:
-                    target["packages"].pop(name, None)
-                else:
-                    target["packages"][name] = value
-            preflight_archive_dependency_policy(
-                {
-                    "base_manifest": manifest,
-                    "target_manifest": target,
-                    "source_build_confirmed": group["source_build_required"],
-                    "action": "environment_repair",
-                    "affected_dependency_packages": sorted(scope),
-                }
-            )
             group["status"] = "repairable"
-        except (
-            DependencyAnalysisError,
-            ArchiveDependencyConflict,
-            ArchiveSourceBuildConflict,
-        ) as error:
+        except DependencyAnalysisError as error:
             group.update(code=error.code, diagnostic=str(error), details=error.details)
             group["changes"], group["package_updates"] = [], {}
     return {

@@ -34,7 +34,7 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - Python 3.10
     import tomli as tomllib
 
-from .storage import LAYER_ROOT, generation_path, load_manifest
+from .storage import LAYER_ROOT, load_manifest
 
 SOLVER_POLICY_VERSION = 11
 COORDINATED_TRANSITIVE_PACKAGES = frozenset({"aiofiles", "idna"})
@@ -107,22 +107,6 @@ def _distribution_inventory(*, include_layer: bool) -> dict[str, str]:
 
 def base_installed_inventory() -> dict[str, str]:
     return _distribution_inventory(include_layer=False)
-
-
-def layer_inventory() -> dict[str, str]:
-    manifest = load_manifest()
-    active_generation = manifest.get("active_generation")
-    if not isinstance(active_generation, int):
-        return {}
-    active_path = generation_path(active_generation)
-    if not active_path.is_dir():
-        return {}
-    result: dict[str, str] = {}
-    for distribution in importlib.metadata.distributions(path=[str(active_path)]):
-        name = distribution.metadata.get("Name")
-        if name:
-            result.setdefault(canonicalize_name(name), distribution.version)
-    return result
 
 
 def installed_inventory() -> dict[str, str]:
@@ -356,15 +340,6 @@ def _project_venv_active() -> bool:
         return False
 
 
-def active_requirement_conflicts(
-    effective: dict[str, str], layer: dict[str, str], manifest: dict[str, Any]
-) -> list[dict[str, Any]]:
-    """Check the selected distribution metadata, including enabled extras."""
-    from .environment import capture_environment
-
-    return capture_environment(manifest=manifest).conflicts
-
-
 def environment_report(*, check_lock: bool = False, snapshot=None) -> dict[str, Any]:
     immutable = protected_core()
     shared = shared_dependencies()
@@ -394,7 +369,6 @@ def environment_report(*, check_lock: bool = False, snapshot=None) -> dict[str, 
     requirements = _project_requirement_map()
     requirement_conflicts = snapshot.conflicts
     immutable_drift: list[dict[str, Any]] = []
-    compatible_shared_drift: list[dict[str, Any]] = []
     incompatible_shared_drift: list[dict[str, Any]] = []
 
     for name, expected in sorted(immutable.items()):
@@ -426,29 +400,20 @@ def environment_report(*, check_lock: bool = False, snapshot=None) -> dict[str, 
                 )
             except InvalidVersion:
                 compatible = False
-        item = {
-            "name": name,
-            "tier": "shared_compatible",
-            "expected": expected,
-            "actual": actual,
-            "kind": _version_relation(actual, expected),
-            "requirement": str(requirement) if requirement else None,
-            "layer": "active_generation" if name in layer else "base",
-        }
-        target = compatible_shared_drift if compatible else incompatible_shared_drift
-        target.append(item)
+        if compatible:
+            continue
+        incompatible_shared_drift.append(
+            {
+                "name": name,
+                "tier": "shared_compatible",
+                "expected": expected,
+                "actual": actual,
+                "kind": _version_relation(actual, expected),
+                "requirement": str(requirement) if requirement else None,
+                "layer": "active_generation" if name in layer else "base",
+            }
+        )
 
-    project_names = set(immutable) | set(shared) | {PROJECT_NAME}
-    external = [
-        {
-            "name": name,
-            "tier": "external_extra",
-            "actual": version,
-            "kind": "extra",
-        }
-        for name, version in sorted(base.items())
-        if name not in project_names and name not in layer
-    ]
     interpreter_mismatch = not _project_venv_active()
     lock_stale = False
     if check_lock:
@@ -474,47 +439,14 @@ def environment_report(*, check_lock: bool = False, snapshot=None) -> dict[str, 
                 lock_stale = True
             else:
                 lock_stale = checked.returncode != 0
-    if lock_stale:
-        status = "project_lock_stale"
-    elif interpreter_mismatch:
-        status = "interpreter_mismatch"
-    elif layer_mismatch:
-        status = "dependency_layer_state_mismatch"
-    elif immutable_drift:
-        status = "immutable_drift"
-    elif incompatible_shared_drift:
-        status = "incompatible_shared_drift"
-    elif requirement_conflicts:
-        status = "current_environment_dependency_conflict"
-    elif compatible_shared_drift:
-        status = "compatible_shared_drift"
-    elif external:
-        status = "extra_packages"
-    else:
-        status = "healthy"
     lock_digest = (
         sha256(LOCK_FILE.read_bytes()).hexdigest() if LOCK_FILE.exists() else "missing"
     )
     payload = {
-        "status": status,
-        "sources": snapshot.sources,
-        "duplicates": snapshot.duplicates,
-        "declarations": snapshot.declarations,
-        "loaded_mismatches": snapshot.loaded_mismatches,
-        "restart_required": bool(snapshot.loaded_mismatches),
-        "snapshot_digest": snapshot.digest,
-        "solver_policy_version": SOLVER_POLICY_VERSION,
-        "python": platform.python_version(),
-        "platform": sys.platform,
-        "immutable_count": len(immutable),
-        "shared_count": len(shared),
         "immutable_drift": immutable_drift,
         "layer_mismatch": layer_mismatch,
         "requirement_conflicts": requirement_conflicts,
-        "compatible_shared_drift": compatible_shared_drift,
         "incompatible_shared_drift": incompatible_shared_drift,
-        "extra_packages": external,
-        "extra_count": len(external),
         "interpreter_mismatch": interpreter_mismatch,
         "project_lock_stale": lock_stale,
         "repairable": bool(
@@ -524,17 +456,14 @@ def environment_report(*, check_lock: bool = False, snapshot=None) -> dict[str, 
             and (immutable_drift or incompatible_shared_drift or requirement_conflicts)
             and LOCK_FILE.is_file()
         ),
-        "repair_command": "uv sync --locked --inexact",
         "repair_mode": "base" if immutable_drift else "layer",
-        "lock_digest": lock_digest,
-        "layer_packages": len(layer),
     }
     payload["fingerprint"] = sha256(
         json.dumps(
             {
                 "lock": lock_digest,
                 "project": sha256(PROJECT_FILE.read_bytes()).hexdigest(),
-                "snapshot": snapshot.digest,
+                "versions": sorted(snapshot.versions.items()),
                 "policy": SOLVER_POLICY_VERSION,
                 "base": sorted(base.items()),
                 "layer": sorted(layer.items()),
@@ -549,8 +478,8 @@ def environment_report(*, check_lock: bool = False, snapshot=None) -> dict[str, 
                         "pending_verification",
                     )
                 },
-                "python": payload["python"],
-                "platform": payload["platform"],
+                "python": platform.python_version(),
+                "platform": sys.platform,
                 "lock_stale": lock_stale,
             },
             sort_keys=True,
@@ -762,7 +691,7 @@ async def _compile(
         )
         import psutil
 
-        from zhenxun.utils.process_tree import verified_descendants
+        from zhenxun.utils.process_tree import kill_tree, verified_descendants
 
         try:
             owned = psutil.Process(process.pid)
@@ -771,20 +700,15 @@ async def _compile(
         try:
             stdout, stderr = await asyncio.wait_for(process.communicate(), 180)
         except (asyncio.CancelledError, asyncio.TimeoutError):
-            children = []
+            tree = [owned] if owned is not None else []
             if owned is not None:
                 with contextlib.suppress(psutil.NoSuchProcess):
-                    children = verified_descendants(owned)
-                for child in [*reversed(children), owned]:
-                    with contextlib.suppress(psutil.NoSuchProcess):
-                        child.kill()
+                    tree += verified_descendants(owned)
+            alive = await asyncio.to_thread(kill_tree, tree)
             if process.returncode is None:
                 with contextlib.suppress(ProcessLookupError):
                     process.kill()
             await asyncio.wait_for(process.wait(), 10)
-            _, alive = await asyncio.to_thread(
-                psutil.wait_procs, [*children, *([owned] if owned else [])], timeout=5
-            )
             if alive:
                 raise DependencyAnalysisError("dependency_tool_cleanup_unconfirmed")
             raise
@@ -842,45 +766,10 @@ def _check_resolution_failure(details: str) -> None:
 
     failure = resolver_failure(details)
     if failure["code"] not in {
-        "archive_dependency_conflict",
-        "archive_dependency_source_required",
+        "dependency_conflict",
+        "dependency_source_required",
     }:
-        raise DependencyAnalysisError(
-            failure["code"].replace("archive_dependency_", "dependency_", 1),
-            details,
-        )
-
-
-def _requirement_names(requirements: list[str]) -> set[str]:
-    names: set[str] = set()
-    for raw in requirements:
-        try:
-            names.add(canonicalize_name(Requirement(str(raw)).name))
-        except (InvalidRequirement, TypeError, ValueError):
-            continue
-    return names
-
-
-def _archive_pin_requirements(archive: dict[str, Any], packages: set[str]) -> list[str]:
-    return [
-        f"{name}=={archive['packages'][name]}"
-        for name in sorted(packages)
-        if name in archive.get("packages", {})
-    ]
-
-
-def _archive_requirement_inputs(
-    archive: dict[str, Any], packages: set[str]
-) -> list[str]:
-    result: list[str] = []
-    for raw in archive.get("requirements", []):
-        try:
-            name = canonicalize_name(Requirement(str(raw)).name)
-        except (InvalidRequirement, TypeError, ValueError):
-            continue
-        if name in packages:
-            result.append(str(raw))
-    return result
+        raise DependencyAnalysisError(failure["code"], details)
 
 
 def _package_changes(
@@ -932,9 +821,7 @@ def _wheel_availability(metadata: dict[str, Any]) -> dict[str, Any]:
         if supported_tags.intersection(tags):
             compatible.append(filename)
     return {
-        "wheel_present": bool(wheels),
         "compatible": bool(compatible),
-        "wheel_files": wheels,
         "compatible_wheel_files": compatible,
     }
 
@@ -1000,41 +887,6 @@ async def solve_install(
     manifest: dict[str, Any] | None = None,
     prefer_existing: bool = True,
 ) -> dict[str, Any]:
-    from zhenxun.services.plugin_store.plugin_archive_dependencies import (
-        archive_dependency_contract,
-    )
-
-    archive = archive_dependency_contract()
-
-    def archive_conflict(reason: str, **details: Any) -> DependencyAnalysisError:
-        from zhenxun.services.installer_network import (
-            UV_BINARY_POLICY_VERSION,
-            uv_version,
-        )
-
-        return DependencyAnalysisError(
-            "archive_dependency_conflict",
-            reason,
-            details={
-                "archive_owners": archive.get("store_keys", []),
-                "resolved_archive_owners": archive.get("resolved_records", []),
-                "legacy_archive_owners": archive.get("legacy_receipts", []),
-                "packages": archive.get("packages", {}),
-                "python": platform.python_version(),
-                "python_executable": sys.executable,
-                "platform": sys.platform,
-                "machine": platform.machine(),
-                "environment_fingerprint": archive.get("environment_fingerprint"),
-                "receipt_environment_fingerprints": archive.get(
-                    "receipt_environment_fingerprints", {}
-                ),
-                "uv_version": uv_version(),
-                "binary_policy_version": UV_BINARY_POLICY_VERSION,
-                "failure_stage": details.pop("failure_stage", "dependency_resolution"),
-                **details,
-            },
-        )
-
     from .environment import capture_environment
 
     snapshot = capture_environment()
@@ -1125,9 +977,6 @@ async def solve_install(
 
     # Discover only the requested plugin's closure. Other installed plugins
     # participate in compatibility checks, never in the scope allowed to move.
-    archive_packages = set(archive.get("packages", {})) | _requirement_names(
-        archive.get("requirements", [])
-    )
     candidate_probe, candidate_error = await _compile(
         candidate_inputs, baseline, wheels_only=False, preferences=baseline
     )
@@ -1138,24 +987,9 @@ async def solve_install(
     if candidate_probe is None:
         raise DependencyAnalysisError("plugin_dependency_invalid", candidate_error)
     candidate_scope = set(candidate_probe) | {candidate_name}
-    relevant_archive_packages = candidate_scope & archive_packages
-    pinned_archive_packages = relevant_archive_packages & set(
-        archive.get("packages", {})
-    )
-    archive_wheel_packages = relevant_archive_packages & set(
-        archive.get("wheels_only_packages", [])
-    )
-    archive_source_packages = relevant_archive_packages & set(
-        archive.get("source_build_packages", [])
-    )
-    archive_inputs = [
-        *_archive_requirement_inputs(archive, relevant_archive_packages),
-        *_archive_pin_requirements(archive, relevant_archive_packages),
-    ]
     # Keep requirements imposed by external owners on the candidate closure.
     active_requirements = [
         *scoped_roots(managed_requirements, candidate_scope),
-        *archive_inputs,
         *external_requirements(snapshot, candidate_scope),
     ]
     requirements = [
@@ -1163,15 +997,13 @@ async def solve_install(
         *active_requirements,
         *candidate_inputs,
     ]
-    archive_pins = archive.get("packages", {})
-    strict_constraints = {**baseline, **archive_pins, **frozen}
+    strict_constraints = {**baseline, **frozen}
     scoped_constraints = {
         **{
             name: version
             for name, version in baseline.items()
             if name not in candidate_scope
         },
-        **archive_pins,
         **frozen,
     }
     for name, version in current.items():
@@ -1179,40 +1011,13 @@ async def solve_install(
             scoped_constraints[name] = version
 
     resolved, strict_error = await _compile(
-        requirements,
-        strict_constraints,
-        wheels_only=False,
-        restricted_packages=tuple(sorted(archive_wheel_packages)),
-        preferences=baseline,
+        requirements, strict_constraints, wheels_only=False, preferences=baseline
     )
-    relaxed = False
     if resolved is None:
-        relaxed = True
         resolved, relaxed_error = await _compile(
-            requirements,
-            scoped_constraints,
-            wheels_only=False,
-            restricted_packages=tuple(sorted(archive_wheel_packages)),
-            preferences=baseline,
+            requirements, scoped_constraints, wheels_only=False, preferences=baseline
         )
         if resolved is None:
-            if archive_wheel_packages:
-                archive_probe, archive_error = await _compile(
-                    [
-                        *_archive_requirement_inputs(archive, archive_wheel_packages),
-                        *_archive_pin_requirements(archive, archive_wheel_packages),
-                    ],
-                    immutable,
-                    wheels_only=False,
-                    restricted_packages=tuple(sorted(archive_wheel_packages)),
-                )
-                if archive_probe is None:
-                    raise archive_conflict(
-                        "archive_requirements_unsatisfied",
-                        failure_stage="archive_probe",
-                        relevant_packages=sorted(relevant_archive_packages),
-                        diagnostic=archive_error,
-                    )
             candidate_requirements = [*project_requirements(), *candidate_inputs]
             candidate_core, candidate_core_error = await _compile(
                 candidate_requirements, immutable, wheels_only=False
@@ -1238,27 +1043,6 @@ async def solve_install(
                 or strict_error,
             )
 
-    if any(
-        resolved.get(name) != archive["packages"][name]
-        for name in pinned_archive_packages
-    ):
-        mismatches = [
-            {
-                "package": name,
-                "expected": version,
-                "actual": resolved.get(name),
-                "archive_owners": archive.get("resolved_records", []),
-            }
-            for name, version in archive["packages"].items()
-            if name in pinned_archive_packages
-            if resolved.get(name) != version
-        ]
-        raise archive_conflict(
-            "archive_dependency_conflict",
-            failure_stage="archive_validation",
-            relevant_packages=sorted(relevant_archive_packages),
-            mismatches=mismatches,
-        )
     core_changes = [
         {
             "name": name,
@@ -1292,84 +1076,17 @@ async def solve_install(
     if final_candidate is None:
         raise DependencyAnalysisError("dependency_resolution_failed", final_error)
     candidate_scope = set(final_candidate) | {candidate_name}
-    relevant_archive_packages = candidate_scope & archive_packages
-    archive_wheel_packages = relevant_archive_packages & set(
-        archive.get("wheels_only_packages", [])
-    )
-    archive_source_packages = relevant_archive_packages & set(
-        archive.get("source_build_packages", [])
-    )
-    for raw in _archive_requirement_inputs(archive, relevant_archive_packages):
-        requirement = Requirement(raw)
-        if requirement.marker and not requirement.marker.evaluate():
-            continue
-        version = resolved.get(canonicalize_name(requirement.name))
-        if version is None or not requirement.specifier.contains(
-            version, prereleases=True
-        ):
-            raise archive_conflict(
-                "archive_dependency_conflict",
-                failure_stage="archive_validation",
-                requirement=str(requirement),
-                actual=version,
-            )
-
-    archive_binary_packages: dict[str, str] = {}
-    binary_candidates = {
-        name: resolved[name]
-        for name in archive_source_packages - set(immutable)
-        if name in resolved
-    }
-    if binary_candidates:
-        binaries, _ = await _compile(
-            [f"{name}=={version}" for name, version in binary_candidates.items()],
-            {},
-            wheels_only=True,
-            no_dependencies=True,
-        )
-        if binaries is not None:
-            archive_binary_packages.update(binaries)
-        else:
-            for name, version in binary_candidates.items():
-                binary, _ = await _compile(
-                    [f"{name}=={version}"], {}, wheels_only=True, no_dependencies=True
-                )
-                if binary is not None:
-                    archive_binary_packages.update(binary)
-    archive_source_packages -= set(immutable) | set(archive_binary_packages)
 
     plugin_inputs = [*active_requirements, *candidate_inputs]
-    wheel_probe_packages = set(resolved) - archive_source_packages
-    wheel_probe_packages.update(archive_wheel_packages)
     plugin_resolved, plugin_error = await _compile(
         plugin_inputs,
         resolved,
         wheels_only=False,
-        restricted_packages=tuple(sorted(wheel_probe_packages)),
+        restricted_packages=tuple(sorted(resolved)),
     )
     if plugin_resolved is None:
-        if archive_wheel_packages:
-            archive_probe, archive_error = await _compile(
-                [
-                    *_archive_requirement_inputs(archive, archive_wheel_packages),
-                    *_archive_pin_requirements(archive, archive_wheel_packages),
-                ],
-                immutable,
-                wheels_only=False,
-                restricted_packages=tuple(sorted(archive_wheel_packages)),
-            )
-            if archive_probe is None:
-                raise archive_conflict(
-                    "archive_requirements_unsatisfied",
-                    failure_stage="archive_probe",
-                    relevant_packages=sorted(relevant_archive_packages),
-                    diagnostic=archive_error,
-                )
         plugin_resolved, source_error = await _compile(
-            plugin_inputs,
-            resolved,
-            wheels_only=False,
-            restricted_packages=tuple(sorted(archive_wheel_packages)),
+            plugin_inputs, resolved, wheels_only=False
         )
         if plugin_resolved is None:
             raise DependencyAnalysisError(
@@ -1413,20 +1130,6 @@ async def solve_install(
             and name not in FORBIDDEN_LAYER_PACKAGES
         ):
             layer_packages[name] = resolved.get(name, str(info["version"]))
-    private_packages = {
-        name: version for name, version in layer_packages.items() if name not in shared
-    }
-    dependency_details = {
-        name: {
-            "distribution_name": name,
-            "version": version,
-            "top_level_modules": [],
-            "nonebot_plugin_ids": [],
-            "source": "source" if source_required else "wheel",
-            "runtime_role": "python_dependency",
-        }
-        for name, version in sorted(layer_packages.items())
-    }
     changes = _package_changes(layer_packages, current)
     affected = {
         candidate_name,
@@ -1445,20 +1148,12 @@ async def solve_install(
         }
         for item in [*changes["added"], *changes["changed"], *shared_changes]
     }
-    private_changes = [
-        item
-        for item in [*changes["added"], *changes["changed"]]
-        if item["name"] in private_packages
-    ]
-    dependency_source_build_required = source_required
     wheel_status = _wheel_availability(metadata)
-    root_wheel_available = bool(wheel_status["compatible"])
     pure_root_wheel = any(
         filename.endswith(("-py3-none-any.whl", "-py2.py3-none-any.whl"))
         for filename in wheel_status["compatible_wheel_files"]
     )
-    plugin_source_build_required = not root_wheel_available
-    source_required = dependency_source_build_required or plugin_source_build_required
+    source_required = source_required or not wheel_status["compatible"]
     candidate_requirement_names = {
         canonicalize_name(requirement.name)
         for requirement in _active_metadata_requirements(metadata)
@@ -1482,63 +1177,16 @@ async def solve_install(
         "package_changes": changes,
         "change_sources": change_sources,
         "candidate_packages": sorted(candidate_scope),
-        "archive_binary_packages": archive_binary_packages,
-        "version_policy": "preserve_existing_scoped_changes",
-        "core_changes": core_changes,
-        "immutable_conflicts": core_changes,
         "shared_changes": shared_changes,
-        "private_changes": private_changes,
         "compatibility_overrides": overrides,
         "remaining_conflicts": retained_conflicts(snapshot, affected),
-        "affected_packages": sorted(affected),
-        "compatibility_trial": "pending" if overrides else "not_required",
-        "native_changes": [],
-        "dependency_tiers": {
-            "immutable_core": sorted(immutable),
-            "shared_compatible": sorted(shared),
-            "plugin_private": sorted(private_packages),
-        },
-        "environment_warnings": [
-            *report["compatible_shared_drift"],
-            *report["extra_packages"],
-        ],
         "non_core_changes": [*shared_changes, *changes["changed"]],
         "source_build_required": source_required,
-        "dependency_source_build_required": dependency_source_build_required,
-        "plugin_source_build_required": plugin_source_build_required,
-        "source_build_reasons": [
-            *(
-                ["dependency_wheel_unavailable"]
-                if dependency_source_build_required
-                else []
-            ),
-            *(
-                [
-                    "plugin_wheel_incompatible"
-                    if wheel_status["wheel_present"]
-                    else "plugin_wheel_unavailable"
-                ]
-                if plugin_source_build_required
-                else []
-            ),
-        ],
         "pure_python_candidate": (
             pure_root_wheel and not source_required and not overrides
         ),
-        "used_relaxed_resolution": relaxed,
-        "resolver_note": strict_error if relaxed else None,
         "solver_policy_version": SOLVER_POLICY_VERSION,
-        "binary_policy": {
-            "mode": "restricted_packages",
-            "wheels_only": False,
-            "restricted_packages": sorted(archive_wheel_packages),
-            "archive_packages": sorted(archive_packages),
-            "relevant_archive_packages": sorted(relevant_archive_packages),
-            "source_build_packages": sorted(archive_source_packages),
-        },
         "candidate_inputs": candidate_inputs,
-        "dependency_details": dependency_details,
-        "plugin_wheel": wheel_status,
         "database_migration_possible": database_migration_possible,
         "database_type": database_type,
     }
@@ -1583,11 +1231,6 @@ def _plugin_released_packages(
 def uninstall_plan(
     plugin: dict[str, Any], *, manifest: dict[str, Any] | None = None
 ) -> dict[str, Any]:
-    from zhenxun.services.plugin_store.plugin_archive_dependencies import (
-        archive_dependency_contract,
-    )
-
-    archive = archive_dependency_contract()
     manifest = manifest or load_manifest()
     packages = {
         canonicalize_name(name): str(info["version"])
@@ -1606,28 +1249,12 @@ def uninstall_plan(
             for item in snapshot.declarations
             if item["name"] == project and item["owner"] != project
         }
-        | ({"archive"} if project in archive["packages"] else set())
     )
     if not owners:
         packages.pop(project, None)
     released, imported = _plugin_released_packages(manifest, project)
     for name in released:
         packages.pop(canonicalize_name(name), None)
-    core = protected_core()
-    for name, version in archive["packages"].items():
-        if name in packages and packages[name] != version:
-            raise DependencyAnalysisError(
-                "archive_dependency_conflict",
-                "卸载计划与归档依赖版本不一致",
-                details={
-                    "package": name,
-                    "expected": version,
-                    "actual": packages[name],
-                    "archive_owners": archive.get("resolved_records", []),
-                },
-            )
-        if name not in core:
-            packages[name] = version
     return {
         "requirements": [],
         "resolved_packages": packages,
@@ -1655,10 +1282,7 @@ def uninstall_plan(
                 if name not in packages
             ],
         },
-        "core_changes": [],
-        "immutable_conflicts": [],
         "shared_changes": [],
-        "private_changes": [],
         "compatibility_overrides": [],
         "retained": (
             [
@@ -1675,18 +1299,9 @@ def uninstall_plan(
         "remaining_conflicts": retained_conflicts(
             snapshot, set() if owners else {project}
         ),
-        "native_changes": [],
-        "dependency_tiers": {
-            "immutable_core": sorted(protected_core()),
-            "shared_compatible": sorted(shared_dependencies()),
-            "plugin_private": sorted(packages),
-        },
-        "environment_warnings": [],
         "non_core_changes": [],
         "source_build_required": False,
         "pure_python_candidate": True,
-        "used_relaxed_resolution": False,
-        "resolver_note": None,
         "solver_policy_version": SOLVER_POLICY_VERSION,
         "candidate_inputs": [],
         "database_migration_possible": False,
@@ -1745,203 +1360,3 @@ def parse_requirement(value: str) -> Requirement:
     if requirement.name == "nonebot":
         raise DependencyAnalysisError("nonebot1_plugin")
     return requirement
-
-
-async def preflight_source_requirements(files: list[Path]) -> dict[str, Any]:
-    """Validate source-store requirements against the managed dependency layer."""
-    from zhenxun.services.plugin_store.plugin_archive_dependencies import (
-        archive_dependency_contract,
-    )
-
-    archive = archive_dependency_contract()
-    requirements = read_requirement_files(files)
-    if not requirements:
-        return {
-            "resolved_packages": {},
-            "package_changes": {"added": [], "changed": [], "removed": []},
-            "candidate_inputs": [],
-        }
-    drift = environment_drift()
-    if drift:
-        raise DependencyAnalysisError("environment_drift")
-    current = installed_inventory()
-    core = protected_core()
-    candidate_inputs = list(requirements)
-    archive_packages = set(archive.get("packages", {})) | _requirement_names(
-        archive.get("requirements", [])
-    )
-    candidate_scope = _requirement_names(candidate_inputs)
-    candidate_probe: dict[str, str] | None = None
-    if archive_packages:
-        candidate_probe, _ = await _compile(
-            candidate_inputs,
-            core,
-            wheels_only=False,
-        )
-        candidate_scope.update(candidate_probe or {})
-    relevant_archive_packages = (
-        set(archive_packages)
-        if archive_packages and candidate_probe is None
-        else candidate_scope & archive_packages
-    )
-    pinned_archive_packages = relevant_archive_packages & set(
-        archive.get("packages", {})
-    )
-    archive_wheel_packages = relevant_archive_packages & set(
-        archive.get("wheels_only_packages", [])
-    )
-    archive_source_packages = relevant_archive_packages & set(
-        archive.get("source_build_packages", [])
-    )
-    requirements.extend(
-        [
-            *_archive_requirement_inputs(archive, relevant_archive_packages),
-            *_archive_pin_requirements(archive, relevant_archive_packages),
-        ]
-    )
-    from .manual import manual_requirements
-
-    requirements.extend(
-        raw
-        for values in manual_requirements(load_manifest()).values()
-        for raw in values
-    )
-    resolved, error = await _compile(
-        requirements,
-        current,
-        wheels_only=False,
-        restricted_packages=tuple(sorted(archive_wheel_packages)),
-    )
-    if resolved is None:
-        resolved, error = await _compile(
-            requirements,
-            core,
-            wheels_only=False,
-            restricted_packages=tuple(sorted(archive_wheel_packages)),
-        )
-    if resolved is None:
-        if archive_wheel_packages:
-            archive_probe, archive_error = await _compile(
-                [
-                    *_archive_requirement_inputs(archive, archive_wheel_packages),
-                    *_archive_pin_requirements(archive, archive_wheel_packages),
-                ],
-                core,
-                wheels_only=False,
-                restricted_packages=tuple(sorted(archive_wheel_packages)),
-            )
-            if archive_probe is None:
-                from zhenxun.services.installer_network import (
-                    UV_BINARY_POLICY_VERSION,
-                    uv_version,
-                )
-
-                raise DependencyAnalysisError(
-                    "archive_dependency_conflict",
-                    "归档 wheel 约束无法满足当前环境",
-                    details={
-                        "archive_owners": archive.get("resolved_records", []),
-                        "packages": archive.get("packages", {}),
-                        "relevant_packages": sorted(relevant_archive_packages),
-                        "diagnostic": archive_error,
-                        "python": platform.python_version(),
-                        "python_executable": sys.executable,
-                        "platform": sys.platform,
-                        "machine": platform.machine(),
-                        "environment_fingerprint": archive.get(
-                            "environment_fingerprint"
-                        ),
-                        "receipt_environment_fingerprints": archive.get(
-                            "receipt_environment_fingerprints", {}
-                        ),
-                        "uv_version": uv_version(),
-                        "binary_policy_version": UV_BINARY_POLICY_VERSION,
-                        "failure_stage": "archive_probe",
-                    },
-                )
-        raise DependencyAnalysisError("core_dependency_conflict", error)
-    if any(
-        resolved.get(name) != archive["packages"][name]
-        for name in pinned_archive_packages
-    ):
-        from zhenxun.services.installer_network import (
-            UV_BINARY_POLICY_VERSION,
-            uv_version,
-        )
-
-        raise DependencyAnalysisError(
-            "archive_dependency_conflict",
-            "归档依赖与当前解析结果不一致",
-            details={
-                "archive_owners": archive.get("resolved_records", []),
-                "packages": archive.get("packages", {}),
-                "relevant_packages": sorted(relevant_archive_packages),
-                "actual": {
-                    name: resolved.get(name) for name in pinned_archive_packages
-                },
-                "python": platform.python_version(),
-                "python_executable": sys.executable,
-                "platform": sys.platform,
-                "machine": platform.machine(),
-                "environment_fingerprint": archive.get("environment_fingerprint"),
-                "receipt_environment_fingerprints": archive.get(
-                    "receipt_environment_fingerprints", {}
-                ),
-                "uv_version": uv_version(),
-                "binary_policy_version": UV_BINARY_POLICY_VERSION,
-                "failure_stage": "archive_validation",
-            },
-        )
-    for name, version in resolved.items():
-        if name in core and core[name] != version:
-            raise DependencyAnalysisError("core_dependency_conflict")
-    wheel_probe_packages = set(resolved) - archive_source_packages
-    wheel_probe_packages.update(archive_wheel_packages)
-    wheel_resolved, wheel_error = await _compile(
-        requirements,
-        resolved,
-        wheels_only=False,
-        restricted_packages=tuple(sorted(wheel_probe_packages)),
-    )
-    source_build_required = wheel_resolved is None
-    if source_build_required and archive_wheel_packages:
-        archive_probe, archive_error = await _compile(
-            [
-                *_archive_requirement_inputs(archive, archive_wheel_packages),
-                *_archive_pin_requirements(archive, archive_wheel_packages),
-            ],
-            core,
-            wheels_only=False,
-            restricted_packages=tuple(sorted(archive_wheel_packages)),
-        )
-        if archive_probe is None:
-            raise DependencyAnalysisError(
-                "archive_wheel_dependencies_unresolved",
-                archive_error,
-            )
-    return {
-        "resolved_packages": resolved,
-        "package_changes": _package_changes(resolved, current),
-        "candidate_inputs": candidate_inputs,
-        "dependency_details": {
-            name: {
-                "distribution_name": name,
-                "version": version,
-                "top_level_modules": [],
-                "nonebot_plugin_ids": [],
-                "source": "source" if source_build_required else "wheel",
-                "runtime_role": "python_dependency",
-            }
-            for name, version in sorted(resolved.items())
-        },
-        "source_build_required": source_build_required,
-        "source_build_detail": wheel_error if source_build_required else None,
-        "binary_policy": {
-            "mode": "restricted_packages",
-            "wheels_only": False,
-            "restricted_packages": sorted(archive_wheel_packages),
-            "archive_packages": sorted(archive_packages),
-            "relevant_archive_packages": sorted(relevant_archive_packages),
-            "source_build_packages": sorted(archive_source_packages),
-        },
-    }

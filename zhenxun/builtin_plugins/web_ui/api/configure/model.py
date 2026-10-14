@@ -70,37 +70,3 @@ class ApplyRequest(BaseModel):
 
 class RestartRequest(BaseModel):
     receipt: str = Field(min_length=16, max_length=256)
-
-
-# Compatibility payloads for old WebUI builds.
-class DatabaseTest(BaseModel):
-    db_url: str
-
-
-class RedisTest(BaseModel):
-    redis_host: str
-    redis_port: int = Field(default=6379, ge=1, le=65535)
-    redis_password: str = ""
-
-
-class Setting(BaseModel):
-    superusers: list[str]
-    db_url: str
-    host: str
-    port: int = Field(ge=1, le=65535)
-    username: str
-    password: str
-    cache_mode: Literal["NONE", "MEMORY", "REDIS"] = "NONE"
-    redis_host: str = "127.0.0.1"
-    redis_port: int = Field(default=6379, ge=1, le=65535)
-    redis_password: str = ""
-
-    @model_validator(mode="before")
-    @classmethod
-    def normalize_mode(cls, values):
-        if isinstance(values, dict):
-            values = {
-                **values,
-                "cache_mode": normalize_cache_mode(values.get("cache_mode")),
-            }
-        return values

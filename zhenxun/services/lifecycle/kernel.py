@@ -5,26 +5,19 @@ from collections.abc import Callable, Coroutine
 import contextlib
 from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 import inspect
-import os
-from pathlib import Path
 import time
 from typing import Any, Literal
 
 from strenum import StrEnum
 
-from zhenxun.utils.atomic_json import write_json_locked
-
 from .deadline import WORKER_SHUTDOWN_SECONDS, remaining_timeout, shutdown_budget
 
 LifecycleStage = Literal["management", "runtime", "warmup"]
 FailurePolicy = Literal["fatal", "degrade"]
-RestartPolicy = Literal["component", "worker"]
 StartCallback = Callable[..., Any]
 StopCallback = Callable[[], Any]
 
-_DEFAULT_RECEIPT_PATH = Path("data/runtime/worker-shutdown-receipt.json")
 _MAX_CONCURRENT_STARTS = 4
 
 
@@ -49,12 +42,11 @@ class ComponentSpec:
     depends_on: tuple[str, ...] = ()
     timeout: float | None = None
     failure_policy: FailurePolicy = "fatal"
-    restart_policy: RestartPolicy = "worker"
     config_keys: tuple[str, ...] = ()
+    """读取的配置键，变更时组件随之重启"""
     priority: int = 0
     stop_priority: int | None = None
     parallel_safe: bool = False
-    source: str = "native"
 
     def __post_init__(self) -> None:
         if not self.component_id or self.component_id.strip() != self.component_id:
@@ -64,21 +56,6 @@ class ComponentSpec:
         if self.timeout is not None and self.timeout <= 0:
             raise ValueError("component_timeout_invalid")
 
-    def public_dict(self) -> dict[str, Any]:
-        return {
-            "component_id": self.component_id,
-            "stage": self.stage,
-            "depends_on": list(self.depends_on),
-            "timeout": self.timeout,
-            "failure_policy": self.failure_policy,
-            "restart_policy": self.restart_policy,
-            "config_keys": list(self.config_keys),
-            "priority": self.priority,
-            "stop_priority": self.stop_priority,
-            "parallel_safe": self.parallel_safe,
-            "source": self.source,
-        }
-
 
 @dataclass(slots=True)
 class LifecycleOperationResult:
@@ -86,20 +63,6 @@ class LifecycleOperationResult:
     affected_components: list[str]
     reason_codes: list[str] = field(default_factory=list)
     rollback_state: str = "none"
-    runtime_generation: int = 0
-
-    def public_dict(self) -> dict[str, Any]:
-        return {
-            "apply_effect": self.apply_effect,
-            "affected_components": list(self.affected_components),
-            "reason_codes": list(self.reason_codes),
-            "rollback_state": self.rollback_state,
-            "runtime_generation": self.runtime_generation,
-        }
-
-
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
 
 def _error_code(error: BaseException) -> str:
@@ -252,48 +215,29 @@ class _Registration:
         self.context: LifecycleContext | None = None
         self.value: Any = None
         self.error_code: str | None = None
-        self.generation = 0
-        self.started_at: str | None = None
-        self.stopped_at: str | None = None
-        self.duration_ms: float | None = None
 
     def public_dict(self) -> dict[str, Any]:
         return {
-            **self.spec.public_dict(),
+            "component_id": self.spec.component_id,
+            "stage": self.spec.stage,
+            "depends_on": list(self.spec.depends_on),
             "state": self.state.value,
             "error_code": self.error_code,
-            "runtime_generation": self.generation,
-            "started_at": self.started_at,
-            "stopped_at": self.stopped_at,
-            "duration_ms": self.duration_ms,
         }
 
 
 class LifecycleKernel:
-    def __init__(self, receipt_path: Path | None = None) -> None:
+    def __init__(self) -> None:
         self._registrations: dict[str, _Registration] = {}
         self._start_order: list[str] = []
         self._operation_lock = asyncio.Lock()
-        self._generation = 0
-        self._recovery_required: set[str] = set()
-        self._process_metadata: dict[str, Any] = {}
-        self._receipt_path = receipt_path
-        self._receipt_written = False
         self._shutdown_requested = False
         self._shutdown_deadline: float | None = None
         self._starting_tasks: set[asyncio.Task[Any]] = set()
 
     @property
-    def runtime_generation(self) -> int:
-        return self._generation
-
-    @property
     def shutdown_requested(self) -> bool:
         return self._shutdown_requested
-
-    @property
-    def process_metadata(self) -> dict[str, Any]:
-        return dict(self._process_metadata)
 
     def register(
         self,
@@ -324,32 +268,6 @@ class LifecycleKernel:
             spec, start, stop, pass_context=pass_context
         )
 
-    def set_process_metadata(self, **metadata: Any) -> None:
-        """更新进程级元数据，用于关闭收据的身份标识
-
-        参数:
-            metadata: 要合并的元数据
-        """
-        self._process_metadata.update(metadata)
-
-    def require_recovery(self, owner: str) -> None:
-        """标记某个资源未能确认释放，关闭收据将不被确认
-
-        参数:
-            owner: 资源所属的组件或模块
-        """
-        self._recovery_required.add(owner)
-
-    def unregister_declared(self, component_id: str) -> None:
-        if component_id in self._start_order:
-            raise LifecycleError(f"component_active:{component_id}")
-        self._registrations.pop(component_id, None)
-        self._recovery_required.discard(component_id)
-
-    def unregister_components(self, component_ids: set[str]) -> None:
-        for component_id in sorted(component_ids, reverse=True):
-            self.unregister_declared(component_id)
-
     def component_context(self, component_id: str) -> LifecycleContext:
         registration = self._registrations.get(component_id)
         if registration is None or registration.context is None:
@@ -358,30 +276,36 @@ class LifecycleKernel:
             raise LifecycleError(f"component_scope_revoked:{component_id}")
         return registration.context
 
+    def spawn_task(
+        self,
+        component_id: str,
+        coroutine: Coroutine[Any, Any, Any],
+        *,
+        name: str | None = None,
+    ) -> asyncio.Task[Any]:
+        """创建归属于组件的后台任务，组件未运行时创建普通任务
+
+        参数:
+            component_id: 组件 ID
+            coroutine: 任务协程
+            name: 任务名称
+
+        返回:
+            asyncio.Task[Any]: 已创建的任务
+        """
+        try:
+            context = self.component_context(component_id)
+        except LifecycleError:
+            return asyncio.create_task(coroutine, name=name)
+        return context.spawn_task(coroutine, name=name, degrade_on_error=False)
+
     def validate(self) -> None:
-        specs = {key: value.spec for key, value in self._registrations.items()}
-        for component_id, spec in specs.items():
-            if missing := set(spec.depends_on) - set(specs):
+        for component_id, registration in self._registrations.items():
+            if missing := set(registration.spec.depends_on) - set(self._registrations):
                 raise LifecycleError(
                     "component_dependency_missing:"
                     f"{component_id}:{','.join(sorted(missing))}"
                 )
-        visiting: set[str] = set()
-        completed: set[str] = set()
-
-        def visit(component_id: str) -> None:
-            if component_id in completed:
-                return
-            if component_id in visiting:
-                raise LifecycleError(f"component_dependency_cycle:{component_id}")
-            visiting.add(component_id)
-            for dependency in specs[component_id].depends_on:
-                visit(dependency)
-            visiting.remove(component_id)
-            completed.add(component_id)
-
-        for component_id in sorted(specs):
-            visit(component_id)
 
     async def start_components(self, component_ids: set[str]) -> None:
         """按依赖和优先级启动组件，致命失败时回滚本次已启动的组件
@@ -486,16 +410,12 @@ class LifecycleKernel:
             if running:
                 for task in running:
                     task.cancel()
-                done, unresolved = await asyncio.wait(
-                    running, timeout=remaining_timeout(5.0)
-                )
+                done, _ = await asyncio.wait(running, timeout=remaining_timeout(5.0))
                 for task in done:
                     if not task.cancelled():
                         task.exception()
                     if running[task] in self._start_order:
                         started.append(running[task])
-                for task in unresolved:
-                    self.require_recovery(running[task])
 
     def _block_failed_dependants(self, pending: set[str]) -> None:
         for component_id in sorted(pending):
@@ -521,7 +441,6 @@ class LifecycleKernel:
         registration.error_code = None
         context = LifecycleContext(self, registration.spec)
         registration.context = context
-        started = time.monotonic()
         task = asyncio.current_task()
         if task is not None:
             self._starting_tasks.add(task)
@@ -538,11 +457,7 @@ class LifecycleKernel:
             if self._shutdown_requested:
                 raise asyncio.CancelledError
             context.value = registration.value = result
-            self._generation += 1
-            registration.generation = self._generation
             registration.state = ComponentState.READY
-            registration.started_at = _now()
-            registration.stopped_at = None
             self._start_order.append(component_id)
         except BaseException as error:
             cancelled = isinstance(error, asyncio.CancelledError)
@@ -560,14 +475,12 @@ class LifecycleKernel:
                 await context.close()
             except BaseException:
                 registration.state = ComponentState.FAILED
-                self.require_recovery(component_id)
             registration.context = None
             registration.value = None
             if cancelled or registration.spec.failure_policy == "fatal":
                 raise
         finally:
             self._starting_tasks.discard(task)  # type: ignore[arg-type]
-            registration.duration_ms = round((time.monotonic() - started) * 1000, 2)
 
     def _task_failed(
         self, component_id: str, task: asyncio.Task[Any], error: BaseException
@@ -633,54 +546,6 @@ class LifecycleKernel:
             return maximum
         return min(maximum, max(0.0, self._shutdown_deadline - time.monotonic()))
 
-    def finalize_terminal_receipt(
-        self, *, exit_signals: list[int] | None = None
-    ) -> None:
-        """事件循环结束后写入关闭收据，供 launcher 和迁移确认资源已释放
-
-        参数:
-            exit_signals: 进程收到的退出信号
-        """
-        if self._receipt_path is None or self._receipt_written:
-            return
-        running = sorted(
-            component_id
-            for component_id, registration in self._registrations.items()
-            if component_id in self._start_order
-            or registration.state in {ComponentState.STARTING, ComponentState.STOPPING}
-        )
-        recovery_required = sorted(self._recovery_required | set(running))
-        metadata = self._process_metadata
-        receipt = {
-            "identity": {
-                "pid": os.getpid(),
-                "boot_id": metadata.get("boot_id"),
-                "launcher_boot_id": metadata.get("launcher_boot_id"),
-                "startup_id": metadata.get("startup_id"),
-            },
-            "recorded_at": _now(),
-            "exit_signals": list(exit_signals or []),
-            "result": "confirmed"
-            if self._shutdown_requested and not recovery_required
-            else "unconfirmed",
-            "budget_remaining_ms": round(self.shutdown_remaining(15.0) * 1000, 2),
-            "budget_exhausted": self.shutdown_remaining(15.0) <= 0,
-            "recovery_required": recovery_required,
-            "failed_components": [
-                {"component_id": component_id, "error_code": registration.error_code}
-                for component_id, registration in sorted(self._registrations.items())
-                if registration.state is ComponentState.FAILED
-            ][:16],
-        }
-        try:
-            write_json_locked(self._receipt_path, receipt, timeout=1)
-        except (OSError, TimeoutError):
-            from zhenxun.services.log import logger
-
-            logger.error("关闭收据写入失败", "Lifecycle")
-        else:
-            self._receipt_written = True
-
     @asynccontextmanager
     async def _shutdown_operation_lock(self):
         try:
@@ -688,7 +553,6 @@ class LifecycleKernel:
                 self._operation_lock.acquire(), remaining_timeout(15)
             )
         except asyncio.TimeoutError:
-            self.require_recovery("lifecycle:startup_shutdown_timeout")
             raise LifecycleError("startup_shutdown_timeout") from None
         try:
             yield
@@ -750,14 +614,12 @@ class LifecycleKernel:
             self._start_order.remove(component_id)
             registration.context = None
             registration.value = None
-            registration.stopped_at = _now()
             registration.state = (
                 ComponentState.FAILED if error else ComponentState.STOPPED
             )
         if error is None:
             return
         registration.error_code = f"component_stop_failed:{_error_code(error)}"
-        self.require_recovery(component_id)
         from zhenxun.services.log import logger
 
         logger.error(
@@ -792,20 +654,8 @@ class LifecycleKernel:
             if normalized & {key.upper() for key in registration.spec.config_keys}
         }
         if not direct:
-            return LifecycleOperationResult(
-                "no_change", [], runtime_generation=self._generation
-            )
+            return LifecycleOperationResult("no_change", [])
         affected = self._dependent_closure(direct)
-        if any(
-            self._registrations[item].spec.restart_policy != "component"
-            for item in affected
-        ):
-            return LifecycleOperationResult(
-                "restart_pending",
-                sorted(affected),
-                ["component_not_restartable"],
-                runtime_generation=self._generation,
-            )
         from zhenxun.services.runtime_mutation import runtime_mutation_coordinator
 
         async with (
@@ -834,11 +684,7 @@ class LifecycleKernel:
                 await value
             change_applied = True
             await self._start_subset(set(active), started)
-            return LifecycleOperationResult(
-                "component_restarted",
-                sorted(affected),
-                runtime_generation=self._generation,
-            )
+            return LifecycleOperationResult("component_restarted", sorted(affected))
         except BaseException as error:
             for component_id in reversed(started):
                 await self._stop_one(component_id, suppress_errors=True)
@@ -858,10 +704,9 @@ class LifecycleKernel:
                     sorted(affected),
                     reasons,
                     "worker_recovery_required",
-                    self._generation,
                 )
             return LifecycleOperationResult(
-                "rolled_back", sorted(affected), reasons, "semantic", self._generation
+                "rolled_back", sorted(affected), reasons, "semantic"
             )
 
     def _dependent_closure(self, direct: set[str]) -> set[str]:
@@ -887,36 +732,16 @@ class LifecycleKernel:
         from zhenxun.services.runtime_mutation import runtime_mutation_coordinator
 
         return {
-            "runtime_generation": self._generation,
             "shutdown_requested": self._shutdown_requested,
             "component_count": len(components),
             "state_counts": dict(sorted(states.items())),
-            "recovery_required": sorted(self._recovery_required),
             "current_mutation": runtime_mutation_coordinator.status(),
             "components": components,
         }
 
     def component_status(self, component_id: str) -> dict[str, Any] | None:
         registration = self._registrations.get(component_id)
-        if registration is None:
-            return None
-        return {
-            **registration.public_dict(),
-            "recovery_required": component_id in self._recovery_required,
-        }
-
-    def native_component_ids_for_stage(self, stage: LifecycleStage) -> set[str]:
-        return {
-            component_id
-            for component_id, registration in self._registrations.items()
-            if registration.spec.stage == stage
-            and registration.spec.source != "priority_lifecycle"
-        }
+        return None if registration is None else registration.public_dict()
 
 
-def _receipt_path_from_environment() -> Path:
-    value = os.getenv("ZHENXUN_SHUTDOWN_RECEIPT_PATH", "").strip()
-    return Path(value) if value else _DEFAULT_RECEIPT_PATH
-
-
-lifecycle_kernel = LifecycleKernel(_receipt_path_from_environment())
+lifecycle_kernel = LifecycleKernel()

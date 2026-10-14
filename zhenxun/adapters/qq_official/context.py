@@ -23,6 +23,7 @@ from nonebot.adapters.qq.event import (
 )
 from tortoise.exceptions import IntegrityError
 
+from zhenxun.services.log import logger
 from zhenxun.services.platform_identity import CURRENT_PLATFORM_SCOPE
 from zhenxun.utils.exception import DependencyUnavailable
 
@@ -36,6 +37,8 @@ from .cache import (
 from .models import QQOfficialIdentity, QQOfficialPrincipal, QQWebhookReceipt
 
 OfficialScene = Literal["c2c", "group", "guild"]
+# 需要回应的互动类型：11 消息按钮，12 单聊快捷菜单
+ANSWERABLE_INTERACTION_TYPES = (11, 12)
 _reply_state_creation_lock = asyncio.Lock()
 
 
@@ -162,7 +165,7 @@ def with_official_event_context(
 
 def _event_address(event: Event) -> tuple[OfficialScene, str, str] | None:
     if isinstance(event, InteractionCreateEvent):
-        if event.type != 11:
+        if event.type not in ANSWERABLE_INTERACTION_TYPES:
             return None
         if event.chat_type == 1:
             return "group", str(event.group_member_openid), str(event.group_openid)
@@ -191,7 +194,10 @@ def _event_address(event: Event) -> tuple[OfficialScene, str, str] | None:
 
 def validate_button_interaction(app_id: str, event: Event) -> None:
     """Validate addresses before either identity creation or transport receipts."""
-    if not isinstance(event, InteractionCreateEvent) or event.type != 11:
+    if (
+        not isinstance(event, InteractionCreateEvent)
+        or event.type not in ANSWERABLE_INTERACTION_TYPES
+    ):
         return
     if str(event.application_id) != str(app_id):
         raise ValueError("interaction application_id mismatch")
@@ -384,6 +390,10 @@ class OfficialReplyExpired(OfficialReplyUnavailable, DependencyUnavailable):
     """The passive reply capability expired; no protocol request was sent."""
 
 
+class OfficialReplyExhausted(OfficialReplyUnavailable):
+    """The passive reply count for this message is used up."""
+
+
 async def allocate_reply_sequence(
     context: OfficialQQEventContext,
 ) -> tuple[ReplyState, int]:
@@ -413,11 +423,45 @@ async def allocate_reply_sequence(
         if datetime.now(timezone.utc) >= state.deadline:
             raise OfficialReplyExpired("QQ passive reply window expired")
         if state.successful + state.in_flight >= state.max_successful:
-            raise OfficialReplyUnavailable("QQ passive reply limit reached")
+            raise OfficialReplyExhausted("QQ passive reply limit reached")
         sequence = state.next_sequence
         state.next_sequence += 1
         state.in_flight += 1
     return state, sequence
+
+
+def _proactive_fallback_enabled() -> bool:
+    import nonebot
+
+    from .config import QQOfficialConfig
+
+    return nonebot.get_plugin_config(QQOfficialConfig).qq_proactive_fallback
+
+
+async def reserve_passive_reply(
+    context: OfficialQQEventContext,
+) -> tuple[ReplyState, int] | None:
+    """申请被动回复序号
+
+    被动回复已过期或条数用尽时，若允许主动消息兜底则返回 None。
+
+    参数:
+        context: 官方事件上下文
+
+    返回:
+        tuple[ReplyState, int] | None: 回复状态与 msg_seq，None 表示改用主动消息
+    """
+    try:
+        return await allocate_reply_sequence(context)
+    except (OfficialReplyExpired, OfficialReplyExhausted) as exc:
+        if not _proactive_fallback_enabled():
+            raise
+        logger.debug(
+            f"QQ 被动回复不可用，改用主动消息: {exc}",
+            "QQOfficial",
+            target=context.app_id,
+        )
+        return None
 
 
 async def finish_reply(state: ReplyState, *, successful: bool) -> None:
@@ -447,7 +491,9 @@ async def invalidate_principal(principal_id: UUID) -> None:
 
 
 __all__ = [
+    "ANSWERABLE_INTERACTION_TYPES",
     "OfficialQQEventContext",
+    "OfficialReplyExhausted",
     "OfficialReplyExpired",
     "OfficialReplyUnavailable",
     "activate_event_official_context",
@@ -462,6 +508,7 @@ __all__ = [
     "prepare_event_context",
     "receipt_seen",
     "release_webhook_receipt",
+    "reserve_passive_reply",
     "reserve_webhook_receipt",
     "with_official_event_context",
 ]

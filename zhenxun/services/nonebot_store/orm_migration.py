@@ -5,7 +5,6 @@ import asyncio
 from contextlib import closing, suppress
 import json
 from pathlib import Path
-import shutil
 import sqlite3
 import sys
 from typing import Any
@@ -14,12 +13,11 @@ import click
 import nonebot
 
 from .storage import (
-    ORM_MIGRATION_STATUS_FILE,
     PENDING_FILE,
     STORE_ROOT,
     generation_path,
     pending_transaction,
-    utc_now,
+    remove_orm_backups,
     write_json,
 )
 
@@ -128,10 +126,6 @@ def restore() -> int:
                 source.backup(target)
         elif not item.get("existed"):
             path.unlink(missing_ok=True)
-    write_json(
-        ORM_MIGRATION_STATUS_FILE,
-        {"status": "restored", "revision": revision, "updated_at": utc_now()},
-    )
     return 0
 
 
@@ -140,10 +134,7 @@ def finalize() -> int:
     revision = str(transaction.get("revision") or "")
     if not revision:
         return 0
-    root = _backup_root(revision)
-    if root.is_dir():
-        shutil.rmtree(root)
-    ORM_MIGRATION_STATUS_FILE.unlink(missing_ok=True)
+    remove_orm_backups()
     return 0
 
 
@@ -179,32 +170,12 @@ async def apply(*, manual_external: bool = False) -> int:
             except click.ClickException:
                 migration_required = True
             if not migration_required:
-                write_json(
-                    ORM_MIGRATION_STATUS_FILE,
-                    {
-                        "status": "current",
-                        "revision": revision,
-                        "updated_at": utc_now(),
-                    },
-                )
                 return 0
             if external and not manual_external:
-                write_json(
-                    ORM_MIGRATION_STATUS_FILE,
-                    {
-                        "status": "external_manual_required",
-                        "revision": revision,
-                        "updated_at": utc_now(),
-                    },
-                )
                 return 3
             cmd_opts.cmd = (migrate.upgrade, [], [])
             external_write_started = external
             await greenlet_spawn(migrate.upgrade, config)
-        write_json(
-            ORM_MIGRATION_STATUS_FILE,
-            {"status": "migrated", "revision": revision, "updated_at": utc_now()},
-        )
         return 0
     except Exception as error:
         from .dependencies import safe_process_error
@@ -224,16 +195,9 @@ async def apply(*, manual_external: bool = False) -> int:
                 "code": type(failure).__name__,
                 "diagnostic": safe_process_error(str(failure)),
             }
-        write_json(
-            ORM_MIGRATION_STATUS_FILE,
-            {
-                "status": "recovery_required" if rollback_error else "failed",
-                "revision": revision,
-                "error_code": type(error).__name__,
-                "diagnostic": safe_process_error(str(error)),
-                "rollback_error": rollback_error,
-                "updated_at": utc_now(),
-            },
+        sys.stderr.write(
+            f"{type(error).__name__}: {safe_process_error(str(error))}\n"
+            + (f"rollback: {rollback_error}\n" if rollback_error else "")
         )
         if external_write_started:
             write_json(

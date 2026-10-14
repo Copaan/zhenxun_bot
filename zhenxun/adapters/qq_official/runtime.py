@@ -72,8 +72,6 @@ async def _cleanup_loop() -> None:
     priority=2,
     component_id="runtime:qq_official",
     depends_on=("management:database",),
-    restart_policy="worker",
-    config_keys=("QQ_ADAPTER_LOAD", "QQ_BOTS", "QQ_WEBHOOK"),
     pass_context=True,
     # 单个平台适配器出问题不应让整个 runtime 阶段失败、把 worker 打回
     # management/setup_only（那会连带关掉其它平台的入口）。降级即可，

@@ -3,24 +3,19 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from copy import deepcopy
-from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 import importlib.metadata
 import os
-from typing import Any, Literal
+from typing import Any, Literal, TypeVar
 import uuid
 
 from fastapi import APIRouter, Query
 from fastapi.responses import JSONResponse
 from packaging.utils import canonicalize_name
-from packaging.version import InvalidVersion, Version
 from pydantic import BaseModel, Field
 
-from zhenxun.services.lifecycle.operations import operation_registry
+from zhenxun.services.lifecycle import lifecycle_kernel
 from zhenxun.services.log import logger
-from zhenxun.services.nonebot_store.cleanup import (
-    active_transaction as pending_transaction,
-)
 from zhenxun.services.nonebot_store.dependencies import (
     DependencyAnalysisError,
     environment_fingerprint,
@@ -52,7 +47,9 @@ from zhenxun.services.nonebot_store.storage import (
     PENDING_FILE,
     STARTUP_STATUS_FILE,
     clear_pending_transaction,
+    defer_transaction,
     dependency_sync_status,
+    draft_transaction,
     load_manifest,
     read_json,
     remove_generation,
@@ -61,33 +58,28 @@ from zhenxun.services.nonebot_store.storage import (
     utc_now,
     write_json,
 )
-from zhenxun.services.plugin_host import plugin_host
-from zhenxun.services.plugin_store.operation_journal import (
-    operation_status,
-    record_operation,
+from zhenxun.services.nonebot_store.storage import (
+    active_transaction as pending_transaction,
 )
-from zhenxun.services.plugin_store.plugin_archive_dependencies import (
-    ArchiveDependencyConflict,
-    preserve_archive_dependencies,
-)
-from zhenxun.services.plugin_store.plugin_store_transaction import (
-    ArchiveSourceBuildConflict,
-    archive_dependency_policy,
-    preflight_archive_dependency_policy,
-)
+from zhenxun.services.plugin_host import RuntimeOperation, plugin_host
+from zhenxun.services.plugin_store.operation_journal import record_operation
 
 from ....apply_result import update_pending_restart
 from ....base_model import Result
 from ....restart_service import restart_status_data
 from ....utils import authentication
-from .store import StoreOperationBusyError, _store_operation
+from .store import (
+    PreviewStore,
+    StoreOperationBusyError,
+    _store_operation,
+    _version_compare,
+    replayed_bound_operation,
+    run_bound_operation,
+)
 
 router = APIRouter(prefix="/store/nonebot")
-_ANALYSIS_TTL = timedelta(minutes=20)
-_ANALYSES: dict[str, dict[str, Any]] = {}
-_REPAIR_PREVIEWS: dict[str, dict[str, Any]] = {}
-_ACTIVE_APPLIES: dict[str, tuple[str, asyncio.Task]] = {}
-_ACTIVE_REPAIRS: dict[str, tuple[str, asyncio.Task]] = {}
+_ANALYSES = PreviewStore()
+_REPAIR_PREVIEWS = PreviewStore()
 _PENDING_TRANSACTION_STATES = {
     "building",
     "pending_restart",
@@ -108,11 +100,6 @@ class AnalyzePayload(BaseModel):
 class ApplyPayload(BaseModel):
     analysis_id: str = Field(min_length=32, max_length=64)
     operation_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
-    confirm_non_core_changes: bool = False
-    confirm_source_build: bool = False
-    confirm_third_party_code: bool = False
-    confirm_compatibility_overrides: bool = False
-    confirm_database_migration: bool = False
     confirmed: bool = False
     summary_revision: str | None = None
 
@@ -123,6 +110,9 @@ class EnvironmentRepairPayload(BaseModel):
     confirmed: bool = False
     preview_id: str | None = None
     group_ids: list[str] | None = None
+
+
+_BoundPayload = TypeVar("_BoundPayload", ApplyPayload, EnvironmentRepairPayload)
 
 
 async def _environment_view() -> dict[str, Any]:
@@ -138,10 +128,7 @@ async def _environment_view() -> dict[str, Any]:
             "fingerprint": "",
             "repairable": False,
             "immutable_drift": [],
-            "compatible_shared_drift": [],
             "incompatible_shared_drift": [],
-            "extra_packages": [],
-            "extra_count": 0,
             "error_code": error.code,
         }
     except Exception as error:
@@ -150,10 +137,7 @@ async def _environment_view() -> dict[str, Any]:
             "fingerprint": "",
             "repairable": False,
             "immutable_drift": [],
-            "compatible_shared_drift": [],
             "incompatible_shared_drift": [],
-            "extra_packages": [],
-            "extra_count": 0,
             "error_code": type(error).__name__,
         }
     result.setdefault(
@@ -170,16 +154,15 @@ async def _environment_view() -> dict[str, Any]:
         },
     )
     result["sync"] = dependency_sync_status()
-    result["startup_verification"] = read_json(STARTUP_STATUS_FILE, {})
+    startup = read_json(STARTUP_STATUS_FILE, {})
+    startup.pop("environment_versions", None)
+    result["startup_verification"] = startup
     pending = pending_transaction() or {}
     from zhenxun.services.nonebot_store.policy import orm_console_instructions
 
     result["orm_manual"] = orm_console_instructions(pending)
     result["candidate_built"] = isinstance(pending.get("generation"), int)
     result["launcher_managed"] = bool(os.environ.get("ZHENXUN_LAUNCHER_PID"))
-    from zhenxun.services.nonebot_store.cleanup import public_records
-
-    result["cleanup_records"] = public_records()
     return result
 
 
@@ -189,6 +172,8 @@ def _enabled_adapters() -> set[str]:
     enabled = {"nonebot.adapters.onebot.v11"}
     if BotConfig.qq_adapter_load:
         enabled.add("nonebot.adapters.qq")
+    if BotConfig.telegram_adapter_load:
+        enabled.add("nonebot.adapters.telegram")
     return enabled
 
 
@@ -299,11 +284,64 @@ def _external_version(
         return None
 
 
-def _version_is_newer(current: str, target: str) -> bool:
-    try:
-        return Version(target) > Version(current)
-    except InvalidVersion:
-        return current != target
+def _plugin_transaction(project_link: str) -> dict[str, Any] | None:
+    """查找最近一次包含该插件且已确认回滚的事务
+
+    参数:
+        project_link: 插件包名
+
+    返回:
+        dict[str, Any] | None: 需要在商店中展示失败信息的事务
+    """
+    from zhenxun.services.nonebot_store.storage import (
+        pending_transaction as recorded_transaction,
+    )
+    from zhenxun.services.nonebot_store.storage import settled_transactions
+
+    for record in (recorded_transaction(), *settled_transactions()):
+        if record and any(
+            item.get("project_link") == project_link
+            for item in record.get("operations", [])
+        ):
+            return record if record.get("rollback_confirmed") else None
+    return None
+
+
+def _failure_reasons(transaction: dict[str, Any], project_link: str) -> list[dict]:
+    """提取失败事务中属于该插件的失败原因
+
+    参数:
+        transaction: 失败的事务
+        project_link: 插件包名
+
+    返回:
+        list[dict]: 失败原因，没有逐插件记录时返回事务错误码
+    """
+    reasons = []
+    for failure in transaction.get("failure_reasons") or []:
+        if not isinstance(failure, dict):
+            continue
+        store_key = str(failure.get("store_key") or "")
+        if store_key and store_key != f"nonebot:{project_link}":
+            continue
+        reasons.append(
+            {
+                "code": str(failure.get("code") or "plugin_import_failed"),
+                "store_key": store_key or None,
+                "module_name": str(failure.get("module_name") or "") or None,
+                "paths": [
+                    str(path)
+                    for path in failure.get("paths") or []
+                    if isinstance(path, str)
+                ][:20],
+            }
+        )
+    return reasons or [
+        {
+            "code": str(transaction.get("error_code") or "nonebot_plugin_apply_failed"),
+            "paths": [],
+        }
+    ]
 
 
 def _catalog_item(
@@ -315,26 +353,7 @@ def _catalog_item(
 ) -> dict[str, Any]:
     project_link = str(plugin["project_link"])
     if pending is None:
-        from zhenxun.services.nonebot_store.cleanup import records
-        from zhenxun.services.nonebot_store.storage import (
-            pending_transaction as recorded_transaction,
-        )
-
-        history = [recorded_transaction(), *records()]
-        pending = next(
-            (
-                record
-                for record in history
-                if record
-                and any(
-                    item.get("project_link") == project_link
-                    for item in record.get("operations", [])
-                )
-            ),
-            None,
-        )
-        if pending and not pending.get("rollback_confirmed"):
-            pending = None
+        pending = _plugin_transaction(project_link)
     managed = _managed_plugin(project_link, manifest)
     if (
         pending
@@ -347,64 +366,37 @@ def _catalog_item(
     ):
         pending = None
     external = None if managed else _external_version(project_link, inventory)
-    pending_operations = pending.get("operations", []) if pending else []
-    matching_operation = next(
+    operation = next(
         (
             item
-            for item in pending_operations
+            for item in (pending or {}).get("operations", [])
             if isinstance(item, dict) and item.get("project_link") == project_link
         ),
         None,
     )
-    matching_transaction = bool(
-        pending and (matching_operation or pending.get("project_link") == project_link)
-    )
-    transaction_state = (
-        str(pending.get("state") or "") if matching_transaction and pending else ""
-    )
+    if not (pending and (operation or pending.get("project_link") == project_link)):
+        pending = None
+    transaction_state = str(pending.get("state") or "") if pending else ""
     pending_action = (
-        str((matching_operation or pending).get("action"))
-        if matching_transaction and transaction_state in _PENDING_TRANSACTION_STATES
+        str((operation or pending).get("action"))
+        if pending and transaction_state in _PENDING_TRANSACTION_STATES
         else None
     )
-    pending_reasons = []
-    if matching_transaction and pending:
-        error_code = str(pending.get("error_code") or "")
-        if error_code:
-            pending_reasons.append({"code": error_code})
+    pending_reasons = (
+        [{"code": str(pending["error_code"])}]
+        if pending and pending.get("error_code")
+        else []
+    )
     reasons = _basic_block_reasons(plugin)
-    failure_reasons: list[dict[str, Any]] = []
-    if matching_transaction and transaction_state == "failed" and pending:
-        for failure in pending.get("failure_reasons") or []:
-            if not isinstance(failure, dict):
-                continue
-            failure_store_key = str(failure.get("store_key") or "")
-            if failure_store_key and failure_store_key != f"nonebot:{project_link}":
-                continue
-            failure_reasons.append(
-                {
-                    "code": str(failure.get("code") or "plugin_import_failed"),
-                    "store_key": failure_store_key or None,
-                    "module_name": str(failure.get("module_name") or "") or None,
-                    "paths": [
-                        str(path)
-                        for path in failure.get("paths") or []
-                        if isinstance(path, str)
-                    ][:20],
-                }
-            )
-        if not failure_reasons:
-            failure_reasons.append(
-                {
-                    "code": str(
-                        pending.get("error_code") or "nonebot_plugin_apply_failed"
-                    ),
-                    "paths": [],
-                }
-            )
+    failure_reasons = (
+        _failure_reasons(pending, project_link)
+        if pending and transaction_state == "failed"
+        else []
+    )
     update_available = bool(
         managed
-        and _version_is_newer(str(managed.get("version", "0")), str(plugin["version"]))
+        and _version_compare(str(managed.get("version", "0")), str(plugin["version"]))
+        == -1
     )
     compatibility_overrides = (
         deepcopy(managed.get("compatibility_overrides") or []) if managed else []
@@ -426,18 +418,7 @@ def _catalog_item(
         install_state = "blocked"
     else:
         install_state = "not_installed"
-    module_name = str(plugin.get("module_name") or "")
-    runtime = (
-        plugin_host.classification_for(module_name)
-        if (managed or external) and module_name
-        else {"reload_support": "hot_reloadable", "reload_reasons": []}
-    )
-
-    def capability(available: bool, reason: str) -> dict[str, Any]:
-        if not available:
-            return {"mode": "blocked", "reason_codes": [reason]}
-        return {"mode": "analysis_required", "reason_codes": []}
-
+    rollback_confirmed = bool(pending and pending.get("rollback_confirmed"))
     return {
         "store_key": f"nonebot:{project_link}",
         "project_link": project_link,
@@ -446,50 +427,24 @@ def _catalog_item(
         "description": plugin.get("desc") or "",
         "author": plugin.get("author") or "",
         "homepage": plugin.get("homepage") or "",
-        "tags": plugin.get("tags") or [],
         "is_official": bool(plugin.get("is_official")),
         "plugin_type": plugin.get("type") or "application",
         "supported_adapters": plugin.get("supported_adapters"),
-        "valid": bool(plugin.get("valid")),
-        "skip_test": bool(plugin.get("skip_test")),
-        "updated_at": plugin.get("time"),
         "version": str(plugin.get("version") or ""),
-        "installed_version": (str(managed.get("version")) if managed else external),
         "install_state": install_state,
         "update_available": update_available,
-        "compatibility": "blocked" if reasons else "compatible",
         "blocked_reasons": reasons,
         "warnings": _registry_warnings(plugin),
         "catalog_source": plugin.get("catalog_source", "registry"),
         "failure_reasons": failure_reasons,
-        "dependency_retry_available": bool(
-            matching_transaction
-            and pending
-            and pending.get("rollback_confirmed")
-            and any(
-                item.get("code") == "dependency_import_failed"
-                for item in failure_reasons
-            )
+        "dependency_retry_available": rollback_confirmed
+        and any(
+            item.get("code") == "dependency_import_failed" for item in failure_reasons
         ),
         "pending_reasons": pending_reasons,
         "managed": bool(managed),
-        "external": bool(external),
-        "compatibility_overrides": compatibility_overrides,
         "compatibility_unverified": bool(compatibility_overrides),
         "compatibility_override_stale": compatibility_override_stale,
-        "install_capability": capability(
-            not managed and not external and not reasons,
-            "plugin_incompatible" if reasons else "plugin_already_installed",
-        ),
-        "update_capability": capability(
-            bool(managed and update_available),
-            "plugin_update_not_available" if managed else "plugin_not_managed",
-        ),
-        "uninstall_capability": capability(
-            bool(managed),
-            "external_install_not_managed" if external else "plugin_not_managed",
-        ),
-        **runtime,
         "apply_mode": (
             "recovery_required"
             if transaction_state == "recovery_required"
@@ -502,28 +457,10 @@ def _catalog_item(
             else None
         ),
         "pending_action": pending_action,
-        "pending_operation_id": (
-            matching_operation.get("operation_id") if matching_operation else None
-        ),
+        "pending_operation_id": operation.get("operation_id") if operation else None,
         "transaction_state": transaction_state or None,
-        "rollback_confirmed": bool(
-            matching_transaction and pending and pending.get("rollback_confirmed")
-        ),
+        "rollback_confirmed": rollback_confirmed,
     }
-
-
-def _cleanup_analyses() -> None:
-    threshold = datetime.now(timezone.utc) - _ANALYSIS_TTL
-    for analysis_id, analysis in list(_ANALYSES.items()):
-        try:
-            created = datetime.fromisoformat(str(analysis["created_at"]))
-        except (KeyError, TypeError, ValueError):
-            created = threshold - timedelta(seconds=1)
-        task = analysis.get("task")
-        if created < threshold and not (
-            isinstance(task, asyncio.Task) and not task.done()
-        ):
-            _ANALYSES.pop(analysis_id, None)
 
 
 def _public_analysis(analysis: dict[str, Any]) -> dict[str, Any]:
@@ -534,8 +471,7 @@ def _public_analysis(analysis: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-async def _analyze(analysis_id: str) -> None:
-    analysis = _ANALYSES[analysis_id]
+async def _analyze(analysis: dict[str, Any]) -> None:
     analysis["status"] = "analyzing"
     try:
         pending = pending_transaction()
@@ -581,10 +517,8 @@ async def _analyze(analysis_id: str) -> None:
             analysis.update(
                 {
                     "status": "blocked",
-                    "compatible": False,
                     "blocked_reasons": reasons,
                     "registry_plugin": plugin,
-                    "registry_cache": registry_meta,
                 }
             )
             return
@@ -623,11 +557,9 @@ async def _analyze(analysis_id: str) -> None:
         analysis.update(
             {
                 "status": "ready",
-                "compatible": True,
                 "blocked_reasons": [],
                 "registry_plugin": plugin,
                 "metadata": metadata,
-                "registry_cache": registry_meta,
                 "fingerprint": environment_fingerprint(
                     plugin, pending_revision=pending_revision
                 ),
@@ -638,27 +570,7 @@ async def _analyze(analysis_id: str) -> None:
                 "plugin": _catalog_item(plugin, manifest=manifest, inventory=inventory),
             }
         )
-        preflight_archive_dependency_policy(
-            {
-                "base_manifest": manifest,
-                "target_manifest": _target_manifest(analysis),
-                "operations": [
-                    {
-                        "project_link": plugin["project_link"],
-                        "source_build_confirmed": bool(
-                            plan.get("source_build_required")
-                        ),
-                        **_dependency_evidence(plan),
-                    }
-                ],
-                "source_build_confirmed": bool(plan.get("source_build_required")),
-            }
-        )
-    except (
-        DependencyAnalysisError,
-        ArchiveDependencyConflict,
-        ArchiveSourceBuildConflict,
-    ) as error:
+    except DependencyAnalysisError as error:
         reason: dict[str, Any] = {
             "code": error.code,
             "message": safe_process_error(str(error)),
@@ -699,48 +611,12 @@ async def _analyze(analysis_id: str) -> None:
         )
     finally:
         analysis["completed_at"] = utc_now()
-        if operation_registry.get(analysis_id) is not None:
-            operation_registry.update(analysis_id, progress=100, phase="analyzed")
-
-
-def _recover_analysis(record: dict[str, Any]):
-    public_input = record.get("public_input") or {}
-    analysis_id = str(record.get("operation_id") or "")
-    project_link = str(public_input.get("project_link") or "")
-    action = str(public_input.get("action") or "")
-    if (
-        not analysis_id
-        or not project_link
-        or action
-        not in {
-            "install",
-            "update",
-            "uninstall",
-        }
-    ):
-        return None
-    _ANALYSES[analysis_id] = {
-        "analysis_id": analysis_id,
-        "project_link": project_link,
-        "action": action,
-        "prefer_existing": public_input.get("prefer_existing", True),
-        "status": "queued",
-        "created_at": utc_now(),
-        "recovered": True,
-    }
-    return _analyze(analysis_id)
-
-
-operation_registry.register_recovery_handler(
-    "nonebot_store_analysis", _recover_analysis
-)
 
 
 def _dependency_evidence(plan: dict[str, Any]) -> dict[str, Any]:
     return {
         "dependency_inputs": list(plan.get("candidate_inputs") or []),
         "candidate_packages": list(plan.get("candidate_packages") or []),
-        "archive_binary_packages": dict(plan.get("archive_binary_packages") or {}),
         "dependency_packages": {
             str(item["name"]): str(item.get("to") or item.get("version"))
             for item in [
@@ -773,11 +649,9 @@ def _target_manifest(analysis: dict[str, Any]) -> dict[str, Any]:
             "version": str(plugin["version"]),
             "state": "managed",
             "installed_at": utc_now(),
-            "registry_time": plugin.get("time"),
             "compatibility_overrides": deepcopy(
                 analysis["plan"].get("compatibility_overrides", [])
             ),
-            "environment_fingerprint": analysis.get("fingerprint"),
             "resolution_inputs": deepcopy(
                 analysis["plan"].get("candidate_inputs") or []
             ),
@@ -792,7 +666,6 @@ def _target_manifest(analysis: dict[str, Any]) -> dict[str, Any]:
         # embedding it here made package entries differ across machines and
         # confused distribution records with plugin records.
         target["packages"][name] = {"version": str(version)}
-    preserve_archive_dependencies(target, core=core)
     return target
 
 
@@ -876,11 +749,17 @@ def _hot_apply_info(action: str) -> str:
     }.get(action, "插件变更已热加载")
 
 
+def _require_hot(operation: RuntimeOperation) -> None:
+    if operation.mode.value != "hot_reloaded":
+        raise RuntimeError(operation.reason or "plugin_runtime_apply_failed")
+
+
 async def _apply_hot(
     analysis: dict[str, Any], transaction: dict[str, Any], build: dict[str, Any]
 ) -> dict[str, Any]:
     """在运行中的进程内切换依赖层并热加载、重载或卸载插件
 
+    卸载在切换依赖层之前完成：切换后清单不再登记该插件，无法再判定为可热处理。
     事务先以待验证状态落盘，进程中途退出时由 launcher 按启动验证确认或回滚；
     热处理失败时回滚依赖层并从原依赖层恢复插件。
 
@@ -905,23 +784,30 @@ async def _apply_hot(
         native_extensions=list(build.get("native_extensions") or []),
         state="verification_pending",
     )
-    save_pending_transaction(transaction)
-    commit_generation(transaction, build, verify_on_start=True)
+    if action == "uninstall":
+        _require_hot(await plugin_host.unload_plugin(module_name))
+    try:
+        save_pending_transaction(transaction)
+        commit_generation(transaction, build, verify_on_start=True)
+    except Exception:
+        if action == "uninstall" and (root := module_source_path(module_name)):
+            await plugin_host.load_new_plugin(
+                module_name, root, submit_restart=False, dependencies_verified=True
+            )
+        raise
     activate_current_generation()
     try:
         if action == "install":
             root = module_source_path(module_name)
             if root is None:
                 raise RuntimeError("plugin_module_missing_after_install")
-            operation = await plugin_host.load_new_plugin(
-                module_name, root, submit_restart=False, dependencies_verified=True
+            _require_hot(
+                await plugin_host.load_new_plugin(
+                    module_name, root, submit_restart=False, dependencies_verified=True
+                )
             )
         elif action == "update":
-            operation = await plugin_host.reload_plugin(module_name)
-        else:
-            operation = await plugin_host.unload_plugin(module_name)
-        if operation.mode.value != "hot_reloaded":
-            raise RuntimeError(operation.reason or "plugin_runtime_apply_failed")
+            _require_hot(await plugin_host.reload_plugin(module_name))
     except Exception as error:
         rollback_pending_transaction()
         activate_current_generation()
@@ -1007,20 +893,9 @@ async def preview_dependency_repair() -> Result[dict]:
                 "changes": view["immutable_drift"] + view["incompatible_shared_drift"],
                 "diagnostic": detail,
             }
-    except (
-        DependencyAnalysisError,
-        ArchiveDependencyConflict,
-        ArchiveSourceBuildConflict,
-    ) as error:
+    except DependencyAnalysisError as error:
         return Result.fail(str(error), code=409)
-    identity = uuid.uuid4().hex
-    now = datetime.now(timezone.utc)
-    for key, value in list(_REPAIR_PREVIEWS.items()):
-        if now - value["created_at"] > _ANALYSIS_TTL:
-            _REPAIR_PREVIEWS.pop(key, None)
-    if len(_REPAIR_PREVIEWS) >= 64:
-        _REPAIR_PREVIEWS.pop(next(iter(_REPAIR_PREVIEWS)))
-    _REPAIR_PREVIEWS[identity] = {**preview, "created_at": now}
+    identity = _REPAIR_PREVIEWS.put(preview)
     return Result.ok(
         {
             key: value
@@ -1039,39 +914,27 @@ async def preview_dependency_repair() -> Result[dict]:
 async def repair_dependency_environment(
     payload: EnvironmentRepairPayload,
 ) -> Result[dict]:
-    """Keep a bound repair queryable across disconnects and worker replacement."""
+    payload, binding = _bind(payload)
+    return await run_bound_operation(
+        str(payload.operation_id),
+        binding,
+        lambda: _repair_dependency_environment(payload, binding),
+    )
+
+
+def _bind(payload: _BoundPayload) -> tuple[_BoundPayload, str]:
+    """补全操作 ID 并计算请求内容摘要
+
+    参数:
+        payload: 请求内容
+
+    返回:
+        tuple[_BoundPayload, str]: 补全后的请求与摘要
+    """
     payload = payload.model_copy(
         update={"operation_id": payload.operation_id or uuid.uuid4().hex}
     )
-    identity = str(payload.operation_id)
-    binding = sha256(payload.model_dump_json().encode()).hexdigest()
-    active = _ACTIVE_REPAIRS.get(identity)
-    if active:
-        if binding != active[0]:
-            return Result.fail("plugin_operation_input_changed", code=409)
-        return await asyncio.shield(active[1])
-    previous = operation_status(identity)
-    if previous:
-        result = previous.get("result") or {}
-        if result.get("request_binding") != binding:
-            return Result.fail("plugin_operation_input_changed", code=409)
-        return Result.ok(result, info="重复请求已复用原操作结果")
-    task = asyncio.create_task(_repair_dependency_environment(payload, binding))
-    _ACTIVE_REPAIRS[identity] = (binding, task)
-    task.add_done_callback(lambda _: _ACTIVE_REPAIRS.pop(identity, None))
-    return await asyncio.shield(task)
-
-
-def active_operation(identity: str) -> dict | None:
-    """Expose accepted store work before its first journal write."""
-    active = _ACTIVE_REPAIRS.get(identity) or _ACTIVE_APPLIES.get(identity)
-    if active is None or active[1].done():
-        return None
-    return {
-        "operation_id": identity,
-        "status": "running",
-        "result": {"operation_id": identity, "status": "running"},
-    }
+    return payload, sha256(payload.model_dump_json().encode()).hexdigest()
 
 
 async def _repair_dependency_environment(
@@ -1089,17 +952,13 @@ async def _repair_dependency_environment(
         async with _store_operation(
             operation_id=identity, owner="webui.nonebot-store.environment-repair"
         ):
-            previous = operation_status(identity)
-            if previous:
-                result = previous.get("result") or {}
-                if result.get("request_binding") != binding:
-                    return Result.fail("plugin_operation_input_changed", code=409)
-                return Result.ok(result, info="重复请求已复用原操作结果")
+            if replayed := replayed_bound_operation(identity, binding):
+                return replayed
             record({"status": "running", "apply_mode": "preparing"})
             recorded = True
             response = await _perform_environment_repair(payload, binding)
             result = (
-                response.data
+                (response.data or {})
                 if response.suc
                 else {
                     "status": "failed",
@@ -1112,7 +971,7 @@ async def _repair_dependency_environment(
     except StoreOperationBusyError:
         return Result.fail("plugin_operation_in_progress", code=409)
     except (Exception, asyncio.CancelledError) as error:
-        if response is not None and response.suc:
+        if response is not None and response.suc and response.data is not None:
             response.data["cleanup_error"] = {
                 "code": "operation_receipt_pending",
                 "diagnostic": safe_process_error(str(error)),
@@ -1159,12 +1018,8 @@ async def _perform_environment_repair(
         return Result.fail("environment_analysis_stale", code=409)
     if not view.get("repairable"):
         return Result.fail("dependency_environment_not_repairable", code=409)
-    preview = _REPAIR_PREVIEWS.get(payload.preview_id or "")
-    if (
-        not preview
-        or preview["fingerprint"] != view["fingerprint"]
-        or datetime.now(timezone.utc) - preview["created_at"] > _ANALYSIS_TTL
-    ):
+    preview = _REPAIR_PREVIEWS.get(payload.preview_id)
+    if not preview or preview["fingerprint"] != view["fingerprint"]:
         return Result.fail("environment_analysis_stale", code=409)
     if preview["mode"] == "layer":
         build = None
@@ -1178,11 +1033,11 @@ async def _perform_environment_repair(
                 != preview["fingerprint"]
             ):
                 return Result.fail("environment_analysis_stale", code=409)
-            transaction = {
-                "version": 2,
-                "revision": uuid.uuid4().hex,
-                "action": "environment_repair",
-                "operations": [
+            transaction = draft_transaction(
+                None,
+                selected["target_manifest"],
+                action="environment_repair",
+                operations=[
                     {
                         "operation_id": payload.operation_id,
                         "kind": "environment_repair",
@@ -1192,25 +1047,17 @@ async def _perform_environment_repair(
                         "created_at": utc_now(),
                     }
                 ],
-                "base_manifest": load_manifest(),
-                "target_manifest": selected["target_manifest"],
-                "remaining_conflicts": selected["remaining_conflicts"],
-                "environment_fingerprint": preview["fingerprint"],
-                "source_build_confirmed": bool(selected.get("source_build_required")),
-                "state": "building",
-                "created_at": utc_now(),
-            }
+                remaining_conflicts=selected["remaining_conflicts"],
+                source_build_confirmed=bool(selected.get("source_build_required")),
+                state="building",
+            )
             build = await prepare_generation(transaction)
             if (await environment_report_async())["fingerprint"] != preview[
                 "fingerprint"
             ]:
                 raise DependencyAnalysisError("environment_analysis_stale")
             stage_generation(transaction, build)
-            _REPAIR_PREVIEWS.pop(payload.preview_id, None)
-            update_pending_restart(
-                "webui.nonebot-store",
-                ["dependency_environment_repair"],
-            )
+            _REPAIR_PREVIEWS.pop(payload.preview_id)
             return Result.ok(
                 _operation_result(
                     "restart_pending",
@@ -1288,7 +1135,7 @@ async def list_plugins(
                 pending=pending,
             )
             if (
-                item["compatibility"] == "blocked"
+                item["blocked_reasons"]
                 and not item["managed"]
                 and not include_incompatible
             ):
@@ -1342,18 +1189,17 @@ async def plugin_detail(project_link: str) -> Result[dict]:
     try:
         local = _managed_plugin(project_link, _effective_manifest())
         try:
-            plugin, meta = await get_registry_plugin(project_link)
+            plugin, _ = await get_registry_plugin(project_link)
         except Exception:
             if not local:
                 raise
-            plugin, meta = _local_registry_item(local), {"unavailable": True}
+            plugin = _local_registry_item(local)
         try:
             metadata = await fetch_pypi_metadata(project_link, str(plugin["version"]))
-        except Exception as error:
+        except Exception:
             if not local:
                 raise
             metadata = {"info": {}, "urls": []}
-            meta["metadata_unavailable"] = type(error).__name__
         info = metadata["info"]
         return Result.ok(
             {
@@ -1363,20 +1209,9 @@ async def plugin_detail(project_link: str) -> Result[dict]:
                     inventory=installed_inventory(),
                     pending=pending_transaction(),
                 ),
-                "registry": meta,
                 "pypi": {
                     "summary": info.get("summary") or "",
                     "requires_python": info.get("requires_python") or "",
-                    "license": info.get("license_expression")
-                    or info.get("license")
-                    or "",
-                    "project_urls": info.get("project_urls") or {},
-                    "requires_dist": info.get("requires_dist") or [],
-                    "wheel_available": any(
-                        str(item.get("filename", "")).endswith(".whl")
-                        for item in metadata.get("urls") or []
-                        if isinstance(item, dict)
-                    ),
                 },
             }
         )
@@ -1393,33 +1228,22 @@ async def plugin_detail(project_link: str) -> Result[dict]:
     response_class=JSONResponse,
 )
 async def analyze_plugin(payload: AnalyzePayload) -> Result[dict]:
-    _cleanup_analyses()
     pending = pending_transaction()
     if pending is not None and pending.get("state") not in {"pending_restart"}:
         return Result.fail("nonebot_transaction_pending", code=409)
-    analysis_id = uuid.uuid4().hex
     analysis = {
-        "analysis_id": analysis_id,
         "project_link": payload.project_link,
         "action": payload.action,
         "prefer_existing": payload.prefer_existing,
         "status": "queued",
         "created_at": utc_now(),
     }
-    _ANALYSES[analysis_id] = analysis
-    _, task = operation_registry.start(
-        "nonebot_store_analysis",
-        _analyze(analysis_id),
-        operation_id=analysis_id,
-        public_input={
-            "project_link": payload.project_link,
-            "action": payload.action,
-            "prefer_existing": payload.prefer_existing,
-        },
-        recovery_policy="restart",
+    analysis_id = analysis["analysis_id"] = _ANALYSES.put(analysis)
+    analysis["task"] = lifecycle_kernel.spawn_task(
+        "management:webui",
+        _analyze(analysis),
         name=f"nonebot-analysis:{analysis_id[:8]}",
     )
-    analysis["task"] = task
     return Result.ok(_public_analysis(analysis), info="依赖分析已开始")
 
 
@@ -1430,7 +1254,6 @@ async def analyze_plugin(payload: AnalyzePayload) -> Result[dict]:
     response_class=JSONResponse,
 )
 async def analysis_status(analysis_id: str) -> Result[dict]:
-    _cleanup_analyses()
     analysis = _ANALYSES.get(analysis_id)
     if analysis is None:
         return Result.fail("analysis_not_found", code=404)
@@ -1444,27 +1267,168 @@ async def analysis_status(analysis_id: str) -> Result[dict]:
     response_class=JSONResponse,
 )
 async def apply_analysis(payload: ApplyPayload) -> Result[dict]:
-    """Keep one accepted operation alive when its browser disconnects."""
-    payload = payload.model_copy(
-        update={"operation_id": payload.operation_id or uuid.uuid4().hex}
+    payload, binding = _bind(payload)
+    return await run_bound_operation(
+        str(payload.operation_id),
+        binding,
+        lambda: _apply_analysis(payload, binding),
     )
-    identity = str(payload.operation_id)
-    binding = sha256(payload.model_dump_json().encode()).hexdigest()
-    active = _ACTIVE_APPLIES.get(identity)
-    if active:
-        if binding != active[0]:
-            return Result.fail("plugin_operation_input_changed", code=409)
-        return await asyncio.shield(active[1])
-    previous = operation_status(identity)
-    if previous:
-        result = previous.get("result") or {}
-        if result.get("request_binding") != binding:
-            return Result.fail("plugin_operation_input_changed", code=409)
-        return Result.ok(result, info="重复请求已复用原操作结果")
-    task = asyncio.create_task(_apply_analysis(payload, binding))
-    _ACTIVE_APPLIES[identity] = (binding, task)
-    task.add_done_callback(lambda _: _ACTIVE_APPLIES.pop(identity, None))
-    return await asyncio.shield(task)
+
+
+def _journal_key(analysis: dict[str, Any]) -> str:
+    return f"nonebot:{analysis['registry_plugin']['project_link']}"
+
+
+def _analysis_stale(analysis: dict[str, Any], revision: str) -> bool:
+    """分析结果是否已与待处理事务或依赖环境不一致
+
+    参数:
+        analysis: 插件分析结果
+        revision: 当前待处理事务修订
+
+    返回:
+        bool: 是否需要重新分析
+    """
+    return analysis.get("pending_revision", "") != revision or environment_fingerprint(
+        analysis["registry_plugin"], pending_revision=revision
+    ) != analysis.get("fingerprint")
+
+
+def _completed(
+    analysis: dict[str, Any],
+    operation_id: str,
+    binding: str,
+    result: dict[str, Any],
+    info: str,
+) -> Result[dict]:
+    """记录插件操作结果，并缓存供同一操作 ID 的重复请求复用
+
+    参数:
+        analysis: 插件分析结果
+        operation_id: 操作 ID
+        binding: 请求绑定摘要
+        result: 操作结果
+        info: 提示信息
+
+    返回:
+        Result[dict]: 操作结果
+    """
+    result.setdefault("operation_id", operation_id)
+    result["request_binding"] = binding
+    analysis["applied_operation_id"] = operation_id
+    analysis["applied_result"] = deepcopy(result)
+    try:
+        record_operation(_journal_key(analysis), result)
+    except OSError as error:
+        result["cleanup_error"] = {
+            "code": "operation_receipt_pending",
+            "diagnostic": safe_process_error(str(error)),
+        }
+    return Result.ok(result, info=info)
+
+
+def _record_failure(
+    analysis: dict[str, Any],
+    operation_id: str,
+    binding: str,
+    code: str,
+    diagnostic: str = "",
+) -> None:
+    record_operation(
+        _journal_key(analysis),
+        {
+            "operation_id": operation_id,
+            "status": "interrupted"
+            if code == "dependency_operation_interrupted"
+            else "failed",
+            "apply_mode": "failed",
+            "reason": code,
+            "request_binding": binding,
+            "diagnostic": diagnostic,
+        },
+    )
+
+
+def _merge_operation(
+    pending: dict[str, Any] | None, operation: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """把插件操作并入待处理事务，同一插件只保留最后一次操作
+
+    尚未生效的安装随后又被卸载时，两次操作相互抵消。
+
+    参数:
+        pending: 当前待处理事务
+        operation: 本次插件操作
+
+    返回:
+        list[dict[str, Any]]: 合并后的操作列表
+    """
+    operations = deepcopy((pending or {}).get("operations", []))
+    project_link = operation["project_link"]
+    index = next(
+        (
+            offset
+            for offset, item in enumerate(operations)
+            if item.get("project_link") == project_link
+        ),
+        None,
+    )
+    if index is None:
+        operations.append(operation)
+        return operations
+    base_plugins = ((pending or {}).get("base_manifest") or {}).get("plugins", {})
+    if (
+        operations[index].get("action") == "install"
+        and operation["action"] == "uninstall"
+        and f"nonebot:{project_link}" not in base_plugins
+    ):
+        operations.pop(index)
+    else:
+        operations[index] = operation
+    return operations
+
+
+def _restart_reasons(
+    analysis: dict[str, Any], source_runtime: dict[str, Any], native_changed: bool
+) -> list[str]:
+    """汇总插件变更需要重启才能生效的原因
+
+    参数:
+        analysis: 插件分析结果
+        source_runtime: 新版本源码的热重载判定
+        native_changed: 原生扩展是否变化
+
+    返回:
+        list[str]: 重启原因代码
+    """
+    plan = analysis["plan"]
+    plugin = analysis["registry_plugin"]
+    root = canonicalize_name(str(plugin["project_link"]))
+    reasons = []
+    if any(
+        canonicalize_name(item["name"]) != root
+        for item in plan["package_changes"]["changed"]
+    ):
+        reasons.append("non_core_dependencies_changed")
+    if plan.get("shared_changes"):
+        reasons.append("shared_dependencies_changed")
+    if plan.get("compatibility_overrides"):
+        reasons.append("compatibility_override_unverified")
+    if native_changed:
+        reasons.append("native_extensions_changed")
+    if source_runtime["reload_support"] != "hot_reloadable":
+        reasons.extend(
+            source_runtime.get("reload_reasons") or ["plugin_not_hot_reloadable"]
+        )
+    runtime = plugin_host.classification_for(str(plugin["module_name"]))
+    if (
+        runtime["reload_support"] != "hot_reloadable"
+        and analysis["action"] != "install"
+    ):
+        reasons.extend(runtime.get("reload_reasons") or ["plugin_not_hot_reloadable"])
+    if plan.get("database_migration_possible"):
+        reasons.append("database_migration_possible")
+    return reasons or ["plugin_restart_required"]
 
 
 async def _apply_analysis(payload: ApplyPayload, binding: str) -> Result[dict]:
@@ -1478,260 +1442,107 @@ async def _apply_analysis(payload: ApplyPayload, binding: str) -> Result[dict]:
         return Result.fail("analysis_already_applied", code=409)
     if analysis.get("status") != "ready":
         return Result.fail("analysis_not_ready", code=409)
-    operation_id = payload.operation_id or uuid.uuid4().hex
-
-    def completed(result: dict[str, Any], info: str) -> Result[dict]:
-        result.setdefault("operation_id", operation_id)
-        result["request_binding"] = binding
-        analysis["applied_operation_id"] = operation_id
-        analysis["applied_result"] = deepcopy(result)
-        try:
-            record_operation(
-                f"nonebot:{analysis['registry_plugin']['project_link']}", result
-            )
-        except OSError as error:
-            result["cleanup_error"] = {
-                "code": "operation_receipt_pending",
-                "diagnostic": safe_process_error(str(error)),
-            }
-        return Result.ok(result, info=info)
-
-    def record_failure(code: str, diagnostic: str = "") -> None:
-        record_operation(
-            f"nonebot:{analysis['registry_plugin']['project_link']}",
-            {
-                "operation_id": operation_id,
-                "status": "interrupted"
-                if code == "dependency_operation_interrupted"
-                else "failed",
-                "apply_mode": "failed",
-                "reason": code,
-                "request_binding": binding,
-                "diagnostic": diagnostic,
-            },
-        )
-
-    plugin = analysis["registry_plugin"]
-    current_pending = pending_transaction()
-    current_revision = _pending_revision(current_pending)
-    if analysis.get("pending_revision", "") != current_revision:
-        return Result.fail("analysis_stale", code=409)
-    if environment_fingerprint(
-        plugin, pending_revision=current_revision
-    ) != analysis.get("fingerprint"):
+    previous_pending = pending_transaction()
+    if _analysis_stale(analysis, _pending_revision(previous_pending)):
         return Result.fail("analysis_stale", code=409)
     plan = analysis["plan"]
-    if payload.confirmed:
-        if payload.summary_revision != plan.get("summary_revision"):
-            return Result.fail("analysis_stale", code=409)
-        payload = payload.model_copy(
-            update={
-                "confirm_third_party_code": True,
-                "confirm_non_core_changes": True,
-                "confirm_source_build": bool(plan["source_build_required"]),
-                "confirm_compatibility_overrides": True,
-                "confirm_database_migration": True,
-            }
-        )
-    if not payload.confirm_third_party_code:
+    if not payload.confirmed:
         return Result.fail("third_party_code_confirmation_required", code=400)
-    if plan["non_core_changes"] and not payload.confirm_non_core_changes:
-        return Result.fail("non_core_changes_confirmation_required", code=400)
-    if plan["source_build_required"] and not payload.confirm_source_build:
-        return Result.fail("source_build_confirmation_required", code=400)
-    if (
-        plan.get("compatibility_overrides")
-        and not payload.confirm_compatibility_overrides
-    ):
-        return Result.fail("compatibility_override_confirmation_required", code=400)
-    if (
-        plan.get("database_migration_possible")
-        and not payload.confirm_database_migration
-    ):
-        return Result.fail("database_migration_confirmation_required", code=400)
-
-    journal_store_key = f"nonebot:{plugin['project_link']}"
-    previous_pending = deepcopy(current_pending)
+    if payload.summary_revision != plan.get("summary_revision"):
+        return Result.fail("analysis_stale", code=409)
+    operation_id = payload.operation_id or uuid.uuid4().hex
+    plugin = analysis["registry_plugin"]
+    action = analysis["action"]
     new_generation: int | None = None
     staged = False
     try:
         async with _store_operation(
             operation_id=operation_id, owner="webui.nonebot_store"
         ):
-            previous = operation_status(operation_id)
-            if previous:
-                result = previous.get("result") or {}
-                if result.get("request_binding") != binding:
-                    return Result.fail("plugin_operation_input_changed", code=409)
-                return Result.ok(result, info="重复请求已复用原操作结果")
+            if replayed := replayed_bound_operation(operation_id, binding):
+                return replayed
             latest_pending = pending_transaction()
-            if _pending_revision(
-                latest_pending
-            ) != current_revision or environment_fingerprint(
-                plugin, pending_revision=current_revision
-            ) != analysis.get("fingerprint"):
+            if _analysis_stale(analysis, _pending_revision(latest_pending)):
                 return Result.fail("analysis_stale", code=409)
             record_operation(
-                journal_store_key,
+                _journal_key(analysis),
                 {
                     "operation_id": operation_id,
-                    "action": analysis["action"],
+                    "action": action,
                     "status": "running",
                     "request_binding": binding,
                 },
             )
             target = _target_manifest(analysis)
-            operations = deepcopy(
-                latest_pending.get("operations", []) if latest_pending else []
+            migration = bool(plan.get("database_migration_possible"))
+            operations = _merge_operation(
+                latest_pending,
+                {
+                    "operation_id": operation_id,
+                    "analysis_id": payload.analysis_id,
+                    "action": action,
+                    "project_link": plugin["project_link"],
+                    "module_name": plugin["module_name"],
+                    "name": plugin.get("name") or plugin["project_link"],
+                    "database_migration_possible": migration,
+                    **_dependency_evidence(plan),
+                    "source_build_confirmed": bool(plan["source_build_required"]),
+                    "created_at": utc_now(),
+                    "target_manifest": deepcopy(target),
+                },
             )
-            operation = {
-                "operation_id": operation_id,
-                "analysis_id": payload.analysis_id,
-                "action": analysis["action"],
-                "project_link": plugin["project_link"],
-                "module_name": plugin["module_name"],
-                "name": plugin.get("name") or plugin["project_link"],
-                "database_migration_possible": bool(
-                    plan.get("database_migration_possible")
-                ),
-                **_dependency_evidence(plan),
-                "source_build_confirmed": bool(payload.confirm_source_build),
-                "created_at": utc_now(),
-                "target_manifest": deepcopy(target),
-            }
-            existing_index = next(
-                (
-                    index
-                    for index, item in enumerate(operations)
-                    if item.get("project_link") == plugin["project_link"]
-                ),
-                None,
-            )
-            if existing_index is None:
-                operations.append(operation)
-            else:
-                previous_operation = operations[existing_index]
-                base_plugins = (
-                    latest_pending.get("base_manifest", {}).get("plugins", {})
-                    if latest_pending
-                    else load_manifest().get("plugins", {})
-                )
-                store_key = f"nonebot:{plugin['project_link']}"
-                if (
-                    previous_operation.get("action") == "install"
-                    and analysis["action"] == "uninstall"
-                    and store_key not in base_plugins
-                ):
-                    operations.pop(existing_index)
-                else:
-                    operations[existing_index] = operation
-            transaction = {
-                "version": 2,
-                "revision": uuid.uuid4().hex,
-                "base_manifest": deepcopy(
-                    latest_pending.get("base_manifest")
-                    if latest_pending
-                    else load_manifest()
-                ),
-                "operations": operations,
-                "target_manifest": target,
-                "remaining_conflicts": plan.get("remaining_conflicts", []),
-                "source_build_confirmed": bool(
-                    payload.confirm_source_build
-                    or (latest_pending or {}).get("source_build_confirmed")
-                ),
-                "database_migration_confirmed": bool(
-                    payload.confirm_database_migration
-                    or (latest_pending or {}).get("database_migration_confirmed")
-                ),
-                "database_migration_possible": bool(
-                    plan.get("database_migration_possible")
-                    or (latest_pending or {}).get("database_migration_possible")
-                ),
-                "database_type": (
-                    plan.get("database_type")
-                    if plan.get("database_migration_possible")
-                    else (latest_pending or {}).get("database_type", "none")
-                ),
-                "state": "building",
-                "created_at": (latest_pending or {}).get("created_at", utc_now()),
-                "updated_at": utc_now(),
-                "generation": (latest_pending or {}).get("generation"),
-                "generation_digest": (latest_pending or {}).get("generation_digest"),
-                "native_extensions": (latest_pending or {}).get(
-                    "native_extensions", []
-                ),
-            }
-            for key in ("released_packages", "retained_imports"):
-                if latest_pending and latest_pending.get(key):
-                    transaction[key] = deepcopy(latest_pending[key])
+            pending = latest_pending or {}
             if not operations:
-                remove_generation(transaction.get("generation"))
+                remove_generation(pending.get("generation"))
                 finalize_orm_migration()
                 clear_pending_transaction()
-                update_pending_restart("webui.nonebot-store", [])
-                return completed(
+                return _completed(
+                    analysis,
+                    operation_id,
+                    binding,
                     _operation_result("rolled_back", ["transaction_canceled"]),
                     "待应用插件变更已相互抵消",
                 )
-            with archive_dependency_policy(transaction):
-                pass
-            module_name = str(plugin["module_name"])
-            runtime = plugin_host.classification_for(module_name)
-            root_change = next(
-                (
-                    item
-                    for item in plan["package_changes"]["changed"]
-                    if canonicalize_name(item["name"])
-                    == canonicalize_name(str(plugin["project_link"]))
+            transaction = draft_transaction(
+                latest_pending,
+                target,
+                operations=operations,
+                remaining_conflicts=plan.get("remaining_conflicts", []),
+                source_build_confirmed=bool(
+                    plan["source_build_required"]
+                    or pending.get("source_build_confirmed")
                 ),
-                None,
+                database_migration_confirmed=True,
+                database_migration_possible=migration
+                or bool(pending.get("database_migration_possible")),
+                database_type=plan.get("database_type")
+                if migration
+                else pending.get("database_type", "none"),
+                state="building",
             )
-            dependency_changes = [
-                item
-                for item in plan["package_changes"]["changed"]
-                if item is not root_change
-            ]
-            hot_candidate = _hot_candidate(
-                analysis["action"], plugin, plan, latest_pending
-            )
-            deferred_source_build = bool(
-                plan["source_build_required"]
-                or (
-                    latest_pending
-                    and latest_pending.get("source_build_confirmed")
-                    and not isinstance(latest_pending.get("generation"), int)
-                )
-            )
-            if deferred_source_build:
-                old_generation = transaction.get("generation")
-                transaction.pop("generation", None)
-                transaction.pop("generation_digest", None)
-                transaction["native_extensions"] = []
-                transaction["state"] = "pending_restart"
-                save_pending_transaction(transaction)
+            if plan["source_build_required"] or (
+                pending.get("source_build_confirmed")
+                and not isinstance(pending.get("generation"), int)
+            ):
+                defer_transaction(transaction)
                 staged = True
-                remove_generation(old_generation)
-                return completed(
-                    _operation_result(
-                        "restart_pending",
-                        ["source_build_required"],
-                        transaction_revision=transaction["revision"],
-                        pending_operations=operations,
-                    ),
+                return _completed(
+                    analysis,
+                    operation_id,
+                    binding,
+                    _operation_result("restart_pending", ["source_build_required"]),
                     "依赖事务已保存，重启后构建并生效",
                 )
-
+            hot_candidate = _hot_candidate(action, plugin, plan, latest_pending)
             previous_native = generation_native_extensions()
             build = await prepare_generation(transaction)
             new_generation = int(build["generation"])
-            next_native = generation_native_extensions(build["path"])
-            native_changed = previous_native != next_native
-            source_runtime = {
-                "reload_support": "hot_reloadable",
-                "reload_reasons": [],
-            }
-            if analysis["action"] != "uninstall":
+            native_changed = previous_native != generation_native_extensions(
+                build["path"]
+            )
+            module_name = str(plugin["module_name"])
+            source_runtime = {"reload_support": "hot_reloadable", "reload_reasons": []}
+            if action != "uninstall":
                 source_root = module_source_path(module_name, build["path"])
                 if source_root is None:
                     raise LayerBuildError("plugin_module_missing_after_install")
@@ -1742,52 +1553,31 @@ async def _apply_analysis(payload: ApplyPayload, binding: str) -> Result[dict]:
                 source_runtime = plugin_host.classification_for_source(
                     module_name, source_root, dependencies_verified=True
                 )
-                hot_candidate = hot_candidate and (
-                    source_runtime["reload_support"] == "hot_reloadable"
-                )
-            if hot_candidate and not native_changed:
+            if (
+                hot_candidate
+                and not native_changed
+                and source_runtime["reload_support"] == "hot_reloadable"
+            ):
                 result = await _apply_hot(analysis, transaction, build)
-                return completed(result, _hot_apply_info(analysis["action"]))
-
-            transaction["native_extensions_changed"] = native_changed
+                return _completed(
+                    analysis, operation_id, binding, result, _hot_apply_info(action)
+                )
             stage_generation(transaction, build)
             staged = True
-            reasons = []
-            if dependency_changes:
-                reasons.append("non_core_dependencies_changed")
-            if plan.get("shared_changes"):
-                reasons.append("shared_dependencies_changed")
-            if plan.get("compatibility_overrides"):
-                reasons.append("compatibility_override_unverified")
-            if native_changed:
-                reasons.append("native_extensions_changed")
-            if source_runtime["reload_support"] != "hot_reloadable":
-                reasons.extend(
-                    source_runtime.get("reload_reasons")
-                    or ["plugin_not_hot_reloadable"]
-                )
-            if (
-                runtime["reload_support"] != "hot_reloadable"
-                and analysis["action"] != "install"
-            ):
-                reasons.extend(
-                    runtime.get("reload_reasons") or ["plugin_not_hot_reloadable"]
-                )
-            if plan.get("database_migration_possible"):
-                reasons.append("database_migration_possible")
-            return completed(
+            return _completed(
+                analysis,
+                operation_id,
+                binding,
                 _operation_result(
                     "restart_pending",
-                    reasons or ["plugin_restart_required"],
-                    transaction_revision=transaction["revision"],
-                    pending_operations=operations,
+                    _restart_reasons(analysis, source_runtime, native_changed),
                 ),
                 "插件事务已准备，重启后生效",
             )
     except asyncio.CancelledError:
         with contextlib.suppress(Exception):
             record_operation(
-                journal_store_key,
+                _journal_key(analysis),
                 {
                     "operation_id": operation_id,
                     "request_binding": binding,
@@ -1798,20 +1588,19 @@ async def _apply_analysis(payload: ApplyPayload, binding: str) -> Result[dict]:
             )
         raise
     except StoreOperationBusyError:
-        record_failure("plugin_operation_in_progress")
+        _record_failure(analysis, operation_id, binding, "plugin_operation_in_progress")
         return Result.fail("plugin_operation_in_progress", code=409)
-    except (ArchiveSourceBuildConflict, ArchiveDependencyConflict) as error:
-        record_failure(error.code, safe_process_error(str(error)))
-        return Result.fail(
-            error.code, code=409, details=getattr(error, "details", None)
-        )
-    except (LayerBuildError, DependencyAnalysisError) as error:
+    except Exception as error:
+        diagnostic = safe_process_error(str(error))
         if staged:
-            return completed(
+            return _completed(
+                analysis,
+                operation_id,
+                binding,
                 {
                     "apply_mode": "restart_pending",
                     "status": "pending",
-                    "diagnostic": safe_process_error(str(error)),
+                    "diagnostic": diagnostic,
                 },
                 "依赖事务已保存，请查询原操作状态",
             )
@@ -1819,90 +1608,70 @@ async def _apply_analysis(payload: ApplyPayload, binding: str) -> Result[dict]:
             remove_generation(new_generation)
         if previous_pending is not None:
             save_pending_transaction(previous_pending)
-        logger.error(f"NoneBot 依赖层构建失败: {error.code}", "WebUi")
-        record_failure(error.code, safe_process_error(str(error)))
+        build_error = isinstance(error, LayerBuildError | DependencyAnalysisError)
+        code = (getattr(error, "code", "") if build_error else "") or (
+            "nonebot_plugin_apply_failed"
+        )
+        logger.error(f"NoneBot 插件应用失败: {code}", "WebUi", e=error)
+        _record_failure(analysis, operation_id, binding, code, diagnostic)
         return Result.fail(
-            error.code,
-            code=400,
+            code,
+            code=400 if build_error else 500,
             details={
-                "stage": "dependency_build",
-                "diagnostic": safe_process_error(str(error)),
+                "stage": "dependency_build"
+                if build_error
+                else "dependency_transaction",
+                "diagnostic": diagnostic,
                 "issues": getattr(error, "details", None),
             },
         )
-    except Exception as error:
-        if staged:
-            return completed(
-                {
-                    "apply_mode": "restart_pending",
-                    "status": "pending",
-                    "diagnostic": safe_process_error(str(error)),
-                },
-                "依赖事务已保存，请查询原操作状态",
-            )
-        if new_generation is not None:
-            remove_generation(new_generation)
-        if previous_pending is not None:
-            save_pending_transaction(previous_pending)
-        logger.error("NoneBot 插件应用失败，已保留原事务", "WebUi", e=error)
-        record_failure("nonebot_plugin_apply_failed", safe_process_error(str(error)))
-        return Result.fail(
-            "nonebot_plugin_apply_failed",
-            code=500,
-            details={
-                "stage": "dependency_transaction",
-                "diagnostic": safe_process_error(str(error)),
-            },
-        )
 
 
-def _public_transaction(transaction: dict[str, Any] | None) -> dict[str, Any] | None:
-    if not transaction:
-        return None
-    return {
-        "revision": transaction.get("revision"),
-        "state": transaction.get("state"),
-        "error_code": transaction.get("error_code"),
-        "rollback_confirmed": bool(transaction.get("rollback_confirmed")),
-        "rollback_error": transaction.get("rollback_error"),
-        "cleanup_error": transaction.get("cleanup_error"),
-        "created_at": transaction.get("created_at"),
-        "updated_at": transaction.get("updated_at"),
-        "database_migration_possible": bool(
-            transaction.get("database_migration_possible")
+def _cancelable(transaction: dict[str, Any]) -> bool:
+    """事务是否处于可撤销状态且未被当前运行层使用
+
+    参数:
+        transaction: 待处理事务
+
+    返回:
+        bool: 是否可撤销
+    """
+    generation = transaction.get("generation")
+    return transaction.get("state") in {
+        "pending_restart",
+        "migration_blocked",
+        "failed",
+    } and not (
+        isinstance(generation, int)
+        and load_manifest().get("active_generation") == generation
+    )
+
+
+def _clear_transaction(transaction: dict[str, Any]) -> Result[dict]:
+    """撤销整个待处理事务
+
+    参数:
+        transaction: 待处理事务
+
+    返回:
+        Result[dict]: 撤销结果
+    """
+    remove_generation(transaction.get("generation"))
+    finalize_orm_migration()
+    clear_pending_transaction()
+    record_manual_operations(transaction, "rolled_back", "rolled_back")
+    failed = transaction.get("state") == "failed"
+    return Result.ok(
+        _operation_result(
+            "rolled_back",
+            ["failed_transaction_cleared" if failed else "transaction_canceled"],
         ),
-        "database_type": transaction.get("database_type", "none"),
-        "operations": [
-            {
-                key: item.get(key)
-                for key in (
-                    "operation_id",
-                    "action",
-                    "project_link",
-                    "module_name",
-                    "name",
-                    "created_at",
-                )
-            }
-            for item in transaction.get("operations", [])
-            if isinstance(item, dict)
-        ],
-    }
-
-
-@router.get(
-    "/transactions/pending",
-    dependencies=[authentication()],
-    response_model=Result[dict],
-    response_class=JSONResponse,
-)
-async def pending_transaction_status() -> Result[dict]:
-    return Result.ok({"transaction": _public_transaction(pending_transaction())})
+        info="失败记录已清除" if failed else "待重启插件事务已取消",
+    )
 
 
 def _cancel_prepared_repair(sync: dict) -> Result[dict]:
     save_dependency_sync_status({**sync, "status": "canceled"})
-    update_pending_restart("webui.nonebot-store", [])
     return Result.ok(
         _operation_result(
             "rolled_back",
@@ -1914,13 +1683,15 @@ def _cancel_prepared_repair(sync: dict) -> Result[dict]:
     )
 
 
-@router.delete(
-    "/transactions/pending/{operation_id}",
-    dependencies=[authentication()],
-    response_model=Result[dict],
-    response_class=JSONResponse,
-)
 async def cancel_pending_operation(operation_id: str) -> Result[dict]:
+    """撤销 NoneBot 商店待重启事务中的指定操作及其之后的操作
+
+    参数:
+        operation_id: 操作 id
+
+    返回:
+        Result[dict]: 撤销结果
+    """
     try:
         async with _store_operation(
             operation_id=operation_id, owner="webui.nonebot_store"
@@ -1932,17 +1703,7 @@ async def cancel_pending_operation(operation_id: str) -> Result[dict]:
             ):
                 return _cancel_prepared_repair(sync)
             transaction = pending_transaction()
-            if transaction is None or transaction.get("state") not in {
-                "pending_restart",
-                "migration_blocked",
-                "failed",
-            }:
-                return Result.fail("nonebot_transaction_not_cancelable", code=409)
-            if (
-                isinstance(transaction.get("generation"), int)
-                and load_manifest().get("active_generation")
-                == transaction["generation"]
-            ):
+            if transaction is None or not _cancelable(transaction):
                 return Result.fail("nonebot_transaction_not_cancelable", code=409)
             operations = transaction.get("operations", [])
             index = next(
@@ -1959,24 +1720,13 @@ async def cancel_pending_operation(operation_id: str) -> Result[dict]:
             removed = operations[index:]
             old_generation = transaction.get("generation")
             if not remaining:
-                remove_generation(old_generation)
-                finalize_orm_migration()
-                clear_pending_transaction()
-                record_manual_operations(transaction, "rolled_back", "rolled_back")
-                update_pending_restart("webui.nonebot-store", [])
-                return Result.ok(
-                    {
-                        **_operation_result("rolled_back", ["transaction_canceled"]),
-                        "removed_operation_ids": [
-                            item.get("operation_id") for item in removed
-                        ],
-                    },
-                    info="待重启插件事务已取消",
-                )
-            transaction["operations"] = remaining
-            transaction["target_manifest"] = deepcopy(remaining[-1]["target_manifest"])
-            transaction["revision"] = uuid.uuid4().hex
-            transaction["updated_at"] = utc_now()
+                return _clear_transaction(transaction)
+            transaction = draft_transaction(
+                transaction,
+                remaining[-1]["target_manifest"],
+                operations=remaining,
+                state="pending_restart",
+            )
             if isinstance(old_generation, int):
                 build = await prepare_generation(transaction)
                 stage_generation(transaction, build)
@@ -1986,19 +1736,7 @@ async def cancel_pending_operation(operation_id: str) -> Result[dict]:
                 {"operations": removed}, "rolled_back", "rolled_back"
             )
             return Result.ok(
-                {
-                    **_operation_result(
-                        "restart_pending",
-                        ["plugin_restart_required"],
-                        transaction_revision=transaction["revision"],
-                        pending_operations=_public_transaction(transaction)[
-                            "operations"
-                        ],
-                    ),
-                    "removed_operation_ids": [
-                        item.get("operation_id") for item in removed
-                    ],
-                },
+                _operation_result("restart_pending", ["plugin_restart_required"]),
                 info="已撤销所选操作及其后的依赖操作",
             )
     except StoreOperationBusyError:
@@ -2024,63 +1762,11 @@ async def cancel_transaction() -> Result[dict]:
             transaction = pending_transaction()
             if transaction is None:
                 return Result.fail("nonebot_transaction_not_found", code=404)
-            state = str(transaction.get("state") or "")
-            if state not in {
-                "pending_restart",
-                "migration_blocked",
-                "failed",
-            }:
+            if not _cancelable(transaction):
                 return Result.fail("nonebot_transaction_not_cancelable", code=409)
-            if (
-                isinstance(transaction.get("generation"), int)
-                and load_manifest().get("active_generation")
-                == transaction["generation"]
-            ):
-                return Result.fail("nonebot_transaction_not_cancelable", code=409)
-            remove_generation(transaction.get("generation"))
-            finalize_orm_migration()
-            clear_pending_transaction()
-            record_manual_operations(transaction, "rolled_back", "rolled_back")
-            update_pending_restart("webui.nonebot-store", [])
-            failed = state == "failed"
-            return Result.ok(
-                _operation_result(
-                    "rolled_back",
-                    [
-                        "failed_transaction_cleared"
-                        if failed
-                        else "transaction_canceled"
-                    ],
-                    project_link=transaction.get("project_link"),
-                    action=transaction.get("action"),
-                ),
-                info=("失败记录已清除" if failed else "待重启插件事务已取消"),
-            )
+            return _clear_transaction(transaction)
     except StoreOperationBusyError:
         return Result.fail("plugin_operation_in_progress", code=409)
     except Exception as error:
         logger.error("取消 NoneBot 插件事务失败", "WebUi", e=error)
         return Result.fail("nonebot_transaction_cancel_failed", code=500)
-
-
-@router.post(
-    "/transactions/{revision}/cleanup/retry",
-    dependencies=[authentication()],
-    response_model=Result[dict],
-)
-async def retry_transaction_cleanup(revision: str) -> Result[dict]:
-    from zhenxun.services.nonebot_store.cleanup import retry_cleanup
-
-    try:
-        async with _store_operation(owner="webui.nonebot-cleanup"):
-            record = retry_cleanup(revision)
-        return Result.ok(
-            {
-                key: record.get(key)
-                for key in ("revision", "state", "cleanup_state", "cleanup_error")
-            }
-        )
-    except StoreOperationBusyError:
-        return Result.fail("plugin_operation_in_progress", code=409)
-    except ValueError as error:
-        return Result.fail(str(error), code=404)

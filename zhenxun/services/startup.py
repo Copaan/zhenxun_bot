@@ -12,8 +12,6 @@ import time
 from typing import Any, Literal
 import uuid
 
-from zhenxun.utils.atomic_json import write_json_locked
-
 StartupState = Literal[
     "starting",
     "management_ready",
@@ -23,8 +21,6 @@ StartupState = Literal[
     "failed",
 ]
 StartupStage = Literal["management", "runtime", "warmup"]
-
-_REPORT_PATH = Path("data/runtime/startup-profile-v1.json")
 
 
 @dataclass(slots=True)
@@ -127,7 +123,6 @@ class StartupCoordinator:
         self._management_complete = False
         self._server_bound = False
         self._setup_required = False
-        self._last_persist_monotonic = 0.0
         self._lock = RLock()
         self._server_bound_event: asyncio.Event | None = None
         self._runtime_event: asyncio.Event | None = None
@@ -151,7 +146,6 @@ class StartupCoordinator:
         with self._lock:
             self._stage_started[stage] = time.monotonic()
             self._stages[stage] = {"state": "running", "duration_ms": None}
-        self.persist()
 
     def finish_stage(self, stage: StartupStage) -> None:
         with self._lock:
@@ -172,7 +166,6 @@ class StartupCoordinator:
                 if self._finished_monotonic is None:
                     self._finished_monotonic = time.monotonic()
                 self._set_event(self._warmup_event)
-        self.persist()
 
     def enter_setup_mode(self) -> None:
         """Keep the minimal management surface alive until first setup restarts."""
@@ -189,7 +182,6 @@ class StartupCoordinator:
                 self._state = "management_ready"
                 if self._finished_monotonic is None:
                     self._finished_monotonic = time.monotonic()
-        self.persist()
 
     def fail_stage(
         self,
@@ -226,7 +218,6 @@ class StartupCoordinator:
             if stage == "warmup":
                 self._set_event(self._warmup_event)
         reason = dict(self._degraded_reasons[-1]) if added else None
-        self.persist()
         if added:
             self._log_degraded_reason(reason or {}, error=error)
 
@@ -255,7 +246,6 @@ class StartupCoordinator:
             self._operations = self._operations[-1000:]
             if self._current_operation and self._current_operation.get("name") == name:
                 self._current_operation = None
-        self._persist_throttled(force=duration_ms >= 250 or state == "failed")
 
     def begin_operation(self, name: str, stage: str, **details: Any) -> None:
         with self._lock:
@@ -265,12 +255,10 @@ class StartupCoordinator:
                 "started_at": datetime.now(timezone.utc).isoformat(),
                 "details": details,
             }
-        self._persist_throttled()
 
     def set_load_plan(self, planner: Any) -> None:
         with self._lock:
             self._load_planner = planner
-        self._persist_throttled(force=True)
 
     def clear_plugin_failures(self, owners: set[str]) -> None:
         """移除已恢复插件的降级原因，全部恢复后回到 warmup_ready
@@ -296,7 +284,6 @@ class StartupCoordinator:
                 and self._stages.get("warmup", {}).get("state") == "completed"
             ):
                 self._state = "warmup_ready"
-        self.persist()
 
     def record_error(
         self,
@@ -320,7 +307,6 @@ class StartupCoordinator:
         reason = dict(self._degraded_reasons[-1]) if added else None
         if added:
             self._log_degraded_reason(reason or {}, error=error)
-            self._persist_throttled(force=True)
 
     def _append_degraded_reason_locked(
         self,
@@ -410,7 +396,6 @@ class StartupCoordinator:
                 if self._setup_required and self._finished_monotonic is None:
                     self._finished_monotonic = time.monotonic()
             self._set_event(self._server_bound_event)
-        self.persist()
 
     async def wait_server_bound(self) -> None:
         await self._event("server").wait()
@@ -567,20 +552,6 @@ class StartupCoordinator:
             result["operations"] = [asdict(item) for item in self._operations]
             result["diagnostics"] = [asdict(item) for item in self._diagnostics]
         return result
-
-    def _persist_throttled(self, *, force: bool = False) -> None:
-        now = time.monotonic()
-        with self._lock:
-            if not force and now - self._last_persist_monotonic < 0.25:
-                return
-            self._last_persist_monotonic = now
-        self.persist()
-
-    def persist(self) -> None:
-        try:
-            write_json_locked(_REPORT_PATH, self.snapshot(), timeout=0.2)
-        except (OSError, TimeoutError):
-            pass
 
 
 startup_coordinator = StartupCoordinator()

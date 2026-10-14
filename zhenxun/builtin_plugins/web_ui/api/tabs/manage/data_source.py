@@ -1,5 +1,4 @@
 import nonebot
-from tortoise.functions import Count
 
 from zhenxun.models.ban_console import BanConsole
 from zhenxun.models.chat_history import ChatHistory
@@ -21,6 +20,7 @@ from zhenxun.utils.platform import PlatformUtils
 
 from ....config import AVA_URL, GROUP_AVA_URL
 from ....utils import webui_db_call
+from ..main.data_source import top_plugins
 from .model import (
     FriendRequestResult,
     GroupDetail,
@@ -147,29 +147,14 @@ class ApiDataSource:
         fd = [x for x in friend_list if x.user_id == user_id]
         if not fd:
             return None
-        like_plugin_list = await webui_db_call(
-            Statistics.filter(user_id=user_id)
-            .annotate(count=Count("id"))
-            .group_by("plugin_name")
-            .order_by("-count")
-            .limit(5)
-            .values_list("plugin_name", "count"),
-            "Manage.friend_like_plugin",
-        )
-        like_plugin = {}
-        module_list = [x[0] for x in like_plugin_list]
-        plugins = await webui_db_call(
-            PluginInfo.get_plugins(
-                load_status=None,
-                filter_parent=False,
-                module__in=module_list,
-            ),
-            "Manage.friend_like_plugin_names",
-        )
-        module2name = {p.module: p.name for p in plugins}
-        for data in like_plugin_list:
-            name = module2name.get(data[0]) or data[0]
-            like_plugin[name] = data[1]
+        storage_bot_id = PlatformUtils.get_storage_bot_id(bot)
+        like_plugin = {
+            plugin.name: plugin.count
+            for plugin in await top_plugins(
+                Statistics.filter(bot_id=storage_bot_id, user_id=user_id),
+                "Manage.like_plugin",
+            )
+        }
         user = fd[0]
         return UserDetail(
             user_id=user_id,
@@ -178,45 +163,15 @@ class ApiDataSource:
             remark="",
             is_ban=await BanConsole.is_ban(user_id),
             chat_count=await webui_db_call(
-                ChatHistory.filter(user_id=user_id).count(),
+                ChatHistory.filter(bot_id=storage_bot_id, user_id=user_id).count(),
                 "Manage.friend_chat_count",
             ),
             call_count=await webui_db_call(
-                Statistics.filter(user_id=user_id).count(),
+                Statistics.filter(bot_id=storage_bot_id, user_id=user_id).count(),
                 "Manage.friend_call_count",
             ),
             like_plugin=like_plugin,
         )
-
-    @classmethod
-    async def __get_group_detail_like_plugin(cls, group_id: str) -> dict[str, int]:
-        """获取群组喜爱的插件
-
-        参数:
-            group_id: 群组id
-
-        返回:
-            dict[str, int]: 插件与调用次数
-        """
-        like_plugin_list = await webui_db_call(
-            Statistics.filter(group_id=group_id)
-            .annotate(count=Count("id"))
-            .group_by("plugin_name")
-            .order_by("-count")
-            .limit(5)
-            .values_list("plugin_name", "count"),
-            "Manage.group_like_plugin",
-        )
-        like_plugin = {}
-        plugins = await webui_db_call(
-            PluginInfo.get_plugins(),
-            "Manage.group_like_plugin_names",
-        )
-        module2name = {p.module: p.name for p in plugins}
-        for data in like_plugin_list:
-            name = module2name.get(data[0]) or data[0]
-            like_plugin[name] = data[1]
-        return like_plugin
 
     @classmethod
     async def __get_group_detail_disable_plugin(
@@ -270,30 +225,17 @@ class ApiDataSource:
         """
         all_task = await TaskInfo.get_tasks(load_status=None)
         task_module2name = {task.module: task.name for task in all_task}
-        task_list = []
-        if group.block_task or group.superuser_block_plugin:
-            sbp = CommonUtils.convert_module_format(group.superuser_block_task)
-            tasks = CommonUtils.convert_module_format(group.block_task)
-            task_list.extend(
-                Task(
-                    name=task.module,
-                    zh_name=task_module2name.get(task.module) or task.module,
-                    status=task.module not in tasks and task.module not in sbp,
-                    is_super_block=task.module in sbp,
-                )
-                for task in all_task
+        sbp = CommonUtils.convert_module_format(group.superuser_block_task)
+        tasks = CommonUtils.convert_module_format(group.block_task)
+        return [
+            Task(
+                name=task.module,
+                zh_name=task_module2name.get(task.module) or task.module,
+                status=task.module not in tasks and task.module not in sbp,
+                is_super_block=task.module in sbp,
             )
-        else:
-            task_list.extend(
-                Task(
-                    name=task.module,
-                    zh_name=task_module2name.get(task.module) or task.module,
-                    status=True,
-                    is_super_block=False,
-                )
-                for task in all_task
-            )
-        return task_list
+            for task in all_task
+        ]
 
     @classmethod
     async def get_group_detail(
@@ -319,14 +261,21 @@ class ApiDataSource:
         group.superuser_block_task = CommonUtils.convert_module_format(
             policy["forced_tasks"]
         )
-        like_plugin = await cls.__get_group_detail_like_plugin(group_id)
+        storage_bot_id = policy["bot_id"]
+        like_plugin = {
+            plugin.name: plugin.count
+            for plugin in await top_plugins(
+                Statistics.filter(bot_id=storage_bot_id, group_id=group_id),
+                "Manage.like_plugin",
+            )
+        }
         disable_plugins: list[Plugin] = await cls.__get_group_detail_disable_plugin(
             group
         )
         task_list = await cls.__get_group_detail_task(group)
         return GroupDetail(
             group_id=group_id,
-            bot_id=policy["bot_id"],
+            bot_id=storage_bot_id,
             policy_revision=policy["revision"],
             policy_effective=policy["effective"],
             ava_url=GROUP_AVA_URL.format(group_id, group_id),
@@ -334,11 +283,11 @@ class ApiDataSource:
             member_count=group.member_count,
             max_member_count=group.max_member_count,
             chat_count=await webui_db_call(
-                ChatHistory.filter(group_id=group_id).count(),
+                ChatHistory.filter(bot_id=storage_bot_id, group_id=group_id).count(),
                 "Manage.group_chat_count",
             ),
             call_count=await webui_db_call(
-                Statistics.filter(group_id=group_id).count(),
+                Statistics.filter(bot_id=storage_bot_id, group_id=group_id).count(),
                 "Manage.group_call_count",
             ),
             like_plugin=like_plugin,

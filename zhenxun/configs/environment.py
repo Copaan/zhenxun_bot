@@ -67,12 +67,7 @@ def sync_env_missing_items(project_root: Path) -> None:
             comments.append(item.original.string)
             continue
         if item.key not in existing_values:
-            text = item.original.string
-            if item.key == "WEBUI_HTTP_MODE" and str(
-                existing_values.get("WEBUI_HTTP_REDIRECT_ENABLED", "")
-            ).casefold() in {"1", "true", "yes", "on"}:
-                text = "WEBUI_HTTP_MODE=redirect\n"
-            additions.append("".join(comments) + text)
+            additions.append("".join(comments) + item.original.string)
             existing_values[item.key] = item.value
             added_keys.append(item.key)
         comments.clear()

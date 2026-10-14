@@ -9,17 +9,10 @@ from zhenxun.configs.utils import PluginExtraData, Task
 from zhenxun.models.task_info import TaskInfo
 from zhenxun.services.cache.runtime_cache import TaskInfoMemoryCache
 from zhenxun.services.log import logger
-from zhenxun.services.startup_reconcile import (
-    commit as commit_reconcile,
-)
-from zhenxun.services.startup_reconcile import (
-    matches as reconcile_matches,
-)
-from zhenxun.services.startup_reconcile import (
-    payload_fingerprint,
-)
 from zhenxun.utils.common_utils import CommonUtils
 from zhenxun.utils.manager.priority_manager import PriorityLifecycle
+
+from .utils import commit_reconcile, payload_fingerprint, reconcile_matches
 
 driver: Driver = nonebot.get_driver()
 

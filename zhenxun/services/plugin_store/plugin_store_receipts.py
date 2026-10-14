@@ -15,7 +15,16 @@ from zhenxun.utils.atomic_json import (
 _RECEIPT_FILE = Path("data/runtime/plugin-store-receipts-v1.json")
 
 
-def source_digest(path: Path) -> str | None:
+def source_digest(path: Path, *, python_only: bool = False) -> str | None:
+    """计算插件源码摘要
+
+    参数:
+        path: 插件目录或文件
+        python_only: 只计入 .py/.pyi 文件
+
+    返回:
+        str | None: 摘要，路径不存在或无法读取时为 None
+    """
     if not path.exists():
         return None
     files = (
@@ -28,6 +37,8 @@ def source_digest(path: Path) -> str | None:
     try:
         for item in files:
             if "__pycache__" in item.parts or item.suffix in {".pyc", ".pyo"}:
+                continue
+            if python_only and item.suffix not in {".py", ".pyi"}:
                 continue
             digest.update(item.relative_to(root).as_posix().encode("utf-8"))
             digest.update(b"\0")
@@ -67,7 +78,7 @@ class StoreReceiptStore:
 def receipt_dependency_inputs(
     overrides: dict[str, list[str] | None] | None = None,
 ) -> dict[str, list[str]]:
-    """读取商店插件回执中记录的依赖声明
+    """读取商店插件回执中记录的依赖声明，源码目录已被删除的本地回执不再计入
 
     参数:
         overrides: 按 store_key 覆盖的依赖声明，None 表示移除
@@ -80,6 +91,7 @@ def receipt_dependency_inputs(
         for key, receipt in StoreReceiptStore.load().items()
         if isinstance(receipt, dict)
         and isinstance(receipt.get("dependency_inputs"), list)
+        and (not receipt.get("local_path") or Path(receipt["local_path"]).exists())
     }
     for key, values in (overrides or {}).items():
         if values is None:
@@ -164,16 +176,12 @@ def store_receipt(
     返回:
         dict[str, Any]: 安装回执
     """
-    installed_version = artifact_version(path)
     receipt = {
         "source": source,
         "module": plugin_info.module,
         "module_path": plugin_info.module_path,
         "runtime_module": runtime_module,
-        "requested_version": str(plugin_info.version),
-        "installed_version": installed_version,
-        "version_source": "artifact_metadata" if installed_version else "unknown",
-        "catalog_version": str(plugin_info.version),
+        "installed_version": artifact_version(path),
         "source_digest": source_digest(path),
         "installed_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -189,7 +197,7 @@ def write_store_receipt(store_key: str, receipt: dict[str, Any]) -> None:
         store_key: 商店插件标识
         receipt: 安装回执
     """
-    from .plugin_store_transaction import release_source_dependencies
+    from zhenxun.services.nonebot_store.storage import release_source_dependencies
 
     release_source_dependencies(
         {store_key: list(receipt.get("dependency_inputs") or [])}
@@ -204,7 +212,7 @@ def delete_store_receipt(store_key: str, path: Path) -> None:
         store_key: 商店插件标识
         path: 已移除的插件源码路径
     """
-    from .plugin_store_transaction import release_source_dependencies
+    from zhenxun.services.nonebot_store.storage import release_source_dependencies
 
     release_source_dependencies({store_key: None}, [path])
     StoreReceiptStore.delete(store_key)

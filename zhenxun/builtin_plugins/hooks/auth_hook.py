@@ -1,6 +1,10 @@
 import asyncio
+from dataclasses import dataclass
 from functools import wraps
+import math
 import time
+import uuid
+import weakref
 
 from nonebot import get_driver
 from nonebot.adapters import Bot, Event
@@ -13,8 +17,7 @@ from nonebot_plugin_uninfo import Uninfo
 
 from zhenxun.services.cache.runtime_cache import is_cache_ready, wait_cache_ready
 from zhenxun.services.log import logger
-from zhenxun.services.message_admission import connection_epochs
-from zhenxun.services.message_load import is_overloaded, mark_activity
+from zhenxun.services.message_load import mark_activity
 from zhenxun.services.runtime_bootstrap import register_runtime_bootstrap
 from zhenxun.utils.exception import DependencyUnavailable
 from zhenxun.utils.manager.priority_manager import PriorityLifecycle
@@ -34,6 +37,122 @@ from .auth_checker import auth
 from .auth_dispatch import get_route_context, install_dispatch, uninstall_dispatch
 
 _SKIP_AUTH_PLUGINS = {"chat_history", "chat_message"}
+
+
+@dataclass(frozen=True)
+class ConnectionEpoch:
+    bot: weakref.ReferenceType
+    connected_second: int
+    connection_id: str
+
+
+class ConnectionEpochs:
+    """按连接记录 Bot 接入时间，用于丢弃接入前积压的旧消息"""
+
+    def __init__(self) -> None:
+        self._entries: dict[tuple[str, str], ConnectionEpoch] = {}
+
+    def connect(self, bot, scope: str) -> ConnectionEpoch:
+        key = (scope, str(bot.self_id))
+
+        def expired(reference):
+            current = self._entries.get(key)
+            if current is not None and current.bot is reference:
+                self._entries.pop(key, None)
+
+        epoch = ConnectionEpoch(
+            weakref.ref(bot, expired), math.floor(time.time()), uuid.uuid4().hex
+        )
+        self._entries[key] = epoch
+        return epoch
+
+    def get(self, bot, scope: str) -> ConnectionEpoch | None:
+        epoch = self._entries.get((scope, str(bot.self_id)))
+        return epoch if epoch is not None and epoch.bot() is bot else None
+
+    def disconnect(self, bot, scope: str) -> None:
+        if self.get(bot, scope) is not None:
+            self._entries.pop((scope, str(bot.self_id)), None)
+
+    def is_backlog(self, bot, scope: str, timestamp: object) -> bool:
+        if (
+            isinstance(timestamp, bool)
+            or not isinstance(timestamp, int | float)
+            or (isinstance(timestamp, float) and not math.isfinite(timestamp))
+            or timestamp < 0
+        ):
+            return False
+        epoch = self.get(bot, scope)
+        return epoch is not None and timestamp < epoch.connected_second
+
+    def clear(self) -> None:
+        self._entries.clear()
+
+
+connection_epochs = ConnectionEpochs()
+
+
+@dataclass(frozen=True)
+class PlatformCapabilities:
+    available: frozenset[str]
+    authorization_unknown: frozenset[str] = frozenset()
+
+
+def event_capabilities(bot: Bot, event: Event, session) -> PlatformCapabilities:
+    """根据事件判断本次可用的平台能力，远端接口权限由调用时校验
+
+    参数:
+        bot: Bot
+        event: Event
+        session: Uninfo
+
+    返回:
+        PlatformCapabilities: 可用能力与未确认授权的能力
+    """
+    from nonebot.adapters.qq.event import (
+        DirectMessageCreateEvent,
+        InteractionCreateEvent,
+    )
+
+    from zhenxun.services.business_identity import supports_business_identity
+    from zhenxun.services.platform_identity import is_namespaced_scope
+    from zhenxun.utils.platform import PlatformUtils
+
+    available = {"uni_message"}
+    remote = set()
+    scene = session.scene
+    if isinstance(event, DirectMessageCreateEvent):
+        available.add("guild_dm")
+    elif scene.is_channel:
+        available.update({"guild", "channel"})
+    elif scene.is_guild:
+        available.add("guild")
+    elif scene.is_group:
+        available.add("group")
+    elif scene.is_private:
+        available.add("c2c")
+    if event.get_type() == "message":
+        available.add("passive_reply")
+    if isinstance(event, InteractionCreateEvent) and event.type in (11, 12):
+        available.add("interaction_response")
+        if event.event_id:
+            available.add("passive_reply")
+    scope = PlatformUtils.get_platform_scope(bot) if isinstance(bot, Bot) else "unknown"
+    supports_members = (scope == "qq_api" and bool(available & {"group", "guild"})) or (
+        scope == "qq_client" and "group" in available
+    )
+    if supports_members:
+        available.add("members_query")
+        # SDK support cannot establish server-side authorization for this Bot.
+        remote.add("members_query")
+    if scope == "qq_client":
+        available.add("legacy_identity")
+    if scope == "qq_client" or is_namespaced_scope(scope):
+        available.add("scoped_management")
+    if event.get_type() == "message" and supports_business_identity(scope):
+        available.add("business_identity")
+    return PlatformCapabilities(frozenset(available), frozenset(remote))
+
 
 driver = get_driver()
 register_runtime_bootstrap(driver)
@@ -86,7 +205,7 @@ def _skip_auth_for_plugin(matcher: Matcher) -> bool:
 
 
 def _enforce_platform_contract(
-    matcher: Matcher, event_context, bot, event, session
+    matcher: Matcher, platform_scope: str, bot, event, session
 ) -> None:
     if matcher.plugin is None:
         return
@@ -95,13 +214,11 @@ def _enforce_platform_contract(
     if not isinstance(extra, dict):
         return
     supported = extra.get("supported_platform_scopes")
-    if supported and event_context.platform_scope not in set(supported):
+    if supported and platform_scope not in set(supported):
         raise IgnoredException("plugin platform scope unsupported")
     required = set(extra.get("required_platform_capabilities") or ())
     if not required:
         return
-    from zhenxun.services.platform_capabilities import event_capabilities
-
     capabilities = event_capabilities(bot, event, session)
     if not required.issubset(capabilities.available):
         raise IgnoredException("plugin platform capability unavailable")
@@ -206,6 +323,11 @@ async def _auth_preprocessor(
 
     # 提前判断是否跳过权限检查
     if _skip_auth_for_plugin(matcher):
+        from zhenxun.utils.platform import PlatformUtils
+
+        _enforce_platform_contract(
+            matcher, PlatformUtils.get_platform_scope(session), bot, event, session
+        )
         return
 
     start_time = time.time()
@@ -216,7 +338,9 @@ async def _auth_preprocessor(
         state,
         message=message,
     )
-    _enforce_platform_contract(matcher, event_context, bot, event, session)
+    _enforce_platform_contract(
+        matcher, event_context.platform_scope, bot, event, session
+    )
     from zhenxun.services.bot_group_policy import bot_group_policy_service
 
     await bot_group_policy_service.ensure_fresh(
@@ -259,7 +383,7 @@ async def _auth_preprocessor(
 
     now = time.monotonic()
     last_log = getattr(_auth_preprocessor, "_last_log", 0.0)
-    if now - last_log > 1.0 and not is_overloaded():
+    if now - last_log > 1.0:
         setattr(_auth_preprocessor, "_last_log", now)
         logger.debug(
             f"auth check cost: {time.time() - start_time:.3f}s",

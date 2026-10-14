@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import ast
+import importlib.util
 from pathlib import Path
 import sys
 from types import ModuleType
@@ -32,6 +33,181 @@ _THREAD_MODULES = {"_thread", "multiprocessing", "threading"}
 _THREAD_NAMES = {"Pool", "Process", "Thread", "Timer", "start_new_thread"}
 _BUILTIN_PREFIX = "zhenxun.builtin_plugins."
 _SOURCE_PREFIX = "zhenxun.plugins."
+_ROUTE_CALLS = {
+    "add_exception_handler",
+    "add_middleware",
+    "lifespan",
+    "middleware",
+    "mount",
+}
+_PROCESS_CALLS = {"Popen", "Process", "Thread", "create_subprocess_exec"}
+_MODEL_MODULES = {
+    "nonebot_plugin_orm",
+    "tortoise.models",
+    "zhenxun.services.db_context",
+    "zhenxun.services.db_context.base_model",
+}
+
+
+def _call_name(node: ast.Call) -> str:
+    target = node.func
+    if isinstance(target, ast.Name):
+        return target.id
+    if isinstance(target, ast.Attribute):
+        return target.attr
+    return ""
+
+
+def _literal_string(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    return None
+
+
+class _ImportBoundaryVisitor(ast.NodeVisitor):
+    """Inspect definitions and statements that execute while a module imports."""
+
+    def __init__(self, module_name: str, *, is_package: bool = False) -> None:
+        self.module_name = module_name
+        self.package = module_name if is_package else module_name.rpartition(".")[0]
+        self.reasons: set[str] = set()
+        self.imports: set[str] = set()
+        self.requires: set[str] = set()
+        self.aliases: dict[str, str] = {}
+        self.deferred_annotations = False
+
+    def visit_Module(self, node: ast.Module) -> None:
+        self.deferred_annotations = any(
+            isinstance(statement, ast.ImportFrom)
+            and statement.module == "__future__"
+            and any(item.name == "annotations" for item in statement.names)
+            for statement in node.body
+        )
+        self.generic_visit(node)
+
+    def _resolve_expression(self, node: ast.expr) -> str:
+        if isinstance(node, ast.Name):
+            return self.aliases.get(node.id, node.id)
+        if isinstance(node, ast.Attribute):
+            owner = self._resolve_expression(node.value)
+            return f"{owner}.{node.attr}" if owner else ""
+        return ""
+
+    def visit_Import(self, node: ast.Import) -> None:
+        for item in node.names:
+            self.imports.add(item.name)
+            self.aliases[item.asname or item.name.split(".")[0]] = (
+                item.name if item.asname else item.name.split(".")[0]
+            )
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        module = node.module or ""
+        if node.level:
+            try:
+                module = importlib.util.resolve_name(
+                    f"{'.' * node.level}{module}", self.package
+                )
+            except (ImportError, ValueError):
+                module = ""
+        if module:
+            self.imports.add(module)
+        for item in node.names:
+            if item.name == "*":
+                continue
+            resolved = f"{module}.{item.name}" if module else item.name
+            self.aliases[item.asname or item.name] = resolved
+            if module:
+                self.imports.add(resolved)
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        for base in node.bases:
+            self.visit(base)
+            resolved = self._resolve_expression(base)
+            module, _, name = resolved.rpartition(".")
+            if name in {"Model", "AbstractModel"} and module in _MODEL_MODULES:
+                self.reasons.add("orm_model")
+        for decorator in node.decorator_list:
+            self.visit(decorator)
+        for keyword in node.keywords:
+            self.visit(keyword.value)
+        for statement in node.body:
+            self.visit(statement)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+        self._inspect_function_decorators(node.decorator_list)
+        for value in [*node.args.defaults, *node.args.kw_defaults]:
+            if value is not None:
+                self.visit(value)
+        if not self.deferred_annotations:
+            arguments = [*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs]
+            arguments.extend(arg for arg in (node.args.vararg, node.args.kwarg) if arg)
+            for value in [*(arg.annotation for arg in arguments), node.returns]:
+                if value is not None:
+                    self.visit(value)
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        for value in [*node.args.defaults, *node.args.kw_defaults]:
+            if value is not None:
+                self.visit(value)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        self.visit(node.target)
+        if node.value is not None:
+            self.visit(node.value)
+        if not self.deferred_annotations:
+            self.visit(node.annotation)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self.visit_FunctionDef(node)
+
+    def _inspect_function_decorators(self, decorators: list[ast.expr]) -> None:
+        for decorator in decorators:
+            self.visit(decorator)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        name = _call_name(node)
+        resolved = ""
+        if isinstance(node.func, ast.Name):
+            resolved = self.aliases.get(node.func.id, "")
+        elif isinstance(node.func, ast.Attribute):
+            parts = [node.func.attr]
+            owner = node.func.value
+            while isinstance(owner, ast.Attribute):
+                parts.append(owner.attr)
+                owner = owner.value
+            if isinstance(owner, ast.Name) and owner.id in self.aliases:
+                resolved = ".".join([self.aliases[owner.id], *reversed(parts)])
+        resolved_name = resolved.rsplit(".", 1)[-1]
+        if resolved in {
+            "nonebot.require",
+            "importlib.import_module",
+            "builtins.__import__",
+        }:
+            name = resolved_name
+        if name in _ROUTE_CALLS:
+            self.reasons.add("fastapi_route")
+        elif name == "register_adapter":
+            self.reasons.add("adapter_registration")
+        elif name in _PROCESS_CALLS:
+            self.reasons.add("import_time_thread_or_process")
+        elif name in {"import_module", "__import__"}:
+            self.reasons.add("dynamic_import")
+        elif name == "require" and node.args:
+            if value := _literal_string(node.args[0]):
+                self.requires.add(value)
+                if value == "nonebot_plugin_orm":
+                    self.reasons.add("nonebot_plugin_orm")
+        self.generic_visit(node)
+
+
+def _module_for_file(root_module: str, root: Path, path: Path) -> str:
+    if root.is_file():
+        return root_module
+    relative = path.relative_to(root)
+    parts = list(relative.with_suffix("").parts)
+    if parts and parts[-1] == "__init__":
+        parts.pop()
+    return ".".join([root_module, *parts]) if parts else root_module
 
 
 def find_plugin(ref: str) -> Plugin | None:
@@ -69,7 +245,7 @@ def plugin_root(plugin: Plugin) -> Path | None:
     return path.parent if path.name == "__init__.py" else path
 
 
-def _source_hazards(path: Path, root_module: str) -> set[str]:
+def _source_hazards(tree: ast.Module, root_module: str) -> set[str]:
     """源码中无法随卸载撤销的行为
 
     给外部模块导入的对象赋值属性（如 ``Bot.send = ...``）记为 external_patch；
@@ -77,16 +253,12 @@ def _source_hazards(path: Path, root_module: str) -> set[str]:
     thread_or_process，这些线程不属于事件循环，卸载时无法结束。
 
     参数:
-        path: 源码文件
+        tree: 源码语法树
         root_module: 插件顶层模块名
 
     返回:
         set[str]: 原因
     """
-    try:
-        tree = ast.parse(path.read_bytes().decode("utf-8"), filename=str(path))
-    except (OSError, UnicodeError, SyntaxError):
-        return set()
     imported: dict[str, str] = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -160,8 +332,16 @@ class PluginClassifier:
         self._graph_cache: tuple[tuple[int, int], dict[str, set[str]]] | None = None
 
     def _file_info(self, path: Path, module_name: str, root_module: str) -> dict:
-        from zhenxun.services.startup_load import _file_record, startup_load_planner
+        """分析源码文件的导入期行为、导入的模块与模型定义，文件未变化时复用结果
 
+        参数:
+            path: 源码文件
+            module_name: 文件对应的模块名
+            root_module: 插件顶层模块名
+
+        返回:
+            dict: reasons、imports、defines_model 与文件状态 stamp
+        """
         try:
             stat = path.stat()
             stamp = (stat.st_size, stat.st_mtime_ns)
@@ -170,19 +350,49 @@ class PluginClassifier:
         key = str(path)
         if (cached := self._file_cache.get(key)) and cached[0] == stamp:
             return cached[1]
-        record = _file_record(
-            path, module_name, startup_load_planner.runtime_file_record(path)
-        )
-        reasons = set(record.get("reasons", []))
-        if "source_unreadable" not in reasons:
-            reasons |= _source_hazards(path, root_module)
-        info = {
-            "reasons": reasons,
-            "digest": record.get("digest"),
-            "defines_model": bool(record.get("defines_model")),
-        }
+        try:
+            tree = ast.parse(path.read_bytes().decode("utf-8"), filename=str(path))
+        except (OSError, UnicodeError, SyntaxError):
+            info = {
+                "reasons": {"source_unreadable"},
+                "imports": set(),
+                "defines_model": False,
+                "stamp": stamp,
+            }
+        else:
+            visitor = _ImportBoundaryVisitor(
+                module_name, is_package=path.name == "__init__.py"
+            )
+            visitor.visit(tree)
+            info = {
+                "reasons": visitor.reasons | _source_hazards(tree, root_module),
+                "imports": visitor.imports | visitor.requires,
+                "defines_model": "orm_model" in visitor.reasons,
+                "stamp": stamp,
+            }
         self._file_cache[key] = (stamp, info)
         return info
+
+    def _source_info(self, module_name: str, root: Path, path: Path) -> dict:
+        return self._file_info(
+            path, _module_for_file(module_name, root, path), module_name
+        )
+
+    def source_imports(self, module_name: str, root: Path) -> set[str]:
+        """插件源码导入或 require 的模块
+
+        参数:
+            module_name: 模块名
+            root: 插件包目录或模块文件
+
+        返回:
+            set[str]: 模块名
+        """
+        return {
+            imported
+            for path in source_files(root)
+            for imported in self._source_info(module_name, root, path)["imports"]
+        }
 
     def source_reasons(
         self,
@@ -203,7 +413,7 @@ class PluginClassifier:
         返回:
             set[str]: 原因
         """
-        from zhenxun.services.startup_load import _module_for_file, startup_load_planner
+        from zhenxun.services.startup_load import startup_load_planner
 
         files = source_files(root)
         if not files:
@@ -212,9 +422,7 @@ class PluginClassifier:
         if module_name.startswith(_BUILTIN_PREFIX):
             reasons.add("builtin_plugin")
         for path in files:
-            info = self._file_info(
-                path, _module_for_file(module_name, root, path), module_name
-            )
+            info = self._source_info(module_name, root, path)
             reasons |= info["reasons"] & _RESTART_FILE_REASONS
             if not info["defines_model"]:
                 continue
@@ -222,10 +430,8 @@ class PluginClassifier:
                 reasons.add("orm_model_new_plugin")
             elif path.name == "__init__.py" and path.parent == root:
                 reasons.add("orm_model_in_package_init")
-            else:
-                record = startup_load_planner.runtime_file_record(path)
-                if not record or record.get("digest") != info["digest"]:
-                    reasons.add("orm_model_changed")
+            elif startup_load_planner.startup_stamp(path) != info["stamp"]:
+                reasons.add("orm_model_changed")
         if (
             new
             and not dependencies_verified
@@ -273,7 +479,7 @@ class PluginClassifier:
         if "builtin_plugin" not in reasons and not self._manageable(plugin):
             reasons.add("library_plugin")
         if not reasons and any(
-            self._file_info(path, "", plugin.module_name)["defines_model"]
+            self._source_info(plugin.module_name, root, path)["defines_model"]
             for path in source_files(root)
         ):
             own = registry.Ownership.of(plugin)
@@ -314,16 +520,6 @@ class PluginClassifier:
                 target = owner(ref) if isinstance(ref, str) else None
                 if target is not None and target != source:
                     graph[target].add(source)
-        from zhenxun.services.startup_load import startup_load_planner
-
-        by_module = {p.module_name: p.id_ for p in list(_plugins.values())}
-        for entry in startup_load_planner.entries.values():
-            if entry.plugin_id not in graph:
-                continue
-            for required in entry.requires:
-                target = required if required in graph else by_module.get(required)
-                if target in graph and target != entry.plugin_id:
-                    graph[target].add(entry.plugin_id)
         self._graph_cache = (key, graph)
         return graph
 

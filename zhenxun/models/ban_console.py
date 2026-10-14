@@ -8,6 +8,11 @@ from tortoise.expressions import Q
 from zhenxun.services.cache.runtime_cache import BanMemoryCache
 from zhenxun.services.db_context import Model
 from zhenxun.services.log import logger
+from zhenxun.services.platform_identity import (
+    scope_owns,
+    scoped_group_id,
+    scoped_user_id,
+)
 from zhenxun.utils.enum import DbLockType
 from zhenxun.utils.exception import UserAndGroupIsNone
 
@@ -142,6 +147,7 @@ class BanConsole(Model):
         返回:
             bool: 权限判断，能否unban
         """
+        user_id, group_id = scoped_user_id(user_id), scoped_group_id(group_id)
         logger.debug("检测用户被ban等级", target=cls._target_label(user_id, group_id))
         if await cls._ensure_ban_cache():
             return BanMemoryCache.check_ban_level(user_id, group_id, level)
@@ -167,6 +173,7 @@ class BanConsole(Model):
         返回:
             int: ban剩余时长，-1时为永久ban，0表示未被ban
         """
+        user_id, group_id = scoped_user_id(user_id), scoped_group_id(group_id)
         logger.debug("获取用户ban时长", target=cls._target_label(user_id, group_id))
         return await cls._get_ban_remaining_time(user_id, group_id)
 
@@ -196,6 +203,7 @@ class BanConsole(Model):
         返回:
             bool: 是否被ban
         """
+        user_id, group_id = scoped_user_id(user_id), scoped_group_id(group_id)
         logger.debug("检测是否被ban", target=cls._target_label(user_id, group_id))
         return (await cls._get_ban_remaining_time(user_id, group_id)) != 0
 
@@ -218,6 +226,7 @@ class BanConsole(Model):
             duration: 时长，分钟，-1时为永久
             operator: 操作者id
         """
+        user_id, group_id = scoped_user_id(user_id), scoped_group_id(group_id)
         logger.debug(
             f"封禁用户/群组，等级:{ban_level}，时长: {duration}",
             target=cls._target_label(user_id, group_id),
@@ -248,6 +257,7 @@ class BanConsole(Model):
         返回:
             bool: 是否被ban
         """
+        user_id, group_id = scoped_user_id(user_id), scoped_group_id(group_id)
         user = await cls._get_data(user_id, group_id)
         if user:
             logger.debug("解除封禁", target=cls._target_label(user_id, group_id))
@@ -271,11 +281,14 @@ class BanConsole(Model):
             group_id: 群组id
 
         返回:
-            Self | None: ban记录
+            Self | None: ban记录，前缀作用域下只返回本平台的记录
         """
         if id is not None:
-            return await cls.safe_get_or_none(id=id)
-        return await cls._get_data(user_id, group_id)
+            record = await cls.safe_get_or_none(id=id)
+            if record and not scope_owns(record.user_id, record.group_id):
+                return None
+            return record
+        return await cls._get_data(scoped_user_id(user_id), scoped_group_id(group_id))
 
     @classmethod
     async def _run_script(cls):

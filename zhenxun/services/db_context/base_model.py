@@ -18,6 +18,7 @@ from zhenxun.services.log import logger
 from zhenxun.services.platform_identity import (
     CURRENT_PLATFORM_SCOPE,
     guard_legacy_identity_write,
+    is_isolated_scope,
 )
 from zhenxun.utils.enum import DbLockType
 
@@ -28,31 +29,36 @@ from .write import WriteQuery, notify_bulk_write, write_boundary
 
 class _PlatformGuardedQuerySet(QuerySet):
     def _guard_platform_write(self, changed=None) -> None:
-        if CURRENT_PLATFORM_SCOPE.get() != "qq_api":
+        if not is_isolated_scope(CURRENT_PLATFORM_SCOPE.get()):
             return
 
-        # Only a positive user_id constraint is an authorization boundary.
-        # OR/negated/raw predicates cannot prove which accounts are touched.
-        def keys_for(node):
+        # Only a positive user_id/group_id constraint is an authorization
+        # boundary. OR/negated/raw predicates cannot prove which rows are touched.
+        def keys_for(node, field):
             if node._is_negated or node.join_type != "AND":
                 return None
             values = node.filters
-            if "user_id" in values:
-                return {str(values["user_id"])}
-            if "user_id__in" in values:
-                return set(map(str, values["user_id__in"]))
+            if field in values:
+                return {str(values[field])}
+            if f"{field}__in" in values:
+                return set(map(str, values[f"{field}__in"]))
             for child in node.children:
-                if (keys := keys_for(child)) is not None:
+                if (keys := keys_for(child, field)) is not None:
                     return keys
             return None
 
-        keys = None
-        for node in self._q_objects:
-            if (keys := keys_for(node)) is not None:
-                break
-        if changed and "user_id" in changed:
-            keys = (keys | {str(changed["user_id"])}) if keys else None
-        guard_legacy_identity_write(self.model._meta.db_table, keys)
+        def constraint(field):
+            keys = None
+            for node in self._q_objects:
+                if (keys := keys_for(node, field)) is not None:
+                    break
+            if changed and field in changed:
+                keys = (keys | {str(changed[field])}) if keys else None
+            return keys
+
+        guard_legacy_identity_write(
+            self.model._meta.db_table, constraint("user_id"), constraint("group_id")
+        )
 
     def update(self, **kwargs: Any):
         self._guard_platform_write(kwargs)
@@ -169,9 +175,11 @@ class Model(TortoiseModel):
             yield
 
     @classmethod
-    def _guard_platform_write(cls, user_id=None) -> None:
+    def _guard_platform_write(cls, user_id=None, group_id=None) -> None:
         guard_legacy_identity_write(
-            cls._meta.db_table, {str(user_id)} if user_id is not None else None
+            cls._meta.db_table,
+            {str(user_id)} if user_id is not None else None,
+            {str(group_id)} if group_id is not None else None,
         )
 
     @classmethod
@@ -179,7 +187,7 @@ class Model(TortoiseModel):
         cls, using_db: BaseDBAsyncClient | None = None, **kwargs: Any
     ) -> Self:
         """创建数据（使用CREATE锁）"""
-        cls._guard_platform_write(kwargs.get("user_id"))
+        cls._guard_platform_write(kwargs.get("user_id"), kwargs.get("group_id"))
         async with cls._lock_context(DbLockType.CREATE):
             # 直接调用父类的_create方法避免触发save的锁
             return await super().create(using_db=using_db, **kwargs)
@@ -192,7 +200,7 @@ class Model(TortoiseModel):
         **kwargs: Any,
     ) -> tuple[Self, bool]:
         """获取或创建数据（无锁版本，依赖数据库约束）"""
-        cls._guard_platform_write(kwargs.get("user_id"))
+        cls._guard_platform_write(kwargs.get("user_id"), kwargs.get("group_id"))
         from uuid import uuid4
 
         db = using_db or cls._choose_db(True)
@@ -244,7 +252,7 @@ class Model(TortoiseModel):
         **kwargs: Any,
     ) -> tuple[Self, bool]:
         """更新或创建数据（使用UPSERT锁）"""
-        cls._guard_platform_write(kwargs.get("user_id"))
+        cls._guard_platform_write(kwargs.get("user_id"), kwargs.get("group_id"))
         async with cls._lock_context(DbLockType.UPSERT):
             db = using_db or cls._choose_db(True)
             active = getattr(db, "_finalized", None) is False
@@ -279,7 +287,9 @@ class Model(TortoiseModel):
         force_update: bool = False,
     ):
         """保存数据（根据操作类型自动选择锁）"""
-        self._guard_platform_write(getattr(self, "user_id", None))
+        self._guard_platform_write(
+            getattr(self, "user_id", None), getattr(self, "group_id", None)
+        )
         lock_type = (
             DbLockType.CREATE
             if getattr(self, "id", None) is None
@@ -296,7 +306,9 @@ class Model(TortoiseModel):
                 await notify_bulk_write(type(self))
 
     async def delete(self, using_db: BaseDBAsyncClient | None = None):
-        self._guard_platform_write(getattr(self, "user_id", None))
+        self._guard_platform_write(
+            getattr(self, "user_id", None), getattr(self, "group_id", None)
+        )
         await super().delete(using_db=using_db)
         if self._meta.db_table in {"group_info_users", "group_plugin_settings"}:
             await notify_bulk_write(type(self))

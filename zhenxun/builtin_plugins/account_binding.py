@@ -8,13 +8,13 @@ from nonebot_plugin_uninfo import Uninfo
 
 from zhenxun.configs.utils import Command, PluginExtraData
 from zhenxun.services.account_binding import (
+    binding_argument,
     binding_status,
     confirm_unbind,
     issue_binding,
     issue_unbind,
     redeem_binding,
 )
-from zhenxun.services.account_binding_routing import binding_argument
 from zhenxun.services.business_identity import (
     BusinessIdentityError,
     resolve_business_identity,
@@ -31,6 +31,7 @@ __plugin_meta__ = PluginMetadata(
     extra=PluginExtraData(
         author="zhenxun",
         version="1.0",
+        required_platform_capabilities={"business_identity"},
         commands=[
             Command(command="绑定QQ"),
             Command(command="绑定状态"),

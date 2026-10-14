@@ -1,5 +1,5 @@
+import asyncio
 from datetime import datetime, timedelta
-from pathlib import Path
 import time
 
 import nonebot
@@ -19,11 +19,12 @@ from zhenxun.services.log import logger
 from zhenxun.utils.platform import PlatformUtils
 
 from ....config import AVA_URL, GROUP_AVA_URL, QueryDateType
-from ....utils import webui_db_call
+from ....utils import webui_db_call, webui_platform
 from .model import (
     ActiveGroup,
     BaseInfo,
     BotBlockModule,
+    ChatCallCount,
     HotPlugin,
     QueryCount,
     TemplateBaseInfo,
@@ -32,82 +33,90 @@ from .model import (
 driver: Driver = nonebot.get_driver()
 
 
-async def get_statistics_counts(bot_id: str | None, operation: str) -> dict[str, int]:
-    """Return all call-count windows with one database aggregate query."""
-    now = datetime.now()
-    query = Statistics
-    if bot_id:
-        query = query.filter(bot_id=bot_id)
-    day_start = now - timedelta(hours=now.hour, minutes=now.minute)
-    week_start = now - timedelta(days=7, hours=now.hour, minutes=now.minute)
-    month_start = now - timedelta(days=30, hours=now.hour, minutes=now.minute)
-    year_start = now - timedelta(days=365, hours=now.hour, minutes=now.minute)
+def window_starts(now: datetime) -> dict[str, datetime]:
+    """统计时间窗口起点
+
+    参数:
+        now: 当前时间
+
+    返回:
+        dict[str, datetime]: 今日、近7天、近30天、近一年的起始时间
+    """
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return {
+        "day": today,
+        "week": today - timedelta(days=6),
+        "month": today - timedelta(days=29),
+        "year": today - timedelta(days=364),
+    }
+
+
+async def get_record_counts(
+    model: type[ChatHistory | Statistics], bot_id: str | None, operation: str
+) -> QueryCount:
+    """一次聚合查询获取总数与各时间窗口数量
+
+    参数:
+        model: ChatHistory 或 Statistics
+        bot_id: 存储 bot id，为空时统计全部
+        operation: 数据库调用标识
+
+    返回:
+        QueryCount: 总数与今日、近7天、近30天、近一年数量
+    """
+    query = model.filter(bot_id=bot_id) if bot_id else model
+    starts = window_starts(datetime.now())
     result = await webui_db_call(
         query.annotate(
             total_count=Count("id"),
-            day_count=Count("id", _filter=Q(create_time__gte=day_start)),
-            week_count=Count("id", _filter=Q(create_time__gte=week_start)),
-            month_count=Count("id", _filter=Q(create_time__gte=month_start)),
-            year_count=Count("id", _filter=Q(create_time__gte=year_start)),
+            **{
+                f"{key}_count": Count("id", _filter=Q(create_time__gte=start))
+                for key, start in starts.items()
+            },
         )
         .limit(1)
-        .values(
-            "total_count",
-            "day_count",
-            "week_count",
-            "month_count",
-            "year_count",
-        ),
+        .values("total_count", *(f"{key}_count" for key in starts)),
         operation,
     )
     result = result[0] if isinstance(result, list) and result else result
     result = result or {}
-    return {
-        "total": int(result.get("total_count") or 0),
-        "day": int(result.get("day_count") or 0),
-        "week": int(result.get("week_count") or 0),
-        "month": int(result.get("month_count") or 0),
-        "year": int(result.get("year_count") or 0),
-    }
+    return QueryCount(
+        num=int(result.get("total_count") or 0),
+        **{key: int(result.get(f"{key}_count") or 0) for key in starts},
+    )
 
 
-async def get_chat_history_counts(bot_id: str | None, operation: str) -> dict[str, int]:
-    """Return all chat-count windows with one database aggregate query."""
-    now = datetime.now()
-    query = ChatHistory
-    if bot_id:
-        query = query.filter(bot_id=bot_id)
-    day_start = now - timedelta(hours=now.hour, minutes=now.minute)
-    week_start = now - timedelta(days=7, hours=now.hour, minutes=now.minute)
-    month_start = now - timedelta(days=30, hours=now.hour, minutes=now.minute)
-    year_start = now - timedelta(days=365, hours=now.hour, minutes=now.minute)
-    result = await webui_db_call(
-        query.annotate(
-            total_count=Count("id"),
-            day_count=Count("id", _filter=Q(create_time__gte=day_start)),
-            week_count=Count("id", _filter=Q(create_time__gte=week_start)),
-            month_count=Count("id", _filter=Q(create_time__gte=month_start)),
-            year_count=Count("id", _filter=Q(create_time__gte=year_start)),
-        )
-        .limit(1)
-        .values(
-            "total_count",
-            "day_count",
-            "week_count",
-            "month_count",
-            "year_count",
-        ),
+async def top_plugins(query, operation: str) -> list[HotPlugin]:
+    """获取调用次数最多的 5 个插件
+
+    参数:
+        query: Statistics 查询
+        operation: 数据库调用标识
+
+    返回:
+        list[HotPlugin]: 插件模块、名称与调用次数
+    """
+    data_list = await webui_db_call(
+        query.annotate(count=Count("id"))
+        .group_by("plugin_name")
+        .order_by("-count")
+        .limit(5)
+        .values_list("plugin_name", "count"),
         operation,
     )
-    result = result[0] if isinstance(result, list) and result else result
-    result = result or {}
-    return {
-        "total": int(result.get("total_count") or 0),
-        "day": int(result.get("day_count") or 0),
-        "week": int(result.get("week_count") or 0),
-        "month": int(result.get("month_count") or 0),
-        "year": int(result.get("year_count") or 0),
-    }
+    plugins = await webui_db_call(
+        PluginInfo.get_plugins(
+            load_status=None,
+            filter_parent=False,
+            module__in=[x[0] for x in data_list],
+        ),
+        f"{operation}_names",
+    )
+    module2name = {p.module: p.name for p in plugins}
+    return [
+        HotPlugin(module=module, name=module2name.get(module) or module, count=count)
+        for module, count in data_list
+    ]
 
 
 class BotLive:
@@ -130,15 +139,7 @@ bot_live = BotLive()
 
 def _bot_identity(bot: Bot) -> tuple[str, str, str, str, dict[str, bool]]:
     runtime_bot_id = str(bot.self_id)
-    adapter = str(bot.adapter.get_name())
-    normalized = adapter.strip().lower()
-    platform = (
-        "onebot_v11"
-        if normalized == "onebot v11"
-        else "qq_official"
-        if normalized == "qq"
-        else "other"
-    )
+    platform = webui_platform(bot)
     storage_bot_id = PlatformUtils.get_storage_bot_id(bot)
     bot_key = f"{platform}:{runtime_bot_id}"
     onebot = platform == "onebot_v11"
@@ -154,12 +155,12 @@ def _bot_identity(bot: Bot) -> tuple[str, str, str, str, dict[str, bool]]:
 
 @driver.on_bot_connect
 async def _(bot: Bot):
-    bot_live.add(_bot_identity(bot)[0])
+    bot_live.add(str(bot.self_id))
 
 
 @driver.on_bot_disconnect
 async def _(bot: Bot):
-    bot_live.remove(_bot_identity(bot)[0])
+    bot_live.remove(str(bot.self_id))
 
 
 class ApiDataSource:
@@ -195,11 +196,11 @@ class ApiDataSource:
         if platform == "qq_official" and nickname == runtime_id and cached_identity:
             nickname = cached_identity.username or runtime_id
         avatar_url = (
-            safe_avatar_url(getattr(self_info, "avatar", None))
+            AVA_URL.format(runtime_id)
+            if platform == "onebot_v11"
+            else safe_avatar_url(getattr(self_info, "avatar", None))
             or (cached_identity.avatar_url if cached_identity else None)
             or ""
-            if platform == "qq_official"
-            else AVA_URL.format(runtime_id)
         )
         return TemplateBaseInfo(
             bot=bot,
@@ -215,34 +216,12 @@ class ApiDataSource:
         )
 
     @classmethod
-    def __get_bot_version(cls) -> str:
-        """获取bot版本
-
-        返回:
-            str | None: 版本
-        """
-        version_file = Path() / "__version__"
-        if version_file.exists():
-            if text := version_file.open(encoding="utf-8").read():
-                return text.replace("__version__: ", "").strip()
-        return "unknown"
-
-    @classmethod
     async def __init_bot_base_data(cls, select_bot: TemplateBaseInfo):
         """初始化bot的基础数据
 
         参数:
             select_bot: bot
         """
-        now = datetime.now()
-        # 今日累计接收消息
-        select_bot.received_messages = await webui_db_call(
-            ChatHistory.filter(
-                bot_id=select_bot.storage_bot_id,
-                create_time__gte=now - timedelta(hours=now.hour),
-            ).count(),
-            "Main.received_messages",
-        )
         # 群聊数量
         try:
             if not select_bot.capabilities.get("group_list"):
@@ -263,18 +242,12 @@ class ApiDataSource:
             select_bot.friend_count = 0
         select_bot.status = await BotConsole.get_bot_status(select_bot.storage_bot_id)
         # 连接时间
-        select_bot.connect_time = bot_live.get(select_bot.bot_key) or 0
+        select_bot.connect_time = bot_live.get(select_bot.runtime_bot_id) or 0
         if select_bot.connect_time:
             connect_date = datetime.fromtimestamp(select_bot.connect_time)
             select_bot.connect_date = connect_date.strftime("%Y-%m-%d %H:%M:%S")
-        select_bot.version = cls.__get_bot_version()
-        day_call = await webui_db_call(
-            Statistics.filter(create_time__gte=now - timedelta(hours=now.hour)).count(),
-            "Main.day_call",
-        )
-        select_bot.day_call = day_call
         select_bot.connect_count = await webui_db_call(
-            BotConnectLog.filter(bot_id=select_bot.storage_bot_id).count(),
+            BotConnectLog.filter(bot_id=select_bot.storage_bot_id, type=1).count(),
             "Main.connect_count",
         )
 
@@ -307,42 +280,20 @@ class ApiDataSource:
         return [BaseInfo(**e.to_dict()) for e in bot_list]
 
     @classmethod
-    async def get_all_chat_count(cls, bot_id: str | None) -> QueryCount:
-        """获取年/月/周/日聊天次数
+    async def get_chat_and_call_count(cls, bot_id: str | None) -> ChatCallCount:
+        """获取聊天与调用次数
 
         参数:
-            bot_id: bot id
+            bot_id: 存储 bot id
 
         返回:
-            QueryCount: 数据内容
+            ChatCallCount: 聊天与调用的总数及各时间窗口数量
         """
-        result = await get_chat_history_counts(bot_id, "Main.chat_counts")
-        return QueryCount(
-            num=result["total"],
-            day=result["day"],
-            week=result["week"],
-            month=result["month"],
-            year=result["year"],
+        chat, call = await asyncio.gather(
+            get_record_counts(ChatHistory, bot_id, "Main.chat_counts"),
+            get_record_counts(Statistics, bot_id, "Main.call_counts"),
         )
-
-    @classmethod
-    async def get_all_call_count(cls, bot_id: str | None) -> QueryCount:
-        """获取年/月/周/日调用次数
-
-        参数:
-            bot_id: bot id
-
-        返回:
-            QueryCount: 数据内容
-        """
-        counts = await get_statistics_counts(bot_id, "Main.call_counts")
-        return QueryCount(
-            num=counts["total"],
-            day=counts["day"],
-            week=counts["week"],
-            month=counts["month"],
-            year=counts["year"],
-        )
+        return ChatCallCount(chat=chat, call=call)
 
     @classmethod
     def __get_query(
@@ -358,34 +309,11 @@ class ApiDataSource:
             bot_id: bot id.
         """
         query = base_query
-        now = datetime.now()
         if bot_id:
             query = query.filter(bot_id=bot_id)
-        if date_type == QueryDateType.DAY:
+        if date_type:
             query = query.filter(
-                create_time__gte=now
-                - timedelta(hours=now.hour, minutes=now.minute, seconds=now.second)
-            )
-        if date_type == QueryDateType.WEEK:
-            query = query.filter(
-                create_time__gte=now
-                - timedelta(
-                    days=7, hours=now.hour, minutes=now.minute, seconds=now.second
-                )
-            )
-        if date_type == QueryDateType.MONTH:
-            query = query.filter(
-                create_time__gte=now
-                - timedelta(
-                    days=30, hours=now.hour, minutes=now.minute, seconds=now.second
-                )
-            )
-        if date_type == QueryDateType.YEAR:
-            query = query.filter(
-                create_time__gte=now
-                - timedelta(
-                    days=365, hours=now.hour, minutes=now.minute, seconds=now.second
-                )
+                create_time__gte=window_starts(datetime.now())[date_type.value]
             )
         return query
 
@@ -420,7 +348,7 @@ class ApiDataSource:
             ):
                 for group_info in info_list:
                     id2name[group_info.group_id] = group_info.group_name
-        active_group_list = [
+        return [
             ActiveGroup(
                 group_id=data[0],
                 name=id2name.get(data[0]) or data[0],
@@ -429,12 +357,6 @@ class ApiDataSource:
             )
             for data in data_list
         ]
-        active_group_list = sorted(
-            active_group_list, key=lambda x: x.chat_num, reverse=True
-        )
-        if len(active_group_list) > 5:
-            active_group_list = active_group_list[:5]
-        return active_group_list
 
     @classmethod
     async def get_hot_plugin(
@@ -449,34 +371,9 @@ class ApiDataSource:
         返回:
             list[HotPlugin]: 热门插件列表
         """
-        query = cls.__get_query(Statistics, date_type, bot_id)
-        data_list = await webui_db_call(
-            query.annotate(count=Count("id"))
-            .group_by("plugin_name")
-            .order_by("-count")
-            .limit(5)
-            .values_list("plugin_name", "count"),
-            "Main.hot_plugin",
+        return await top_plugins(
+            cls.__get_query(Statistics, date_type, bot_id), "Main.hot_plugin"
         )
-        hot_plugin_list = []
-        module_list = [x[0] for x in data_list]
-        plugins = await webui_db_call(
-            PluginInfo.get_plugins(
-                load_status=None,
-                filter_parent=False,
-                module__in=module_list,
-            ),
-            "Main.hot_plugin_names",
-        )
-        module2name = {p.module: p.name for p in plugins}
-        for data in data_list:
-            module = data[0]
-            name = module2name.get(module) or module
-            hot_plugin_list.append(HotPlugin(module=module, name=name, count=data[1]))
-        hot_plugin_list = sorted(hot_plugin_list, key=lambda x: x.count, reverse=True)
-        if len(hot_plugin_list) > 5:
-            hot_plugin_list = hot_plugin_list[:5]
-        return hot_plugin_list
 
     @classmethod
     async def get_bot_block_module(cls, bot_id: str) -> BotBlockModule | None:

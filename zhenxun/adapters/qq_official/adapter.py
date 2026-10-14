@@ -43,7 +43,7 @@ ACK_BODY = '{"op":12}'
 # These upstream boundaries parse and dispatch the events intercepted below.
 # Refuse an unreviewed adapter upgrade instead of silently bypassing persistence.
 _INGRESS_HASHES = {
-    "_forward_ws": "639eeb40df6563054e76c1e2b96e4da32a8ed5b69a1f36a594b5d324786dfea1",
+    "_forward_ws": "bd4d10451faeabda31779bebd0f383af25f6a95db25d0b20bf1d66df6e34a077",
     "payload_to_event": (
         "6fba40f56bb62375164805cd554ad6a51f4d93de7a209af098d10b9bd6f6e0c6"
     ),

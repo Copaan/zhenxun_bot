@@ -10,6 +10,7 @@ from zhenxun.models.task_info import TaskInfo
 from zhenxun.services.cache.runtime_cache import GroupMemoryCache
 from zhenxun.services.db_context import Model
 from zhenxun.services.db_context.schema_ops import AlterColumnType, CreateIndex
+from zhenxun.services.platform_identity import scoped_group_id
 from zhenxun.utils.enum import DbLockType, PluginType
 
 if TYPE_CHECKING:
@@ -327,7 +328,7 @@ class GroupConsole(Model):
         普通群固定使用 ``channel_id IS NULL``；频道记录必须继续显式传
         ``channel_id`` 走原有 get_or_create/update_or_create。
         """
-        gid = str(group_id).strip()
+        gid = str(scoped_group_id(group_id)).strip()
         if not gid:
             raise ValueError("group_id cannot be empty")
 
@@ -384,7 +385,7 @@ class GroupConsole(Model):
         channel_id: str | None = None,
         clean_duplicates: bool = True,
     ) -> "GroupSnapshot | None":
-        return GroupMemoryCache.get_if_ready(group_id, channel_id)
+        return GroupMemoryCache.get_if_ready(scoped_group_id(group_id), channel_id)
 
     @classmethod
     async def get_group_db(
@@ -394,6 +395,7 @@ class GroupConsole(Model):
         clean_duplicates: bool = True,
     ) -> Self | None:
         """获取群组（数据库）"""
+        group_id = scoped_group_id(group_id)
         if channel_id:
             return await cls.safe_get_or_none(
                 group_id=group_id,
@@ -408,7 +410,7 @@ class GroupConsole(Model):
 
     @classmethod
     async def is_super_group(cls, group_id: str) -> bool:
-        group = GroupMemoryCache.get_if_ready(group_id, None)
+        group = GroupMemoryCache.get_if_ready(scoped_group_id(group_id), None)
         return bool(group and group.is_super)
 
     @classmethod
@@ -420,7 +422,7 @@ class GroupConsole(Model):
         )
         if scoped is not None:
             return scoped
-        if group := GroupMemoryCache.get_if_ready(group_id, None):
+        if group := GroupMemoryCache.get_if_ready(scoped_group_id(group_id), None):
             return bool(
                 group.superuser_block_plugin_set
                 and module in group.superuser_block_plugin_set
@@ -435,7 +437,7 @@ class GroupConsole(Model):
         scoped = await bot_group_policy_service.legacy_blocked(group_id, module)
         if scoped is not None:
             return scoped
-        if group := GroupMemoryCache.get_if_ready(group_id, None):
+        if group := GroupMemoryCache.get_if_ready(scoped_group_id(group_id), None):
             return (
                 True
                 if group.block_plugin_set and module in group.block_plugin_set
@@ -500,7 +502,9 @@ class GroupConsole(Model):
         )
         if scoped is not None:
             return scoped
-        if group := GroupMemoryCache.get_if_ready(group_id, channel_id):
+        if group := GroupMemoryCache.get_if_ready(
+            scoped_group_id(group_id), channel_id
+        ):
             return bool(group.block_plugin_set and module in group.block_plugin_set)
         else:
             return False
@@ -514,7 +518,7 @@ class GroupConsole(Model):
         )
         if scoped is not None:
             return scoped
-        if group := GroupMemoryCache.get_if_ready(group_id, None):
+        if group := GroupMemoryCache.get_if_ready(scoped_group_id(group_id), None):
             return bool(
                 group.superuser_block_task_set
                 and task in group.superuser_block_task_set
@@ -533,6 +537,7 @@ class GroupConsole(Model):
         )
         if scoped is not None:
             return scoped
+        group_id = scoped_group_id(group_id)
         if not channel_id:
             group = GroupMemoryCache.get_if_ready(group_id, None)
             if not group:

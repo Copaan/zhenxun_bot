@@ -56,7 +56,7 @@ def _restored_access(preview: dict | None) -> dict | None:
         try:
             settings = settings_from_values(preview["environment"])
             urls = preferred_access_urls(
-                settings.host, settings.port, settings=settings, sidecar_available=True
+                settings.host, settings.port, settings=settings, http_available=True
             )
         except (WebUITLSConfigError, ValueError):
             pass

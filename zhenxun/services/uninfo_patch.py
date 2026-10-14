@@ -285,7 +285,7 @@ async def _event_session(self, bot, event):
     """Authoritative event fields must not inherit a cached member's privileges."""
     from nonebot_plugin_uninfo.model import Role
 
-    if isinstance(event, InteractionCreateEvent) and event.type == 11:
+    if isinstance(event, InteractionCreateEvent) and event.type in (11, 12):
         data = await _fast_qq_interaction(bot, event)
     elif isinstance(event, GroupMemberEvent):
         data = _qq_user_payload(bot, event.member_openid, group_id=event.group_openid)

@@ -4,10 +4,6 @@ from nonebot.adapters.onebot.v11 import (
     GroupDecreaseNoticeEvent,
     GroupIncreaseNoticeEvent,
 )
-from nonebot.adapters.onebot.v12 import (
-    GroupMemberDecreaseEvent,
-    GroupMemberIncreaseEvent,
-)
 from nonebot.plugin import PluginMetadata
 from nonebot_plugin_uninfo import Uninfo
 
@@ -85,13 +81,13 @@ limit_cd = base_config.get("welcome_msg_cd")
 group_increase_handle = on_notice(
     priority=1,
     block=False,
-    rule=notice_rule([GroupIncreaseNoticeEvent, GroupMemberIncreaseEvent]),
+    rule=notice_rule(GroupIncreaseNoticeEvent),
 )
 """群员增加处理"""
 group_decrease_handle = on_notice(
     priority=1,
     block=False,
-    rule=notice_rule([GroupMemberDecreaseEvent, GroupDecreaseNoticeEvent]),
+    rule=notice_rule(GroupDecreaseNoticeEvent),
 )
 """群员减少处理"""
 
@@ -104,7 +100,7 @@ cache = CacheRoot.cache_dict(
 async def _(
     bot: Bot,
     session: Uninfo,
-    event: GroupIncreaseNoticeEvent | GroupMemberIncreaseEvent,
+    event: GroupIncreaseNoticeEvent,
 ):
     if session.user.id == bot.self_id:
         """新成员为bot本身"""
@@ -125,7 +121,7 @@ async def _(
 async def _(
     bot: Bot,
     session: Uninfo,
-    event: GroupDecreaseNoticeEvent | GroupMemberDecreaseEvent,
+    event: GroupDecreaseNoticeEvent,
 ):
     user_id = str(event.user_id)
     group_id = str(event.group_id)

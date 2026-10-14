@@ -369,18 +369,6 @@ async def probe_network(
     )
 
 
-async def test_db_connection(db_url: str) -> bool | str:
-    result = await probe_database(DatabaseConfig(mode="url", url=db_url))
-    return True if result.status == "ok" else result.message
-
-
-async def test_redis_connection(host: str, port: int, password: str = "") -> bool | str:
-    result = await probe_cache(
-        CacheConfig(mode="REDIS", host=host, port=port, password=password)
-    )
-    return True if result.status == "ok" else result.message
-
-
 __all__ = [
     "build_database_url",
     "probe_cache",
@@ -388,6 +376,4 @@ __all__ = [
     "probe_network",
     "resolve_network_host",
     "resolve_sqlite_path",
-    "test_db_connection",
-    "test_redis_connection",
 ]

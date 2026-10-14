@@ -9,7 +9,7 @@ from zhenxun.models.chat_history import ChatHistory
 from zhenxun.models.task_info import TaskInfo
 from zhenxun.services.bot_group_policy import bot_group_policy_service
 from zhenxun.services.log import logger
-from zhenxun.services.message_load import should_pause_tasks
+from zhenxun.services.message_load import should_pause_db_tasks
 from zhenxun.utils.platform import PlatformUtils
 
 Config.add_plugin_config(
@@ -28,7 +28,7 @@ Config.add_plugin_config(
     minute=40,
 )
 async def _():
-    if should_pause_tasks():
+    if should_pause_db_tasks():
         return
     if not Config.get_config("chat_history", "FLAG"):
         logger.debug("未开启历史发言记录，过滤群组发言检测...")

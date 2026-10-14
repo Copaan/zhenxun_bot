@@ -251,6 +251,8 @@ class Message(BaseModel):
     消息
     """
 
+    bot_id: str
+    """接收消息的 bot 运行时 id"""
     object_id: str
     """主体id user_id 或 group_id"""
     user_id: str

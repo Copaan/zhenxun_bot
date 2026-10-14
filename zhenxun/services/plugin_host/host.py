@@ -33,6 +33,9 @@ from nonebot.plugin.manager import PluginManager
 
 from zhenxun.services.log import logger
 from zhenxun.services.memory_governor import freeze_heap
+from zhenxun.services.plugin_store.plugin_store_transaction import (
+    LOADED_PLUGINS_INDEX,
+)
 from zhenxun.services.runtime_mutation import runtime_mutation_coordinator
 from zhenxun.utils.atomic_json import read_json_locked, write_json_locked
 from zhenxun.utils.enum import PriorityLifecycleType
@@ -48,7 +51,6 @@ from .classifier import (
 )
 from .models import ApplyMode, RuntimeOperation
 
-INDEX_FILE = Path("data/runtime/loaded-plugins-v1.json")
 CONFIG_RESTART_REASON = "import_time_config_consumer_requires_restart"
 _DRAIN_TIMEOUT = 10.0
 _CANCEL_TIMEOUT = 5.0
@@ -361,7 +363,9 @@ class PluginHost:
         )
         duties = {name: self.duties[name] for name in modules if name in self.duties}
         try:
-            write_json_locked(INDEX_FILE, {"modules": modules, "duties": duties})
+            write_json_locked(
+                LOADED_PLUGINS_INDEX, {"modules": modules, "duties": duties}
+            )
         except OSError as error:
             logger.warning(f"已加载插件索引写入失败: {type(error).__name__}")
 
@@ -372,9 +376,8 @@ class PluginHost:
     ) -> None:
         from zhenxun.services.lifecycle import lifecycle_kernel
         from zhenxun.utils.manager.priority_manager import (
-            _paired_shutdown_hooks,
             _run_hook,
-            _shutdown_only_hooks,
+            _shutdown_hooks,
             lifecycle_component_ids,
         )
 
@@ -389,7 +392,7 @@ class PluginHost:
             except Exception as error:
                 notes.append(f"component_stop_failed:{type(error).__name__}")
         try:
-            hooks = {**_paired_shutdown_hooks(), **_shutdown_only_hooks()}
+            hooks = _shutdown_hooks()
         except Exception:
             hooks = {}
         covered = {
@@ -420,12 +423,12 @@ class PluginHost:
 
         collected = registry.collect(own)
         # 先移除 matcher 阻止新事件进入，再等待正在处理的事件结束
-        registry.remove({"matcher": collected.pop("matcher", [])})
+        registry.remove({"matcher": collected.pop("matcher", [])}, notes)
         _, handling = registry.owned_tasks(own)
         if handling:
             await asyncio.wait(handling, timeout=_DRAIN_TIMEOUT)
         await self._stop_hooks(collected, set(own.modules()), notes)
-        registry.remove(collected)
+        registry.remove(collected, notes)
         background, handling = registry.owned_tasks(own)
         tasks = [*background, *handling]
         for task in tasks:
@@ -839,8 +842,11 @@ class PluginHost:
             if not files and not reasons:
                 return await self._restore_batch(batch, ids)
         if files:
-            return await self.request_dependency_restart(
-                files, submit_launcher=submit_restart
+            return await self.request_restart(
+                set(ids),
+                "dependencies_changed",
+                submit_launcher=submit_restart,
+                dependency_files=files,
             )
         return await self.request_restart(
             set(ids), sorted(reasons)[0], submit_launcher=submit_restart
@@ -964,8 +970,11 @@ class PluginHost:
             module_name, root, new=True, dependencies_verified=dependencies_verified
         )
         if "dependencies_changed" in reasons:
-            return await self.request_dependency_restart(
-                _dependency_files(root), submit_launcher=submit_restart
+            return await self.request_restart(
+                {module_name},
+                "dependencies_changed",
+                submit_launcher=submit_restart,
+                dependency_files=_dependency_files(root),
             )
         if reasons:
             return await self.request_restart(
@@ -1121,7 +1130,7 @@ class PluginHost:
         """
         from zhenxun.services.startup_load import startup_load_planner
 
-        index = read_json_locked(INDEX_FILE, {})
+        index = read_json_locked(LOADED_PLUGINS_INDEX, {})
         self.duties.update(index.get("duties") or {})
         entries = {
             entry.plugin_id: entry
@@ -1256,7 +1265,12 @@ class PluginHost:
             self.pending_restart.discard(reason)
 
     async def request_restart(
-        self, affected: set[str], reason: str, *, submit_launcher: bool = True
+        self,
+        affected: set[str],
+        reason: str,
+        *,
+        submit_launcher: bool = True,
+        dependency_files: set[Path] | None = None,
     ) -> RuntimeOperation:
         """登记需要重启才能生效的变更，由 launcher 托管时可直接提交重启
 
@@ -1264,6 +1278,7 @@ class PluginHost:
             affected: 受影响的插件
             reason: 原因
             submit_launcher: 是否提交给 launcher
+            dependency_files: 变更的依赖文件，给出时请求同步依赖后重启
 
         返回:
             RuntimeOperation: 操作结果
@@ -1271,52 +1286,22 @@ class PluginHost:
         self.pending_restart.add(reason)
         mode = ApplyMode.RESTART_PENDING
         if submit_launcher and os.environ.get("ZHENXUN_LAUNCHER_PID"):
-            try:
-                from zhenxun.utils._restart_utils import request_restart
+            from zhenxun.utils import _restart_utils
 
-                accepted, _ = await request_restart(f"plugin_host:{reason}")
+            source = f"plugin_host:{reason}"
+            try:
+                if dependency_files:
+                    accepted, _ = await _restart_utils.request_dependency_restart(
+                        source, dependency_files
+                    )
+                else:
+                    accepted, _ = await _restart_utils.request_restart(source)
                 if accepted:
                     mode = ApplyMode.RESTART_REQUESTED
             except Exception as error:
                 logger.warning(f"自动重启请求失败: {type(error).__name__}")
         operation = RuntimeOperation(
             mode, "pending_restart", sorted(affected), reason, self.generation
-        )
-        self.last_operation = operation
-        return operation
-
-    async def request_dependency_restart(
-        self, changed: set[Path], *, submit_launcher: bool = True
-    ) -> RuntimeOperation:
-        """依赖文件变更，请求同步依赖后重启
-
-        参数:
-            changed: 变更的依赖文件
-            submit_launcher: 是否提交给 launcher
-
-        返回:
-            RuntimeOperation: 操作结果
-        """
-        reason = "dependencies_changed"
-        self.pending_restart.add(reason)
-        mode = ApplyMode.RESTART_PENDING
-        if submit_launcher and os.environ.get("ZHENXUN_LAUNCHER_PID"):
-            try:
-                from zhenxun.utils._restart_utils import request_dependency_restart
-
-                accepted, _ = await request_dependency_restart(
-                    f"plugin_host:{reason}", changed
-                )
-                if accepted:
-                    mode = ApplyMode.RESTART_REQUESTED
-            except Exception as error:
-                logger.warning(f"依赖同步重启请求失败: {type(error).__name__}")
-        operation = RuntimeOperation(
-            mode,
-            "pending_restart",
-            sorted(path.name for path in changed),
-            reason,
-            self.generation,
         )
         self.last_operation = operation
         return operation

@@ -11,7 +11,7 @@ from zhenxun.adapters.qq_official.diagnostics import (
 from zhenxun.configs.config import BotConfig
 
 from ...base_model import Result
-from ...utils import authentication
+from ...utils import authentication, webui_platform
 from .configuration import router as configuration_router
 from .model import (
     ProtocolConnection,
@@ -26,21 +26,12 @@ router.include_router(configuration_router)
 router.include_router(qq_registration_router)
 
 
-def _platform(adapter_name: str) -> str:
-    normalized = adapter_name.strip().lower()
-    if normalized == "onebot v11":
-        return "onebot_v11"
-    if normalized == "qq":
-        return "qq_official"
-    return "other"
-
-
 def build_protocol_status() -> ProtocolStatus:
     connections: list[ProtocolConnection] = []
     qq_runtime_bots: dict[str, object] = {}
     for bot in nonebot.get_bots().values():
         adapter_name = str(bot.adapter.get_name())
-        platform = _platform(adapter_name)
+        platform = webui_platform(bot)
         try:
             self_info = getattr(bot, "self_info", None)
         except Exception:
@@ -110,6 +101,8 @@ def build_protocol_status() -> ProtocolStatus:
         onebot_v11_connected="onebot_v11" in platforms,
         qq_official_enabled=BotConfig.qq_adapter_load,
         qq_official_connected="qq_official" in platforms,
+        telegram_enabled=BotConfig.telegram_adapter_load,
+        telegram_connected=any(item.adapter == "Telegram" for item in connections),
         qq_webhook_mode=qq_config.qq_webhook_mode,
         qq_webhook_callback_url=(
             f"{qq_config.qq_webhook_public_base_url.rstrip('/')}/qq/webhook"

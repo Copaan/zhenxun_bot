@@ -1,24 +1,29 @@
-"""launcher 附属进程：worker 就绪探测、WebUI HTTP 兼容入口与 QQ HTTPS ingress"""
+"""launcher 附属进程：worker 就绪探测与 QQ HTTPS ingress"""
 
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
 from functools import partial
+import hashlib
+import hmac
+import http.client
 import json
 import os
 from pathlib import Path
+import ssl
 import subprocess
 import sys
 import time
 import urllib.error
+from urllib.parse import urlsplit
 import uuid
 
 from .supervisor import launcher_log, launcher_supervisor
 
 WORKER_READY_TIMEOUT = 120.0
 WORKER_READY_POLL_INTERVAL = 0.25
-HTTP_SIDECAR_RETRY_DELAYS = (1.0, 2.0, 5.0, 15.0, 30.0)
-HTTP_SIDECAR_START_TIMEOUT = 7.0
+INGRESS_START_TIMEOUT = 7.0
 
 certificate_pin: str | None = None
 """当前 worker HTTPS 证书指纹，探测 worker 时用于固定证书"""
@@ -73,10 +78,46 @@ def ingress_environment() -> dict[str, str]:
     return environment
 
 
-def _health_urlopen(url: str):
-    from zhenxun.services.listener_health import health_response
+@contextmanager
+def _health_urlopen(url: str, *, timeout: float = 1):
+    """请求本地健康检查地址，HTTPS 时按 launcher 固定的证书指纹校验
 
-    return health_response(url, fingerprint=certificate_pin)
+    参数:
+        url: 健康检查地址
+        timeout: 超时秒数
+    """
+    target = urlsplit(url)
+    if target.scheme == "https":
+        if not certificate_pin:
+            raise OSError("health_certificate_pin_missing")
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.check_hostname = False
+        # Local names need not occur in the certificate; authenticate its DER pin
+        # before sending any HTTP data instead of using system CA/name validation.
+        context.verify_mode = ssl.CERT_NONE
+        connection = http.client.HTTPSConnection(
+            target.hostname, target.port, timeout=timeout, context=context
+        )
+    elif target.scheme == "http":
+        connection = http.client.HTTPConnection(
+            target.hostname, target.port, timeout=timeout
+        )
+    else:
+        raise ValueError("health_scheme_invalid")
+    try:
+        connection.connect()
+        if target.scheme == "https":
+            certificate = connection.sock.getpeercert(binary_form=True)
+            actual = hashlib.sha256(certificate).hexdigest()
+            if not hmac.compare_digest(actual, certificate_pin.lower()):
+                raise OSError("health_certificate_pin_mismatch")
+        connection.request("GET", target.path or "/")
+        with connection.getresponse() as response:
+            yield response
+    except http.client.HTTPException as error:
+        raise OSError("health_response_invalid") from error
+    finally:
+        connection.close()
 
 
 def read_worker_status(settings, *, scheme: str = "http") -> dict[str, object] | None:
@@ -165,236 +206,10 @@ async def wait_worker_ready(
     return False
 
 
-async def worker_webui_ready_once(
-    worker: subprocess.Popen, settings, *, scheme: str = "http"
-) -> bool:
-    status = await asyncio.to_thread(read_worker_status, settings, scheme=scheme)
-    if (
-        status is None
-        or not bind_worker_status(worker, status)
-        or not status.get("server_bound")
-    ):
-        return False
-
-    def probe() -> bool:
-        url = _worker_url(settings, "/zhenxun/api/configure/status", scheme)
-        try:
-            with _health_urlopen(url) as response:
-                return response.status == 200
-        except (OSError, urllib.error.URLError):
-            return False
-
-    return await asyncio.to_thread(probe)
-
-
-async def wait_worker_webui_ready(
-    worker: subprocess.Popen, settings, *, scheme: str = "http"
-) -> bool:
-    deadline = time.monotonic() + WORKER_READY_TIMEOUT
-    while time.monotonic() < deadline:
-        if (
-            worker.poll() is not None
-            or launcher_supervisor.shutdown_deadline is not None
-        ):
-            return False
-        if await worker_webui_ready_once(worker, settings, scheme=scheme):
-            return True
-        await asyncio.sleep(WORKER_READY_POLL_INTERVAL)
-    return False
-
-
 async def stop_process(process: subprocess.Popen, name: str | None = None) -> None:
     if name:
         launcher_log(f"stopping {name} pid={process.pid}")
     await launcher_supervisor.stop_process(process, allow_force=True)
-
-
-def publish_http_sidecar_state(**changes: object) -> dict[str, object]:
-    from zhenxun.services.webui_http_sidecar_state import (
-        read_http_sidecar_state,
-        write_http_sidecar_state,
-    )
-
-    if changes:
-        write_http_sidecar_state(
-            **{**changes, "launcher_boot_id": os.getenv("ZHENXUN_LAUNCHER_BOOT_ID", "")}
-        )
-    return read_http_sidecar_state()
-
-
-def http_sidecar_signature(settings) -> tuple | None:
-    from zhenxun.configs.webui_tls import certificate_sha256
-
-    if not settings.http_sidecar_enabled:
-        return None
-    return (
-        settings.effective_http_mode,
-        settings.host,
-        settings.redirect_port,
-        settings.port,
-        certificate_sha256(settings.certfile),
-    )
-
-
-def _build_http_sidecar_command(settings) -> list[str]:
-    from zhenxun.configs.webui_tls import certificate_sha256
-    from zhenxun.utils.network import internal_connect_host
-
-    return [
-        sys.executable,
-        "-m",
-        "zhenxun.cli",
-        "run-http-sidecar",
-        settings.effective_http_mode,
-        settings.host,
-        str(settings.redirect_port),
-        internal_connect_host(settings.host),
-        str(settings.port),
-        certificate_sha256(settings.certfile),
-    ]
-
-
-def _child_error(state: dict, startup_id: str) -> dict:
-    """取子进程自己发布的错误；不属于本次启动时返回空字典"""
-    if state.get("startup_id") != startup_id or not state.get("last_error"):
-        return {}
-    keys = ("last_error", "error_code", "stage", "errno")
-    return {key: state.get(key) for key in keys}
-
-
-async def start_http_sidecar(settings, cwd: Path) -> subprocess.Popen | None:
-    """启动 WebUI HTTP 兼容入口，失败时写入降级状态
-
-    参数:
-        settings: WebUI TLS 设置
-        cwd: 项目目录
-
-    返回:
-        subprocess.Popen | None: 已就绪的进程，失败时为 None
-    """
-    from zhenxun.services.webui_http_sidecar_state import sidecar_error_details
-
-    startup_id = uuid.uuid4().hex
-    failure = "sidecar_startup_failed"
-
-    async def wait_ready(process):
-        nonlocal failure
-        publish_http_sidecar_state(spawn_pid=process.pid)
-        deadline = time.monotonic() + HTTP_SIDECAR_START_TIMEOUT
-        while process.poll() is None and time.monotonic() < deadline:
-            if launcher_supervisor.shutdown_deadline is not None:
-                failure = "sidecar_startup_interrupted"
-                raise OSError(failure)
-            state = publish_http_sidecar_state()
-            if state.get("startup_id") == startup_id:
-                if state.get("state") == "ready":
-                    return
-                if state.get("state") == "degraded":
-                    break
-            await asyncio.sleep(0.05)
-        if process.poll() is None and time.monotonic() >= deadline:
-            failure = "startup_timeout"
-        raise OSError(failure)
-
-    publish_http_sidecar_state(
-        startup_id=startup_id,
-        mode=settings.effective_http_mode,
-        port=settings.redirect_port,
-        pid=None,
-        spawn_pid=None,
-        state="starting",
-        active_connections=0,
-        last_error=None,
-        error_code=None,
-        stage="spawn",
-        errno=None,
-        retry_in_seconds=0,
-        next_retry_at=None,
-    )
-    spawned = False
-
-    def spawn() -> subprocess.Popen:
-        nonlocal spawned
-        process = subprocess.Popen(
-            _build_http_sidecar_command(settings),
-            cwd=str(cwd),
-            creationflags=creationflags(),
-            env={
-                **os.environ,
-                "ZHENXUN_HTTP_SIDECAR_CHILD": "1",
-                "ZHENXUN_HTTP_SIDECAR_STARTUP_ID": startup_id,
-            },
-        )
-        spawned = True
-        return process
-
-    try:
-        process = await launcher_supervisor.start_process(
-            "http_sidecar", spawn, ready=wait_ready, startup_id=startup_id
-        )
-    except OSError as error:
-        details = _child_error(publish_http_sidecar_state(), startup_id) or (
-            sidecar_error_details(
-                failure if spawned else error,
-                stage="readiness" if spawned else "spawn",
-            )
-        )
-        publish_http_sidecar_state(
-            state="degraded", active_connections=0, startup_id=startup_id, **details
-        )
-        return None
-    publish_http_sidecar_state(
-        state="ready",
-        spawn_pid=process.pid,
-        last_error=None,
-        error_code=None,
-        stage=None,
-        errno=None,
-    )
-    launcher_log(
-        "WebUI HTTP compatibility sidecar ready on "
-        f"{settings.host}:{settings.redirect_port} "
-        f"(mode={settings.effective_http_mode})"
-    )
-    return process
-
-
-def http_sidecar_exited(process: subprocess.Popen, retry_index: int) -> float:
-    """记录 HTTP 兼容入口意外退出并返回下次重试的等待秒数
-
-    参数:
-        process: 已退出的进程
-        retry_index: 已重试次数
-
-    返回:
-        float: 重试等待秒数
-    """
-    state = publish_http_sidecar_state()
-    launcher_supervisor.release(process, "unexpected_exit")
-    delay = HTTP_SIDECAR_RETRY_DELAYS[
-        min(retry_index, len(HTTP_SIDECAR_RETRY_DELAYS) - 1)
-    ]
-    publish_http_sidecar_state(
-        state="degraded",
-        active_connections=0,
-        **(
-            _child_error(state, str(state.get("startup_id") or ""))
-            or {
-                "last_error": "sidecar_unexpected_exit",
-                "error_code": "sidecar_unexpected_exit",
-                "stage": "serve",
-                "errno": None,
-            }
-        ),
-        retry_in_seconds=delay,
-        next_retry_at=time.time() + delay,
-        retry_count=retry_index + 1,
-    )
-    launcher_log(
-        "WebUI HTTP sidecar exited unexpectedly; "
-        f"HTTPS remains available, retrying in {delay:g}s"
-    )
-    return delay
 
 
 async def start_qq_ingress(settings, tls, cwd: Path) -> subprocess.Popen:
@@ -413,7 +228,7 @@ async def start_qq_ingress(settings, tls, cwd: Path) -> subprocess.Popen:
     startup_id = uuid.uuid4().hex
 
     async def wait_ready(process):
-        deadline = time.monotonic() + HTTP_SIDECAR_START_TIMEOUT
+        deadline = time.monotonic() + INGRESS_START_TIMEOUT
         while process.poll() is None and time.monotonic() < deadline:
             if launcher_supervisor.shutdown_deadline is not None:
                 raise OSError("ingress_startup_interrupted")

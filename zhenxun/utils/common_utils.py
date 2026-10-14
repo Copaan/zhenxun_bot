@@ -50,9 +50,7 @@ class CommonUtils:
         from zhenxun.utils.platform import PlatformUtils
 
         scope = PlatformUtils.get_platform_scope(session)
-        bot_id = str(session.self_id)
-        if scope == "qq_api":
-            bot_id = f"qq_api:{bot_id}"
+        bot_id = PlatformUtils.storage_bot_id(scope, str(session.self_id))
         channel_id = getattr(getattr(session, "channel", None), "id", None)
         await bot_group_policy_service.ensure_fresh(bot_id, scope, group_id, channel_id)
         if bot_group_policy_service.blocked(

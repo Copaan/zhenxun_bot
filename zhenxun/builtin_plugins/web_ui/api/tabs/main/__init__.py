@@ -1,18 +1,14 @@
 import asyncio
 import contextlib
-import time
 
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 import nonebot
-from nonebot.config import Config
 from starlette.websockets import WebSocket, WebSocketDisconnect, WebSocketState
 from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 
 from zhenxun.models.bot_console import BotConsole
 from zhenxun.services.log import logger
-from zhenxun.services.plugin_policy import plugin_policy_service
-from zhenxun.utils.platform import PlatformUtils
 
 from ....base_model import Result
 from ....config import QueryDateType
@@ -20,7 +16,6 @@ from ....security import (
     authenticate_websocket,
     close_authenticated_websocket,
     is_websocket_disconnect_error,
-    record_websocket_disconnect,
     send_authenticated_text,
     spawn_websocket_task,
     unregister_authenticated_websocket,
@@ -31,15 +26,12 @@ from .model import (
     ActiveGroup,
     BaseInfo,
     BotBlockModule,
-    BotManageUpdateParam,
     BotStatusParam,
+    ChatCallCount,
     HotPlugin,
-    NonebotData,
-    QueryCount,
 )
 
 driver = nonebot.get_driver()
-run_time = time.time()
 
 ws_router = APIRouter()
 router = APIRouter(prefix="/main")
@@ -90,8 +82,6 @@ async def _(bot_id: str | None = None) -> Result[list[BaseInfo]]:
     """
     try:
         result = await ApiDataSource.get_base_info(bot_id)
-        if not result:
-            Result.warning_("无Bot连接...")
         return Result.ok(result, "拿到信息啦!")
     except TimeoutError:
         return Result.fail(DB_BUSY_MESSAGE)
@@ -101,94 +91,20 @@ async def _(bot_id: str | None = None) -> Result[list[BaseInfo]]:
 
 
 @router.get(
-    "/get_all_chat_count",
+    "/get_chat_and_call_count",
     dependencies=[authentication()],
-    response_model=Result[QueryCount],
+    response_model=Result[ChatCallCount],
     response_class=JSONResponse,
-    description="获取接收消息数量",
+    description="获取聊天与调用次数",
 )
-async def _(bot_id: str | None = None) -> Result[QueryCount]:
+async def _(bot_id: str | None = None) -> Result[ChatCallCount]:
     try:
-        return Result.ok(await ApiDataSource.get_all_chat_count(bot_id), "拿到信息啦!")
+        return Result.ok(await ApiDataSource.get_chat_and_call_count(bot_id))
     except TimeoutError:
         return Result.fail(DB_BUSY_MESSAGE)
     except Exception as e:
-        logger.error(f"{router.prefix}/get_all_chat_count 调用错误", "WebUi", e=e)
-        return Result.fail(f"发生了一点错误捏 {type(e)}: {e}")
-
-
-@router.get(
-    "/get_all_call_count",
-    dependencies=[authentication()],
-    response_model=Result[QueryCount],
-    response_class=JSONResponse,
-    description="获取调用次数",
-)
-async def _(bot_id: str | None = None) -> Result[QueryCount]:
-    try:
-        return Result.ok(await ApiDataSource.get_all_call_count(bot_id), "拿到信息啦!")
-    except TimeoutError:
-        return Result.fail(DB_BUSY_MESSAGE)
-    except Exception as e:
-        logger.error(f"{router.prefix}/get_all_call_count 调用错误", "WebUi", e=e)
-        return Result.fail(f"发生了一点错误捏 {type(e)}: {e}")
-
-
-@router.get(
-    "/get_fg_count",
-    dependencies=[authentication()],
-    response_model=Result[dict[str, int]],
-    response_class=JSONResponse,
-    description="好友/群组数量",
-)
-async def _(bot_id: str) -> Result[dict[str, int]]:
-    try:
-        bot = nonebot.get_bot(bot_id)
-        data = {
-            "friend_count": len(await PlatformUtils.get_friend_list(bot)),
-            "group_count": len(await PlatformUtils.get_group_list(bot)),
-        }
-        return Result.ok(data, "拿到信息啦!")
-    except (ValueError, KeyError):
-        return Result.warning_("指定Bot未连接...")
-    except Exception as e:
-        logger.error(f"{router.prefix}/get_fg_count 调用错误", "WebUi", e=e)
-        return Result.fail(f"发生了一点错误捏 {type(e)}: {e}")
-
-
-@router.get(
-    "/get_nb_data",
-    dependencies=[authentication()],
-    response_model=Result[NonebotData],
-    response_class=JSONResponse,
-    description="获取nb数据",
-)
-async def _() -> Result[NonebotData]:
-    global run_time
-    return Result.ok(NonebotData(config=driver.config, run_time=int(run_time)))
-
-
-@router.get(
-    "/get_nb_config",
-    dependencies=[authentication()],
-    response_model=Result[Config],
-    response_class=JSONResponse,
-    description="获取nb配置",
-)
-async def _() -> Result[Config]:
-    return Result.ok(driver.config)
-
-
-@router.get(
-    "/get_run_time",
-    dependencies=[authentication()],
-    response_model=Result[int],
-    response_class=JSONResponse,
-    description="获取nb运行时间",
-)
-async def _() -> Result[int]:
-    global run_time
-    return Result.ok(int(run_time))
+        logger.error(f"{router.prefix}/get_chat_and_call_count 调用错误", "WebUi", e=e)
+        return Result.fail("消息统计读取失败，请稍后重试。")
 
 
 @router.get(
@@ -265,30 +181,6 @@ async def _(bot_id: str) -> Result[BotBlockModule]:
         return Result.fail(f"发生了一点错误捏 {type(e)}: {e}")
 
 
-@router.post(
-    "/update_bot_manage",
-    dependencies=[authentication()],
-    response_model=Result,
-    response_class=JSONResponse,
-    description="修改bot全局开关",
-)
-async def _(param: BotManageUpdateParam):
-    try:
-        result = await plugin_policy_service.update_account(
-            param.bot_id,
-            expected_revision=None,
-            block_plugins=param.block_plugins,
-            block_tasks=param.block_tasks,
-        )
-        return Result.ok(
-            result,
-            "账号插件设置已保存；若原账号绑定共享策略，现已转为独立设置。",
-        )
-    except Exception as e:
-        logger.error(f"{router.prefix}/update_bot_manage 调用错误", "WebUi", e=e)
-        return Result.fail(f"发生了一点错误捏 {type(e)}: {e}")
-
-
 @ws_router.websocket("/system_status")
 async def system_logs_realtime(websocket: WebSocket, sleep: int = 5):
     if not await authenticate_websocket(websocket):
@@ -315,8 +207,6 @@ async def system_logs_realtime(websocket: WebSocket, sleep: int = 5):
                 logger.warning(
                     f"ws system_status receive failed: {type(error).__name__}"
                 )
-            else:
-                record_websocket_disconnect(error)
         except Exception as e:
             logger.warning(f"ws system_status receive failed: {type(e).__name__}")
         finally:

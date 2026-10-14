@@ -66,6 +66,22 @@ def _apply_alconna_conflict_patch() -> None:
         _alconna_patch_applied = True
 
 
+def _apply_superuser_patch() -> None:
+    """让 NoneBot 的 SUPERUSER 权限按平台判定超级用户"""
+    from nonebot.permission import SuperUser
+
+    from zhenxun.utils.platform import PlatformUtils
+
+    async def _call(self, bot, event) -> bool:
+        try:
+            user_id = event.get_user_id()
+        except Exception:
+            return False
+        return PlatformUtils.is_superuser(bot, user_id)
+
+    SuperUser.__call__ = _call
+
+
 async def _launcher_watchdog_loop(launcher_pid: int) -> None:
     global _launcher_force_exit_timer
     try:
@@ -135,28 +151,11 @@ async def _stop_launcher_watchdog() -> None:
 
 
 def finalize_runtime_executor() -> None:
-    """Close the worker-owned default executor after all lifespan hooks."""
+    """worker 退出前关闭 lifespan 未能回收的共享线程池，并取消排队中的任务"""
     global _thread_executor
-    from zhenxun.services.lifecycle.deadline import remaining_timeout
-
-    executor = _thread_executor
-    if executor is not None:
-        from zhenxun.services.lifecycle import lifecycle_kernel
-
-        deadline = time.monotonic() + min(
-            remaining_timeout(2.0),
-            lifecycle_kernel.shutdown_remaining(2.0),
-        )
-        executor.shutdown(wait=False, cancel_futures=True)
-        for thread in tuple(executor._threads):
-            thread.join(max(0.0, deadline - time.monotonic()))
-        if any(thread.is_alive() for thread in executor._threads):
-            logger.error(
-                "共享执行器仍有活动工作项 | code=shared_executor_shutdown_timeout",
-                "Lifecycle",
-            )
-        else:
-            _thread_executor = None
+    if _thread_executor is not None:
+        _thread_executor.shutdown(wait=False, cancel_futures=True)
+        _thread_executor = None
 
 
 async def finish_runtime_workers() -> None:
@@ -165,14 +164,13 @@ async def finish_runtime_workers() -> None:
     from anyio._backends._asyncio import WorkerThread
 
     from zhenxun.services.lifecycle import lifecycle_kernel
-    from zhenxun.services.shared_workers import shared_worker_threads
 
     lifecycle_kernel.request_shutdown()
     remaining = lifecycle_kernel.shutdown_remaining(15)
     deadline = time.monotonic() + remaining
     loop = asyncio.get_running_loop()
     executor = _thread_executor
-    threads = set(shared_worker_threads())
+    threads: set[threading.Thread] = set()
     if executor is not None:
         executor.shutdown(wait=False, cancel_futures=True)
         threads.update(executor._threads)
@@ -187,7 +185,6 @@ async def finish_runtime_workers() -> None:
     while any(thread.is_alive() for thread in threads) and time.monotonic() < deadline:  # noqa: ASYNC110
         await asyncio.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
     if any(thread.is_alive() for thread in threads):
-        lifecycle_kernel.require_recovery("infrastructure:shared_workers")
         logger.error(
             "共享工作线程尚未退出 | code=shared_worker_shutdown_timeout", "Lifecycle"
         )
@@ -201,14 +198,6 @@ def install_runtime_worker_teardown(app) -> None:
         return
     from zhenxun.services.lifecycle import lifecycle_kernel
 
-    lifecycle_kernel.set_process_metadata(
-        role="worker",
-        pid=os.getpid(),
-        boot_id=startup_coordinator.boot_id,
-        startup_id=os.getenv("ZHENXUN_WORKER_STARTUP_ID") or None,
-        launcher_boot_id=os.getenv("ZHENXUN_LAUNCHER_BOOT_ID") or None,
-    )
-
     @contextlib.asynccontextmanager
     async def lifespan(application):
         try:
@@ -220,7 +209,6 @@ def install_runtime_worker_teardown(app) -> None:
             try:
                 await lifecycle_kernel.stop_all()
             except Exception as error:
-                lifecycle_kernel.require_recovery("lifecycle:teardown_failed")
                 logger.error("Core lifecycle teardown failed", e=error)
             await finish_runtime_workers()
 
@@ -230,6 +218,7 @@ def install_runtime_worker_teardown(app) -> None:
 
 def register_runtime_bootstrap(_driver) -> None:
     _apply_alconna_conflict_patch()
+    _apply_superuser_patch()
     # Auth hooks can register before library plugins are loaded.  Importing
     # Uninfo here marks it as a normal module and prevents ``nonebot.require``
     # from loading it as a plugin later.  The CLI applies the patch again
@@ -270,25 +259,6 @@ def register_runtime_bootstrap(_driver) -> None:
         with contextlib.suppress(Exception):
             limiter = anyio.to_thread.current_default_thread_limiter()
             limiter.total_tokens = _get_anyio_tokens(workers)
-
-    @PriorityLifecycle.on_startup(
-        priority=-99,
-        stage="management",
-        component_id="management:operations",
-        depends_on=("management:runtime_concurrency",),
-        pass_context=True,
-    )
-    async def _setup_operations(context) -> None:
-        from zhenxun.services.lifecycle.operations import operation_registry
-
-        operation_registry.bind(context)
-        await operation_registry.recover_pending()
-
-    @PriorityLifecycle.on_shutdown(priority=65, component_id="management:operations")
-    async def _shutdown_operations() -> None:
-        from zhenxun.services.lifecycle.operations import operation_registry
-
-        await operation_registry.shutdown()
 
     @PriorityLifecycle.on_startup(
         priority=-95,

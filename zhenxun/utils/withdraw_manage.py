@@ -1,12 +1,7 @@
 import asyncio
 
 from nonebot.adapters import Bot
-
-# from nonebot.adapters.discord import Bot as DiscordBot
-# from nonebot.adapters.dodo import Bot as DodoBot
-# from nonebot.adapters.kaiheila import Bot as KaiheilaBot
 from nonebot.adapters.onebot.v11 import Bot as v11Bot
-from nonebot.adapters.onebot.v12 import Bot as v12Bot
 from nonebot_plugin_session import EventSession
 from ruamel.yaml.comments import CommentedSeq
 
@@ -100,12 +95,3 @@ class WithdrawManager:
         if isinstance(bot, v11Bot):
             logger.debug(f"v11Bot 撤回消息ID: {message_id}", "WithdrawManager")
             await bot.delete_msg(message_id=int(message_id))
-        elif isinstance(bot, v12Bot):
-            logger.debug(f"v12Bot 撤回消息ID: {message_id}", "WithdrawManager")
-            await bot.delete_message(message_id=str(message_id))
-        # elif isinstance(bot, KaiheilaBot):
-        #     pass
-        # elif isinstance(bot, DodoBot):
-        #     pass
-        # elif isinstance(bot, DiscordBot):
-        #     pass

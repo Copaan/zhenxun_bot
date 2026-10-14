@@ -47,6 +47,7 @@ __plugin_meta__ = PluginMetadata(
     extra=PluginExtraData(
         author="HibiKier",
         version="0.1",
+        required_platform_capabilities={"business_identity"},
         plugin_type=PluginType.NORMAL,
         menu_type="商店",
         commands=[

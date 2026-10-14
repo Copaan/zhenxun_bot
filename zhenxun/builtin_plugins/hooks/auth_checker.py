@@ -266,13 +266,21 @@ async def _reserve_gold(
 
     异常:
         DependencyUnavailable: 数据库不可用，跳过本条消息
-        SkipPluginException: 金币不足
+        SkipPluginException: 当前平台无法解析业务身份或金币不足
     """
-    from zhenxun.services.business_identity import business_user_id
+    from zhenxun.services.business_identity import (
+        business_user_id,
+        supports_business_identity,
+    )
 
+    module = prep.profile.module
+    if not supports_business_identity(prep.snapshot.context.platform_scope):
+        raise SkipPluginException(
+            f"{module} 当前平台不支持金币消耗，已取消执行...",
+            tip_message="当前平台暂不支持金币功能..",
+        )
     if is_db_unhealthy():
         raise DependencyUnavailable("cost_database_unavailable")
-    module = prep.profile.module
     try:
         reservation = await UserConsole.reserve_gold(
             await business_user_id(session),

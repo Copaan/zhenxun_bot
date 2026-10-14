@@ -52,6 +52,7 @@ __plugin_meta__ = PluginMetadata(
     extra=PluginExtraData(
         author="HibiKier",
         version="0.1",
+        required_platform_capabilities={"scoped_management"},
         plugin_type=PluginType.SUPERUSER,
     ).to_dict(),
 )

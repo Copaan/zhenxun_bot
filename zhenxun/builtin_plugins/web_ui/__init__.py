@@ -3,7 +3,7 @@ import os
 import secrets
 import sys
 
-from fastapi import APIRouter, Depends, FastAPI
+from fastapi import APIRouter, FastAPI
 import nonebot
 from nonebot.plugin import PluginMetadata
 
@@ -12,7 +12,6 @@ from zhenxun.configs.utils import PluginExtraData, RegisterConfig
 from zhenxun.configs.webui_tls import current_webui_scheme
 from zhenxun.services.log import logger
 from zhenxun.services.startup import startup_coordinator
-from zhenxun.services.webui_transport import transport_runtime
 from zhenxun.utils.enum import PluginType
 from zhenxun.utils.manager.priority_manager import PriorityLifecycle
 from zhenxun.utils.network import emit_webui_console_banner
@@ -42,7 +41,7 @@ from .config import install_cors_middleware
 from .console_access import console_access
 from .public import init_public
 from .ready_banner import webui_ready_banner
-from .security import bind_lifecycle_context, require_private_request
+from .security import bind_lifecycle_context
 
 __plugin_meta__ = PluginMetadata(
     name="WebUi",
@@ -88,9 +87,7 @@ install_cors_middleware()
 gConfig.set_name("web-ui", "web-ui")
 
 
-BaseApiRouter = APIRouter(
-    prefix="/zhenxun/api", dependencies=[Depends(require_private_request)]
-)
+BaseApiRouter = APIRouter(prefix="/zhenxun/api")
 
 
 BaseApiRouter.include_router(auth_router)
@@ -118,30 +115,11 @@ WsApiRouter.include_router(chat_routes)
 
 
 @PriorityLifecycle.on_startup(
-    priority=-1,
-    stage="management",
-    timeout=5,
-    component_id="management:webui-transport",
-    depends_on=("management:runtime_concurrency",),
-    restart_policy="worker",
-)
-async def _install_transport_runtime():
-    transport_runtime.install()
-
-
-@PriorityLifecycle.on_shutdown(priority=1001, component_id="management:webui-transport")
-async def _retain_transport_runtime_until_loop_close():
-    transport_runtime.retain_until_loop_close()
-
-
-@PriorityLifecycle.on_startup(
     priority=0,
     stage="management",
     timeout=20,
     component_id="management:webui",
-    depends_on=("management:webui-transport",),
-    restart_policy="worker",
-    config_keys=("HOST", "PORT", "DRIVER", "WEBUI_TLS"),
+    depends_on=("management:runtime_concurrency",),
     pass_context=True,
 )
 async def _(context):
@@ -154,7 +132,7 @@ async def _(context):
         app: FastAPI = nonebot.get_app()
         app.include_router(BaseApiRouter)
         app.include_router(WsApiRouter)
-        public_ready = await init_public(app, context)
+        public_ready = await init_public(app)
         logger.info("<g>API启动成功</g>", "WebUi")
 
         async def emit_ready_banner() -> None:
@@ -179,12 +157,9 @@ async def _(context):
 
                     finalize_applied_update()
                 from zhenxun.configs.webui_tls import runtime_webui_settings
-                from zhenxun.services.webui_http_sidecar_state import (
-                    read_http_sidecar_state,
-                )
+                from zhenxun.services.webui_http import http_compat_state
 
                 tls_settings = runtime_webui_settings()
-                http_state = read_http_sidecar_state()
                 emit_webui_console_banner(
                     str(driver.config.host),
                     int(driver.config.port),
@@ -194,10 +169,7 @@ async def _(context):
                     scheme=current_webui_scheme(),
                     http_compatibility_port=(
                         tls_settings.redirect_port
-                        if tls_settings.http_sidecar_enabled
-                        and http_state.get("state") == "ready"
-                        and http_state.get("mode") == tls_settings.http_mode
-                        and http_state.get("port") == tls_settings.redirect_port
+                        if http_compat_state().get("state") == "ready"
                         else None
                     ),
                 )
@@ -215,6 +187,21 @@ async def _(context):
     except Exception as e:
         logger.error("<g>API启动失败</g>", "WebUi", e=e)
         raise
+
+
+@PriorityLifecycle.on_startup(
+    priority=1,
+    stage="management",
+    timeout=5,
+    component_id="management:webui-http",
+    depends_on=("management:webui",),
+    pass_context=True,
+)
+async def _start_http_compat(context):
+    from zhenxun.configs.webui_tls import runtime_webui_settings
+    from zhenxun.services.webui_http import webui_http_compat
+
+    await webui_http_compat.start(context, nonebot.get_app(), runtime_webui_settings())
 
 
 @PriorityLifecycle.on_shutdown(priority=1000, component_id="management:webui")

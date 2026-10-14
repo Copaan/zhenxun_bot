@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from contextlib import suppress
 from copy import deepcopy
 from datetime import datetime, timezone
+from hashlib import sha256
 from pathlib import Path
 import shutil
 from typing import Any
+import uuid
 
 from zhenxun.utils.atomic_json import read_json_locked, write_json_locked
 
@@ -14,10 +17,10 @@ MANIFEST_FILE = STORE_ROOT / "manifest-v1.json"
 PENDING_FILE = STORE_ROOT / "pending-transaction-v1.json"
 STARTUP_STATUS_FILE = STORE_ROOT / "startup-status-v1.json"
 DEPENDENCY_SYNC_STATUS_FILE = STORE_ROOT / "dependency-sync-status-v1.json"
-ORM_MIGRATION_STATUS_FILE = STORE_ROOT / "orm-migration-status-v1.json"
 ROLLBACK_FILE = STORE_ROOT / "rollback-manifest-v1.json"
 REGISTRY_CACHE_FILE = STORE_ROOT / "registry-plugins-v1.json"
 REGISTRY_META_FILE = STORE_ROOT / "registry-meta-v1.json"
+SETTLED_LIMIT = 20
 
 
 def utc_now() -> str:
@@ -94,6 +97,69 @@ def next_generation(
     return max(generations, default=0) + 1
 
 
+_OUTCOME_KEYS = (
+    "error",
+    "error_code",
+    "failure_reasons",
+    "rollback_confirmed",
+    "cleanup_error",
+    "verification_confirmed",
+)
+
+
+def draft_transaction(
+    pending: dict[str, Any] | None, target_manifest: dict[str, Any], **fields: Any
+) -> dict[str, Any]:
+    """在待应用事务上生成新的事务修订，没有待应用事务时以当前清单为基线
+
+    参数:
+        pending: 当前待应用事务
+        target_manifest: 目标清单
+        fields: 覆盖的事务字段
+
+    返回:
+        dict[str, Any]: 尚未保存的事务
+    """
+    now = utc_now()
+    if pending:
+        transaction = {
+            key: deepcopy(value)
+            for key, value in pending.items()
+            if key not in _OUTCOME_KEYS
+        }
+    else:
+        transaction = {
+            "version": 2,
+            "base_manifest": load_manifest(),
+            "operations": [],
+            "database_migration_possible": False,
+            "database_migration_confirmed": False,
+            "database_type": "none",
+            "created_at": now,
+        }
+    transaction.update(
+        revision=uuid.uuid4().hex,
+        updated_at=now,
+        target_manifest=deepcopy(target_manifest),
+        **fields,
+    )
+    return transaction
+
+
+def defer_transaction(transaction: dict[str, Any]) -> None:
+    """保存推迟到重启后构建的事务，并移除已失效的候选层
+
+    参数:
+        transaction: 待保存的事务
+    """
+    generation = transaction.pop("generation", None)
+    transaction.pop("generation_digest", None)
+    transaction["native_extensions"] = []
+    transaction["state"] = "pending_restart"
+    save_pending_transaction(transaction)
+    remove_generation(generation)
+
+
 def remove_generation(generation: int | str | None) -> None:
     if generation is None:
         return
@@ -135,25 +201,88 @@ def pending_transaction() -> dict[str, Any] | None:
 
 
 def save_pending_transaction(value: dict[str, Any]) -> None:
-    from zhenxun.services.plugin_store.plugin_store_transaction import (
-        archive_dependency_policy,
-    )
-
-    with archive_dependency_policy(value):
-        write_json(PENDING_FILE, value)
+    write_json(PENDING_FILE, value)
 
 
 def clear_pending_transaction() -> None:
     write_json(PENDING_FILE, None)
 
 
-def public_manifest() -> dict[str, Any]:
+def remove_orm_backups() -> None:
+    """删除依赖层事务结束后不再需要的数据库迁移备份"""
+    root = STORE_ROOT / "orm-backups"
+    if root.is_dir():
+        shutil.rmtree(root)
+
+
+def _settled_path(revision: str) -> Path:
+    return STORE_ROOT / "settled" / (sha256(revision.encode()).hexdigest() + ".json")
+
+
+def is_settled(transaction: dict[str, Any] | None) -> bool:
+    """判断事务结果是否已被依赖层清单确认（提交并验证，或已回滚）
+
+    参数:
+        transaction: 依赖层事务
+
+    返回:
+        bool: 已结束
+    """
+    if not transaction or not transaction.get("revision"):
+        return False
     manifest = load_manifest()
-    return {
-        "active_generation": manifest.get("active_generation"),
-        "pending_verification": bool(manifest.get("pending_verification")),
-        "plugins": deepcopy(manifest.get("plugins", {})),
-    }
+    if manifest.get("pending_verification"):
+        return False
+    if transaction.get("rollback_confirmed"):
+        return manifest.get("active_generation") == transaction.get(
+            "base_manifest", {}
+        ).get("active_generation")
+    return bool(
+        transaction.get("verification_confirmed")
+        and manifest.get("verified_transaction_revision") == transaction["revision"]
+        and manifest.get("active_generation") == transaction.get("generation")
+    )
+
+
+def active_transaction() -> dict[str, Any] | None:
+    """读取尚未结束的依赖层事务
+
+    返回:
+        dict[str, Any] | None: 事务，已结束或不存在时为 None
+    """
+    value = pending_transaction()
+    return None if is_settled(value) else value
+
+
+def settled_transactions() -> list[dict[str, Any]]:
+    """读取已归档的事务记录，最新的在前
+
+    返回:
+        list[dict[str, Any]]: 事务记录
+    """
+    result = []
+    for path in (STORE_ROOT / "settled").glob("*.json"):
+        value = read_json(path, {})
+        if isinstance(value, dict) and value.get("revision"):
+            result.append(value)
+    return sorted(result, key=lambda value: value.get("settled_at", ""), reverse=True)
+
+
+def archive_settled() -> dict[str, Any] | None:
+    """归档已结束的事务并释放事务槽，只保留最近的若干条记录
+
+    返回:
+        dict[str, Any] | None: 归档的事务，事务未结束时为 None
+    """
+    transaction = pending_transaction()
+    if not transaction or not is_settled(transaction):
+        return None
+    record = {**deepcopy(transaction), "settled_at": utc_now()}
+    write_json(_settled_path(record["revision"]), record)
+    for old in settled_transactions()[SETTLED_LIMIT:]:
+        _settled_path(old["revision"]).unlink(missing_ok=True)
+    clear_pending_transaction()
+    return record
 
 
 def dependency_sync_status() -> dict[str, Any]:
@@ -166,3 +295,142 @@ def save_dependency_sync_status(value: dict[str, Any]) -> None:
         DEPENDENCY_SYNC_STATUS_FILE,
         {**value, "updated_at": utc_now()},
     )
+
+
+def _released_dependencies(
+    target: dict[str, Any],
+    overrides: dict[str, list[str] | None],
+    removed_paths: list[Path],
+    added_paths: list[Path],
+) -> tuple[list[str], list[dict[str, Any]]]:
+    """计算商店插件依赖变化后可释放的包，分析失败时不释放
+
+    参数:
+        target: 依赖层清单
+        overrides: 按 store_key 的依赖声明覆盖
+        removed_paths: 将移除的源码路径
+        added_paths: 将加入的源码路径
+
+    返回:
+        tuple[list[str], list[dict[str, Any]]]: 可释放的包，因仍被导入而保留的包
+    """
+    from zhenxun.services.plugin_store.plugin_store_receipts import (
+        receipt_dependency_inputs,
+    )
+
+    from .dependencies import DependencyAnalysisError
+    from .environment import released_packages
+
+    before = receipt_dependency_inputs()
+    if not any(key in before for key in overrides):
+        return [], []
+    try:
+        return released_packages(
+            target,
+            target,
+            sources_before=before,
+            sources_after=receipt_dependency_inputs(overrides),
+            removed_paths=removed_paths,
+            added_paths=added_paths,
+        )
+    except (DependencyAnalysisError, OSError, KeyError, TypeError):
+        return [], []
+
+
+def merge_source_dependencies(
+    layer_packages: dict[str, str],
+    overrides: dict[str, list[str] | None],
+    removed_paths: list[Path],
+    added_paths: list[Path],
+    *,
+    source: dict[str, Any] | None,
+) -> dict[str, Any] | str | None:
+    """把商店插件的新增依赖与可释放依赖合并进依赖层事务
+
+    参数:
+        layer_packages: 需要写入依赖层的包版本
+        overrides: 按 store_key 的依赖声明覆盖
+        removed_paths: 将移除的源码路径
+        added_paths: 将加入的源码路径
+        source: 商店插件源码事务
+
+    返回:
+        dict[str, Any] | str | None: 写入的事务，失败时为错误码，无变化时为 None
+    """
+    current = pending_transaction()
+    if current and current.get("state") != "pending_restart":
+        return "cross_store_transaction_not_mutable" if layer_packages else None
+    base = deepcopy(current.get("base_manifest") if current else load_manifest())
+    target = deepcopy(current.get("target_manifest") if current else base) or {}
+    released, retained = _released_dependencies(
+        target, overrides, removed_paths, added_paths
+    )
+    released = [name for name in released if name not in layer_packages]
+    if not layer_packages and not released:
+        return None
+    target_packages = target.setdefault("packages", {})
+    base_packages = base.get("packages", {})
+    for name, version in layer_packages.items():
+        existing = target_packages.get(name)
+        existing_version = (
+            str(existing.get("version")) if isinstance(existing, dict) else None
+        )
+        base_info = base_packages.get(name) if isinstance(base_packages, dict) else None
+        base_version = (
+            str(base_info.get("version")) if isinstance(base_info, dict) else None
+        )
+        if (
+            existing_version is not None
+            and existing_version != version
+            and existing_version != base_version
+        ):
+            return "cross_store_dependency_conflict"
+        target_packages[name] = {"version": version}
+    for name in released:
+        target_packages.pop(name, None)
+
+    source_build_confirmed = any(
+        operation.get("source_build_confirmed")
+        for operation in (source or {}).get("operations", [])
+    )
+    transaction = draft_transaction(
+        current,
+        target,
+        source_build_confirmed=bool(
+            (current or {}).get("source_build_confirmed") or source_build_confirmed
+        ),
+        state="pending_restart",
+        **({"revision": current["revision"]} if current else {"base_manifest": base}),
+    )
+    if source is not None:
+        transaction["source_transaction_revision"] = source.get("revision")
+    transaction["released_packages"] = sorted(
+        set(transaction.get("released_packages") or []) | set(released)
+    )
+    if retained:
+        transaction["retained_imports"] = retained
+    save_pending_transaction(transaction)
+    return transaction
+
+
+def release_source_dependencies(
+    overrides: dict[str, list[str] | None], removed_paths: list[Path] | None = None
+) -> list[str]:
+    """商店插件热更新或热卸载后，将不再需要的依赖登记到待应用的依赖层事务
+
+    依赖层在下次重启时重建，不会主动请求重启；分析失败或已有事务不可修改时跳过。
+
+    参数:
+        overrides: 按 store_key 的依赖声明覆盖，None 表示移除
+        removed_paths: 已移除的源码路径
+
+    返回:
+        list[str]: 登记释放的包
+    """
+    with suppress(Exception):
+        transaction = merge_source_dependencies(
+            {}, overrides, removed_paths or [], [], source=None
+        )
+        if isinstance(transaction, dict):
+            return list(transaction.get("released_packages") or [])
+    return []

@@ -1,10 +1,9 @@
 import contextlib
 from datetime import datetime, timedelta
-import os
 from pathlib import Path
 from typing import Any
 
-from fastapi import Depends, HTTPException
+from fastapi import Depends, HTTPException, Request
 from fastapi.security import OAuth2PasswordBearer
 from nonebot.utils import run_sync
 import psutil
@@ -16,7 +15,7 @@ from zhenxun.services.db_context import with_db_timeout
 from zhenxun.services.message_load import is_db_unhealthy
 from zhenxun.utils.webui_session import SESSION_SECONDS
 
-from .base_model import SystemFolderSize, SystemStatus, User
+from .base_model import SystemStatus, User
 from .security import validate_access_token
 
 ALGORITHM = "HS256"
@@ -35,6 +34,23 @@ token_data = {"token": []}
 if token_file.exists():
     with contextlib.suppress(json.JSONDecodeError):
         token_data = json.load(open(token_file, encoding="utf8"))
+
+
+_WEBUI_PLATFORMS = {"qq_client": "onebot_v11", "qq_api": "qq_official"}
+
+
+def webui_platform(bot) -> str:
+    """WebUI 展示用的协议类型
+
+    参数:
+        bot: Bot
+
+    返回:
+        str: OneBot V11 为 onebot_v11，QQ 官方为 qq_official，其余为 other
+    """
+    from zhenxun.utils.platform import PlatformUtils
+
+    return _WEBUI_PLATFORMS.get(PlatformUtils.get_platform_scope(bot), "other")
 
 
 async def webui_db_call(coro, operation: str):
@@ -159,25 +175,61 @@ def authentication():
     return Depends(inner)
 
 
-def _get_dir_size(dir_path: Path) -> float:
-    """获取文件夹大小
+def request_authenticated(request: Request) -> bool:
+    """请求是否携带有效的 WebUI 登录凭证
 
     参数:
-        dir_path: 文件夹路径
+        request: Request
+
+    返回:
+        bool: 凭证是否有效
     """
-    return sum(
-        sum(os.path.getsize(os.path.join(root, name)) for name in files)
-        for root, dirs, files in os.walk(dir_path)
-    )
+    token = request.headers.get("Authorization", "")
+    return bool(token) and validate_access_token(token)
+
+
+_PUBLIC_STARTUP_KEYS = (
+    "boot_id",
+    "launcher_boot_id",
+    "startup_id",
+    "pid",
+    "state",
+    "server_bound",
+    "operating_mode",
+    "accepts_bot_events",
+    "failure_terminal",
+    "transaction_verification_pending",
+)
+
+
+def public_startup_status(status: dict[str, Any]) -> dict[str, Any]:
+    """未登录时可见的启动状态，只保留启动进度与身份字段
+
+    参数:
+        status: 完整启动状态
+
+    返回:
+        dict[str, Any]: 公开启动状态
+    """
+    stages = status.get("stages")
+    return {
+        **{key: status.get(key) for key in _PUBLIC_STARTUP_KEYS if key in status},
+        "stages": {
+            name: {"state": stage.get("state")}
+            for name, stage in (stages.items() if isinstance(stages, dict) else ())
+            if isinstance(stage, dict)
+        },
+    }
 
 
 @run_sync
 def get_system_status() -> SystemStatus:
     """获取系统信息等"""
     from zhenxun.services.plugin_host import plugin_host
-    from zhenxun.services.webui_resources import webui_resources
 
-    resources = webui_resources.snapshot
+    from .public import webui_resources
+
+    resources = webui_resources
 
     cpu = psutil.cpu_percent()
     memory = psutil.virtual_memory().percent
@@ -190,37 +242,5 @@ def get_system_status() -> SystemStatus:
         check_time=datetime.now().replace(microsecond=0),
         runtime_generation=plugin_host.generation,
         webui_revision=str(resources.manifest.get("revision") or ""),
-        resource_revision=resources.revision,
         resources_ready=resources.ready,
     )
-
-
-@run_sync
-def get_system_disk(
-    full_path: str | None,
-) -> list[SystemFolderSize]:
-    """获取资源文件大小等"""
-    if full_path:
-        base_path, err = validate_path(full_path)
-        if err or not base_path:
-            return []
-    else:
-        base_path = Path().resolve()
-    other_size = 0
-    data_list = []
-    for file in os.listdir(base_path):
-        f = base_path / file
-        if f.is_dir():
-            size = _get_dir_size(f) / 1024 / 1024
-            data_list.append(
-                SystemFolderSize(name=file, size=size, full_path=str(f), is_dir=True)
-            )
-        else:
-            other_size += f.stat().st_size / 1024 / 1024
-    if other_size:
-        data_list.append(
-            SystemFolderSize(
-                name="other_file", size=other_size, full_path=full_path, is_dir=False
-            )
-        )
-    return data_list

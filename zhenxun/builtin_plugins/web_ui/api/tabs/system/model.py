@@ -7,34 +7,16 @@ class LifecycleComponentStatus(BaseModel):
     component_id: str
     stage: str
     depends_on: list[str]
-    timeout: float | None = None
-    failure_policy: str
-    restart_policy: str
-    config_keys: list[str]
-    priority: int
-    stop_priority: int | None = None
-    parallel_safe: bool
-    source: str
     state: str
     error_code: str | None = None
-    runtime_generation: int
-    started_at: str | None = None
-    stopped_at: str | None = None
-    duration_ms: float | None = None
-    recovery_required: bool = False
 
 
 class LifecycleStatus(BaseModel):
-    runtime_generation: int
     shutdown_requested: bool = False
     component_count: int
     state_counts: dict[str, int]
-    recovery_required: list[str] = Field(default_factory=list)
     current_mutation: dict[str, Any] | None = None
-    operation_registry: dict[str, Any] = Field(default_factory=dict)
     plugin_runtime: dict[str, Any] = Field(default_factory=dict)
-    transport: dict[str, Any] = Field(default_factory=dict)
-    http_sidecar: dict[str, Any] = Field(default_factory=dict)
     network: dict[str, Any] = Field(default_factory=dict)
     components: list[LifecycleComponentStatus]
 

@@ -1756,7 +1756,7 @@ wheels = [
 
 [[package]]
 name = "nonebot-adapter-qq"
-version = "1.7.2"
+version = "1.7.3"
 source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple/" }
 dependencies = [
     { name = "cryptography" },
@@ -1765,9 +1765,23 @@ dependencies = [
     { name = "typing-extensions" },
     { name = "yarl" },
 ]
-sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/88/0a/04db32e598a37595ae5bd4908cb483818160ce1981e624353992107a30fd/nonebot_adapter_qq-1.7.2.tar.gz", hash = "sha256:07a2a1613def7a0d555597cf9103adf7934167d7f644172252fd69bb4a7f87fa", size = 34435, upload-time = "2026-08-09T08:24:15.241Z" }
+sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/44/b6/cfbf1098d0c564031ca71c7cad083153d433687dc1bf07e09e8f6c0682da/nonebot_adapter_qq-1.7.3.tar.gz", hash = "sha256:54d6427894ca1443bdab8d3101e7efdbf4407a6385d032cbda883c396fb2025e", size = 35945, upload-time = "2026-09-26T15:53:25.461Z" }
 wheels = [
-    { url = "https://pypi.tuna.tsinghua.edu.cn/packages/8c/68/adcff2c5601d1e35e759b40018fc76aac05fb61481d91a744551a1c3d0fc/nonebot_adapter_qq-1.7.2-py3-none-any.whl", hash = "sha256:487aa6473c1c9874fe5ed088817589f7c6a09967b8ac468b29a48e41cce4f1e6", size = 39199, upload-time = "2026-08-09T08:24:13.833Z" },
+    { url = "https://pypi.tuna.tsinghua.edu.cn/packages/6a/9b/f81f100a625e15e9749ab35236f0e5f6a700d4480c0a01abc8d0a88d2251/nonebot_adapter_qq-1.7.3-py3-none-any.whl", hash = "sha256:fe59b6b9dbde979f1eb8a4a33dc6f27634feb92ecb4ceb9dc3ea8d04c979ac77", size = 40725, upload-time = "2026-09-26T15:53:24.448Z" },
+]
+
+[[package]]
+name = "nonebot-adapter-telegram"
+version = "0.1.0b20"
+source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple/" }
+dependencies = [
+    { name = "anyio" },
+    { name = "nonebot2" },
+    { name = "pydantic" },
+]
+sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/89/18/28944035c60d6cbf9beceefe800cc68e797595effbb439ff253b58fd55ee/nonebot-adapter-telegram-0.1.0b20.tar.gz", hash = "sha256:fc17df61cbdb3162f29dbada1e5712b26f37c185da87602b613694bca32c9ada", size = 29594, upload-time = "2024-11-24T09:01:06.882Z" }
+wheels = [
+    { url = "https://pypi.tuna.tsinghua.edu.cn/packages/24/3e/12d823f920fe3b42a474d8a5220e57ea1113a007d47860c23a224b2f570b/nonebot_adapter_telegram-0.1.0b20-py3-none-any.whl", hash = "sha256:a90acf29b8a9c8a16d4aaa93fb930debde4648d514f2050af945e973cd37a8d4", size = 30266, upload-time = "2024-11-24T09:01:05.258Z" },
 ]
 
 [[package]]
@@ -4231,6 +4245,11 @@ dependencies = [
     { name = "uvloop", marker = "sys_platform != 'win32'" },
 ]
 
+[package.optional-dependencies]
+telegram = [
+    { name = "nonebot-adapter-telegram" },
+]
+
 [package.dev-dependencies]
 dev = [
     { name = "nonebug" },
@@ -4262,7 +4281,8 @@ requires-dist = [
     { name = "mcp", specifier = ">=1.8.0" },
     { name = "multidict", specifier = ">=6.0.0,!=6.3.2" },
     { name = "nonebot-adapter-onebot", specifier = ">=2.3.1" },
-    { name = "nonebot-adapter-qq", specifier = ">=1.7.2,<2" },
+    { name = "nonebot-adapter-qq", specifier = ">=1.7.3,<2" },
+    { name = "nonebot-adapter-telegram", marker = "extra == 'telegram'", specifier = ">=0.1.0b20,<0.2" },
     { name = "nonebot-plugin-alconna", specifier = ">=0.59.4" },
     { name = "nonebot-plugin-apscheduler", specifier = ">=0.5" },
     { name = "nonebot-plugin-htmlrender", specifier = ">=0.6.0,<1.0.0" },
@@ -4293,6 +4313,7 @@ requires-dist = [
     { name = "urllib3", specifier = ">=2.0.0,<3.0.0" },
     { name = "uvloop", marker = "sys_platform != 'win32'", specifier = ">=0.21.0" },
 ]
+provides-extras = ["telegram"]
 
 [package.metadata.requires-dev]
 dev = [

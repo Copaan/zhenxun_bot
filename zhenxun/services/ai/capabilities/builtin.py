@@ -32,7 +32,10 @@ from zhenxun.services.business_identity import (
     current_business_identity,
     resolve_business_identity,
 )
-from zhenxun.services.platform_identity import CURRENT_PLATFORM_SCOPE
+from zhenxun.services.platform_identity import (
+    CURRENT_PLATFORM_SCOPE,
+    is_isolated_scope,
+)
 from zhenxun.utils.enum import GoldHandle
 from zhenxun.utils.exception import InsufficientGold
 from zhenxun.utils.platform import PlatformUtils
@@ -210,9 +213,10 @@ class BillingCapability(AbstractCapability):
             platform = context.get_platform()
             bot, event = context.get_bot(), context.get_event()
             official = (
-                PlatformUtils.get_platform_scope(bot) == "qq_api"
+                is_isolated_scope(PlatformUtils.get_platform_scope(bot))
                 if bot is not None
-                else platform == "qq_api" or CURRENT_PLATFORM_SCOPE.get() == "qq_api"
+                else platform == "qq_api"
+                or is_isolated_scope(CURRENT_PLATFORM_SCOPE.get())
             )
             if (bot is None or event is None) and (official or event is not None):
                 raise ToolFatalError("收费工具缺少可核验的消息身份")

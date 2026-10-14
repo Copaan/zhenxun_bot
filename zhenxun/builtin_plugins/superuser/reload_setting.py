@@ -13,7 +13,7 @@ from zhenxun.configs.utils import (
 )
 from zhenxun.services.log import logger
 from zhenxun.services.plugin_host import ApplyMode, RuntimeOperation
-from zhenxun.services.runtime_config_reload import reload_runtime_config
+from zhenxun.services.runtime_config import reload_runtime_config
 from zhenxun.utils.enum import PluginType
 from zhenxun.utils.manager.priority_manager import PriorityLifecycle
 from zhenxun.utils.message import MessageUtils

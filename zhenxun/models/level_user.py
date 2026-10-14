@@ -3,6 +3,7 @@ from tortoise import fields
 from zhenxun.services.cache.runtime_cache import LevelUserMemoryCache
 from zhenxun.services.db_context import Model
 from zhenxun.services.db_context.schema_ops import AlterColumnType, RenameColumn
+from zhenxun.services.platform_identity import scoped_group_id, scoped_user_id
 
 
 class LevelUser(Model):
@@ -35,6 +36,7 @@ class LevelUser(Model):
         """
         if not group_id:
             return 0
+        user_id, group_id = scoped_user_id(user_id), scoped_group_id(group_id)
         if user := await LevelUserMemoryCache.get(user_id, group_id):
             return user.user_level
         return 0
@@ -55,6 +57,7 @@ class LevelUser(Model):
             level: 权限等级
             group_flag: 是否被自动更新刷新权限 0:是, 1:否.
         """
+        user_id, group_id = scoped_user_id(user_id), scoped_group_id(group_id)
         if await cls.exists(user_id=user_id, group_id=group_id, user_level=level):
             # 权限相同时跳过
             return
@@ -78,6 +81,7 @@ class LevelUser(Model):
         返回:
             bool: 是否含有用户权限
         """
+        user_id, group_id = scoped_user_id(user_id), scoped_group_id(group_id)
         if user := await cls.get_or_none(user_id=user_id, group_id=group_id):
             await user.delete()
             return True
@@ -97,6 +101,7 @@ class LevelUser(Model):
         """
         if level == 0:
             return True
+        user_id, group_id = scoped_user_id(user_id), scoped_group_id(group_id)
         if group_id:
             if user := await LevelUserMemoryCache.get(user_id, group_id):
                 return user.user_level >= level
@@ -116,6 +121,7 @@ class LevelUser(Model):
         返回:
             bool: 是否会被自动更新权限刷新
         """
+        user_id, group_id = scoped_user_id(user_id), scoped_group_id(group_id)
         if user := await LevelUserMemoryCache.get(user_id, group_id):
             return user.group_flag == 1
         return False

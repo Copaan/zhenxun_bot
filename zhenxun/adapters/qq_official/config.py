@@ -11,7 +11,14 @@ from typing import Literal
 from cryptography import x509
 from cryptography.hazmat.primitives import serialization
 from dotenv import dotenv_values
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from zhenxun.utils.network import internal_connect_host
 
@@ -39,11 +46,25 @@ class QQOfficialIntent(BaseModel):
 
 class QQOfficialBotConfig(BaseModel):
     id: str
-    token: str = ""
     secret: str
     use_websocket: bool = False
     intent: QQOfficialIntent = Field(default_factory=QQOfficialIntent)
     shard: tuple[int, int] | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_token(cls, value):
+        """忽略已被官方废弃的 Bot token 配置
+
+        参数:
+            value: 原始配置
+
+        返回:
+            去掉 token 后的配置
+        """
+        if isinstance(value, dict) and "token" in value:
+            value = {key: item for key, item in value.items() if key != "token"}
+        return value
 
     @field_validator("shard")
     @classmethod
@@ -60,17 +81,13 @@ class QQOfficialBotConfig(BaseModel):
             raise ValueError("must not be blank")
         return value
 
-    @field_validator("token")
-    @classmethod
-    def _strip_token(cls, value: str) -> str:
-        return value.strip()
-
     model_config = ConfigDict(extra="forbid")
 
 
 class QQOfficialConfig(BaseModel):
     qq_bots: list[QQOfficialBotConfig] = Field(default_factory=list)
     qq_verify_webhook: bool = True
+    qq_proactive_fallback: bool = True
     qq_webhook_mode: QQWebhookMode = "external"
     qq_webhook_listen_host: str = "0.0.0.0"
     qq_webhook_listen_port: int = 443

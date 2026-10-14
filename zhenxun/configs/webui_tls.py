@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-import socket
 from typing import Any
 
 from cryptography import x509
@@ -34,12 +33,10 @@ class WebUITLSSettings:
     def effective_http_mode(self) -> str:
         if not self.enabled:
             return "disabled"
-        if self.http_mode is not None:
-            return self.http_mode
-        return "redirect" if self.redirect_enabled else "serve"
+        return self.http_mode or "redirect"
 
     @property
-    def http_sidecar_enabled(self) -> bool:
+    def http_compat_enabled(self) -> bool:
         return self.effective_http_mode != "disabled"
 
 
@@ -133,8 +130,6 @@ def validate_webui_tls_settings(
     settings: WebUITLSSettings,
     *,
     qq_https_port: int | None = None,
-    launcher_managed: bool = True,
-    check_redirect_port: bool = False,
 ) -> None:
     if (
         settings.http_mode is None
@@ -142,27 +137,11 @@ def validate_webui_tls_settings(
         and not settings.enabled
     ):
         raise WebUITLSConfigError("启用 HTTP 重定向前必须先启用 WebUI HTTPS")
-    if (
-        settings.http_mode is None
-        and settings.redirect_enabled
-        and not launcher_managed
-    ):
-        raise WebUITLSConfigError("HTTP 重定向仅在 launcher 托管模式下可用")
     if settings.enabled:
         _validate_certificate(settings.certfile, settings.keyfile)
     occupied = {port for port in (qq_https_port,) if port is not None}
     if settings.enabled and settings.port in occupied:
         raise WebUITLSConfigError("WebUI HTTPS 端口与 QQ Webhook HTTPS 端口冲突")
-    if check_redirect_port and settings.http_sidecar_enabled:
-        family = socket.AF_INET6 if ":" in settings.host else socket.AF_INET
-        probe = socket.socket(family, socket.SOCK_STREAM)
-        try:
-            probe.bind((settings.host, settings.redirect_port))
-        except OSError:
-            # The optional HTTP sidecar reports bind conflicts as a degradation.
-            pass
-        finally:
-            probe.close()
 
 
 _runtime_settings: WebUITLSSettings | None = None

@@ -53,7 +53,7 @@ async def classify_plugin(
     from zhenxun.utils.platform import PlatformUtils
 
     scope = PlatformUtils.get_platform_scope(session)
-    bot_id = f"qq_api:{session.self_id}" if scope == "qq_api" else str(session.self_id)
+    bot_id = PlatformUtils.storage_bot_id(scope, str(session.self_id))
     bot = await BotConsole.get_or_none(bot_id=bot_id)
     channel_id = getattr(getattr(session, "channel", None), "id", None)
     for menu, value in sort_data.items():

@@ -111,13 +111,19 @@ async def group_handle(group_id: str) -> None:
             )
 
 
-async def user_handle(plugin: PluginInfo, entity: EntityIDs, session: Uninfo) -> None:
+async def user_handle(
+    plugin: PluginInfo,
+    entity: EntityIDs,
+    session: Uninfo,
+    ban_entity: EntityIDs | None = None,
+) -> None:
     """用户ban检查
 
     参数:
-        module: 插件模块名
-        entity: 实体ID信息
+        plugin: 插件信息
+        entity: 实体ID信息，用于提示消息
         session: Uninfo
+        ban_entity: 查询 ban 记录使用的持久化实体ID，默认同 entity
 
     异常:
         SkipPluginException: 用户处于黑名单
@@ -125,7 +131,8 @@ async def user_handle(plugin: PluginInfo, entity: EntityIDs, session: Uninfo) ->
     start_time = time.time()
     try:
         ban_result = Config.get_config("hook", "BAN_RESULT")
-        time_val = await is_ban(entity.user_id, entity.group_id)
+        ban_entity = ban_entity or entity
+        time_val = await is_ban(ban_entity.user_id, ban_entity.group_id)
         if not time_val:
             return
         time_str = format_time(time_val)
@@ -178,18 +185,21 @@ async def auth_ban(
             return
         if not matcher.plugin_name:
             return
+        ban_entity = None
         if context is not None:
             entity = context.entity
+            ban_entity = context.event.limit_entity
             is_superuser = context.is_superuser
         if entity is None:
             entity = get_entity_ids(session)
+        ban_entity = ban_entity or entity
         if is_superuser:
             return
-        if entity.group_id:
-            await group_handle(entity.group_id)
+        if ban_entity.group_id:
+            await group_handle(ban_entity.group_id)
 
         if entity.user_id:
-            await user_handle(plugin, entity, session)
+            await user_handle(plugin, entity, session, ban_entity)
     finally:
         # 记录总执行时间
         elapsed = time.time() - start_time

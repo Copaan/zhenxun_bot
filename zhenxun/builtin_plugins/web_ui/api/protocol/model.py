@@ -47,6 +47,8 @@ class ProtocolStatus(BaseModel):
     onebot_v11_connected: bool
     qq_official_enabled: bool
     qq_official_connected: bool
+    telegram_enabled: bool = False
+    telegram_connected: bool = False
     qq_webhook_mode: Literal["external", "builtin_https"]
     qq_webhook_callback_url: str | None = None
     connections: list[ProtocolConnection]

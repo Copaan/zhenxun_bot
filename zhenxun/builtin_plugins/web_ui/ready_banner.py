@@ -4,21 +4,11 @@ import asyncio
 from collections.abc import Awaitable, Callable
 import contextlib
 import inspect
-import ipaddress
 from typing import Any
 
+from zhenxun.utils.network import internal_connect_host
+
 ReadyCallback = Callable[[], Awaitable[None] | None]
-
-
-def _connect_host(host: str) -> str:
-    value = host.strip().strip("[]")
-    if value in {"", "0.0.0.0", "::"}:
-        return "127.0.0.1"
-    try:
-        address = ipaddress.ip_address(value)
-    except ValueError:
-        return value
-    return "127.0.0.1" if address.is_unspecified else value
 
 
 class UvicornReadyBanner:
@@ -39,7 +29,7 @@ class UvicornReadyBanner:
     ) -> bool:
         if self._task is not None or self._emitted:
             return False
-        coroutine = self._probe(callback, _connect_host(host), port, timeout)
+        coroutine = self._probe(callback, internal_connect_host(host), port, timeout)
         self._task = (
             context.spawn_task(
                 coroutine,

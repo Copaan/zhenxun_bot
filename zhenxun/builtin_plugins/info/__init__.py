@@ -22,7 +22,10 @@ __plugin_meta__ = PluginMetadata(
         我的信息 ?[at]
     """.strip(),
     extra=PluginExtraData(
-        author="HibiKier", version="0.1", commands=[Command(command="我的信息")]
+        author="HibiKier",
+        version="0.1",
+        required_platform_capabilities={"business_identity"},
+        commands=[Command(command="我的信息")],
     ).to_dict(),
 )
 

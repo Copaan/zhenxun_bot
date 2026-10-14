@@ -23,6 +23,7 @@ from .utils import (
     check_git,
     filter_files,
     git_auth_environment,
+    git_download_environment,
     redact_git_output,
     run_git_command,
 )
@@ -267,7 +268,6 @@ class BaseRepoManager(ABC):
                 authenticated_url = prepare_repo_url(repo_url)
             repo_url = canonicalize_git_url(authenticated_url)
             git_env = git_auth_environment(authenticated_url, repo_url)
-            from zhenxun.services.git_proxy import git_download_environment
             from zhenxun.services.network_proxy import proxy_runtime
 
             git_env, _ = git_download_environment(

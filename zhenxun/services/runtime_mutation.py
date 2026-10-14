@@ -6,11 +6,18 @@ from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from functools import wraps
-from typing import Any
+from typing import Any, ParamSpec, TypeVar
 import uuid
+
+P = ParamSpec("P")
+R = TypeVar("R")
 
 
 class RuntimeMutationBusyError(RuntimeError):
+    pass
+
+
+class StoreOperationBusyError(RuntimeError):
     pass
 
 
@@ -23,10 +30,6 @@ class RuntimeMutationCoordinator:
 
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
-        self._depth: ContextVar[int] = ContextVar("runtime_mutation_depth", default=0)
-        self._operation_id: ContextVar[str | None] = ContextVar(
-            "runtime_mutation_operation_id", default=None
-        )
         self._current: dict[str, Any] | None = None
         self._state = "open"
         self._idle = asyncio.Event()
@@ -38,10 +41,6 @@ class RuntimeMutationCoordinator:
         self._inherited_transaction: ContextVar[object | None] = ContextVar(
             "runtime_mutation_transaction", default=None
         )
-
-    @property
-    def locked(self) -> bool:
-        return self._lock.locked()
 
     @property
     def reentrant(self) -> bool:
@@ -57,37 +56,25 @@ class RuntimeMutationCoordinator:
         return None if self._state == "open" else {"coordinator_state": self._state}
 
     @property
-    def accepting(self) -> bool:
-        return self._state == "open"
-
-    @property
-    def current_operation_id(self) -> str | None:
-        return self._operation_id.get() if self.reentrant else None
-
-    @property
     def cancellation_requested(self) -> bool:
         return bool(self._cancel_event and self._cancel_event.is_set())
-
-    def set_phase(self, phase: str) -> None:
-        if self._current is not None and self.reentrant:
-            self._current["phase"] = phase
-            from zhenxun.services.lifecycle.operations import operation_registry
-
-            operation_id = self.current_operation_id
-            record = operation_registry.get(operation_id) if operation_id else None
-            if record and record["state"] not in {
-                "completed",
-                "failed",
-                "cancelled",
-                "recovery_required",
-            }:
-                operation_registry.update(operation_id, phase=phase)
 
     def checkpoint(self) -> None:
         if not self.reentrant:
             raise RuntimeMutationBusyError("mutation_not_owner")
         if self.cancellation_requested:
             raise MutationCancelled()
+
+    def _check_enter(self, fail_if_busy: bool) -> None:
+        if (
+            self._transaction is not None
+            and self._inherited_transaction.get() is self._transaction
+        ):
+            raise RuntimeMutationBusyError("mutation_cross_task_reentry")
+        if self._state != "open":
+            raise RuntimeMutationBusyError(f"runtime_mutation_{self._state}")
+        if fail_if_busy and self._lock.locked():
+            raise RuntimeMutationBusyError("runtime_mutation_in_progress")
 
     async def run_owned(
         self,
@@ -96,24 +83,25 @@ class RuntimeMutationCoordinator:
         *,
         fail_if_busy: bool = False,
     ) -> Any:
+        """在独立任务中持锁执行变更，调用方取消等待时只请求变更在安全点停止
+
+        参数:
+            kind: 变更类型
+            callback: 变更内容
+            fail_if_busy: 已有变更时是否直接失败
+
+        返回:
+            Any: 变更结果
+        """
         if self.reentrant:
             return await callback()
-        if self._transaction is not None and (
-            self._inherited_transaction.get() is self._transaction
-        ):
-            raise RuntimeMutationBusyError("mutation_cross_task_reentry")
-        if not self.accepting:
-            raise RuntimeMutationBusyError(f"runtime_mutation_{self._state}")
-        if fail_if_busy and self.locked:
-            raise RuntimeMutationBusyError("runtime_mutation_in_progress")
+        self._check_enter(fail_if_busy)
         from zhenxun.services.lifecycle.deadline import ShutdownBudget, current_budget
-        from zhenxun.services.lifecycle.operations import operation_registry
 
         cancel = asyncio.Event()
         budget = ShutdownBudget(float("inf"))
         if parent := current_budget.get():
             budget.tighten(parent)
-        operation_id = uuid.uuid4().hex
 
         def request_cancel() -> None:
             if parent := current_budget.get():
@@ -123,7 +111,7 @@ class RuntimeMutationCoordinator:
         async def execute() -> Any:
             token = current_budget.set(budget)
             try:
-                async with self.operation(kind, operation_id=operation_id):
+                async with self.operation(kind):
                     self._cancel_event = cancel
                     self._active_budget = budget
                     self.checkpoint()
@@ -131,14 +119,7 @@ class RuntimeMutationCoordinator:
             finally:
                 current_budget.reset(token)
 
-        _, task = operation_registry.start(
-            kind,
-            execute(),
-            operation_id=operation_id,
-            public_input={"source": kind},
-            cancel=request_cancel,
-        )
-        # The caller can abandon its wait, but cannot interrupt the lock owner.
+        task = asyncio.create_task(execute(), name=f"runtime-mutation:{kind}")
         while True:
             try:
                 return await asyncio.shield(task)
@@ -146,19 +127,6 @@ class RuntimeMutationCoordinator:
                 if task.done():
                     return task.result()
                 request_cancel()
-
-    def associate(self, operation_id: str, owner: str | None = None) -> None:
-        if self._current is None or not self.reentrant:
-            return
-        self._operation_id.set(operation_id)
-        self._current["operation_id"] = operation_id
-        if owner is not None:
-            self._current["owner"] = owner
-
-    def request_cancel(self) -> None:
-        if not self.reentrant:
-            raise RuntimeMutationBusyError("mutation_not_owner")
-        self._request_cancel()
 
     def _request_cancel(self) -> None:
         from zhenxun.services.lifecycle.deadline import current_budget
@@ -196,37 +164,21 @@ class RuntimeMutationCoordinator:
         owner: str | None = None,
         phase: str = "running",
     ) -> AsyncIterator[None]:
-        depth = self._depth.get()
         if self.reentrant:
-            token = self._depth.set(depth + 1)
-            try:
-                yield
-            finally:
-                self._depth.reset(token)
+            yield
             return
-        if (
-            self._transaction is not None
-            and self._inherited_transaction.get() is self._transaction
-        ):
-            raise RuntimeMutationBusyError("mutation_cross_task_reentry")
-        if self._state != "open":
-            raise RuntimeMutationBusyError(f"runtime_mutation_{self._state}")
-        if fail_if_busy and self._lock.locked():
-            raise RuntimeMutationBusyError("runtime_mutation_in_progress")
+        self._check_enter(fail_if_busy)
         async with self._lock:
             if self._state != "open":
                 raise RuntimeMutationBusyError(f"runtime_mutation_{self._state}")
-            token = self._depth.set(1)
             self._owner_task = asyncio.current_task()
             self._transaction = object()
             transaction_token = self._inherited_transaction.set(self._transaction)
-            operation_id = operation_id or uuid.uuid4().hex
-            operation_token = self._operation_id.set(operation_id)
             self._idle.clear()
             self._cancel_event = asyncio.Event()
             self._current = {
                 "kind": kind,
-                "operation_id": operation_id,
+                "operation_id": operation_id or uuid.uuid4().hex,
                 "owner": owner,
                 "phase": phase,
                 "started_at": datetime.now(timezone.utc).isoformat(),
@@ -241,8 +193,6 @@ class RuntimeMutationCoordinator:
                 self._active_budget = None
                 self._inherited_transaction.reset(transaction_token)
                 self._idle.set()
-                self._operation_id.reset(operation_token)
-                self._depth.reset(token)
 
 
 runtime_mutation_coordinator = RuntimeMutationCoordinator()
@@ -261,8 +211,58 @@ def managed_mutation(kind: str):
     return decorate
 
 
+@asynccontextmanager
+async def store_operation(
+    *, operation_id: str | None = None, owner: str | None = None
+) -> AsyncIterator[None]:
+    """持有插件商店变更锁，已有其他变更时直接失败
+
+    参数:
+        operation_id: 操作 ID
+        owner: 操作来源
+    """
+    try:
+        async with runtime_mutation_coordinator.operation(
+            "plugin_store",
+            fail_if_busy=True,
+            operation_id=operation_id,
+            owner=owner,
+        ):
+            yield
+    except RuntimeMutationBusyError as error:
+        raise StoreOperationBusyError("plugin_operation_in_progress") from error
+
+
+def coordinated_store_operation(
+    func: Callable[P, Coroutine[Any, Any, R]],
+) -> Callable[P, Coroutine[Any, Any, R]]:
+    """以插件商店变更锁运行函数，已有其他变更时直接失败
+
+    参数:
+        func: 商店操作函数
+
+    返回:
+        Callable[P, Coroutine[Any, Any, R]]: 包装后的函数
+    """
+
+    @wraps(func)
+    async def wrapped(*args: P.args, **kwargs: P.kwargs) -> R:
+        try:
+            return await runtime_mutation_coordinator.run_owned(
+                "plugin_store", lambda: func(*args, **kwargs), fail_if_busy=True
+            )
+        except RuntimeMutationBusyError as error:
+            raise StoreOperationBusyError("plugin_operation_in_progress") from error
+
+    return wrapped
+
+
 __all__ = [
     "RuntimeMutationBusyError",
     "RuntimeMutationCoordinator",
+    "StoreOperationBusyError",
+    "coordinated_store_operation",
+    "managed_mutation",
     "runtime_mutation_coordinator",
+    "store_operation",
 ]

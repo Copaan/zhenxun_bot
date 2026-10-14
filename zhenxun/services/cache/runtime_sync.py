@@ -159,7 +159,7 @@ class RuntimeCacheSync:
         return enabled and _redis_enabled()
 
     @classmethod
-    async def start(cls, *, strict: bool = False) -> None:
+    async def start(cls) -> None:
         if cls._ready:
             return
         if not cls._sync_enabled():
@@ -199,8 +199,6 @@ class RuntimeCacheSync:
                         f"{RUNTIME_CACHE_REVISION_PREFIX}:{cache_type}"
                     )
                 except Exception as error:
-                    if strict:
-                        raise
                     logger.warning(
                         f"runtime cache revision seed failed: {cache_type}",
                         LOG_COMMAND,
@@ -218,8 +216,6 @@ class RuntimeCacheSync:
         except Exception as exc:
             logger.error("runtime cache sync init failed", LOG_COMMAND, e=exc)
             await cls.stop()
-            if strict:
-                raise
 
     @classmethod
     async def stop(cls) -> None:

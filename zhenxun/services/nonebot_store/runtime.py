@@ -20,19 +20,11 @@ from typing import Any
 
 from packaging.utils import canonicalize_name
 
-from zhenxun.services.plugin_store.plugin_archive_dependencies import (
-    ArchiveDependencyConflict,
-)
-from zhenxun.services.plugin_store.plugin_store_transaction import (
-    ArchiveSourceBuildConflict,
-    archive_dependency_policy,
-)
 from zhenxun.utils.pythonpath import subprocess_pythonpath
 
 from .dependencies import protected_core, safe_process_error
 from .storage import (
     LAYER_ROOT,
-    ORM_MIGRATION_STATUS_FILE,
     PENDING_FILE,
     ROLLBACK_FILE,
     STARTUP_STATUS_FILE,
@@ -43,6 +35,7 @@ from .storage import (
     prune_generations,
     read_json,
     remove_generation,
+    remove_orm_backups,
     save_manifest,
     utc_now,
     write_json,
@@ -193,78 +186,10 @@ def layer_digest(root: Path) -> str:
     return digest.hexdigest()
 
 
-def _package_runtime_details(
-    root: Path, packages: dict[str, Any]
-) -> dict[str, dict[str, Any]]:
-    """Read installed distribution metadata without guessing import names."""
-    details: dict[str, dict[str, Any]] = {}
-    for dist_info in root.glob("*.dist-info"):
-        metadata = dist_info / "METADATA"
-        if not metadata.is_file():
-            continue
-        values: dict[str, str] = {}
-        for line in metadata.read_text(encoding="utf-8", errors="replace").splitlines():
-            if ": " in line:
-                key, value = line.split(": ", 1)
-                values.setdefault(key, value.strip())
-        raw_name = values.get("Name")
-        if not raw_name:
-            continue
-        name = canonicalize_name(raw_name)
-        if name not in packages:
-            continue
-        top_level_file = dist_info / "top_level.txt"
-        modules = (
-            sorted(
-                line.strip()
-                for line in top_level_file.read_text(encoding="utf-8").splitlines()
-                if line.strip() and line.strip().isidentifier()
-            )
-            if top_level_file.is_file()
-            else []
-        )
-        details[name] = {
-            "distribution_name": name,
-            "version": str(packages[name].get("version")),
-            "top_level_modules": modules,
-            "nonebot_plugin_ids": [],
-            "runtime_role": "python_dependency",
-        }
-    return details
-
-
-def generation_packages(root: Path) -> dict[str, dict[str, Any]]:
-    """读取依赖层中实际安装的包，生成清单中的包记录
-
-    参数:
-        root: 依赖层目录
-
-    返回:
-        dict[str, dict[str, Any]]: 规范化包名到包记录的映射
-    """
-    from importlib import metadata
-
-    packages: dict[str, dict[str, Any]] = {
-        canonicalize_name(dist.metadata["Name"]): {"version": dist.version}
-        for dist in metadata.distributions(path=[str(root)])
-        if dist.metadata["Name"]
-    }
-    for name, detail in _package_runtime_details(root, packages).items():
-        packages[name].update(detail)
-    return dict(sorted(packages.items()))
-
-
 def build_generation(
     transaction: dict[str, Any], *, cancel_requested: Callable[[], bool] | None = None
 ) -> dict[str, Any]:
-    try:
-        with archive_dependency_policy(transaction):
-            return _build_generation(transaction, cancel_requested=cancel_requested)
-    except (ArchiveSourceBuildConflict, ArchiveDependencyConflict) as error:
-        raise LayerBuildError(
-            error.code,
-            details=getattr(error, "details", None),
-        ) from error
+    return _build_generation(transaction, cancel_requested=cancel_requested)
 
 
 async def prepare_generation(transaction: dict[str, Any]) -> dict[str, Any]:
@@ -303,7 +228,7 @@ def _run_installer(
     """Wait for an installer and its owned descendants before releasing staging."""
     import psutil
 
-    from zhenxun.utils.process_tree import verified_descendants
+    from zhenxun.utils.process_tree import kill_tree, verified_descendants
 
     process = subprocess.Popen(
         command,
@@ -346,14 +271,10 @@ def _run_installer(
         unexpected_children = []
         if finished:
             _, unexpected_children = psutil.wait_procs(list(owned.values()), timeout=5)
-        for child in reversed(list(owned.values())):
-            with contextlib.suppress(psutil.NoSuchProcess):
-                if child.is_running():
-                    child.kill()
+        alive = kill_tree(list(owned.values()))
         if process.poll() is None:
             process.kill()
         process.wait(timeout=5)
-        _, alive = psutil.wait_procs(list(owned.values()), timeout=5)
         for pipe in (process.stdout, process.stderr):
             if pipe is not None:
                 pipe.close()
@@ -373,9 +294,6 @@ def _build_generation(
         uv_binary_options,
         uv_command,
         uv_version,
-    )
-    from zhenxun.services.plugin_store.plugin_archive_dependencies import (
-        archive_dependency_contract,
     )
 
     packages = transaction.get("target_manifest", {}).get("packages", {})
@@ -443,27 +361,11 @@ def _build_generation(
                 "--python",
                 sys.executable,
             )
-            if transaction.get("archive_wheels_only") or not transaction.get(
-                "source_build_confirmed"
-            ):
-                command.extend(uv_binary_options(wheels_only=True))
-            else:
-                forbidden_builds = set(
-                    archive_dependency_contract().get("wheels_only_packages", [])
+            command.extend(
+                uv_binary_options(
+                    wheels_only=not transaction.get("source_build_confirmed")
                 )
-                forbidden_builds.update(
-                    transaction.get("archive_binary_only_packages", [])
-                )
-                if "archive_build_allowlist" in transaction:
-                    forbidden_builds.update(
-                        set(packages) - set(transaction["archive_build_allowlist"])
-                    )
-                command.extend(
-                    uv_binary_options(
-                        wheels_only=False,
-                        restricted_packages=tuple(forbidden_builds),
-                    )
-                )
+            )
             try:
                 completed = _run_installer(
                     command, installer_environment(), cancel_requested
@@ -497,20 +399,10 @@ def _build_generation(
                 manifest=transaction["target_manifest"], candidate_path=staging
             )
         )
-        verification = validate_candidate(staging, transaction)
+        validate_candidate(staging, transaction)
         native_files = _scan_native_extensions(staging)
-        package_details = _package_runtime_details(staging, packages)
-        metadata = {
-            "version": 1,
-            "generation": generation,
-            "created_at": utc_now(),
-            "packages": sorted(requested),
-            "package_details": package_details,
-            "native_extensions": native_files,
-            "dependency_verification": verification,
-        }
         (staging / ".zhenxun-generation.json").write_text(
-            json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
+            json.dumps({"native_extensions": native_files}, indent=2), encoding="utf-8"
         )
         digest = layer_digest(staging)
         staging.replace(final_path)
@@ -522,70 +414,42 @@ def _build_generation(
     }
 
 
-def _validate_archive_generation(
-    transaction: dict[str, Any], build: dict[str, Any]
-) -> None:
+def _validate_generation(transaction: dict[str, Any], build: dict[str, Any]) -> None:
     from .environment import validate_candidate
 
     path = generation_path(int(build["generation"]))
     if layer_digest(path) != build.get("digest"):
         raise LayerBuildError("dependency_layer_state_mismatch")
     validate_candidate(path, transaction)
-    if not transaction.get("archive_wheels_only"):
-        return
-    path = generation_path(int(build["generation"]))
-    metadata = read_json(path / ".zhenxun-generation.json", {})
-    expected = sorted(
-        f"{canonicalize_name(name)}=={info['version']}"
-        for name, info in transaction["target_manifest"]["packages"].items()
-    )
-    # A later archive merge can change the manifest after this layer was built.
-    # Its old digest alone does not prove it contains the newly owned pins.
-    if (
-        not isinstance(metadata, dict)
-        or metadata.get("packages") != expected
-        or layer_digest(path) != build.get("digest")
-    ):
-        raise LayerBuildError("archive_dependency_conflict")
 
 
 def commit_generation(
     transaction: dict[str, Any], build: dict[str, Any], *, verify_on_start: bool
 ) -> dict[str, Any]:
-    with archive_dependency_policy(transaction):
-        _validate_archive_generation(transaction, build)
-        previous = load_manifest()
-        target = deepcopy(transaction["target_manifest"])
-        generation_metadata = read_json(
-            generation_path(int(build["generation"])) / ".zhenxun-generation.json", {}
-        )
-        package_details = generation_metadata.get("package_details", {})
-        if isinstance(package_details, dict):
-            for name, detail in package_details.items():
-                if isinstance(target.get("packages", {}).get(name), dict):
-                    target["packages"][name].update(detail)
-        target["active_generation"] = int(build["generation"])
-        target["previous_generation"] = previous.get("active_generation")
-        target["pending_verification"] = bool(verify_on_start)
-        target.pop("verified_transaction_revision", None)
-        target["generation_digest"] = build["digest"]
-        write_json(ROLLBACK_FILE, previous)
-        save_manifest(target)
-        return target
+    _validate_generation(transaction, build)
+    previous = load_manifest()
+    target = deepcopy(transaction["target_manifest"])
+    target["active_generation"] = int(build["generation"])
+    target["previous_generation"] = previous.get("active_generation")
+    target["pending_verification"] = bool(verify_on_start)
+    target.pop("verified_transaction_revision", None)
+    target["generation_digest"] = build["digest"]
+    write_json(ROLLBACK_FILE, previous)
+    save_manifest(target)
+    return target
 
 
 def stage_generation(transaction: dict[str, Any], build: dict[str, Any]) -> None:
     """Persist a built generation without exposing it to the running worker."""
-    with archive_dependency_policy(transaction):
-        _validate_archive_generation(transaction, build)
-        previous = transaction.get("generation")
-        transaction["generation"] = int(build["generation"])
-        transaction["generation_digest"] = str(build["digest"])
-        transaction["native_extensions"] = list(build.get("native_extensions") or [])
-        transaction["state"] = "pending_restart"
-        write_json(PENDING_FILE, transaction)
-        if isinstance(previous, int) and previous != build["generation"]:
-            remove_generation(previous)
+    _validate_generation(transaction, build)
+    previous = transaction.get("generation")
+    transaction["generation"] = int(build["generation"])
+    transaction["generation_digest"] = str(build["digest"])
+    transaction["native_extensions"] = list(build.get("native_extensions") or [])
+    transaction["state"] = "pending_restart"
+    write_json(PENDING_FILE, transaction)
+    if isinstance(previous, int) and previous != build["generation"]:
+        remove_generation(previous)
 
 
 def _staged_build(transaction: dict[str, Any]) -> dict[str, Any] | None:
@@ -603,13 +467,21 @@ def _staged_build(transaction: dict[str, Any]) -> dict[str, Any] | None:
         "native_extensions": list(transaction.get("native_extensions") or []),
     }
     try:
-        _validate_archive_generation(transaction, build)
+        _validate_generation(transaction, build)
     except LayerBuildError:
         return None
     return build
 
 
-def _run_orm_migration(action: str) -> int:
+def _run_orm_migration(action: str) -> tuple[int, str]:
+    """在子进程中执行 ORM 迁移操作
+
+    参数:
+        action: apply / restore / finalize
+
+    返回:
+        tuple[int, str]: 退出码，失败时的诊断输出
+    """
     try:
         completed = subprocess.run(
             [
@@ -629,26 +501,18 @@ def _run_orm_migration(action: str) -> int:
         )
     except (OSError, subprocess.TimeoutExpired) as error:
         completed = subprocess.CompletedProcess([], 124, "", type(error).__name__)
-    if completed.returncode:
-        status = read_json(ORM_MIGRATION_STATUS_FILE, {})
-        write_json(
-            ORM_MIGRATION_STATUS_FILE,
-            {
-                **status,
-                "tool_action": action,
-                "tool_exit_code": completed.returncode,
-                "tool_diagnostic": safe_process_error(
-                    completed.stderr or completed.stdout or ""
-                )[-4000:],
-                "updated_at": utc_now(),
-            },
-        )
-    return int(completed.returncode)
+    diagnostic = (
+        safe_process_error(completed.stderr or completed.stdout or "")[-4000:]
+        if completed.returncode
+        else ""
+    )
+    return int(completed.returncode), diagnostic
 
 
 def finalize_orm_migration() -> None:
-    if _run_orm_migration("finalize"):
-        raise LayerBuildError("database_migration_cleanup_failed")
+    code, diagnostic = _run_orm_migration("finalize")
+    if code:
+        raise LayerBuildError("database_migration_cleanup_failed", diagnostic)
 
 
 def record_manual_operations(transaction: dict, mode: str, status: str) -> None:
@@ -691,6 +555,102 @@ def record_manual_operations(transaction: dict, mode: str, status: str) -> None:
         )
 
 
+def reconcile_operation(value: dict[str, Any]) -> bool:
+    """按依赖层事务、清单与修复状态更新依赖相关操作的记录
+
+    参数:
+        value: 操作记录
+
+    返回:
+        bool: 记录状态已由依赖层确定
+    """
+    if value.get("store_key") == "dependencies:manual":
+        receipt = (
+            load_manifest()
+            .get("declaration_receipts", {})
+            .get(value.get("operation_id"))
+        )
+        if isinstance(receipt, dict):
+            value.update(
+                status="completed", apply_mode="applied", result=deepcopy(receipt)
+            )
+            return True
+    if value.get("store_key") == "dependencies:repair":
+        from .storage import dependency_sync_status
+
+        sync = dependency_sync_status()
+        if sync.get("operation_id") == value.get("operation_id"):
+            state = sync.get("status")
+            mode, status = "verifying", "running"
+            if state == "prepared":
+                mode, status = "restart_pending", "pending"
+            elif state == "canceled":
+                mode, status = "rolled_back", "canceled"
+            elif state == "failed":
+                mode, status = "failed", "failed"
+            elif state == "succeeded":
+                from zhenxun.services.startup import startup_coordinator
+
+                if startup_coordinator.runtime_ready:
+                    mode, status = "applied", "completed"
+            value["status"], value["apply_mode"] = status, mode
+            value.setdefault("result", {}).update(status=status, apply_mode=mode)
+            if sync.get("code"):
+                value["result"]["reason"] = sync["code"]
+            return True
+    transaction = pending_transaction() or {}
+    if not any(
+        item.get("operation_id") == value.get("operation_id")
+        for item in transaction.get("operations", [])
+    ):
+        from .storage import settled_transactions
+
+        transaction = next(
+            (
+                record
+                for record in settled_transactions()
+                if any(
+                    item.get("operation_id") == value.get("operation_id")
+                    for item in record.get("operations", [])
+                )
+            ),
+            {},
+        )
+    if any(
+        item.get("operation_id") == value.get("operation_id")
+        for item in transaction.get("operations", [])
+    ):
+        state = transaction.get("state")
+        mode, status = {
+            "pending_restart": ("restart_pending", "pending"),
+            "migration_blocked": ("restart_pending", "pending"),
+            "building": ("preparing", "running"),
+            "verification_pending": ("verifying", "running"),
+            "recovery_required": ("recovery_required", "recovery_required"),
+            "failed": (
+                "rolled_back" if transaction.get("rollback_confirmed") else "failed",
+                "failed",
+            ),
+            "committed": ("applied", "completed"),
+            "cleanup_pending": ("applied", "completed"),
+        }.get(state, (value.get("apply_mode"), value.get("status")))
+        value["status"], value["apply_mode"] = status, mode
+        value.setdefault("result", {}).update(status=status, apply_mode=mode)
+        value["result"]["transaction_state"] = state
+        if state == "migration_blocked":
+            value["result"].update(
+                reason="external_database_manual_migration_required",
+                restart_available=False,
+            )
+        if transaction.get("cleanup_error"):
+            value["result"]["cleanup_error"] = transaction["cleanup_error"]
+        else:
+            value["result"].pop("cleanup_error", None)
+        if state != "building":
+            return True
+    return False
+
+
 def apply_pending_transaction() -> bool:
     """Build a queued layer after the launcher has stopped the old worker."""
     transaction = pending_transaction()
@@ -706,10 +666,8 @@ def apply_pending_transaction() -> bool:
     }:
         return False
     try:
-        # Check even when reusing a generation, before any migration execution.
-        with archive_dependency_policy(transaction):
-            transaction["state"] = "building"
-            write_json(PENDING_FILE, transaction)
+        transaction["state"] = "building"
+        write_json(PENDING_FILE, transaction)
         build = _staged_build(transaction) or build_generation(transaction)
         if transaction.get("database_migration_possible"):
             transaction["generation"] = int(build["generation"])
@@ -718,8 +676,9 @@ def apply_pending_transaction() -> bool:
                 build.get("native_extensions") or []
             )
             write_json(PENDING_FILE, transaction)
-            migration_result = _run_orm_migration("apply")
+            migration_result, diagnostic = _run_orm_migration("apply")
             if migration_result:
+                transaction["error"] = diagnostic
                 transaction["state"] = (
                     "migration_blocked"
                     if migration_result == 3
@@ -786,7 +745,7 @@ def load_managed_plugins() -> dict[str, Any]:
         try:
             snapshot = capture_environment(manifest=manifest)
             status["loaded_mismatches"] = snapshot.loaded_mismatches
-            status["environment_snapshot"] = snapshot.digest
+            status["environment_versions"] = snapshot.versions
         except DependencyAnalysisError as error:
             status["environment_error"] = {"code": error.code, "details": error.details}
     write_json(STARTUP_STATUS_FILE, status)
@@ -898,7 +857,7 @@ def startup_verification() -> tuple[bool, dict[str, Any]]:
         valid = (
             valid
             and check["state"] != "failed"
-            and status.get("environment_snapshot") == snapshot.digest
+            and status.get("environment_versions") == snapshot.versions
             and not status.get("loaded_mismatches")
             and not status.get("environment_error")
         )
@@ -915,15 +874,11 @@ def startup_verification() -> tuple[bool, dict[str, Any]]:
 
 
 def finalize_pending_transaction() -> None:
-    """Commit verification independently of retryable backup/journal cleanup."""
+    """确认依赖层事务验证通过并归档；清理失败只记录，遗留文件由下一次事务结束时清理"""
     transaction = pending_transaction() or {}
     manifest = load_manifest()
     manifest["pending_verification"] = False
     manifest["previous_generation"] = None
-    for plugin in manifest.get("plugins", {}).values():
-        for item in plugin.get("compatibility_overrides", []):
-            if item.get("evidence"):
-                item["verification"] = "startup_verified"
     if transaction.get("revision"):
         manifest["verified_transaction_revision"] = transaction["revision"]
     save_manifest(manifest)
@@ -939,11 +894,6 @@ def finalize_pending_transaction() -> None:
             retained.add(active)
         prune_generations(retained)
         ROLLBACK_FILE.unlink(missing_ok=True)
-        from .cleanup import archive_settled
-
-        transaction["cleanup_state"] = "completed"
-        write_json(PENDING_FILE, transaction)
-        archive_settled()
     except Exception as error:
         transaction.update(
             state="cleanup_pending",
@@ -954,11 +904,10 @@ def finalize_pending_transaction() -> None:
         )
         with contextlib.suppress(OSError):
             write_json(PENDING_FILE, transaction)
-        from .cleanup import archive_settled
+    from .storage import archive_settled
 
-        with contextlib.suppress(Exception):
-            archive_settled()
-        return
+    with contextlib.suppress(Exception):
+        archive_settled()
 
 
 def rollback_pending_transaction() -> None:
@@ -974,7 +923,7 @@ def rollback_pending_transaction() -> None:
         write_json(PENDING_FILE, transaction)
         record_manual_operations(transaction, "recovery_required", "recovery_required")
         raise LayerBuildError("dependency_rollback_receipt_missing")
-    if not transaction.get("rollback_confirmed") and _run_orm_migration("restore"):
+    if not transaction.get("rollback_confirmed") and _run_orm_migration("restore")[0]:
         transaction.update(
             state="recovery_required", error_code="database_migration_rollback_failed"
         )
@@ -1019,10 +968,9 @@ def rollback_pending_transaction() -> None:
             remove_generation(failed_generation)
         prune_generations({restored} if isinstance(restored, int) else set())
         ROLLBACK_FILE.unlink(missing_ok=True)
-        if transaction.get("cleanup_error"):
-            transaction.pop("cleanup_error", None)
-        transaction["cleanup_state"] = "completed"
-        write_json(PENDING_FILE, transaction)
+        remove_orm_backups()
+        if transaction.pop("cleanup_error", None):
+            write_json(PENDING_FILE, transaction)
     except OSError as error:
         transaction["cleanup_error"] = {
             "code": "dependency_rollback_cleanup_pending",

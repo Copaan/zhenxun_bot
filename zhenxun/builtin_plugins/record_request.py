@@ -9,7 +9,6 @@ from nonebot.adapters.onebot.v11 import (
     GroupRequestEvent,
 )
 from nonebot.adapters.onebot.v11 import Bot as v11Bot
-from nonebot.adapters.onebot.v12 import Bot as v12Bot
 from nonebot.plugin import PluginMetadata
 from nonebot_plugin_session import EventSession
 
@@ -126,7 +125,7 @@ async def _build_permanent_ban_tip(
 
 
 @friend_req.handle()
-async def _(bot: v12Bot | v11Bot, event: FriendRequestEvent, session: EventSession):
+async def _(bot: v11Bot, event: FriendRequestEvent, session: EventSession):
     logger.debug("收录好友请求...", "好友请求", target=event.user_id)
     user = await bot.get_stranger_info(user_id=event.user_id)
     nickname = user["nickname"]
@@ -191,7 +190,7 @@ async def _(bot: v12Bot | v11Bot, event: FriendRequestEvent, session: EventSessi
 
 
 @group_req.handle()
-async def _(bot: v12Bot | v11Bot, event: GroupRequestEvent, session: EventSession):
+async def _(bot: v11Bot, event: GroupRequestEvent, session: EventSession):
     # sourcery skip: low-code-quality
     if event.sub_type != "invite":
         return

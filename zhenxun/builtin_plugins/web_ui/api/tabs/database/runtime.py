@@ -24,9 +24,8 @@ from zhenxun.services.cache.runtime_cache import (
     health_snapshot,
     refresh_all_runtime_caches,
 )
-from zhenxun.services.runtime_environment import runtime_environment_manager
+from zhenxun.services.runtime_config import runtime_environment_manager
 from zhenxun.utils._restart_utils import issue_restart_ticket
-from zhenxun.utils.pydantic_compat import model_copy
 
 from ....apply_result import (
     apply_result_data,
@@ -136,15 +135,14 @@ def _database_public(config: DatabaseConfig) -> dict:
     if config.mode == "sqlite":
         return {"mode": "sqlite", "path": config.path}
     if config.mode == "url":
-        return {"mode": "url", "url": "", "has_saved_url": bool(config.url)}
+        return {"mode": "url", "url": config.url}
     return {
         "mode": config.mode,
         "host": config.host,
         "port": config.port,
         "username": config.username,
         "database": config.database,
-        "password": "",
-        "has_password": bool(config.password),
+        "password": config.password,
     }
 
 
@@ -153,8 +151,7 @@ def _cache_public(config: CacheConfig) -> dict:
         "mode": config.mode,
         "host": config.host,
         "port": config.port,
-        "password": "",
-        "has_password": bool(config.password),
+        "password": config.password,
     }
 
 
@@ -243,21 +240,6 @@ def _runtime_health() -> dict:
     }
 
 
-def _merge_saved_passwords(
-    database: DatabaseConfig,
-    cache: CacheConfig,
-    current_database: DatabaseConfig,
-    current_cache: CacheConfig,
-) -> tuple[DatabaseConfig, CacheConfig]:
-    if not database.password and database.mode == current_database.mode:
-        database = model_copy(database, update={"password": current_database.password})
-    if not cache.password and cache.mode == "REDIS" and current_cache.mode == "REDIS":
-        cache = model_copy(cache, update={"password": current_cache.password})
-    if database.mode == "url" and not database.url and current_database.mode == "url":
-        database = model_copy(database, update={"url": current_database.url})
-    return database, cache
-
-
 @router.get(
     "/runtime",
     dependencies=[authentication()],
@@ -306,13 +288,8 @@ async def database_probe(payload: RuntimeProbeRequest | None = None) -> Result:
         )
         return Result.ok({"database": database_result, "cache": cache_result})
     values = _env_values()
-    current_database = _current_database(values)
-    current_cache = _current_cache(values)
-    database = payload.database or current_database
-    cache = payload.cache or current_cache
-    database, cache = _merge_saved_passwords(
-        database, cache, current_database, current_cache
-    )
+    database = payload.database or _current_database(values)
+    cache = payload.cache or _current_cache(values)
     database_result, cache_result = await asyncio.gather(
         probe_database(database), probe_cache(cache)
     )
@@ -336,13 +313,7 @@ async def update_database_configuration(
         raise HTTPException(
             status_code=409, detail="环境配置已被外部修改，请重新加载。"
         )
-    values = _env_values()
-    database, cache = _merge_saved_passwords(
-        payload.database,
-        payload.cache,
-        _current_database(values),
-        _current_cache(values),
-    )
+    database, cache = payload.database, payload.cache
     database_result, cache_result = await asyncio.gather(
         probe_database(database), probe_cache(cache)
     )
@@ -410,11 +381,9 @@ async def update_database_configuration(
         info=(
             "数据服务配置已保存，需要重启后生效。"
             if restart_required
-            else (
-                "缓存服务已重新连接并立即生效。"
-                if apply_mode in {"config_reloaded", "hot_reloaded"}
-                else "数据服务配置没有需要应用的运行时变化。"
-            )
+            else "数据服务配置没有变化。"
+            if apply_mode == "no_change"
+            else "数据服务配置已保存并生效。"
         ),
     )
 

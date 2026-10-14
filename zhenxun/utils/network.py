@@ -35,22 +35,6 @@ def _is_private_ipv4(address: ipaddress.IPv4Address) -> bool:
     return any(address in network for network in _IPV4_PRIVATE_NETWORKS)
 
 
-def is_private_client(host: str | None) -> bool:
-    """Return whether a client address belongs to the WebUI access boundary."""
-    if not host:
-        return False
-    normalized = host.split("%", 1)[0]
-    try:
-        address = ipaddress.ip_address(normalized)
-    except ValueError:
-        return normalized.casefold() == "localhost"
-    if address.is_loopback or address.is_link_local:
-        return True
-    if isinstance(address, ipaddress.IPv4Address):
-        return _is_private_ipv4(address)
-    return address in _IPV6_PRIVATE_NETWORK
-
-
 def private_ipv4_addresses() -> list[str]:
     """List active RFC1918 addresses without exposing wildcard or link-local IPs."""
     stats = psutil.net_if_stats()
@@ -153,14 +137,13 @@ def emit_webui_console_banner(
     safe_username = " ".join(str(username or "").split())
     lines = ["", "WebUI 已启动"]
     if state == "configured":
-        lines.append("  临时管理：请打开下面带 code 的连接链接")
+        lines.append("  临时管理：打开下面带连接码的链接即可直接登录")
     else:
-        lines.append("  首次配置：必须打开下面带 code 的连接链接")
+        lines.append("  首次配置：必须打开下面带连接码的链接")
     for item in display_urls:
         label = "本机" if item.label == "Local" else "局域网"
         lines.append(
-            f"  -> {label}连接链接（含 code）: "
-            f"{item.url}/#/connect?code={connection_code}"
+            f"  -> {label}连接链接: {item.url}/#/connect?code={connection_code}"
         )
     preferred_login = next(
         (item.url for item in display_urls if item.label == "Network"),
@@ -170,13 +153,15 @@ def emit_webui_console_banner(
     lines.append(f"  -> {login_label}: {preferred_login}")
     if state == "configured":
         lines.append(f"  -> 管理员账号: {safe_username or '已配置'}")
-        lines.append("  -> 提示: 带 code 的链接可在本次启动中临时登录")
+        lines.append("  -> 提示: 连接链接无需输入账号密码，忘记密码时也可用它登录")
     else:
-        lines.append("  -> 提示: 不带 code 的普通地址不能领取首次配置会话")
+        lines.append("  -> 提示: 普通地址不带连接码，无法进行首次配置")
     normalized_host = bind_host.strip().strip("[]")
     has_network = any(item.label == "Network" for item in display_urls)
-    if normalized_host in {"0.0.0.0", "::"} and not has_network:
-        lines.append("  -> 网络: 未检测到可用的私网网卡地址，仅显示本机链接")
+    if normalized_host in {"0.0.0.0", "::"}:
+        if not has_network:
+            lines.append("  -> 网络: 未检测到私网网卡地址，仅显示本机链接")
+        lines.append("  -> 公网: 使用服务器公网 IP 或域名访问，需放通端口")
     elif normalized_host in {"127.0.0.1", "::1", "localhost"}:
         lines.append("  -> 网络: 当前仅监听本机，局域网设备无法访问")
     lines.append("  -> 安全提示: 连接链接仅对本次启动有效，请勿分享")
@@ -191,7 +176,6 @@ __all__ = [
     "emit_webui_console_banner",
     "format_access_url_banner",
     "internal_connect_host",
-    "is_private_client",
     "local_access_urls",
     "private_ipv4_addresses",
     "private_ipv6_addresses",

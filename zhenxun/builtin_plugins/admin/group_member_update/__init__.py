@@ -16,7 +16,7 @@ from nonebot_plugin_uninfo import Scene, SceneType, get_interface
 from zhenxun.configs.config import BotConfig
 from zhenxun.configs.utils import PluginExtraData
 from zhenxun.services.log import logger
-from zhenxun.services.message_load import should_pause_tasks
+from zhenxun.services.message_load import should_pause_db_tasks
 from zhenxun.services.tags import tag_manager
 from zhenxun.utils.enum import PluginType
 from zhenxun.utils.message import MessageUtils
@@ -192,7 +192,7 @@ async def _(bot: Bot, event: GroupIncreaseNoticeEvent):
     coalesce=True,
 )
 async def _nightly_full_refresh():
-    if should_pause_tasks():
+    if should_pause_db_tasks():
         return
     now = time.time()
     bots = nonebot.get_bots()

@@ -25,8 +25,10 @@ from .model import (
 router = APIRouter(prefix="/plugin-policy")
 
 
-def _saved(result: dict, label: str):
-    suffix = "已保存，缓存发布待核验" if result.get("publication_pending") else "已保存"
+def _saved(result: dict, label: str, action: str = "已保存"):
+    suffix = (
+        f"{action}，缓存发布待核验" if result.get("publication_pending") else action
+    )
     return Result.ok(result, label + suffix)
 
 
@@ -191,19 +193,6 @@ async def get_policies() -> Result[list[dict]]:
     return Result.ok(await plugin_policy_service.list_policies())
 
 
-@router.get(
-    "/policies/{policy_id}",
-    dependencies=[authentication()],
-    response_model=Result[dict],
-    response_class=JSONResponse,
-)
-async def get_policy(policy_id: int) -> Result[dict]:
-    try:
-        return Result.ok(await plugin_policy_service.get_policy(policy_id))
-    except PluginPolicyError as error:
-        _raise_api_error(error)
-
-
 @router.post(
     "/policies",
     dependencies=[authentication()],
@@ -222,7 +211,7 @@ async def create_policy(payload: PolicyCreate) -> Result[dict]:
             bind_bot_ids=payload.bind_bot_ids,
             expected_revisions=payload.expected_revisions,
         )
-        return Result.ok(result, "插件策略已创建")
+        return _saved(result, "插件策略", "已创建")
     except (PluginPolicyError, RuntimeMutationBusyError) as error:
         _raise_api_error(error)
 
@@ -297,7 +286,7 @@ async def copy_account(payload: PolicyCopy) -> Result[dict]:
             target_bot_ids=payload.target_bot_ids,
             expected_revisions=payload.expected_revisions,
         )
-        return Result.ok(result, "账号设置已复制")
+        return _saved(result, "账号设置", "已复制")
     except (PluginPolicyError, RuntimeMutationBusyError) as error:
         _raise_api_error(error)
 
@@ -311,178 +300,18 @@ async def policy_migration_preview():
 
 @router.get("/export", dependencies=[authentication()])
 async def export_policy_configuration():
-    from zhenxun.models.bot_group_policy import BotGroupPluginPolicy
-    from zhenxun.services.bot_group_policy import bot_group_policy_service, group_key
+    from zhenxun.services.bot_group_policy import bot_group_policy_service
 
-    scopes = []
-    for row in await BotGroupPluginPolicy.all().order_by(
-        "bot_id", "platform_scope", "group_id", "channel_id"
-    ):
-        _, state = await bot_group_policy_service._state(
-            group_key(row.bot_id, row.platform_scope, row.group_id, row.channel_id)
-        )
-        state["expected_revision"] = state.pop("revision")
-        scopes.append(state)
-    accounts = []
-    for account in await plugin_policy_service.list_accounts():
-        state = await plugin_policy_service.get_account(account["bot_id"])
-        state["expected_revision"] = state.pop("revision")
-        accounts.append(state)
-    policies = await plugin_policy_service.list_policies()
-    for policy in policies:
-        policy["expected_revision"] = policy.pop("revision")
-    global_policy = await plugin_policy_service.global_state()
-    global_policy["expected_revision"] = global_policy.pop("revision")
-    global_tasks = await plugin_policy_service.global_state(task=True)
-    global_tasks["expected_revision"] = global_tasks.pop("revision")
-    return Result.ok(
-        {
-            "version": 1,
-            "scopes": scopes,
-            "accounts": accounts,
-            "policies": policies,
-            "global_policy": global_policy,
-            "global_tasks": global_tasks,
-            "authority": "database",
-        }
-    )
+    return Result.ok(await bot_group_policy_service.export_document())
 
 
 @router.post("/import", dependencies=[authentication()])
 async def import_policy_configuration(payload: PolicyDocument):
-    from tortoise.transactions import in_transaction
+    from zhenxun.services.bot_group_policy import bot_group_policy_service
 
-    from zhenxun.models.bot_console import BotConsole
-    from zhenxun.models.plugin_info import PluginInfo
-    from zhenxun.models.plugin_policy import PluginPolicy
-    from zhenxun.models.task_info import TaskInfo
-    from zhenxun.services.bot_group_policy import bot_group_policy_service, group_key
-    from zhenxun.services.runtime_mutation import runtime_mutation_coordinator
-
-    scopes = sorted(
-        payload.scopes,
-        key=lambda row: (row.bot_id, row.platform_scope, row.group_id, row.channel_id),
-    )
-    keys = [
-        group_key(row.bot_id, row.platform_scope, row.group_id, row.channel_id)
-        for row in scopes
-    ]
-    if len(set(keys)) != len(keys):
-        raise HTTPException(422, detail="策略作用域重复")
     try:
-        async with runtime_mutation_coordinator.operation("plugin_policy_import"):
-            async with in_transaction() as connection:
-                await (
-                    PluginPolicy.all()
-                    .using_db(connection)
-                    .select_for_update()
-                    .order_by("id")
-                )
-                await (
-                    BotConsole.all()
-                    .using_db(connection)
-                    .select_for_update()
-                    .order_by("id")
-                )
-                if len({row.bot_id for row in payload.accounts}) != len(
-                    payload.accounts
-                ) or len({row.id for row in payload.policies}) != len(payload.policies):
-                    raise PluginPolicyError("重复的账号或模板")
-                for row in payload.accounts:
-                    current = await plugin_policy_service.get_account(row.bot_id)
-                    plugin_policy_service._check_revision(
-                        row.expected_revision, current["revision"]
-                    )
-                if payload.global_policy:
-                    await (
-                        PluginInfo.all()
-                        .using_db(connection)
-                        .select_for_update()
-                        .order_by("id")
-                    )
-                    global_state = await plugin_policy_service.global_state()
-                    plugin_policy_service._check_revision(
-                        payload.global_policy.expected_revision,
-                        global_state["revision"],
-                    )
-                    for module, values in sorted(payload.global_policy.plugins.items()):
-                        await plugin_policy_service.set_global_settings(
-                            module,
-                            default_status=values.default_status,
-                            block_type=values.block_type
-                            or (None if values.status else "ALL"),
-                        )
-                if payload.global_tasks:
-                    await (
-                        TaskInfo.all()
-                        .using_db(connection)
-                        .select_for_update()
-                        .order_by("id")
-                    )
-                    task_state = await plugin_policy_service.global_state(task=True)
-                    plugin_policy_service._check_revision(
-                        payload.global_tasks.expected_revision, task_state["revision"]
-                    )
-                    for module, values in sorted(payload.global_tasks.tasks.items()):
-                        await plugin_policy_service.set_global(
-                            module, values.status, task=True
-                        )
-                        await plugin_policy_service.set_global(
-                            module, values.default_status, task=True, default=True
-                        )
-                for row in sorted(payload.policies, key=lambda item: item.id):
-                    await plugin_policy_service.update_policy(
-                        row.id,
-                        expected_revision=row.expected_revision,
-                        name=row.name,
-                        description=row.description,
-                        block_plugins=row.block_plugins,
-                        block_tasks=row.block_tasks,
-                    )
-                for row in sorted(payload.accounts, key=lambda item: item.bot_id):
-                    current = await plugin_policy_service.get_account(row.bot_id)
-                    if row.policy_id is not None:
-                        await plugin_policy_service.bind_accounts(
-                            policy_id=row.policy_id,
-                            bot_ids=[row.bot_id],
-                            expected_revisions={row.bot_id: current["revision"]},
-                        )
-                    else:
-                        await plugin_policy_service.update_account(
-                            row.bot_id,
-                            expected_revision=current["revision"],
-                            block_plugins=row.block_plugins,
-                            block_tasks=row.block_tasks,
-                        )
-                for row in scopes:
-                    if row.platform_scope == "private":
-                        if (
-                            row.group_id != bot_group_policy_service.PRIVATE_KEY
-                            or row.channel_id
-                        ):
-                            raise PluginPolicyError("私聊策略范围无效")
-                    else:
-                        await bot_group_policy_service.get_group(
-                            row.bot_id, row.platform_scope, row.group_id, row.channel_id
-                        )
-                    key = group_key(
-                        await plugin_policy_service._resolve_bot_id(row.bot_id),
-                        row.platform_scope,
-                        row.group_id,
-                        row.channel_id,
-                    )
-                    await bot_group_policy_service._write(
-                        key,
-                        lambda state, item=row: {
-                            **state,
-                            "block_plugins": item.block_plugins,
-                            "block_tasks": item.block_tasks,
-                            "forced_plugins": item.forced_plugins,
-                            "forced_tasks": item.forced_tasks,
-                        },
-                        row.expected_revision,
-                    )
-        return Result.ok({"applied": len(scopes), "source": "database"})
+        applied = await bot_group_policy_service.import_document(payload)
+        return Result.ok({"applied": applied, "source": "database"})
     except (PluginPolicyError, RuntimeMutationBusyError) as error:
         _raise_api_error(error)
 

@@ -1,13 +1,10 @@
 import asyncio
+from collections.abc import Callable
 from contextlib import AsyncExitStack, suppress
-from contextvars import ContextVar
-from functools import wraps
 import importlib
 import re
 import sys
-import time
 from typing import Any
-from urllib.parse import urlparse
 
 import anyio
 from exceptiongroup import catch
@@ -22,16 +19,8 @@ from nonebot.rule import TrieRule
 from nonebot.utils import escape_tag
 
 from zhenxun.adapters.qq_official.context import with_official_event_context
-from zhenxun.configs.config import BotConfig
 from zhenxun.configs.utils import PluginExtraData
 from zhenxun.services.log import logger
-from zhenxun.services.message_load import signal_overload
-from zhenxun.services.message_resources import (
-    ResourceLanes,
-    combined_lease,
-    matcher_resource_lane,
-    resource_lanes,
-)
 
 from .auth.config import LOGGER_COMMAND
 from .auth.context import (
@@ -48,71 +37,13 @@ from .auth_activation import (
     text_match_candidates,
 )
 
-_dispatch_lease: ContextVar = ContextVar("dispatch_lease", default=None)
-_waiter_bridge: tuple | None = None
-
-
-def _install_waiter_bridge() -> None:
-    """让 nonebot_plugin_waiter 等待用户输入期间释放 matcher 占用的分发通道"""
-    global _waiter_bridge
-    module = sys.modules.get("nonebot_plugin_waiter")
-    if module is None or _waiter_bridge is not None:
-        return
-    original = module.Waiter.wait
-
-    @wraps(original)
-    async def wait(waiter, *args, **kwargs):
-        lease = _dispatch_lease.get()
-        if lease is None:
-            return await original(waiter, *args, **kwargs)
-        lease()
-        result = await original(waiter, *args, **kwargs)
-        await lease.reacquire()
-        return result
-
-    module.Waiter.wait = wait
-    _waiter_bridge = module.Waiter, original, wait
-
-
-def _uninstall_waiter_bridge() -> None:
-    """恢复 nonebot_plugin_waiter 原始的等待方法"""
-    global _waiter_bridge
-    if _waiter_bridge is None:
-        return
-    cls, original, wrapper = _waiter_bridge
-    if cls.wait is wrapper:
-        cls.wait = original
-    _waiter_bridge = None
-
-
-def _passive_db_limit() -> int:
-    scheme = urlparse(BotConfig.db_url or "").scheme.lower()
-    if scheme == "sqlite":
-        return 1
-    if scheme.startswith("postgres"):
-        return 6
-    return 4 if scheme == "mysql" else 2
-
-
-# 各分发通道同时执行的 matcher 上限
-DISPATCH_LANE_LIMITS: dict[str, int] = {
-    "command_exact": 96,
-    "command_shortcut": 32,
-    "command_regex": 8,
-    "system": 64,
-    "passive_light": 12,
-    "passive_db": _passive_db_limit(),
-    "passive_http": 4,
-    "passive_ai": 2,
-    "passive_render": 2,
-}
-# 单个优先级选中 matcher 数超过该值时视为过载
-OVERLOAD_SELECTED_THRESHOLD = 48
-# 通道等待超过该毫秒数时视为过载
-OVERLOAD_LANE_WAIT_MS = 200.0
-
-_DISPATCH_LANES = ResourceLanes(DISPATCH_LANE_LIMITS)
 _HANDLER_ACTIVATION_INDEX = HandlerActivationIndex()
+_active_matchers = 0
+# 同时处理的普通消息上限，限制积压时每轮事件循环的工作量
+EVENT_ADMISSION_LIMIT = 64
+# 普通消息占用名额的最长秒数，超时后让出，等待 I/O 的处理不阻塞后续消息
+EVENT_ADMISSION_SECONDS = 1.0
+_event_admission: tuple[asyncio.AbstractEventLoop, asyncio.Semaphore] | None = None
 
 _ROUTE_INDEX_LOCK = asyncio.Lock()
 _ROUTE_INDEX_READY = False
@@ -120,12 +51,6 @@ _ROUTE_COMMAND_MAP: dict[str, set[str]] = {}
 _ROUTE_PREFIX_MAP: dict[str, set[str]] = {}
 
 _LEADING_PLACEHOLDER_PATTERN = re.compile(r"^(?:\s*(?:\[[^\]]*]|\<[^>]*>))+\s*")
-_PATCHED_MODULES = (
-    "nonebot.adapters.onebot.v11.bot",
-    "nonebot.adapters.onebot.v12.bot",
-    "nonebot.adapters.qq.bot",
-    "onebug.mixin.process",
-)
 _original_handle_events: dict[Any, Any] = {}
 
 
@@ -430,7 +355,7 @@ def _is_account_binding_command(event: Event, bot: Bot) -> bool:
     返回:
         bool: 是否为账号绑定指令
     """
-    from zhenxun.services.account_binding_routing import (
+    from zhenxun.services.account_binding import (
         bare_binding_code,
         binding_command,
     )
@@ -451,12 +376,12 @@ def _is_chatinter_matcher(matcher: type[Matcher]) -> bool:
 
 
 def has_active_dispatch() -> bool:
-    """是否有 matcher 正在分发通道中执行
+    """是否有 matcher 正在执行
 
     返回:
         bool: 是否有正在执行的 matcher
     """
-    return _DISPATCH_LANES.busy()
+    return _active_matchers > 0
 
 
 def _select_matchers(
@@ -477,9 +402,6 @@ def _select_matchers(
             logger.warning(
                 "matcher 预筛失败，当前优先级按适配器筛选", LOGGER_COMMAND, e=exc
             )
-        else:
-            if len(selected) > OVERLOAD_SELECTED_THRESHOLD:
-                signal_overload(3.0)
     if selected is None:
         selected = [
             matcher
@@ -502,7 +424,7 @@ async def _dispatch_priority(
     dependency_cache: dict,
     on_stop,
 ) -> None:
-    """按通道限流并发执行同一优先级选中的 matcher
+    """并发执行同一优先级选中的 matcher
 
     参数:
         selected: 选中的 matcher
@@ -513,18 +435,17 @@ async def _dispatch_priority(
         dependency_cache: 依赖缓存
         on_stop: 阻断事件传播时的回调
     """
-    groups: dict[tuple[str, str], list[type[Matcher]]] = {}
-    for matcher in selected:
-        descriptor = _HANDLER_ACTIVATION_INDEX.descriptor_for(matcher)
-        lane = descriptor.lane if descriptor is not None else "system"
-        groups.setdefault((lane, matcher_resource_lane(matcher)), []).append(matcher)
-    leases = set()
 
-    async def run(matcher: type[Matcher], lane: str, release) -> None:
-        _install_waiter_bridge()
+    async def run(matcher: type[Matcher]) -> None:
+        global _active_matchers
+        descriptor = _HANDLER_ACTIVATION_INDEX.descriptor_for(matcher)
         matcher_state = state.copy()
-        matcher_state["_zx_dispatch_lane"] = lane
-        token = _dispatch_lease.set(release)
+        matcher_state["_zx_passive_matcher"] = (
+            descriptor is not None
+            and not descriptor.temp
+            and not descriptor.command_like
+        )
+        _active_matchers += 1
         try:
             # 异常在子任务内处理，避免一个 matcher 失败取消同级 matcher
             with catch(
@@ -539,38 +460,49 @@ async def _dispatch_priority(
                     matcher, bot, event, matcher_state, stack, dependency_cache
                 )
         finally:
-            _dispatch_lease.reset(token)
-            release()
-            leases.discard(release)
+            _active_matchers -= 1
 
-    async def admit(tg, lane: str, resource: str, matchers: list[type[Matcher]]):
-        # 每个通道一个排队者，数据库通道饱和不会阻塞其他通道
-        for matcher in matchers:
-            started = time.perf_counter()
-            resource_release = await resource_lanes.acquire(resource)
-            try:
-                lane_release = await _DISPATCH_LANES.acquire(lane)
-            except BaseException:
-                resource_release()
-                raise
-            if (time.perf_counter() - started) * 1000 >= OVERLOAD_LANE_WAIT_MS:
-                signal_overload(2.0)
-            release = combined_lease(resource_release, lane_release)
-            leases.add(release)
-            tg.start_soon(run, matcher, lane, release)
+    async with anyio.create_task_group() as tg:
+        for matcher in selected:
+            tg.start_soon(run, matcher)
 
-    try:
-        async with anyio.create_task_group() as tg:
-            for (lane, resource), matchers in groups.items():
-                tg.start_soon(admit, tg, lane, resource, matchers)
-    finally:
-        for release in list(leases):
-            release()
+
+async def _admit_event(event: Event) -> Callable[[], None]:
+    """普通消息占用处理名额，命令消息与非消息事件不占用
+
+    名额在处理结束或占用满 EVENT_ADMISSION_SECONDS 秒时释放。
+
+    参数:
+        event: Event
+
+    返回:
+        Callable[[], None]: 释放名额，可重复调用
+    """
+    global _event_admission
+    if event.get_type() != "message" or await get_route_context(
+        _event_plain_text(event), None
+    ):
+        return lambda: None
+    loop = asyncio.get_running_loop()
+    if _event_admission is None or _event_admission[0] is not loop:
+        _event_admission = (loop, asyncio.Semaphore(EVENT_ADMISSION_LIMIT))
+    gate = _event_admission[1]
+    await gate.acquire()
+    released = False
+
+    def release() -> None:
+        nonlocal released
+        if not released:
+            released = True
+            gate.release()
+
+    loop.call_later(EVENT_ADMISSION_SECONDS, release)
+    return release
 
 
 @with_official_event_context
 async def handle_event(bot: Bot, event: Event) -> None:
-    """处理事件：按命令文本预筛 matcher，再按通道限流执行
+    """处理事件：普通消息限时占用处理名额，按命令文本预筛 matcher，再按优先级并发执行
 
     参数:
         bot: Bot
@@ -589,7 +521,9 @@ async def handle_event(bot: Bot, event: Event) -> None:
 
     state: dict[Any, Any] = {}
     dependency_cache = {}
+    release = await _admit_event(event)
     async with AsyncExitStack() as stack:
+        stack.callback(release)
         if not await nb_message._apply_event_preprocessors(
             bot=bot,
             event=event,
@@ -662,14 +596,13 @@ async def install_dispatch() -> None:
     await ensure_route_index()
     if _original_handle_events:
         return
-    _original_handle_events[nb_message] = nb_message.handle_event
-    nb_message.handle_event = handle_event
-    for name in _PATCHED_MODULES:
-        with suppress(Exception):
-            module = importlib.import_module(name)
-            if hasattr(module, "handle_event"):
-                _original_handle_events[module] = module.handle_event
-                setattr(module, "handle_event", handle_event)
+    original = nb_message.handle_event
+    # 适配器以 `from nonebot.message import handle_event` 引用分发入口
+    for module in list(sys.modules.values()):
+        namespace = getattr(module, "__dict__", None)
+        if isinstance(namespace, dict) and namespace.get("handle_event") is original:
+            _original_handle_events[module] = original
+            setattr(module, "handle_event", handle_event)
 
 
 def uninstall_dispatch() -> None:
@@ -677,4 +610,3 @@ def uninstall_dispatch() -> None:
     for module, original in _original_handle_events.items():
         setattr(module, "handle_event", original)
     _original_handle_events.clear()
-    _uninstall_waiter_bridge()

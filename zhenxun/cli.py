@@ -2,7 +2,6 @@
 
 用法:
     zx run          启动 launcher
-    zx run --webui-dev [--webui-source PATH]  在原入口使用前端开发热更新
     zx run-worker   启动 worker（由 launcher 调用）
     zx version      显示版本信息
 
@@ -56,65 +55,22 @@ def _run_ingress(args: list[str]) -> None:
     )
 
 
-def _run_http_sidecar(args: list[str]) -> None:
-    if len(args) != 6 or os.environ.get("ZHENXUN_HTTP_SIDECAR_CHILD") != "1":
-        raise RuntimeError("run-http-sidecar 参数无效；该命令只能由 zx launcher 调用")
-    from zhenxun.services.webui_http_sidecar import (
-        HttpSidecarSettings,
-        run_http_sidecar,
-    )
-
-    settings = HttpSidecarSettings(
-        mode=args[0],
-        listen_host=args[1],
-        listen_port=int(args[2]),
-        upstream_host=args[3],
-        upstream_port=int(args[4]),
-        certificate_sha256=args[5],
-    )
-    try:
-        run_http_sidecar(settings)
-    except (OSError, RuntimeError, ValueError):
-        raise SystemExit(2) from None
-
-
 def main() -> None:
     args = sys.argv[1:]
 
     if not args or args[0] == "run":
-        import argparse
-
         from zhenxun.services.launcher.lease import InstanceLease, LeaseError
         from zhenxun.services.launcher.main import run_launcher
         from zhenxun.services.startup_banner import show_startup_banner
 
         project = _ensure_project_root()
-        parser = argparse.ArgumentParser(prog="zx run")
-        parser.add_argument(
-            "--webui-dev",
-            action="store_true",
-            help="Serve live WebUI source through the Bot address",
-        )
-        parser.add_argument(
-            "--webui-source",
-            type=Path,
-            help="WebUI source directory (default: sibling zhenxun_bot_webui)",
-        )
-        options = parser.parse_args(args[1:] if args else [])
-        if options.webui_source and not options.webui_dev:
-            parser.error("--webui-source requires --webui-dev")
-        webui_dev_source = (
-            (options.webui_source or project.parent / "zhenxun_bot_webui").resolve()
-            if options.webui_dev
-            else None
-        )
         show_startup_banner()
         try:
             with InstanceLease(project, role="launcher") as lease:
                 previous = os.environ.get("ZHENXUN_INSTANCE_LEASE_ID")
                 os.environ["ZHENXUN_INSTANCE_LEASE_ID"] = lease.identity
                 try:
-                    run_launcher(project, webui_dev_source)
+                    run_launcher(project)
                 finally:
                     if previous is None:
                         os.environ.pop("ZHENXUN_INSTANCE_LEASE_ID", None)
@@ -162,8 +118,6 @@ def main() -> None:
                 )
     elif args[0] == "run-ingress":
         _run_ingress(args[1:])
-    elif args[0] == "run-http-sidecar":
-        _run_http_sidecar(args[1:])
     elif args[0] == "run-maintenance" and len(args) == 2:
         from zhenxun.services.launcher.maintenance import execute
 

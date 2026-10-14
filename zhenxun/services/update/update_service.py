@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 from datetime import datetime, timezone
 import hashlib
 from html.parser import HTMLParser
@@ -18,7 +17,7 @@ import zipfile
 
 import httpx
 
-from zhenxun.services.lifecycle.operations import operation_registry
+from zhenxun.services.lifecycle import lifecycle_kernel
 from zhenxun.services.network_proxy import ManagedAsyncClient
 from zhenxun.services.resource_install import (
     ResourceInstallError,
@@ -51,6 +50,7 @@ _STATUS_LOCK = asyncio.Lock()
 _JOB_LOCK = asyncio.Lock()
 _STATUS_CACHE: tuple[float, dict[str, Any]] | None = None
 _ACTIVE_TASK: asyncio.Task[None] | None = None
+_PREPARING_JOB_STATES = {"queued", "preparing", "staged"}
 _BLOCKED_BOT_RELEASES = {"0.2.4-fix"}
 _RESOURCE_ENTRIES = (
     "font",
@@ -331,18 +331,34 @@ def read_job(job_id: str) -> dict[str, Any]:
     return data
 
 
+def job_status(job_id: str) -> dict[str, Any]:
+    """读取更新任务，准备阶段的任务已不在本进程运行时标记为中断
+
+    参数:
+        job_id: 任务 ID
+
+    返回:
+        dict[str, Any]: 任务内容
+    """
+    job = read_job(job_id)
+    if job.get("state") in _PREPARING_JOB_STATES and (
+        _ACTIVE_TASK is None or _ACTIVE_TASK.done()
+    ):
+        job = _update_job(
+            job_id,
+            state="failed",
+            error="update_interrupted",
+            progress=100,
+            apply_mode="failed",
+        )
+    return job
+
+
 def _update_job(job_id: str, **changes: Any) -> dict[str, Any]:
     job = read_job(job_id)
     job.update(changes)
     job["updated_at"] = _now_iso()
     _write_json(_job_path(job_id), job)
-    if operation_registry.get(job_id) is not None:
-        with contextlib.suppress(Exception):
-            operation_registry.update(
-                job_id,
-                phase=str(job.get("state") or "running"),
-                progress=int(job.get("progress") or 0),
-            )
     return job
 
 
@@ -723,7 +739,6 @@ async def _prepare_job(job_id: str) -> None:
             checksum=checksum,
         )
         if component == "webui":
-            operation_registry.mark_commit_critical(job_id, "webui_hot_apply")
             async with runtime_mutation_coordinator.operation(
                 "webui_update",
                 operation_id=job_id,
@@ -745,7 +760,6 @@ async def _prepare_job(job_id: str) -> None:
         if component == "resource":
             _update_job(job_id, state="applying", progress=82)
             try:
-                operation_registry.mark_commit_critical(job_id, "resource_hot_apply")
                 async with runtime_mutation_coordinator.operation(
                     "resource_update",
                     operation_id=job_id,
@@ -800,36 +814,6 @@ async def _prepare_job(job_id: str) -> None:
         _update_job(
             job_id, state="failed", error=code, progress=100, apply_mode="failed"
         )
-        raise
-
-
-def _update_checkpoint(job_id: str) -> dict[str, Any]:
-    try:
-        job = read_job(job_id)
-    except UpdateServiceError:
-        return {"job_state": "missing"}
-    return {
-        "job_state": job.get("state"),
-        "progress": job.get("progress"),
-        "ref": job.get("ref"),
-        "checksum": job.get("checksum"),
-    }
-
-
-def _recover_update(record: dict[str, Any]):
-    job_id = str(record.get("operation_id") or "")
-    if not job_id:
-        return None
-    try:
-        job = read_job(job_id)
-    except UpdateServiceError:
-        return None
-    if job.get("state") in {"completed", "failed", "pending_restart"}:
-        return None
-    return _prepare_job(job_id)
-
-
-operation_registry.register_recovery_handler("update_prepare", _recover_update)
 
 
 async def create_update_job(
@@ -873,18 +857,9 @@ async def create_update_job(
             "updated_at": _now_iso(),
         }
         _write_json(_job_path(job_id), job)
-        _, _ACTIVE_TASK = operation_registry.start(
-            "update_prepare",
+        _ACTIVE_TASK = lifecycle_kernel.spawn_task(
+            "management:webui",
             _prepare_job(job_id),
-            operation_id=job_id,
-            public_input={
-                "component": component,
-                "channel": channel,
-                "method": method,
-                "source": source,
-            },
-            recovery_policy="restart",
-            checkpoint=lambda: _update_checkpoint(job_id),
             name=f"update-{component}-{job_id[:8]}",
         )
     return job

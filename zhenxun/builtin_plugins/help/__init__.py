@@ -18,6 +18,7 @@ from zhenxun.configs.utils import PluginExtraData, RegisterConfig
 from zhenxun.services.log import logger
 from zhenxun.utils.enum import PluginType
 from zhenxun.utils.message import MessageUtils
+from zhenxun.utils.platform import PlatformUtils
 
 from .data_source import create_help_img, get_llm_help, get_plugin_help
 
@@ -99,7 +100,7 @@ async def _(
     session: Uninfo,
     is_detail: Query[bool] = AlconnaQuery("detail.value", False),
 ):
-    _is_superuser = session.user.id in bot.config.superusers
+    _is_superuser = PlatformUtils.is_superuser(bot, session.user.id)
 
     if name.available:
         help_style = Config.get_config("help", "HELP_STYLE")
@@ -116,7 +117,7 @@ async def _(
             logger.info(f"查看帮助详情: {name.result}", "帮助", session=session)
         elif Config.get_config("help", "ENABLE_LLM_HELPER"):
             logger.info(f"智能帮助处理问题: {name.result}", "帮助", session=session)
-            llm_answer = await get_llm_help(name.result, session.user.id)
+            llm_answer = await get_llm_help(name.result, session.user.id, _is_superuser)
             await MessageUtils.build_message(llm_answer).send(reply_to=True)
         else:
             await MessageUtils.build_message("没有查找到这个功能噢...").send(

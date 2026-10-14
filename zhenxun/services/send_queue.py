@@ -45,24 +45,6 @@ class SendRejected(DependencyUnavailable):
     """The adapter was not called; the caller must not report success."""
 
 
-def _send_platform_scope(adapter: Any) -> str:
-    if adapter is None:
-        return "unknown"
-    if isinstance(adapter, OneBotV11Adapter):
-        return "qq_client"
-    get_name = getattr(adapter, "get_name", None)
-    if callable(get_name):
-        try:
-            name = str(get_name()).lower()
-        except Exception:
-            name = ""
-    else:
-        name = adapter.__class__.__name__.lower()
-    if name == "qq" or "qq" in name:
-        return "qq_api"
-    return name or "unknown"
-
-
 @dataclass(frozen=True)
 class SendObservation:
     trace_id: str
@@ -228,8 +210,6 @@ async def _queued_call_api(
     api: str,
     **data: Any,
 ):
-    if _send_platform_scope(adapter) != "qq_client":
-        return await _invoke_adapter_api(adapter, cast(OneBotV11Bot, bot), api, **data)
     if api not in _SEND_APIS:
         return await _invoke_adapter_api(adapter, cast(OneBotV11Bot, bot), api, **data)
     if _STOPPING:

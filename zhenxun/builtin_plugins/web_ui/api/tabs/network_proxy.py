@@ -68,7 +68,6 @@ class ProxyDraft(BaseModel):
     url: str = Field(default="", max_length=2048)
     username: str | None = Field(default=None, max_length=512)
     password: str | None = Field(default=None, max_length=1024)
-    clear_auth: bool = False
     plugins: list[str] = Field(default_factory=list)
     core_enabled: bool = False
     bypass: list[str] = Field(default_factory=lambda: list(DEFAULT_BYPASS))
@@ -107,7 +106,6 @@ def _draft(payload, values):
             str(values.get("SYSTEM_PROXY") or ""),
             draft.username,
             draft.password,
-            draft.clear_auth,
         ),
         "NETWORK_PROXY_MODE": draft.mode,
         "NETWORK_PROXY_PLUGINS": draft.plugins,

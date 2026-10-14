@@ -115,17 +115,26 @@ def normalize_proxy(value: str) -> str:
 
 
 def public_proxy(value: str) -> dict:
+    """拆分代理地址与认证信息
+
+    参数:
+        value: 已保存的代理地址
+
+    返回:
+        dict: 不含认证的地址、用户名与密码
+    """
     parsed = urlsplit(value)
     host = parsed.hostname or ""
     authority = f"[{host}]" if ":" in host else host
     return {
         "url": f"{parsed.scheme}://{authority}:{parsed.port}" if value else "",
-        "has_auth": parsed.username is not None,
+        "username": unquote(parsed.username or ""),
+        "password": unquote(parsed.password or ""),
     }
 
 
 def credential_proxy(
-    url: str, saved: str, username: str | None, password: str | None, clear_auth: bool
+    url: str, saved: str, username: str | None, password: str | None
 ) -> str:
     normalized = normalize_proxy(url)
     if not normalized:
@@ -134,8 +143,6 @@ def credential_proxy(
         raise ProxyPolicyError("proxy_use_separate_auth_fields")
     same = public_proxy(saved)["url"] == normalized
     previous = urlsplit(saved) if same else None
-    if clear_auth:
-        return normalized
     user = (
         username
         if username is not None

@@ -24,7 +24,7 @@ from pydantic import BaseModel
 from zhenxun.configs.config import Config
 from zhenxun.models.scheduled_job import ScheduledJob
 from zhenxun.services.log import logger
-from zhenxun.services.message_load import should_pause_tasks
+from zhenxun.services.message_load import should_pause_db_tasks
 from zhenxun.utils.common_utils import CommonUtils
 from zhenxun.utils.decorator.retry import Retry
 from zhenxun.utils.platform import PlatformUtils
@@ -452,11 +452,11 @@ async def _execute_persistent_job(schedule_id: int, force: bool = False):
     schedule = None
 
     global _LAST_PRESSURE_SKIP
-    if should_pause_tasks():
+    if should_pause_db_tasks():
         now = time.time()
         if now - _LAST_PRESSURE_SKIP > 30:
             _LAST_PRESSURE_SKIP = now
-            logger.info("scheduler paused due to message pressure")
+            logger.info("数据库暂不可用，定时任务暂停执行")
         return
 
     scheduler_registry.running_tasks.add(schedule_id)

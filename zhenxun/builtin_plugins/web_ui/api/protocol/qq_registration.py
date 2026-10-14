@@ -273,7 +273,6 @@ async def _save_websocket_bot(app_id: str, secret: str) -> dict[str, Any]:
             merged.append(
                 {
                     "id": app_id,
-                    "token": "",
                     "secret": secret,
                     "use_websocket": True,
                     "intent": model_dump(QQOfficialIntent(c2c_group_at_messages=True)),

@@ -13,6 +13,7 @@ from nonebot_plugin_session import EventSession
 from zhenxun.configs.config import Config
 from zhenxun.models.ban_console import BanConsole
 from zhenxun.services.log import logger
+from zhenxun.services.platform_identity import is_isolated_scope
 from zhenxun.utils.enum import PluginType
 from zhenxun.utils.message import MessageUtils
 from zhenxun.utils.platform import PlatformUtils
@@ -87,7 +88,7 @@ def _malicious_plugin_set() -> set[str]:
     return {str(item).strip().casefold() for item in items if str(item).strip()}
 
 
-def _should_check_plugin(module: str, lane: str) -> bool:
+def _should_check_plugin(module: str, is_passive: bool) -> bool:
     mode = _malicious_check_mode()
     if mode == "off":
         return False
@@ -98,7 +99,6 @@ def _should_check_plugin(module: str, lane: str) -> bool:
 
     plugin_set = _malicious_plugin_set()
     in_plugin_set = normalized_module in plugin_set
-    is_passive = str(lane or "").startswith("passive_")
 
     if mode == "blacklist":
         return in_plugin_set
@@ -161,7 +161,7 @@ def _get_positive_config(key: str, cast_type: type[int] | type[float]) -> int | 
 async def _(
     matcher: Matcher, bot: Bot, session: EventSession, state: T_State, event: Event
 ):
-    if PlatformUtils.get_platform_scope(bot) == "qq_api":
+    if is_isolated_scope(PlatformUtils.get_platform_scope(bot)):
         return
     # 提前判断 notice 类型，直接跳过
     if matcher.type == "notice":
@@ -187,8 +187,7 @@ async def _(
     else:
         return
 
-    lane = state.get("_zx_dispatch_lane")
-    if not _should_check_plugin(module, lane if isinstance(lane, str) else ""):
+    if not _should_check_plugin(module, state.get("_zx_passive_matcher") is True):
         return
 
     user_id = resolve_actor_user_id(event, session.id1)
@@ -197,7 +196,7 @@ async def _(
     if user_id:
         is_superuser = state.get("_zx_is_superuser")
         if not isinstance(is_superuser, bool):
-            is_superuser = user_id in bot.config.superusers
+            is_superuser = PlatformUtils.is_superuser(bot, user_id)
         if is_superuser:
             return
     else:
@@ -206,7 +205,7 @@ async def _(
     if not _mark_event_plugin_checked(state, event, user_id, module):
         return
 
-    # 只统计通过模式/lane过滤且同事件同插件去重后的有效触发。
+    # 只统计通过模式过滤、非被动且同事件同插件去重后的有效触发。
     limiter_key = f"{user_id}__{module}"
     malicious_check_time = float(_get_positive_config("MALICIOUS_CHECK_TIME", float))
     malicious_ban_count = int(_get_positive_config("MALICIOUS_BAN_COUNT", int))

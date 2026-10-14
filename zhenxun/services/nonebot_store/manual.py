@@ -66,9 +66,6 @@ async def preview_manual_dependencies(
     values: list[str], action: str, *, manifest: dict[str, Any] | None = None
 ) -> dict[str, Any]:
     """Prepare a scoped plan without installing or changing the active manifest."""
-    from zhenxun.services.plugin_store.plugin_archive_dependencies import (
-        archive_dependency_contract,
-    )
     from zhenxun.services.plugin_store.plugin_store_receipts import (
         receipt_dependency_inputs,
     )
@@ -131,8 +128,6 @@ async def preview_manual_dependencies(
         **core,
         **{name: baseline[name] for name in ORM_PACKAGES if name in baseline},
     }
-    archive = archive_dependency_contract()
-    archive_pins = archive.get("packages", {})
     plugin_roots = [
         raw
         for owner, raw in dependency_roots(target)
@@ -152,7 +147,6 @@ async def preview_manual_dependencies(
                     and item["owner"] not in {f"manual:{key}" for key in requested}
                     and item["owner"] not in requested
                 }
-                | ({"archive"} if name in archive_pins else set())
                 | ({"project"} if name in core else set())
             )
             if owners:
@@ -181,30 +175,21 @@ async def preview_manual_dependencies(
         *scoped_roots(plugin_roots, scope),
         *scoped_roots(root_inputs, scope),
         *external,
-        *scoped_roots(archive.get("requirements", []), scope),
-        *[
-            f"{name}=={version}"
-            for name, version in archive_pins.items()
-            if name in scope
-        ],
     ]
-    constraints = {**baseline, **archive_pins, **frozen}
+    constraints = {**baseline, **frozen}
     for name in removing:
         constraints.pop(name, None)
         if name in base:
             constraints[name] = base[name]
     scoped = {
         **{name: version for name, version in constraints.items() if name not in scope},
-        **archive_pins,
         **frozen,
         **{name: base[name] for name in removing if name in base},
     }
-    restricted = tuple(sorted(archive.get("wheels_only_packages", [])))
     resolved, diagnostic = await resolve(
         requirements,
         constraints,
         wheels_only=False,
-        restricted_packages=restricted,
         preferences=baseline,
     )
     if resolved is None:
@@ -212,7 +197,6 @@ async def preview_manual_dependencies(
             requirements,
             scoped,
             wheels_only=False,
-            restricted_packages=restricted,
             preferences=baseline,
         )
     if resolved is None:
@@ -340,15 +324,8 @@ def stage_plan(
     返回:
         bool: 是否写入了待应用的事务
     """
-    import uuid
-
     from .dependencies import DependencyAnalysisError
-    from .storage import (
-        load_manifest,
-        remove_generation,
-        save_pending_transaction,
-        utc_now,
-    )
+    from .storage import defer_transaction, draft_transaction, utc_now
 
     if plan["no_change"]:
         return False
@@ -356,43 +333,22 @@ def stage_plan(
         raise DependencyAnalysisError(
             "source_build_confirmation_required", plan["diagnostic"]
         )
-    now = utc_now()
-    transaction = (
-        deepcopy(pending)
-        if pending
-        else {
-            "version": 2,
-            "base_manifest": load_manifest(),
-            "operations": [],
-            "database_migration_possible": False,
-            "database_migration_confirmed": False,
-            "created_at": now,
-        }
-    )
-    if pending:
-        transaction.pop("generation", None)
-        transaction.pop("generation_digest", None)
-    transaction.update(
-        revision=uuid.uuid4().hex,
+    transaction = draft_transaction(
+        pending,
+        plan["target_manifest"],
         action="manual_dependencies",
-        updated_at=now,
-        target_manifest=deepcopy(plan["target_manifest"]),
         remaining_conflicts=deepcopy(plan.get("remaining_conflicts", [])),
-        state="pending_restart",
-        source_build_confirmed=bool(transaction.get("source_build_confirmed")),
     )
     transaction["operations"].append(
         {
             "kind": "manual_dependencies",
             "action": "install",
             "name": ", ".join(requirements),
-            "created_at": now,
+            "created_at": utc_now(),
             "target_manifest": deepcopy(plan["target_manifest"]),
             "database_migration_possible": False,
             "source_build_confirmed": False,
         }
     )
-    save_pending_transaction(transaction)
-    if pending:
-        remove_generation(pending.get("generation"))
+    defer_transaction(transaction)
     return True

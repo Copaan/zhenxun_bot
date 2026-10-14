@@ -7,12 +7,10 @@ from importlib import import_module
 import inspect
 import json
 from pathlib import Path
-import re
 import subprocess
 import sys
 import time
 from typing import Any, ClassVar, cast
-from urllib.parse import unquote, urlsplit
 
 import nonebot
 
@@ -24,14 +22,7 @@ from .resources import browser_gone, browser_resources
 from .types import BaseScreenshotEngine
 
 _PLAYWRIGHT_DISCONNECT_ERROR = "Connection closed while reading from the driver"
-_PLAYWRIGHT_TARGET_CLOSED_ERROR_MARKERS = (
-    "TargetClosedError",
-    "Target page, context or browser has been closed",
-    "browser has been closed",
-    "BrowserContext.new_page",
-)
 _UNRETRIEVED_FUTURE_MESSAGE = "Future exception was never retrieved"
-_LOOP_EXCEPTION_FILTER_STATE_ATTR = "_zhenxun_playwright_exception_filter_state"
 _DISCONNECT_SUPPRESSION_WINDOW_SECONDS = 10.0
 
 htmlrender_module: Any | None = None
@@ -62,116 +53,6 @@ def _isolate_playwright_signals() -> None:
             return await original.create_subprocess_exec(*args, **kwargs)
 
     transport.asyncio = PlaywrightAsyncio()
-
-
-_DIAGNOSTIC_ROOT = Path(__file__).resolve().parents[3]
-_DIAGNOSTIC_WINDOW_SECONDS = 30.0
-_DIAGNOSTIC_MAX_ITEMS = 256
-_DIAGNOSTIC_TEMPLATE_BURST = 5
-_SCRIPT_ERROR_CATEGORIES = frozenset(
-    {
-        "Error",
-        "EvalError",
-        "RangeError",
-        "ReferenceError",
-        "SyntaxError",
-        "TypeError",
-        "URIError",
-        "AggregateError",
-    }
-)
-_render_diagnostic_times: OrderedDict[str, float] = OrderedDict()
-_render_diagnostic_templates: OrderedDict[str, tuple[float, int]] = OrderedDict()
-
-
-def _diagnostic_resource(value: Any) -> str:
-    """Only disclose repository-local paths, never URL authorities or payloads."""
-    if not isinstance(value, str) or not value or len(value) > 4096:
-        return "unknown"
-    try:
-        url = urlsplit(value)
-        if url.scheme not in {"", "file"}:
-            return "remote" if url.scheme in {"http", "https"} else "redacted"
-        if url.netloc:
-            return "external"
-        path_text = unquote(url.path)
-        if re.match(r"^/[A-Za-z]:/", path_text):
-            path_text = path_text[1:]
-        path = Path(path_text)
-        if not path.is_absolute():
-            path = _DIAGNOSTIC_ROOT / path
-        relative = path.resolve().relative_to(_DIAGNOSTIC_ROOT).as_posix()
-        if len(relative) > 180 or not re.fullmatch(r"[\w ./-]+", relative):
-            return "local"
-        return relative
-    except (ValueError, OSError):
-        return "external"
-
-
-def _script_error_location(error: Any) -> tuple[str, int | None, int | None]:
-    stack = getattr(error, "stack", None)
-    if isinstance(stack, str):
-        stack = stack[:16384]
-        message = getattr(error, "message", "")
-        name = getattr(error, "name", "")
-        if isinstance(message, str) and message:
-            if len(message) > 8192 or not isinstance(name, str) or len(name) > 128:
-                return "inline", None, None
-            prefix = f"{name}: {message}"
-            if not stack.startswith(prefix):
-                return "inline", None, None
-            stack = stack[len(prefix) :]
-        # Ignore the message, source excerpts and function names. Only parse frames.
-        for frame in stack.splitlines()[1:21]:
-            match = re.fullmatch(
-                r"\s*at (?:.*? \()?((?:file|https?)://[^\r\n]+):(\d{1,9}):(\d{1,9})\)?",
-                frame,
-            )
-            if match:
-                return (_diagnostic_resource(match[1]), int(match[2]), int(match[3]))
-    return "inline", None, None
-
-
-def _render_diagnostic(
-    code: str,
-    *,
-    template: str,
-    category: str,
-    resource: str,
-    line: int | None = None,
-    column: int | None = None,
-) -> None:
-    details = {
-        "template": template,
-        "category": category,
-        "resource": resource,
-        "line": line,
-        "column": column,
-    }
-    serialized = json.dumps(details, ensure_ascii=True, sort_keys=True)
-    diagnostic_id = hashlib.sha256(f"{code}:{serialized}".encode()).hexdigest()[:16]
-    now = time.monotonic()
-    for cache in (_render_diagnostic_times, _render_diagnostic_templates):
-        while cache:
-            value = next(iter(cache.values()))
-            timestamp = value[0] if isinstance(value, tuple) else value
-            if now - timestamp < _DIAGNOSTIC_WINDOW_SECONDS:
-                break
-            cache.popitem(last=False)
-    if diagnostic_id in _render_diagnostic_times:
-        return
-    started, count = _render_diagnostic_templates.get(template, (now, 0))
-    if count >= _DIAGNOSTIC_TEMPLATE_BURST:
-        return
-    _render_diagnostic_times[diagnostic_id] = now
-    _render_diagnostic_templates[template] = (started, count + 1)
-    for cache in (_render_diagnostic_times, _render_diagnostic_templates):
-        while len(cache) > _DIAGNOSTIC_MAX_ITEMS:
-            cache.popitem(last=False)
-    logger.warning(
-        f"渲染页面异常 | code={code} | diagnostic_id={diagnostic_id} | {serialized}",
-        "Renderer",
-    )
 
 
 def _load_htmlrender_modules() -> tuple[Any, Any]:
@@ -207,17 +88,12 @@ class HtmlrenderTaskTracker:
     def is_draining(self) -> bool:
         return self._draining
 
-    async def reset(self) -> None:
+    async def resume(self) -> None:
         async with self._lock:
             self._draining = False
             self._drain_reason = None
             if self._active_tasks == 0:
                 self._idle_event.set()
-
-    async def resume(self) -> None:
-        async with self._lock:
-            self._draining = False
-            self._drain_reason = None
 
     async def mark_draining(self, reason: str) -> None:
         async with self._lock:
@@ -302,68 +178,39 @@ async def _get_browser_instance() -> Any:
     raise RuntimeError("nonebot_plugin_htmlrender.browser 未提供可用浏览器获取函数。")
 
 
-def _is_ignorable_playwright_disconnect(ctx: dict[str, Any]) -> bool:
-    exc = ctx.get("exception")
-    return (
-        ctx.get("message") == _UNRETRIEVED_FUTURE_MESSAGE
-        and isinstance(exc, Exception)
-        and _PLAYWRIGHT_DISCONNECT_ERROR in str(exc)
+_suppress_disconnect_until = 0.0
+
+
+def _suppress_disconnect_noise(loop: asyncio.AbstractEventLoop) -> None:
+    """关闭浏览器后的一段时间内忽略 Playwright 驱动断开产生的未取回异常
+
+    参数:
+        loop: 当前事件循环
+    """
+    global _suppress_disconnect_until
+    _suppress_disconnect_until = (
+        time.monotonic() + _DISCONNECT_SUPPRESSION_WINDOW_SECONDS
     )
+    original = loop.get_exception_handler()
+    if getattr(original, "_zx_playwright_filter", False):
+        return
 
-
-def _is_playwright_target_closed_error(exc: Exception) -> bool:
-    exc_name = type(exc).__name__
-    if exc_name == "TargetClosedError":
-        return True
-    message = str(exc)
-    return any(marker in message for marker in _PLAYWRIGHT_TARGET_CLOSED_ERROR_MARKERS)
-
-
-def _get_loop_exception_filter_state(
-    loop: asyncio.AbstractEventLoop,
-) -> dict[str, Any] | None:
-    state = getattr(loop, _LOOP_EXCEPTION_FILTER_STATE_ATTR, None)
-    if isinstance(state, dict):
-        return state
-    return None
-
-
-def _ensure_loop_exception_filter(
-    loop: asyncio.AbstractEventLoop,
-) -> dict[str, Any]:
-    state = _get_loop_exception_filter_state(loop)
-    if state is not None:
-        return state
-
-    state = {
-        "original_handler": loop.get_exception_handler(),
-        "suppress_until": 0.0,
-    }
-
-    def _filter(lp: asyncio.AbstractEventLoop, ctx: dict[str, Any]) -> None:
-        if _is_ignorable_playwright_disconnect(ctx):
-            suppress_until = float(state.get("suppress_until", 0.0))
-            if suppress_until >= time.monotonic():
-                return
-        original_handler = state.get("original_handler")
-        if callable(original_handler):
-            original_handler(lp, ctx)
+    def handler(lp: asyncio.AbstractEventLoop, ctx: dict[str, Any]) -> None:
+        exc = ctx.get("exception")
+        if (
+            ctx.get("message") == _UNRETRIEVED_FUTURE_MESSAGE
+            and isinstance(exc, Exception)
+            and _PLAYWRIGHT_DISCONNECT_ERROR in str(exc)
+            and time.monotonic() <= _suppress_disconnect_until
+        ):
             return
-        lp.default_exception_handler(ctx)
+        if original is not None:
+            original(lp, ctx)
+        else:
+            lp.default_exception_handler(ctx)
 
-    loop.set_exception_handler(_filter)
-    setattr(loop, _LOOP_EXCEPTION_FILTER_STATE_ATTR, state)
-    return state
-
-
-def _arm_disconnect_exception_suppression(
-    loop: asyncio.AbstractEventLoop,
-    *,
-    seconds: float = _DISCONNECT_SUPPRESSION_WINDOW_SECONDS,
-) -> None:
-    state = _ensure_loop_exception_filter(loop)
-    deadline = time.monotonic() + max(seconds, 0.0)
-    state["suppress_until"] = max(float(state.get("suppress_until", 0.0)), deadline)
+    handler._zx_playwright_filter = True  # type: ignore[attr-defined]
+    loop.set_exception_handler(handler)
 
 
 def _browser_running() -> bool:
@@ -374,42 +221,29 @@ def _browser_running() -> bool:
 
 
 _browser_cleanup_task: asyncio.Task | None = None
-_browser_cleanup_identity: tuple | None = None
 
 
 async def _shutdown_browser_instance() -> None:
-    global _browser_cleanup_task, _browser_cleanup_identity
+    global _browser_cleanup_task
     if htmlrender_browser is None:
         return
-    identity = (
-        getattr(htmlrender_browser, "_browser", None),
-        getattr(htmlrender_browser, "_playwright", None),
-    )
-    if identity == (None, None):
+    task = _browser_cleanup_task
+    if task is not None and not task.done():
+        await asyncio.shield(task)
+    browser = getattr(htmlrender_browser, "_browser", None)
+    playwright = getattr(htmlrender_browser, "_playwright", None)
+    if browser is None and playwright is None:
         return
-    retry_failed = (
-        _browser_cleanup_task is not None
-        and _browser_cleanup_task.done()
-        and (
-            _browser_cleanup_task.cancelled()
-            or _browser_cleanup_task.exception() is not None
-        )
+    task = _browser_cleanup_task = asyncio.create_task(
+        _close_browser_resources(browser, playwright), name="renderer-browser-cleanup"
     )
-    if _browser_cleanup_identity != identity or retry_failed:
-        if _browser_cleanup_task is not None and not _browser_cleanup_task.done():
-            await asyncio.shield(_browser_cleanup_task)
-        _browser_cleanup_identity = identity
-        _browser_cleanup_task = asyncio.create_task(
-            _close_browser_resources(*identity), name="renderer-browser-cleanup"
-        )
-    await asyncio.shield(_browser_cleanup_task)
+    await asyncio.shield(task)
 
 
 async def _close_browser_resources(browser_obj, playwright_obj) -> None:
     if htmlrender_browser is None:
         return
-    loop = asyncio.get_running_loop()
-    _arm_disconnect_exception_suppression(loop)
+    _suppress_disconnect_noise(asyncio.get_running_loop())
 
     if browser_obj is None and playwright_obj is None:
         return
@@ -635,12 +469,10 @@ class PlaywrightEngine(BaseScreenshotEngine):
     def __init__(self):
         _patch_playwright_env_check_once()
         self._render_semaphore = asyncio.Semaphore(self._MAX_CONCURRENT_RENDER)
-        self._debug_console_log = bool(Config.get_config("UI", "DEBUG_MODE", False))
         self._state_lock = asyncio.Lock()
         self._warmup_lock = asyncio.Lock()
         self._context_changed = asyncio.Event()
         self._active_renders = 0
-        self._render_count = 0
         self._recent_results: OrderedDict[str, tuple[float, bytes]] = OrderedDict()
         self._inflight_tasks: dict[str, asyncio.Task[bytes]] = {}
         self._render_waiters: dict[asyncio.Task, int] = {}
@@ -655,7 +487,6 @@ class PlaywrightEngine(BaseScreenshotEngine):
         self._pending_creations = 0
         self._idle_task: asyncio.Task[None] | None = None
         self._closing = False
-        self._preparation_timings: dict[str, float] = {}
         self._preparation_tasks: set[asyncio.Task] = set()
 
     @staticmethod
@@ -701,38 +532,13 @@ class PlaywrightEngine(BaseScreenshotEngine):
         self._recent_results.move_to_end(key)
         return result
 
-    async def get_runtime_snapshot(self) -> dict[str, Any]:
-        async with self._state_lock:
-            return {
-                "closing": self._closing,
-                "preparation_timings": dict(self._preparation_timings),
-                "preparation_task_count": sum(
-                    not task.done() for task in self._preparation_tasks
-                ),
-                "browser_running": _browser_running(),
-                "ready_contexts": self._pool.qsize(),
-                "context_count": len(self._contexts),
-                "active_leases": self._leases,
-                "active_renders": self._active_renders,
-                "render_count": self._render_count,
-                "idle_seconds": round(
-                    time.monotonic() - _HTMLRENDER_TASK_TRACKER.last_finished
-                ),
-                "inflight_task_count": len(self._inflight_tasks),
-                "recent_result_count": len(self._recent_results),
-                "recent_result_bytes": sum(
-                    len(value) for _, value in self._recent_results.values()
-                ),
-                "browser_resources": browser_resources.snapshot(),
-                "htmlrender_active_tasks": _HTMLRENDER_TASK_TRACKER.active_tasks,
-                "htmlrender_draining": _HTMLRENDER_TASK_TRACKER.is_draining,
-            }
+    def busy(self) -> bool:
+        """是否有进行中的渲染或借出的上下文
 
-    async def _log_runtime_snapshot(self, reason: str) -> None:
-        snapshot = await self.get_runtime_snapshot()
-        logger.trace(
-            f"截图引擎状态快照[{reason}]: {snapshot}",
-        )
+        返回:
+            bool: 引擎是否忙碌
+        """
+        return bool(self._active_renders or self._leases)
 
     async def initialize(self) -> None:
         async with self._state_lock:
@@ -742,8 +548,7 @@ class PlaywrightEngine(BaseScreenshotEngine):
             self._idle_task = asyncio.create_task(
                 self._idle_close_loop(), name="renderer-idle-close"
             )
-        await _HTMLRENDER_TASK_TRACKER.reset()
-        await self._log_runtime_snapshot("initialize")
+        await _HTMLRENDER_TASK_TRACKER.resume()
 
     async def close(self) -> None:
         if self._close_task is None:
@@ -801,8 +606,6 @@ class PlaywrightEngine(BaseScreenshotEngine):
             except Exception as error:
                 failures.append(error)
 
-        await self._log_runtime_snapshot("close:before_dispose")
-
         async def contexts():
             with shutdown_budget(10.0):
                 results = await asyncio.gather(
@@ -823,8 +626,13 @@ class PlaywrightEngine(BaseScreenshotEngine):
             await browser_resources.drain()
         except Exception as error:
             failures.append(error)
+        browser_left = htmlrender_browser is not None and any(
+            getattr(htmlrender_browser, name, None) is not None
+            for name in ("_browser", "_playwright")
+        )
         if (
-            browser_resources.contexts
+            (failures and browser_left)
+            or browser_resources.contexts
             or _HTMLRENDER_TASK_TRACKER.active_tasks
             or any(not task.done() for task in self._inflight_tasks.values())
             or any(not task.done() for task in self._preparation_tasks)
@@ -836,17 +644,7 @@ class PlaywrightEngine(BaseScreenshotEngine):
             raise RuntimeError("renderer_resource_release_unconfirmed") from (
                 failures[0] if failures else None
             )
-        if (
-            failures
-            and htmlrender_browser is not None
-            and any(
-                getattr(htmlrender_browser, name, None) is not None
-                for name in ("_browser", "_playwright")
-            )
-        ):
-            raise RuntimeError("renderer_browser_cleanup_failed") from failures[0]
         self._inflight_tasks.clear()
-        await self._log_runtime_snapshot("close:after_shutdown")
 
     async def _on_render_begin(self) -> None:
         await _HTMLRENDER_TASK_TRACKER.begin("zhenxun_renderer")
@@ -855,7 +653,6 @@ class PlaywrightEngine(BaseScreenshotEngine):
     async def _on_render_end(self) -> None:
         await _HTMLRENDER_TASK_TRACKER.end()
         self._active_renders = max(0, self._active_renders - 1)
-        self._render_count += 1
 
     @staticmethod
     def _build_page_options(
@@ -872,7 +669,6 @@ class PlaywrightEngine(BaseScreenshotEngine):
         options.pop("clip_selector", None)
         options.pop("clip_padding", None)
         options.pop("disable_animations", None)
-        options.pop("diagnostic_template", None)
         if pooled:
             options.pop("base_url", None)
             options.pop("device_scale_factor", None)
@@ -926,63 +722,21 @@ class PlaywrightEngine(BaseScreenshotEngine):
         # Finish the base-directory document before observing rendered content.
         # Chromium directory-listing scripts are not part of the template.
         await page.goto(template_path, wait_until="load")
-        template = _diagnostic_resource(
-            render_options.get("diagnostic_template", template_path)
-        )
 
-        def script_error(error):
-            name = getattr(error, "name", None)
-            category = (
-                name
-                if isinstance(name, str) and name in _SCRIPT_ERROR_CATEGORIES
-                else "ScriptError"
-            )
-            resource, line, column = _script_error_location(error)
-            _render_diagnostic(
-                "render_page_script_error",
-                template=template,
-                category=category,
-                resource=resource,
-                line=line,
-                column=column,
+        def page_error(error):
+            # 错误消息可能包含渲染数据，只记录错误类型
+            logger.warning(
+                f"渲染页面脚本错误: {getattr(error, 'name', None) or 'Error'}",
+                "PlaywrightEngine",
             )
 
-        def request_failed(request):
-            if request.resource_type in {"script", "stylesheet"}:
-                _render_diagnostic(
-                    "render_page_resource_failed",
-                    template=template,
-                    category=request.resource_type,
-                    resource=_diagnostic_resource(request.url),
-                )
-
-        def console_message(message):
-            # Console text and arguments can contain rendered data or credentials.
-            if message.type not in {"warning", "error"}:
-                return
-            location = message.location
-            _render_diagnostic(
-                "render_page_console",
-                template=template,
-                category=f"console_{message.type}",
-                resource=_diagnostic_resource(location.get("url")),
-                line=location.get("lineNumber", 0) + 1,
-                column=location.get("columnNumber", 0) + 1,
-            )
-
-        page.on("pageerror", script_error)
-        page.on("requestfailed", request_failed)
-        if self._debug_console_log:
-            page.on("console", console_message)
+        page.on("pageerror", page_error)
         try:
             return await self._capture_rendered_page(
                 page, html, template_path, render_options
             )
         finally:
-            page.remove_listener("pageerror", script_error)
-            page.remove_listener("requestfailed", request_failed)
-            if self._debug_console_log:
-                page.remove_listener("console", console_message)
+            page.remove_listener("pageerror", page_error)
 
     async def _capture_rendered_page(self, page, html, template_path, render_options):
         await page.set_content(html, wait_until=self._SET_CONTENT_WAIT_UNTIL)
@@ -1282,12 +1036,7 @@ class PlaywrightEngine(BaseScreenshotEngine):
             await self._prewarm()
 
     async def _prewarm(self) -> None:
-        started = time.monotonic()
         await _get_browser_instance()
-        self._preparation_timings["browser_start_ms"] = (
-            time.monotonic() - started
-        ) * 1000
-        started = time.monotonic()
         tasks = [
             asyncio.create_task(self._prewarm_context(), name="renderer-prewarm")
             for _ in range(min(self._PREWARM_CONTEXT_COUNT, self._CONTEXT_POOL_SIZE))
@@ -1303,9 +1052,6 @@ class PlaywrightEngine(BaseScreenshotEngine):
             self._preparation_tasks.difference_update(
                 task for task in tasks if task.done()
             )
-        self._preparation_timings["context_prewarm_ms"] = (
-            time.monotonic() - started
-        ) * 1000
 
     async def _prewarm_context(self) -> None:
         context = await self._acquire_context()
@@ -1446,7 +1192,7 @@ class PlaywrightEngine(BaseScreenshotEngine):
                 broken = True
                 last_error = e
                 if attempt == 0:
-                    if _is_playwright_target_closed_error(e):
+                    if browser_gone(e):
                         logger.warning(
                             "截图引擎浏览器上下文已失效，清空上下文池后重试一次。",
                             "PlaywrightEngine",
@@ -1654,8 +1400,6 @@ async def stop_preparation(task: asyncio.Task | None) -> None:
         if not task.cancelled():
             task.exception()
         return
-    from zhenxun.services.lifecycle.deadline import remaining_timeout
-
     task.cancel()
     _, pending = await asyncio.wait({task}, timeout=remaining_timeout(5.0))
     if pending:
@@ -1673,39 +1417,12 @@ class EngineManager:
         self._init_task: asyncio.Task | None = None
         self._warmup_task: asyncio.Task | None = None
         self._closing = False
-        self._state = "not_started"
-        self._last_error: str | None = None
-
-    def reopen(self) -> None:
-        if self._instance is not None or any(
-            task and not task.done() for task in (self._init_task, self._warmup_task)
-        ):
-            if self._closing:
-                raise RuntimeError("renderer_cleanup_pending")
-            return
-        self._closing = False
-        self._state = "not_started"
-        self._last_error = None
-        self._init_task = self._warmup_task = None
-
-    def _record_failure(self, phase: str, error: BaseException) -> None:
-        # Keep diagnostics useful without disclosing browser URLs or launch arguments.
-        reason = str(error)
-        if not re.fullmatch(r"renderer_[a-z_]+", reason):
-            reason = type(error).__name__
-        self._last_error = f"{phase}:{reason}"
-        self._state = "failed"
 
     async def _initialize(self) -> BaseScreenshotEngine:
-        self._state = "initializing"
-        try:
-            engine = self._engine_class()
-            self._instance = engine
-            await engine.initialize()
-            return engine
-        except BaseException as error:
-            self._record_failure("initialize", error)
-            raise
+        engine = self._engine_class()
+        self._instance = engine
+        await engine.initialize()
+        return engine
 
     async def get_engine(self) -> BaseScreenshotEngine:
         if self._closing:
@@ -1716,34 +1433,12 @@ class EngineManager:
             )
         return await asyncio.shield(self._init_task)
 
-    async def get_runtime_snapshot(self) -> dict[str, Any]:
-        engine = self._instance
-        snapshot = (
-            await engine.get_runtime_snapshot()
-            if isinstance(engine, PlaywrightEngine)
-            else {}
-        )
-        return {
-            **snapshot,
-            "initialization_state": self._state,
-            "initialization_error": self._last_error,
-            "closing": self._closing or snapshot.get("closing", False),
-        }
-
     async def _prepare(self) -> None:
-        try:
-            engine = await self.get_engine()
-            self._state = "warming"
-            if isinstance(engine, PlaywrightEngine):
-                await engine.warmup()
-            if self._closing:
-                raise RuntimeError("renderer_closing")
-            self._state = "ready"
-            self._last_error = None
-        except BaseException as error:
-            if self._last_error is None:
-                self._record_failure("warmup", error)
-            raise
+        engine = await self.get_engine()
+        if isinstance(engine, PlaywrightEngine):
+            await engine.warmup()
+        if self._closing:
+            raise RuntimeError("renderer_closing")
 
     async def warmup(self) -> None:
         if self._closing:
@@ -1756,14 +1451,12 @@ class EngineManager:
 
     async def close(self):
         self._closing = True
-        self._state = "closing"
         await stop_preparation(self._warmup_task)
         await stop_preparation(self._init_task)
         if self._instance is not None:
             await self._instance.close()
             self._instance = None
         self._init_task = self._warmup_task = None
-        self._state = "closed"
 
 
 engine_manager = EngineManager()

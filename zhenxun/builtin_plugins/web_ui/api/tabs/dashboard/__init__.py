@@ -1,8 +1,6 @@
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
-import nonebot
 from nonebot import require
-from nonebot.config import Config
 
 from zhenxun.services.log import logger
 
@@ -10,10 +8,7 @@ from ....base_model import BaseResultModel, QueryModel, Result
 from ....utils import DB_BUSY_MESSAGE, authentication
 from .data_source import ApiDataSource
 from .model import (
-    AllChatAndCallCount,
-    BotInfo,
     ChatCallMonthCount,
-    QueryChatCallCount,
     RuntimeOverview,
 )
 from .overview import build_runtime_overview
@@ -21,8 +16,6 @@ from .overview import build_runtime_overview
 require("plugin_store")
 
 router = APIRouter(prefix="/dashboard")
-
-driver = nonebot.get_driver()
 
 
 @router.get(
@@ -34,59 +27,6 @@ driver = nonebot.get_driver()
 )
 async def _(force: bool = False) -> Result[RuntimeOverview]:
     return Result.ok(await build_runtime_overview(force))
-
-
-@router.get(
-    "/get_bot_list",
-    dependencies=[authentication()],
-    response_model=Result[list[BotInfo]],
-    response_class=JSONResponse,
-    description="获取bot列表",  # type: ignore
-)
-async def _() -> Result[list[BotInfo]]:
-    try:
-        return Result.ok(await ApiDataSource.get_bot_list())
-    except TimeoutError:
-        return Result.fail(DB_BUSY_MESSAGE)
-    except Exception as e:
-        logger.error(f"{router.prefix}/get_bot_list 调用错误", "WebUi", e=e)
-        return Result.fail("Bot列表读取失败，请稍后重试。")
-
-
-@router.get(
-    "/get_chat_and_call_count",
-    dependencies=[authentication()],
-    response_model=Result[QueryChatCallCount],
-    response_class=JSONResponse,
-    description="获取聊天/调用记录的全部和今日数量",
-)
-async def _(bot_id: str | None = None) -> Result[QueryChatCallCount]:
-    try:
-        return Result.ok(await ApiDataSource.get_chat_and_call_count(bot_id))
-    except TimeoutError:
-        return Result.fail(DB_BUSY_MESSAGE)
-    except Exception as e:
-        logger.error(f"{router.prefix}/get_chat_and_call_count 调用错误", "WebUi", e=e)
-        return Result.fail("消息统计读取失败，请稍后重试。")
-
-
-@router.get(
-    "/get_all_chat_and_call_count",
-    dependencies=[authentication()],
-    response_model=Result[AllChatAndCallCount],
-    response_class=JSONResponse,
-    description="获取聊天/调用记录的全部数据次数",
-)
-async def _(bot_id: str | None = None) -> Result[AllChatAndCallCount]:
-    try:
-        return Result.ok(await ApiDataSource.get_all_chat_and_call_count(bot_id))
-    except TimeoutError:
-        return Result.fail(DB_BUSY_MESSAGE)
-    except Exception as e:
-        logger.error(
-            f"{router.prefix}/get_all_chat_and_call_count 调用错误", "WebUi", e=e
-        )
-        return Result.fail("累计统计读取失败，请稍后重试。")
 
 
 @router.get(
@@ -119,14 +59,3 @@ async def _(query: QueryModel) -> Result[BaseResultModel]:
     except Exception as e:
         logger.error(f"{router.prefix}/get_connect_log 调用错误", "WebUi", e=e)
         return Result.fail("连接记录读取失败，请稍后重试。")
-
-
-@router.get(
-    "/get_nonebot_config",
-    dependencies=[authentication()],
-    response_model=Result[Config],
-    response_class=JSONResponse,
-    description="获取nb配置",  # type: ignore
-)
-async def _() -> Result[Config]:
-    return Result.ok(driver.config)
