@@ -110,7 +110,7 @@ AccessToken: PUBLIC_ZHENXUN_TEST
 |                                项目名称                                | 主要用途 |                      仓库作者                       |                         备注                          |
 | :--------------------------------------------------------------------: | :------: | :-------------------------------------------------: | :---------------------------------------------------: |
 |      [插件库](https://github.com/zhenxun-org/zhenxun_bot_plugins)      |   插件   |    [zhenxun-org](https://github.com/zhenxun-org)    |                 原 plugins 文件夹插件                 |
-| [插件索引库](https://github.com/zhenxun-org/zhenxun_bot_plugins_index) |   插件   |    [zhenxun-org](https://github.com/zhenxun-org)    |                    扩展插件索引库                     |
+| [插件索引库](https://github.com/zhenxun-org/zhenxun_bot_plugins_index) |   插件    |    [zhenxun-org](https://github.com/zhenxun-org)    |                    扩展插件索引库                     |
 |    [一键安装](https://github.com/soloxiaoye2022/zhenxun_bot-deploy)    |   安装   | [soloxiaoye2022](https://github.com/soloxiaoye2022) |                        第三方                         |
 |          [WebUi](https://github.com/zhenxun-org/zhenxun_bot)           |   管理   |       [hibikier](https://github.com/HibiKier)       | 基于真寻 WebApi 的 webui 实现 [预览](#-webui界面展示) |
 |  [安卓 app(WebUi)](https://github.com/YuS1aN/zhenxun_bot_android_ui)   |   安装   |         [YuS1aN](https://github.com/YuS1aN)         |                        第三方                         |
