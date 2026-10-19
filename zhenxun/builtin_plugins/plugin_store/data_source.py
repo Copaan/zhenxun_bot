@@ -856,24 +856,53 @@ class StoreManager:
             )
 
             try:
-                dependency_plan = await preflight_source_requirements(requirement_files)
+                dependency_plan = await preflight_source_requirements(
+                    requirement_files, allow_build=confirm_source_build
+                )
             except DependencyAnalysisError as error:
-                raise PluginStoreException(error.code) from error
+                if error.code == "dependency_source_metadata_unavailable":
+                    raise PluginStoreException(
+                        "source_build_confirmation_required"
+                    ) from error
+                raise PluginStoreException(cls._dependency_error(error)) from error
         result = StoreInstallResult(
             dependency_plan=dependency_plan,
             download_source="ali" if selected_source == RepoType.ALIYUN else "git",
         )
-        if (
-            result.dependency_changes
-            and dependency_plan.get("source_build_required")
-            and not confirm_source_build
-        ):
-            raise PluginStoreException("source_build_confirmation_required")
+        if result.dependency_changes and dependency_plan.get("source_build_required"):
+            if not confirm_source_build:
+                raise PluginStoreException("source_build_confirmation_required")
+            from zhenxun.services.nonebot_store.dependencies import prebuild_packages
+
+            if failed := await prebuild_packages(result.dependency_packages):
+                for name, error in failed.items():
+                    logger.warning(f"依赖 {name} 源码构建失败: {error}", LOG_COMMAND)
+                raise PluginStoreException(
+                    f"{'、'.join(failed)}: dependency_source_build_failed"
+                )
         local_path = cls._resolve_local_plugin_path(plugin_info)
         candidate = root / "candidate" / local_path.name
         for staged_path, destination_path in deploy_files:
             cls._copy(staged_path, candidate / destination_path.relative_to(local_path))
         return candidate, result
+
+    @staticmethod
+    def _dependency_error(error: Exception) -> str:
+        """依赖预检错误的提示，涉及具体包时附上包名
+
+        参数:
+            error: DependencyAnalysisError
+
+        返回:
+            str: 错误码，或“包名: 错误码”
+        """
+        code = getattr(error, "code", "")
+        if code == "dependency_requirement_unsupported":
+            return f"{str(error).partition(': ')[2]}: {code}"
+        if code == "orm_dependency_console_required":
+            names = [str(item.get("name")) for item in getattr(error, "details", [])]
+            return f"{'、'.join(names)}: {code}"
+        return code
 
     @classmethod
     def store_key(cls, plugin_info: StorePluginInfo, is_external: bool) -> str:

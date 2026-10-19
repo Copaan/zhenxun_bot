@@ -96,6 +96,7 @@ class AnalyzePayload(BaseModel):
     project_link: str = Field(min_length=1, max_length=200)
     action: Literal["install", "update", "uninstall"]
     prefer_existing: bool = True
+    allow_source_build: bool = False
 
 
 class ApplyPayload(BaseModel):
@@ -165,6 +166,21 @@ async def _environment_view() -> dict[str, Any]:
     result["candidate_built"] = isinstance(pending.get("generation"), int)
     result["launcher_managed"] = bool(os.environ.get("ZHENXUN_LAUNCHER_PID"))
     return result
+
+
+_environment_task: asyncio.Task[dict[str, Any]] | None = None
+
+
+async def _shared_environment_view() -> dict[str, Any]:
+    """读取用于展示的依赖环境，同时到达的请求共用一次检查
+
+    返回:
+        dict[str, Any]: 依赖环境信息
+    """
+    global _environment_task
+    if _environment_task is None or _environment_task.done():
+        _environment_task = asyncio.create_task(_environment_view())
+    return deepcopy(await asyncio.shield(_environment_task))
 
 
 def _enabled_adapters() -> set[str]:
@@ -543,6 +559,7 @@ async def _analyze(analysis: dict[str, Any]) -> None:
                 metadata or {},
                 manifest=manifest,
                 prefer_existing=analysis.get("prefer_existing", True),
+                allow_build=analysis.get("allow_source_build", False),
             )
         )
         from zhenxun.services.nonebot_store.policy import summary_revision
@@ -578,7 +595,7 @@ async def _analyze(analysis: dict[str, Any]) -> None:
                 "pending_revision": pending_revision,
                 "base_manifest": manifest,
                 "plan": plan,
-                "environment": await _environment_view(),
+                "environment": await _shared_environment_view(),
                 "plugin": _catalog_item(plugin, manifest=manifest, inventory=inventory),
             }
         )
@@ -594,7 +611,7 @@ async def _analyze(analysis: dict[str, Any]) -> None:
                 "status": "blocked",
                 "compatible": False,
                 "blocked_reasons": [reason],
-                "environment": await _environment_view(),
+                "environment": await _shared_environment_view(),
             }
         )
     except KeyError:
@@ -623,6 +640,31 @@ async def _analyze(analysis: dict[str, Any]) -> None:
         )
     finally:
         analysis["completed_at"] = utc_now()
+
+
+async def _prebuild_plan(plan: dict[str, Any]) -> None:
+    """提前构建计划中新增或变更的包，构建失败时不保存事务
+
+    参数:
+        plan: 安装计划
+
+    异常:
+        DependencyAnalysisError: 有包构建失败
+    """
+    from zhenxun.services.nonebot_store.dependencies import prebuild_packages
+
+    changes = plan.get("package_changes") or {}
+    packages = {item["name"]: item["version"] for item in changes.get("added", [])}
+    packages.update({item["name"]: item["to"] for item in changes.get("changed", [])})
+    failed = await prebuild_packages(packages)
+    if failed:
+        raise DependencyAnalysisError(
+            "dependency_source_build_failed",
+            "、".join(failed),
+            details=[
+                {"name": name, "diagnostic": error} for name, error in failed.items()
+            ],
+        )
 
 
 def _dependency_evidence(plan: dict[str, Any]) -> dict[str, Any]:
@@ -872,7 +914,7 @@ async def _apply_hot(
     response_class=JSONResponse,
 )
 async def dependency_environment() -> Result[dict]:
-    return Result.ok(await _environment_view())
+    return Result.ok(await _shared_environment_view())
 
 
 @router.post(
@@ -1286,6 +1328,7 @@ async def analyze_plugin(payload: AnalyzePayload) -> Result[dict]:
         "project_link": payload.project_link,
         "action": payload.action,
         "prefer_existing": payload.prefer_existing,
+        "allow_source_build": payload.allow_source_build,
         "status": "queued",
         "created_at": utc_now(),
     }
@@ -1575,6 +1618,7 @@ async def _apply_analysis(payload: ApplyPayload, binding: str) -> Result[dict]:
                 pending.get("source_build_confirmed")
                 and not isinstance(pending.get("generation"), int)
             ):
+                await _prebuild_plan(plan)
                 defer_transaction(transaction)
                 staged = True
                 return _completed(

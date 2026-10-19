@@ -63,9 +63,28 @@ def request_digest(action: str, values: list[str]) -> str:
 
 
 async def preview_manual_dependencies(
-    values: list[str], action: str, *, manifest: dict[str, Any] | None = None
+    values: list[str],
+    action: str,
+    *,
+    manifest: dict[str, Any] | None = None,
+    restore: bool = False,
+    preferences: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Prepare a scoped plan without installing or changing the active manifest."""
+    """生成手动依赖的安装或卸载计划，不安装也不修改当前清单
+
+    恢复备份时 restore 为 True：解析允许构建源码包，ORM 与数据库驱动中不属于
+    核心依赖的包可以随计划安装或变更。
+
+    参数:
+        values: 依赖声明
+        action: install 或 uninstall
+        manifest: 作为基线的依赖层清单，为空时使用当前清单
+        restore: 是否为恢复备份生成的计划
+        preferences: 当前环境中没有的包优先选用的版本
+
+    返回:
+        dict[str, Any]: 依赖计划
+    """
     from zhenxun.services.plugin_store.plugin_store_receipts import (
         receipt_dependency_inputs,
     )
@@ -106,7 +125,8 @@ async def preview_manual_dependencies(
         summary_revision,
     )
 
-    guard_orm_request(requested)
+    if not restore:
+        guard_orm_request(requested, snapshot.versions)
     target = deepcopy(manifest if manifest is not None else snapshot.manifest)
     original = deepcopy(target)
     roots = manual_requirements(target)
@@ -126,8 +146,13 @@ async def preview_manual_dependencies(
     core = protected_core()
     frozen = {
         **core,
-        **{name: baseline[name] for name in ORM_PACKAGES if name in baseline},
+        **{
+            name: baseline[name]
+            for name in ORM_PACKAGES
+            if name in baseline and not restore
+        },
     }
+    preferred = {**(preferences or {}), **baseline}
     plugin_roots = [
         raw
         for owner, raw in dependency_roots(target)
@@ -164,7 +189,11 @@ async def preview_manual_dependencies(
     else:
         candidate_inputs = [raw for items in requested.values() for raw in items]
         probe, diagnostic = await resolve(
-            candidate_inputs, frozen, wheels_only=False, preferences=baseline
+            candidate_inputs,
+            frozen,
+            wheels_only=False,
+            preferences=preferred,
+            allow_build=restore,
         )
         if probe is None:
             raise DependencyAnalysisError("dependency_resolution_failed", diagnostic)
@@ -190,14 +219,16 @@ async def preview_manual_dependencies(
         requirements,
         constraints,
         wheels_only=False,
-        preferences=baseline,
+        preferences=preferred,
+        allow_build=restore,
     )
     if resolved is None:
         resolved, diagnostic = await resolve(
             requirements,
             scoped,
             wheels_only=False,
-            preferences=baseline,
+            preferences=preferred,
+            allow_build=restore,
         )
     if resolved is None:
         raise DependencyAnalysisError("dependency_resolution_failed", diagnostic)
@@ -238,7 +269,8 @@ async def preview_manual_dependencies(
     )
     changes = []
     effective = {**base, **{name: info["version"] for name, info in packages.items()}}
-    guard_orm_changes(current, effective)
+    if not restore:
+        guard_orm_changes(current, effective)
     for name in sorted(set(baseline) | set(effective)):
         before, after = baseline.get(name), effective.get(name)
         if before != after:
@@ -312,14 +344,21 @@ def stage_requirement_files(files: list[Path]) -> bool:
 
 
 def stage_plan(
-    plan: dict[str, Any], requirements: list[str], pending: dict | None = None
+    plan: dict[str, Any],
+    requirements: list[str],
+    pending: dict | None = None,
+    *,
+    restore: bool = False,
 ) -> bool:
     """把依赖计划写入待应用的依赖层事务，由启动器在下次启动 worker 前构建
+
+    恢复备份的计划允许构建源码包，并允许安装非核心的 ORM 与数据库驱动。
 
     参数:
         plan: preview_manual_dependencies 返回的计划
         requirements: 本次登记的依赖声明
         pending: 当前待重启的事务，在其基础上追加
+        restore: 是否为恢复备份生成的计划
 
     返回:
         bool: 是否写入了待应用的事务
@@ -329,7 +368,7 @@ def stage_plan(
 
     if plan["no_change"]:
         return False
-    if plan["source_build_required"]:
+    if plan["source_build_required"] and not restore:
         raise DependencyAnalysisError(
             "source_build_confirmation_required", plan["diagnostic"]
         )
@@ -338,6 +377,11 @@ def stage_plan(
         plan["target_manifest"],
         action="manual_dependencies",
         remaining_conflicts=deepcopy(plan.get("remaining_conflicts", [])),
+        **(
+            {"source_build_confirmed": True, "orm_packages_allowed": True}
+            if restore
+            else {}
+        ),
     )
     transaction["operations"].append(
         {
@@ -347,7 +391,7 @@ def stage_plan(
             "created_at": utc_now(),
             "target_manifest": deepcopy(plan["target_manifest"]),
             "database_migration_possible": False,
-            "source_build_confirmed": False,
+            "source_build_confirmed": restore,
         }
     )
     defer_transaction(transaction)

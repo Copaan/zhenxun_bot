@@ -14,6 +14,7 @@ import uuid
 from filelock import FileLock, Timeout
 from packaging.utils import canonicalize_name
 
+from zhenxun.services.plugin_store.operation_journal import settle_operations
 from zhenxun.services.plugin_store.plugin_store_receipts import source_digest
 from zhenxun.utils.atomic_json import (
     AtomicJsonLockTimeout,
@@ -281,6 +282,9 @@ def cancel_operation(operation_id: str | None = None) -> dict[str, Any]:
             transaction["state"] = "pending_restart"
             transaction.pop("failure_reasons", None)
             _write_pending(transaction)
+        settle_operations(
+            [str(item["operation_id"]) for item in removed], "canceled", "rolled_back"
+        )
         return {
             "apply_mode": "rolled_back",
             "removed_operation_ids": [item["operation_id"] for item in removed],
@@ -299,15 +303,26 @@ def dependency_packages() -> dict[str, str]:
     return packages
 
 
-def _fail_pending(code: str) -> None:
+def fail_pending_transaction(code: str) -> None:
+    """将待重启的源码事务标记为失败
+
+    参数:
+        code: 失败原因
+    """
     with _locked_transaction():
         transaction = _read_pending()
-        if not transaction:
+        if not transaction or transaction.get("state") != "pending_restart":
             return
         transaction["state"] = "failed"
         transaction["failure_reasons"] = [{"code": code}]
         transaction["updated_at"] = _now()
         _write_pending(transaction)
+        settle_operations(
+            [str(item["operation_id"]) for item in transaction.get("operations", [])],
+            "failed",
+            "failed",
+            code,
+        )
 
 
 def _source_changes(
@@ -352,7 +367,7 @@ def prepare_dependency_transaction() -> bool:
             name = canonicalize_name(raw_name)
             if name in core:
                 if core[name] != version:
-                    _fail_pending("core_dependency_conflict")
+                    fail_pending_transaction("core_dependency_conflict")
                     return False
                 continue
             layer_packages[name] = version
@@ -367,7 +382,7 @@ def prepare_dependency_transaction() -> bool:
         source=source,
     )
     if isinstance(result, str):
-        _fail_pending(result)
+        fail_pending_transaction(result)
         return False
     return True
 
@@ -474,6 +489,11 @@ def finalize_pending_transaction() -> None:
                 StoreReceiptStore.set(str(operation["store_key"]), operation["receipt"])
             _remove(ROOT / str(operation["operation_id"]))
         _write_pending(None)
+        settle_operations(
+            [str(item["operation_id"]) for item in transaction.get("operations", [])],
+            "completed",
+            "applied",
+        )
 
 
 def _restore_operations(transaction: dict[str, Any]) -> None:
@@ -499,12 +519,19 @@ def rollback_pending_transaction(
         ]
         transaction["updated_at"] = _now()
         _write_pending(transaction)
+        settle_operations(
+            [str(item["operation_id"]) for item in transaction.get("operations", [])],
+            "failed",
+            "failed",
+            str(transaction["failure_reasons"][0].get("code") or ""),
+        )
 
 
 __all__ = [
     "apply_pending_transaction",
     "cancel_operation",
     "dependency_packages",
+    "fail_pending_transaction",
     "finalize_pending_transaction",
     "pending_transaction",
     "prepare_dependency_transaction",
@@ -515,21 +542,26 @@ __all__ = [
 ]
 
 
-async def preflight_source_requirements(files: list[Path]) -> dict[str, Any]:
+async def preflight_source_requirements(
+    files: list[Path], *, allow_build: bool = False
+) -> dict[str, Any]:
     """按依赖层规则预检商店插件的 requirements 文件，确认可解析且不改动核心依赖
 
     参数:
         files: 插件源码中的 requirements 文件
+        allow_build: 是否允许解析时构建源码包读取依赖信息
 
     返回:
         dict[str, Any]: 解析出的包版本、包变化与是否需要源码构建
 
     异常:
-        DependencyAnalysisError: 依赖声明无效、环境漂移或与核心依赖冲突
+        DependencyAnalysisError: 依赖声明无效、环境漂移、与核心依赖冲突、需要
+            安装工具或会改变已安装的 ORM 与数据库驱动
     """
     from zhenxun.services.nonebot_store import dependencies
     from zhenxun.services.nonebot_store.dependencies import DependencyAnalysisError
     from zhenxun.services.nonebot_store.manual import manual_requirements
+    from zhenxun.services.nonebot_store.policy import guard_orm_changes
 
     requirements = dependencies.read_requirement_files(files)
     if not requirements:
@@ -549,26 +581,46 @@ async def preflight_source_requirements(files: list[Path]) -> dict[str, Any]:
         for raw in values
     )
     resolved, error = await dependencies._compile(
-        requirements, current, wheels_only=False
+        requirements, current, wheels_only=False, allow_build=allow_build
     )
     if resolved is None:
         resolved, error = await dependencies._compile(
-            requirements, core, wheels_only=False
+            requirements, core, wheels_only=False, allow_build=allow_build
         )
     if resolved is None:
-        raise DependencyAnalysisError("core_dependency_conflict", error)
+        free, _ = await dependencies._compile(
+            requirements, {}, wheels_only=False, allow_build=allow_build
+        )
+        raise DependencyAnalysisError(
+            "dependency_resolution_failed"
+            if free is None
+            else "core_dependency_conflict",
+            error,
+        )
     for name, version in resolved.items():
         if name in core and core[name] != version:
             raise DependencyAnalysisError("core_dependency_conflict")
-    wheel_resolved, _ = await dependencies._compile(
-        requirements,
-        resolved,
-        wheels_only=False,
-        restricted_packages=tuple(sorted(resolved)),
-    )
+    changes = dependencies._package_changes(resolved, current)
+    changed = {item["name"] for item in [*changes["added"], *changes["changed"]]}
+    tools = sorted(changed & dependencies.FORBIDDEN_LAYER_PACKAGES)
+    if tools:
+        raise DependencyAnalysisError(
+            "dependency_requirement_unsupported", "、".join(tools)
+        )
+    guard_orm_changes(current, {**current, **resolved})
+    if allow_build:
+        source_build_required = True
+    else:
+        wheel_resolved, _ = await dependencies._compile(
+            requirements,
+            resolved,
+            wheels_only=False,
+            restricted_packages=tuple(sorted(resolved)),
+        )
+        source_build_required = wheel_resolved is None
     return {
         "resolved_packages": resolved,
-        "package_changes": dependencies._package_changes(resolved, current),
+        "package_changes": changes,
         "candidate_inputs": candidate_inputs,
-        "source_build_required": wheel_resolved is None,
+        "source_build_required": source_build_required,
     }

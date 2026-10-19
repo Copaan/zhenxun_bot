@@ -103,6 +103,35 @@ def record_operation(store_key: str, result: dict[str, Any]) -> str:
     return operation_id
 
 
+def settle_operations(
+    operation_ids: list[str], status: str, apply_mode: str, reason: str = ""
+) -> None:
+    """更新待重启操作的最终状态
+
+    参数:
+        operation_ids: 操作 ID
+        status: 操作状态
+        apply_mode: 生效方式
+        reason: 失败原因
+    """
+    if not operation_ids:
+        return
+
+    def update(state: dict[str, Any]) -> None:
+        for operation_id in operation_ids:
+            entry = state.get("operations", {}).get(operation_id)
+            if not isinstance(entry, dict):
+                continue
+            changes = {"status": status, "apply_mode": apply_mode}
+            entry.update(changes, updated_at=_now())
+            result = entry.setdefault("result", {})
+            result.update(changes, restart_required=False, restart_available=False)
+            if reason:
+                result.update(reason=reason, reason_codes=[reason])
+
+    mutate_json_locked(_JOURNAL_FILE, {}, update)
+
+
 def operation_status(operation_id: str) -> dict[str, Any] | None:
     state = read_json_locked(_JOURNAL_FILE, {})
     value = state.get("operations", {}).get(operation_id)
@@ -113,4 +142,5 @@ __all__ = [
     "begin_operation",
     "operation_status",
     "record_operation",
+    "settle_operations",
 ]

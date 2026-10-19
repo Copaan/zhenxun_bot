@@ -175,6 +175,7 @@ def inspect(path: Path, password: str | None = None) -> dict:
         "plugins": sorted(saved["plugins"]),
         "manual_requirements": sorted(saved["manual_requirements"]),
         "extra_requirements": sorted(saved["extra_requirements"]),
+        "unsupported_requirements": sorted(saved.get("unsupported_requirements") or {}),
         "python": saved["python"],
         "platform": saved["platform"],
         "warnings": warnings,
@@ -532,7 +533,10 @@ def _apply(request: dict, root: Path) -> None:
     try:
         if request["kind"] == "restore":
             saved = json.loads((PACKAGE / backup.DEPENDENCIES).read_text("utf-8"))
-            report = asyncio.run(deps.stage_restore(saved, request["skip_failed"]))
+            files = PACKAGE / "files" if "plugins" in request["categories"] else None
+            report = asyncio.run(
+                deps.stage_restore(saved, request["skip_failed"], files)
+            )
             _save(request, dependencies=report)
     except Exception as error:
         _save(

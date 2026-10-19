@@ -25,8 +25,8 @@ setup_router = APIRouter(
 class ExportPayload(BaseModel):
     categories: list[str] = list(backup.DEFAULT_CATEGORIES)
     """备份的文件分类"""
-    extras: list[str] = []
-    """一并带上的未纳管依赖包名"""
+    extras: list[str] | None = None
+    """高级模式选择记录的依赖包名，为空时记录全部依赖"""
     password: str | None = None
     """加密密码"""
 

@@ -28,8 +28,8 @@ class PluginTransactions:
     async def apply(self) -> None:
         """在启动 worker 前应用待处理事务，并记录需要验证的部分"""
         source_before = source_store.pending_transaction()
-        nonebot_before = nonebot_storage.pending_transaction()
         dependencies_ready = source_store.prepare_dependency_transaction()
+        nonebot_before = nonebot_storage.pending_transaction()
         nonebot_applied = False
         if dependencies_ready and nonebot_storage.pending_transaction():
             nonebot_applied = await run_maintenance("nonebot-apply")
@@ -41,6 +41,11 @@ class PluginTransactions:
             and nonebot_after.get("state")
             in {"failed", "migration_blocked", "recovery_required"}
         )
+        if nonebot_failed and source_before:
+            source_store.fail_pending_transaction(
+                (nonebot_after or {}).get("error_code")
+                or "dependency_layer_build_failed"
+            )
         source_applied = (
             await run_maintenance("source-apply")
             if dependencies_ready

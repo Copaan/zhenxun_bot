@@ -38,13 +38,21 @@ ORM_PACKAGES = frozenset(
 
 
 def guard_orm_changes(before: dict, after: dict) -> None:
-    """Keep ORM packages and drivers under console ownership, including absences."""
+    """已安装的 ORM 与数据库驱动只能在控制台改变版本，新增与移除不受限制
+
+    参数:
+        before: 变更前的包版本
+        after: 变更后的包版本
+
+    异常:
+        DependencyAnalysisError: 已安装的 ORM 或数据库驱动版本会变化
+    """
     from .dependencies import DependencyAnalysisError
 
     changes = [
         {"name": name, "from": before.get(name), "to": after.get(name)}
         for name in sorted(ORM_PACKAGES)
-        if before.get(name) != after.get(name)
+        if before.get(name) and after.get(name) and before[name] != after[name]
     ]
     if changes:
         raise DependencyAnalysisError(
@@ -52,10 +60,19 @@ def guard_orm_changes(before: dict, after: dict) -> None:
         )
 
 
-def guard_orm_request(names) -> None:
+def guard_orm_request(names, installed) -> None:
+    """已安装的 ORM 与数据库驱动只能在控制台安装、升级或卸载
+
+    参数:
+        names: 本次操作的包名
+        installed: 当前已安装的包
+
+    异常:
+        DependencyAnalysisError: 操作涉及已安装的 ORM 或数据库驱动
+    """
     from .dependencies import DependencyAnalysisError
 
-    packages = sorted(set(names) & ORM_PACKAGES)
+    packages = sorted(set(names) & ORM_PACKAGES & set(installed))
     if packages:
         raise DependencyAnalysisError(
             "orm_dependency_console_required", details=packages

@@ -11,7 +11,13 @@ from urllib.parse import unquote, urljoin, urlsplit
 import zipfile
 
 from packaging.specifiers import SpecifierSet
-from packaging.utils import canonicalize_name, parse_sdist_filename
+from packaging.utils import (
+    InvalidSdistFilename,
+    InvalidWheelFilename,
+    canonicalize_name,
+    parse_sdist_filename,
+    parse_wheel_filename,
+)
 from packaging.version import Version
 
 _ARCHIVE_LIMIT = 64 * 1024 * 1024
@@ -69,11 +75,76 @@ def _metadata(data: bytes, filename: str, expected: str) -> tuple[bytes, str]:
     }:
         raise DependencyAnalysisError(
             "dependency_source_metadata_unavailable",
-            "Source dependencies require execution of its build backend; "
-            "provide a wheel or install this package in the console.",
+            f"源码包 {expected} 需要执行构建才能读取依赖信息",
             details={"package": expected},
         )
     return raw, version
+
+
+async def _index_links(client, name: str, environment: dict) -> list[str]:
+    """读取包索引中某个包的全部下载链接，使用第一个包含该包的索引
+
+    参数:
+        client: HTTP 客户端
+        name: 规范化的包名
+        environment: 安装器环境变量
+
+    返回:
+        list[str]: 下载链接，已排除被撤回的文件
+    """
+    if environment.get("UV_NO_INDEX"):
+        return []
+    indexes = [
+        *environment.get("UV_INDEX", "").split(),
+        environment.get("UV_DEFAULT_INDEX", "https://pypi.org/simple"),
+    ]
+    for index in indexes:
+        match = re.match(r"^([A-Za-z0-9_-]+)=(https?://.*)$", index)
+        auth = None
+        if match:
+            label, index = match.groups()
+            key = re.sub(r"[^A-Za-z0-9]", "_", label).upper()
+            username = environment.get(f"UV_INDEX_{key}_USERNAME")
+            if username is not None:
+                auth = (username, environment.get(f"UV_INDEX_{key}_PASSWORD", ""))
+        url = index.rstrip("/") + "/" + name + "/"
+        response = await client.get(url, auth=auth)
+        if response.status_code == 404:
+            continue
+        response.raise_for_status()
+        links = _Links()
+        links.feed(response.text)
+        return [urljoin(str(response.url), link) for link in links.links]
+    return []
+
+
+async def index_versions(name: str) -> list[Version]:
+    """包索引中某个包可下载的全部版本
+
+    参数:
+        name: 规范化的包名
+
+    返回:
+        list[Version]: 从低到高排列的版本
+    """
+    from zhenxun.services.installer_network import installer_environment
+    from zhenxun.services.network_proxy import ManagedAsyncClient
+
+    async with ManagedAsyncClient(timeout=30, follow_redirects=True) as client:
+        links = await _index_links(client, name, installer_environment())
+    versions = set()
+    for link in links:
+        filename = unquote(urlsplit(link).path.rsplit("/", 1)[-1])
+        try:
+            if filename.endswith(".whl"):
+                project, version = parse_wheel_filename(filename)[:2]
+            else:
+                project, version = parse_sdist_filename(filename)
+        except (InvalidSdistFilename, InvalidWheelFilename):
+            continue
+        if project == name:
+            versions.add(version)
+    return sorted(versions)
 
 
 async def project_static_sources(
@@ -91,32 +162,7 @@ async def project_static_sources(
             path.as_uri() for path in Path(local).iterdir() if path.is_file()
         )
     async with ManagedAsyncClient(timeout=30, follow_redirects=True) as client:
-        if not environment.get("UV_NO_INDEX"):
-            indexes = [
-                *environment.get("UV_INDEX", "").split(),
-                environment.get("UV_DEFAULT_INDEX", "https://pypi.org/simple"),
-            ]
-            for index in indexes:
-                match = re.match(r"^([A-Za-z0-9_-]+)=(https?://.*)$", index)
-                auth = None
-                if match:
-                    label, index = match.groups()
-                    key = re.sub(r"[^A-Za-z0-9]", "_", label).upper()
-                    username = environment.get(f"UV_INDEX_{key}_USERNAME")
-                    if username is not None:
-                        auth = (
-                            username,
-                            environment.get(f"UV_INDEX_{key}_PASSWORD", ""),
-                        )
-                url = index.rstrip("/") + "/" + name + "/"
-                response = await client.get(url, auth=auth)
-                if response.status_code == 404:
-                    continue
-                response.raise_for_status()
-                links = _Links()
-                links.feed(response.text)
-                sources.extend(urljoin(str(response.url), link) for link in links.links)
-                break
+        sources.extend(await _index_links(client, name, environment))
         added = False
         for source in sources:
             url = urlsplit(source)

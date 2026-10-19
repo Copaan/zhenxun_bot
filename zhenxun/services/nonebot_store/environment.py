@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import ast
 from collections.abc import Iterable
+import csv
 from dataclasses import dataclass
+from functools import cached_property
 import importlib.metadata as metadata
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import sys
 from typing import Any
 from urllib.parse import urldefrag
@@ -32,12 +34,37 @@ def _invalid(owner: str, value: str):
     )
 
 
+class _CachedDistribution(metadata.PathDistribution):
+    """只解析一次元数据的发行包"""
+
+    @cached_property
+    def metadata(self):  # pyright: ignore[reportIncompatibleMethodOverride]
+        return super().metadata
+
+
+def _recorded_files(distribution) -> list:
+    """读取包安装记录中的文件路径，不逐个检查文件是否存在
+
+    参数:
+        distribution: 已安装的包
+
+    返回:
+        list: 相对包安装目录的文件路径
+    """
+    text = distribution.read_text("RECORD")
+    if text is None:
+        return list(distribution.files or ())
+    return [PurePosixPath(row[0]) for row in csv.reader(text.splitlines()) if row]
+
+
 def distributions(paths=None) -> tuple[dict, dict]:
     """Select the first distribution on each search path, retaining duplicates."""
     selected, duplicates = {}, {}
     for distribution in metadata.distributions(
         path=paths if paths is not None else sys.path
     ):
+        if type(distribution) is metadata.PathDistribution:
+            distribution = _CachedDistribution(distribution._path)
         raw_name = distribution.metadata.get("Name")
         if not raw_name:
             continue
@@ -408,7 +435,7 @@ def capture_environment(
                 )
         except InvalidSpecifier:
             _invalid(name, python)
-        for file in dist.files or ():
+        for file in _recorded_files(dist):
             parts = file.parts
             if not (
                 (len(parts) == 2 and parts[1] == "__init__.py")
@@ -418,8 +445,10 @@ def capture_environment(
             module_name = parts[0].removesuffix(".py")
             module = sys.modules.get(module_name)
             actual_path = getattr(module, "__file__", None)
+            if not actual_path:
+                continue
             expected_path = Path(dist.locate_file(file)).resolve()
-            if actual_path and Path(actual_path).resolve() != expected_path:
+            if expected_path.exists() and Path(actual_path).resolve() != expected_path:
                 loaded.append(
                     {
                         "name": name,
@@ -553,7 +582,8 @@ def validate_candidate(path: Path, transaction: dict[str, Any]) -> dict:
     baseline = capture_environment(
         manifest=transaction.get("base_manifest") or load_manifest()
     )
-    guard_orm_changes(baseline.versions, snapshot.versions)
+    if not transaction.get("orm_packages_allowed"):
+        guard_orm_changes(baseline.versions, snapshot.versions)
     permitted = transaction.get(
         "remaining_conflicts", snapshot.manifest.get("dependency_warnings", [])
     )

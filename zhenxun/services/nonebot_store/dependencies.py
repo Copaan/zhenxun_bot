@@ -68,7 +68,7 @@ IMMUTABLE_ANCHORS = frozenset(
         "aiocache",
     }
 )
-FORBIDDEN_LAYER_PACKAGES = frozenset({PROJECT_NAME, "pip", "setuptools", "wheel", "uv"})
+FORBIDDEN_LAYER_PACKAGES = frozenset({PROJECT_NAME, "pip", "uv"})
 DependencyTier = Literal[
     "immutable_core", "shared_compatible", "plugin_private", "external_extra"
 ]
@@ -647,6 +647,7 @@ async def _compile(
     restricted_packages: tuple[str, ...] = (),
     preferences: dict[str, str] | None = None,
     no_dependencies: bool = False,
+    allow_build: bool = False,
     _metadata_links: tuple[Path, ...] = (),
 ) -> tuple[dict[str, str] | None, str]:
     from zhenxun.services.installer_network import (
@@ -669,9 +670,10 @@ async def _compile(
             # uv reuses existing output pins as preferences, not hard constraints.
             _write_constraints(output, preferences)
         command = uv_compile_command(source, output, constraint_file)
-        command.extend(
-            uv_binary_options(wheels_only=True) if wheels_only else ["--no-build"]
-        )
+        if wheels_only:
+            command.extend(uv_binary_options(wheels_only=True))
+        elif not allow_build:
+            command.append("--no-build")
         if no_dependencies:
             command.append("--no-deps")
         environment = installer_environment()
@@ -727,7 +729,12 @@ async def _compile(
         if process.returncode != 0 or not output.exists():
             _check_resolution_failure(details)
             missing = re.search(r"Wheels are required for `([A-Za-z0-9_.-]+)`", details)
-            if not wheels_only and missing and len(_metadata_links) < 32:
+            if (
+                not wheels_only
+                and not allow_build
+                and missing
+                and len(_metadata_links) < 32
+            ):
                 name = canonicalize_name(missing.group(1))
                 projected = any(
                     list(link.glob(name.replace("-", "_") + "-*.whl"))
@@ -759,6 +766,68 @@ async def _compile(
                         )
             return None, details
         return _parse_compiled(output), details
+
+
+async def prebuild_packages(packages: dict[str, str]) -> dict[str, str]:
+    """把包安装到临时目录，提前构建源码包并留在 uv 缓存中
+
+    整体安装失败时逐个安装，找出失败的包。
+
+    参数:
+        packages: 包名 -> 版本
+
+    返回:
+        dict[str, str]: 安装失败的包 -> 错误说明
+    """
+    import psutil
+
+    from zhenxun.services.installer_network import installer_environment, uv_command
+    from zhenxun.utils.process_tree import kill_tree, verified_descendants
+
+    async def install(names: list[str]) -> str | None:
+        with tempfile.TemporaryDirectory(prefix="zhenxun_prebuild_") as root:
+            requirements = Path(root) / "requirements.txt"
+            requirements.write_text(
+                "".join(f"{name}=={packages[name]}\n" for name in names),
+                encoding="utf-8",
+            )
+            process = await asyncio.create_subprocess_exec(
+                *uv_command(
+                    "pip",
+                    "install",
+                    "--target",
+                    str(Path(root) / "target"),
+                    "--requirements",
+                    str(requirements),
+                    "--no-deps",
+                    "--python",
+                    sys.executable,
+                ),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=installer_environment(),
+            )
+            try:
+                _, stderr = await asyncio.wait_for(process.communicate(), 1800)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                with contextlib.suppress(psutil.NoSuchProcess):
+                    owned = psutil.Process(process.pid)
+                    await asyncio.to_thread(
+                        kill_tree, [owned, *verified_descendants(owned)]
+                    )
+                raise
+            if process.returncode == 0:
+                return None
+            return safe_process_error(stderr.decode(errors="replace"))
+
+    if not packages or await install(list(packages)) is None:
+        return {}
+    failed = {}
+    for name in packages:
+        error = await install([name])
+        if error:
+            failed[name] = error
+    return failed
 
 
 def _check_resolution_failure(details: str) -> None:
@@ -847,7 +916,7 @@ def _compatibility_overrides(
             inputs.append(str(requirement))
             continue
         if name in ORM_PACKAGES:
-            guard_orm_request({name})
+            guard_orm_request({name}, current)
         if name in immutable:
             raise DependencyAnalysisError(
                 "core_dependency_conflict",
@@ -886,7 +955,20 @@ async def solve_install(
     *,
     manifest: dict[str, Any] | None = None,
     prefer_existing: bool = True,
+    allow_build: bool = False,
 ) -> dict[str, Any]:
+    """解析安装 NoneBot 插件后的依赖层
+
+    参数:
+        plugin: 商店中的插件信息
+        metadata: 插件在 PyPI 上的元数据
+        manifest: 作为基线的依赖层清单，为空时使用当前清单
+        prefer_existing: 插件声明不包含已安装版本时是否优先保留已安装版本
+        allow_build: 是否允许解析时构建源码包读取依赖信息
+
+    返回:
+        dict[str, Any]: 安装计划
+    """
     from .environment import capture_environment
 
     snapshot = capture_environment()
@@ -941,15 +1023,11 @@ async def solve_install(
         scoped_roots,
     )
 
-    guard_orm_request({canonicalize_name(str(plugin["project_link"]))})
+    guard_orm_request({canonicalize_name(str(plugin["project_link"]))}, current)
     frozen = {
         **immutable,
         **{name: current[name] for name in ORM_PACKAGES if name in current},
     }
-    for requirement in _active_metadata_requirements(metadata):
-        name = canonicalize_name(requirement.name)
-        if name in ORM_PACKAGES and name not in current:
-            guard_orm_request({name})
     overrides, candidate_dependencies = _compatibility_overrides(
         metadata,
         immutable=immutable,
@@ -978,11 +1056,19 @@ async def solve_install(
     # Discover only the requested plugin's closure. Other installed plugins
     # participate in compatibility checks, never in the scope allowed to move.
     candidate_probe, candidate_error = await _compile(
-        candidate_inputs, baseline, wheels_only=False, preferences=baseline
+        candidate_inputs,
+        baseline,
+        wheels_only=False,
+        allow_build=allow_build,
+        preferences=baseline,
     )
     if candidate_probe is None:
         candidate_probe, candidate_error = await _compile(
-            candidate_inputs, frozen, wheels_only=False, preferences=baseline
+            candidate_inputs,
+            frozen,
+            wheels_only=False,
+            allow_build=allow_build,
+            preferences=baseline,
         )
     if candidate_probe is None:
         raise DependencyAnalysisError("plugin_dependency_invalid", candidate_error)
@@ -1011,16 +1097,27 @@ async def solve_install(
             scoped_constraints[name] = version
 
     resolved, strict_error = await _compile(
-        requirements, strict_constraints, wheels_only=False, preferences=baseline
+        requirements,
+        strict_constraints,
+        wheels_only=False,
+        allow_build=allow_build,
+        preferences=baseline,
     )
     if resolved is None:
         resolved, relaxed_error = await _compile(
-            requirements, scoped_constraints, wheels_only=False, preferences=baseline
+            requirements,
+            scoped_constraints,
+            wheels_only=False,
+            allow_build=allow_build,
+            preferences=baseline,
         )
         if resolved is None:
             candidate_requirements = [*project_requirements(), *candidate_inputs]
             candidate_core, candidate_core_error = await _compile(
-                candidate_requirements, immutable, wheels_only=False
+                candidate_requirements,
+                immutable,
+                wheels_only=False,
+                allow_build=allow_build,
             )
             if candidate_core is not None:
                 raise DependencyAnalysisError(
@@ -1028,7 +1125,7 @@ async def solve_install(
                     relaxed_error or strict_error,
                 )
             candidate_free, candidate_free_error = await _compile(
-                candidate_inputs, {}, wheels_only=False
+                candidate_inputs, {}, wheels_only=False, allow_build=allow_build
             )
             if candidate_free is not None:
                 raise DependencyAnalysisError(
@@ -1071,7 +1168,7 @@ async def solve_install(
         )
 
     final_candidate, final_error = await _compile(
-        candidate_inputs, resolved, wheels_only=False
+        candidate_inputs, resolved, wheels_only=False, allow_build=allow_build
     )
     if final_candidate is None:
         raise DependencyAnalysisError("dependency_resolution_failed", final_error)
@@ -1082,11 +1179,12 @@ async def solve_install(
         plugin_inputs,
         resolved,
         wheels_only=False,
+        allow_build=allow_build,
         restricted_packages=tuple(sorted(resolved)),
     )
     if plugin_resolved is None:
         plugin_resolved, source_error = await _compile(
-            plugin_inputs, resolved, wheels_only=False
+            plugin_inputs, resolved, wheels_only=False, allow_build=allow_build
         )
         if plugin_resolved is None:
             raise DependencyAnalysisError(
@@ -1153,7 +1251,7 @@ async def solve_install(
         filename.endswith(("-py3-none-any.whl", "-py2.py3-none-any.whl"))
         for filename in wheel_status["compatible_wheel_files"]
     )
-    source_required = source_required or not wheel_status["compatible"]
+    source_required = source_required or allow_build or not wheel_status["compatible"]
     candidate_requirement_names = {
         canonicalize_name(requirement.name)
         for requirement in _active_metadata_requirements(metadata)
@@ -1241,8 +1339,8 @@ def uninstall_plan(
     from .environment import capture_environment
     from .policy import guard_orm_request, retained_conflicts
 
-    guard_orm_request({project})
     snapshot = capture_environment()
+    guard_orm_request({project}, snapshot.versions)
     owners = sorted(
         {
             item["owner"]

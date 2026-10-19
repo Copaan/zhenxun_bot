@@ -13,6 +13,7 @@ import tempfile
 from typing import ClassVar, Literal
 import zipfile
 
+from packaging.utils import canonicalize_name
 import pyzipper
 
 from . import data, deps
@@ -163,7 +164,7 @@ def scan(root: Path | None = None, db_url: str | None = None) -> dict:
     return {
         "categories": sizes,
         "default_categories": list(DEFAULT_CATEGORIES),
-        "dependencies": deps.unmanaged(root),
+        "dependencies": deps.inventory(root),
     }
 
 
@@ -224,7 +225,7 @@ async def export_backup(
 
     参数:
         categories: 备份的文件分类
-        extras: 一并带上的未纳管依赖包名
+        extras: 高级模式选择记录的依赖包名，为 None 时记录全部依赖
         password: 加密密码，为空时不加密
         root: 项目根目录
         db_url: 数据库地址，默认使用当前配置
@@ -244,10 +245,11 @@ async def export_backup(
         destination or root / BACKUP_DIR / f"zhenxun-{now:%Y%m%d-%H%M%S}{SUFFIX}"
     ).resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)
-    selected = {name.casefold() for name in extras or ()}
-    dependencies = deps.snapshot(
-        [item for item in deps.unmanaged(root) if item["name"] in selected]
-    )
+    items = deps.inventory(root)
+    if extras is not None:
+        selected = {canonicalize_name(name) for name in extras}
+        items = [item for item in items if item["name"] in selected]
+    dependencies = deps.snapshot(items)
     work = Path(tempfile.mkdtemp(prefix=".zx-export-", dir=destination.parent))
     part = destination.with_name(destination.name + ".part")
     try:
@@ -423,12 +425,14 @@ class ExportTask:
     _task: ClassVar[asyncio.Task | None] = None
 
     @classmethod
-    def start(cls, categories, extras: list[str], password: str | None = None) -> dict:
+    def start(
+        cls, categories, extras: list[str] | None, password: str | None = None
+    ) -> dict:
         """开始导出
 
         参数:
             categories: 备份的文件分类
-            extras: 一并带上的未纳管依赖包名
+            extras: 高级模式选择记录的依赖包名，为 None 时记录全部依赖
             password: 加密密码
 
         返回:

@@ -307,18 +307,29 @@ def _build_generation(
     effective.update(
         {name: str(info.get("version")) for name, info in packages.items()}
     )
-    guard_orm_changes(before.versions, effective)
+    allow_orm = bool(transaction.get("orm_packages_allowed"))
+    if not allow_orm:
+        guard_orm_changes(before.versions, effective)
     core = protected_core()
+    copied = (
+        set()
+        if allow_orm
+        else {name for name in set(packages) & ORM_PACKAGES if name in before.layer}
+    )
     requested: list[str] = []
+    wheel_only: list[str] = []
     for raw_name, info in sorted(packages.items()):
         name = canonicalize_name(str(raw_name))
         if name in core:
             raise LayerBuildError("core_dependency_in_layer")
         if not isinstance(info, dict) or not info.get("version"):
             raise LayerBuildError("dependency_plan_invalid")
-        if name in ORM_PACKAGES:
+        if name in copied:
             continue
         requested.append(f"{name}=={info['version']}")
+        current = before.layer.get(name)
+        if current is None or current.version != str(info["version"]):
+            wheel_only.append(name)
 
     manifest = load_manifest()
     generation = next_generation(manifest)
@@ -331,10 +342,8 @@ def _build_generation(
         prefix=f"generation-{generation}-", dir=str(LAYER_ROOT)
     ) as temporary:
         staging = Path(temporary)
-        for name in set(packages) & ORM_PACKAGES:
-            distribution = before.layer.get(name)
-            if distribution is None:
-                raise LayerBuildError("orm_dependency_console_required", name)
+        for name in copied:
+            distribution = before.layer[name]
             source_root = Path(distribution.locate_file("")).resolve()
             for file in distribution.files or ():
                 source = Path(distribution.locate_file(file)).resolve()
@@ -363,7 +372,10 @@ def _build_generation(
             )
             command.extend(
                 uv_binary_options(
-                    wheels_only=not transaction.get("source_build_confirmed")
+                    wheels_only=False,
+                    restricted_packages=()
+                    if transaction.get("source_build_confirmed")
+                    else tuple(wheel_only),
                 )
             )
             try:
