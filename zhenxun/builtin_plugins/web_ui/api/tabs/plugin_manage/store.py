@@ -1,13 +1,14 @@
 import asyncio
 from collections.abc import AsyncIterator, Callable, Coroutine
 from contextlib import asynccontextmanager
+from pathlib import Path
 import time
-from typing import Any
+from typing import Any, Literal
 import uuid
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
-from nonebot import require
+from nonebot import get_loaded_plugins, require
 from nonebot.compat import model_dump
 from packaging.version import InvalidVersion, Version
 
@@ -196,6 +197,42 @@ def _install_state(
     }[comparison]
 
 
+def _read_local_artifacts(
+    targets: list[tuple[Path, bool]],
+) -> list[tuple[bool, str | None, str | None]]:
+    """读取商店插件对应的本地文件状态
+
+    参数:
+        targets: 插件本地路径与是否需要计算源码摘要
+
+    返回:
+        list[tuple[bool, str | None, str | None]]: 是否存在、元数据版本、源码摘要
+    """
+    artifacts = []
+    for path, need_digest in targets:
+        exists = path.exists()
+        artifacts.append(
+            (
+                exists,
+                artifact_version(path) if exists else None,
+                source_digest(path) if exists and need_digest else None,
+            )
+        )
+    return artifacts
+
+
+def _warm_reload_classification() -> None:
+    """预先计算已加载扩展插件的热处理分类，填充源码分析缓存"""
+    try:
+        for plugin in list(get_loaded_plugins()):
+            if plugin.parent_plugin is None and plugin.module_name.startswith(
+                "zhenxun.plugins."
+            ):
+                plugin_host.classification_for(plugin.module_name)
+    except Exception as error:
+        logger.debug(f"预热插件热处理分类失败: {type(error).__name__}", "WebUi")
+
+
 @asynccontextmanager
 async def _store_operation(
     *,
@@ -381,7 +418,9 @@ def _finish_operation(
     response_class=JSONResponse,
     description="获取插件商店插件信息",  # type: ignore
 )
-async def _(refresh: bool = False) -> Result[dict]:
+async def _(
+    refresh: bool = False, download_source: Literal["auto", "ali", "git"] = "auto"
+) -> Result[dict]:
     try:
         require("plugin_store")
         from zhenxun.builtin_plugins.plugin_store import StoreManager
@@ -389,11 +428,14 @@ async def _(refresh: bool = False) -> Result[dict]:
             public_transaction,
         )
 
-        official_plugins, community_plugins = await StoreManager.get_data(
-            refresh=refresh
+        source = None if download_source == "auto" else download_source
+        (official_plugins, community_plugins), _, _ = await asyncio.gather(
+            StoreManager.get_data(refresh=refresh, source=source),
+            StoreManager.catalog_files(refresh=refresh, source=source),
+            asyncio.to_thread(_warm_reload_classification),
         )
         catalog_health = await StoreManager.catalog_health(
-            official_plugins, refresh=refresh
+            official_plugins, source=source
         )
         installed_plugins = await StoreManager.get_installed_plugins()
         receipts = StoreReceiptStore.load()
@@ -403,13 +445,23 @@ async def _(refresh: bool = False) -> Result[dict]:
             str(item.get("store_key")): item
             for item in transaction.get("operations", [])
         }
+        entries = [(item, "official") for item in official_plugins] + [
+            (item, "community") for item in community_plugins
+        ]
+        artifacts = await asyncio.to_thread(
+            _read_local_artifacts,
+            [
+                (
+                    StoreManager._resolve_local_plugin_path(item),
+                    _store_key(item_source, item.module) in receipts,
+                )
+                for item, item_source in entries
+            ],
+        )
         plugin_list = []
-        for idx, (plugin, source) in enumerate(
-            [(item, "official") for item in official_plugins]
-            + [(item, "community") for item in community_plugins]
-        ):
+        for idx, ((plugin, source), artifact) in enumerate(zip(entries, artifacts)):
+            exists, local_version, digest = artifact
             store_key = _store_key(source, plugin.module)
-            path = StoreManager._resolve_local_plugin_path(plugin)
             installed_version = installed_plugins.get(plugin.module)
             pending = pending_by_key.get(store_key) or {}
             item = {
@@ -419,7 +471,7 @@ async def _(refresh: bool = False) -> Result[dict]:
                 "source": source,
                 "store_key": store_key,
                 "capabilities": _plugin_capabilities(plugin),
-                "installed": path.exists() or installed_version is not None,
+                "installed": exists or installed_version is not None,
                 "installed_version": installed_version,
                 "runtime_module": None,
                 "install_state": "not_installed",
@@ -447,18 +499,16 @@ async def _(refresh: bool = False) -> Result[dict]:
                     or StoreManager.runtime_module(plugin)
                 )
                 state, update_available = _install_state(
-                    installed_version=(
-                        artifact_version(path) if path.exists() else None
-                    )
-                    or installed_version,
+                    installed_version=local_version or installed_version,
                     catalog_version=str(plugin.version),
-                    digest=source_digest(path) if receipt else None,
+                    digest=digest if receipt else None,
                     receipt=receipt,
                 )
                 item.update(
                     runtime_module=runtime_module,
                     install_state=state,
                     update_available=update_available,
+                    parked=plugin_host.is_parked(runtime_module),
                     **plugin_host.classification_for(runtime_module),
                 )
             plugin_list.append(item)
@@ -495,11 +545,18 @@ async def _install_or_update(param: PluginIr, action: str) -> Result:
             require("plugin_store")
             from zhenxun.builtin_plugins.plugin_store import StoreManager
 
+            requested_source = (
+                None if param.download_source == "auto" else param.download_source
+            )
             plugin_info, is_external = await StoreManager.get_plugin_by_value(
-                _request_value(param), is_update=action == "update"
+                _request_value(param),
+                is_update=action == "update",
+                source=requested_source,
             )
             if action == "install" and not is_external:
-                health = await StoreManager.catalog_health([plugin_info])
+                health = await StoreManager.catalog_health(
+                    [plugin_info], source=requested_source
+                )
                 if health.get(plugin_info.module, {}).get("status") == "missing":
                     return Result.fail("catalog_source_missing", code=409)
             source = _validate_requested_source(param, is_external=is_external)
@@ -527,7 +584,7 @@ async def _install_or_update(param: PluginIr, action: str) -> Result:
                 operation = await StoreManager.apply_plugin(
                     plugin_info,
                     is_external,
-                    None if param.download_source == "auto" else param.download_source,
+                    requested_source,
                     confirm_source_build=param.confirm_source_build,
                     operation_id=journal_operation_id,
                 )

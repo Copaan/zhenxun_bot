@@ -1,7 +1,8 @@
 import asyncio
+from typing import Annotated
 from urllib.parse import urlsplit
 
-from fastapi import APIRouter, UploadFile
+from fastapi import APIRouter, Depends, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
@@ -13,8 +14,12 @@ from ...restart_service import preferred_access_urls, request_webui_restart
 from ...utils import authentication
 from ..configure.data_source import build_database_url, probe_database
 from ..configure.model import DatabaseConfig
+from ..configure.setup_access import SetupSession, require_setup_token, setup_access
 
 router = APIRouter(prefix="/backup", dependencies=[authentication()])
+setup_router = APIRouter(
+    prefix="/configure/backup", dependencies=[Depends(require_setup_token)]
+)
 
 
 class ExportPayload(BaseModel):
@@ -40,6 +45,11 @@ class RestorePayload(InspectPayload):
     """依赖无法安装时跳过对应插件继续"""
 
 
+class SetupRestorePayload(RestorePayload):
+    database: DatabaseConfig
+    """恢复到的数据库，须为空库"""
+
+
 def _restored_access(preview: dict | None) -> dict | None:
     """备份中的配置恢复后 WebUI 的访问地址与管理员账号
 
@@ -47,7 +57,8 @@ def _restored_access(preview: dict | None) -> dict | None:
         preview: restore.configuration_preview 的结果
 
     返回:
-        dict | None: access_urls 为访问地址（无法确定时为空），username 为管理员账号
+        dict | None: access_urls 为访问地址（无法确定时为空），username 为管理员账号，
+            password_set 为是否设置了管理员密码
     """
     if preview is None:
         return None
@@ -60,13 +71,17 @@ def _restored_access(preview: dict | None) -> dict | None:
             )
         except (WebUITLSConfigError, ValueError):
             pass
-    return {"access_urls": urls, "username": preview["username"]}
+    return {
+        "access_urls": urls,
+        "username": preview["username"],
+        "password_set": preview["password_set"],
+    }
 
 
 class _Restart:
     """调用 WebUI 重启并保留重启信息，供前端等待新进程
 
-    恢复配置时，新进程按备份中的配置监听，重启信息中的访问地址改为备份中的地址
+    恢复配置时，重启信息中的访问地址按恢复后生效的配置计算
     """
 
     def __init__(self, categories: list[str] | None = None):
@@ -131,6 +146,9 @@ async def _(name: str):
     return FileResponse(path, filename=path.name, media_type="application/zip")
 
 
+@setup_router.post(
+    "/upload", response_class=JSONResponse, description="首次部署上传备份包"
+)
 @router.post("/upload", response_class=JSONResponse, description="上传备份包")
 async def _(file: UploadFile) -> Result[str]:
     try:
@@ -142,6 +160,9 @@ async def _(file: UploadFile) -> Result[str]:
     return Result.ok(path.name)
 
 
+@setup_router.post(
+    "/inspect", response_class=JSONResponse, description="首次部署读取备份包摘要"
+)
 @router.post("/inspect", response_class=JSONResponse, description="读取备份包摘要")
 async def _(payload: InspectPayload) -> Result[dict]:
     try:
@@ -171,6 +192,43 @@ async def _(payload: RestorePayload) -> Result[dict]:
     return Result.ok({**restart.data, "restore": status}, "已开始恢复，Bot 即将重启")
 
 
+@setup_router.post(
+    "/restore", response_class=JSONResponse, description="首次部署从备份包恢复"
+)
+async def _(
+    payload: SetupRestorePayload,
+    session: Annotated[SetupSession, Depends(require_setup_token)],
+) -> Result[dict]:
+    if "configuration" not in payload.categories:
+        return Result.fail("首次部署恢复必须包含配置分类", 400)
+    probe = await probe_database(payload.database)
+    if probe.status == "error":
+        return Result.fail(probe.message, 400)
+    try:
+        path = backup.backup_path(payload.name)
+        summary = await asyncio.to_thread(
+            restore.inspect, path, payload.password or None
+        )
+        preview = summary["configuration_preview"] or {}
+        if not (preview.get("username") and preview.get("password_set")):
+            return Result.fail(
+                "备份中没有 WebUI 管理员账号或密码，无法用于首次部署", 400
+            )
+        restart = _Restart(payload.categories)
+        status = await restore.request_restore(
+            path,
+            payload.password or None,
+            payload.categories,
+            payload.skip_failed,
+            restart,
+            db_url=build_database_url(payload.database),
+        )
+    except (backup.BackupError, restore.RestoreError, ValueError) as error:
+        return Result.fail(str(error), 400)
+    await setup_access.mark_applied(session)
+    return Result.ok({**restart.data, "restore": status}, "已开始恢复，Bot 即将重启")
+
+
 @router.post("/switch", response_class=JSONResponse, description="切换到新数据库")
 async def _(payload: DatabaseConfig) -> Result[dict]:
     probe = await probe_database(payload)
@@ -186,6 +244,9 @@ async def _(payload: DatabaseConfig) -> Result[dict]:
     )
 
 
+@setup_router.get(
+    "/restore", response_class=JSONResponse, description="首次部署上次恢复的状态"
+)
 @router.get("/restore", response_class=JSONResponse, description="恢复状态")
 async def _() -> Result[dict]:
     return Result.ok(restore.status())

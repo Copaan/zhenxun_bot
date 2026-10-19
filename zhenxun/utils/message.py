@@ -122,8 +122,7 @@ class MessageUtils:
                 if msg.exists():
                     if config.image_to_bytes:
                         logger.debug("图片转为bytes发送", "MessageUtils")
-                        image = BuildImage.open(msg)
-                        message_list.append(Image(raw=image.pic2bytes()))
+                        message_list.append(Image(raw=msg.read_bytes()))
                     else:
                         message_list.append(Image(path=msg))
                 else:
@@ -183,9 +182,7 @@ class MessageUtils:
             if isinstance(_message, list):
                 for i in range(len(_message.copy())):
                     if isinstance(_message[i], Path):
-                        _message[i] = Image(
-                            raw=BuildImage.open(_message[i]).pic2bytes()
-                        )
+                        _message[i] = Image(raw=_message[i].read_bytes())
                     elif isinstance(_message[i], BuildImage):
                         _message[i] = Image(raw=_message[i].pic2bytes())
             node_list.append(

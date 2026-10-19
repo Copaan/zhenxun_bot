@@ -1,5 +1,6 @@
 from zhenxun.utils.manager.priority_manager import PriorityLifecycle
 
+from .engine import engine_manager
 from .service import RendererService
 from .types import Renderable, RenderResult
 
@@ -23,4 +24,4 @@ async def _init_renderer_service(context):
     return renderer_service
 
 
-__all__ = ["RenderResult", "Renderable", "renderer_service"]
+__all__ = ["RenderResult", "Renderable", "engine_manager", "renderer_service"]

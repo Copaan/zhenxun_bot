@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 from copy import deepcopy
 from functools import cache
 import hashlib
@@ -49,7 +50,10 @@ from zhenxun.services.ai.llm.adapters.factory import (
     get_adapter_for_api_type,
 )
 from zhenxun.services.ai.llm.manager import get_default_api_base_for_type
-from zhenxun.services.ai.llm.system.capabilities import get_model_capabilities
+from zhenxun.services.ai.llm.system.capabilities import (
+    DEFAULT_PERMISSIVE_CAPABILITIES,
+    get_model_capabilities,
+)
 from zhenxun.services.ai.llm.system.network import health_manager, http_client_manager
 from zhenxun.services.log import logger
 from zhenxun.services.plugin_host import RuntimeOperation
@@ -89,7 +93,10 @@ _ADVANCED_KEYS = {"client_settings", "debug_log", "provider_settings"}
 _DISCOVERY_TYPES = {"openai", "openai_responses", "deepseek", "openrouter", "gemini"}
 _DISCOVERY_TIMEOUT = 12.0
 _PERSIST_LOCK = asyncio.Lock()
-_SANDBOX_STARTUP_VALUES = model_dump(get_llm_config().sandbox)
+# 在空上下文中读取，避免把 web_ui 登记为全部 AI 配置项的导入期读取方
+_SANDBOX_STARTUP_VALUES = contextvars.Context().run(
+    lambda: model_dump(get_llm_config().sandbox)
+)
 _SANDBOX_STARTUP_KEYS = {"enable_sandbox", "sandbox_type"}
 
 
@@ -421,6 +428,12 @@ def _validate_full(ai: dict[str, Any], *, strict_references: bool = True) -> LLM
                 )
         model_names: set[str] = set()
         for model in provider.models:
+            if not model.model_name.strip():
+                raise _configuration_error(
+                    "model_name_empty",
+                    f"服务商 {provider.name} 存在空的模型名称。",
+                    "AI.PROVIDERS",
+                )
             if model.model_name in model_names:
                 raise _configuration_error(
                     "model_name_duplicate",
@@ -722,11 +735,15 @@ def _provider_view(
             {
                 **jsonable_encoder(raw_models.get(model.model_name, {})),
                 **model_dump(model),
-                "capabilities": jsonable_encoder(
-                    model_dump(get_model_capabilities(model.model_name))
+                "capabilities": jsonable_encoder(model_dump(capabilities)),
+                "capability_source": (
+                    "default"
+                    if capabilities is DEFAULT_PERMISSIVE_CAPABILITIES
+                    else "registry"
                 ),
             }
             for model in provider.models
+            for capabilities in (get_model_capabilities(model.model_name),)
         ],
         "discovery_status": discovery_status,
     }
@@ -864,7 +881,7 @@ async def get_configuration() -> Result:
 
 
 def _provider_fields(payload: ProviderSettingsUpdate, keys: Any) -> dict[str, Any]:
-    """校验密钥并生成要写入的服务商字段
+    """生成要写入的服务商字段，未填写密钥时保存为空列表
 
     参数:
         payload: 提交的服务商设置
@@ -874,12 +891,6 @@ def _provider_fields(payload: ProviderSettingsUpdate, keys: Any) -> dict[str, An
         dict[str, Any]: 服务商字段
     """
     keys = _keys(keys)
-    if not keys:
-        raise _configuration_error(
-            "provider_key_required",
-            "服务商必须填写至少一个 API Key。",
-            "AI.PROVIDERS.api_key",
-        )
     return {
         "name": payload.name.strip(),
         "api_key": keys,

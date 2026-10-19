@@ -10,6 +10,7 @@ import sys
 
 from packaging.requirements import InvalidRequirement, Requirement
 from packaging.utils import canonicalize_name
+from packaging.version import InvalidVersion, Version
 
 try:
     import tomllib
@@ -106,16 +107,53 @@ def _venv_extras(known: set[str]) -> dict[str, str]:
     return {name: extras[name] for name in sorted(extras) if name not in required}
 
 
+def _unsupported(name: str) -> str | None:
+    """依赖不能由恢复装入插件依赖层的原因
+
+    ORM 与数据库驱动只能在控制台安装；依赖 pip、uv 等安装工具的包（如 nb-cli）
+    在依赖层中无法满足。
+
+    参数:
+        name: 包名
+
+    返回:
+        str | None: 原因，可以装入时为 None
+    """
+    from zhenxun.services.nonebot_store.dependencies import FORBIDDEN_LAYER_PACKAGES
+    from zhenxun.services.nonebot_store.policy import ORM_PACKAGES
+
+    if name in ORM_PACKAGES:
+        return "ORM 与数据库驱动只能在控制台安装"
+    try:
+        requires = importlib.metadata.distribution(name).requires or []
+    except importlib.metadata.PackageNotFoundError:
+        return None
+    for raw in requires:
+        try:
+            requirement = Requirement(raw)
+        except InvalidRequirement:
+            continue
+        if requirement.marker and not requirement.marker.evaluate({"extra": ""}):
+            continue
+        dependency = canonicalize_name(requirement.name)
+        if dependency in ORM_PACKAGES:
+            return f"依赖 {dependency}，ORM 与数据库驱动只能在控制台安装"
+        if dependency in FORBIDDEN_LAYER_PACKAGES:
+            return f"依赖安装工具 {dependency}，只能在控制台安装"
+    return None
+
+
 def unmanaged(root: Path | None = None) -> list[dict]:
     """项目锁定文件与依赖层清单都没有记录的依赖，导出时由用户选择是否带上
 
-    来源包括插件目录声明的依赖和手动安装进核心虚拟环境的包。
+    来源包括插件目录声明的依赖和手动安装进核心虚拟环境的包。不能由恢复安装的
+    依赖带有 unsupported 原因，导出时不会记录。
 
     参数:
         root: 项目根目录
 
     返回:
-        list[dict]: [{name, requirements, version, sources}]
+        list[dict]: [{name, requirements, version, sources, unsupported}]
     """
     from zhenxun.services.nonebot_store.dependencies import (
         base_installed_inventory,
@@ -141,6 +179,8 @@ def unmanaged(root: Path | None = None) -> list[dict]:
             name, {"name": name, "requirements": [], "version": version}
         )
         item.setdefault("sources", []).append(".venv")
+    for item in result.values():
+        item["unsupported"] = _unsupported(item["name"])
     return [result[name] for name in sorted(result)]
 
 
@@ -181,28 +221,41 @@ def snapshot(extras: list[dict] | None = None) -> dict:
                 "version": item["version"],
             }
             for item in extras or []
+            if not item.get("unsupported")
         },
         "store_receipts": read_json(RECEIPTS_FILE, {}),
     }
 
 
-def _requirements(saved: dict, plugins: dict, extras: dict, relaxed: bool) -> list:
+def _requirements(saved: dict, plugins: dict, extras: dict, relaxed: set) -> list:
     values = []
-    for item in plugins.values():
+    for key, item in plugins.items():
         for raw in item.get("resolution_inputs") or [item["project_link"]]:
-            values.append(Requirement(raw).name if relaxed else raw)
+            values.append(Requirement(raw).name if key in relaxed else raw)
     for items in saved["manual_requirements"].values():
         values.extend(items)
     for name, item in extras.items():
-        if relaxed or not item.get("version"):
+        if name in relaxed or not item.get("version"):
             values.extend(item["requirements"] or [name])
         else:
             values.append(f"{name}=={item['version']}")
     return values
 
 
-async def _plan(saved: dict, plugins: dict, extras: dict) -> dict:
-    """依次按备份时的精确版本、放宽版本解析依赖"""
+async def _plan(
+    saved: dict, plugins: dict, extras: dict, relaxed: set | None = None
+) -> dict:
+    """解析依赖，relaxed 中的插件与依赖不限版本，其余按备份时的精确版本
+
+    参数:
+        saved: 备份中的 dependencies.json
+        plugins: 参与解析的商店插件
+        extras: 参与解析的未纳管依赖
+        relaxed: 放宽版本的插件键与依赖名
+
+    返回:
+        dict: 依赖计划，requirements 为参与解析的依赖声明
+    """
     from copy import deepcopy
 
     from zhenxun.services.nonebot_store.dependencies import DependencyAnalysisError
@@ -211,70 +264,191 @@ async def _plan(saved: dict, plugins: dict, extras: dict) -> dict:
 
     base = deepcopy(load_manifest())
     base.update(plugins=plugins, packages={}, manual_requirements={})
-    error = None
-    for relaxed in (False, True):
-        values = _requirements(saved, plugins, extras, relaxed)
+    values = _requirements(saved, plugins, extras, relaxed or set())
+    plan = await preview_manual_dependencies(values, "install", manifest=base)
+    if plan["source_build_required"]:
+        raise DependencyAnalysisError(
+            "source_build_confirmation_required", plan["diagnostic"]
+        )
+    target = plan["target_manifest"]
+    manual = {canonicalize_name(name) for name in saved["manual_requirements"]}
+    target["manual_requirements"] = {
+        name: items
+        for name, items in target["manual_requirements"].items()
+        if name in manual or name in extras
+    }
+    plan["requirements"] = values
+    return plan
+
+
+def _downgraded(saved: dict, extras: dict, target: dict) -> dict[str, list[str]]:
+    """解析结果中低于备份时版本的包
+
+    参数:
+        saved: 备份中的 dependencies.json
+        extras: 参与解析的未纳管依赖
+        target: 解析得到的依赖层清单
+
+    返回:
+        dict[str, list[str]]: 包名 -> [备份时版本, 解析版本]
+    """
+
+    def version(value) -> str | None:
+        return value.get("version") if isinstance(value, dict) else value
+
+    before = {name: version(value) for name, value in saved["packages"].items()}
+    before.update((name, item["version"]) for name, item in extras.items())
+    result = {}
+    for name, value in target.get("packages", {}).items():
+        old, new = before.get(name), version(value)
         try:
-            plan = await preview_manual_dependencies(values, "install", manifest=base)
-        except DependencyAnalysisError as failure:
-            error = failure
+            if old and new and Version(new) < Version(old):
+                result[name] = [old, new]
+        except InvalidVersion:
             continue
-        if plan["source_build_required"]:
-            error = DependencyAnalysisError(
-                "source_build_confirmation_required", plan["diagnostic"]
+    return result
+
+
+def describe(details) -> str:
+    """把依赖错误的详情整理为简短说明
+
+    参数:
+        details: DependencyAnalysisError.details
+
+    返回:
+        str: 说明，没有可读详情时为空
+    """
+    items = details if isinstance(details, list) else [details]
+    parts = []
+    for item in items[:5]:
+        if isinstance(item, str):
+            parts.append(item)
+        elif not isinstance(item, dict):
+            continue
+        elif item.get("owner") and item.get("requirement"):
+            actual = item.get("actual")
+            parts.append(
+                f"{item['owner']} 需要 {item['requirement']}，"
+                + (f"当前为 {actual}" if actual else "当前未安装")
             )
-            continue
-        target = plan["target_manifest"]
-        manual = {canonicalize_name(name) for name in saved["manual_requirements"]}
-        target["manual_requirements"] = {
-            name: items
-            for name, items in target["manual_requirements"].items()
-            if name in manual or name in extras
+        elif item.get("name") or item.get("package"):
+            parts.append(str(item.get("name") or item.get("package")))
+    if len(items) > 5 and parts:
+        parts.append(f"等 {len(items)} 项")
+    return "、".join(parts)
+
+
+def layer_status(revision: str) -> dict:
+    """恢复写入的依赖层事务的结果
+
+    参数:
+        revision: 事务修订号
+
+    返回:
+        dict: state 为 pending / done / failed / unknown（事务已被后续操作替换），
+            失败时带 error_code 与 detail
+    """
+    from zhenxun.services.nonebot_store.storage import (
+        is_settled,
+        pending_transaction,
+        settled_transactions,
+    )
+
+    transaction = pending_transaction()
+    if not transaction or transaction.get("revision") != revision:
+        transaction = next(
+            (item for item in settled_transactions() if item["revision"] == revision),
+            None,
+        )
+        if transaction is None:
+            return {"state": "unknown"}
+    elif transaction.get("state") != "failed" and not is_settled(transaction):
+        return {"state": "pending"}
+    if transaction.get("state") == "failed" or transaction.get("rollback_confirmed"):
+        return {
+            "state": "failed",
+            "error_code": transaction.get("error_code")
+            or "nonebot_plugin_apply_failed",
+            "detail": describe(transaction.get("error_details"))
+            or transaction.get("error")
+            or "",
         }
-        plan["requirements"] = values
-        return plan
-    raise error  # type: ignore
+    return {"state": "done"}
 
 
 async def stage_restore(saved: dict, skip_failed: bool = False) -> dict:
     """把备份中的依赖解析为当前环境可用的版本，写入待应用的依赖层事务
 
-    先按备份时的精确版本解析，失败后放宽版本；仍失败时按 skip_failed 决定中止，
-    或逐个排除无法安装的插件与依赖后继续。
+    先按备份时的精确版本整体解析；失败时逐个检查，只放宽单独也无法按精确版本
+    解析的插件与依赖，放宽后仍失败的按 skip_failed 决定中止或排除。ORM、数据库
+    驱动与安装工具不会由恢复安装，总是排除。
 
     参数:
         saved: 备份中的 dependencies.json
         skip_failed: 是否跳过无法安装的插件与依赖
 
     返回:
-        dict: {staged, skipped_plugins, skipped_requirements}
+        dict: {staged, revision, skipped_plugins, skipped_requirements,
+            unsupported_requirements, relaxed, downgraded}
     """
-    from zhenxun.services.nonebot_store.dependencies import DependencyAnalysisError
+    from zhenxun.services.nonebot_store.dependencies import (
+        FORBIDDEN_LAYER_PACKAGES,
+        DependencyAnalysisError,
+    )
     from zhenxun.services.nonebot_store.manual import stage_plan
+    from zhenxun.services.nonebot_store.policy import ORM_PACKAGES
+    from zhenxun.services.nonebot_store.storage import pending_transaction
 
     plugins = dict(saved["plugins"])
     extras = dict(saved["extra_requirements"])
-    report = {"staged": False, "skipped_plugins": [], "skipped_requirements": []}
+    blocked = ORM_PACKAGES | FORBIDDEN_LAYER_PACKAGES
+    report = {
+        "staged": False,
+        "skipped_plugins": [],
+        "skipped_requirements": [],
+        "unsupported_requirements": sorted(set(extras) & blocked),
+        "relaxed": [],
+        "downgraded": {},
+    }
+    for name in report["unsupported_requirements"]:
+        extras.pop(name)
     if not (plugins or extras or saved["manual_requirements"]):
         return report
+    relaxed: set[str] = set()
     try:
         plan = await _plan(saved, plugins, extras)
     except DependencyAnalysisError:
-        if not skip_failed:
-            raise
         empty = {**saved, "manual_requirements": {}}
-        for key in list(plugins):
+        for key in [*plugins, *extras]:
+            if key in plugins:
+                single = ({key: plugins[key]}, {})
+            else:
+                single = ({}, {key: extras[key]})
             try:
-                await _plan(empty, {key: plugins[key]}, {})
+                await _plan(empty, *single)
+                continue
             except DependencyAnalysisError:
-                report["skipped_plugins"].append(key)
-                plugins.pop(key)
-        for name in list(extras):
+                pass
             try:
-                await _plan(empty, {}, {name: extras[name]})
+                await _plan(empty, *single, {key})
+                relaxed.add(key)
             except DependencyAnalysisError:
-                report["skipped_requirements"].append(name)
-                extras.pop(name)
-        plan = await _plan(saved, plugins, extras)
+                if not skip_failed:
+                    raise
+                if key in plugins:
+                    report["skipped_plugins"].append(key)
+                    plugins.pop(key)
+                else:
+                    report["skipped_requirements"].append(key)
+                    extras.pop(key)
+        try:
+            plan = await _plan(saved, plugins, extras, relaxed)
+        except DependencyAnalysisError:
+            relaxed = {*plugins, *extras}
+            plan = await _plan(saved, plugins, extras, relaxed)
+    report["relaxed"] = sorted(relaxed)
+    report["downgraded"] = _downgraded(saved, extras, plan["target_manifest"])
     report["staged"] = stage_plan(plan, plan["requirements"])
+    if report["staged"]:
+        report["revision"] = (pending_transaction() or {}).get("revision")
     return report

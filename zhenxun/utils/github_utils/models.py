@@ -1,5 +1,7 @@
+import asyncio
 import base64
 import contextlib
+import importlib
 import sys
 from typing import TYPE_CHECKING, ClassVar, Protocol
 
@@ -321,7 +323,10 @@ class AliyunFileInfo:
 
     @classmethod
     async def get_client(cls) -> "devops20210625Client":
-        """获取阿里云客户端"""
+        """获取阿里云客户端，首次调用时在线程中导入 SDK，避免阻塞事件循环"""
+        await asyncio.to_thread(
+            importlib.import_module, "alibabacloud_devops20210625.client"
+        )
         from alibabacloud_devops20210625.client import (
             Client as devops20210625Client,
         )

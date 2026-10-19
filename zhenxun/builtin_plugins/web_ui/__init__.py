@@ -24,6 +24,7 @@ from .api.menu import router as menu_router
 from .api.protocol import router as protocol_router
 from .api.tabs.ai import router as ai_router
 from .api.tabs.backup import router as backup_router
+from .api.tabs.backup import setup_router as backup_setup_router
 from .api.tabs.dashboard import router as dashboard_router
 from .api.tabs.database import router as database_router
 from .api.tabs.main import router as main_router
@@ -102,6 +103,7 @@ BaseApiRouter.include_router(plugin_router)
 BaseApiRouter.include_router(plugin_policy_router)
 BaseApiRouter.include_router(network_proxy_router)
 BaseApiRouter.include_router(backup_router)
+BaseApiRouter.include_router(backup_setup_router)
 BaseApiRouter.include_router(system_router)
 BaseApiRouter.include_router(menu_router)
 BaseApiRouter.include_router(configure_router)

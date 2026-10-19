@@ -138,31 +138,44 @@ class PluginInfo(Model):
 
     @classmethod
     async def get_plugin(
-        cls, load_status: bool | None = True, filter_parent: bool = True, **kwargs
+        cls,
+        load_status: bool | None = True,
+        filter_parent: bool = True,
+        include_parked: bool = False,
+        **kwargs,
     ) -> "PluginInfo | None":
         """获取插件列表
 
         参数:
             load_status: 加载状态.
             filter_parent: 过滤父组件
+            include_parked: load_status 为 True 时是否包含因全局禁用而未加载的插件
 
         返回:
             Self | None: 插件
         """
         plugins = await cls.get_plugins(
-            load_status=load_status, filter_parent=filter_parent, **kwargs
+            load_status=load_status,
+            filter_parent=filter_parent,
+            include_parked=include_parked,
+            **kwargs,
         )
         return plugins[0] if plugins else None
 
     @classmethod
     async def get_plugins(
-        cls, load_status: bool | None = True, filter_parent: bool = True, **kwargs
+        cls,
+        load_status: bool | None = True,
+        filter_parent: bool = True,
+        include_parked: bool = False,
+        **kwargs,
     ) -> list["PluginInfo"]:
         """获取插件列表
 
         参数:
             load_status: 加载状态.
             filter_parent: 过滤父组件
+            include_parked: load_status 为 True 时是否包含因全局禁用而未加载的插件
 
         返回:
             list[Self]: 插件列表
@@ -179,12 +192,14 @@ class PluginInfo(Model):
         else:
             plugins = await PluginInfo.filter(**filters).all()
         if filters.get("load_status") is True:
+            from zhenxun.services.plugin_host import plugin_host
             from zhenxun.services.startup_load import startup_load_planner
 
             plugins = [
                 plugin
                 for plugin in plugins
                 if startup_load_planner.plugin_available(plugin.module_path)
+                or (include_parked and plugin_host.is_parked(plugin.module_path))
             ]
         return plugins
 

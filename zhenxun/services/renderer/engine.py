@@ -6,6 +6,7 @@ import hashlib
 from importlib import import_module
 import inspect
 import json
+import math
 from pathlib import Path
 import subprocess
 import sys
@@ -179,6 +180,7 @@ async def _get_browser_instance() -> Any:
 
 
 _suppress_disconnect_until = 0.0
+_PLAYWRIGHT_CALL_STACK: list[inspect.FrameInfo] | None = None
 
 
 def _suppress_disconnect_noise(loop: asyncio.AbstractEventLoop) -> None:
@@ -425,6 +427,7 @@ class PlaywrightEngine(BaseScreenshotEngine):
     _FULL_PAGE_VIEWPORT_MAX_HEIGHT = 4_096
     _FULL_PAGE_VIEWPORT_MAX_WIDTH = 4_096
     _CLIP_PADDING_DEFAULT = 0
+    _JPEG_QUALITY_DEFAULT = 90
     _DISABLE_ANIMATIONS_STYLE = """
         *, *::before, *::after {
             animation: none !important;
@@ -674,15 +677,29 @@ class PlaywrightEngine(BaseScreenshotEngine):
             options.pop("device_scale_factor", None)
         return options
 
-    @staticmethod
-    def _build_screenshot_options(render_options: dict[str, Any]) -> dict[str, Any]:
+    @classmethod
+    def _build_screenshot_options(
+        cls, render_options: dict[str, Any]
+    ) -> dict[str, Any]:
+        """生成截图参数，未指定格式时使用 JPEG
+
+        参数:
+            render_options: 渲染参数
+
+        返回:
+            dict[str, Any]: 截图参数
+        """
         scale = render_options.get("screenshot_scale", render_options.get("scale"))
         if scale not in ("css", "device"):
             scale = None
+        image_type = render_options.get("type", "jpeg")
+        quality = render_options.get("quality")
+        if image_type == "jpeg" and quality is None:
+            quality = cls._JPEG_QUALITY_DEFAULT
         return {
             "full_page": bool(render_options.get("full_page", True)),
-            "type": render_options.get("type", "png"),
-            "quality": render_options.get("quality"),
+            "type": image_type,
+            "quality": quality,
             "scale": scale,
             "timeout": render_options.get("screenshot_timeout", 30_000),
         }
@@ -772,50 +789,48 @@ class PlaywrightEngine(BaseScreenshotEngine):
         screenshot_options: dict[str, Any],
         clip_padding: int,
     ) -> bytes | None:
+        """按选择器所在区域裁剪页面截图
+
+        参数:
+            page: 已渲染完成的页面
+            selector: 截图区域的 CSS 选择器
+            screenshot_options: 截图参数
+            clip_padding: 区域四周的留白像素
+
+        返回:
+            bytes | None: 截图数据，找不到元素或元素不可见时为 None
+        """
         element = await page.query_selector(selector)
         if element is None:
             return None
-
-        element_screenshot_options = {
-            "type": screenshot_options.get("type", "png"),
-            "quality": screenshot_options.get("quality"),
-            "timeout": screenshot_options.get("timeout", 30_000),
-        }
-        with contextlib.suppress(Exception):
+        box = await element.bounding_box()
+        if box is None:
+            return None
+        viewport = page.viewport_size or {}
+        width = max(
+            int(viewport.get("width") or 0),
+            math.ceil(box["x"] + box["width"] + clip_padding),
+        )
+        height = max(
+            int(viewport.get("height") or 0),
+            math.ceil(box["y"] + box["height"] + clip_padding),
+        )
+        if (width, height) != (viewport.get("width"), viewport.get("height")):
+            await page.set_viewport_size({"width": width, "height": height})
             box = await element.bounding_box()
-            if box and clip_padding > 0:
-                viewport = page.viewport_size or {}
-                width = int(viewport.get("width") or 0)
-                if width > 0:
-                    target_height = int(box["y"] + box["height"] + clip_padding)
-                    current_height = int(viewport.get("height") or 0)
-                    if target_height > current_height:
-                        await page.set_viewport_size(
-                            {"width": width, "height": target_height}
-                        )
-
-        if clip_padding <= 0:
-            return await element.screenshot(**element_screenshot_options)
-
-        with contextlib.suppress(Exception):
-            clip_box = await element.bounding_box()
-            if clip_box is None:
-                return await element.screenshot(**element_screenshot_options)
-            clip = {
-                "x": max(clip_box["x"] - clip_padding, 0),
-                "y": max(clip_box["y"] - clip_padding, 0),
-                "width": clip_box["width"] + clip_padding * 2,
-                "height": clip_box["height"] + clip_padding * 2,
-            }
-            page_options = {
-                "type": screenshot_options.get("type", "png"),
-                "quality": screenshot_options.get("quality"),
-                "timeout": screenshot_options.get("timeout", 30_000),
-                "clip": clip,
-            }
-            return await page.screenshot(**page_options)
-
-        return await element.screenshot(**element_screenshot_options)
+            if box is None:
+                return None
+        return await page.screenshot(
+            type=screenshot_options["type"],
+            quality=screenshot_options["quality"],
+            timeout=screenshot_options["timeout"],
+            clip={
+                "x": max(box["x"] - clip_padding, 0),
+                "y": max(box["y"] - clip_padding, 0),
+                "width": box["width"] + clip_padding * 2,
+                "height": box["height"] + clip_padding * 2,
+            },
+        )
 
     async def _wait_for_visual_stability(self, page: Any) -> None:
         # 先做一次快速预检，判断页面是否有外部图片和自定义字体
@@ -1148,6 +1163,7 @@ class PlaywrightEngine(BaseScreenshotEngine):
             await browser_resources.close_context(context)
 
     async def _finish_pooled_page(self, context, page, broken) -> None:
+        self._share_playwright_call_stack()
         with shutdown_budget(10.0):
             try:
                 reusable = await browser_resources.finish_page(
@@ -1299,6 +1315,15 @@ class PlaywrightEngine(BaseScreenshotEngine):
         finally:
             _HTMLRENDER_TASK_TRACKER.unpause()
 
+    @staticmethod
+    def _share_playwright_call_stack() -> None:
+        """让当前任务内的 Playwright 调用复用同一份调用栈，不再逐次收集"""
+        global _PLAYWRIGHT_CALL_STACK
+        if _PLAYWRIGHT_CALL_STACK is None:
+            _PLAYWRIGHT_CALL_STACK = inspect.stack(0)[:1]
+        if task := asyncio.current_task():
+            setattr(task, "__pw_stack__", _PLAYWRIGHT_CALL_STACK)
+
     async def _render_and_store_result(
         self,
         key: str,
@@ -1306,6 +1331,7 @@ class PlaywrightEngine(BaseScreenshotEngine):
         base_url_for_browser: str,
         render_options: dict[str, Any],
     ) -> bytes:
+        self._share_playwright_call_stack()
         async with self._render_semaphore:
             await self._on_render_begin()
             try:

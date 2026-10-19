@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib
+import json
 import os
 from pathlib import Path
 import platform
@@ -38,6 +39,44 @@ def record_process_crash(error: BaseException, *, role: str) -> None:
         pass
 
 
+def _playwright_chromium_installed() -> bool:
+    """Playwright 自带的 Chromium 无头浏览器是否已安装
+
+    返回:
+        bool: 当前 Playwright 版本对应的 chromium-headless-shell 已安装完成
+    """
+    try:
+        import playwright
+
+        manifest = (
+            Path(playwright.__file__).parent / "driver" / "package" / "browsers.json"
+        )
+        revision = next(
+            item["revision"]
+            for item in json.loads(manifest.read_text("utf-8"))["browsers"]
+            if item["name"] == "chromium-headless-shell"
+        )
+    except Exception:
+        return False
+    configured = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+    if configured == "0":
+        root = manifest.parent / ".local-browsers"
+    elif configured:
+        root = Path(configured)
+    elif platform.system() == "Windows":
+        local = os.environ.get("LOCALAPPDATA")
+        root = (Path(local) if local else Path.home() / "AppData/Local") / (
+            "ms-playwright"
+        )
+    elif platform.system() == "Darwin":
+        root = Path.home() / "Library/Caches/ms-playwright"
+    else:
+        cache = os.environ.get("XDG_CACHE_HOME")
+        root = (Path(cache) if cache else Path.home() / ".cache") / "ms-playwright"
+    marker = root / f"chromium_headless_shell-{revision}" / "INSTALLATION_COMPLETE"
+    return marker.exists()
+
+
 def run_worker(project_root: Path) -> None:
     """启动 Bot worker
 
@@ -65,7 +104,7 @@ def run_worker(project_root: Path) -> None:
     import nonebot
 
     htmlrender_browser_channel = None
-    system = platform.system()
+    system = None if _playwright_chromium_installed() else platform.system()
 
     if system == "Windows":
         import winreg
@@ -133,7 +172,7 @@ def run_worker(project_root: Path) -> None:
         except ModuleNotFoundError as e:
             raise RuntimeError(
                 "TELEGRAM_ADAPTER_LOAD=True 需要先安装可选依赖: "
-                "uv sync --extra telegram"
+                "uv sync --locked --inexact --extra telegram"
             ) from e
         driver.register_adapter(TelegramAdapter)
         enabled_adapters.append("Telegram")
@@ -281,6 +320,7 @@ def run_worker(project_root: Path) -> None:
         nonebot.run(
             workers=1,
             access_log=False,
+            ws_per_message_deflate=False,
             limit_concurrency=WORKER_CONNECTION_LIMIT,
             backlog=WORKER_BACKLOG,
             timeout_keep_alive=WORKER_KEEP_ALIVE_TIMEOUT,

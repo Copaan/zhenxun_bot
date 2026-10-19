@@ -698,6 +698,9 @@ def apply_pending_transaction() -> bool:
         transaction["state"] = "failed"
         transaction["error_code"] = getattr(error, "code", type(error).__name__)
         transaction["error"] = safe_process_error(str(error))
+        transaction["error_details"] = json.loads(
+            json.dumps(getattr(error, "details", None), default=str)
+        )
         write_json(PENDING_FILE, transaction)
         return False
     transaction["state"] = "verification_pending"

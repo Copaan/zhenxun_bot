@@ -364,15 +364,15 @@ class BotGroupPolicyService:
                     item.get("block_type"), "value", item.get("block_type")
                 )
                 if (
-                    (
-                        not item["global_status"]
-                        and block_type in {None, "ALL"}
-                        and not (super_group and block_type == "ALL")
-                    )
-                    or (private and block_type == "PRIVATE")
-                    or (not private and block_type == "GROUP")
+                    not item["global_status"]
+                    and block_type in {None, "ALL"}
+                    and not (super_group and block_type == "ALL")
                 ):
                     reasons.append("global_disabled")
+                elif private and block_type == "PRIVATE":
+                    reasons.append("global_private_disabled")
+                elif not private and block_type == "GROUP":
+                    reasons.append("global_group_disabled")
                 if module in upper:
                     reasons.append("account_disabled")
                 if module in forced:

@@ -8,7 +8,9 @@ import json
 import logging
 import os
 from pathlib import Path
+import re
 import shutil
+import stat
 import subprocess
 import time
 from typing import Any, Literal
@@ -51,7 +53,6 @@ _JOB_LOCK = asyncio.Lock()
 _STATUS_CACHE: tuple[float, dict[str, Any]] | None = None
 _ACTIVE_TASK: asyncio.Task[None] | None = None
 _PREPARING_JOB_STATES = {"queued", "preparing", "staged"}
-_BLOCKED_BOT_RELEASES = {"0.2.4-fix"}
 _RESOURCE_ENTRIES = (
     "font",
     "image",
@@ -96,20 +97,44 @@ class ResourceHotSwapUnavailable(UpdateServiceError):
     pass
 
 
-def _normalized_release(value: object) -> str:
-    normalized = str(value or "").strip().lower()
-    return normalized[1:] if normalized.startswith("v") else normalized
+def _release_numbers(value: object) -> tuple[int, ...] | None:
+    """提取版本号开头的 x.y.z 数字部分
+
+    参数:
+        value: 版本号，如 v0.2.4-fix3、v0.2.4-203754e
+
+    返回:
+        tuple[int, ...] | None: 数字部分，无法识别时为 None
+    """
+    match = re.match(r"v?(\d+)\.(\d+)\.(\d+)", str(value or "").strip().lower())
+    return tuple(int(part) for part in match.groups()) if match else None
 
 
 def _blocked_release_reason(
-    component: UpdateComponent, channel: UpdateChannel, value: object
+    component: UpdateComponent,
+    channel: UpdateChannel,
+    value: object,
+    current: object,
 ) -> str | None:
-    if (
-        component == "bot"
-        and channel == "release"
-        and _normalized_release(value) in _BLOCKED_BOT_RELEASES
-    ):
-        return "该版本存在已知兼容性问题，已禁止更新。"
+    """判断本体正式版能否更新，只允许更新到数字版本号更高的正式版
+
+    参数:
+        component: 更新组件
+        channel: 更新通道
+        value: 正式版版本号
+        current: 当前版本号
+
+    返回:
+        str | None: 禁止更新的原因，允许时为 None
+    """
+    if component != "bot" or channel != "release":
+        return None
+    latest = _release_numbers(value)
+    installed = _release_numbers(current)
+    if latest is None or installed is None:
+        return "无法比较当前版本与正式版的版本号，已禁止更新到正式版。"
+    if latest <= installed:
+        return "该正式版不比当前版本新，更新会退回旧代码，已禁止。"
     return None
 
 
@@ -234,7 +259,11 @@ def _component_status(
         latest_commit if component == "webui" and latest_commit else latest_version
     )
     comparable = comparable_current != "unknown" and comparable_latest != "unknown"
-    block_reason = _blocked_release_reason(component, channel, latest_version)
+    block_reason = (
+        _blocked_release_reason(component, channel, latest_version, current_version)
+        if latest_version != "unknown"
+        else None
+    )
     return {
         "component": component,
         "current_version": current_version,
@@ -246,6 +275,7 @@ def _component_status(
         "compatible": (
             component != "webui" or remote.get("api_version") == _WEBUI_API_VERSION
         ),
+        "comparable": comparable,
         "update_available": (
             comparable and comparable_current != comparable_latest and not block_reason
         ),
@@ -267,7 +297,7 @@ async def check_updates(
             and now - _STATUS_CACHE[0] < _STATUS_CACHE_SECONDS
             and _STATUS_CACHE[1].get("channel") == channel
         ):
-            return _STATUS_CACHE[1]
+            return {**_STATUS_CACHE[1], "pending_job": pending_job()}
 
         bot_current = _read_version_file(_ROOT / "__version__")
         resource_current = _read_version_file(_ROOT / "resources" / "__version__")
@@ -408,7 +438,8 @@ async def _latest_ref(component: UpdateComponent, channel: UpdateChannel) -> str
     ref = str(release.get("tag_name") or "").strip()
     if not ref:
         raise UpdateServiceError("release_not_found")
-    if _blocked_release_reason(component, channel, ref):
+    current = _read_version_file(_ROOT / "__version__")
+    if _blocked_release_reason(component, channel, ref, current):
         raise UpdateServiceError("release_blocked")
     return ref
 
@@ -556,6 +587,56 @@ def _validate_staging(component: UpdateComponent, root: Path) -> None:
         validate_resources(root, _ROOT / "resources.spec")
 
 
+def _clear_readonly(function: Any, target: str, _error: Any) -> None:
+    os.chmod(target, stat.S_IWRITE)
+    function(target)
+
+
+def _remove_entry(path: Path) -> None:
+    """删除文件或目录，遇到只读文件时去掉只读属性后重试
+
+    参数:
+        path: 要删除的路径
+    """
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path, onerror=_clear_readonly)
+    elif path.exists() or path.is_symlink():
+        try:
+            path.unlink()
+        except PermissionError:
+            os.chmod(path, stat.S_IWRITE)
+            path.unlink()
+
+
+def _remove_tree(path: Path) -> None:
+    """删除目录，遇到只读文件时去掉只读属性后重试，失败只记录日志
+
+    参数:
+        path: 要删除的目录
+    """
+    if not path.exists():
+        return
+    try:
+        _remove_entry(path)
+    except OSError as error:
+        logger.warning(
+            "WebUIUpdate: 清理更新目录失败 %s（%s）", path, error.__class__.__name__
+        )
+
+
+def _prune_backups(keep_job_id: str) -> None:
+    """只保留指定任务的更新备份，删除其余任务的备份
+
+    参数:
+        keep_job_id: 要保留备份的任务 ID
+    """
+    if not _BACKUP_ROOT.is_dir():
+        return
+    for item in _BACKUP_ROOT.iterdir():
+        if item.name != keep_job_id:
+            _remove_tree(item)
+
+
 def _remove_path(path: Path) -> None:
     if path.is_dir() and not path.is_symlink():
         shutil.rmtree(path)
@@ -685,6 +766,7 @@ def _apply_webui(job_id: str, staged_root: Path) -> None:
     except Exception:
         _copy_visible(backup, destination)
         raise
+    _remove_tree(_BACKUP_ROOT / job_id)
 
 
 async def _prepare_job(job_id: str) -> None:
@@ -695,11 +777,8 @@ async def _prepare_job(job_id: str) -> None:
         if component == "bot" and _git_dirty() and not job["force"]:
             raise UpdateServiceError("working_tree_dirty")
         ref = await _latest_ref(component, job["channel"])
-        if _blocked_release_reason(component, job["channel"], ref):
-            raise UpdateServiceError("release_blocked")
         stage = _STAGING_ROOT / job_id
-        if stage.exists():
-            shutil.rmtree(stage)
+        await asyncio.to_thread(_remove_tree, stage)
         stage.mkdir(parents=True, exist_ok=True)
         checksum: str | None = None
         if job["method"] == "git":
@@ -746,6 +825,7 @@ async def _prepare_job(job_id: str) -> None:
                 phase="hot_apply",
             ):
                 await asyncio.to_thread(_apply_webui, job_id, root)
+            await asyncio.to_thread(_remove_tree, stage)
             _update_job(
                 job_id,
                 state="completed",
@@ -774,6 +854,7 @@ async def _prepare_job(job_id: str) -> None:
                     fallback_reason,
                 )
             else:
+                await asyncio.to_thread(_remove_tree, stage)
                 _update_job(
                     job_id,
                     state="completed",
@@ -811,6 +892,7 @@ async def _prepare_job(job_id: str) -> None:
             else exc.__class__.__name__
         )
         logger.error("WebUIUpdate: 更新任务失败 component=%s code=%s", component, code)
+        await asyncio.to_thread(_remove_tree, _STAGING_ROOT / job_id)
         _update_job(
             job_id, state="failed", error=code, progress=100, apply_mode="failed"
         )
@@ -833,9 +915,8 @@ async def create_update_job(
         if source == "aliyun" and method == "download":
             method = "git"
         if component == "bot" and channel == "release":
-            ref = await _latest_ref(component, channel)
-            if _blocked_release_reason(component, channel, ref):
-                raise UpdateServiceError("release_blocked")
+            await _latest_ref(component, channel)
+        await asyncio.to_thread(_remove_tree, _STAGING_ROOT)
         job_id = uuid4().hex
         job = {
             "job_id": job_id,
@@ -891,35 +972,80 @@ async def request_update_apply(job_id: str) -> tuple[bool, str, dict[str, Any]]:
     return ok, message, job
 
 
-def _restore_directory(backup: Path, destination: Path) -> None:
-    if destination.exists():
-        shutil.rmtree(destination)
-    shutil.copytree(backup, destination)
+def cancel_pending_update(job_id: str) -> dict[str, Any]:
+    """取消等待重启应用的更新，删除暂存文件和待重启标记
+
+    参数:
+        job_id: 更新任务 ID
+
+    返回:
+        dict[str, Any]: 取消后的任务
+    """
+    global _STATUS_CACHE
+    job = read_job(job_id)
+    pending = pending_job()
+    if (
+        job.get("state") != "pending_restart"
+        or pending is None
+        or pending.get("job_id") != job_id
+    ):
+        raise UpdateServiceError("update_not_pending")
+    from zhenxun.utils._restart_utils import clear_restart_pending
+
+    _PENDING_FILE.unlink(missing_ok=True)
+    clear_restart_pending(f"webui.update:{job_id}")
+    _remove_tree(_STAGING_ROOT / job_id)
+    _STATUS_CACHE = None
+    return _update_job(
+        job_id,
+        state="cancelled",
+        progress=100,
+        apply_mode="cancelled",
+        restart_required=False,
+    )
+
+
+def _replace_package(source: Path, destination: Path) -> None:
+    """用 source 替换本体包内容，已存在的 plugins 目录保持不动
+
+    参数:
+        source: 新的 zhenxun 包目录
+        destination: 要替换的 zhenxun 包目录
+    """
+    destination.mkdir(parents=True, exist_ok=True)
+    keep_plugins = (destination / "plugins").exists()
+    for item in destination.iterdir():
+        if item.name != "plugins":
+            _remove_entry(item)
+    for item in source.iterdir():
+        if item.name == "plugins" and keep_plugins:
+            continue
+        target = destination / item.name
+        if item.is_dir():
+            shutil.copytree(item, target)
+        else:
+            shutil.copy2(item, target)
 
 
 def _apply_bot_update(staged: Path, backup: Path) -> None:
+    _prune_backups(backup.parent.name)
     if backup.exists():
-        shutil.rmtree(backup)
+        _remove_entry(backup)
     backup.mkdir(parents=True, exist_ok=True)
     current_package = _ROOT / "zhenxun"
-    shutil.copytree(current_package, backup / "zhenxun")
+    shutil.copytree(
+        current_package,
+        backup / "zhenxun",
+        ignore=lambda directory, _names: (
+            ["plugins"] if Path(directory) == current_package else []
+        ),
+    )
     for name in _BOT_ROOT_FILES:
         source = _ROOT / name
         if source.exists():
             shutil.copy2(source, backup / name)
-
-    preserved_plugins = backup / "user_plugins"
-    plugins = current_package / "plugins"
-    if plugins.exists():
-        shutil.copytree(plugins, preserved_plugins)
     try:
-        shutil.rmtree(current_package)
-        shutil.copytree(staged / "zhenxun", current_package)
-        if preserved_plugins.exists():
-            target_plugins = current_package / "plugins"
-            if target_plugins.exists():
-                shutil.rmtree(target_plugins)
-            shutil.copytree(preserved_plugins, target_plugins)
+        _replace_package(staged / "zhenxun", current_package)
         for name in _BOT_ROOT_FILES:
             source = staged / name
             if source.exists():
@@ -931,7 +1057,7 @@ def _apply_bot_update(staged: Path, backup: Path) -> None:
 
 
 def _restore_bot_update(backup: Path) -> None:
-    _restore_directory(backup / "zhenxun", _ROOT / "zhenxun")
+    _replace_package(backup / "zhenxun", _ROOT / "zhenxun")
     for name in _BOT_ROOT_FILES:
         source = backup / name
         destination = _ROOT / name
@@ -1038,7 +1164,11 @@ def apply_pending_update(project_root: Path | None = None) -> bool:
         )
         _update_job(job_id, state="failed", error=code, progress=100)
         _PENDING_FILE.unlink(missing_ok=True)
+        _remove_tree(_STAGING_ROOT / job_id)
         raise
+    _remove_tree(_STAGING_ROOT / job_id)
+    if component == "resource":
+        _remove_tree(_BACKUP_ROOT / job_id)
     if component == "bot":
         _write_json(
             _APPLIED_FILE,
@@ -1122,6 +1252,7 @@ __all__ = [
     "UpdateServiceError",
     "applied_update_pending",
     "apply_pending_update",
+    "cancel_pending_update",
     "check_updates",
     "create_update_job",
     "finalize_applied_update",

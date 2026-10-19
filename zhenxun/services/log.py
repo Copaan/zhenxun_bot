@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, overload
 
 from loguru import logger as logger_
 import nonebot
+from nonebot import _log_patcher as _nonebot_log_patcher
 from nonebot.log import default_filter, default_format
 
 if TYPE_CHECKING:
@@ -75,6 +76,33 @@ _ERROR_LOG_SINK_ID = logger_.add(
     filter=default_filter,
     retention=timedelta(days=30),
 )
+
+_DEBUG_LEVEL = logger_.level("DEBUG")
+_INFO_LEVEL_NO = logger_.level("INFO").no
+
+
+def _log_patcher(record: Any) -> None:
+    """把 NoneBot 每次运行事件响应器时输出的提示日志降为 DEBUG，再交给 NoneBot 处理
+
+    参数:
+        record: loguru 日志记录
+    """
+    message = record["message"]
+    if (
+        record["level"].no == _INFO_LEVEL_NO
+        and (record["name"] or "").startswith("nonebot.")
+        and (
+            message.startswith("Event will be handled by ")
+            or message.endswith(" running complete")
+        )
+    ):
+        record["level"] = type(record["level"])(
+            _DEBUG_LEVEL.name, _DEBUG_LEVEL.no, _DEBUG_LEVEL.icon
+        )
+    _nonebot_log_patcher(record)
+
+
+logger_.configure(patcher=_log_patcher)
 
 
 def reload_log_level(level: str | int) -> None:

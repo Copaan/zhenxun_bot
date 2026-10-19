@@ -81,6 +81,7 @@ class ApiDataSource:
         plugins = await DbPluginInfo.get_plugins(
             load_status=None if module else True,
             filter_parent=False,
+            include_parked=True,
             **filters,
         )
         receipts = StoreReceiptStore.load()
@@ -194,7 +195,9 @@ class ApiDataSource:
         返回:
             DbPluginInfo | None: 插件数据
         """
-        db_plugin = await DbPluginInfo.get_plugin(module=param.module)
+        db_plugin = await DbPluginInfo.get_plugin(
+            module=param.module, include_parked=True
+        )
         if not db_plugin:
             raise ValueError("插件不存在")
         previous_db = {
@@ -481,7 +484,7 @@ class ApiDataSource:
         返回:
             PluginDetail: 插件详情数据
         """
-        db_plugin = await DbPluginInfo.get_plugin(module=module)
+        db_plugin = await DbPluginInfo.get_plugin(module=module, include_parked=True)
         if not db_plugin:
             raise ValueError("插件不存在")
         config_list = []

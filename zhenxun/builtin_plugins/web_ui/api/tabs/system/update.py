@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Literal
 
 from fastapi import APIRouter, HTTPException
@@ -8,6 +9,7 @@ from pydantic import BaseModel
 
 from zhenxun.services.update.update_service import (
     UpdateServiceError,
+    cancel_pending_update,
     check_updates,
     create_update_job,
     job_status,
@@ -44,7 +46,7 @@ def _service_error(error: UpdateServiceError) -> HTTPException:
             status_code=409,
             detail={
                 "code": "release_blocked",
-                "message": "该版本存在已知兼容性问题，已禁止更新。",
+                "message": "该正式版不比当前版本新或无法比较版本号，已禁止更新。",
             },
         )
     if code == "update_not_pending":
@@ -129,6 +131,20 @@ async def apply_update_job(job_id: str) -> Result:
         "reason_codes": [f"update:{job.get('component', 'unknown')}:{job_id}"],
     }
     return Result.ok(data, info=message) if ok else Result.fail(message, code=409)
+
+
+@router.post(
+    "/jobs/{job_id}/cancel",
+    dependencies=[authentication()],
+    response_model=Result,
+    response_class=JSONResponse,
+)
+async def cancel_update_job(job_id: str) -> Result:
+    try:
+        job = await asyncio.to_thread(cancel_pending_update, job_id)
+    except UpdateServiceError as error:
+        raise _service_error(error) from error
+    return Result.ok(job, info="已取消待应用的更新。")
 
 
 __all__ = ["router"]

@@ -20,6 +20,7 @@ from .runtime_snapshot import (
     PluginLimitSnapshot,
     TaskInfoSnapshot,
 )
+from .runtime_snapshot import _parse_block_modules as _parse_block_modules
 from .runtime_sync import (
     LOG_COMMAND,
     RUNTIME_CACHES,

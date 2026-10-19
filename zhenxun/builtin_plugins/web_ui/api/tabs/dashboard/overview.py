@@ -411,8 +411,8 @@ async def build_runtime_overview(force: bool = False) -> RuntimeOverview:
                 database.status,
                 "数据库需要检查",
                 database.detail,
-                "查看系统状态",
-                "/system",
+                "查看数据与缓存",
+                "/database",
             )
         )
     if cache.status != "ok":
@@ -422,8 +422,8 @@ async def build_runtime_overview(force: bool = False) -> RuntimeOverview:
                 "warning",
                 "缓存状态异常",
                 cache.detail,
-                "查看系统状态",
-                "/system",
+                "查看数据与缓存",
+                "/database",
             )
         )
     if protocol_error:

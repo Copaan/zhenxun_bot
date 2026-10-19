@@ -13,6 +13,7 @@ from datetime import datetime
 import json
 from pathlib import Path
 import shutil
+import time
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
@@ -21,6 +22,31 @@ REQUEST = STATE_DIR / "request.json"
 PACKAGE = STATE_DIR / "package"
 ROLLBACK = STATE_DIR / "rollback"
 RUNNING = frozenset({"pending", "importing", "failed_import", "rollback_import"})
+LOCAL_KEYS = frozenset(
+    {
+        "ENVIRONMENT",
+        "HOST",
+        "PORT",
+        "DRIVER",
+        "CACHE_MODE",
+        "REDIS_HOST",
+        "REDIS_PORT",
+        "REDIS_PASSWORD",
+        "WEBUI_HTTPS_ENABLED",
+        "WEBUI_HTTP_MODE",
+        "WEBUI_HTTP_REDIRECT_ENABLED",
+        "WEBUI_HTTP_REDIRECT_PORT",
+        "WEBUI_TLS_CERTFILE",
+        "WEBUI_TLS_KEYFILE",
+        "QQ_WEBHOOK_MODE",
+        "QQ_WEBHOOK_LISTEN_HOST",
+        "QQ_WEBHOOK_LISTEN_PORT",
+        "QQ_WEBHOOK_PUBLIC_BASE_URL",
+        "QQ_WEBHOOK_TLS_CERTFILE",
+        "QQ_WEBHOOK_TLS_KEYFILE",
+    }
+)
+"""恢复 .env 时保留本机值的配置项（监听地址、证书、缓存等与部署机器相关的配置）"""
 
 Restart = Callable[[], Awaitable[tuple[bool, str]]]
 
@@ -34,18 +60,21 @@ def _now() -> str:
 
 
 def _load() -> dict | None:
+    from zhenxun.utils.atomic_json import read_json_locked
+
     try:
-        return json.loads(REQUEST.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        request = read_json_locked(REQUEST, None)
+    except OSError:
         return None
+    return request if isinstance(request, dict) else None
 
 
 def _save(request: dict, **changes) -> dict:
+    from zhenxun.utils.atomic_json import write_json_locked
+
     request.update(changes, updated_at=_now())
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    temporary = REQUEST.with_suffix(".tmp")
-    temporary.write_text(json.dumps(request, ensure_ascii=False), encoding="utf-8")
-    temporary.replace(REQUEST)
+    write_json_locked(REQUEST, request)
     return request
 
 
@@ -67,18 +96,29 @@ def _current_db_url() -> str:
 
 def _message(error: BaseException) -> str:
     code = getattr(error, "code", None)
-    return f"{code}: {error}" if code and str(error) != code else str(error)
+    text = str(error)
+    return f"{code}: {text}" if code and not text.startswith(code) else text
 
 
 def status() -> dict:
     """当前或最近一次恢复 / 切换的状态，数据库密码已隐藏
 
+    恢复写入了依赖层事务时，dependencies.layer 为该事务的应用结果。
+
     返回:
         dict: 状态，没有记录时 state 为 idle
     """
+    from . import deps
+
     request = _load()
     if request is None:
         return {"state": "idle"}
+    report = request.get("dependencies") or {}
+    if report.get("revision"):
+        request["dependencies"] = {
+            **report,
+            "layer": deps.layer_status(report["revision"]),
+        }
     return {
         **request,
         "db_url": _mask(request.get("db_url")),
@@ -149,14 +189,15 @@ def inspect(path: Path, password: str | None = None) -> dict:
 def configuration_preview(
     path: Path | None = None, password: str | None = None
 ) -> dict:
-    """读取备份中恢复后会生效的 .env 配置与 WebUI 管理员账号
+    """读取恢复后会生效的 .env 配置与 WebUI 管理员账号，LOCAL_KEYS 取本机值
 
     参数:
         path: 备份包路径，为空时读取已解压的待恢复备份
         password: 加密备份的密码
 
     返回:
-        dict: environment 为 .env 配置项，username 为管理员账号，缺失时为空
+        dict: environment 为 .env 配置项，username 为管理员账号，缺失时为空，
+            password_set 为是否设置了管理员密码
     """
     import contextlib
     from io import StringIO
@@ -187,10 +228,27 @@ def configuration_preview(
 
     text = contents.get(".env.dev") or contents.get(".env")
     environment = dict(dotenv_values(stream=StringIO(text))) if text else {}
-    username = webui("data/config.yaml").get("USERNAME") or (
-        webui("data/configs/plugins2config.yaml").get("USERNAME") or {}
-    ).get("value")
-    return {"environment": environment, "username": username}
+    if environment:
+        local = dotenv_values(_environment_path(Path()))
+        environment = {
+            key: value
+            for key, value in environment.items()
+            if key.upper() not in LOCAL_KEYS
+        }
+        environment.update(
+            (key, value) for key, value in local.items() if key.upper() in LOCAL_KEYS
+        )
+
+    def value(key: str):
+        return webui("data/config.yaml").get(key) or (
+            webui("data/configs/plugins2config.yaml").get(key) or {}
+        ).get("value")
+
+    return {
+        "environment": environment,
+        "username": value("USERNAME"),
+        "password_set": bool(value("PASSWORD")),
+    }
 
 
 def _idle() -> None:
@@ -232,6 +290,7 @@ async def request_restore(
     categories: list[str],
     skip_failed: bool = False,
     restart: Restart | None = None,
+    db_url: str | None = None,
 ) -> dict:
     """准备从备份包恢复并请求重启
 
@@ -241,19 +300,32 @@ async def request_restore(
         categories: 恢复的文件分类
         skip_failed: 依赖无法安装时是否跳过对应插件继续
         restart: 请求重启的函数，默认直接请求启动器重启
+        db_url: 恢复到的新数据库（首次部署时使用），须为空库；
+            指定时不导出当前数据库，导入失败只回滚文件
 
     返回:
         dict: 恢复状态
     """
+    from zhenxun.services.nonebot_store.storage import active_transaction
+
     from . import backup
 
+    transaction = active_transaction()
+    if transaction and transaction.get("state") not in {"pending_restart", "failed"}:
+        raise RestoreError(
+            f"插件依赖有未完成的变更（{transaction.get('state')}），"
+            "请等待完成或在插件商店处理后再恢复"
+        )
+    current = _current_db_url()
+    if db_url:
+        await _require_empty(db_url)
     _idle()
     try:
         manifest = await asyncio.to_thread(backup.extract, path, PACKAGE, password)
         if unknown := set(categories) - set(manifest["categories"]):
             raise RestoreError(f"备份中没有这些分类: {', '.join(sorted(unknown))}")
-        db_url = _current_db_url()
-        await _export(db_url, ROLLBACK / "database")
+        if not db_url:
+            await _export(current, ROLLBACK / "database")
     except BaseException:
         shutil.rmtree(STATE_DIR, ignore_errors=True)
         raise
@@ -264,15 +336,29 @@ async def request_restore(
             "name": path.name,
             "categories": sorted(categories),
             "skip_failed": skip_failed,
-            "db_url": db_url,
-            "previous_db_url": db_url,
+            "db_url": db_url or current,
+            "previous_db_url": current,
             "created_at": _now(),
         },
         restart,
     )
 
 
+TABLES_SQL = {
+    "sqlite": "SELECT name FROM sqlite_master"
+    " WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+    "mysql": "SELECT table_name FROM information_schema.tables"
+    " WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE'",
+    "postgres": "SELECT tablename FROM pg_tables WHERE schemaname = current_schema()",
+}
+
+
 async def _require_empty(db_url: str) -> None:
+    """检查目标数据库中已有的表都没有数据，不依赖已注册的模型
+
+    参数:
+        db_url: 目标数据库地址
+    """
     from . import data
 
     try:
@@ -280,14 +366,13 @@ async def _require_empty(db_url: str) -> None:
     except Exception as error:
         raise RestoreError(f"无法连接目标数据库: {error}") from error
     try:
-        for model in data._models():
-            table = model._meta.db_table
+        sql = TABLES_SQL[client.capabilities.dialect]
+        tables = [
+            next(iter(row.values())) for row in await client.execute_query_dict(sql)
+        ]
+        for table in sorted(tables):
             query = client.query_class.from_(table).select(1).limit(1).get_sql()
-            try:
-                rows = (await client.execute_query(query))[1]
-            except Exception:
-                continue
-            if rows:
+            if (await client.execute_query(query))[1]:
                 raise RestoreError(f"目标数据库已有数据（表 {table}），请使用空数据库")
     finally:
         await client.close()
@@ -370,14 +455,44 @@ class _Files:
             (self.root / relative).unlink(missing_ok=True)
 
 
-def _environment_file(root: Path) -> str:
+def _environment_path(root: Path) -> Path:
     from zhenxun.configs.environment import environment_file
 
-    return environment_file(root=root).relative_to(root).as_posix()
+    return environment_file(root=root)
+
+
+def _environment_file(root: Path) -> str:
+    return _environment_path(root).relative_to(root).as_posix()
+
+
+def _keep_local_keys(target: Path, local: dict[str, str | None]) -> None:
+    """把恢复后的 .env 文件中 LOCAL_KEYS 的值改回本机原值，本机未设置的项删除
+
+    参数:
+        target: 恢复后的 .env 文件
+        local: 恢复前本机该文件的配置项
+    """
+    from dotenv import dotenv_values, set_key, unset_key
+
+    kept = {
+        key.upper(): (key, value)
+        for key, value in local.items()
+        if key.upper() in LOCAL_KEYS and value is not None
+    }
+    for key in dotenv_values(target):
+        upper = key.upper()
+        if upper not in LOCAL_KEYS:
+            continue
+        if upper in kept and kept[upper][0] == key:
+            set_key(target, key, kept.pop(upper)[1], quote_mode="always")
+        else:
+            unset_key(target, key)
+    for key, value in kept.values():
+        set_key(target, key, value, quote_mode="always")
 
 
 def _write_files(request: dict, root: Path, files: _Files) -> None:
-    from dotenv import set_key
+    from dotenv import dotenv_values, set_key
 
     from zhenxun.services.nonebot_store.storage import read_json, write_json
 
@@ -385,6 +500,9 @@ def _write_files(request: dict, root: Path, files: _Files) -> None:
     from .deps import RECEIPTS_FILE
 
     files.protect(_environment_file(root))
+    local = {
+        path.name: dotenv_values(path) for path in root.glob(".env*") if path.is_file()
+    }
     source = PACKAGE / "files"
     if source.is_dir():
         for path in sorted(source.rglob("*")):
@@ -394,6 +512,8 @@ def _write_files(request: dict, root: Path, files: _Files) -> None:
                 and backup.category_for(relative) in request["categories"]
             ):
                 files.write(relative, path)
+                if relative in local:
+                    _keep_local_keys(root / relative, local[relative])
     if "plugins" in request["categories"]:
         saved = json.loads((PACKAGE / backup.DEPENDENCIES).read_text("utf-8"))
         files.protect(RECEIPTS_FILE.as_posix())
@@ -415,7 +535,13 @@ def _apply(request: dict, root: Path) -> None:
             report = asyncio.run(deps.stage_restore(saved, request["skip_failed"]))
             _save(request, dependencies=report)
     except Exception as error:
-        _save(request, state="failed", error=f"依赖无法安装：{_message(error)}")
+        _save(
+            request,
+            state="failed",
+            error=f"依赖无法安装：{_message(error)}",
+            error_code=getattr(error, "code", None),
+            error_detail=deps.describe(getattr(error, "details", None)),
+        )
         return
     files = _Files(root)
     try:
@@ -446,11 +572,9 @@ def apply_pending(root: Path | None = None) -> bool:
         _apply(request, root)
     elif request["state"] == "failed_import":
         _Files(root).rollback()
-        _save(
-            request,
-            state="rollback_import" if request["kind"] == "restore" else "rolled_back",
-        )
-        if request["kind"] == "switch":
+        rollback = (ROLLBACK / "database").is_dir()
+        _save(request, state="rollback_import" if rollback else "rolled_back")
+        if not rollback:
             shutil.rmtree(PACKAGE, ignore_errors=True)
     else:
         return False
@@ -472,10 +596,20 @@ async def import_pending() -> None:
     rollback = request["state"] == "rollback_import"
     source = (ROLLBACK if rollback else PACKAGE) / "database"
     progress: dict[str, Any] = {}
+    saved_at = 0.0
 
     def update(table: str, rows: int):
+        nonlocal saved_at
+        changed = progress.get("table") != table
         progress.update(table=table, rows=rows)
-        _save(request, progress=progress)
+        now = time.monotonic()
+        if not changed and now - saved_at < 1:
+            return
+        saved_at = now
+        try:
+            _save(request, progress=progress)
+        except OSError as error:
+            logger.warning("恢复进度写入失败", "恢复", e=error)
 
     logger.info("正在导入回滚数据" if rollback else "正在导入恢复数据", "恢复")
     try:

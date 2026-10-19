@@ -63,6 +63,7 @@ async def _() -> Result[PluginCount]:
         plugins = await DbPluginInfo.get_plugins(
             load_status=True,
             filter_parent=False,
+            include_parked=True,
         )
         for plugin in plugins:
             plugin_type = plugin.plugin_type
@@ -137,7 +138,9 @@ async def _(param: UpdatePlugin) -> Result:
 )
 async def _(param: PluginSwitch) -> Result:
     try:
-        db_plugin = await DbPluginInfo.get_plugin(module=param.module)
+        db_plugin = await DbPluginInfo.get_plugin(
+            module=param.module, include_parked=True
+        )
         if not db_plugin:
             return Result.fail("插件不存在...")
         from zhenxun.services.plugin_policy import plugin_policy_service
@@ -167,6 +170,7 @@ async def _() -> Result[list[str]]:
             "menu_type",
             load_status=True,
             filter_parent=False,
+            include_parked=True,
         )
         for r in result:
             if r not in menu_type_list and r:

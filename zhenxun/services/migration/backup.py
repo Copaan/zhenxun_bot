@@ -48,7 +48,7 @@ _EXCLUDED_DIRS = frozenset(
 _EXCLUDED_PREFIXES = ("data/runtime/", "data/web_ui/", "data/db/", "resources/temp/")
 _EXCLUDED_SUFFIXES = (".pyc", ".log", SUFFIX, ".part")
 
-Progress = Callable[[str, int, int], None]
+Progress = Callable[[str, int, int, str], None]
 
 
 class BackupError(RuntimeError):
@@ -71,7 +71,7 @@ def category_for(relative: str) -> str | None:
         return "plugins"
     if path.startswith("resources/"):
         return "resources"
-    if "/" not in path and path.startswith(".env"):
+    if "/" not in path and path.startswith(".env") and path != ".env.example":
         return "configuration"
     if path == "data/config.yaml" or path.startswith(("data/configs/", "certs/")):
         return "configuration"
@@ -203,7 +203,7 @@ def _write(
                 skipped.append(relative)
             done += size
             if progress:
-                progress("files", done, total)
+                progress("files", done, total, "")
         manifest["skipped_files"] = skipped
         archive.writestr(DEPENDENCIES, json.dumps(dependencies, ensure_ascii=False))
         archive.writestr(MANIFEST, json.dumps(manifest, ensure_ascii=False, indent=1))
@@ -229,7 +229,8 @@ async def export_backup(
         root: 项目根目录
         db_url: 数据库地址，默认使用当前配置
         destination: 备份包路径，默认 data/backups/zhenxun-<时间>.zx
-        progress: 进度回调 (阶段, 已完成, 总量)
+        progress: 进度回调 (阶段, 已完成, 总量, 当前表名)；数据库阶段的已完成
+            为当前表已导出的行数
 
     返回:
         tuple[Path, dict]: 备份包路径与清单
@@ -255,7 +256,7 @@ async def export_backup(
             tables = await data.export_data(
                 work,
                 client,
-                progress=(lambda table, rows: progress("database", rows, 0))
+                progress=(lambda table, rows: progress("database", rows, 0, table))
                 if progress
                 else None,
             )
@@ -437,10 +438,16 @@ class ExportTask:
             raise BackupError("已有导出任务正在进行")
         if unknown := set(categories) - set(CATEGORIES):
             raise BackupError(f"未知的备份分类: {', '.join(sorted(unknown))}")
-        cls.status = {"state": "running", "stage": "database", "done": 0, "total": 0}
+        cls.status = {
+            "state": "running",
+            "stage": "database",
+            "done": 0,
+            "total": 0,
+            "table": "",
+        }
 
-        def progress(stage: str, done: int, total: int):
-            cls.status.update(stage=stage, done=done, total=total)
+        def progress(stage: str, done: int, total: int, table: str):
+            cls.status.update(stage=stage, done=done, total=total, table=table)
 
         async def run():
             from zhenxun.services.log import logger

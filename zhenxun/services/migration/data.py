@@ -195,6 +195,24 @@ def _decoder(field) -> Callable[[Any], Any]:
     return field.to_python_value
 
 
+def _strip_nul(value: Any) -> Any:
+    """去掉字符串（含 JSON 内嵌字符串）中 PostgreSQL 无法存储的 NUL 字符
+
+    参数:
+        value: 解码后的字段值
+
+    返回:
+        Any: 处理后的值
+    """
+    if isinstance(value, str):
+        return value.replace("\x00", "")
+    if isinstance(value, list):
+        return [_strip_nul(item) for item in value]
+    if isinstance(value, dict):
+        return {_strip_nul(key): _strip_nul(item) for key, item in value.items()}
+    return value
+
+
 def _default(model: type[Model], name: str) -> Callable[[], Any]:
     field = model._meta.fields_map[name]
     if getattr(field, "auto_now", False) or getattr(field, "auto_now_add", False):
@@ -237,6 +255,11 @@ async def _write_table(
     index = {name: position for position, name in enumerate(source)}
     defaults = {name: _default(model, name) for name in columns if name not in index}
     decode = {name: _decoder(meta.fields_map[name]) for name in columns}
+    if db.capabilities.dialect == "postgres":
+        decode = {
+            name: lambda value, decoder=decoder: _strip_nul(decoder(value))
+            for name, decoder in decode.items()
+        }
     to_db = executor.column_map
 
     def convert(row: list) -> list:
@@ -280,7 +303,7 @@ async def import_data(
     """在一个事务内把导出数据写入目标数据库，按目标模型兼容字段差异
 
     目标库须已建表。导出中有而目标模型没有的表和字段被跳过，目标模型新增的
-    字段使用默认值。
+    字段使用默认值。导入 PostgreSQL 时去掉文本中的 NUL 字符。
 
     参数:
         directory: 导出目录
@@ -290,7 +313,7 @@ async def import_data(
         progress: 进度回调 (表名, 已导入行数)
 
     返回:
-        dict: 导入报告
+        dict: 导入报告，skipped_tables 为跳过的表及其导出行数
     """
     try:
         manifest = json.loads((directory / MANIFEST).read_text(encoding="utf-8"))
@@ -302,7 +325,10 @@ async def import_data(
     models = _models()
     report = {
         "tables": {},
-        "skipped_tables": sorted(set(exported) - {m._meta.db_table for m in models}),
+        "skipped_tables": {
+            table: exported[table]["rows"]
+            for table in sorted(set(exported) - {m._meta.db_table for m in models})
+        },
         "dropped_fields": {},
         "defaulted_fields": {},
     }

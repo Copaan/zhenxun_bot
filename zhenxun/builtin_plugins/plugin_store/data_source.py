@@ -102,8 +102,9 @@ def row_style(column: str, text: str) -> RowStyle:
 
 
 class StoreManager:
-    _catalog_health: ClassVar[dict[str, dict[str, Any]]] = {}
-    _catalog_health_checked_at: ClassVar[float] = 0.0
+    _catalog_files: ClassVar[
+        dict[str | None, tuple[float, list[set[str]], list[str]]]
+    ] = {}
     _SOURCE_NAMES: ClassVar[dict[RepoType, str]] = {
         RepoType.ALIYUN: "阿里云",
         RepoType.GITHUB: "GitHub",
@@ -145,9 +146,13 @@ class StoreManager:
     @classmethod
     @core_network_operation
     async def get_data(
-        cls, *, refresh: bool = False
+        cls, *, refresh: bool = False, source: str | None = None
     ) -> tuple[list[StorePluginInfo], list[StorePluginInfo]]:
         """获取插件信息数据
+
+        参数:
+            refresh: 是否忽略缓存重新拉取
+            source: 拉取目录的下载源，ali / git，为空时先阿里云后 GitHub
 
         返回:
             tuple[list[StorePluginInfo], list[StorePluginInfo]]:
@@ -188,11 +193,14 @@ class StoreManager:
             ):
                 return deepcopy(cached_data)
 
-            plugins = await RepoFileManager.get_text_content(
-                DEFAULT_GITHUB_URL, "plugins.json"
-            )
-            extra_plugins = await RepoFileManager.get_text_content(
-                EXTRA_GITHUB_URL, "plugins.json", "index"
+            repo_type = None if source is None else cls._get_source_order(source)[0]
+            plugins, extra_plugins = await asyncio.gather(
+                RepoFileManager.get_text_content(
+                    DEFAULT_GITHUB_URL, "plugins.json", repo_type=repo_type
+                ),
+                RepoFileManager.get_text_content(
+                    EXTRA_GITHUB_URL, "plugins.json", "index", repo_type=repo_type
+                ),
             )
             result = (
                 parse_entries(plugins, "official"),
@@ -209,37 +217,73 @@ class StoreManager:
         async with _PLUGIN_STORE_DATA_LOCK:
             await _PLUGIN_STORE_DATA_CACHE.delete("plugins_json")
             _PLUGIN_STORE_GENERATION += 1
-            cls._catalog_health = {}
-            cls._catalog_health_checked_at = 0.0
+            cls._catalog_files = {}
 
     @classmethod
     @core_network_operation
-    async def catalog_health(
-        cls, plugins: list[StorePluginInfo], *, refresh: bool = False
-    ) -> dict[str, dict[str, Any]]:
+    async def catalog_files(
+        cls, *, refresh: bool = False, source: str | None = None
+    ) -> tuple[list[set[str]], list[str]]:
+        """并发列出各下载源官方仓库中的文件，成功结果缓存 5 分钟，失败结果缓存 1 分钟
+
+        参数:
+            refresh: 是否忽略缓存重新拉取
+            source: 下载源，ali / git，为空时同时列出阿里云和 GitHub
+
+        返回:
+            tuple[list[set[str]], list[str]]: 成功源的文件集合，失败源的错误类型
+        """
         now = time.monotonic()
-        if (
-            not refresh
-            and cls._catalog_health
-            and now - cls._catalog_health_checked_at < 60
-        ):
-            return cls._catalog_health.copy()
+        cached = cls._catalog_files.get(source)
+        if not refresh and cached:
+            checked_at, source_files, source_errors = cached
+            if now - checked_at < (60 if source_errors else 5 * 60):
+                return source_files, source_errors
+        results = await asyncio.gather(
+            *(
+                RepoFileManager.list_directory_files(
+                    DEFAULT_GITHUB_URL, "", "main", repo_type=repo_type
+                )
+                for repo_type in cls._get_source_order(source)
+            ),
+            return_exceptions=True,
+        )
         source_files: list[set[str]] = []
         source_errors: list[str] = []
-        for repo_type in (RepoType.ALIYUN, RepoType.GITHUB):
-            try:
-                files = await RepoFileManager.list_directory_files(
-                    DEFAULT_GITHUB_URL,
-                    "",
-                    "main",
-                    repo_type=repo_type,
-                )
-            except Exception as error:
-                source_errors.append(type(error).__name__)
+        for files in results:
+            if isinstance(files, BaseException):
+                if not isinstance(files, Exception):
+                    raise files
+                source_errors.append(type(files).__name__)
                 continue
             source_files.append(
                 {Path(file.path).as_posix() for file in files if not file.is_dir}
             )
+        cls._catalog_files[source] = (now, source_files, source_errors)
+        return source_files, source_errors
+
+    @classmethod
+    async def catalog_health(
+        cls,
+        plugins: list[StorePluginInfo],
+        *,
+        refresh: bool = False,
+        source: str | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        """检查官方插件在下载源目录中是否存在
+
+        参数:
+            plugins: 插件信息
+            refresh: 是否忽略缓存重新检查
+            source: 检查的下载源，ali / git，为空时检查阿里云和 GitHub
+
+        返回:
+            dict[str, dict[str, Any]]: 模块名: 检查结果
+        """
+        source_files, source_errors = await cls.catalog_files(
+            refresh=refresh, source=source
+        )
+        all_sources_checked = not source_errors
         result = {}
         for plugin in plugins:
             if plugin.github_url not in {None, DEFAULT_GITHUB_URL} or plugin.ali_url:
@@ -250,7 +294,6 @@ class StoreManager:
                 f"{module_path}/__init__.py" if plugin.is_dir else f"{module_path}.py"
             )
             available = any(expected in files for files in source_files)
-            all_sources_checked = len(source_files) == 2
             result[plugin.module] = {
                 "status": (
                     "available"
@@ -269,9 +312,7 @@ class StoreManager:
                 "expected_path": expected,
                 "failed_sources": source_errors,
             }
-        cls._catalog_health = result
-        cls._catalog_health_checked_at = now
-        return result.copy()
+        return result
 
     @classmethod
     def version_check(cls, plugin_info: StorePluginInfo, suc_plugin: dict[str, str]):
@@ -381,6 +422,7 @@ class StoreManager:
         index_or_module: str,
         is_update: bool = False,
         is_remove: bool = False,
+        source: str | None = None,
     ) -> tuple[StorePluginInfo, bool]:
         """获取插件信息
 
@@ -399,7 +441,7 @@ class StoreManager:
         """
         plugin_list: list[StorePluginInfo]
         extra_plugin_list: list[StorePluginInfo]
-        plugin_list, extra_plugin_list = await cls.get_data()
+        plugin_list, extra_plugin_list = await cls.get_data(source=source)
         plugin_info = None
         is_external = False
         try:

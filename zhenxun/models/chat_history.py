@@ -247,9 +247,9 @@ class ChatHistory(Model):
             # 允许 group_id 为空
             SetColumnNullable("chat_history", "group_id", {"mysql": "VARCHAR(255)"}),
             # 允许 text 为空
-            SetColumnNullable("chat_history", "text", {"mysql": "TEXT"}),
+            SetColumnNullable("chat_history", "text", {"mysql": "LONGTEXT"}),
             # 允许 plain_text 为空
-            SetColumnNullable("chat_history", "plain_text", {"mysql": "TEXT"}),
+            SetColumnNullable("chat_history", "plain_text", {"mysql": "LONGTEXT"}),
             # 将user_id改为user_id
             RenameColumn("chat_history", "user_qq", "user_id"),
             AlterColumnType(

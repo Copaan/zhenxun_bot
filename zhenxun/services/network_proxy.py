@@ -13,6 +13,7 @@ import ipaddress
 import json
 import os
 from pathlib import Path
+import sys
 import time
 from typing import Any
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
@@ -277,6 +278,13 @@ class ProxyPolicy:
 
 
 def request_owner() -> str | None:
+    """当前请求所属的插件；插件宿主未加载时（如启动器进程）没有所属插件
+
+    返回:
+        str | None: 插件模块，不属于插件时为 None
+    """
+    if "zhenxun.services.plugin_host" not in sys.modules:
+        return None
     from zhenxun.services.plugin_host import current_owner
 
     return current_owner()

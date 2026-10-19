@@ -442,6 +442,7 @@ def _catalog_item(
         "plugin_type": plugin.get("type") or "application",
         "supported_adapters": plugin.get("supported_adapters"),
         "version": str(plugin.get("version") or ""),
+        "time": str(plugin.get("time") or ""),
         "install_state": install_state,
         "update_available": update_available,
         "blocked_reasons": reasons,
@@ -1191,7 +1192,15 @@ async def list_plugins(
                 "update_available",
             }:
                 continue
-            if status not in {"all", "installed"} and item["install_state"] != status:
+            if status == "managed" and item["install_state"] not in {
+                "managed",
+                "update_available",
+            }:
+                continue
+            if (
+                status not in {"all", "installed", "managed"}
+                and item["install_state"] != status
+            ):
                 continue
             if plugin_type != "all" and item["plugin_type"] != plugin_type:
                 continue
@@ -1199,6 +1208,14 @@ async def list_plugins(
             if adapter != "all" and supported and adapter not in supported:
                 continue
             items.append(item)
+        # 最近更新的在前，未通过官方加载测试的排在最后
+        items.sort(key=lambda item: item["time"], reverse=True)
+        items.sort(
+            key=lambda item: any(
+                warning["code"] == "registry_plugin_invalid"
+                for warning in item["warnings"]
+            )
+        )
         start = (page - 1) * page_size
         return Result.ok(
             {

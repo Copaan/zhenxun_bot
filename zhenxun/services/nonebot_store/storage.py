@@ -100,6 +100,7 @@ def next_generation(
 _OUTCOME_KEYS = (
     "error",
     "error_code",
+    "error_details",
     "failure_reasons",
     "rollback_confirmed",
     "cleanup_error",
