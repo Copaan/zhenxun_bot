@@ -14,12 +14,12 @@ from ....base_model import Result
 from ....utils import authentication
 from .model import (
     AccountPolicyUpdate,
+    GroupPolicyUpdate,
     PolicyBindingUpdate,
     PolicyCopy,
     PolicyCreate,
     PolicyDocument,
     PolicyUpdate,
-    ScopedPolicyImport,
 )
 
 router = APIRouter(prefix="/plugin-policy")
@@ -89,7 +89,7 @@ async def get_account_group(
 async def update_account_group(
     bot_id: str,
     group_id: str,
-    payload: AccountPolicyUpdate,
+    payload: GroupPolicyUpdate,
     platform_scope: str,
     channel_id: str = "",
 ):
@@ -105,6 +105,8 @@ async def update_account_group(
                 expected_revision=payload.expected_revision,
                 block_plugins=payload.block_plugins,
                 block_tasks=payload.block_tasks,
+                forced_plugins=payload.forced_plugins,
+                forced_tasks=payload.forced_tasks,
             ),
             "单群设置",
         )
@@ -312,22 +314,5 @@ async def import_policy_configuration(payload: PolicyDocument):
     try:
         applied = await bot_group_policy_service.import_document(payload)
         return Result.ok({"applied": applied, "source": "database"})
-    except (PluginPolicyError, RuntimeMutationBusyError) as error:
-        _raise_api_error(error)
-
-
-@router.post("/migration/apply", dependencies=[authentication()])
-async def migrate_policy_scope(payload: ScopedPolicyImport):
-    from zhenxun.services.bot_group_policy import bot_group_policy_service
-
-    try:
-        result = await bot_group_policy_service.migrate_scope(
-            payload.bot_id,
-            payload.platform_scope,
-            payload.group_id,
-            payload.channel_id,
-            payload.expected_revision,
-        )
-        return Result.ok(result, "此作用域已切换至数据库策略")
     except (PluginPolicyError, RuntimeMutationBusyError) as error:
         _raise_api_error(error)

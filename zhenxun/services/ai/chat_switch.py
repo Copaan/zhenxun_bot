@@ -6,6 +6,7 @@ from contextvars import ContextVar
 from functools import wraps
 
 _admitted = ContextVar("ai_chat_admitted_request", default=None)
+_scene_admitted = ContextVar("plugin_scene_admitted", default=False)
 
 
 def module_identity(owner: str) -> str:
@@ -48,15 +49,29 @@ def chat_plugin_enabled(owner: str | None, values: dict | None = None) -> bool:
 
 
 def require_chat_enabled(owner: str | None = None) -> None:
+    from nonebot.matcher import current_matcher
+
     from zhenxun.services.ai.core.exceptions import ConfigurationException
     from zhenxun.services.plugin_host import current_owner
 
     if _admitted.get() is asyncio.current_task():
         return
+    if _scene_admitted.get() or current_matcher.get(None) is not None:
+        return
     if not chat_plugin_enabled(owner or current_owner()):
         raise ConfigurationException(
             "ai_chat_plugin_disabled: 当前 AI 聊天插件已停用。"
         )
+
+
+@contextmanager
+def scene_admitted():
+    """入口已按场景判定插件可用，期间的 AI 调用不再按全局开关拦截"""
+    token = _scene_admitted.set(True)
+    try:
+        yield
+    finally:
+        _scene_admitted.reset(token)
 
 
 @contextmanager

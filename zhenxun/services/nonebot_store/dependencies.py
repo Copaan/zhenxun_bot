@@ -1260,15 +1260,7 @@ async def solve_install(
         canonicalize_name(str(plugin["project_link"])) == "nonebot-plugin-orm"
         or "nonebot-plugin-orm" in candidate_requirement_names
     )
-    database_type = "none"
-    if database_migration_possible:
-        env_file = Path(".env.dev") if Path(".env.dev").exists() else Path(".env")
-        raw_url = str(dotenv_values(env_file).get("SQLALCHEMY_DATABASE_URL") or "")
-        database_type = (
-            "sqlite"
-            if not raw_url or raw_url.casefold().startswith("sqlite")
-            else "external"
-        )
+    database_type = orm_database_type() if database_migration_possible else "none"
     return {
         "requirements": requirements,
         "resolved_packages": layer_packages,
@@ -1288,6 +1280,19 @@ async def solve_install(
         "database_migration_possible": database_migration_possible,
         "database_type": database_type,
     }
+
+
+def orm_database_type() -> str:
+    """读取 nonebot-plugin-orm 使用的数据库类型
+
+    返回:
+        str: 未配置或 SQLite 为 sqlite，其余为 external
+    """
+    env_file = Path(".env.dev") if Path(".env.dev").exists() else Path(".env")
+    raw_url = str(dotenv_values(env_file).get("SQLALCHEMY_DATABASE_URL") or "")
+    if not raw_url or raw_url.casefold().startswith("sqlite"):
+        return "sqlite"
+    return "external"
 
 
 def _plugin_released_packages(

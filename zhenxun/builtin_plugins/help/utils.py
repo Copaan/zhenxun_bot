@@ -60,7 +60,7 @@ async def classify_plugin(
         for plugin in value:
             if not classify.get(menu):
                 classify[menu] = []
-            item = handle(bot, plugin, group, is_detail)
+            item = handle(plugin, is_detail)
             reason = plugin_policy_service.availability(
                 plugin,
                 bot,
@@ -72,7 +72,7 @@ async def classify_plugin(
             )
             item["status"] = (
                 3
-                if reason == "global_disabled"
+                if reason and reason.startswith("global_")
                 else 2
                 if reason in {"account_disabled", "administrator_disabled"}
                 else 1

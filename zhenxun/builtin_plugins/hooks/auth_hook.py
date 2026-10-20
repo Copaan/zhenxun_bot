@@ -283,12 +283,11 @@ async def _drop_message_before_cache_ready(event: Event, bot: Bot):
 
 
 def _admit_plugin(matcher: Matcher) -> None:
-    """启动期尚未就绪、加载失败或 AI 对话开关已关闭的插件不处理事件
+    """加载失败而停用的插件不处理事件
 
     参数:
         matcher: Matcher
     """
-    from zhenxun.services.ai.chat_switch import chat_plugin_enabled
     from zhenxun.services.startup_load import startup_load_planner
 
     plugin_id = matcher.plugin_id
@@ -300,8 +299,51 @@ def _admit_plugin(matcher: Matcher) -> None:
     )
     if owner in startup_load_planner.failed_plugins:
         raise IgnoredException("plugin not admitted")
-    if not chat_plugin_enabled(plugin_id):
-        raise IgnoredException("ai chat plugin disabled")
+
+
+def _reject_disabled_owner(matcher: Matcher, context=None) -> None:
+    """所属插件（含上级插件）全局关闭时不处理事件，超级群与超级用户按统一规则豁免
+
+    参数:
+        matcher: Matcher
+        context: EventContext，为空时不豁免
+    """
+    from zhenxun.services.plugin_policy import (
+        PluginPolicyNotReady,
+        plugin_policy_service,
+    )
+
+    try:
+        blocked = plugin_policy_service.owner_blocked(
+            matcher.plugin_id,
+            super_group=context is not None and _is_super_group(context),
+            is_superuser=context is not None and context.is_superuser,
+        )
+    except PluginPolicyNotReady:
+        raise IgnoredException("plugin policy not ready") from None
+    if blocked:
+        raise IgnoredException("plugin globally disabled")
+
+
+def _is_super_group(context) -> bool:
+    """当前事件所在群是否为超级群
+
+    参数:
+        context: EventContext
+
+    返回:
+        bool: 是否为超级群
+    """
+    if not context.group_id:
+        return False
+    from zhenxun.services.cache.runtime_cache import GroupMemoryCache
+    from zhenxun.services.platform_identity import is_namespaced_scope
+
+    if is_namespaced_scope(context.platform_scope):
+        group = GroupMemoryCache.get_if_ready(context.storage_group_id)
+    else:
+        group = GroupMemoryCache.get_if_ready(context.group_id, context.channel_id)
+    return bool(group and group.is_super)
 
 
 @run_preprocessor
@@ -323,6 +365,7 @@ async def _auth_preprocessor(
 
     # 提前判断是否跳过权限检查
     if _skip_auth_for_plugin(matcher):
+        _reject_disabled_owner(matcher)
         from zhenxun.utils.platform import PlatformUtils
 
         _enforce_platform_contract(
@@ -341,6 +384,7 @@ async def _auth_preprocessor(
     _enforce_platform_contract(
         matcher, event_context.platform_scope, bot, event, session
     )
+    _reject_disabled_owner(matcher, event_context)
     from zhenxun.services.bot_group_policy import bot_group_policy_service
 
     await bot_group_policy_service.ensure_fresh(

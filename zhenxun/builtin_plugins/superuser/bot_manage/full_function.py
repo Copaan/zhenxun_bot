@@ -1,7 +1,10 @@
 from nonebot_plugin_alconna import AlconnaMatch, Match
 from nonebot_plugin_uninfo import Uninfo
 
-from zhenxun.builtin_plugins.superuser.bot_manage.command import bot_manage
+from zhenxun.builtin_plugins.superuser.bot_manage.command import (
+    bot_manage,
+    detach_notice,
+)
 from zhenxun.models.bot_console import BotConsole
 from zhenxun.services.log import logger
 from zhenxun.utils.message import MessageUtils
@@ -21,11 +24,12 @@ async def enable_full_function(
             "bot_manage.full_function.enable",
             session=session,
         )
-        await BotConsole.enable_all(bot_id.result, "tasks")
+        policy = await BotConsole.enable_all(bot_id.result, "tasks")
         await BotConsole.enable_all(bot_id.result, "plugins")
 
         await MessageUtils.build_message(
             f"已开启 {bot_id.result} 的所有插件及被动"
+            + detach_notice({bot_id.result: policy})
         ).finish()
 
 
@@ -43,9 +47,10 @@ async def diasble_full_function(
             "bot_manage.full_function.disable",
             session=session,
         )
-        await BotConsole.disable_all(bot_id.result, "tasks")
+        policy = await BotConsole.disable_all(bot_id.result, "tasks")
         await BotConsole.disable_all(bot_id.result, "plugins")
 
         await MessageUtils.build_message(
             f"已禁用 {bot_id.result} 的所有插件及被动"
+            + detach_notice({bot_id.result: policy})
         ).finish()

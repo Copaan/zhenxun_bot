@@ -9,11 +9,10 @@ import secrets
 import tempfile
 from typing import Any
 
-from ruamel.yaml import YAML
-
 from zhenxun.configs.config import Config
 from zhenxun.configs.environment import environment_file, environment_target
 
+from ...config_validation import _yaml_parser
 from ...passwords import hash_password
 from .data_source import build_database_url, resolve_network_host
 from .model import ApplyRequest
@@ -45,24 +44,17 @@ def _quote_env(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
-def _yaml() -> YAML:
-    parser = YAML()
-    parser.preserve_quotes = True
-    parser.indent(mapping=2, sequence=4, offset=2)
-    return parser
-
-
 def _load_yaml(path: Path) -> Any:
     if not path.exists():
         return {}
-    parser = _yaml()
+    parser = _yaml_parser()
     with path.open(encoding="utf-8") as stream:
         return parser.load(stream) or {}
 
 
 def _dump_yaml(data: Any) -> bytes:
     stream = StringIO()
-    _yaml().dump(data, stream)
+    _yaml_parser().dump(data, stream)
     return stream.getvalue().encode("utf-8")
 
 

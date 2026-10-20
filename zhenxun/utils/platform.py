@@ -691,17 +691,8 @@ class PlatformUtils:
                     update_list.append(_group)
         if create_list:
             await GroupConsole.bulk_create(create_list, 10)
-            task_modules = await GroupConsole._get_task_modules(default_status=False)
-            plugin_modules = await GroupConsole._get_plugin_modules(
-                default_status=False
-            )
             new_ids = [g.group_id for g in create_list]
             fresh = await GroupConsole.filter(group_id__in=new_ids).all()
-            if task_modules or plugin_modules:
-                for group in fresh:
-                    await GroupConsole._update_modules(
-                        group, task_modules, plugin_modules
-                    )
             from zhenxun.services.cache.runtime_cache import GroupMemoryCache
 
             for group in fresh:

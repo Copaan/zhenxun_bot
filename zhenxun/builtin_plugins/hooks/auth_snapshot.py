@@ -164,10 +164,6 @@ def _build_runtime_group_snapshot(context: EventContext) -> GroupSnapshot | None
         level=5,
         is_super=False,
         group_flag=0,
-        block_plugin="",
-        superuser_block_plugin="",
-        block_task="",
-        superuser_block_task="",
         platform=context.platform,
     )
 

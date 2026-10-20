@@ -3,18 +3,16 @@ from fastapi.responses import JSONResponse
 
 from zhenxun.models.plugin_info import PluginInfo as DbPluginInfo
 from zhenxun.services.log import logger
-from zhenxun.services.plugin_host import ApplyMode
+from zhenxun.services.plugin_host.models import ApplyMode
 from zhenxun.services.plugin_policy import PluginPolicyConflict
-from zhenxun.utils._restart_utils import issue_restart_ticket
 from zhenxun.utils.enum import PluginType
 
 from ....apply_result import (
     APPLY_CONFIG_RELOADED,
+    APPLY_HOT_RELOADED,
     apply_result_data,
-    update_pending_restart,
 )
 from ....base_model import Result
-from ....restart_service import restart_status_data
 from ....utils import authentication
 from .data_source import ApiDataSource
 from .model import (
@@ -25,6 +23,7 @@ from .model import (
     PluginDetail,
     PluginInfo,
     PluginSwitch,
+    PluginUnload,
     RenameMenuTypePayload,
     UpdatePlugin,
 )
@@ -90,36 +89,11 @@ async def _() -> Result[PluginCount]:
 )
 async def _(param: UpdatePlugin) -> Result:
     try:
-        _, operation = await ApiDataSource.update_plugin(param)
-        apply_mode = (
-            operation.mode.value if operation is not None else APPLY_CONFIG_RELOADED
+        await ApiDataSource.update_plugin(param)
+        return Result.ok(
+            apply_result_data(apply_mode=APPLY_CONFIG_RELOADED),
+            info="插件设置已保存并生效。",
         )
-        restart_required = apply_mode in {
-            ApplyMode.RESTART_PENDING.value,
-            ApplyMode.RESTART_REQUESTED.value,
-        }
-        reasons = [operation.reason] if operation and operation.reason else []
-        launcher_managed = update_pending_restart(
-            f"webui.plugin-config:{param.module}",
-            reasons if restart_required else [],
-        )
-        if restart_required and launcher_managed:
-            issue_restart_ticket("webui.settings", ttl_seconds=10 * 60)
-        status = restart_status_data()
-        data = apply_result_data(
-            apply_mode=apply_mode,
-            changed_keys=operation.config_keys if operation else [],
-            restart_required=restart_required,
-            reason_codes=reasons,
-            access_urls=status["access_urls"],
-            access_targets=status["access_targets"],
-        )
-        info = (
-            "插件设置已保存，需要重启后生效。"
-            if restart_required
-            else "插件设置已保存并生效。"
-        )
-        return Result.ok(data, info=info)
     except PluginPolicyConflict as error:
         raise HTTPException(409, detail=str(error)) from error
     except (ValueError, KeyError):
@@ -153,6 +127,46 @@ async def _(param: PluginSwitch) -> Result:
         raise HTTPException(409, detail=str(error)) from error
     except Exception as e:
         logger.error(f"{router.prefix}/change_switch 调用错误", "WebUi", e=e)
+        return Result.fail(f"{type(e)}: {e}")
+
+
+@router.post(
+    "/unload",
+    dependencies=[authentication()],
+    response_model=Result,
+    response_class=JSONResponse,
+    description="卸载全局禁用的插件以释放资源，或重新加载",
+)
+async def _(param: PluginUnload) -> Result:
+    try:
+        db_plugin = await DbPluginInfo.get_plugin(
+            module=param.module, include_parked=True
+        )
+        if not db_plugin:
+            return Result.fail("插件不存在...")
+        if param.unloaded and db_plugin.status:
+            return Result.fail("请先全局关闭该插件")
+        from zhenxun.services.plugin_host import plugin_host
+
+        module_path = str(db_plugin.module_path or db_plugin.module)
+        if param.unloaded == plugin_host.is_parked(module_path):
+            return Result.fail("插件已卸载" if param.unloaded else "插件未卸载")
+        operation = await plugin_host.set_unloaded(module_path, param.unloaded)
+        if operation is None:
+            return Result.fail(
+                "该插件当前无法卸载：内置插件、不支持热重载、被其他未关闭的插件依赖，"
+                "或仍有开启的被动技能/定时任务"
+            )
+        if operation.mode == ApplyMode.FAILED:
+            return Result.fail(f"操作失败: {operation.reason}")
+        return Result.ok(
+            apply_result_data(
+                apply_mode=APPLY_HOT_RELOADED, changed_keys=operation.changed
+            ),
+            info="插件已卸载，资源已释放" if param.unloaded else "插件已重新加载",
+        )
+    except Exception as e:
+        logger.error(f"{router.prefix}/unload 调用错误", "WebUi", e=e)
         return Result.fail(f"{type(e)}: {e}")
 
 

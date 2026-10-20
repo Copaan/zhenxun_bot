@@ -127,27 +127,14 @@ class BotGroupSync:
                     if not self._current(bot, key):
                         return
                     if scope == "qq_client":
-                        tasks = await GroupConsole._get_task_modules(
-                            default_status=False
-                        )
-                        plugins = await GroupConsole._get_plugin_modules(
-                            default_status=False
-                        )
                         for candidate in groups:
-                            (
-                                group,
-                                created,
-                            ) = await GroupConsole.get_or_create_root_group(
+                            group, _ = await GroupConsole.get_or_create_root_group(
                                 candidate.group_id,
                                 defaults={
                                     "group_name": candidate.group_name,
                                     "group_flag": 1,
                                 },
                             )
-                            if created and (tasks or plugins):
-                                await GroupConsole._update_modules(
-                                    group, tasks, plugins
-                                )
                             await GroupMemoryCache.upsert_from_model(group)
                     await bot_group_policy_service.record_memberships(
                         [

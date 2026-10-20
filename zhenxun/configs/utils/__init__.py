@@ -1,11 +1,12 @@
 from collections.abc import Callable
 import copy
 from pathlib import Path
+import sys
 from typing import Any, TypeVar
 
 import cattrs
 from nonebot.log import logger as _nonebot_logger
-from nonebot.plugin import _current_plugin
+from nonebot.plugin import _current_plugin, get_plugin_by_module_name
 from pydantic import BaseModel, Field
 from ruamel.yaml import YAML
 from ruamel.yaml.scanner import ScannerError
@@ -111,6 +112,8 @@ class ConfigGroup(BaseModel):
     """插件名"""
     configs: dict[str, ConfigModel] = Field(default_factory=dict)
     """配置项列表"""
+    plugins: list[str] = Field(default_factory=list)
+    """注册过此配置组的插件"""
 
     def get(self, c: str, default: Any = None, *, build_model: bool = True) -> Any:
         """
@@ -393,6 +396,7 @@ class ConfigsManager:
         type: type | None = None,
         arg_parser: Callable | None = None,
         ui: ConfigUIModel | dict[str, Any] | None = None,
+        plugin: str | None = None,
         _override: bool = False,
     ):
         """为插件添加一个配置，不会被覆盖，只有第一个生效
@@ -406,6 +410,7 @@ class ConfigsManager:
             type: 值类型.
             arg_parser: 值解析器，一般与webui配合使用.
             ui: WebUI 展示元数据.
+            plugin: 注册配置的插件名，为空时按调用方模块识别.
             _override: 强制覆盖值.
 
         异常:
@@ -428,6 +433,12 @@ class ConfigsManager:
         processed_default_value = self._normalize_config_data(default_value)
 
         self.add_module.append(f"{module}:{key}".lower())
+        if plugin is None and (
+            owner := get_plugin_by_module_name(
+                sys._getframe(1).f_globals.get("__name__", "")
+            )
+        ):
+            plugin = owner.name
         if module in self._data and (config := self._data[module].configs.get(key)):
             config.help = help
             config.arg_parser = arg_parser
@@ -448,6 +459,8 @@ class ConfigsManager:
                 arg_parser=arg_parser,
                 ui=ConfigUIModel(**ui) if isinstance(ui, dict) else ui,
             )
+        if plugin and plugin not in self._data[module].plugins:
+            self._data[module].plugins.append(plugin)
 
     def set_config(
         self,
@@ -587,6 +600,19 @@ class ConfigsManager:
         }
         with open(path, "w", encoding="utf8") as f:
             _yaml.dump(save_data, f)
+
+    def remove_groups(self, modules: set[str]) -> None:
+        """删除配置组并保存到 plugins2config.yaml
+
+        参数:
+            modules: 配置组名称
+        """
+        if not modules & set(self._data):
+            return
+        for module in modules:
+            self._data.pop(module, None)
+            self._simple_data.pop(module, None)
+        self.save()
 
     def snapshot_runtime_values(self) -> tuple[dict, dict[str, dict[str, Any]]]:
         """Capture mutable config values for transactional runtime reloads."""

@@ -38,6 +38,11 @@ def _activate_staged_generation(transaction: dict[str, Any]) -> Path:
 
 
 def _load_target_plugins(transaction: dict[str, Any]) -> None:
+    """加载需要执行迁移的插件，恢复备份时加载全部托管插件与带迁移脚本的源码插件
+
+    参数:
+        transaction: 依赖层事务
+    """
     from .runtime import _load_managed_plugin
 
     operations = [
@@ -50,8 +55,11 @@ def _load_target_plugins(transaction: dict[str, Any]) -> None:
     }
     # Transactions created before migration ownership was recorded require the
     # conservative legacy behavior.
-    restrict_modules = bool(operations) and any(
-        "database_migration_possible" in item for item in operations
+    restore = bool(transaction.get("restore"))
+    restrict_modules = (
+        not restore
+        and bool(operations)
+        and any("database_migration_possible" in item for item in operations)
     )
     plugins = transaction.get("target_manifest", {}).get("plugins", {})
     for plugin in plugins.values():
@@ -60,6 +68,36 @@ def _load_target_plugins(transaction: dict[str, Any]) -> None:
         module_name = str(plugin.get("module_name") or "")
         if module_name and (not restrict_modules or module_name in migration_modules):
             _load_managed_plugin(module_name)
+    if restore:
+        _load_source_migration_plugins()
+
+
+def _load_source_migration_plugins() -> None:
+    """加载带 migrations 目录的源码插件，加载失败的插件跳过，由 worker 启动时隔离"""
+    from nonebot.plugin import _managers
+    from nonebot.plugin.manager import PluginManager
+
+    from zhenxun.configs.config import BotConfig
+
+    from .dependencies import safe_process_error
+
+    roots = [Path("zhenxun/plugins")]
+    roots += [Path(path.strip()) for path in BotConfig.ext_path if path.strip()]
+    for root in roots:
+        if not root.is_dir():
+            continue
+        manager = PluginManager(search_path=[str(root.resolve())])
+        _managers.append(manager)
+        for plugin_id, module_name in sorted(manager.controlled_modules.items()):
+            if not (root / module_name.rsplit(".", 1)[-1] / "migrations").is_dir():
+                continue
+            try:
+                manager.load_plugin(plugin_id)
+            except Exception as error:
+                sys.stderr.write(
+                    f"skip source plugin {plugin_id}: {type(error).__name__}: "
+                    f"{safe_process_error(str(error))}\n"
+                )
 
 
 def _sqlite_paths(orm_module: Any) -> tuple[list[Path], bool]:
@@ -150,9 +188,15 @@ async def apply(*, manual_external: bool = False) -> int:
         _activate_staged_generation(transaction)
         from sqlalchemy.util import greenlet_spawn
 
-        from zhenxun.configs.environment import environment_file
+        from zhenxun.configs.environment import (
+            environment_file,
+            migrate_orm_data_dir,
+            sync_env_missing_items,
+        )
 
+        sync_env_missing_items(Path.cwd())
         nonebot.init(_env_file=environment_file())
+        migrate_orm_data_dir()
         _load_target_plugins(transaction)
         import nonebot_plugin_orm as orm
         from nonebot_plugin_orm import migrate

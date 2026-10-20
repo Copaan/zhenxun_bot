@@ -60,10 +60,17 @@ def recovery_required() -> bool:
     return (pending_transaction() or {}).get("state") == "recovery_required"
 
 
-def rollback_for_launcher() -> bool:
-    """Retain a failed rollback without restarting business components."""
+def rollback_for_launcher(failed: list[dict[str, Any]] | None = None) -> bool:
+    """回滚未通过启动验证的依赖层事务，回滚失败时保留为待恢复状态
+
+    参数:
+        failed: launcher 记录的失败项
+
+    返回:
+        bool: 是否已回滚
+    """
     try:
-        rollback_pending_transaction()
+        rollback_pending_transaction(failed)
     except Exception as error:
         transaction = pending_transaction() or {}
         transaction.update(
@@ -874,7 +881,7 @@ def _probe_config_main(module_name: str, layer: str) -> None:
         sys.path.insert(0, layer)
         import nonebot
 
-        from zhenxun.configs.environment import environment_file
+        from zhenxun.configs.environment import environment_file, migrate_orm_data_dir
 
         nonebot.init(
             _env_file=environment_file(),
@@ -882,6 +889,7 @@ def _probe_config_main(module_name: str, layer: str) -> None:
             render_backend="playwright",
             render_playwright={"channel": None},
         )
+        migrate_orm_data_dir()
         _load_managed_plugin(module_name, purge=False)
     except Exception as error:
         missing = missing_config_key(error)
@@ -1031,7 +1039,14 @@ def finalize_pending_transaction() -> None:
         archive_settled()
 
 
-def rollback_pending_transaction() -> None:
+def rollback_pending_transaction(failed: list[dict[str, Any]] | None = None) -> None:
+    """回滚待验证的依赖层事务并记录失败原因
+
+    worker 未能完成启动时记录为 worker_startup_failed，否则按插件加载结果记录。
+
+    参数:
+        failed: launcher 记录的失败项
+    """
     current = load_manifest()
     transaction = pending_transaction() or {}
     failed_generation = transaction.get("generation", current.get("active_generation"))
@@ -1053,12 +1068,21 @@ def rollback_pending_transaction() -> None:
         raise LayerBuildError("database_migration_rollback_failed")
     if isinstance(rollback, dict) and not transaction.get("rollback_confirmed"):
         save_manifest(rollback)
+    worker_failed = any(
+        item.get("code") == "worker_health_check_failed" for item in failed or []
+    )
     if transaction:
         transaction["state"] = "failed"
         transaction["rollback_confirmed"] = True
-        transaction["error_code"] = "plugin_startup_verification_failed"
+        transaction["error_code"] = (
+            "worker_startup_failed"
+            if worker_failed
+            else "plugin_startup_verification_failed"
+        )
         failures = failed_status.get("failed")
-        if isinstance(failures, list):
+        if worker_failed:
+            transaction["failure_reasons"] = [{"code": "worker_startup_failed"}]
+        elif isinstance(failures, list):
             transaction["failure_reasons"] = [
                 {
                     "code": str(item.get("code") or "plugin_import_failed"),

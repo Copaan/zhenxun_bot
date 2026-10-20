@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Collection
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
 import importlib
@@ -37,7 +38,10 @@ from zhenxun.services.memory_governor import freeze_heap
 from zhenxun.services.plugin_store.plugin_store_transaction import (
     LOADED_PLUGINS_INDEX,
 )
-from zhenxun.services.runtime_mutation import runtime_mutation_coordinator
+from zhenxun.services.runtime_mutation import (
+    RuntimeMutationBusyError,
+    runtime_mutation_coordinator,
+)
 from zhenxun.utils.atomic_json import read_json_locked, write_json_locked
 from zhenxun.utils.enum import PriorityLifecycleType
 
@@ -319,7 +323,7 @@ class PluginHost:
         self.stopped: dict[str, _Stopped] = {}
         """热重载失败而停用的插件模块"""
         self.parked: dict[str, tuple[Path | None, list[str]]] = {}
-        """因全局禁用而未加载的插件模块，值为插件目录与需恢复登记的子插件模块"""
+        """手动卸载的全局禁用插件模块，值为插件目录与需恢复登记的子插件模块"""
         self.duties: dict[str, dict[str, list[str]]] = {}
         """插件模块的被动技能与可调度任务，见 _duties"""
         self._sync_task: asyncio.Task | None = None
@@ -372,15 +376,15 @@ class PluginHost:
         }
 
     def is_parked(self, module_path: str) -> bool:
-        """模块是否属于因全局禁用而未加载的插件"""
+        """模块是否属于手动卸载的全局禁用插件"""
         return any(
             module_path == name or module_path.startswith(f"{name}.")
             for name in self.parked
         )
 
     def write_index(self) -> None:
-        """记录已加载与因禁用未加载的插件模块，供 launcher 启动验证读取，
-        并记录各插件的被动技能与可调度任务，供下次启动判断是否跳过加载
+        """记录已加载与手动卸载的插件模块，供 launcher 启动验证读取，
+        并记录手动卸载的插件及各插件的被动技能与可调度任务，供下次启动判断是否跳过加载
         """
         for plugin in list(_plugins.values()):
             if plugin.parent_plugin is None:
@@ -395,7 +399,8 @@ class PluginHost:
         duties = {name: self.duties[name] for name in modules if name in self.duties}
         try:
             write_json_locked(
-                LOADED_PLUGINS_INDEX, {"modules": modules, "duties": duties}
+                LOADED_PLUGINS_INDEX,
+                {"modules": modules, "duties": duties, "parked": sorted(self.parked)},
             )
         except OSError as error:
             logger.warning(f"已加载插件索引写入失败: {type(error).__name__}")
@@ -1162,7 +1167,7 @@ class PluginHost:
         }
 
     async def park_disabled_entries(self) -> None:
-        """启动时跳过加载全局禁用的插件，解除禁用后再热加载
+        """启动时跳过加载上次手动卸载且仍全局禁用的插件，解除禁用后再热加载
 
         仅处理可热加载、且没有未跳过的插件依赖它的第三方插件。
         """
@@ -1170,12 +1175,14 @@ class PluginHost:
 
         index = read_json_locked(LOADED_PLUGINS_INDEX, {})
         self.duties.update(index.get("duties") or {})
+        parked = set(index.get("parked") or ())
         entries = {
             entry.plugin_id: entry
             for entry in startup_load_planner.entries.values()
             if entry.phase == "runtime_load"
             and entry.status == "pending"
             and entry.source != "builtin"
+            and entry.module_name in parked
         }
         if not entries:
             return
@@ -1207,12 +1214,18 @@ class PluginHost:
                 entry.status = "unloaded"
                 self.parked[entry.module_name] = (entry.root, [])
         if candidates:
-            logger.info(f"跳过加载全局禁用的插件: {', '.join(sorted(candidates))}")
+            logger.info(f"跳过加载已卸载的插件: {', '.join(sorted(candidates))}")
 
-    async def sync_disabled(self) -> RuntimeOperation | None:
-        """卸载全局禁用的插件以释放资源，重新加载已解除禁用的插件
+    async def sync_disabled(
+        self, unload: Collection[str] = (), reload: Collection[str] = ()
+    ) -> RuntimeOperation | None:
+        """卸载指定的全局禁用插件以释放资源，重新加载已解除禁用或指定的已卸载插件
 
         依赖它的插件同样禁用、且均可热处理时才卸载。
+
+        参数:
+            unload: 要卸载的顶层插件模块
+            reload: 仍全局禁用但要重新加载的插件模块
 
         返回:
             RuntimeOperation | None: 操作结果，没有变化时为 None
@@ -1228,7 +1241,7 @@ class PluginHost:
             disabled = await self._disabled(set(tops) | set(self.parked))
             eligible = []
             for name, plugin in tops.items():
-                if name not in disabled:
+                if name not in disabled or name not in unload:
                     continue
                 closure = self.classifier.closure([plugin], self.generation)
                 if all(
@@ -1236,8 +1249,10 @@ class PluginHost:
                     for item in closure
                 ):
                     eligible.append(plugin)
+            wake = [
+                name for name in self.parked if name not in disabled or name in reload
+            ]
             park = self.classifier.closure(eligible, self.generation)
-            wake = [name for name in self.parked if name not in disabled]
             if not park and not wake:
                 self.write_index()
                 return None
@@ -1267,15 +1282,46 @@ class PluginHost:
                 )
             if loaded:
                 logger.info(
-                    f"已加载解除禁用的插件: {', '.join(p.id_ for p in loaded)}",
+                    f"已重新加载插件: {', '.join(p.id_ for p in loaded)}",
                     _LOG_COMMAND,
                 )
             if reason:
                 return self._finish(ApplyMode.FAILED, ids, reason, notes, wake)
             return self._finish(ApplyMode.HOT_RELOADED, ids, notes=notes)
 
+    async def set_unloaded(
+        self, module_path: str, unloaded: bool
+    ) -> RuntimeOperation | None:
+        """手动卸载全局禁用的插件以释放资源，或重新加载已卸载的插件
+
+        参数:
+            module_path: 插件模块
+            unloaded: True 为卸载，False 为重新加载
+
+        返回:
+            RuntimeOperation | None: 操作结果，插件不满足条件时为 None
+        """
+        names = {
+            plugin.module_name
+            for plugin in list(_plugins.values())
+            if plugin.parent_plugin is None
+        } | set(self.parked)
+        name = next(
+            (
+                name
+                for name in names
+                if module_path == name or module_path.startswith(f"{name}.")
+            ),
+            None,
+        )
+        if name is None:
+            return None
+        if unloaded:
+            return await self.sync_disabled(unload={name})
+        return await self.sync_disabled(reload={name})
+
     def schedule_sync_disabled(self) -> None:
-        """在后台执行 sync_disabled，短时间内的多次请求合并执行"""
+        """在后台重新加载已解除禁用的已卸载插件，短时间内的多次请求合并执行"""
         if self._sync_task is not None and not self._sync_task.done():
             self._sync_again = True
             return
@@ -1289,6 +1335,11 @@ class PluginHost:
             try:
                 await self.sync_disabled()
             except Exception as error:
+                if isinstance(error, RuntimeMutationBusyError) and str(error) in {
+                    "runtime_mutation_quiescing",
+                    "runtime_mutation_closed",
+                }:
+                    return
                 logger.error("同步插件全局禁用状态失败", _LOG_COMMAND, e=error)
 
     def clear_pending_restart(self, reason: str | None = None) -> None:

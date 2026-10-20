@@ -1,6 +1,3 @@
-from copy import deepcopy
-from pathlib import Path
-import re
 from urllib.parse import quote
 
 from fastapi import Query
@@ -8,22 +5,18 @@ import nonebot
 from tortoise.exceptions import DoesNotExist
 
 from zhenxun.configs.config import Config
-from zhenxun.configs.utils import ConfigGroup
 from zhenxun.models.plugin_info import PluginInfo as DbPluginInfo
 from zhenxun.services.cache.runtime_cache import PluginInfoMemoryCache
 from zhenxun.services.nonebot_store.storage import (
     load_manifest as load_nonebot_manifest,
 )
-from zhenxun.services.plugin_host import ApplyMode, RuntimeOperation
 from zhenxun.services.plugin_store.plugin_store_receipts import StoreReceiptStore
-from zhenxun.services.runtime_config import reload_runtime_config
 from zhenxun.services.runtime_mutation import managed_mutation
 from zhenxun.utils.enum import BlockType, PluginType
 
-from ....config_schema import configuration_value
+from ..system.configuration import simple_config_groups
 from .model import (
     BatchUpdatePlugins,
-    PluginConfig,
     PluginDetail,
     PluginInfo,
     UpdatePlugin,
@@ -90,6 +83,7 @@ class ApiDataSource:
             for store_key, item in load_nonebot_manifest().get("plugins", {}).items()
             if isinstance(item, dict) and item.get("state") == "managed"
         }
+        from zhenxun.services.plugin_host import plugin_host
         from zhenxun.services.plugin_policy import plugin_policy_service
 
         policy_revision = (await plugin_policy_service.global_state())["revision"]
@@ -178,22 +172,21 @@ class ApiDataSource:
                 is_builtin=is_builtin,
                 allow_setting=plugin.plugin_type != PluginType.HIDDEN,
                 allow_switch=plugin.plugin_type != PluginType.HIDDEN,
+                parked=plugin_host.is_parked(runtime_module),
             )
             plugin_list.append(plugin_info)
         return plugin_list
 
     @classmethod
     @managed_mutation("plugin_configuration")
-    async def update_plugin(
-        cls, param: UpdatePlugin
-    ) -> tuple[DbPluginInfo, RuntimeOperation | None]:
-        """更新插件数据
+    async def update_plugin(cls, param: UpdatePlugin) -> DbPluginInfo:
+        """更新插件设置
 
         参数:
             param: UpdatePlugin
 
         返回:
-            DbPluginInfo | None: 插件数据
+            DbPluginInfo: 插件数据
         """
         db_plugin = await DbPluginInfo.get_plugin(
             module=param.module, include_parked=True
@@ -212,11 +205,6 @@ class ApiDataSource:
                 "status",
             )
         }
-        runtime_snapshot = Config.snapshot_runtime_values()
-        previous_simple = deepcopy(Config._simple_data)
-        simple_path = Path("data/config.yaml")
-        previous_file = simple_path.read_bytes() if simple_path.exists() else None
-        operation: RuntimeOperation | None = None
         from zhenxun.services.plugin_policy import plugin_policy_service
 
         applied_policy = await plugin_policy_service.set_global_settings(
@@ -234,42 +222,7 @@ class ApiDataSource:
             await db_plugin.save(
                 update_fields=["limit_superuser", "cost_gold", "level", "menu_type"]
             )
-            if param.configs or param.unset_configs:
-                from ..system.configuration import (
-                    _unset_fields,
-                    _update_simple,
-                    _write_transaction,
-                    validate_simple_yaml,
-                )
-
-                content = _update_simple(
-                    (previous_file or b"").decode("utf-8"),
-                    {param.module: param.configs or {}},
-                )
-                content = _unset_fields(
-                    content,
-                    "simple",
-                    [[param.module, key] for key in param.unset_configs],
-                )
-                validate_simple_yaml(content)
-                _write_transaction([(simple_path, content.encode("utf-8"))])
-                operation = await reload_runtime_config(
-                    submit_restart=False,
-                    previous_simple_data=previous_simple,
-                )
-                if operation.mode is ApplyMode.FAILED:
-                    raise RuntimeError(
-                        operation.reason or "config_consumer_reload_failed"
-                    )
         except BaseException:
-            # Restore the file even if a newer policy revision prevents compensation.
-            Config.restore_runtime_values(runtime_snapshot)
-            from ...configure.persistence import _write_transaction
-
-            if previous_file is None:
-                simple_path.unlink(missing_ok=True)
-            else:
-                _write_transaction([(simple_path, previous_file)])
             await plugin_policy_service.set_global_settings(
                 param.module,
                 default_status=previous_db["default_status"],
@@ -284,7 +237,7 @@ class ApiDataSource:
             )
             raise
         await db_plugin.refresh_from_db()
-        return db_plugin, operation
+        return db_plugin
 
     @classmethod
     async def batch_update_plugins(cls, params: BatchUpdatePlugins) -> dict:
@@ -392,49 +345,6 @@ class ApiDataSource:
         }
 
     @classmethod
-    def __build_plugin_config(
-        cls, module: str, cfg: str, config: ConfigGroup
-    ) -> PluginConfig:
-        """获取插件配置项
-
-        参数:
-            module: 模块名
-            cfg: cfg
-            config: ConfigGroup
-
-        返回:
-            PluginConfig: 配置数据
-        """
-        type_str = ""
-        type_inner = None
-        ct = str(config.configs[cfg].type)
-        if r := re.search(r"<class '(.*)'>", ct):
-            type_str = r[1]
-        elif (r := re.search(r"typing\.(.*)\[(.*)\]", ct)) or (
-            r := re.search(r"(.*)\[(.*)\]", ct)
-        ):
-            type_str = r[1]
-            if type_str:
-                type_str = type_str.lower()
-            type_inner = r[2]
-            if type_inner:
-                type_inner = [x.strip() for x in type_inner.split(",")]
-        else:
-            type_str = ct
-        from ....config_schema import schema_for_type
-
-        return PluginConfig(
-            module=module,
-            key=cfg,
-            value=configuration_value(config.configs[cfg].value),
-            help=config.configs[cfg].help,
-            default_value=configuration_value(config.configs[cfg].default_value),
-            type=type_str,
-            type_inner=type_inner,  # type: ignore
-            schema=schema_for_type(config.configs[cfg].type),
-        )
-
-    @classmethod
     async def rename_menu_type(cls, old_name: str, new_name: str) -> dict:
         """重命名菜单类型，并更新所有相关插件
 
@@ -472,6 +382,32 @@ class ApiDataSource:
             raise RuntimeError(f"数据库更新菜单类型失败: {e!s}")
 
     @classmethod
+    def config_modules(cls, module: str) -> set[str]:
+        """获取插件相关的配置组
+
+        包括与插件同名的配置组，以及插件及其父插件注册过的配置组
+
+        参数:
+            module: 插件模块名
+
+        返回:
+            set[str]: 配置组名
+        """
+        names = {module}
+        plugin = next(
+            (item for item in nonebot.get_loaded_plugins() if item.name == module),
+            None,
+        )
+        while plugin is not None:
+            names.add(plugin.name)
+            plugin = plugin.parent_plugin
+        return {
+            group
+            for group in Config.keys()
+            if group == module or names.intersection(Config[group].plugins)
+        }
+
+    @classmethod
     async def get_plugin_detail(cls, module: str) -> PluginDetail:
         """获取插件详情
 
@@ -487,17 +423,15 @@ class ApiDataSource:
         db_plugin = await DbPluginInfo.get_plugin(module=module, include_parked=True)
         if not db_plugin:
             raise ValueError("插件不存在")
-        config_list = []
-        if config := Config.get(module):
-            config_list.extend(
-                cls.__build_plugin_config(module, cfg, config) for cfg in config.configs
-            )
         summary = next(
             iter(await cls.get_plugin_list(plugin_type=None, module=module)),
             None,
         )
         if summary is None:
             raise ValueError("插件不存在")
-        data = summary.model_dump()
-        data["config_list"] = config_list
-        return PluginDetail(**data)
+        simple = simple_config_groups(cls.config_modules(module))
+        return PluginDetail(
+            **summary.model_dump(),
+            config_groups=simple["groups"],
+            config_revision=simple["revision"],
+        )

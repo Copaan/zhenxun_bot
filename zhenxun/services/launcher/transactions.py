@@ -121,7 +121,9 @@ class PluginTransactions:
         参数:
             failed: 失败项
         """
-        rolled_back = not self.verify_nonebot or nonebot_runtime.rollback_for_launcher()
+        rolled_back = not self.verify_nonebot or nonebot_runtime.rollback_for_launcher(
+            failed
+        )
         if self.verify_source and rolled_back:
             source_store.rollback_pending_transaction(failed)
 

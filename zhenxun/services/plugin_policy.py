@@ -18,9 +18,10 @@ from zhenxun.models.plugin_info import PluginInfo
 from zhenxun.models.plugin_policy import BotPluginPolicyBinding, PluginPolicy
 from zhenxun.models.task_info import TaskInfo
 from zhenxun.services.cache.runtime_cache import BotMemoryCache
+from zhenxun.services.db_context.write import current_connection
 from zhenxun.services.log import logger
 from zhenxun.services.runtime_mutation import runtime_mutation_coordinator
-from zhenxun.utils.enum import PluginType
+from zhenxun.utils.enum import BlockType, PluginType
 from zhenxun.utils.platform import PlatformUtils
 
 FeatureKind = Literal["plugins", "tasks"]
@@ -140,6 +141,82 @@ def _policy_transaction(method):
     return wrapped
 
 
+def scene_global_state(
+    status: bool, block_type: BlockType | None, scene: BlockType, enabled: bool
+) -> tuple[bool, BlockType | None]:
+    """按群聊/私聊两个场景开关计算新的全局状态
+
+    参数:
+        status: 当前全局开关
+        block_type: 当前全局禁用范围
+        scene: 本次操作的场景，ALL 表示群聊和私聊
+        enabled: 允许或禁止该场景
+
+    返回:
+        tuple[bool, BlockType | None]: 新的全局开关与禁用范围
+    """
+    all_off = not status and block_type in {None, BlockType.ALL}
+    group_ok = not all_off and block_type != BlockType.GROUP
+    private_ok = not all_off and block_type != BlockType.PRIVATE
+    if scene in {BlockType.ALL, BlockType.GROUP}:
+        group_ok = enabled
+    if scene in {BlockType.ALL, BlockType.PRIVATE}:
+        private_ok = enabled
+    if group_ok and private_ok:
+        return True, None
+    if not group_ok and not private_ok:
+        return False, BlockType.ALL
+    return True, BlockType.PRIVATE if group_ok else BlockType.GROUP
+
+
+def block_reasons(
+    module: str,
+    *,
+    load_status: bool,
+    status: bool,
+    block_type: Any,
+    private: bool | None,
+    account: Collection[str] = (),
+    forced: Collection[str] = (),
+    local: Collection[str] = (),
+    super_group: bool = False,
+) -> list[str]:
+    """按统一顺序列出插件/被动技能不可用的原因
+
+    参数:
+        module: 模块名
+        load_status: 是否已加载
+        status: 全局开关
+        block_type: 全局禁用范围，ALL/GROUP/PRIVATE 或空
+        private: 私聊为 True，群聊为 False，账号层不区分场景时为 None
+        account: 账号禁用的模块
+        forced: 超级管理员在当前场景禁用的模块
+        local: 当前场景禁用的模块
+        super_group: 当前群是否为超级群，超级群不受全局关闭影响
+
+    返回:
+        list[str]: 不可用原因，为空表示可用
+    """
+    block_type = getattr(block_type, "value", block_type)
+    reasons = []
+    if not load_status:
+        reasons.append("not_loaded")
+    if not status and block_type in {None, "ALL"}:
+        if not (super_group and block_type == "ALL"):
+            reasons.append("global_disabled")
+    elif private is True and block_type == "PRIVATE":
+        reasons.append("global_private_disabled")
+    elif private is False and block_type == "GROUP":
+        reasons.append("global_group_disabled")
+    if module in account:
+        reasons.append("account_disabled")
+    if module in forced:
+        reasons.append("administrator_disabled")
+    if module in local:
+        reasons.append("private_disabled" if private else "group_disabled")
+    return reasons
+
+
 class PluginPolicyService:
     @staticmethod
     def availability(
@@ -154,54 +231,58 @@ class PluginPolicyService:
         is_superuser=False,
         task=False,
     ):
+        """判断插件/被动技能在当前场景是否可用，超级用户只受未加载与账号禁用限制
+
+        参数:
+            profile: 插件或被动技能快照
+            bot: 账号快照
+            group: 旧群资料快照
+            bot_id: 账号
+            platform_scope: 平台范围
+            group_id: 群号，私聊为空
+            channel_id: 频道
+            is_superuser: 是否为超级用户
+            task: 是否为被动技能
+
+        返回:
+            str | None: 第一个不可用原因，可用时为 None
+        """
         from zhenxun.services.bot_group_policy import bot_group_policy_service as scoped
 
-        module = profile.module
         kind = "tasks" if task else "plugins"
-        superuser_exempt = is_superuser and (
-            not getattr(profile, "limit_superuser", False)
-            or getattr(profile, "plugin_type", None) == PluginType.SUPERUSER
+        superuser_exempt = (
+            not task
+            and is_superuser
+            and (
+                not getattr(profile, "limit_superuser", False)
+                or getattr(profile, "plugin_type", None) == PluginType.SUPERUSER
+            )
         )
-        if not getattr(profile, "load_status", True):
-            return "not_loaded"
-        if bot is not None and module in _module_set(bot, f"block_{kind}"):
-            return "account_disabled"
-        scope = platform_scope if group_id else "private"
-        scene = group_id or scoped.PRIVATE_KEY
-        if scoped.blocked(
+        forced, local = scoped.scene_blocks(
             bot_id,
-            scope,
-            scene,
-            module,
+            platform_scope,
+            group_id,
+            channel_id,
             task=task,
-            channel_id=channel_id,
-            is_superuser=superuser_exempt,
-        ):
-            return "group_disabled" if group_id else "private_disabled"
-        if superuser_exempt and not task:
-            return None
-        block_type = getattr(profile, "block_type", None)
-        block_type = getattr(block_type, "value", block_type)
-        global_disabled = (
-            (not profile.status and block_type in {None, "ALL"})
-            or (group_id and block_type == "GROUP")
-            or (not group_id and block_type == "PRIVATE")
         )
-        if global_disabled and not (
-            group is not None
-            and getattr(group, "is_super", False)
-            and block_type == "ALL"
-        ):
-            return "global_disabled"
-        if group is not None and not scoped.migrated(
-            bot_id, platform_scope, group_id, channel_id
-        ):
-            suffix = "task" if task else "plugin"
-            if module in _module_set(group, f"superuser_block_{suffix}"):
-                return "administrator_disabled"
-            if module in _module_set(group, f"block_{suffix}"):
-                return "group_disabled"
-        return None
+        reasons = block_reasons(
+            profile.module,
+            load_status=getattr(profile, "load_status", True),
+            status=profile.status,
+            block_type=getattr(profile, "block_type", None),
+            private=not group_id,
+            account=_module_set(bot, f"block_{kind}") if bot is not None else (),
+            forced=forced,
+            local=local,
+            super_group=bool(group is not None and getattr(group, "is_super", False)),
+        )
+        if superuser_exempt:
+            reasons = [
+                reason
+                for reason in reasons
+                if reason in {"not_loaded", "account_disabled"}
+            ]
+        return reasons[0] if reasons else None
 
     @staticmethod
     def global_switch_values():
@@ -224,11 +305,50 @@ class PluginPolicyService:
             for module, row in PluginInfoMemoryCache._by_module.items()
         }
 
+    def owner_blocked(
+        self, owner: str | None, *, super_group: bool = False, is_superuser=False
+    ) -> bool:
+        """所属插件（含上级插件）是否因全局关闭而不可用
+
+        超级群不受全部关闭影响，超级用户豁免规则同 availability。
+
+        参数:
+            owner: 插件 id 或模块
+            super_group: 当前群是否为超级群
+            is_superuser: 是否为超级用户
+
+        返回:
+            bool: 是否不可用
+
+        异常:
+            PluginPolicyNotReady: 插件策略尚未就绪
+        """
+        from zhenxun.services.ai.chat_switch import module_identity
+        from zhenxun.services.cache.runtime_cache import PluginInfoMemoryCache
+
+        values = self.global_switch_values()
+        if not owner:
+            return False
+        identity = module_identity(owner)
+        for module, enabled in values.items():
+            name = module_identity(module)
+            if enabled or (identity != name and not identity.startswith(f"{name}.")):
+                continue
+            row = PluginInfoMemoryCache._by_module[module]
+            if is_superuser and (
+                not row.limit_superuser or row.plugin_type == PluginType.SUPERUSER
+            ):
+                continue
+            block_type = getattr(row.block_type, "value", row.block_type)
+            if super_group and block_type == "ALL":
+                continue
+            return True
+        return False
+
     async def migrate_legacy_chat_switches(self):
         from zhenxun.configs.config import Config
         from zhenxun.models.plugin_policy import PluginPolicyMigration
         from zhenxun.services.ai.chat_switch import module_identity
-        from zhenxun.utils.enum import BlockType
 
         values = Config.get_config("AI", "CHAT_PLUGIN_ENABLED", {}) or {}
         if not isinstance(values, dict):
@@ -310,8 +430,6 @@ class PluginPolicyService:
         task=False,
         default=False,
     ):
-        from zhenxun.utils.enum import BlockType
-
         model = TaskInfo if task else PluginInfo
         async with runtime_mutation_coordinator.operation("plugin_policy_global"):
             async with policy_transaction() as connection:
@@ -402,15 +520,16 @@ class PluginPolicyService:
                 await self.set_global(module, default_status, default=True)
         return await self.global_state()
 
-    async def _catalog_modules(self) -> tuple[set[str], set[str]]:
-        catalog = await self.catalog()
+    @staticmethod
+    def _catalog_modules(catalog: dict[str, list[dict[str, Any]]]) -> CatalogModules:
         return (
             {item["module"] for item in catalog["plugins"]},
             {item["module"] for item in catalog["tasks"]},
         )
 
-    async def _validate_modules(
-        self,
+    @staticmethod
+    def _validate_modules(
+        catalog_modules: CatalogModules,
         block_plugins: Iterable[str],
         block_tasks: Iterable[str],
         *,
@@ -419,7 +538,7 @@ class PluginPolicyService:
     ) -> tuple[list[str], list[str]]:
         plugins = _normalize_modules(block_plugins)
         tasks = _normalize_modules(block_tasks)
-        catalog_plugins, catalog_tasks = await self._catalog_modules()
+        catalog_plugins, catalog_tasks = catalog_modules
         invalid_plugins = sorted(set(plugins) - catalog_plugins - set(preserve_plugins))
         invalid_tasks = sorted(set(tasks) - catalog_tasks - set(preserve_tasks))
         if invalid_plugins or invalid_tasks:
@@ -500,15 +619,12 @@ class PluginPolicyService:
             )
         raise PluginPolicyNotFound("机器人账号不存在", details={"bot_id": candidate})
 
-    async def _resolve_bot_ids(self, bot_ids: Iterable[str]) -> list[str]:
-        known = None
-        resolved: set[str] = set()
-        for bot_id in bot_ids:
-            if known is None:
-                known = await self._known_accounts()
-            canonical = await self._resolve_bot_id(bot_id, known=known)
-            resolved.add(canonical)
-        return sorted(resolved)
+    async def _resolve_bot_ids(
+        self, bot_ids: Iterable[str], known: dict[str, dict[str, Any]]
+    ) -> list[str]:
+        return sorted(
+            {await self._resolve_bot_id(bot_id, known=known) for bot_id in bot_ids}
+        )
 
     @staticmethod
     def _policy_payload(policy: PluginPolicy) -> dict[str, Any]:
@@ -599,40 +715,35 @@ class PluginPolicyService:
             )
         return sorted(result, key=lambda item: (not item["connected"], item["bot_id"]))
 
-    async def get_account(self, bot_id: str) -> dict[str, Any]:
-        known = await self._known_accounts()
+    async def get_account(
+        self,
+        bot_id: str,
+        *,
+        known: dict[str, dict[str, Any]] | None = None,
+        catalog: dict[str, list[dict[str, Any]]] | None = None,
+    ) -> dict[str, Any]:
+        """读取账号层插件设置与最终状态
+
+        参数:
+            bot_id: 账号
+            known: 已读取的账号列表，为空时重新读取
+            catalog: 已读取的功能目录，为空时重新读取
+
+        返回:
+            dict[str, Any]: 账号设置、共享策略与每个功能的最终状态
+        """
+        known = known if known is not None else await self._known_accounts()
         bot_id = await self._resolve_bot_id(bot_id, known=known)
         bot, binding, policy = await self._state_for_bot(bot_id)
         state = self._account_payload(bot_id, bot, binding, policy)
-        catalog = await self.catalog()
-        plugin_modules = {item["module"] for item in catalog["plugins"]}
-        task_modules = {item["module"] for item in catalog["tasks"]}
-        effective = {}
-        for kind in ("plugins", "tasks"):
-            effective[kind] = []
-            for item in catalog[kind]:
-                reasons = []
-                if not item["load_status"]:
-                    reasons.append("not_loaded")
-                if item["module"] in state[f"block_{kind}"]:
-                    reasons.append("account_disabled")
-                block_type = item.get("block_type")
-                if not item["global_status"] and block_type not in {"GROUP", "PRIVATE"}:
-                    reasons.append("global_disabled")
-                if block_type in {"GROUP", "PRIVATE"}:
-                    reasons.append(
-                        "global_group_disabled"
-                        if block_type == "GROUP"
-                        else "global_private_disabled"
-                    )
-                effective[kind].append(
-                    {
-                        "module": item["module"],
-                        "local_enabled": item["module"] not in state[f"block_{kind}"],
-                        "effective_enabled": not reasons,
-                        "blocked_by": reasons,
-                    }
-                )
+        catalog = catalog if catalog is not None else await self.catalog()
+        plugin_modules, task_modules = self._catalog_modules(catalog)
+        effective = {
+            kind: self.decisions(
+                catalog[kind], private=None, account=state[f"block_{kind}"]
+            )
+            for kind in ("plugins", "tasks")
+        }
         return {
             **known[bot_id],
             **state,
@@ -645,11 +756,53 @@ class PluginPolicyService:
             "publication_pending": bool(BotMemoryCache._publication_failed),
         }
 
-    async def _ensure_known(self, bot_ids: Iterable[str]) -> None:
-        known = await self._known_accounts()
-        unknown = sorted(set(bot_ids) - set(known))
-        if unknown:
-            raise PluginPolicyNotFound("机器人账号不存在", details={"bot_ids": unknown})
+    @staticmethod
+    def decisions(
+        items: Iterable[dict[str, Any]],
+        *,
+        private: bool | None,
+        account: Collection[str],
+        local: Collection[str] = (),
+        forced: Collection[str] = (),
+        super_group: bool = False,
+    ) -> list[dict[str, Any]]:
+        """计算目录中每个功能在页面上的最终状态
+
+        参数:
+            items: catalog 中的插件或被动技能
+            private: 私聊为 True，群聊为 False，账号层为 None
+            account: 账号禁用的模块
+            local: 群聊或私聊层禁用的模块
+            forced: 超级管理员禁用的模块
+            super_group: 当前群是否为超级群
+
+        返回:
+            list[dict[str, Any]]: 每个模块的本层开关、最终状态与不可用原因
+        """
+        layer = account if private is None else local
+        result = []
+        for item in items:
+            module = item["module"]
+            reasons = block_reasons(
+                module,
+                load_status=item["load_status"],
+                status=item["global_status"],
+                block_type=item.get("block_type"),
+                private=private,
+                account=account,
+                forced=forced,
+                local=local,
+                super_group=super_group,
+            )
+            result.append(
+                {
+                    "module": module,
+                    "local_enabled": module not in layer,
+                    "effective_enabled": not reasons,
+                    "blocked_by": reasons,
+                }
+            )
+        return result
 
     async def _materialize(
         self,
@@ -657,17 +810,13 @@ class PluginPolicyService:
         bot_id: str,
         block_plugins: Iterable[str],
         block_tasks: Iterable[str],
-        catalog_modules: CatalogModules,
     ) -> None:
-        plugin_modules, task_modules = catalog_modules
         blocked_plugins = _normalize_modules(block_plugins)
         blocked_tasks = _normalize_modules(block_tasks)
         defaults = {
             "policy_revision": F("policy_revision") + 1,
             "block_plugins": _encode_modules(blocked_plugins),
             "block_tasks": _encode_modules(blocked_tasks),
-            "available_plugins": _encode_modules(plugin_modules - set(blocked_plugins)),
-            "available_tasks": _encode_modules(task_modules - set(blocked_tasks)),
         }
         bot = await BotConsole.filter(bot_id=bot_id).using_db(connection).first()
         if bot is None:
@@ -708,34 +857,30 @@ class PluginPolicyService:
         block_plugins: Iterable[str],
         block_tasks: Iterable[str],
     ) -> dict[str, Any]:
-        bot_id = await self._resolve_bot_id(bot_id)
-        async with runtime_mutation_coordinator.operation("plugin_policy_account"):
-            await self._ensure_known([bot_id])
-            current = await self.get_account(bot_id)
-            if expected_revision:
-                self._check_revision(expected_revision, current["revision"])
-            clean_plugins, clean_tasks = await self._validate_modules(
-                block_plugins,
-                block_tasks,
-                preserve_plugins=current["missing_plugins"],
-                preserve_tasks=current["missing_tasks"],
-            )
-            catalog_modules = await self._catalog_modules()
-            async with policy_transaction() as connection:
-                await (
-                    BotPluginPolicyBinding.filter(bot_id=bot_id)
-                    .using_db(connection)
-                    .delete()
-                )
-                await self._materialize(
-                    connection,
-                    bot_id,
-                    clean_plugins,
-                    clean_tasks,
-                    catalog_modules,
-                )
-            await self._publish_accounts([bot_id])
-        return await self.get_account(bot_id)
+        known = await self._known_accounts()
+        catalog = await self.catalog()
+        catalog_modules = self._catalog_modules(catalog)
+        current = await self.get_account(bot_id, known=known, catalog=catalog)
+        bot_id = current["bot_id"]
+        if expected_revision:
+            self._check_revision(expected_revision, current["revision"])
+        clean_plugins, clean_tasks = self._validate_modules(
+            catalog_modules,
+            block_plugins,
+            block_tasks,
+            preserve_plugins=current["missing_plugins"],
+            preserve_tasks=current["missing_tasks"],
+        )
+        connection = current_connection()
+        await BotPluginPolicyBinding.filter(bot_id=bot_id).using_db(connection).delete()
+        await self._materialize(
+            connection,
+            bot_id,
+            clean_plugins,
+            clean_tasks,
+        )
+        await self._publish_accounts([bot_id])
+        return await self.get_account(bot_id, known=known, catalog=catalog)
 
     @_policy_transaction
     async def create_policy(
@@ -753,64 +898,62 @@ class PluginPolicyService:
         name = name.strip()
         if not name:
             raise PluginPolicyError("策略名称不能为空")
-        targets = await self._resolve_bot_ids(bind_bot_ids)
+        known = await self._known_accounts()
+        catalog = await self.catalog()
+        catalog_modules = self._catalog_modules(catalog)
+        targets = await self._resolve_bot_ids(bind_bot_ids, known)
         if source_bot_id:
-            source_bot_id = await self._resolve_bot_id(source_bot_id)
-        async with runtime_mutation_coordinator.operation("plugin_policy_create"):
-            if source_bot_id:
-                source = await self.get_account(source_bot_id)
-                if not source_revision:
-                    raise PluginPolicyConflict("缺少源账号修订号，请重新加载")
-                self._check_revision(source_revision, source["revision"])
-                block_plugins = source["block_plugins"]
-                block_tasks = source["block_tasks"]
-                preserve_plugins = source["missing_plugins"]
-                preserve_tasks = source["missing_tasks"]
-            else:
-                preserve_plugins = ()
-                preserve_tasks = ()
-            clean_plugins, clean_tasks = await self._validate_modules(
-                block_plugins,
-                block_tasks,
-                preserve_plugins=preserve_plugins,
-                preserve_tasks=preserve_tasks,
+            source = await self.get_account(source_bot_id, known=known, catalog=catalog)
+            if not source_revision:
+                raise PluginPolicyConflict("缺少源账号修订号，请重新加载")
+            self._check_revision(source_revision, source["revision"])
+            block_plugins = source["block_plugins"]
+            block_tasks = source["block_tasks"]
+            preserve_plugins = source["missing_plugins"]
+            preserve_tasks = source["missing_tasks"]
+        else:
+            preserve_plugins = ()
+            preserve_tasks = ()
+        clean_plugins, clean_tasks = self._validate_modules(
+            catalog_modules,
+            block_plugins,
+            block_tasks,
+            preserve_plugins=preserve_plugins,
+            preserve_tasks=preserve_tasks,
+        )
+        for bot_id in targets:
+            current = await self.get_account(bot_id, known=known, catalog=catalog)
+            self._check_revision(
+                (expected_revisions or {}).get(bot_id, ""),
+                current["revision"],
             )
-            await self._ensure_known(targets)
-            for bot_id in targets:
-                current = await self.get_account(bot_id)
-                self._check_revision(
-                    (expected_revisions or {}).get(bot_id, ""),
-                    current["revision"],
-                )
-            existing_names = [p.name.casefold() for p in await PluginPolicy.all()]
-            if name.casefold() in existing_names:
-                raise PluginPolicyError("策略名称已存在")
-            catalog_modules = await self._catalog_modules()
-            async with policy_transaction() as connection:
-                policy = await PluginPolicy.create(
-                    using_db=connection,
-                    name=name,
-                    description=description.strip(),
-                    block_plugins=clean_plugins,
-                    block_tasks=clean_tasks,
-                )
-                for bot_id in targets:
-                    await (
-                        BotPluginPolicyBinding.filter(bot_id=bot_id)
-                        .using_db(connection)
-                        .delete()
-                    )
-                    await BotPluginPolicyBinding.create(
-                        using_db=connection, bot_id=bot_id, policy_id=policy.id
-                    )
-                    await self._materialize(
-                        connection,
-                        bot_id,
-                        policy.block_plugins,
-                        policy.block_tasks,
-                        catalog_modules,
-                    )
-            await self._publish_accounts(targets)
+        existing_names = [p.name.casefold() for p in await PluginPolicy.all()]
+        if name.casefold() in existing_names:
+            raise PluginPolicyError("策略名称已存在")
+        connection = current_connection()
+        policy = await PluginPolicy.create(
+            using_db=connection,
+            name=name,
+            description=description.strip(),
+            block_plugins=clean_plugins,
+            block_tasks=clean_tasks,
+        )
+        for bot_id in targets:
+            await (
+                BotPluginPolicyBinding.filter(bot_id=bot_id)
+                .using_db(connection)
+                .delete()
+            )
+            await BotPluginPolicyBinding.create(
+                using_db=connection, bot_id=bot_id, policy_id=policy.id
+            )
+            await self._materialize(
+                connection,
+                bot_id,
+                policy.block_plugins,
+                policy.block_tasks,
+            )
+        await self._publish_accounts(targets)
         return self._policy_view(policy, targets)
 
     @_policy_transaction
@@ -824,82 +967,68 @@ class PluginPolicyService:
         block_plugins: Iterable[str],
         block_tasks: Iterable[str],
     ) -> dict[str, Any]:
-        async with runtime_mutation_coordinator.operation("plugin_policy_update"):
-            policy = await PluginPolicy.get_or_none(id=policy_id)
-            if policy is None:
-                raise PluginPolicyNotFound("策略不存在")
-            bot_ids = await BotPluginPolicyBinding.filter(
-                policy_id=policy_id
-            ).values_list("bot_id", flat=True)
-            current = self._policy_view(policy, bot_ids)
-            self._check_revision(expected_revision, current["revision"])
-            clean_name = name.strip()
-            if not clean_name:
-                raise PluginPolicyError("策略名称不能为空")
-            duplicate = await PluginPolicy.exclude(id=policy_id).all()
-            if clean_name.casefold() in {p.name.casefold() for p in duplicate}:
-                raise PluginPolicyError("策略名称已存在")
-            clean_plugins = _normalize_modules(block_plugins)
-            clean_tasks = _normalize_modules(block_tasks)
-            catalog_plugins, catalog_tasks = await self._catalog_modules()
-            catalog_modules = (catalog_plugins, catalog_tasks)
-            invalid_plugins = sorted(
-                set(clean_plugins)
-                - catalog_plugins
-                - set(_normalize_modules(policy.block_plugins))
+        policy = await PluginPolicy.get_or_none(id=policy_id)
+        if policy is None:
+            raise PluginPolicyNotFound("策略不存在")
+        bot_ids = await BotPluginPolicyBinding.filter(policy_id=policy_id).values_list(
+            "bot_id", flat=True
+        )
+        current = self._policy_view(policy, bot_ids)
+        self._check_revision(expected_revision, current["revision"])
+        clean_name = name.strip()
+        if not clean_name:
+            raise PluginPolicyError("策略名称不能为空")
+        duplicate = await PluginPolicy.exclude(id=policy_id).all()
+        if clean_name.casefold() in {p.name.casefold() for p in duplicate}:
+            raise PluginPolicyError("策略名称已存在")
+        catalog_modules = self._catalog_modules(await self.catalog())
+        clean_plugins, clean_tasks = self._validate_modules(
+            catalog_modules,
+            block_plugins,
+            block_tasks,
+            preserve_plugins=policy.block_plugins,
+            preserve_tasks=policy.block_tasks,
+        )
+        connection = current_connection()
+        await (
+            PluginPolicy.filter(id=policy_id)
+            .using_db(connection)
+            .update(
+                name=clean_name,
+                description=description.strip(),
+                block_plugins=clean_plugins,
+                block_tasks=clean_tasks,
+                revision=F("revision") + 1,
+                update_time=datetime.now(timezone.utc),
             )
-            invalid_tasks = sorted(
-                set(clean_tasks)
-                - catalog_tasks
-                - set(_normalize_modules(policy.block_tasks))
+        )
+        for bot_id in bot_ids:
+            await self._materialize(
+                connection,
+                bot_id,
+                clean_plugins,
+                clean_tasks,
             )
-            if invalid_plugins or invalid_tasks:
-                raise PluginPolicyError(
-                    "包含不可配置或未知的模块",
-                    details={"plugins": invalid_plugins, "tasks": invalid_tasks},
-                )
-            async with policy_transaction() as connection:
-                await (
-                    PluginPolicy.filter(id=policy_id)
-                    .using_db(connection)
-                    .update(
-                        name=clean_name,
-                        description=description.strip(),
-                        block_plugins=clean_plugins,
-                        block_tasks=clean_tasks,
-                        revision=F("revision") + 1,
-                        update_time=datetime.now(timezone.utc),
-                    )
-                )
-                for bot_id in bot_ids:
-                    await self._materialize(
-                        connection,
-                        bot_id,
-                        clean_plugins,
-                        clean_tasks,
-                        catalog_modules,
-                    )
-            await self._publish_accounts(bot_ids)
-            policy = await PluginPolicy.get(id=policy_id)
+        await self._publish_accounts(bot_ids)
+        policy = await PluginPolicy.get(id=policy_id)
         return self._policy_view(policy, bot_ids)
 
     @_policy_transaction
     async def delete_policy(self, policy_id: int, expected_revision: str) -> None:
-        async with runtime_mutation_coordinator.operation("plugin_policy_delete"):
-            policy = await PluginPolicy.get_or_none(id=policy_id)
-            if policy is None:
-                raise PluginPolicyNotFound("策略不存在")
-            bot_ids = await BotPluginPolicyBinding.filter(
-                policy_id=policy_id
-            ).values_list("bot_id", flat=True)
-            self._check_revision(
-                expected_revision, self._policy_view(policy, bot_ids)["revision"]
+        policy = await PluginPolicy.get_or_none(id=policy_id)
+        if policy is None:
+            raise PluginPolicyNotFound("策略不存在")
+        bot_ids = await BotPluginPolicyBinding.filter(policy_id=policy_id).values_list(
+            "bot_id", flat=True
+        )
+        self._check_revision(
+            expected_revision, self._policy_view(policy, bot_ids)["revision"]
+        )
+        if bot_ids:
+            raise PluginPolicyInUse(
+                "策略仍被机器人账号使用", details={"bot_ids": sorted(bot_ids)}
             )
-            if bot_ids:
-                raise PluginPolicyInUse(
-                    "策略仍被机器人账号使用", details={"bot_ids": sorted(bot_ids)}
-                )
-            await policy.delete()
+        await policy.delete()
 
     @_policy_transaction
     async def bind_accounts(
@@ -909,56 +1038,54 @@ class PluginPolicyService:
         bot_ids: Iterable[str],
         expected_revisions: dict[str, str],
     ) -> dict[str, Any]:
-        targets = await self._resolve_bot_ids(bot_ids)
-        async with runtime_mutation_coordinator.operation("plugin_policy_bind"):
-            await self._ensure_known(targets)
-            policy = await PluginPolicy.get_or_none(id=policy_id)
-            if policy is None:
-                raise PluginPolicyNotFound("策略不存在")
-            changes: list[dict[str, Any]] = []
-            for bot_id in targets:
-                current = await self.get_account(bot_id)
-                self._check_revision(
-                    expected_revisions.get(bot_id, ""), current["revision"]
-                )
-                changes.append(
-                    {
-                        "bot_id": bot_id,
-                        "previous_mode": current["mode"],
-                        "previous_policy_id": current["policy_id"],
-                        "plugins_added": sorted(
-                            set(policy.block_plugins) - set(current["block_plugins"])
-                        ),
-                        "plugins_removed": sorted(
-                            set(current["block_plugins"]) - set(policy.block_plugins)
-                        ),
-                        "tasks_added": sorted(
-                            set(policy.block_tasks) - set(current["block_tasks"])
-                        ),
-                        "tasks_removed": sorted(
-                            set(current["block_tasks"]) - set(policy.block_tasks)
-                        ),
-                    }
-                )
-            catalog_modules = await self._catalog_modules()
-            async with policy_transaction() as connection:
-                for bot_id in targets:
-                    await (
-                        BotPluginPolicyBinding.filter(bot_id=bot_id)
-                        .using_db(connection)
-                        .delete()
-                    )
-                    await BotPluginPolicyBinding.create(
-                        using_db=connection, bot_id=bot_id, policy_id=policy.id
-                    )
-                    await self._materialize(
-                        connection,
-                        bot_id,
-                        policy.block_plugins,
-                        policy.block_tasks,
-                        catalog_modules,
-                    )
-            await self._publish_accounts(targets)
+        known = await self._known_accounts()
+        catalog = await self.catalog()
+        targets = await self._resolve_bot_ids(bot_ids, known)
+        policy = await PluginPolicy.get_or_none(id=policy_id)
+        if policy is None:
+            raise PluginPolicyNotFound("策略不存在")
+        changes: list[dict[str, Any]] = []
+        for bot_id in targets:
+            current = await self.get_account(bot_id, known=known, catalog=catalog)
+            self._check_revision(
+                expected_revisions.get(bot_id, ""), current["revision"]
+            )
+            changes.append(
+                {
+                    "bot_id": bot_id,
+                    "previous_mode": current["mode"],
+                    "previous_policy_id": current["policy_id"],
+                    "plugins_added": sorted(
+                        set(policy.block_plugins) - set(current["block_plugins"])
+                    ),
+                    "plugins_removed": sorted(
+                        set(current["block_plugins"]) - set(policy.block_plugins)
+                    ),
+                    "tasks_added": sorted(
+                        set(policy.block_tasks) - set(current["block_tasks"])
+                    ),
+                    "tasks_removed": sorted(
+                        set(current["block_tasks"]) - set(policy.block_tasks)
+                    ),
+                }
+            )
+        connection = current_connection()
+        for bot_id in targets:
+            await (
+                BotPluginPolicyBinding.filter(bot_id=bot_id)
+                .using_db(connection)
+                .delete()
+            )
+            await BotPluginPolicyBinding.create(
+                using_db=connection, bot_id=bot_id, policy_id=policy.id
+            )
+            await self._materialize(
+                connection,
+                bot_id,
+                policy.block_plugins,
+                policy.block_tasks,
+            )
+        await self._publish_accounts(targets)
         return {
             "updated_bot_ids": targets,
             "policy_id": policy_id,
@@ -974,34 +1101,32 @@ class PluginPolicyService:
         target_bot_ids: Iterable[str],
         expected_revisions: dict[str, str],
     ) -> dict[str, Any]:
-        source_bot_id = await self._resolve_bot_id(source_bot_id)
-        targets = await self._resolve_bot_ids(target_bot_ids)
+        known = await self._known_accounts()
+        catalog = await self.catalog()
+        source = await self.get_account(source_bot_id, known=known, catalog=catalog)
+        source_bot_id = source["bot_id"]
+        targets = await self._resolve_bot_ids(target_bot_ids, known)
         targets = [bot_id for bot_id in targets if bot_id != source_bot_id]
-        async with runtime_mutation_coordinator.operation("plugin_policy_copy"):
-            await self._ensure_known([source_bot_id, *targets])
-            source = await self.get_account(source_bot_id)
-            self._check_revision(source_revision, source["revision"])
-            for bot_id in targets:
-                current = await self.get_account(bot_id)
-                self._check_revision(
-                    expected_revisions.get(bot_id, ""), current["revision"]
-                )
-            catalog_modules = await self._catalog_modules()
-            async with policy_transaction() as connection:
-                for bot_id in targets:
-                    await (
-                        BotPluginPolicyBinding.filter(bot_id=bot_id)
-                        .using_db(connection)
-                        .delete()
-                    )
-                    await self._materialize(
-                        connection,
-                        bot_id,
-                        source["block_plugins"],
-                        source["block_tasks"],
-                        catalog_modules,
-                    )
-            await self._publish_accounts(targets)
+        self._check_revision(source_revision, source["revision"])
+        for bot_id in targets:
+            current = await self.get_account(bot_id, known=known, catalog=catalog)
+            self._check_revision(
+                expected_revisions.get(bot_id, ""), current["revision"]
+            )
+        connection = current_connection()
+        for bot_id in targets:
+            await (
+                BotPluginPolicyBinding.filter(bot_id=bot_id)
+                .using_db(connection)
+                .delete()
+            )
+            await self._materialize(
+                connection,
+                bot_id,
+                source["block_plugins"],
+                source["block_tasks"],
+            )
+        await self._publish_accounts(targets)
         return {"source_bot_id": source_bot_id, "updated_bot_ids": targets}
 
     async def set_feature_enabled(
@@ -1010,17 +1135,27 @@ class PluginPolicyService:
         kind: FeatureKind,
         module: str,
         enabled: bool,
-    ) -> None:
+    ) -> str | None:
+        """开关账号或全部账号的单个插件/被动技能
+
+        参数:
+            bot_id: 账号，为空时修改全部账号与共享策略
+            kind: 插件或被动技能
+            module: 模块名
+            enabled: 是否启用
+
+        返回:
+            str | None: 账号因此解除的共享策略名称
+        """
         module = module.strip()
         if not module:
             raise PluginPolicyError("模块名不能为空")
-        catalog_plugins, catalog_tasks = await self._catalog_modules()
-        catalog = catalog_plugins if kind == "plugins" else catalog_tasks
-        if module not in catalog:
+        catalog = await self.catalog()
+        if module not in {item["module"] for item in catalog[kind]}:
             raise PluginPolicyError("模块不可配置", details={"module": module})
         if bot_id is not None:
-            bot_id = await self._resolve_bot_id(bot_id)
-            current = await self.get_account(bot_id)
+            current = await self.get_account(bot_id, catalog=catalog)
+            bot_id = current["bot_id"]
             plugins = set(current["block_plugins"])
             tasks = set(current["block_tasks"])
             target = plugins if kind == "plugins" else tasks
@@ -1031,19 +1166,31 @@ class PluginPolicyService:
                 block_plugins=plugins,
                 block_tasks=tasks,
             )
-            return
+            return current["policy"]["name"] if current["policy"] else None
         await self._mutate_all(kind, enabled=enabled, module=module)
+        return None
 
     async def set_all_features_enabled(
         self,
         bot_id: str | None,
         kind: FeatureKind,
         enabled: bool,
-    ) -> None:
+    ) -> str | None:
+        """开关账号或全部账号的全部插件/被动技能
+
+        参数:
+            bot_id: 账号，为空时修改全部账号与共享策略
+            kind: 插件或被动技能
+            enabled: 是否启用
+
+        返回:
+            str | None: 账号因此解除的共享策略名称
+        """
         if bot_id is not None:
-            bot_id = await self._resolve_bot_id(bot_id)
-            current = await self.get_account(bot_id)
-            catalog_plugins, catalog_tasks = await self._catalog_modules()
+            catalog = await self.catalog()
+            current = await self.get_account(bot_id, catalog=catalog)
+            bot_id = current["bot_id"]
+            catalog_plugins, catalog_tasks = self._catalog_modules(catalog)
             plugins = (
                 set(current["missing_plugins"])
                 if enabled
@@ -1064,8 +1211,9 @@ class PluginPolicyService:
                 block_plugins=plugins,
                 block_tasks=tasks,
             )
-            return
+            return current["policy"]["name"] if current["policy"] else None
         await self._mutate_all(kind, enabled=enabled, module=None)
+        return None
 
     @_policy_transaction
     async def _mutate_all(
@@ -1075,9 +1223,8 @@ class PluginPolicyService:
         enabled: bool,
         module: str | None,
     ) -> None:
-        catalog_plugins, catalog_tasks = await self._catalog_modules()
-        catalog_modules = (catalog_plugins, catalog_tasks)
-        catalog = catalog_plugins if kind == "plugins" else catalog_tasks
+        catalog_modules = self._catalog_modules(await self.catalog())
+        catalog = catalog_modules[0 if kind == "plugins" else 1]
 
         def mutate(values: Iterable[str]) -> list[str]:
             result = set(_normalize_modules(values))
@@ -1089,51 +1236,48 @@ class PluginPolicyService:
                 result.add(module)
             return sorted(result)
 
-        async with runtime_mutation_coordinator.operation("plugin_policy_legacy_all"):
-            policies = await PluginPolicy.all()
-            bindings = await BotPluginPolicyBinding.all()
-            bots = {str(bot.bot_id): bot for bot in await BotConsole.all()}
-            policy_updates: dict[int, tuple[list[str], list[str]]] = {}
-            for policy in policies:
-                plugins = _normalize_modules(policy.block_plugins)
-                tasks = _normalize_modules(policy.block_tasks)
+        policies = await PluginPolicy.all()
+        bindings = await BotPluginPolicyBinding.all()
+        bots = {str(bot.bot_id): bot for bot in await BotConsole.all()}
+        policy_updates: dict[int, tuple[list[str], list[str]]] = {}
+        for policy in policies:
+            plugins = _normalize_modules(policy.block_plugins)
+            tasks = _normalize_modules(policy.block_tasks)
+            if kind == "plugins":
+                plugins = mutate(plugins)
+            else:
+                tasks = mutate(tasks)
+            policy_updates[int(policy.id)] = (plugins, tasks)
+        binding_by_bot = {
+            binding.bot_id: int(binding.policy_id) for binding in bindings
+        }
+        affected = set(bots) | set(binding_by_bot)
+        connection = current_connection()
+        for policy_id, (plugins, tasks) in policy_updates.items():
+            await (
+                PluginPolicy.filter(id=policy_id)
+                .using_db(connection)
+                .update(
+                    block_plugins=plugins,
+                    block_tasks=tasks,
+                    revision=F("revision") + 1,
+                    update_time=datetime.now(timezone.utc),
+                )
+            )
+        for bot_id in affected:
+            policy_id = binding_by_bot.get(bot_id)
+            if policy_id is not None:
+                plugins, tasks = policy_updates[policy_id]
+            else:
+                bot = bots[bot_id]
+                plugins = _decode_modules(bot.block_plugins)
+                tasks = _decode_modules(bot.block_tasks)
                 if kind == "plugins":
                     plugins = mutate(plugins)
                 else:
                     tasks = mutate(tasks)
-                policy_updates[int(policy.id)] = (plugins, tasks)
-            binding_by_bot = {
-                binding.bot_id: int(binding.policy_id) for binding in bindings
-            }
-            affected = set(bots) | set(binding_by_bot)
-            async with policy_transaction() as connection:
-                for policy_id, (plugins, tasks) in policy_updates.items():
-                    await (
-                        PluginPolicy.filter(id=policy_id)
-                        .using_db(connection)
-                        .update(
-                            block_plugins=plugins,
-                            block_tasks=tasks,
-                            revision=F("revision") + 1,
-                            update_time=datetime.now(timezone.utc),
-                        )
-                    )
-                for bot_id in affected:
-                    policy_id = binding_by_bot.get(bot_id)
-                    if policy_id is not None:
-                        plugins, tasks = policy_updates[policy_id]
-                    else:
-                        bot = bots[bot_id]
-                        plugins = _decode_modules(bot.block_plugins)
-                        tasks = _decode_modules(bot.block_tasks)
-                        if kind == "plugins":
-                            plugins = mutate(plugins)
-                        else:
-                            tasks = mutate(tasks)
-                    await self._materialize(
-                        connection, bot_id, plugins, tasks, catalog_modules
-                    )
-            await self._publish_accounts(affected)
+            await self._materialize(connection, bot_id, plugins, tasks)
+        await self._publish_accounts(affected)
 
     async def reconcile(self) -> dict[str, int]:
         await self.migrate_legacy_chat_switches()
@@ -1141,7 +1285,6 @@ class PluginPolicyService:
         async with runtime_mutation_coordinator.operation("plugin_policy_reconcile"):
             bindings = await BotPluginPolicyBinding.all()
             policies = {int(p.id): p for p in await PluginPolicy.all()}
-            catalog_modules = await self._catalog_modules()
             async with policy_transaction() as connection:
                 bots = {
                     str(bot.bot_id): bot
@@ -1149,7 +1292,6 @@ class PluginPolicyService:
                 }
                 binding_by_bot = {binding.bot_id: binding for binding in bindings}
                 bot_ids = sorted(set(bots) | set(binding_by_bot))
-                plugin_modules, task_modules = catalog_modules
                 for bot_id in bot_ids:
                     bot = bots.get(bot_id)
                     binding = binding_by_bot.get(bot_id)
@@ -1166,25 +1308,16 @@ class PluginPolicyService:
                     )
                     expected_plugins = _encode_modules(block_plugins)
                     expected_tasks = _encode_modules(block_tasks)
-                    expected_available_plugins = _encode_modules(
-                        plugin_modules - set(block_plugins)
-                    )
-                    expected_available_tasks = _encode_modules(
-                        task_modules - set(block_tasks)
-                    )
                     if (
                         bot is None
                         or bot.block_plugins != expected_plugins
                         or bot.block_tasks != expected_tasks
-                        or bot.available_plugins != expected_available_plugins
-                        or bot.available_tasks != expected_available_tasks
                     ):
                         await self._materialize(
                             connection,
                             bot_id,
                             block_plugins,
                             block_tasks,
-                            catalog_modules,
                         )
                         changed.append(bot_id)
             await self._publish_accounts(changed)

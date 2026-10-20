@@ -61,6 +61,9 @@ __plugin_meta__ = PluginMetadata(
 - `--only`：白名单模式，仅在指定群组开启，其他群组自动关闭
 - `-s`：**强制管控**。使用系统级字段禁用功能，群管理员无法通过普通指令自行开启
 
+超级用户执行开启时会同时解除本群禁用与强制管控；
+超级用户自身不受全局与群聊开关限制（插件开启“限制超级用户”时除外），只受账号禁用限制。
+
 **操作示例：**
 - `关闭 签到 抽卡 -t 游戏群`：关闭所有带有"游戏群"标签的群的签到和抽卡功能
 - `开启 色图 --only -g 123456 654321`：仅在这两个群开启色图，其余群全部关闭
@@ -71,6 +74,8 @@ __plugin_meta__ = PluginMetadata(
 范围：`p` (私聊), `g` (所有群聊), `a` (全局)
 
 - `关闭 签到 --type a`：全局彻底禁用签到功能
+- `开启 签到 --type g`：允许签到在群聊中使用，私聊的全局状态保持不变
+- 私聊中 `开启/关闭 [功能名]`：设置当前账号所有私聊中的该功能
 - `开启/关闭默认 [功能名]`：修改功能进群时的默认开关状态
 - `开启/关闭所有默认功能`：批量修改所有功能的进群默认状态
 
@@ -249,9 +254,7 @@ async def _handle_switch_command(
                 _type = BlockType.PRIVATE
             elif block_type_val in ["g", "group"]:
                 _type = BlockType.GROUP
-            result = await PluginManager.superuser_set_status(
-                name_str, status, _type, None, is_task=task.result
-            )
+            result = await PluginManager.superuser_set_status(name_str, status, _type)
             messages.append(result)
             continue
 
@@ -265,7 +268,7 @@ async def _handle_switch_command(
                 if entity is None:
                     messages.append(f"未找到功能: {name_str}")
                     continue
-                await bot_group_policy_service.set_features(
+                view = await bot_group_policy_service.set_features(
                     PlatformUtils.get_storage_bot_id(bot),
                     PlatformUtils.get_platform_scope(bot),
                     None,
@@ -275,11 +278,15 @@ async def _handle_switch_command(
                     is_superuser=True,
                     force=use_su_field_final,
                 )
-                result = (
-                    f"已{'开启' if status else '关闭'}当前账号所有私聊中的 {name_str}；"
-                    "上层限制仍然有效。"
+                notice = (
+                    PluginManager.blocked_notice([view], {entity.module}, task.result)
+                    if status
+                    else ""
                 )
-                messages.append(result)
+                messages.append(
+                    f"已{'开启' if status else '关闭'}当前账号所有私聊中的 {name_str}"
+                    + notice
+                )
                 continue
             messages.append(f"{name_str}: 请选择一个目标群组")
             continue
@@ -440,13 +447,14 @@ async def _(
 
 @_status_matcher.assign("task")
 async def _(
+    bot: Bot,
     session: Uninfo,
     arparma: Arparma,
 ):
     if arparma.find("check") or arparma.find("open") or arparma.find("close"):
         return
 
-    image = await build_task(session.group.id if session.group else None)
+    image = await build_task(bot, session.group.id if session.group else None)
     if image:
         logger.info("查看群被动列表", arparma.header_result, session=session)
         await MessageUtils.build_message(image).finish(reply_to=True)

@@ -4,8 +4,6 @@ from nonebot_plugin_uninfo import Uninfo
 from zhenxun import ui
 from zhenxun.configs.config import BotConfig, Config
 from zhenxun.configs.utils import PluginExtraData
-from zhenxun.models.bot_console import BotConsole
-from zhenxun.models.group_console import GroupConsole
 from zhenxun.models.level_user import LevelUser
 from zhenxun.models.plugin_info import PluginInfo
 from zhenxun.models.statistics import Statistics
@@ -19,7 +17,7 @@ from zhenxun.services.renderer.result_cache import RenderResultMemoryCache
 from zhenxun.services.startup_load import startup_load_planner
 from zhenxun.ui.models import PluginMenuCategory, PluginMenuData
 from zhenxun.utils.common_utils import format_usage_for_markdown
-from zhenxun.utils.enum import BlockType, PluginType
+from zhenxun.utils.enum import PluginType
 from zhenxun.utils.platform import PlatformUtils
 
 from .utils import classify_plugin
@@ -51,14 +49,8 @@ async def _read_db(factory, operation: str):
         raise _DbBusyError from exc
 
 
-def _create_plugin_menu_item(
-    bot: BotConsole | None,
-    plugin: PluginInfo,
-    group: GroupConsole | None,
-    is_detail: bool,
-) -> dict:
-    """为插件菜单构造一个插件菜单项数据字典"""
-    status_type = 0
+def _create_plugin_menu_item(plugin: PluginInfo, is_detail: bool) -> dict:
+    """为插件菜单构造一个插件菜单项数据字典，开关状态由 classify_plugin 填入"""
     has_superuser_help = False
     nb_plugin = nonebot.get_plugin_by_module_name(plugin.module_path)
     if nb_plugin and nb_plugin.metadata and nb_plugin.metadata.extra:
@@ -67,22 +59,6 @@ def _create_plugin_menu_item(
         )
         if extra_data.superuser_help:
             has_superuser_help = True
-
-    module_tag = f"<{plugin.module},"
-
-    if not plugin.status:
-        if plugin.block_type == BlockType.ALL:
-            status_type = 3
-        elif group and plugin.block_type == BlockType.GROUP:
-            status_type = 3
-        elif not group and plugin.block_type == BlockType.PRIVATE:
-            status_type = 3
-    elif group and module_tag in (group.superuser_block_plugin or ""):
-        status_type = 2
-    elif bot and module_tag in (bot.block_plugins or ""):
-        status_type = 2
-    elif group and module_tag in (group.block_plugin or ""):
-        status_type = 1
 
     commands = []
     if is_detail and nb_plugin and nb_plugin.metadata and nb_plugin.metadata.extra:
@@ -94,7 +70,7 @@ def _create_plugin_menu_item(
     return {
         "id": str(plugin.id),
         "name": plugin.name,
-        "status": status_type,
+        "status": 0,
         "has_superuser_help": has_superuser_help,
         "commands": commands,
     }

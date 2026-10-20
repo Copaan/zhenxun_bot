@@ -137,7 +137,7 @@ def run_worker(project_root: Path) -> None:
     from zhenxun.services import proxy_clients
 
     proxy_clients.install()
-    from zhenxun.configs.environment import environment_file
+    from zhenxun.configs.environment import environment_file, migrate_orm_data_dir
 
     nonebot.init(
         _env_file=environment_file(),
@@ -145,6 +145,7 @@ def run_worker(project_root: Path) -> None:
         render_backend="playwright",
         render_playwright={"channel": htmlrender_browser_channel},
     )
+    migrate_orm_data_dir(project_root)
 
     from zhenxun.adapters.onebot_managed import ManagedOneBotAdapter as OneBotV11Adapter
     from zhenxun.configs.config import BotConfig

@@ -14,7 +14,6 @@ from zhenxun.services.plugin_policy import (
     policy_transaction,
 )
 from zhenxun.services.runtime_mutation import managed_mutation
-from zhenxun.utils.common_utils import CommonUtils
 from zhenxun.utils.enum import RequestType
 from zhenxun.utils.platform import PlatformUtils
 
@@ -174,59 +173,43 @@ class ApiDataSource:
         )
 
     @classmethod
-    async def __get_group_detail_disable_plugin(
-        cls, group: GroupConsole
-    ) -> list[Plugin]:
+    async def __get_group_detail_disable_plugin(cls, policy: dict) -> list[Plugin]:
         """获取群组禁用插件
 
         参数:
-            group: GroupConsole
+            policy: 群策略数据
 
         返回:
             list[Plugin]: 禁用插件数据列表
         """
-        disable_plugins: list[Plugin] = []
         plugins = await PluginInfo.get_plugins()
         module2name = {p.module: p.name for p in plugins}
-        if group.block_plugin:
-            for module in CommonUtils.convert_module_format(group.block_plugin):
-                if module:
-                    plugin = Plugin(
-                        module=module,
-                        plugin_name=module,
-                        is_super_block=False,
-                    )
-                    plugin.plugin_name = module2name.get(module) or module
-                    disable_plugins.append(plugin)
-        exists_modules = [p.module for p in disable_plugins]
-        if group.superuser_block_plugin:
-            for module in CommonUtils.convert_module_format(
-                group.superuser_block_plugin
-            ):
-                if module and module not in exists_modules:
-                    plugin = Plugin(
-                        module=module,
-                        plugin_name=module,
-                        is_super_block=True,
-                    )
-                    plugin.plugin_name = module2name.get(module) or module
-                    disable_plugins.append(plugin)
-        return disable_plugins
+        forced = set(policy["forced_plugins"])
+        modules = dict.fromkeys([*policy["block_plugins"], *policy["forced_plugins"]])
+        return [
+            Plugin(
+                module=module,
+                plugin_name=module2name.get(module) or module,
+                is_super_block=module in forced,
+            )
+            for module in modules
+            if module
+        ]
 
     @classmethod
-    async def __get_group_detail_task(cls, group: GroupConsole) -> list[Task]:
+    async def __get_group_detail_task(cls, policy: dict) -> list[Task]:
         """获取群组被动技能状态
 
         参数:
-            group: GroupConsole
+            policy: 群策略数据
 
         返回:
             list[Task]: 群组被动列表
         """
         all_task = await TaskInfo.get_tasks(load_status=None)
         task_module2name = {task.module: task.name for task in all_task}
-        sbp = CommonUtils.convert_module_format(group.superuser_block_task)
-        tasks = CommonUtils.convert_module_format(group.block_task)
+        sbp = set(policy["forced_tasks"])
+        tasks = set(policy["block_tasks"])
         return [
             Task(
                 name=task.module,
@@ -253,14 +236,6 @@ class ApiDataSource:
         if not group:
             return None
         policy = await cls._group_policy(group_id, bot_id)
-        group.block_plugin = CommonUtils.convert_module_format(policy["block_plugins"])
-        group.block_task = CommonUtils.convert_module_format(policy["block_tasks"])
-        group.superuser_block_plugin = CommonUtils.convert_module_format(
-            policy["forced_plugins"]
-        )
-        group.superuser_block_task = CommonUtils.convert_module_format(
-            policy["forced_tasks"]
-        )
         storage_bot_id = policy["bot_id"]
         like_plugin = {
             plugin.name: plugin.count
@@ -269,10 +244,8 @@ class ApiDataSource:
                 "Manage.like_plugin",
             )
         }
-        disable_plugins: list[Plugin] = await cls.__get_group_detail_disable_plugin(
-            group
-        )
-        task_list = await cls.__get_group_detail_task(group)
+        disable_plugins = await cls.__get_group_detail_disable_plugin(policy)
+        task_list = await cls.__get_group_detail_task(policy)
         return GroupDetail(
             group_id=group_id,
             bot_id=storage_bot_id,

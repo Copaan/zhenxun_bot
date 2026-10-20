@@ -352,7 +352,9 @@ def stage_plan(
 ) -> bool:
     """把依赖计划写入待应用的依赖层事务，由启动器在下次启动 worker 前构建
 
-    恢复备份的计划允许构建源码包，并允许安装非核心的 ORM 与数据库驱动。
+    恢复备份的计划允许构建源码包，并允许安装非核心的 ORM 与数据库驱动；
+    目标依赖包含 nonebot-plugin-orm 时，启动器在启动 worker 前执行数据库迁移，
+    迁移时同时加载带迁移脚本的源码插件。
 
     参数:
         plan: preview_manual_dependencies 返回的计划
@@ -363,7 +365,9 @@ def stage_plan(
     返回:
         bool: 是否写入了待应用的事务
     """
-    from .dependencies import DependencyAnalysisError
+    from packaging.utils import canonicalize_name
+
+    from .dependencies import DependencyAnalysisError, orm_database_type
     from .storage import defer_transaction, draft_transaction, utc_now
 
     if plan["no_change"]:
@@ -372,17 +376,30 @@ def stage_plan(
         raise DependencyAnalysisError(
             "source_build_confirmation_required", plan["diagnostic"]
         )
+    migration = restore and "nonebot-plugin-orm" in {
+        canonicalize_name(name) for name in plan["target_manifest"].get("packages", {})
+    }
     transaction = draft_transaction(
         pending,
         plan["target_manifest"],
         action="manual_dependencies",
         remaining_conflicts=deepcopy(plan.get("remaining_conflicts", [])),
         **(
-            {"source_build_confirmed": True, "orm_packages_allowed": True}
+            {
+                "source_build_confirmed": True,
+                "orm_packages_allowed": True,
+                "restore": True,
+            }
             if restore
             else {}
         ),
     )
+    if migration:
+        transaction.update(
+            database_migration_possible=True,
+            database_migration_confirmed=True,
+            database_type=orm_database_type(),
+        )
     transaction["operations"].append(
         {
             "kind": "manual_dependencies",

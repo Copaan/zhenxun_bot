@@ -17,17 +17,15 @@ class PluginSwitch(BaseModel):
     """开关状态"""
 
 
-class UpdateConfig(BaseModel):
+class PluginUnload(BaseModel):
     """
-    配置项修改参数
+    手动卸载/重新加载全局禁用插件
     """
 
     module: str
     """模块"""
-    key: str
-    """配置项key"""
-    value: Any
-    """配置项值"""
+    unloaded: bool
+    """True 为卸载，False 为重新加载"""
 
 
 class UpdatePlugin(BaseModel):
@@ -50,10 +48,6 @@ class UpdatePlugin(BaseModel):
     """菜单类型"""
     block_type: BlockType | None = None
     """禁用类型"""
-    configs: dict[str, Any] | None = None
-    """设置项"""
-    unset_configs: list[str] = Field(default_factory=list)
-    """恢复为未设置的配置项，不等同于 null。"""
 
 
 class PluginInfo(BaseModel):
@@ -101,21 +95,8 @@ class PluginInfo(BaseModel):
     """是否允许开关"""
     allow_setting: bool = True
     """是否允许设置"""
-
-
-class PluginConfig(BaseModel):
-    """
-    插件配置项
-    """
-
-    module: str = Field(..., description="模块名")
-    key: str = Field(..., description="键")
-    value: Any = Field(None, description="值")
-    help: str | None = Field(None, description="帮助信息")
-    default_value: Any = Field(None, description="默认值")
-    type: str | None = Field(None, description="类型")
-    type_inner: list[str] | None = Field(None, description="内部类型")
-    schema_info: dict[str, Any] = Field(default_factory=dict, alias="schema")
+    parked: bool = False
+    """是否已手动卸载以释放资源"""
 
 
 class PluginCount(BaseModel):
@@ -153,7 +134,10 @@ class PluginDetail(PluginInfo):
     插件详情
     """
 
-    config_list: list[PluginConfig]
+    config_groups: list[dict[str, Any]] = Field(default_factory=list)
+    """插件相关的 config.yaml 配置组"""
+    config_revision: str = ""
+    """config.yaml 文件版本"""
 
 
 class RenameMenuTypePayload(BaseModel):

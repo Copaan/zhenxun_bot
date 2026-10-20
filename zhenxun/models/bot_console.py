@@ -4,7 +4,12 @@ from tortoise import fields
 
 from zhenxun.services.cache.runtime_cache import BotMemoryCache
 from zhenxun.services.db_context import Model
-from zhenxun.services.db_context.schema_ops import AlterColumnType, RenameColumn
+from zhenxun.services.db_context.schema_ops import (
+    AlterColumnType,
+    DropColumn,
+    RenameColumn,
+    SchemaOpRisk,
+)
 
 
 class BotConsole(Model):
@@ -22,10 +27,6 @@ class BotConsole(Model):
     """禁用插件"""
     block_tasks = fields.TextField(default="", description="禁用被动技能")
     """禁用被动技能"""
-    available_plugins = fields.TextField(default="", description="可用插件")
-    """可用插件"""
-    available_tasks = fields.TextField(default="", description="可用被动技能")
-    """可用被动技能管理镜像，不作为运行白名单。"""
     policy_revision = fields.IntField(default=0, description="账号策略修订")
 
     class Meta:  # pyright: ignore [reportIncompatibleVariableOverride]
@@ -80,33 +81,51 @@ class BotConsole(Model):
     async def get_tasks(cls, bot_id: str, status: bool = True) -> list[str]: ...
 
     @classmethod
+    async def _account_modules(
+        cls, kind: Literal["plugins", "tasks"], bot_id: str | None, status: bool
+    ):
+        """账号禁用或可用的插件/被动技能，可用项为全部插件/被动技能减去账号禁用项
+
+        参数:
+            kind: plugins 或 tasks
+            bot_id: bot_id，为空时返回全部账号
+            status: True 为可用项，False 为禁用项
+
+        返回:
+            dict[str, list[str]] | list[str]: 模块名
+        """
+        if bot_id:
+            snapshot = await BotMemoryCache.get(bot_id)
+            snapshots = {bot_id: snapshot} if snapshot else {}
+        else:
+            snapshots = await BotMemoryCache.get_all()
+        catalog: set[str] = set()
+        if status:
+            from zhenxun.services.plugin_policy import plugin_policy_service
+
+            catalog = plugin_policy_service._catalog_modules(
+                await plugin_policy_service.catalog()
+            )[0 if kind == "plugins" else 1]
+        result = {}
+        for key, snapshot in snapshots.items():
+            blocked = cls.convert_module_format(getattr(snapshot, f"block_{kind}"))
+            result[key] = sorted(catalog - set(blocked)) if status else blocked
+        return result if not bot_id else result.get(bot_id, [])
+
+    @classmethod
     async def get_tasks(cls, bot_id: str | None = None, status: bool | None = True):
         """
-        获取bot被动技能管理镜像。
-
-        available_tasks 只服务管理命令和展示，不参与运行白名单判断。
-        被动运行真源是 TaskInfo.status/load_status、BotConsole.block_tasks、
-        GroupConsole.block_task/superuser_block_task。
+        获取bot被动技能
 
         参数:
             bot_id (str | None, optional): bot_id. Defaults to None.
-            status (bool | None, optional): 被动状态. Defaults to True.
+            status (bool | None, optional): True 为可用被动，False 为禁用被动.
+                Defaults to True.
 
         返回:
-            list[tuple[str, str]] | str: 被动技能
+            dict[str, list[str]] | list[str]: 被动技能
         """
-        if not bot_id:
-            data = await BotMemoryCache.get_all()
-            task_attr = "available_tasks" if status else "block_tasks"
-            return {
-                bot_id: cls.convert_module_format(getattr(snapshot, task_attr))
-                for bot_id, snapshot in data.items()
-            }
-        result = await BotMemoryCache.get(bot_id)
-        if result:
-            tasks = result.available_tasks if status else result.block_tasks
-            return cls.convert_module_format(tasks)
-        return []
+        return await cls._account_modules("tasks", bot_id, bool(status))
 
     @overload
     @classmethod
@@ -131,24 +150,13 @@ class BotConsole(Model):
 
         参数:
             bot_id (str | None, optional): bot_id. Defaults to None.
-            status (bool, optional): 插件状态. Defaults to True.
+            status (bool, optional): True 为可用插件，False 为禁用插件.
+                Defaults to True.
 
         返回:
-            list[tuple[str, str]] | str: 插件
+            dict[str, list[str]] | list[str]: 插件
         """
-        if not bot_id:
-            data = await BotMemoryCache.get_all()
-            plugin_attr = "available_plugins" if status else "block_plugins"
-            return {
-                bot_id: cls.convert_module_format(getattr(snapshot, plugin_attr))
-                for bot_id, snapshot in data.items()
-            }
-
-        result = await BotMemoryCache.get(bot_id)
-        if result:
-            plugins = result.available_plugins if status else result.block_plugins
-            return cls.convert_module_format(plugins)
-        return []
+        return await cls._account_modules("plugins", bot_id, status)
 
     @classmethod
     async def set_bot_status(cls, status: bool, bot_id: str | None = None) -> None:
@@ -196,62 +204,74 @@ class BotConsole(Model):
             return "".join(cls.format(item) for item in data)
 
     @classmethod
-    async def disable_plugin(cls, bot_id: str | None, plugin_name: str) -> None:
+    async def disable_plugin(cls, bot_id: str | None, plugin_name: str) -> str | None:
         """
         禁用插件
 
         参数:
             bot_id (str | None): bot_id
             plugin_name (str): 插件名称
+
+        返回:
+            str | None: 账号因此解除的共享策略名称
         """
         from zhenxun.services.plugin_policy import plugin_policy_service
 
-        await plugin_policy_service.set_feature_enabled(
+        return await plugin_policy_service.set_feature_enabled(
             bot_id, "plugins", plugin_name, False
         )
 
     @classmethod
-    async def enable_plugin(cls, bot_id: str | None, plugin_name: str) -> None:
+    async def enable_plugin(cls, bot_id: str | None, plugin_name: str) -> str | None:
         """
         启用插件
 
         参数:
             bot_id (str | None): bot_id
             plugin_name (str): 插件名称
+
+        返回:
+            str | None: 账号因此解除的共享策略名称
         """
         from zhenxun.services.plugin_policy import plugin_policy_service
 
-        await plugin_policy_service.set_feature_enabled(
+        return await plugin_policy_service.set_feature_enabled(
             bot_id, "plugins", plugin_name, True
         )
 
     @classmethod
-    async def disable_task(cls, bot_id: str | None, task_name: str) -> None:
+    async def disable_task(cls, bot_id: str | None, task_name: str) -> str | None:
         """
         禁用被动技能
 
         参数:
             bot_id (str | None): bot_id
             task_name (str): 被动技能名称
+
+        返回:
+            str | None: 账号因此解除的共享策略名称
         """
         from zhenxun.services.plugin_policy import plugin_policy_service
 
-        await plugin_policy_service.set_feature_enabled(
+        return await plugin_policy_service.set_feature_enabled(
             bot_id, "tasks", task_name, False
         )
 
     @classmethod
-    async def enable_task(cls, bot_id: str | None, task_name: str) -> None:
+    async def enable_task(cls, bot_id: str | None, task_name: str) -> str | None:
         """
         启用被动技能
 
         参数:
             bot_id (str | None): bot_id
             task_name (str): 被动技能名称
+
+        返回:
+            str | None: 账号因此解除的共享策略名称
         """
         from zhenxun.services.plugin_policy import plugin_policy_service
 
-        await plugin_policy_service.set_feature_enabled(
+        return await plugin_policy_service.set_feature_enabled(
             bot_id, "tasks", task_name, True
         )
 
@@ -260,34 +280,40 @@ class BotConsole(Model):
         cls,
         bot_id: str,
         feat: Literal["plugins", "tasks"],
-    ) -> None:
+    ) -> str | None:
         """
         禁用全部插件或被动技能
 
         参数:
             bot_id (str): bot_id
             feat (Literal["plugins", "tasks"]): 插件或被动技能
+
+        返回:
+            str | None: 账号因此解除的共享策略名称
         """
         from zhenxun.services.plugin_policy import plugin_policy_service
 
-        await plugin_policy_service.set_all_features_enabled(bot_id, feat, False)
+        return await plugin_policy_service.set_all_features_enabled(bot_id, feat, False)
 
     @classmethod
     async def enable_all(
         cls,
         bot_id: str,
         feat: Literal["plugins", "tasks"],
-    ) -> None:
+    ) -> str | None:
         """
         启用全部插件或被动技能
 
         参数:
             bot_id (str): bot_id
             feat (Literal["plugins", "tasks"]): 插件或被动技能
+
+        返回:
+            str | None: 账号因此解除的共享策略名称
         """
         from zhenxun.services.plugin_policy import plugin_policy_service
 
-        await plugin_policy_service.set_all_features_enabled(bot_id, feat, True)
+        return await plugin_policy_service.set_all_features_enabled(bot_id, feat, True)
 
     @classmethod
     async def is_block_plugin(cls, bot_id: str, plugin_name: str) -> bool:
@@ -351,4 +377,6 @@ class BotConsole(Model):
             RenameColumn("bot_console", "block_task", "block_tasks"),
             AlterColumnType("bot_console", "block_plugins", "TEXT"),
             AlterColumnType("bot_console", "block_tasks", "TEXT"),
+            DropColumn("bot_console", "available_plugins", SchemaOpRisk.SAFE),
+            DropColumn("bot_console", "available_tasks", SchemaOpRisk.SAFE),
         ]

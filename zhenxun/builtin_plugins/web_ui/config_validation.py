@@ -78,7 +78,7 @@ def validate_dotenv(content: str, *, file: str = ".env.dev") -> list[dict[str, A
 def _yaml_parser() -> YAML:
     parser = YAML()
     parser.preserve_quotes = True
-    parser.indent(mapping=2, sequence=4, offset=2)
+    parser.indent(mapping=2, sequence=2, offset=0)
     return parser
 
 

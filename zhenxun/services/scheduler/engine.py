@@ -228,19 +228,79 @@ async def _run_dependent_task(
     func: Callable, injected_params: dict, bot: Bot, state: T_State
 ):
     """将普通函数包装为 NoneBot Dependent 并执行的内部辅助方法"""
-    from zhenxun.services.ai.chat_switch import chat_plugin_enabled
+    from zhenxun.services.ai.chat_switch import scene_admitted
 
     owner = getattr(func, "__zhenxun_registration_owner__", None) or getattr(
         func, "__module__", None
     )
-    if not chat_plugin_enabled(owner):
+    if await _plugin_blocked(owner, bot, injected_params.get("context")):
         return
 
     async def wrapper(bot: Bot):
         return await func(bot=bot, **injected_params)
 
     dependent = Dependent.parse(call=wrapper, allow_types=Matcher.HANDLER_PARAM_TYPES)
-    return await dependent(bot=bot, state=state)
+    with scene_admitted():
+        return await dependent(bot=bot, state=state)
+
+
+async def _plugin_blocked(owner: str | None, bot: Bot, context) -> bool:
+    """定时任务所属插件在目标场景是否不可用
+
+    全局关闭（超级群豁免）对所有任务生效；有目标群或用户时，另按统一判定检查
+    账号与群聊/私聊禁用。
+
+    参数:
+        owner: 任务函数所属模块或插件 id
+        bot: Bot
+        context: ScheduleContext，可能为空
+
+    返回:
+        bool: 是否不可用
+    """
+    from nonebot.plugin import get_plugin_by_module_name
+
+    from zhenxun.services.bot_group_policy import bot_group_policy_service
+    from zhenxun.services.cache.runtime_cache import (
+        BotMemoryCache,
+        GroupMemoryCache,
+        PluginInfoMemoryCache,
+    )
+    from zhenxun.services.db_context.write import CacheUnavailable
+    from zhenxun.services.plugin_policy import (
+        PluginPolicyNotReady,
+        plugin_policy_service,
+    )
+
+    group_id = getattr(context, "group_id", None)
+    user_id = getattr(context, "user_id", None)
+    try:
+        group = GroupMemoryCache.get_if_ready(group_id) if group_id else None
+        if plugin_policy_service.owner_blocked(
+            owner, super_group=bool(group and group.is_super)
+        ):
+            return True
+        plugin = get_plugin_by_module_name(owner) if owner else None
+        if plugin is None or not (group_id or user_id):
+            return False
+        profile = PluginInfoMemoryCache.get_by_module_path(plugin.module_name)
+    except (CacheUnavailable, PluginPolicyNotReady):
+        return True
+    if profile is None:
+        return False
+    scope = PlatformUtils.get_platform_scope(bot)
+    bot_id = PlatformUtils.get_storage_bot_id(bot)
+    await bot_group_policy_service.ensure_fresh(bot_id, scope, group_id, None)
+    return bool(
+        plugin_policy_service.availability(
+            profile,
+            await BotMemoryCache.get(bot_id),
+            group,
+            bot_id=bot_id,
+            platform_scope=scope,
+            group_id=group_id,
+        )
+    )
 
 
 async def _execute_single_job_instance(

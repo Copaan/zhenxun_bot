@@ -14,6 +14,9 @@ from zhenxun.services.plugin_policy import (
 )
 from zhenxun.services.runtime_mutation import runtime_mutation_coordinator
 
+_BLOCK_FIELDS = ("block_plugins", "block_tasks", "forced_plugins", "forced_tasks")
+_LEGACY_PLATFORMS = {None, "qq", "qq_client", "OneBot V11", "QQClient"}
+
 
 def group_key(bot_id, platform_scope, group_id, channel_id=None):
     key = str(bot_id), str(platform_scope), str(group_id), str(channel_id or "")
@@ -30,8 +33,6 @@ class BotGroupPolicyService:
     def __init__(self):
         self._epoch = 0
         self._policies = {}
-        self._migrated = set()
-        self._superuser_exempt = {}
         self._stale = set()
         self._refresh_tasks = {}
         self._memberships = set()
@@ -44,8 +45,6 @@ class BotGroupPolicyService:
         self._epoch += 1
         self.context = context
         self._policies.clear()
-        self._migrated.clear()
-        self._superuser_exempt.clear()
         self._stale.clear()
         for row in await BotGroupPluginPolicy.all():
             self._accept_row(
@@ -69,56 +68,57 @@ class BotGroupPolicyService:
         self.context = None
         self._pending.clear()
         self._policies.clear()
-        self._migrated.clear()
-        self._superuser_exempt.clear()
         self._stale.clear()
         self._memberships.clear()
         while not self._queue.empty():
             self._queue.get_nowait()
             self._queue.task_done()
 
-    def blocked(
+    def scene_blocks(
         self,
         bot_id,
-        scope,
+        platform_scope,
         group_id,
-        module,
+        channel_id=None,
         *,
         task=False,
-        channel_id=None,
-        is_superuser=False,
     ):
-        if not group_id:
-            return False
-        key = group_key(bot_id, scope, group_id, channel_id)
+        """读取当前群聊或私聊场景的禁用模块，尚无策略记录时为空
+
+        参数:
+            bot_id: 账号
+            platform_scope: 平台范围
+            group_id: 群号，私聊为空
+            channel_id: 频道
+            task: 是否为被动技能
+
+        返回:
+            tuple[Collection[str], Collection[str]]: 超级管理员禁用与普通禁用的模块
+        """
+        key = group_key(
+            bot_id,
+            platform_scope if group_id else "private",
+            group_id or self.PRIVATE_KEY,
+            channel_id,
+        )
         if key in self._stale:
             raise CacheUnavailable("plugin_policy_stale")
-        state = self._policies.get(key)
-        if is_superuser and module in self._superuser_exempt.get(key, ()):
-            return False
-        return bool(state and module in state[int(task)])
+        if key in self._policies:
+            return self._policies[key][int(task)]
+        return (), ()
 
     def _accept_row(self, key, row):
         if row is None:
             self._policies.pop(key, None)
-            self._migrated.discard(key)
-            self._superuser_exempt.pop(key, None)
         else:
-            self._policies[key] = (
-                frozenset((row.block_plugins or []) + (row.forced_plugins or [])),
-                frozenset((row.block_tasks or []) + (row.forced_tasks or [])),
-            )
-            if row.migration_version:
-                self._migrated.add(key)
-            else:
-                self._migrated.discard(key)
-            self._superuser_exempt[key] = frozenset(
-                (row.migration_snapshot or {}).get("superuser_exempt_plugins", [])
+            self._policies[key] = tuple(
+                (frozenset(forced or []), frozenset(local or []))
+                for forced, local in (
+                    (row.forced_plugins, row.block_plugins),
+                    (row.forced_tasks, row.block_tasks),
+                )
             )
         self._stale.discard(key)
-
-    def migrated(self, bot_id, scope, group_id, channel_id=None):
-        return group_key(bot_id, scope, group_id, channel_id) in self._migrated
 
     async def refresh_policy(self, key):
         epoch = self._epoch
@@ -134,7 +134,11 @@ class BotGroupPolicyService:
             group_id or self.PRIVATE_KEY,
             channel_id,
         )
-        initialize = bool(group_id and self.loaded and key not in self._memberships)
+        initialize = bool(
+            group_id
+            and self.loaded
+            and (key not in self._memberships or key not in self._policies)
+        )
         if key not in self._stale and not initialize:
             return
         task = self._refresh_tasks.get(key)
@@ -204,50 +208,17 @@ class BotGroupPolicyService:
                     }
                     if entry.get("group_name"):
                         defaults["group_name"] = entry["group_name"]
-                    is_new = (
-                        not await BotGroupMembership.filter(**fields)
-                        .using_db(connection)
-                        .exists()
-                    )
                     await BotGroupMembership.update_or_create(
                         defaults=defaults, using_db=connection, **fields
                     )
-                    keys.add(group_key(**fields))
-                    if is_new:
-                        key = group_key(**fields)
-                        row, state = await self._state(key, connection)
-                        if row is None:
-                            from zhenxun.models.group_console import GroupConsole
-                            from zhenxun.models.plugin_info import PluginInfo
-                            from zhenxun.models.task_info import TaskInfo
-
-                            legacy = (
-                                key[1] == "qq_client"
-                                and await GroupConsole.filter(
-                                    group_id=key[2], channel_id=key[3] or None
-                                )
-                                .using_db(connection)
-                                .exists()
-                            )
-                            if not legacy:
-                                state["block_plugins"] = list(
-                                    await PluginInfo.filter(default_status=False)
-                                    .using_db(connection)
-                                    .values_list("module", flat=True)
-                                )
-                                state["block_tasks"] = list(
-                                    await TaskInfo.filter(default_status=False)
-                                    .using_db(connection)
-                                    .values_list("module", flat=True)
-                                )
-                            await self._write(
-                                key,
-                                lambda current, initial=state: {
-                                    **current,
-                                    "block_plugins": initial["block_plugins"],
-                                    "block_tasks": initial["block_tasks"],
-                                },
-                            )
+                    key = group_key(**fields)
+                    keys.add(key)
+                    if (
+                        not await BotGroupPluginPolicy.filter(**fields)
+                        .using_db(connection)
+                        .exists()
+                    ):
+                        await self._write(key, lambda current: current)
             self._memberships.update(keys)
 
     async def list_groups(self, bot_id):
@@ -273,121 +244,122 @@ class BotGroupPolicyService:
     PRIVATE_KEY = "__all__"
 
     async def _state(self, key, connection=None):
-        from zhenxun.models.group_console import GroupConsole
-
         row = await BotGroupPluginPolicy.get_or_none(**key_fields(key)).using_db(
             connection
         )
-        original_plugins = set(row.block_plugins or []) if row else set()
+        blocks = (
+            {field: sorted(getattr(row, field) or []) for field in _BLOCK_FIELDS}
+            if row
+            else await self._initial_blocks(key, connection)
+        )
         state = {
             **key_fields(key),
-            "block_plugins": sorted(row.block_plugins or []) if row else [],
-            "block_tasks": sorted(row.block_tasks or []) if row else [],
-            "forced_plugins": sorted(row.forced_plugins or []) if row else [],
-            "forced_tasks": sorted(row.forced_tasks or []) if row else [],
+            **blocks,
             "revision_number": row.revision if row else 0,
             "migration_version": row.migration_version if row else 0,
-            "superuser_exempt_plugins": (row.migration_snapshot or {}).get(
-                "superuser_exempt_plugins", []
-            )
-            if row
-            else [],
         }
-        if not state["migration_version"] and key[1] == "qq_client":
-            from zhenxun.models.plugin_policy import PluginPolicyMigration
-
-            for receipt in await PluginPolicyMigration.filter(
-                key__startswith="task-create:"
-            ).using_db(connection):
-                if [key[2], key[3]] in receipt.previous.get("groups", []):
-                    state["block_tasks"] = sorted(
-                        set(state["block_tasks"])
-                        | set(receipt.previous.get("block_tasks", []))
-                    )
-            query = GroupConsole.filter(group_id=key[2], channel_id=key[3] or None)
-            groups = await query.using_db(connection)
-            if len(groups) > 1:
-                raise PluginPolicyError("旧群策略归属不唯一，需要核验后迁移")
-            if groups:
-                group = groups[0]
-                if group.platform not in {
-                    None,
-                    "qq",
-                    "qq_client",
-                    "OneBot V11",
-                    "QQClient",
-                }:
-                    raise PluginPolicyError("旧群策略平台归属需要核验")
-                for target, source in (
-                    ("block_plugins", "block_plugin"),
-                    ("block_tasks", "block_task"),
-                    ("forced_plugins", "superuser_block_plugin"),
-                    ("forced_tasks", "superuser_block_task"),
-                ):
-                    state[target] = sorted(
-                        set(state[target])
-                        | set(_decode_modules(getattr(group, source)))
-                    )
-        if not state["migration_version"]:
-            state["superuser_exempt_plugins"] = sorted(
-                (set(state["block_plugins"]) | set(state["forced_plugins"]))
-                - original_plugins
-            )
         state["revision"] = _revision(state)
         return row, state
 
+    async def _initial_blocks(self, key, connection=None):
+        """尚无策略记录的作用域的初始禁用列表
+
+        私聊为空；群聊优先导入旧群资料中的禁用列表，否则使用进群默认禁用的插件与被动技能。
+
+        参数:
+            key: 作用域
+            connection: 数据库连接
+
+        返回:
+            dict[str, list[str]]: 四个禁用列表
+        """
+        from zhenxun.models.group_console import GroupConsole
+
+        if key[1] == "private":
+            return {field: [] for field in _BLOCK_FIELDS}
+        if key[1] == "qq_client" and (
+            legacy := await self._legacy_blocks(key, connection)
+        ):
+            return legacy
+        return {
+            "block_plugins": sorted(
+                await GroupConsole._get_plugin_modules(default_status=False)
+            ),
+            "block_tasks": sorted(
+                await GroupConsole._get_task_modules(default_status=False)
+            ),
+            "forced_plugins": [],
+            "forced_tasks": [],
+        }
+
+    async def _legacy_blocks(self, key, connection=None):
+        """从旧群资料导入禁用列表
+
+        仅导入唯一、平台为 QQ 客户端且禁用列表不全为空的旧记录，并补上旧记录建立后
+        新增的默认禁用被动技能；不在当前插件目录中的模块会被丢弃。
+
+        参数:
+            key: 作用域
+            connection: 数据库连接
+
+        返回:
+            dict[str, list[str]] | None: 四个禁用列表，没有可导入的旧记录时为 None
+        """
+        from zhenxun.models.group_console import GroupConsole
+        from zhenxun.models.plugin_policy import PluginPolicyMigration
+
+        groups = await GroupConsole.filter(
+            group_id=key[2], channel_id=key[3] or None
+        ).using_db(connection)
+        if len(groups) != 1 or groups[0].platform not in _LEGACY_PLATFORMS:
+            return None
+        blocks = {
+            target: set(_decode_modules(getattr(groups[0], source)))
+            for target, source in (
+                ("block_plugins", "block_plugin"),
+                ("block_tasks", "block_task"),
+                ("forced_plugins", "superuser_block_plugin"),
+                ("forced_tasks", "superuser_block_task"),
+            )
+        }
+        if not any(blocks.values()):
+            return None
+        for receipt in await PluginPolicyMigration.filter(
+            key__startswith="task-create:"
+        ).using_db(connection):
+            if [key[2], key[3]] in receipt.previous.get("groups", []):
+                blocks["block_tasks"] |= set(receipt.previous.get("block_tasks", []))
+        plugins, tasks = plugin_policy_service._catalog_modules(
+            await plugin_policy_service.catalog()
+        )
+        return {
+            field: sorted(modules & (tasks if field.endswith("tasks") else plugins))
+            for field, modules in blocks.items()
+        }
+
     async def _view(self, key):
         row, state = await self._state(key)
-        account = await plugin_policy_service.get_account(key[0])
         catalog = await plugin_policy_service.catalog()
-        decisions = {}
+        account = await plugin_policy_service.get_account(key[0], catalog=catalog)
         private = key[1] == "private"
         super_group = False
-        if key[1] == "qq_client":
+        if not private:
             from zhenxun.models.group_console import GroupConsole
 
-            legacy_group = await GroupConsole.get_or_none(
-                group_id=key[2], channel_id=key[3] or None
+            super_group = await GroupConsole.filter(
+                group_id=key[2], channel_id=key[3] or None, is_super=True
+            ).exists()
+        decisions = {
+            kind: plugin_policy_service.decisions(
+                catalog[kind],
+                private=private,
+                account=account[f"block_{kind}"],
+                local=state[f"block_{kind}"],
+                forced=state[f"forced_{kind}"],
+                super_group=super_group,
             )
-            super_group = bool(legacy_group and legacy_group.is_super)
-        for kind in ("plugins", "tasks"):
-            values = []
-            local = set(state[f"block_{kind}"])
-            forced = set(state[f"forced_{kind}"])
-            upper = set(account[f"block_{kind}"])
-            for item in catalog[kind]:
-                module = item["module"]
-                reasons = []
-                if not item["load_status"]:
-                    reasons.append("not_loaded")
-                block_type = getattr(
-                    item.get("block_type"), "value", item.get("block_type")
-                )
-                if (
-                    not item["global_status"]
-                    and block_type in {None, "ALL"}
-                    and not (super_group and block_type == "ALL")
-                ):
-                    reasons.append("global_disabled")
-                elif private and block_type == "PRIVATE":
-                    reasons.append("global_private_disabled")
-                elif not private and block_type == "GROUP":
-                    reasons.append("global_group_disabled")
-                if module in upper:
-                    reasons.append("account_disabled")
-                if module in forced:
-                    reasons.append("administrator_disabled")
-                if module in local:
-                    reasons.append("private_disabled" if private else "group_disabled")
-                values.append(
-                    {
-                        "module": module,
-                        "local_enabled": module not in local,
-                        "effective_enabled": not reasons,
-                        "blocked_by": reasons,
-                    }
-                )
-            decisions[kind] = values
+            for kind in ("plugins", "tasks")
+        }
         return {
             **state,
             "scope": "private" if private else key[1],
@@ -428,6 +400,7 @@ class BotGroupPolicyService:
         from zhenxun.models.bot_console import BotConsole
         from zhenxun.services.db_context.write import defer, require_publication
 
+        written = False
         async with runtime_mutation_coordinator.operation("plugin_policy_scope"):
             try:
                 async with policy_transaction() as connection:
@@ -446,7 +419,11 @@ class BotGroupPolicyService:
                             expected_revision, current["revision"]
                         )
                     changed = transform(current)
-                    plugins, tasks = await plugin_policy_service._validate_modules(
+                    modules = plugin_policy_service._catalog_modules(
+                        await plugin_policy_service.catalog()
+                    )
+                    plugins, tasks = plugin_policy_service._validate_modules(
+                        modules,
                         changed["block_plugins"],
                         changed["block_tasks"],
                         preserve_plugins=current["block_plugins"],
@@ -455,7 +432,8 @@ class BotGroupPolicyService:
                     (
                         forced_plugins,
                         forced_tasks,
-                    ) = await plugin_policy_service._validate_modules(
+                    ) = plugin_policy_service._validate_modules(
+                        modules,
                         changed["forced_plugins"],
                         changed["forced_tasks"],
                         preserve_plugins=current["forced_plugins"],
@@ -467,16 +445,11 @@ class BotGroupPolicyService:
                         "forced_plugins": forced_plugins,
                         "forced_tasks": forced_tasks,
                         "migration_version": 1,
-                        "migration_snapshot": {
-                            **(
-                                row.migration_snapshot
-                                if row and row.migration_version
-                                else current
-                            ),
-                            "superuser_exempt_plugins": changed[
-                                "superuser_exempt_plugins"
-                            ],
-                        },
+                        "migration_snapshot": (
+                            row.migration_snapshot
+                            if row and row.migration_version
+                            else current
+                        ),
                         "revision": current["revision_number"] + 1,
                     }
                     if row is None:
@@ -487,6 +460,7 @@ class BotGroupPolicyService:
                         for name, value in fields.items():
                             setattr(row, name, value)
                         await row.save(using_db=connection, update_fields=list(fields))
+                    written = True
 
                     async def publish():
                         try:
@@ -499,7 +473,8 @@ class BotGroupPolicyService:
                     if not defer(("bot_group_policy", *key), publish):
                         raise RuntimeError("policy_transaction_publication_unavailable")
             except BaseException:
-                self._stale.add(key)
+                if written:
+                    self._stale.add(key)
                 raise
         return await self._view(key)
 
@@ -513,16 +488,16 @@ class BotGroupPolicyService:
         expected_revision,
         block_plugins,
         block_tasks,
+        forced_plugins=None,
+        forced_tasks=None,
     ):
         current = await self.get_group(bot_id, scope, group_id, channel_id)
         key = group_key(current["bot_id"], scope, group_id, channel_id)
         return await self._write(
             key,
-            lambda state: {
-                **state,
-                "block_plugins": block_plugins,
-                "block_tasks": block_tasks,
-            },
+            self._replace_blocks(
+                block_plugins, block_tasks, forced_plugins, forced_tasks
+            ),
             expected_revision,
         )
 
@@ -532,14 +507,41 @@ class BotGroupPolicyService:
         bot_id = await plugin_policy_service._resolve_bot_id(bot_id)
         key = group_key(bot_id, "private", self.PRIVATE_KEY)
         return await self._write(
-            key,
-            lambda state: {
-                **state,
-                "block_plugins": block_plugins,
-                "block_tasks": block_tasks,
-            },
-            expected_revision,
+            key, self._replace_blocks(block_plugins, block_tasks), expected_revision
         )
+
+    @staticmethod
+    def _replace_blocks(
+        block_plugins, block_tasks, forced_plugins=None, forced_tasks=None
+    ):
+        """生成整体替换禁用列表的变更函数，超管锁定为空时保持不变
+
+        参数:
+            block_plugins: 禁用插件
+            block_tasks: 禁用被动技能
+            forced_plugins: 超管锁定的插件
+            forced_tasks: 超管锁定的被动技能
+
+        返回:
+            Callable: 供 _write 使用的变更函数
+        """
+
+        replaced = {
+            "block_plugins": block_plugins,
+            "block_tasks": block_tasks,
+            "forced_plugins": forced_plugins,
+            "forced_tasks": forced_tasks,
+        }
+
+        def change(state):
+            return {
+                **state,
+                **{
+                    name: value for name, value in replaced.items() if value is not None
+                },
+            }
+
+        return change
 
     async def set_features(
         self,
@@ -565,17 +567,23 @@ class BotGroupPolicyService:
         )
         modules = set(modules)
 
+        kind = "tasks" if task else "plugins"
+        if enabled:
+            fields = [f"block_{kind}"] + [f"forced_{kind}"] * is_superuser
+        else:
+            fields = [f"{'forced' if force else 'block'}_{kind}"]
+
         def change(state):
-            field = ("forced_" if force else "block_") + (
-                "tasks" if task else "plugins"
-            )
-            old = set(state[field])
             return {
                 **state,
-                field: sorted(old - modules if enabled else old | modules),
-                "superuser_exempt_plugins": sorted(
-                    set(state["superuser_exempt_plugins"]) - modules
-                ),
+                **{
+                    field: sorted(
+                        set(state[field]) - modules
+                        if enabled
+                        else set(state[field]) | modules
+                    )
+                    for field in fields
+                },
             }
 
         return await self._write(key, change)
@@ -650,43 +658,54 @@ class BotGroupPolicyService:
         return any(module in state[field] for field in fields)
 
     async def migration_preview(self):
+        """旧群资料迁移概况
+
+        已关联 Bot 的群：有策略记录为 migrated，否则为 pending（首次收到消息或修改时
+        按旧群资料或进群默认写入）；尚未关联任何 Bot、但旧禁用列表不为空的旧群资料
+        为 unlinked，等 Bot 关联该群时再导入。
+
+        返回:
+            list[dict]: 迁移概况
+        """
         from zhenxun.models.group_console import GroupConsole
 
         result = []
         members = await BotGroupMembership.all()
-        known = {
-            (row.group_id, row.channel_id)
-            for row in members
-            if row.platform_scope == "qq_client"
-        }
+        known = {(row.group_id, row.channel_id) for row in members}
         for member in members:
             key = group_key(
                 member.bot_id, member.platform_scope, member.group_id, member.channel_id
             )
-            try:
-                _, state = await self._state(key)
-                result.append(
-                    {
-                        "status": "migrated"
-                        if state["migration_version"]
-                        else "pending",
-                        **state,
-                    }
-                )
-            except PluginPolicyError as error:
-                result.append(
-                    {**key_fields(key), "status": "needs_review", "reason": str(error)}
-                )
+            _, state = await self._state(key)
+            migrated = bool(state["migration_version"])
+            result.append(
+                {
+                    **state,
+                    "status": "migrated" if migrated else "pending",
+                    "reason": ""
+                    if migrated
+                    else "首次收到该群消息或修改策略时按旧群资料或进群默认写入",
+                }
+            )
         for group in await GroupConsole.all():
-            if (group.group_id, group.channel_id or "") not in known:
-                result.append(
-                    {
-                        "group_id": group.group_id,
-                        "channel_id": group.channel_id or "",
-                        "status": "needs_review",
-                        "reason": "旧群资料尚无可核验 Bot 关联，未自动选择账号",
-                    }
+            if (group.group_id, group.channel_id or "") in known or not any(
+                _decode_modules(getattr(group, field))
+                for field in (
+                    "block_plugin",
+                    "block_task",
+                    "superuser_block_plugin",
+                    "superuser_block_task",
                 )
+            ):
+                continue
+            result.append(
+                {
+                    "group_id": group.group_id,
+                    "channel_id": group.channel_id or "",
+                    "status": "unlinked",
+                    "reason": "旧群资料尚未关联 Bot，Bot 关联该群时导入",
+                }
+            )
         return result
 
     async def initialize_created_tasks(self, modules):
@@ -736,21 +755,6 @@ class BotGroupPolicyService:
                             ),
                         },
                     )
-
-    async def migrate_scope(
-        self, bot_id, scope, group_id, channel_id, expected_revision
-    ):
-        key = group_key(
-            await plugin_policy_service._resolve_bot_id(bot_id),
-            scope,
-            group_id,
-            channel_id,
-        )
-        _, state = await self._state(key)
-        plugin_policy_service._check_revision(expected_revision, state["revision"])
-        if state["migration_version"]:
-            return await self._view(key)
-        return await self._write(key, lambda current: current, expected_revision)
 
     async def export_document(self) -> dict:
         """导出全部插件策略

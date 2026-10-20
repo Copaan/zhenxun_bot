@@ -13,6 +13,7 @@ from zhenxun.services.log import logger
 from zhenxun.utils.enum import PluginType
 from zhenxun.utils.manager.priority_manager import PriorityLifecycle
 
+from ._absent import prune_absent_plugins
 from .manager import manager
 from .utils import commit_reconcile, payload_fingerprint, reconcile_matches
 
@@ -145,8 +146,16 @@ def _file_digest(path: Path) -> str:
     depends_on=("runtime:reconcile_config",),
 )
 async def reconcile_plugin_runtime():
-    """
-    初始化插件数据配置
+    """初始化插件数据配置，并清理连续多次启动未找到的插件"""
+    loaded = await _reconcile_plugins()
+    await prune_absent_plugins(set(loaded))
+
+
+async def _reconcile_plugins() -> list[str]:
+    """同步已加载插件的记录与限制
+
+    返回:
+        list[str]: 本次启动已加载（含暂停）的插件模块路径
     """
     plugin_list: list[PluginInfo] = []
     limit_list: list[PluginLimit] = []
@@ -212,7 +221,7 @@ async def reconcile_plugin_runtime():
         )
     if not plugins_changed and not limits_changed:
         logger.debug("插件元数据与限制声明未变化，跳过启动期数据库写入")
-        return
+        return load_plugin
 
     existing_plugins = await PluginInfo.all()
     existing_by_path = {plugin.module_path: plugin for plugin in existing_plugins}
@@ -276,3 +285,4 @@ async def reconcile_plugin_runtime():
             for path in (manager.cd_file, manager.block_file, manager.count_file)
         }
         commit_reconcile("plugin_limits", payload_fingerprint(limit_payload))
+    return load_plugin

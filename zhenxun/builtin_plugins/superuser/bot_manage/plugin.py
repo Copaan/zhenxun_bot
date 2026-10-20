@@ -1,7 +1,10 @@
 from nonebot_plugin_alconna import AlconnaMatch, Match
 from nonebot_plugin_uninfo import Uninfo
 
-from zhenxun.builtin_plugins.superuser.bot_manage.command import bot_manage
+from zhenxun.builtin_plugins.superuser.bot_manage.command import (
+    bot_manage,
+    detach_notice,
+)
 from zhenxun.models.bot_console import BotConsole
 from zhenxun.models.plugin_info import PluginInfo
 from zhenxun.services.log import logger
@@ -101,9 +104,10 @@ async def enable_plugin(
                 "bot_manage.plugin.disable",
                 session=session,
             )
-            await BotConsole.enable_plugin(bot_id.result, plugin.module)
+            policy = await BotConsole.enable_plugin(bot_id.result, plugin.module)
             await MessageUtils.build_message(
                 f"已开启 {bot_id.result} 的插件 {plugin_name.result}"
+                + detach_notice({bot_id.result: policy})
             ).finish()
         else:
             logger.info(
@@ -121,18 +125,24 @@ async def enable_plugin(
             "bot_manage.plugin.disable",
             session=session,
         )
-        await BotConsole.enable_all(bot_id.result, "plugins")
-        await MessageUtils.build_message(f"已开启 {bot_id.result} 全部插件").finish()
+        policy = await BotConsole.enable_all(bot_id.result, "plugins")
+        await MessageUtils.build_message(
+            f"已开启 {bot_id.result} 全部插件" + detach_notice({bot_id.result: policy})
+        ).finish()
     else:
         bot_id_list = await BotConsole.annotate().values_list("bot_id", flat=True)
-        for __bot_id in bot_id_list:
-            await BotConsole.enable_all(__bot_id, "plugins")  # type: ignore
+        detached = {
+            bot: await BotConsole.enable_all(bot, "plugins")
+            for bot in map(str, bot_id_list)
+        }
         logger.info(
             "开启全部 bot 全部插件",
             "bot_manage.plugin.disable",
             session=session,
         )
-        await MessageUtils.build_message("开启全部 bot 全部插件").finish()
+        await MessageUtils.build_message(
+            "开启全部 bot 全部插件" + detach_notice(detached)
+        ).finish()
 
 
 @bot_manage.assign("plugin.disable")
@@ -152,9 +162,10 @@ async def disable_plugin(
                 "bot_manage.plugin.disable",
                 session=session,
             )
-            await BotConsole.disable_plugin(bot_id.result, plugin.module)
+            policy = await BotConsole.disable_plugin(bot_id.result, plugin.module)
             await MessageUtils.build_message(
                 f"已禁用 {bot_id.result} 的插件 {plugin_name.result}"
+                + detach_notice({bot_id.result: policy})
             ).finish()
         else:
             logger.info(
@@ -172,15 +183,21 @@ async def disable_plugin(
             "bot_manage.plugin.disable",
             session=session,
         )
-        await BotConsole.disable_all(bot_id.result, "plugins")
-        await MessageUtils.build_message(f"已禁用 {bot_id.result} 全部插件").finish()
+        policy = await BotConsole.disable_all(bot_id.result, "plugins")
+        await MessageUtils.build_message(
+            f"已禁用 {bot_id.result} 全部插件" + detach_notice({bot_id.result: policy})
+        ).finish()
     else:
         bot_id_list = await BotConsole.annotate().values_list("bot_id", flat=True)
-        for __bot_id in bot_id_list:
-            await BotConsole.disable_all(__bot_id, "plugins")  # type: ignore
+        detached = {
+            bot: await BotConsole.disable_all(bot, "plugins")
+            for bot in map(str, bot_id_list)
+        }
         logger.info(
             "禁用全部 bot 全部插件",
             "bot_manage.plugin.disable",
             session=session,
         )
-        await MessageUtils.build_message("禁用全部 bot 全部插件").finish()
+        await MessageUtils.build_message(
+            "禁用全部 bot 全部插件" + detach_notice(detached)
+        ).finish()

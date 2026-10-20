@@ -78,15 +78,33 @@ async def build_plugin() -> bytes:
     return await ui.render(table, viewport={"width": 1400, "height": 10})
 
 
-async def build_task(group_id: str | None) -> bytes:
-    """构造被动技能状态图片"""
+async def build_task(bot: Bot, group_id: str | None) -> bytes:
+    """构造被动技能状态图片
+
+    参数:
+        bot: Bot
+        group_id: 群组id，为空时不显示群组状态
+
+    返回:
+        bytes: 图片
+    """
+    from zhenxun.services.bot_group_policy import bot_group_policy_service
+
     task_list = await TaskInfo.get_tasks(load_status=None)
     column_name = ["ID", "模块", "名称", "群组状态", "全局状态", "运行时间"]
     group = None
+    blocked: set[str] = set()
     if group_id:
         group = await GroupConsole.get_group_db(group_id=group_id)
         if not group:
             raise GroupConsoleNotFound()
+        forced, local = bot_group_policy_service.scene_blocks(
+            PlatformUtils.get_storage_bot_id(bot),
+            PlatformUtils.get_platform_scope(bot),
+            group_id,
+            task=True,
+        )
+        blocked = {*forced, *local}
     else:
         column_name.remove("群组状态")
     rows = []
@@ -97,7 +115,7 @@ async def build_task(group_id: str | None) -> bytes:
         )
         row = [task.id, task.module, task.name]
         if group:
-            is_group_open = f"<{task.module}," not in group.block_task
+            is_group_open = task.module not in blocked
             group_status_cell = StatusBadgeCell(
                 text="开启" if is_group_open else "关闭",
                 status_type="ok" if is_group_open else "error",

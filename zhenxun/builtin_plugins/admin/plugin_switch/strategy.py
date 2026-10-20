@@ -19,18 +19,6 @@ class SwitchStrategy(ABC):
     def entity_type_name(self) -> str:
         pass
 
-    @property
-    @abstractmethod
-    def norm_field(self) -> str:
-        """普通的群组禁用字段名"""
-        pass
-
-    @property
-    @abstractmethod
-    def su_field(self) -> str:
-        """超级用户群组禁用字段名"""
-        pass
-
     @abstractmethod
     async def get_entity(self, name: str) -> Any:
         """通过名称获取实体信息"""
@@ -78,14 +66,6 @@ class PluginStrategy(SwitchStrategy):
     @property
     def entity_type_name(self) -> str:
         return "功能"
-
-    @property
-    def norm_field(self) -> str:
-        return "block_plugin"
-
-    @property
-    def su_field(self) -> str:
-        return "superuser_block_plugin"
 
     async def get_entity(self, name: str) -> Any:
         if name.isdigit():
@@ -148,14 +128,6 @@ class TaskStrategy(SwitchStrategy):
     @property
     def entity_type_name(self) -> str:
         return "被动"
-
-    @property
-    def norm_field(self) -> str:
-        return "block_task"
-
-    @property
-    def su_field(self) -> str:
-        return "superuser_block_task"
 
     async def get_entity(self, name: str) -> Any:
         return await TaskInfo.get_or_none(name=name)

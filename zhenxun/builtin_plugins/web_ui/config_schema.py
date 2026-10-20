@@ -93,3 +93,44 @@ def inferred_schema(value: Any) -> dict[str, Any]:
     if value is None:
         return {}
     return schema_for_type(type(value))
+
+
+def _accepts_null(schema: dict[str, Any]) -> bool:
+    types = schema.get("type")
+    if types == "null" or (isinstance(types, list) and "null" in types):
+        return True
+    return any(
+        _accepts_null(branch)
+        for branch in schema.get("anyOf", []) + schema.get("oneOf", [])
+    )
+
+
+def config_field_schema(value_type: Any, value: Any, default: Any) -> dict[str, Any]:
+    """生成配置项的编辑 schema
+
+    未声明类型时按当前值或默认值推断，两者都为空时按文本处理；
+    值或默认值为空时允许 null，使未填写的配置项可以直接编辑和保存。
+
+    参数:
+        value_type: 声明的类型
+        value: 当前值
+        default: 默认值
+
+    返回:
+        dict[str, Any]: JSON Schema
+    """
+    schema = schema_for_type(value_type) or inferred_schema(
+        value if value is not None else default
+    )
+    if not schema and value is None and default is None:
+        schema = {"type": "string"}
+    if not schema or (value is not None and default is not None):
+        return schema
+    if _accepts_null(schema):
+        return schema
+    branch = dict(schema)
+    nullable: dict[str, Any] = {"anyOf": [branch, {"type": "null"}]}
+    for key in ("$defs", "definitions", "title", "description"):
+        if key in branch:
+            nullable[key] = branch.pop(key)
+    return nullable

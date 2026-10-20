@@ -6,8 +6,6 @@ from tortoise.transactions import in_transaction
 
 from zhenxun.configs.utils import PluginExtraData
 from zhenxun.models.bot_console import BotConsole
-from zhenxun.models.plugin_info import PluginInfo
-from zhenxun.models.task_info import TaskInfo
 from zhenxun.services.db_context import database_ready
 from zhenxun.services.log import logger
 from zhenxun.utils.enum import PluginType
@@ -55,31 +53,10 @@ async def init_bot_console(bot: Bot):
         )
         return
 
-    async def _filter_blocked_items(
-        items_list: list[str], block_list: list[str]
-    ) -> list[str]:
-        """过滤被block的项目
-
-        参数:
-            items_list: 需要过滤的项目列表
-            block_list: block列表
-
-        返回:
-            list: 过滤后且经过格式化的项目列表
-        """
-        return [item for item in items_list if item not in block_list]
-
-    plugin_list = [
-        plugin.module
-        for plugin in await PluginInfo.get_plugins(
-            plugin_type__in=[PluginType.NORMAL, PluginType.DEPENDANT, PluginType.ADMIN]
-        )
-    ]
-    task_list = await TaskInfo.get_modules(status=True)
     platform = PlatformUtils.get_platform(bot)
     storage_bot_id = PlatformUtils.get_storage_bot_id(bot)
     try:
-        bot_data, created = await BotConsole.get_or_create(
+        bot_data, _ = await BotConsole.get_or_create(
             bot_id=storage_bot_id, platform=platform
         )
     except (IntegrityError, TransactionManagementError):
@@ -89,19 +66,6 @@ async def init_bot_console(bot: Bot):
                 .using_db(connection)
                 .get()
             )
-        created = False
-
-    if not created:
-        task_list = await _filter_blocked_items(
-            task_list, await bot_data.get_tasks(storage_bot_id, False)
-        )
-        plugin_list = await _filter_blocked_items(
-            plugin_list, await bot_data.get_plugins(storage_bot_id, False)
-        )
-
-    bot_data.available_plugins = BotConsole.convert_module_format(plugin_list)
-    bot_data.available_tasks = BotConsole.convert_module_format(task_list)
-    await bot_data.save(update_fields=["available_plugins", "available_tasks"])
     from zhenxun.services.cache.runtime_cache import BotMemoryCache
 
     await BotMemoryCache.upsert_from_model(bot_data)

@@ -24,9 +24,8 @@ class CommonUtils:
     ) -> bool:
         """判断被动技能是否被阻断。
 
-        运行真源固定为 TaskInfo.status/load_status、BotConsole.block_tasks、
-        GroupConsole.block_task/superuser_block_task，以及 bot/group ban 状态。
-        BotConsole.available_tasks 只用于管理展示，不作为运行白名单。
+        被动全局状态、账号与群聊/私聊禁用由 plugin_policy_service.availability
+        统一判断，另外检查 bot 休眠、群权限与群 ban 状态。
 
         参数:
             module: 被动技能模块名
@@ -47,57 +46,31 @@ class CommonUtils:
         if not group_id and isinstance(session, Session):
             group_id = session.group.id if session.group else None
         from zhenxun.services.bot_group_policy import bot_group_policy_service
+        from zhenxun.services.plugin_policy import plugin_policy_service
         from zhenxun.utils.platform import PlatformUtils
 
         scope = PlatformUtils.get_platform_scope(session)
         bot_id = PlatformUtils.storage_bot_id(scope, str(session.self_id))
         channel_id = getattr(getattr(session, "channel", None), "id", None)
         await bot_group_policy_service.ensure_fresh(bot_id, scope, group_id, channel_id)
-        if bot_group_policy_service.blocked(
-            bot_id,
-            scope if group_id else "private",
-            group_id or bot_group_policy_service.PRIVATE_KEY,
-            module,
-            task=True,
-            channel_id=channel_id,
-        ):
-            return True
-        if await TaskInfoMemoryCache.is_runtime_disabled(module):
-            """被动全局状态"""
-            return True
         bot_snapshot = await BotMemoryCache.get(bot_id)
         if bot_snapshot and not bot_snapshot.status:
             """bot是否休眠"""
             return True
-        if bot_snapshot:
-            block_tasks = cls.convert_module_format(bot_snapshot.block_tasks)
-            if module in block_tasks:
-                """bot是否禁用被动"""
-                return True
+        profile = await TaskInfoMemoryCache.get(module)
+        if profile is not None and plugin_policy_service.availability(
+            profile,
+            bot_snapshot,
+            GroupMemoryCache.get_if_ready(group_id, channel_id) if group_id else None,
+            bot_id=bot_id,
+            platform_scope=scope,
+            group_id=group_id,
+            channel_id=channel_id,
+            task=True,
+        ):
+            """被动全局状态、账号与群聊/私聊禁用"""
+            return True
         if group_id:
-            legacy = GroupMemoryCache.get_if_ready(group_id, channel_id)
-            parent = GroupMemoryCache.get_if_ready(group_id, None)
-            if not bot_group_policy_service.migrated(
-                bot_id, scope, group_id, channel_id
-            ) and (
-                (
-                    legacy
-                    and (
-                        module in legacy.block_task_set
-                        or module in legacy.superuser_block_task_set
-                    )
-                )
-                or (
-                    channel_id
-                    and parent
-                    and (
-                        module in parent.block_task_set
-                        or module in parent.superuser_block_task_set
-                    )
-                )
-            ):
-                """群组是否禁用被动"""
-                return True
             if g := GroupMemoryCache.get_if_ready(group_id, None):
                 """群组权限是否小于0"""
                 if g.level < 0:

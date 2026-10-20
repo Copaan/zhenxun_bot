@@ -64,6 +64,8 @@ _POLICY_SKIP_MESSAGES = {
 # 插件策略禁止调用时发送给用户的提示
 _PLUGIN_POLICY_TIPS = {
     "global_disabled": "该功能在当前场景全局关闭...",
+    "global_group_disabled": "该功能在群聊中已被全局关闭...",
+    "global_private_disabled": "该功能在私聊中已被全局关闭...",
     "administrator_disabled": "超级管理员禁用了该群此功能...",
     "group_disabled": "该群未开启此功能...",
     "private_disabled": "当前账号未开启此私聊功能...",

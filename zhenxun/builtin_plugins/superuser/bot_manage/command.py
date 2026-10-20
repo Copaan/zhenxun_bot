@@ -3,6 +3,20 @@ from arclet.alconna.action import store_false
 from nonebot.permission import SUPERUSER
 from nonebot_plugin_alconna import on_alconna
 
+
+def detach_notice(detached: dict[str, str | None]) -> str:
+    """生成账号解除共享策略的提示
+
+    参数:
+        detached: 账号与其解除的共享策略名称
+
+    返回:
+        str: 提示文本，没有账号解除共享策略时为空
+    """
+    items = [f"{bot_id}「{name}」" for bot_id, name in detached.items() if name]
+    return f"\n已解除共享策略并转为独立设置：{'、'.join(items)}" if items else ""
+
+
 bot_manage = on_alconna(
     Alconna(
         "bot_manage",

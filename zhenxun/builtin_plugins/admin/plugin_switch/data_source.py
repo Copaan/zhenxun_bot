@@ -3,14 +3,53 @@ from nonebot.adapters import Bot
 from zhenxun.models.group_console import GroupConsole
 from zhenxun.services.cache.runtime_cache import GroupMemoryCache
 from zhenxun.services.platform_identity import scoped_group_id
+from zhenxun.services.plugin_policy import scene_global_state
 from zhenxun.utils.common_utils import CommonUtils
 from zhenxun.utils.enum import BlockType
 from zhenxun.utils.platform import PlatformUtils
 
 from .strategy import get_strategy
 
+BLOCK_REASON_LABELS = {
+    "not_loaded": "未加载",
+    "global_disabled": "全局关闭",
+    "global_group_disabled": "全局群聊关闭",
+    "global_private_disabled": "全局私聊关闭",
+    "account_disabled": "账号禁用",
+    "administrator_disabled": "超管锁定",
+    "group_disabled": "本群禁用",
+    "private_disabled": "私聊禁用",
+}
+
 
 class PluginManager:
+    @staticmethod
+    def blocked_notice(views: list[dict], modules: set[str], is_task: bool) -> str:
+        """汇总开启后仍不可用的功能及原因
+
+        参数:
+            views: 写入后返回的场景策略视图
+            modules: 本次开启的模块
+            is_task: 是否为被动技能
+
+        返回:
+            str: 提示文本，全部可用时为空
+        """
+        reasons = [
+            row["blocked_by"]
+            for view in views
+            for row in view["effective"]["tasks" if is_task else "plugins"]
+            if row["module"] in modules and row["blocked_by"]
+        ]
+        if not reasons:
+            return ""
+        labels = "、".join(
+            label
+            for reason, label in BLOCK_REASON_LABELS.items()
+            if any(reason in items for items in reasons)
+        )
+        return f"\n其中 {len(reasons)} 项仍不可用，原因：{labels}"
+
     @staticmethod
     def _modify_block_string(current_str: str, module: str, add: bool) -> str:
         """辅助: 添加或移除禁用模块字符串"""
@@ -69,7 +108,22 @@ class PluginManager:
         use_su_field: bool = False,
         channel_id: str | None = None,
     ) -> str:
-        """批量更新状态 (已用策略模式完全重构)"""
+        """批量开关多个群中的功能，超级用户开启时同时解除本群禁用与超管锁定
+
+        参数:
+            name: 功能名称
+            target_groups: 目标群
+            status: 开启或关闭
+            is_task: 是否为被动技能
+            is_superuser: 是否为超级用户
+            is_whitelist_mode: 仅在目标群开启，其余群关闭
+            bot: 当前账号
+            use_su_field: 关闭时写入超管锁定
+            channel_id: 频道
+
+        返回:
+            str: 回复消息，包含开启后仍不可用的原因
+        """
         from zhenxun.services.bot_group_policy import bot_group_policy_service
 
         if bot is None:
@@ -83,8 +137,9 @@ class PluginManager:
         )
         bot_id = PlatformUtils.get_storage_bot_id(bot)
         scope = PlatformUtils.get_platform_scope(bot)
+        opened = []
         for gid in sorted(to_open | to_close):
-            await bot_group_policy_service.set_features(
+            view = await bot_group_policy_service.set_features(
                 bot_id,
                 scope,
                 gid,
@@ -95,10 +150,11 @@ class PluginManager:
                 force=use_su_field,
                 is_superuser=is_superuser,
             )
+            if gid in to_open:
+                opened.append(view)
         return (
             f"已更新当前账号策略：开启 {len(to_open)} 群，关闭 {len(to_close)} 群。"
-            "上层关闭仍然有效。"
-        )
+        ) + cls.blocked_notice(opened, {entity.module}, is_task)
 
     @classmethod
     async def set_default_status(
@@ -142,21 +198,22 @@ class PluginManager:
                 return "缺少 Bot 作用域，请指定目标账号后重试。"
             from zhenxun.services.bot_group_policy import bot_group_policy_service
 
-            await bot_group_policy_service.set_features(
+            modules = set(await strategy.get_all_modules())
+            view = await bot_group_policy_service.set_features(
                 PlatformUtils.get_storage_bot_id(bot),
                 PlatformUtils.get_platform_scope(bot),
                 group_id,
-                await strategy.get_all_modules(),
+                modules,
                 status,
                 task=is_task,
                 channel_id=channel_id,
                 force=use_su_field,
                 is_superuser=is_superuser,
             )
+            notice = cls.blocked_notice([view], modules, is_task) if status else ""
             return (
                 f"当前账号{'当前群' if group_id else '所有私聊'}的所有{type_str}"
-                f"已{'开启' if status else '关闭'}；"
-                "上层限制仍然有效。"
+                f"已{'开启' if status else '关闭'}{notice}"
             )
 
         await strategy.set_all_global_status(status)
@@ -164,50 +221,42 @@ class PluginManager:
 
     @classmethod
     async def superuser_set_status(
-        cls,
-        plugin_name: str,
-        status: bool,
-        block_type: BlockType | None,
-        group_id: str | None,
-        is_task: bool = False,
-        bot: Bot | None = None,
-        channel_id: str | None = None,
+        cls, plugin_name: str, status: bool, scene: BlockType
     ) -> str:
-        strategy = get_strategy(is_task)
+        """在群聊/私聊/全部场景全局开启或关闭功能
+
+        参数:
+            plugin_name: 功能名称
+            status: 开启或关闭
+            scene: 操作场景
+
+        返回:
+            str: 回复消息
+        """
+        strategy = get_strategy(False)
         entity = await strategy.get_entity(plugin_name)
-        action_cn = "开启" if status else "关闭"
-
-        if entity:
-            if group_id:
-                if bot is None:
-                    from nonebot.matcher import current_bot
-
-                    try:
-                        bot = current_bot.get()
-                    except LookupError:
-                        return "缺少 Bot 作用域，请指定目标账号后重试。"
-                return await cls.batch_update_status(
-                    plugin_name,
-                    {group_id},
-                    status,
-                    is_task=is_task,
-                    is_superuser=True,
-                    use_su_field=True,
-                    bot=bot,
-                    channel_id=channel_id,
-                )
-
-            await strategy.set_global_status(entity, status, block_type)
-            await strategy.refresh_cache()
-
-            if not block_type or block_type == BlockType.ALL:
-                return f"已成功将 {entity.name} 全局{action_cn}!"
-            if block_type == BlockType.GROUP:
-                return f"已成功将 {entity.name} 全局群组{action_cn}!"
-            if block_type == BlockType.PRIVATE:
-                return f"已成功将 {entity.name} 全局私聊{action_cn}!"
-
-        return "没有找到这个功能喔..."
+        if not entity:
+            return "没有找到这个功能喔..."
+        new_status, block_type = scene_global_state(
+            entity.status, entity.block_type, scene, status
+        )
+        await strategy.set_global_status(entity, new_status, block_type)
+        await strategy.refresh_cache()
+        state = {
+            None: "群聊和私聊均可用",
+            BlockType.GROUP: "仅私聊可用",
+            BlockType.PRIVATE: "仅群聊可用",
+            BlockType.ALL: "全局关闭",
+        }[block_type]
+        scene_cn = {
+            BlockType.ALL: "全局",
+            BlockType.GROUP: "群聊中",
+            BlockType.PRIVATE: "私聊中",
+        }[scene]
+        return (
+            f"已在{scene_cn}{'开启' if status else '关闭'} {entity.name}，"
+            f"当前状态：{state}"
+        )
 
     @classmethod
     async def batch_set_group_active_status(

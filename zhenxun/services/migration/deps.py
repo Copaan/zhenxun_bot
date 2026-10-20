@@ -443,7 +443,7 @@ def layer_status(revision: str) -> dict:
 
     返回:
         dict: state 为 pending / done / failed / unknown（事务已被后续操作替换），
-            失败时带 error_code 与 detail
+            失败时带 error_code 与 detail，启动验证失败时 detail 列出加载失败的插件
     """
     from zhenxun.services.nonebot_store.storage import (
         is_settled,
@@ -462,13 +462,19 @@ def layer_status(revision: str) -> dict:
     elif transaction.get("state") != "failed" and not is_settled(transaction):
         return {"state": "pending"}
     if transaction.get("state") == "failed" or transaction.get("rollback_confirmed"):
+        modules = [
+            str(item.get("module_name") or item.get("store_key"))
+            for item in transaction.get("failure_reasons") or []
+            if isinstance(item, dict)
+            and (item.get("module_name") or item.get("store_key"))
+        ]
         return {
             "state": "failed",
             "error_code": transaction.get("error_code")
             or "nonebot_plugin_apply_failed",
             "detail": describe(transaction.get("error_details"))
             or transaction.get("error")
-            or "",
+            or (f"加载失败的插件：{'、'.join(modules)}" if modules else ""),
         }
     return {"state": "done"}
 

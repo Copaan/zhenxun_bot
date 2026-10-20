@@ -46,7 +46,12 @@ from ....apply_result import (
     update_pending_restart,
 )
 from ....base_model import Result
-from ....config_schema import configuration_value, inferred_schema, schema_for_type
+from ....config_schema import (
+    config_field_schema,
+    configuration_value,
+    inferred_schema,
+    schema_for_type,
+)
 from ....config_validation import (
     ConfigurationValidationError,
     _yaml_parser,
@@ -167,14 +172,66 @@ def _env_values(content: str) -> dict[str, Any]:
     }
 
 
-def _registered_groups() -> list[dict[str, Any]]:
+def _group_owners(names: list[str]) -> tuple[list[dict[str, str]], str]:
+    """读取配置组的已加载归属插件及分类
+
+    参数:
+        names: 注册过配置组的插件名
+
+    返回:
+        tuple[list[dict[str, str]], str]: 归属插件与分类（plugin / builtin / core）
+    """
+    from nonebot import get_loaded_plugins
+
+    plugins = {plugin.name: plugin for plugin in get_loaded_plugins()}
+    loaded = [plugin for name in names if (plugin := plugins.get(name))]
+    owners = [
+        {
+            "module": plugin.name,
+            "name": getattr(plugin.metadata, "name", None) or plugin.name,
+        }
+        for plugin in loaded
+    ]
+    if not loaded:
+        return owners, "core"
+    if all(
+        plugin.module_name.startswith("zhenxun.builtin_plugins.") for plugin in loaded
+    ):
+        return owners, "builtin"
+    return owners, "plugin"
+
+
+def simple_config_groups(modules: set[str] | None = None) -> dict[str, Any]:
+    """读取 config.yaml 的配置组与文件版本
+
+    参数:
+        modules: 只返回这些配置组，为空时返回全部
+
+    返回:
+        dict[str, Any]: 配置组列表与文件版本
+    """
+    content = _read(_SIMPLE_FILE)
+    groups = [
+        group
+        for group in _registered_groups(content)
+        if (group["fields"] or not group["registered"])
+        and (modules is None or group["module"] in modules)
+    ]
+    return {"groups": groups, "revision": _revision(content)}
+
+
+def _registered_groups(content: str) -> list[dict[str, Any]]:
     """读取插件配置组，合并 config.yaml 中的值与未注册配置
+
+    参数:
+        content: config.yaml 内容
 
     返回:
         list[dict[str, Any]]: 配置组
     """
     groups = []
     for module, group in Config.get_data().items():
+        owners, category = _group_owners(group.plugins)
         fields = []
         for key, config in group.configs.items():
             managed = module.casefold() == "ai" and key.upper() == "CHAT_PLUGIN_ENABLED"
@@ -184,7 +241,9 @@ def _registered_groups() -> list[dict[str, Any]]:
                     "help": _MANAGED_HELP if managed else config.help or "",
                     "value": configuration_value(config.value),
                     "default_value": configuration_value(config.default_value),
-                    "schema": schema_for_type(config.type),
+                    "schema": config_field_schema(
+                        config.type, config.value, config.default_value
+                    ),
                     "ui": model_dump(config.ui, exclude_none=True) if config.ui else {},
                     "authority": "database" if managed else "file",
                 }
@@ -193,13 +252,17 @@ def _registered_groups() -> list[dict[str, Any]]:
         groups.append(
             {
                 "module": module,
-                "name": group.name or module,
+                "name": module
+                if len(owners) > 1
+                else group.name or (owners[0]["name"] if owners else module),
+                "plugins": owners,
+                "category": category,
                 "fields": fields,
                 "registered": True,
                 "source_status": "loaded",
             }
         )
-    stored = _yaml_parser().load(StringIO(_read(_SIMPLE_FILE))) or {}
+    stored = _yaml_parser().load(StringIO(content)) or {}
     if not isinstance(stored, dict):
         return groups
     known_groups = {item["module"]: item for item in groups}
@@ -793,10 +856,7 @@ async def configuration_summary() -> Result:
                 "custom_env": custom_env,
                 "revision": _revision(env_content),
             },
-            "simple": {
-                "groups": _registered_groups(),
-                "revision": _revision(_read(_SIMPLE_FILE)),
-            },
+            "simple": simple_config_groups(),
             "launcher_managed": bool(os.getenv("ZHENXUN_LAUNCHER_PID")),
             "network": network_configuration_status(),
         }

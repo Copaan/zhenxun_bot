@@ -267,8 +267,6 @@ class BotMemoryCache(RuntimeMemoryCache):
                 platform=entry.platform,
                 block_plugins=entry.block_plugins,
                 block_tasks=entry.block_tasks,
-                available_plugins=entry.available_plugins,
-                available_tasks=entry.available_tasks,
             )
             cls._by_id[bot_id] = updated
         RuntimeCacheMutation.publish("bot", "upsert", updated.to_payload())

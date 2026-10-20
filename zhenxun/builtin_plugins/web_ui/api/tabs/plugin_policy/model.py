@@ -9,6 +9,11 @@ class AccountPolicyUpdate(BaseModel):
     block_tasks: list[str] = Field(default_factory=list)
 
 
+class GroupPolicyUpdate(AccountPolicyUpdate):
+    forced_plugins: list[str] | None = None
+    forced_tasks: list[str] | None = None
+
+
 class PolicyCreate(BaseModel):
     name: str = Field(min_length=1, max_length=80)
     description: str = Field(default="", max_length=255)

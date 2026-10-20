@@ -1,6 +1,4 @@
-import hashlib
 from io import StringIO
-import json
 from pathlib import Path
 
 import nonebot
@@ -23,7 +21,6 @@ _yaml.indent = 2
 driver: Driver = nonebot.get_driver()
 
 SIMPLE_CONFIG_FILE = DATA_PATH / "config.yaml"
-_CONFIG_HASH_FILE = DATA_PATH / "configs" / ".config_hash"
 
 old_config_file = Path() / "zhenxun" / "configs" / "config.yaml"
 if old_config_file.exists():
@@ -31,10 +28,11 @@ if old_config_file.exists():
 
 
 def _handle_config(plugin: Plugin, exists_module: list[str]):
-    """处理配置项
+    """处理配置项，配置组名称取同名插件，否则取首个注册的插件
 
     参数:
         plugin: Plugin
+        exists_module: 已注册的配置键列表
     """
     if plugin.metadata and plugin.metadata.extra:
         extra = plugin.metadata.extra
@@ -43,7 +41,8 @@ def _handle_config(plugin: Plugin, exists_module: list[str]):
                 reg_config = RegisterConfig(**config)
                 module = reg_config.module or plugin.name
                 g_config = Config.get(module)
-                g_config.name = plugin.metadata.name
+                if not g_config.name or plugin.name == module:
+                    g_config.name = plugin.metadata.name
                 Config.add_plugin_config(
                     module,
                     reg_config.key,
@@ -53,6 +52,7 @@ def _handle_config(plugin: Plugin, exists_module: list[str]):
                     type=reg_config.type,  # type: ignore
                     arg_parser=reg_config.arg_parser,
                     ui=reg_config.ui,
+                    plugin=plugin.name,
                     _override=False,
                 )
                 exists_module.append(f"{module}:{reg_config.key}".lower())
@@ -141,47 +141,15 @@ def _generate_simple_config(exists_module: list[str]) -> bool:
     depends_on=("management:database",),
 )
 def reconcile_config_runtime() -> set[Path]:
+    """初始化插件数据配置，按模块名顺序处理插件，保证生成的配置文件稳定
+
+    返回:
+        set[Path]: 被改写的配置文件
     """
-    初始化插件数据配置
-    """
-    plugins2config_file = DATA_PATH / "configs" / "plugins2config.yaml"
     exists_module = []
-    for plugin in get_loaded_plugins():
+    for plugin in sorted(get_loaded_plugins(), key=lambda p: p.module_name):
         if plugin.metadata:
             _handle_config(plugin, exists_module)
-    exists_module = _normalize_config_keys(exists_module)
-    if Config.is_empty():
-        changed = _generate_simple_config(exists_module)
-        Config.reload()
-        return {SIMPLE_CONFIG_FILE.resolve()} if changed else set()
-    # 计算当前插件配置指纹，未变化则跳过重写
-    fingerprint = hashlib.md5(
-        json.dumps(sorted(exists_module), ensure_ascii=False).encode()
-    ).hexdigest()
-    if (
-        _CONFIG_HASH_FILE.exists()
-        and _CONFIG_HASH_FILE.read_text(encoding="utf-8").strip() == fingerprint
-        and plugins2config_file.exists()
-        and SIMPLE_CONFIG_FILE.exists()
-    ):
-        logger.debug("插件配置无变化，跳过配置文件重写", "初始化配置")
-        changed = _generate_simple_config(exists_module)
-        Config.reload()
-        return {SIMPLE_CONFIG_FILE.resolve()} if changed else set()
-    Config.save()
-    _data: CommentedMap = _yaml.load(plugins2config_file.open(encoding="utf8"))
-    for module in _data.keys():
-        plugin_name = Config.get(module).name
-        _data.yaml_set_comment_before_after_key(
-            after=f"{plugin_name}",
-            key=module,
-        )
-    # 存完插件基本设置
-    with plugins2config_file.open("w", encoding="utf8") as wf:
-        _yaml.dump(_data, wf)
-    changed = _generate_simple_config(exists_module)
+    changed = _generate_simple_config(_normalize_config_keys(exists_module))
     Config.reload()
-    # 保存指纹
-    _CONFIG_HASH_FILE.parent.mkdir(parents=True, exist_ok=True)
-    _CONFIG_HASH_FILE.write_text(fingerprint, encoding="utf-8")
     return {SIMPLE_CONFIG_FILE.resolve()} if changed else set()

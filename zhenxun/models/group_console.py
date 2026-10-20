@@ -1,5 +1,5 @@
 import asyncio
-from typing import TYPE_CHECKING, Any, ClassVar, cast, overload
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 from typing_extensions import Self
 
 from tortoise import fields
@@ -11,46 +11,10 @@ from zhenxun.services.cache.runtime_cache import GroupMemoryCache
 from zhenxun.services.db_context import Model
 from zhenxun.services.db_context.schema_ops import AlterColumnType, CreateIndex
 from zhenxun.services.platform_identity import scoped_group_id
-from zhenxun.utils.enum import DbLockType, PluginType
+from zhenxun.utils.enum import DbLockType
 
 if TYPE_CHECKING:
     from zhenxun.services.cache.runtime_snapshot import GroupSnapshot
-
-
-def add_disable_marker(name: str) -> str:
-    """添加模块禁用标记符
-
-    Args:
-        name: 模块名称
-
-    Returns:
-        添加了禁用标记的模块名 (前缀'<'和后缀',')
-    """
-    return f"<{name},"
-
-
-@overload
-def convert_module_format(data: str) -> list[str]: ...
-
-
-@overload
-def convert_module_format(data: list[str]) -> str: ...
-
-
-def convert_module_format(data: str | list[str]) -> str | list[str]:
-    """
-    在 `<aaa,<bbb,<ccc,` 和 `["aaa", "bbb", "ccc"]` (即禁用启用)之间进行相互转换。
-
-    参数:
-        data: 要转换的数据
-
-    返回:
-        str | list[str]: 根据输入类型返回转换后的数据。
-    """
-    if isinstance(data, str):
-        return [item.strip(",") for item in data.split("<") if item.strip()]
-    else:
-        return "".join(add_disable_marker(item) for item in data)
 
 
 class GroupConsole(Model):
@@ -76,16 +40,18 @@ class GroupConsole(Model):
     """超级用户指定群，可以使用全局关闭的功能"""
     group_flag = fields.IntField(default=0, description="群认证标记")
     """群认证标记"""
-    block_plugin = fields.TextField(default="", description="禁用插件")
-    """禁用插件"""
+    block_plugin = fields.TextField(default="", description="旧版禁用插件")
+    """旧版禁用插件，仅作导入群策略的来源"""
     superuser_block_plugin = fields.TextField(
-        default="", description="超级用户禁用插件"
+        default="", description="旧版超级用户禁用插件"
     )
-    """超级用户禁用插件"""
-    block_task = fields.TextField(default="", description="禁用被动技能")
-    """禁用被动技能"""
-    superuser_block_task = fields.TextField(default="", description="超级用户禁用被动")
-    """超级用户禁用被动"""
+    """旧版超级用户禁用插件，仅作导入群策略的来源"""
+    block_task = fields.TextField(default="", description="旧版禁用被动技能")
+    """旧版禁用被动技能，仅作导入群策略的来源"""
+    superuser_block_task = fields.TextField(
+        default="", description="旧版超级用户禁用被动"
+    )
+    """旧版超级用户禁用被动，仅作导入群策略的来源"""
     platform = fields.CharField(255, default="qq", description="所属平台")
     """所属平台"""
 
@@ -119,18 +85,23 @@ class GroupConsole(Model):
 
     @classmethod
     async def _get_plugin_modules(cls, *, default_status: bool) -> list[str]:
-        """获取默认禁用的插件模块
+        """获取进群默认状态为 default_status 的插件模块，范围为插件策略管理的插件类型
+
+        参数:
+            default_status: 进群默认状态
 
         返回:
             list[str]: 插件模块列表
         """
+        from zhenxun.services.plugin_policy import _MANAGED_PLUGIN_TYPES
+
         return cast(
             list[str],
             await PluginInfo.get_plugins_values_list(
                 "module",
                 load_status=None,
                 filter_parent=False,
-                plugin_type__in=[PluginType.NORMAL, PluginType.DEPENDANT],
+                plugin_type__in=list(_MANAGED_PLUGIN_TYPES),
                 default_status=default_status,
             ),
         )
@@ -141,45 +112,9 @@ class GroupConsole(Model):
     ) -> Self:
         """覆盖create方法"""
         group = await super().create(using_db=using_db, **kwargs)
-
-        task_modules = await cls._get_task_modules(default_status=False)
-        plugin_modules = await cls._get_plugin_modules(default_status=False)
-
-        if task_modules or plugin_modules:
-            await cls._update_modules(group, task_modules, plugin_modules, using_db)
-
         await GroupMemoryCache.upsert_from_model(group)
 
         return group
-
-    @classmethod
-    async def _update_modules(
-        cls,
-        group: Self,
-        task_modules: list[str],
-        plugin_modules: list[str],
-        using_db: BaseDBAsyncClient | None = None,
-    ) -> None:
-        """更新模块设置
-
-        参数:
-            group: 群组实例
-            task_modules: 任务模块列表
-            plugin_modules: 插件模块列表
-            using_db: 数据库连接
-        """
-        update_fields = []
-
-        if task_modules:
-            group.block_task = convert_module_format(task_modules)
-            update_fields.append("block_task")
-
-        if plugin_modules:
-            group.block_plugin = convert_module_format(plugin_modules)
-            update_fields.append("block_plugin")
-
-        if update_fields:
-            await group.save(using_db=using_db, update_fields=update_fields)
 
     @classmethod
     async def get_or_create(
@@ -192,16 +127,8 @@ class GroupConsole(Model):
         group, is_create = await super().get_or_create(
             defaults=defaults, using_db=using_db, **kwargs
         )
-        if not is_create:
-            return group, is_create
-
-        task_modules = await cls._get_task_modules(default_status=False)
-        plugin_modules = await cls._get_plugin_modules(default_status=False)
-
-        if task_modules or plugin_modules:
-            await cls._update_modules(group, task_modules, plugin_modules, using_db)
-
-        await GroupMemoryCache.upsert_from_model(group)
+        if is_create:
+            await GroupMemoryCache.upsert_from_model(group)
 
         return group, is_create
 
@@ -216,16 +143,8 @@ class GroupConsole(Model):
         group, is_create = await super().update_or_create(
             defaults=defaults, using_db=using_db, **kwargs
         )
-        if not is_create:
-            return group, is_create
-
-        task_modules = await cls._get_task_modules(default_status=False)
-        plugin_modules = await cls._get_plugin_modules(default_status=False)
-
-        if task_modules or plugin_modules:
-            await cls._update_modules(group, task_modules, plugin_modules, using_db)
-
-        await GroupMemoryCache.upsert_from_model(group)
+        if is_create:
+            await GroupMemoryCache.upsert_from_model(group)
 
         return group, is_create
 
@@ -250,23 +169,7 @@ class GroupConsole(Model):
         score += 4 if group.is_super else 0
         score += 3 if not group.status else 0
         score += 3 if group.level != 5 else 0
-        score += len(convert_module_format(group.block_plugin))
-        score += len(convert_module_format(group.superuser_block_plugin))
-        score += len(convert_module_format(group.block_task))
-        score += len(convert_module_format(group.superuser_block_task))
         return score, int(group.id or 0)
-
-    @classmethod
-    def _merge_module_field(cls, groups: list[Self], field: str) -> str:
-        modules: list[str] = []
-        seen = set()
-        for group in groups:
-            value = getattr(group, field, "") or ""
-            for module in cast(list[str], convert_module_format(value)):
-                if module not in seen:
-                    seen.add(module)
-                    modules.append(module)
-        return cast(str, convert_module_format(modules))
 
     @classmethod
     async def _deduplicate_root_group_records(cls, groups: list[Self]) -> Self:
@@ -288,16 +191,16 @@ class GroupConsole(Model):
             "level": min(g.level for g in groups),
             "is_super": any(g.is_super for g in groups),
             "group_flag": max(g.group_flag for g in groups),
-            "block_plugin": cls._merge_module_field(groups, "block_plugin"),
-            "superuser_block_plugin": cls._merge_module_field(
-                groups, "superuser_block_plugin"
-            ),
-            "block_task": cls._merge_module_field(groups, "block_task"),
-            "superuser_block_task": cls._merge_module_field(
-                groups, "superuser_block_task"
-            ),
             "platform": next((g.platform for g in newest_first if g.platform), "qq"),
         }
+        for field in (
+            "block_plugin",
+            "superuser_block_plugin",
+            "block_task",
+            "superuser_block_task",
+        ):
+            values = {getattr(g, field) or "" for g in groups}
+            merged[field] = values.pop() if len(values) == 1 else ""
 
         update_fields = []
         for field, value in merged.items():
@@ -417,37 +320,15 @@ class GroupConsole(Model):
     async def is_superuser_block_plugin(cls, group_id: str, module: str) -> bool:
         from zhenxun.services.bot_group_policy import bot_group_policy_service
 
-        scoped = await bot_group_policy_service.legacy_blocked(
-            group_id, module, forced=True
+        return bool(
+            await bot_group_policy_service.legacy_blocked(group_id, module, forced=True)
         )
-        if scoped is not None:
-            return scoped
-        if group := GroupMemoryCache.get_if_ready(scoped_group_id(group_id), None):
-            return bool(
-                group.superuser_block_plugin_set
-                and module in group.superuser_block_plugin_set
-            )
-        else:
-            return False
 
     @classmethod
     async def is_block_plugin(cls, group_id: str, module: str) -> bool:
         from zhenxun.services.bot_group_policy import bot_group_policy_service
 
-        scoped = await bot_group_policy_service.legacy_blocked(group_id, module)
-        if scoped is not None:
-            return scoped
-        if group := GroupMemoryCache.get_if_ready(scoped_group_id(group_id), None):
-            return (
-                True
-                if group.block_plugin_set and module in group.block_plugin_set
-                else bool(
-                    group.superuser_block_plugin_set
-                    and module in group.superuser_block_plugin_set
-                )
-            )
-        else:
-            return False
+        return bool(await bot_group_policy_service.legacy_blocked(group_id, module))
 
     @classmethod
     async def set_block_plugin(
@@ -497,34 +378,21 @@ class GroupConsole(Model):
     ) -> bool:
         from zhenxun.services.bot_group_policy import bot_group_policy_service
 
-        scoped = await bot_group_policy_service.legacy_blocked(
-            group_id, module, channel_id=channel_id, forced=False
+        return bool(
+            await bot_group_policy_service.legacy_blocked(
+                group_id, module, channel_id=channel_id, forced=False
+            )
         )
-        if scoped is not None:
-            return scoped
-        if group := GroupMemoryCache.get_if_ready(
-            scoped_group_id(group_id), channel_id
-        ):
-            return bool(group.block_plugin_set and module in group.block_plugin_set)
-        else:
-            return False
 
     @classmethod
     async def is_superuser_block_task(cls, group_id: str, task: str) -> bool:
         from zhenxun.services.bot_group_policy import bot_group_policy_service
 
-        scoped = await bot_group_policy_service.legacy_blocked(
-            group_id, task, kind="tasks", forced=True
-        )
-        if scoped is not None:
-            return scoped
-        if group := GroupMemoryCache.get_if_ready(scoped_group_id(group_id), None):
-            return bool(
-                group.superuser_block_task_set
-                and task in group.superuser_block_task_set
+        return bool(
+            await bot_group_policy_service.legacy_blocked(
+                group_id, task, kind="tasks", forced=True
             )
-        else:
-            return False
+        )
 
     @classmethod
     async def is_block_task(
@@ -532,30 +400,10 @@ class GroupConsole(Model):
     ) -> bool:
         from zhenxun.services.bot_group_policy import bot_group_policy_service
 
-        scoped = await bot_group_policy_service.legacy_blocked(
-            group_id, task, channel_id=channel_id, kind="tasks"
-        )
-        if scoped is not None:
-            return scoped
-        group_id = scoped_group_id(group_id)
-        if not channel_id:
-            group = GroupMemoryCache.get_if_ready(group_id, None)
-            if not group:
-                return False
-            if group.block_task_set and task in group.block_task_set:
-                return True
-            return bool(
-                group.superuser_block_task_set
-                and task in group.superuser_block_task_set
-            )
-        group = GroupMemoryCache.get_if_ready(group_id, channel_id)
-        if group and group.block_task_set and task in group.block_task_set:
-            return True
-        super_group = GroupMemoryCache.get_if_ready(group_id, None)
         return bool(
-            super_group
-            and super_group.superuser_block_task_set
-            and task in super_group.superuser_block_task_set
+            await bot_group_policy_service.legacy_blocked(
+                group_id, task, channel_id=channel_id, kind="tasks"
+            )
         )
 
     @classmethod

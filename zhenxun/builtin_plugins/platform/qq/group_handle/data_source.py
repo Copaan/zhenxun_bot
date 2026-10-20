@@ -17,7 +17,6 @@ from zhenxun.models.fg_request import FgRequest
 from zhenxun.models.group_console import GroupConsole
 from zhenxun.models.group_member_info import GroupInfoUser
 from zhenxun.models.level_user import LevelUser
-from zhenxun.models.plugin_info import PluginInfo
 from zhenxun.services.hot_query_cache import (
     invalidate_group_members,
     invalidate_member_names,
@@ -108,14 +107,6 @@ class GroupManager:
             group.group_flag = 1
             await group.save(update_fields=["group_flag"])
         else:
-            block_plugin = ""
-            if plugin_list := await PluginInfo.get_plugins(
-                load_status=None,
-                filter_parent=False,
-                default_status=False,
-            ):
-                for plugin in plugin_list:
-                    block_plugin += f"<{plugin.module},"
             group_info = await _safe_get_group_info(bot, group_id)
             if not group_info:
                 logger.warning(
@@ -131,7 +122,6 @@ class GroupManager:
                     "max_member_count": group_info["max_member_count"],
                     "member_count": group_info["member_count"],
                     "group_flag": 1,
-                    "block_plugin": block_plugin,
                     "platform": "qq",
                 },
                 update_defaults=True,
