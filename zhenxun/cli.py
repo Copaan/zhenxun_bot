@@ -80,6 +80,14 @@ def main() -> None:
             sys.stderr.write(f"错误: {error}\n")
             sys.exit(1)
     elif args[0] == "run-worker":
+        from zhenxun.utils.pythonpath import (
+            activate_dependency_layer,
+            startup_dependency_layer,
+        )
+
+        project = _ensure_project_root()
+        activate_dependency_layer(startup_dependency_layer())
+
         from zhenxun.services.launcher.lease import (
             InstanceLease,
             LeaseError,
@@ -87,7 +95,6 @@ def main() -> None:
         )
         from zhenxun.worker import WorkerReexec, record_process_crash, run_worker
 
-        project = _ensure_project_root()
         launcher = os.environ.get("ZHENXUN_LAUNCHER_PID")
         if launcher:
             identity = os.environ.get("ZHENXUN_INSTANCE_LEASE_ID")

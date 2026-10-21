@@ -325,33 +325,6 @@ def fail_pending_transaction(code: str) -> None:
         )
 
 
-def _source_changes(
-    source: dict[str, Any],
-) -> tuple[dict[str, list[str] | None], list[Path], list[Path]]:
-    """汇总源码事务对商店插件依赖与源码的变更
-
-    参数:
-        source: 源码插件事务
-
-    返回:
-        tuple: 按 store_key 的依赖声明覆盖，将移除的源码路径，将加入的源码路径
-    """
-    overrides: dict[str, list[str] | None] = {}
-    removed: list[Path] = []
-    added: list[Path] = []
-    for operation in source.get("operations", []):
-        key = str(operation.get("store_key") or "")
-        if operation.get("action") == "uninstall":
-            overrides[key] = None
-        else:
-            inputs = operation.get("dependency_inputs") or []
-            overrides[key] = [str(raw) for raw in inputs]
-            added.append(ROOT / str(operation["operation_id"]) / "new")
-        if operation.get("action") != "install":
-            removed.append(Path(str(operation["live_path"])))
-    return overrides, removed, added
-
-
 def prepare_dependency_transaction() -> bool:
     """Merge source-store dependency changes into the managed generation."""
     source = pending_transaction()
@@ -373,14 +346,7 @@ def prepare_dependency_transaction() -> bool:
             layer_packages[name] = version
     from zhenxun.services.nonebot_store.storage import merge_source_dependencies
 
-    overrides, removed_paths, added_paths = _source_changes(source)
-    result = merge_source_dependencies(
-        layer_packages,
-        overrides,
-        removed_paths,
-        added_paths,
-        source=source,
-    )
+    result = merge_source_dependencies(layer_packages, source=source)
     if isinstance(result, str):
         fail_pending_transaction(result)
         return False
@@ -543,16 +509,20 @@ __all__ = [
 
 
 async def preflight_source_requirements(
-    files: list[Path], *, allow_build: bool = False
+    files: list[Path], *, store_key: str = "", allow_build: bool = False
 ) -> dict[str, Any]:
-    """按依赖层规则预检商店插件的 requirements 文件，确认可解析且不改动核心依赖
+    """按依赖层规则预检商店插件的 requirements 文件
+
+    与其他依赖来源（包括已安装和待应用的商店插件）一起解析，确认可解析、不改动
+    核心依赖与已安装的 ORM 和数据库驱动。
 
     参数:
         files: 插件源码中的 requirements 文件
+        store_key: 商店插件标识，该插件原有的依赖声明被本次声明替换
         allow_build: 是否允许解析时构建源码包读取依赖信息
 
     返回:
-        dict[str, Any]: 解析出的包版本、包变化与是否需要源码构建
+        dict[str, Any]: 依赖层中新增或变化的包版本、包变化与是否需要源码构建
 
     异常:
         DependencyAnalysisError: 依赖声明无效、环境漂移、与核心依赖冲突、需要
@@ -560,8 +530,13 @@ async def preflight_source_requirements(
     """
     from zhenxun.services.nonebot_store import dependencies
     from zhenxun.services.nonebot_store.dependencies import DependencyAnalysisError
-    from zhenxun.services.nonebot_store.manual import manual_requirements
-    from zhenxun.services.nonebot_store.policy import guard_orm_changes
+    from zhenxun.services.nonebot_store.environment import capture_environment
+    from zhenxun.services.nonebot_store.storage import (
+        pending_transaction as layer_transaction,
+    )
+    from zhenxun.services.plugin_store.plugin_store_receipts import (
+        receipt_dependency_inputs,
+    )
 
     requirements = dependencies.read_requirement_files(files)
     if not requirements:
@@ -569,58 +544,57 @@ async def preflight_source_requirements(
             "resolved_packages": {},
             "package_changes": {"added": [], "changed": [], "removed": []},
             "candidate_inputs": [],
+            "source_build_required": False,
         }
     if dependencies.environment_drift():
         raise DependencyAnalysisError("environment_drift")
-    current = dependencies.installed_inventory()
-    core = dependencies.protected_core()
-    candidate_inputs = list(requirements)
-    requirements.extend(
-        raw
-        for values in manual_requirements(dependencies.load_manifest()).values()
-        for raw in values
+    tools = sorted(
+        {dependencies.parse_requirement(raw).name for raw in requirements}
+        & dependencies.FORBIDDEN_LAYER_PACKAGES
     )
-    resolved, error = await dependencies._compile(
-        requirements, current, wheels_only=False, allow_build=allow_build
-    )
-    if resolved is None:
-        resolved, error = await dependencies._compile(
-            requirements, core, wheels_only=False, allow_build=allow_build
-        )
-    if resolved is None:
-        free, _ = await dependencies._compile(
-            requirements, {}, wheels_only=False, allow_build=allow_build
-        )
-        raise DependencyAnalysisError(
-            "dependency_resolution_failed"
-            if free is None
-            else "core_dependency_conflict",
-            error,
-        )
-    for name, version in resolved.items():
-        if name in core and core[name] != version:
-            raise DependencyAnalysisError("core_dependency_conflict")
-    changes = dependencies._package_changes(resolved, current)
-    changed = {item["name"] for item in [*changes["added"], *changes["changed"]]}
-    tools = sorted(changed & dependencies.FORBIDDEN_LAYER_PACKAGES)
     if tools:
         raise DependencyAnalysisError(
             "dependency_requirement_unsupported", "、".join(tools)
         )
-    guard_orm_changes(current, {**current, **resolved})
-    if allow_build:
-        source_build_required = True
-    else:
-        wheel_resolved, _ = await dependencies._compile(
-            requirements,
-            resolved,
-            wheels_only=False,
-            restricted_packages=tuple(sorted(resolved)),
+    overrides: dict[str, list[str] | None] = {}
+    for operation in (pending_transaction() or {}).get("operations", []):
+        key = str(operation.get("store_key") or "")
+        overrides[key] = (
+            None
+            if operation.get("action") == "uninstall"
+            else [str(raw) for raw in operation.get("dependency_inputs") or []]
         )
-        source_build_required = wheel_resolved is None
+    if store_key:
+        overrides[store_key] = list(requirements)
+    pending = layer_transaction() or {}
+    manifest = (
+        pending.get("target_manifest")
+        if pending.get("state") == "pending_restart"
+        else None
+    ) or dependencies.load_manifest()
+    result = await dependencies.resolve_layer(
+        requirements,
+        snapshot=capture_environment(),
+        manifest=manifest,
+        sources=receipt_dependency_inputs(overrides),
+        allow_build=allow_build,
+    )
+    changes = [
+        item
+        for item in result["changes"]
+        if item["to"] and item["name"] in result["resolved"]
+    ]
     return {
-        "resolved_packages": resolved,
-        "package_changes": changes,
-        "candidate_inputs": candidate_inputs,
-        "source_build_required": source_build_required,
+        "resolved_packages": {item["name"]: item["to"] for item in changes},
+        "package_changes": {
+            "added": [
+                {"name": item["name"], "version": item["to"]}
+                for item in changes
+                if not item["from"]
+            ],
+            "changed": [item for item in changes if item["from"]],
+            "removed": [],
+        },
+        "candidate_inputs": list(requirements),
+        "source_build_required": result["source_build_required"],
     }

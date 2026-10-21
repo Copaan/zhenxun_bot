@@ -3,7 +3,7 @@ from __future__ import annotations
 import secrets
 import time
 
-from jose import ExpiredSignatureError, JWTError, jwt
+import jwt
 
 SESSION_VERSION = 2
 SESSION_SECONDS = 6 * 60 * 60
@@ -34,7 +34,7 @@ def issue_token(secret: str, subject: str, *, claims=None, now=None) -> str:
 def decode_token(token: str, secret: str, *, now=None) -> dict:
     """Verify the common session contract without loading a running bot."""
     if not isinstance(token, str) or not token or len(token) > 16384 or not secret:
-        raise JWTError("invalid session")
+        raise jwt.InvalidTokenError("invalid session")
     value = jwt.decode(
         compact_token(token),
         secret,
@@ -57,9 +57,9 @@ def decode_token(token: str, secret: str, *, now=None) -> dict:
         or value["exp"] - value["iat"] != SESSION_SECONDS
         or value["iat"] > current + 30
     ):
-        raise JWTError("invalid session contract")
+        raise jwt.InvalidTokenError("invalid session contract")
     if current >= value["exp"]:
-        raise ExpiredSignatureError("session expired")
+        raise jwt.ExpiredSignatureError("session expired")
     return value
 
 

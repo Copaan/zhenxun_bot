@@ -108,7 +108,7 @@ def status() -> dict:
     返回:
         dict: 状态，没有记录时 state 为 idle
     """
-    from . import deps
+    from . import restore_deps
 
     request = _load()
     if request is None:
@@ -117,7 +117,7 @@ def status() -> dict:
     if report.get("revision"):
         request["dependencies"] = {
             **report,
-            "layer": deps.layer_status(report["revision"]),
+            "layer": restore_deps.layer_status(report["revision"]),
         }
     return {
         **request,
@@ -528,14 +528,14 @@ def _write_files(request: dict, root: Path, files: _Files) -> None:
 def _apply(request: dict, root: Path) -> None:
     from zhenxun.services.nonebot_store.storage import clear_pending_transaction
 
-    from . import backup, deps
+    from . import backup, restore_deps
 
     try:
         if request["kind"] == "restore":
             saved = json.loads((PACKAGE / backup.DEPENDENCIES).read_text("utf-8"))
             files = PACKAGE / "files" if "plugins" in request["categories"] else None
             report = asyncio.run(
-                deps.stage_restore(saved, request["skip_failed"], files)
+                restore_deps.stage_restore(saved, request["skip_failed"], files)
             )
             _save(request, dependencies=report)
     except Exception as error:
@@ -544,7 +544,7 @@ def _apply(request: dict, root: Path) -> None:
             state="failed",
             error=f"依赖无法安装：{_message(error)}",
             error_code=getattr(error, "code", None),
-            error_detail=deps.describe(getattr(error, "details", None)),
+            error_detail=restore_deps.describe(getattr(error, "details", None)),
         )
         return
     files = _Files(root)

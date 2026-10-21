@@ -275,57 +275,70 @@ def _apply_proxy(environment):
     return environment
 
 
-def resolver_failure(text):
-    """Classify before redaction; never infer a missing wheel from any failure."""
-    lowered = text.lower()
-    code = "dependency_resolution_failed"
-    for needles, candidate in (
+_ENVIRONMENT_FAILURES = tuple(
+    (re.compile(pattern), code)
+    for pattern, code in (
         (
-            (
-                "cannot be used with",
-                "unexpected argument",
-                "unrecognized option",
-                "unknown option",
-            ),
+            r"cannot be used with|unexpected argument|unrecognized option"
+            r"|unknown option",
             "dependency_resolver_configuration",
         ),
-        (("no space left", "disk full"), "dependency_disk_full"),
-        (("407", "proxy authentication"), "dependency_proxy_auth"),
-        (("401", "403", "unauthorized", "forbidden"), "dependency_index_auth"),
-        (("certificate", "tls", "ssl"), "dependency_tls"),
+        (r"no space left|disk full", "dependency_disk_full"),
         (
-            (
-                "failed to connect",
-                "connection",
-                "timed out",
-                "dns",
-                "failed to fetch",
-                "network",
-            ),
+            r"proxy authentication|\b407 proxy|\bstatus(?: code)?:? 407\b",
+            "dependency_proxy_auth",
+        ),
+        (
+            r"\bunauthorized\b|\bforbidden\b|\bstatus(?: code)?:? 40[13]\b",
+            "dependency_index_auth",
+        ),
+        (r"\bcertificate\b|\btls\b|\bssl\b", "dependency_tls"),
+        (
+            r"failed to connect|tcp connect error|failed to fetch"
+            r"|connection (?:was )?(?:forcibly )?(?:refused|reset|aborted|closed)"
+            r"|\btimed out\b|\bdns error\b|failed to lookup address"
+            r"|error sending request|request failed after"
+            r"|network (?:is )?unreachable",
             "dependency_network",
         ),
+    )
+)
+_RESOLUTION_FAILURES = tuple(
+    (re.compile(pattern), code)
+    for pattern, code in (
+        (r"requires-python|python version|requires python", "dependency_python"),
         (
-            ("requires-python", "python version", "requires python"),
-            "dependency_python",
-        ),
-        (
-            (
-                "no wheels",
-                "no usable wheels",
-                "source distribution",
-                "building is disabled",
-                "building source distributions is disabled",
-            ),
+            r"no wheels|no usable wheels|source distribution"
+            r"|building (?:source distributions )?is disabled",
             "dependency_source_required",
         ),
-        (
-            ("no solution", "incompatible", "conflict", "unsatisfiable"),
-            "dependency_conflict",
-        ),
-    ):
-        if any(needle in lowered for needle in needles):
-            code = candidate
-            break
+        (r"no solution|incompatible|conflict|unsatisfiable", "dependency_conflict"),
+    )
+)
+
+
+def resolver_failure(text):
+    """对 uv 解析失败输出分类并脱敏
+
+    输出包含解析结论（No solution found / unsatisfiable）时只按 Python 版本、
+    缺少 wheel、依赖冲突分类，其中出现的包名不会被当作网络或证书错误；
+    否则先匹配配置、磁盘、代理、索引认证、TLS、网络错误。
+
+    参数:
+        text: uv 输出
+
+    返回:
+        dict: code 错误码、detail 脱敏后的输出、
+            source_build_available 是否可尝试源码构建
+    """
+    lowered = text.lower()
+    rules = _RESOLUTION_FAILURES
+    if not re.search(r"no solution found|unsatisfiable", lowered):
+        rules = _ENVIRONMENT_FAILURES + _RESOLUTION_FAILURES
+    code = next(
+        (code for pattern, code in rules if pattern.search(lowered)),
+        "dependency_resolution_failed",
+    )
     from zhenxun.services.nonebot_store.dependencies import safe_process_error
 
     detail = re.sub(r"https?://[^\s<>]+", "<package-source>", text)

@@ -97,13 +97,24 @@ def retained_conflicts(snapshot, affected) -> list[dict]:
     ]
 
 
-def external_requirements(snapshot, scope) -> list[str]:
+def external_requirements(snapshot, scope, replaced=frozenset()) -> list[str]:
+    """解析范围外的来源对范围内包的依赖声明，已存在的冲突不计入
+
+    参数:
+        snapshot: 环境快照
+        scope: 解析范围内的包
+        replaced: 声明不再参与解析的来源
+
+    返回:
+        list[str]: 依赖声明
+    """
     conflicts = {(i["owner"], i["requirement"]) for i in snapshot.conflicts}
     return [
         item["requirement"]
         for item in snapshot.declarations
         if item["name"] in scope
         and item["owner"] not in scope
+        and item["owner"] not in replaced
         and not item["owner"].startswith("manual:")
         and (item["owner"], item["requirement"]) not in conflicts
     ]

@@ -9,7 +9,7 @@ import time
 from typing import Literal
 
 from fastapi import Header, HTTPException, Request
-from jose import JWTError
+import jwt
 
 from zhenxun.configs.config import BotConfig, Config
 from zhenxun.utils.webui_session import (
@@ -109,7 +109,7 @@ class SetupAccessManager:
             self._prune_sessions()
             try:
                 claims = decode_token(token or "", self.secret)
-            except JWTError:
+            except jwt.PyJWTError:
                 raise HTTPException(401, detail="首次配置会话无效或已过期。") from None
             token_digest = claims["sid"]
             session = self._sessions.get(token_digest)

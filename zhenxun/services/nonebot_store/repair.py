@@ -13,6 +13,7 @@ from .dependencies import (
     _compile,
     environment_report,
     protected_core,
+    shared_dependencies,
 )
 from .environment import capture_environment
 
@@ -60,16 +61,75 @@ def select_repair_groups(preview: dict, selected: list[str] | None) -> dict:
     }
 
 
+def _layer_rebuild_preview(report: dict[str, Any], snapshot) -> dict[str, Any]:
+    """依赖层内容与清单不一致时，按清单重建依赖层的修复预览
+
+    与清单一致的包沿用当前依赖层，其余包按清单记录的版本重新安装，清单以外的
+    包不再保留。
+
+    参数:
+        report: 依赖环境报告
+        snapshot: 当前环境快照
+
+    返回:
+        dict[str, Any]: 只含一个重建分组的修复预览
+    """
+    from .policy import retained_conflicts
+
+    mismatch = report["layer_mismatch"]
+    names = sorted(item["name"] for item in mismatch)
+    changes = [
+        {
+            "name": item["name"],
+            "from": item["actual"],
+            "to": item["recorded"],
+            "source": "active_generation",
+            "requirements": [],
+        }
+        for item in mismatch
+    ]
+    group = {
+        "id": sha256("\n".join(names).encode()).hexdigest()[:16],
+        "roots": names,
+        "status": "repairable",
+        "changes": changes,
+        "package_updates": {},
+        "issues": mismatch,
+        "source_build_required": True,
+    }
+    return {
+        "base_manifest": snapshot.manifest,
+        "bound_conflicts": retained_conflicts(snapshot, set()),
+        "groups": [group],
+        "issues": [*mismatch, *report["requirement_conflicts"]],
+        "changes": changes,
+        "fingerprint": report["fingerprint"],
+        "mode": "layer",
+    }
+
+
 async def preview_layer_repair(report: dict[str, Any]) -> dict[str, Any]:
-    """Solve connected repair components, keeping unrelated versions fixed."""
+    """按冲突分组生成依赖层修复预览，分组外的包版本保持不变
+
+    依赖层内容与清单不一致时，只给出按清单重建依赖层的分组。
+
+    参数:
+        report: 依赖环境报告
+
+    返回:
+        dict[str, Any]: 修复预览
+    """
     snapshot = capture_environment()
     from .policy import ORM_PACKAGES, guard_orm_changes, retained_conflicts
 
     if environment_report(snapshot=snapshot)["fingerprint"] != report["fingerprint"]:
         raise DependencyAnalysisError("environment_analysis_stale")
+    if report["layer_mismatch"]:
+        return _layer_rebuild_preview(report, snapshot)
     manifest, current = snapshot.manifest, snapshot.versions
     base = {name: dist.version for name, dist in snapshot.base.items()}
     core = protected_core()
+    floors = shared_dependencies()
     plugins = {name for name in current if name.startswith("nonebot-plugin-")}
     plugins.update(
         canonicalize_name(p["project_link"]) for p in manifest["plugins"].values()
@@ -143,7 +203,11 @@ async def preview_layer_repair(report: dict[str, Any]) -> dict[str, Any]:
             }
             constraints.update(fixed)
             resolved, detail = await _compile(
-                inputs, constraints, wheels_only=True, preferences=current
+                inputs,
+                constraints,
+                wheels_only=True,
+                preferences=current,
+                floors=floors,
             )
             group["source_build_required"] = False
             if resolved is None:
@@ -152,6 +216,7 @@ async def preview_layer_repair(report: dict[str, Any]) -> dict[str, Any]:
                     constraints,
                     wheels_only=False,
                     preferences=current,
+                    floors=floors,
                 )
                 if resolved is not None:
                     group["source_build_required"] = True

@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from packaging.requirements import Requirement
+from .storage import transaction_lock
 
 
 def normalize_requirements(values: list[str], action: str) -> dict[str, list[str]]:
@@ -72,8 +72,9 @@ async def preview_manual_dependencies(
 ) -> dict[str, Any]:
     """生成手动依赖的安装或卸载计划，不安装也不修改当前清单
 
-    恢复备份时 restore 为 True：解析允许构建源码包，ORM 与数据库驱动中不属于
-    核心依赖的包可以随计划安装或变更。
+    安装时与其他依赖来源一起解析；卸载时移除不再被其他来源声明的包，以及只为它们
+    安装、未被源码插件导入的子依赖。恢复备份时 restore 为 True：解析允许构建源码包，
+    ORM 与数据库驱动中不属于核心依赖的包可以随计划安装或变更。
 
     参数:
         values: 依赖声明
@@ -90,23 +91,14 @@ async def preview_manual_dependencies(
     )
 
     from .dependencies import (
-        FORBIDDEN_LAYER_PACKAGES,
         SOLVER_POLICY_VERSION,
         DependencyAnalysisError,
-        _compile,
         environment_report,
-        project_requirements,
         protected_core,
+        resolve_layer,
     )
-    from .environment import capture_environment, dependency_roots, released_packages
-
-    async def resolve(requirements, constraints, **options):
-        active = [
-            raw
-            for raw in requirements
-            if not Requirement(raw).marker or Requirement(raw).marker.evaluate()
-        ]
-        return await _compile(active, constraints, **options) if active else ({}, "")
+    from .environment import capture_environment, released_packages
+    from .policy import guard_orm_request, retained_conflicts, summary_revision
 
     requested = normalize_requirements(values, action)
     snapshot = capture_environment()
@@ -115,54 +107,40 @@ async def preview_manual_dependencies(
         raise DependencyAnalysisError("dependency_environment_unconfirmed")
     if report["layer_mismatch"] or report["immutable_drift"]:
         raise DependencyAnalysisError("dependency_environment_repair_required")
-    from .policy import (
-        ORM_PACKAGES,
-        external_requirements,
-        guard_orm_changes,
-        guard_orm_request,
-        retained_conflicts,
-        scoped_roots,
-        summary_revision,
-    )
-
     if not restore:
         guard_orm_request(requested, snapshot.versions)
     target = deepcopy(manifest if manifest is not None else snapshot.manifest)
     original = deepcopy(target)
     roots = manual_requirements(target)
+    current = snapshot.versions
+    base = {name: dist.version for name, dist in snapshot.base.items()}
+    retained = []
+    diagnostic = ""
+    source_build_required = False
     if action == "install":
         roots.update(requested)
+        target["manual_requirements"] = roots
+        result = await resolve_layer(
+            [raw for items in requested.values() for raw in items],
+            snapshot=snapshot,
+            manifest=target,
+            sources=receipt_dependency_inputs(),
+            allow_build=restore,
+            restore=restore,
+            preferences=preferences,
+        )
+        target["packages"] = result["packages"]
+        source_build_required = result["source_build_required"]
+        diagnostic = result["diagnostic"]
     else:
         missing = sorted(set(requested) - set(roots))
         if missing:
             raise DependencyAnalysisError("dependency_not_managed", details=missing)
         for name in requested:
             roots.pop(name)
-    target["manual_requirements"] = roots
-    packages = target.setdefault("packages", {})
-    current = snapshot.versions
-    baseline = {**current, **{name: info["version"] for name, info in packages.items()}}
-    base = {name: dist.version for name, dist in snapshot.base.items()}
-    core = protected_core()
-    frozen = {
-        **core,
-        **{
-            name: baseline[name]
-            for name in ORM_PACKAGES
-            if name in baseline and not restore
-        },
-    }
-    preferred = {**(preferences or {}), **baseline}
-    plugin_roots = [
-        raw
-        for owner, raw in dependency_roots(target)
-        if owner != "pyproject.toml" and not owner.startswith("manual:")
-    ]
-    root_inputs = [raw for items in roots.values() for raw in items]
-    retained = []
-    scope = set(requested)
-    removing: set[str] = set()
-    if action == "uninstall":
+        target["manual_requirements"] = roots
+        packages = target.setdefault("packages", {})
+        core = protected_core()
         for name in requested:
             owners = sorted(
                 {
@@ -176,77 +154,14 @@ async def preview_manual_dependencies(
             )
             if owners:
                 retained.append(
-                    {"name": name, "owners": owners, "version": baseline.get(name)}
+                    {"name": name, "owners": owners, "version": current.get(name)}
                 )
-            else:
-                packages.pop(name, None)
-                removing.add(name)
-                if name in base:
-                    retained.append(
-                        {"name": name, "owners": ["base"], "version": base[name]}
-                    )
-        candidate_inputs = root_inputs
-    else:
-        candidate_inputs = [raw for items in requested.values() for raw in items]
-        probe, diagnostic = await resolve(
-            candidate_inputs,
-            frozen,
-            wheels_only=False,
-            preferences=preferred,
-            allow_build=restore,
-        )
-        if probe is None:
-            raise DependencyAnalysisError("dependency_resolution_failed", diagnostic)
-        scope.update(probe)
-    external = external_requirements(snapshot, scope)
-    requirements = [
-        *scoped_roots(project_requirements(), scope),
-        *scoped_roots(plugin_roots, scope),
-        *scoped_roots(root_inputs, scope),
-        *external,
-    ]
-    constraints = {**baseline, **frozen}
-    for name in removing:
-        constraints.pop(name, None)
-        if name in base:
-            constraints[name] = base[name]
-    scoped = {
-        **{name: version for name, version in constraints.items() if name not in scope},
-        **frozen,
-        **{name: base[name] for name in removing if name in base},
-    }
-    resolved, diagnostic = await resolve(
-        requirements,
-        constraints,
-        wheels_only=False,
-        preferences=preferred,
-        allow_build=restore,
-    )
-    if resolved is None:
-        resolved, diagnostic = await resolve(
-            requirements,
-            scoped,
-            wheels_only=False,
-            preferences=preferred,
-            allow_build=restore,
-        )
-    if resolved is None:
-        raise DependencyAnalysisError("dependency_resolution_failed", diagnostic)
-    for name, version in resolved.items():
-        if name in baseline and name not in scope and version != baseline[name]:
-            raise DependencyAnalysisError("dependency_resolution_scope_changed", name)
-        if name in core:
-            if version != core[name]:
-                raise DependencyAnalysisError("core_dependency_conflict", name)
-            continue
-        if name in FORBIDDEN_LAYER_PACKAGES:
-            continue
-        if name in scope or name not in baseline:
-            if base.get(name) == version:
-                packages.pop(name, None)
-            else:
-                packages[name] = {**packages.get(name, {}), "version": version}
-    if action == "uninstall":
+                continue
+            packages.pop(name, None)
+            if name in base:
+                retained.append(
+                    {"name": name, "owners": ["base"], "version": base[name]}
+                )
         try:
             sources = receipt_dependency_inputs()
             released, imported = released_packages(
@@ -257,37 +172,27 @@ async def preview_manual_dependencies(
         for name in released:
             packages.pop(name, None)
         retained.extend(imported)
-    wheels, wheel_error = (
-        await resolve(
-            [f"{name}=={item['version']}" for name, item in packages.items()],
-            {},
-            wheels_only=True,
-            no_dependencies=True,
-        )
-        if packages
-        else ({}, "")
+    effective = {
+        **base,
+        **{name: info["version"] for name, info in target["packages"].items()},
+    }
+    changes = [
+        {
+            "name": name,
+            "from": current.get(name),
+            "to": effective.get(name),
+            "source": "managed"
+            if name in target["packages"]
+            else "base"
+            if effective.get(name)
+            else "removed",
+        }
+        for name in sorted(set(current) | set(effective))
+        if current.get(name) != effective.get(name)
+    ]
+    target["dependency_warnings"] = retained_conflicts(
+        snapshot, {item["name"] for item in changes}
     )
-    changes = []
-    effective = {**base, **{name: info["version"] for name, info in packages.items()}}
-    if not restore:
-        guard_orm_changes(current, effective)
-    for name in sorted(set(baseline) | set(effective)):
-        before, after = baseline.get(name), effective.get(name)
-        if before != after:
-            changes.append(
-                {
-                    "name": name,
-                    "from": before,
-                    "to": after,
-                    "source": "managed"
-                    if name in packages
-                    else "base"
-                    if after
-                    else "removed",
-                }
-            )
-    affected = {item["name"] for item in changes}
-    target["dependency_warnings"] = retained_conflicts(snapshot, affected)
     plan = {
         "target_manifest": target,
         "fingerprint": report["fingerprint"],
@@ -296,8 +201,8 @@ async def preview_manual_dependencies(
         "changes": changes,
         "retained": retained,
         "manual_requirements": roots,
-        "source_build_required": wheels is None,
-        "diagnostic": wheel_error if wheels is None else "",
+        "source_build_required": source_build_required,
+        "diagnostic": diagnostic,
         "no_change": target == original,
         "blocked_reasons": [],
         "remaining_conflicts": target["dependency_warnings"],
@@ -311,38 +216,104 @@ async def preview_manual_dependencies(
     return plan
 
 
+@transaction_lock()
 def stage_requirement_files(files: list[Path]) -> bool:
-    """将插件 requirements 文件登记为手动依赖，并写入待应用的依赖层事务
+    """按插件 requirements 文件更新依赖声明，写入待应用的依赖层事务
 
-    依赖层由启动器在下次启动 worker 前构建，核心虚拟环境不会被修改。
+    每个文件的依赖记在该文件路径名下，替换它此前的声明；文件已删除或为空时只移除
+    声明，已安装的包保留。依赖不变且没有待应用事务时直接保存清单；否则由启动器在
+    下次启动 worker 前构建依赖层，核心虚拟环境不会被修改。
 
     参数:
-        files: requirements 文件列表
+        files: requirements 文件，路径相对于项目根目录
 
     返回:
         bool: 是否写入了待应用的事务
     """
     import asyncio
 
-    from .dependencies import DependencyAnalysisError, read_requirement_files
-    from .storage import load_manifest, pending_transaction
+    from zhenxun.services.plugin_store.plugin_store_receipts import (
+        receipt_dependency_inputs,
+    )
 
-    requirements = read_requirement_files(files)
-    if not requirements:
-        return False
+    from .dependencies import (
+        DependencyAnalysisError,
+        read_requirement_files,
+        resolve_layer,
+    )
+    from .environment import capture_environment
+    from .policy import retained_conflicts
+    from .storage import (
+        defer_transaction,
+        draft_transaction,
+        load_manifest,
+        pending_transaction,
+        save_manifest,
+        utc_now,
+    )
+
     pending = pending_transaction()
     if pending and pending.get("state") != "pending_restart":
         raise DependencyAnalysisError("dependency_transaction_pending")
-    plan = asyncio.run(
-        preview_manual_dependencies(
-            requirements,
-            "install",
-            manifest=(pending or {}).get("target_manifest") or load_manifest(),
+    original = (pending or {}).get("target_manifest") or load_manifest()
+    target = deepcopy(original)
+    declared = target.setdefault("plugin_requirements", {})
+    owners = {path.as_posix() for path in files}
+    requests = []
+    for path in files:
+        values = read_requirement_files([path]) if path.is_file() else []
+        if values:
+            declared[path.as_posix()] = values
+            requests.extend(values)
+        else:
+            declared.pop(path.as_posix(), None)
+    if target == original:
+        return False
+    snapshot = capture_environment()
+    if requests:
+        result = asyncio.run(
+            resolve_layer(
+                requests,
+                snapshot=snapshot,
+                manifest=target,
+                sources=receipt_dependency_inputs(),
+                replaced=frozenset(owners),
+            )
         )
+        if result["source_build_required"]:
+            raise DependencyAnalysisError(
+                "source_build_confirmation_required", result["diagnostic"]
+            )
+        target["packages"] = result["packages"]
+    before, after = original.get("packages", {}), target.get("packages", {})
+    if not pending and before == after:
+        save_manifest(target)
+        return False
+    changed = {
+        name for name in set(before) | set(after) if before.get(name) != after.get(name)
+    }
+    transaction = draft_transaction(
+        pending,
+        target,
+        action="plugin_requirements",
+        remaining_conflicts=retained_conflicts(snapshot, changed),
     )
-    return stage_plan(plan, requirements, pending)
+    transaction["operations"].append(
+        {
+            "kind": "plugin_requirements",
+            "action": "install",
+            "name": ", ".join(sorted(owners)),
+            "created_at": utc_now(),
+            "target_manifest": deepcopy(target),
+            "database_migration_possible": False,
+            "source_build_confirmed": False,
+        }
+    )
+    defer_transaction(transaction)
+    return True
 
 
+@transaction_lock()
 def stage_plan(
     plan: dict[str, Any],
     requirements: list[str],

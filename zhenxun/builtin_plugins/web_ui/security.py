@@ -8,8 +8,7 @@ import time
 from typing import Any
 
 from fastapi.staticfiles import StaticFiles
-from jose import JWTError
-from jose.exceptions import ExpiredSignatureError
+import jwt
 from starlette.types import Scope
 from starlette.websockets import WebSocket, WebSocketDisconnect, WebSocketState
 
@@ -98,9 +97,9 @@ def decode_access_token_status(
         from zhenxun.utils.webui_session import decode_token
 
         payload = decode_token(token, secret)
-    except ExpiredSignatureError:
+    except jwt.ExpiredSignatureError:
         return None, "expired"
-    except (JWTError, TypeError, ValueError):
+    except (jwt.PyJWTError, TypeError, ValueError):
         return None, "invalid"
     username = payload.get("sub")
     if not username or str(username) != str(configured_username):

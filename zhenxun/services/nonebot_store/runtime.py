@@ -10,7 +10,6 @@ import json
 import os
 from pathlib import Path
 import shutil
-import site
 import subprocess
 import sys
 import tempfile
@@ -20,7 +19,7 @@ from typing import Any
 
 from packaging.utils import canonicalize_name
 
-from zhenxun.utils.pythonpath import subprocess_pythonpath
+from zhenxun.utils.pythonpath import activate_dependency_layer, subprocess_pythonpath
 
 from .dependencies import protected_core, safe_process_error
 from .storage import (
@@ -37,6 +36,7 @@ from .storage import (
     remove_generation,
     remove_orm_backups,
     save_manifest,
+    transaction_lock,
     utc_now,
     write_json,
 )
@@ -60,6 +60,126 @@ def recovery_required() -> bool:
     return (pending_transaction() or {}).get("state") == "recovery_required"
 
 
+def environment_signature() -> dict[str, str]:
+    """当前解释器与核心虚拟环境的特征，依赖层按它判断是否需要重新同步
+
+    返回:
+        dict[str, str]: python 为解释器的首选 wheel 标签，base 为核心虚拟环境
+            site-packages 中全部包版本的摘要
+    """
+    from importlib import metadata
+    import sysconfig
+
+    from packaging.tags import sys_tags
+
+    paths = sorted({sysconfig.get_path("purelib"), sysconfig.get_path("platlib")})
+    packages = sorted(
+        f"{canonicalize_name(dist.name)}=={dist.version}"
+        for dist in metadata.distributions(path=paths)
+        if dist.name
+    )
+    return {
+        "python": str(next(iter(sys_tags()))),
+        "base": sha256("\n".join(packages).encode()).hexdigest(),
+    }
+
+
+def environment_resync_required() -> bool:
+    """依赖层记录的解释器或核心虚拟环境与当前不一致，且没有待处理的事务
+
+    同一环境下自动同步已失败过时不再重复尝试。
+
+    返回:
+        bool: 是否需要执行 stage_environment_resync
+    """
+    from .storage import settled_transactions
+
+    manifest = load_manifest()
+    if not isinstance(manifest.get("active_generation"), int) or pending_transaction():
+        return False
+    current = environment_signature()
+    if manifest.get("environment") == current:
+        return False
+    latest = next(iter(settled_transactions()), {})
+    return not (
+        latest.get("resync_environment") == current and latest.get("state") == "failed"
+    )
+
+
+@transaction_lock()
+def stage_environment_resync() -> bool:
+    """按当前解释器与核心虚拟环境重新同步依赖层
+
+    核心虚拟环境已提供不低于依赖层版本、且满足全部依赖声明的包从依赖层移除；
+    解释器变化时按原版本重新安装依赖层。需要重建时写入待应用的依赖层事务，
+    由启动器构建并在 worker 启动后验证；否则只更新清单中记录的环境。
+
+    返回:
+        bool: 是否写入了待应用的依赖层事务
+    """
+    from packaging.requirements import Requirement
+    from packaging.version import InvalidVersion, Version
+
+    from .environment import capture_environment
+    from .policy import ORM_PACKAGES
+    from .storage import defer_transaction, draft_transaction
+
+    manifest = load_manifest()
+    if not isinstance(manifest.get("active_generation"), int) or pending_transaction():
+        return False
+    current = environment_signature()
+    recorded = manifest.get("environment") or {}
+    if recorded == current:
+        return False
+    snapshot = capture_environment(manifest=manifest)
+    target = deepcopy(manifest)
+    dropped = []
+    for name, dist in snapshot.layer.items():
+        base = snapshot.base.get(name)
+        if base is None or name in ORM_PACKAGES or name not in target["packages"]:
+            continue
+        requirements = [
+            Requirement(item["requirement"])
+            for item in snapshot.declarations
+            if item["name"] == name
+        ]
+        try:
+            newer = Version(base.version) >= Version(dist.version)
+        except InvalidVersion:
+            continue
+        if newer and all(
+            not requirement.url
+            and requirement.specifier.contains(base.version, prereleases=True)
+            for requirement in requirements
+        ):
+            target["packages"].pop(name)
+            dropped.append(name)
+    if not dropped and recorded.get("python", current["python"]) == current["python"]:
+        manifest["environment"] = current
+        save_manifest(manifest)
+        return False
+    transaction = draft_transaction(
+        None,
+        target,
+        action="environment_repair",
+        resync_environment=current,
+        remaining_conflicts=deepcopy(snapshot.conflicts),
+        source_build_confirmed=True,
+        operations=[
+            {
+                "kind": "environment_repair",
+                "name": "依赖层同步：解释器或核心依赖已变化",
+                "released": sorted(dropped),
+                "target_manifest": deepcopy(target),
+                "created_at": utc_now(),
+            }
+        ],
+    )
+    defer_transaction(transaction)
+    return True
+
+
+@transaction_lock()
 def rollback_for_launcher(failed: list[dict[str, Any]] | None = None) -> bool:
     """回滚未通过启动验证的依赖层事务，回滚失败时保留为待恢复状态
 
@@ -98,24 +218,7 @@ def _active_path(manifest: dict[str, Any] | None = None) -> Path | None:
 
 def activate_current_generation() -> Path | None:
     """Put exactly one managed dependency generation at the front of sys.path."""
-    layer_root = LAYER_ROOT.resolve()
-    sys.path[:] = [item for item in sys.path if not _is_layer_path(item, layer_root)]
-    path = _active_path()
-    if path is not None:
-        sys.path.insert(0, str(path))
-        # The layer is already first on sys.path, so addsitedir only processes
-        # its .pth files (e.g. pywin32, namespace packages).
-        site.addsitedir(str(path))
-        importlib.invalidate_caches()
-    return path
-
-
-def _is_layer_path(value: str, layer_root: Path) -> bool:
-    try:
-        Path(value).resolve().relative_to(layer_root)
-    except (OSError, ValueError):
-        return False
-    return True
+    return activate_dependency_layer(_active_path())
 
 
 def referenced_generations() -> set[int]:
@@ -193,9 +296,73 @@ def layer_digest(root: Path) -> str:
     return digest.hexdigest()
 
 
+def _reusable_distribution(distribution) -> list[tuple[Path, Path]] | None:
+    """列出当前依赖层中可以直接沿用到新依赖层的包文件
+
+    包的 wheel 标签不适用于当前解释器、安装记录中有依赖层以外或已缺失的文件时
+    不能沿用。
+
+    参数:
+        distribution: 当前依赖层中的包
+
+    返回:
+        list[tuple[Path, Path]] | None: (源文件, 相对依赖层的路径) 列表，不能沿用时
+            为 None
+    """
+    from packaging.tags import parse_tag, sys_tags
+
+    from .environment import _recorded_files
+
+    tags = {
+        tag
+        for line in (distribution.read_text("WHEEL") or "").splitlines()
+        if line.startswith("Tag:")
+        for tag in parse_tag(line.partition(":")[2].strip())
+    }
+    if not tags or tags.isdisjoint(sys_tags()):
+        return None
+    root = Path(distribution.locate_file("")).resolve()
+    files = []
+    for file in _recorded_files(distribution):
+        if "__pycache__" in file.parts:
+            continue
+        source = Path(distribution.locate_file(file)).resolve()
+        if not source.is_relative_to(root) or not source.is_file():
+            return None
+        files.append((source, source.relative_to(root)))
+    return files
+
+
+def _link_files(files: list[tuple[Path, Path]], staging: Path) -> None:
+    """把文件硬链接到候选依赖层，无法硬链接时复制
+
+    参数:
+        files: (源文件, 相对依赖层的路径) 列表
+        staging: 候选依赖层目录
+    """
+    for source, relative in files:
+        destination = staging / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.link(source, destination)
+        except OSError:
+            shutil.copy2(source, destination)
+
+
 def build_generation(
     transaction: dict[str, Any], *, cancel_requested: Callable[[], bool] | None = None
 ) -> dict[str, Any]:
+    """按事务的目标清单构建新的依赖层
+
+    版本未变化且适用于当前解释器的包从当前依赖层硬链接，其余包重新安装。
+
+    参数:
+        transaction: 依赖层事务
+        cancel_requested: 返回是否已请求取消
+
+    返回:
+        dict[str, Any]: 依赖层编号、目录、原生扩展与摘要
+    """
     return _build_generation(transaction, cancel_requested=cancel_requested)
 
 
@@ -307,22 +474,17 @@ def _build_generation(
     if not isinstance(packages, dict):
         raise LayerBuildError("dependency_plan_invalid")
     from .environment import capture_environment
-    from .policy import ORM_PACKAGES, guard_orm_changes
+    from .policy import guard_orm_changes
 
     before = capture_environment()
     effective = {name: dist.version for name, dist in before.base.items()}
     effective.update(
         {name: str(info.get("version")) for name, info in packages.items()}
     )
-    allow_orm = bool(transaction.get("orm_packages_allowed"))
-    if not allow_orm:
+    if not transaction.get("orm_packages_allowed"):
         guard_orm_changes(before.versions, effective)
     core = protected_core()
-    copied = (
-        set()
-        if allow_orm
-        else {name for name in set(packages) & ORM_PACKAGES if name in before.layer}
-    )
+    reused: dict[str, list[tuple[Path, Path]]] = {}
     requested: list[str] = []
     wheel_only: list[str] = []
     for raw_name, info in sorted(packages.items()):
@@ -331,12 +493,15 @@ def _build_generation(
             raise LayerBuildError("core_dependency_in_layer")
         if not isinstance(info, dict) or not info.get("version"):
             raise LayerBuildError("dependency_plan_invalid")
-        if name in copied:
-            continue
-        requested.append(f"{name}=={info['version']}")
         current = before.layer.get(name)
-        if current is None or current.version != str(info["version"]):
+        if current is not None and current.version == str(info["version"]):
+            files = _reusable_distribution(current)
+            if files is not None:
+                reused[name] = files
+                continue
+        else:
             wheel_only.append(name)
+        requested.append(f"{name}=={info['version']}")
 
     manifest = load_manifest()
     generation = next_generation(manifest)
@@ -349,19 +514,8 @@ def _build_generation(
         prefix=f"generation-{generation}-", dir=str(LAYER_ROOT)
     ) as temporary:
         staging = Path(temporary)
-        for name in copied:
-            distribution = before.layer[name]
-            source_root = Path(distribution.locate_file("")).resolve()
-            for file in distribution.files or ():
-                source = Path(distribution.locate_file(file)).resolve()
-                destination = (staging / str(file)).resolve()
-                if not source.is_relative_to(
-                    source_root
-                ) or not destination.is_relative_to(staging.resolve()):
-                    raise LayerBuildError("dependency_layer_state_mismatch", name)
-                if source.is_file():
-                    destination.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(source, destination)
+        for files in reused.values():
+            _link_files(files, staging)
         if requested:
             requirements = staging.parent / f"generation-{generation}.requirements.txt"
             requirements.write_text("\n".join(requested) + "\n", encoding="utf-8")
@@ -413,12 +567,11 @@ def _build_generation(
         from .environment import capture_environment, validate_candidate
         from .policy import bind_trials
 
-        bind_trials(
-            capture_environment(
-                manifest=transaction["target_manifest"], candidate_path=staging
-            )
+        snapshot = capture_environment(
+            manifest=transaction["target_manifest"], candidate_path=staging
         )
-        validate_candidate(staging, transaction)
+        bind_trials(snapshot)
+        validate_candidate(staging, transaction, snapshot=snapshot)
         native_files = _scan_native_extensions(staging)
         (staging / ".zhenxun-generation.json").write_text(
             json.dumps({"native_extensions": native_files}, indent=2), encoding="utf-8"
@@ -442,25 +595,51 @@ def _validate_generation(transaction: dict[str, Any], build: dict[str, Any]) -> 
     validate_candidate(path, transaction)
 
 
+@transaction_lock()
 def commit_generation(
     transaction: dict[str, Any], build: dict[str, Any], *, verify_on_start: bool
 ) -> dict[str, Any]:
-    _validate_generation(transaction, build)
-    previous = load_manifest()
+    """把已构建的依赖层设为当前清单
+
+    build 须为刚构建或经 _staged_build 校验过的依赖层，这里不再重复校验。
+    回滚清单在每个事务中只写入一次并在事务中标记；提交后进程中断再次提交时，
+    沿用已保存的回滚清单，不会用已提交的清单覆盖它。
+
+    参数:
+        transaction: 待提交的依赖事务
+        build: 已构建的依赖层
+        verify_on_start: 是否需要启动验证
+
+    返回:
+        dict[str, Any]: 新的清单
+    """
+    previous = (
+        read_json(ROLLBACK_FILE, None) if transaction.get("rollback_saved") else None
+    )
+    if not isinstance(previous, dict):
+        previous = load_manifest()
+        write_json(ROLLBACK_FILE, previous)
+        transaction["rollback_saved"] = True
+        write_json(PENDING_FILE, transaction)
     target = deepcopy(transaction["target_manifest"])
     target["active_generation"] = int(build["generation"])
     target["previous_generation"] = previous.get("active_generation")
     target["pending_verification"] = bool(verify_on_start)
     target.pop("verified_transaction_revision", None)
     target["generation_digest"] = build["digest"]
-    write_json(ROLLBACK_FILE, previous)
+    target["environment"] = environment_signature()
     save_manifest(target)
     return target
 
 
+@transaction_lock()
 def stage_generation(transaction: dict[str, Any], build: dict[str, Any]) -> None:
-    """Persist a built generation without exposing it to the running worker."""
-    _validate_generation(transaction, build)
+    """保存刚构建的依赖层，留待重启后提交，不对运行中的 worker 生效
+
+    参数:
+        transaction: 依赖层事务
+        build: 刚构建的依赖层
+    """
     previous = transaction.get("generation")
     transaction["generation"] = int(build["generation"])
     transaction["generation_digest"] = str(build["digest"])
@@ -670,8 +849,16 @@ def reconcile_operation(value: dict[str, Any]) -> bool:
     return False
 
 
+@transaction_lock()
 def apply_pending_transaction() -> bool:
-    """Build a queued layer after the launcher has stopped the old worker."""
+    """launcher 停止旧 worker 后构建并提交待应用的依赖层
+
+    失败时活动依赖层未切换、数据库未迁移或迁移已自行恢复的事务记为已确认回滚，
+    由之后的事务操作自动归档，不再阻挡新的依赖操作。
+
+    返回:
+        bool: 是否已提交并等待启动验证
+    """
     transaction = pending_transaction()
     if transaction is None:
         return False
@@ -684,6 +871,7 @@ def apply_pending_transaction() -> bool:
         "migration_blocked",
     }:
         return False
+    migrated = False
     try:
         transaction["state"] = "building"
         write_json(PENDING_FILE, transaction)
@@ -710,11 +898,17 @@ def apply_pending_transaction() -> bool:
                     if migration_result == 3
                     else "database_migration_failed"
                 )
+                if migration_result == 2:
+                    transaction["rollback_confirmed"] = True
                 write_json(PENDING_FILE, transaction)
                 return False
+            migrated = True
         commit_generation(transaction, build, verify_on_start=True)
     except Exception as error:
         transaction["state"] = "failed"
+        transaction["rollback_confirmed"] = not migrated and load_manifest().get(
+            "active_generation"
+        ) == (transaction.get("base_manifest") or {}).get("active_generation")
         transaction["error_code"] = getattr(error, "code", type(error).__name__)
         transaction["error"] = safe_process_error(str(error))
         transaction["error_details"] = json.loads(
@@ -948,68 +1142,173 @@ def _safe_plugin_import_failure(error: Exception) -> dict[str, Any]:
     return {"code": "plugin_import_failed", "paths": []}
 
 
+def issue_text(item: dict[str, Any]) -> str:
+    """把启动验证中的问题整理为简短说明
+
+    参数:
+        item: 启动状态中 failures / warnings 的一项
+
+    返回:
+        str: 说明
+    """
+    code = str(item.get("code") or "")
+    if item.get("module_name") or item.get("store_key"):
+        name = item.get("module_name") or item.get("store_key")
+        return f"插件 {name} 加载失败（{code}）"
+    if code == "loaded_source_mismatch":
+        return (
+            f"{item.get('name')} 已从 {item.get('loaded_path')} 加载，"
+            "依赖层中的版本未生效"
+        )
+    if code == "plugin_not_loaded":
+        return f"插件未加载：{'、'.join(map(str, item.get('modules') or []))}"
+    parts = []
+    details = item.get("details")
+    for detail in details if isinstance(details, list) else []:
+        if not isinstance(detail, dict):
+            continue
+        actual = detail.get("actual") or "未安装"
+        if detail.get("requirement"):
+            parts.append(
+                f"{detail.get('owner')} 需要 {detail['requirement']}，当前为 {actual}"
+            )
+        elif detail.get("expected"):
+            parts.append(
+                f"{detail.get('name')} 应为 {detail['expected']}，当前为 {actual}"
+            )
+    return f"{code}：{'；'.join(parts[:5])}" if parts else code
+
+
 def startup_verification() -> tuple[bool, dict[str, Any]]:
+    """检查重启后依赖层与托管插件的加载结果
+
+    worker 未使用当前依赖层、依赖层文件与记录不符、核心依赖被改动或未从依赖层加载、
+    运行环境在加载后发生变化时验证失败。插件加载失败、非核心依赖冲突与非核心包未从
+    依赖层加载记为告警：恢复备份的事务保留依赖层并记录告警，其他事务只允许此前已
+    记录的插件加载失败。
+
+    返回:
+        tuple[bool, dict[str, Any]]: 是否通过，启动状态；failures 为导致验证失败的
+            问题，warnings 为保留依赖层时记录的告警
+    """
     from .dependencies import DependencyAnalysisError
     from .environment import capture_environment, validate_candidate
 
     manifest = load_manifest()
     status = read_json(STARTUP_STATUS_FILE, {})
+    transaction = read_json(PENDING_FILE, {})
     expected = manifest.get("active_generation")
-    valid = (
-        status.get("generation") == expected
-        and isinstance(status.get("failed"), list)
-        and not status["failed"]
-        and set(status.get("loaded", []))
-        == {
-            item["module_name"]
-            for item in manifest.get("plugins", {}).values()
-            if item.get("state") == "managed"
-        }
-    )
+    core = protected_core()
+    fatal: list[dict[str, Any]] = []
+    warnings: list[dict[str, Any]] = []
+
+    def conflicts(code: str, details) -> None:
+        items = details if isinstance(details, list) else []
+        broken = [
+            item
+            for item in items
+            if isinstance(item, dict) and item.get("name") in core
+        ]
+        rest = [item for item in items if item not in broken]
+        if broken:
+            fatal.append({"code": code, "details": broken})
+        if rest or not items:
+            warnings.append({"code": code, "details": rest or details})
+
+    failed = status.get("failed")
+    if status.get("generation") != expected or not isinstance(failed, list):
+        fatal.append({"code": "dependency_generation_not_loaded"})
+        failed = []
+    failed = [item for item in failed if isinstance(item, dict)]
+    warnings.extend(failed)
+    managed = {
+        str(item.get("module_name") or "")
+        for item in manifest.get("plugins", {}).values()
+        if item.get("state") == "managed"
+    }
+    attempted = set(status.get("loaded", [])) | {
+        str(item.get("module_name") or "") for item in failed
+    }
+    if not managed <= attempted:
+        fatal.append(
+            {"code": "plugin_not_loaded", "modules": sorted(managed - attempted)}
+        )
     try:
-        transaction = read_json(PENDING_FILE, {})
         if isinstance(expected, int):
-            transaction = {**transaction, "target_manifest": manifest}
             if layer_digest(generation_path(expected)) != manifest.get(
                 "generation_digest"
             ):
                 raise DependencyAnalysisError("dependency_layer_state_mismatch")
-            check = validate_candidate(generation_path(expected), transaction)
+            check = validate_candidate(
+                generation_path(expected), {**transaction, "target_manifest": manifest}
+            )
         else:
             snapshot = capture_environment(manifest=manifest)
             check = {
                 "state": "failed" if snapshot.conflicts else "passed",
                 "remaining_conflicts": snapshot.conflicts,
             }
-        snapshot = capture_environment(manifest=manifest)
         status["dependency_verification"] = check
-        valid = (
-            valid
-            and check["state"] != "failed"
-            and status.get("environment_versions") == snapshot.versions
-            and not status.get("loaded_mismatches")
-            and not status.get("environment_error")
-        )
+        if check["state"] == "failed":
+            conflicts(
+                "current_environment_dependency_conflict", check["remaining_conflicts"]
+            )
+        snapshot = capture_environment(manifest=manifest)
+        if status.get("environment_error"):
+            fatal.append(dict(status["environment_error"]))
+        elif status.get("environment_versions") != snapshot.versions:
+            fatal.append({"code": "environment_changed_after_load"})
+        for item in status.get("loaded_mismatches") or []:
+            (fatal if item.get("name") in core else warnings).append(
+                {"code": "loaded_source_mismatch", **item}
+            )
     except DependencyAnalysisError as error:
         status["dependency_verification"] = {
             "state": "failed",
             "code": error.code,
             "details": error.details,
         }
-        valid = False
-    status["plugin_verification"] = "passed" if not status.get("failed") else "failed"
+        if error.code == "current_environment_dependency_conflict":
+            conflicts(error.code, error.details)
+        else:
+            fatal.append({"code": error.code, "details": error.details})
+    known = set(manifest.get("load_failures") or {})
+    rejected = (
+        []
+        if transaction.get("restore")
+        else [item for item in warnings if item.get("module_name") not in known]
+    )
+    status["failures"] = [*fatal, *rejected]
+    status["warnings"] = [item for item in warnings if item not in rejected]
+    status["plugin_verification"] = "passed" if not failed else "failed"
     write_json(STARTUP_STATUS_FILE, status)
-    return valid, status
+    return not status["failures"], status
 
 
+@transaction_lock()
 def finalize_pending_transaction() -> None:
-    """确认依赖层事务验证通过并归档；清理失败只记录，遗留文件由下一次事务结束时清理"""
+    """确认依赖层事务验证通过并归档；清理失败只记录，遗留文件由下一次事务结束时清理
+
+    启动验证的告警记入事务的 warnings，加载失败的托管插件记入 manifest 的
+    load_failures，之后的事务不再因这些插件回滚。
+    """
     transaction = pending_transaction() or {}
     manifest = load_manifest()
     manifest["pending_verification"] = False
     manifest["previous_generation"] = None
     if transaction.get("revision"):
         manifest["verified_transaction_revision"] = transaction["revision"]
+    status = read_json(STARTUP_STATUS_FILE, {})
+    if status.get("generation") == manifest.get("active_generation"):
+        manifest["load_failures"] = {
+            str(item["module_name"]): str(item.get("code") or "")
+            for item in status.get("failed") or []
+            if isinstance(item, dict) and item.get("module_name")
+        }
+        if status.get("warnings"):
+            transaction["warnings"] = [
+                issue_text(item) for item in status["warnings"][:20]
+            ]
     save_manifest(manifest)
     transaction.update(state="committed", verification_confirmed=True)
     transaction.pop("cleanup_error", None)
@@ -1039,10 +1338,12 @@ def finalize_pending_transaction() -> None:
         archive_settled()
 
 
+@transaction_lock()
 def rollback_pending_transaction(failed: list[dict[str, Any]] | None = None) -> None:
     """回滚待验证的依赖层事务并记录失败原因
 
-    worker 未能完成启动时记录为 worker_startup_failed，否则按插件加载结果记录。
+    worker 未能完成启动时记录为 worker_startup_failed，否则记录启动验证中导致
+    失败的问题及说明。
 
     参数:
         failed: launcher 记录的失败项
@@ -1079,10 +1380,14 @@ def rollback_pending_transaction(failed: list[dict[str, Any]] | None = None) -> 
             if worker_failed
             else "plugin_startup_verification_failed"
         )
-        failures = failed_status.get("failed")
+        failures = [
+            item
+            for item in failed_status.get("failures") or []
+            if isinstance(item, dict)
+        ][:10]
         if worker_failed:
             transaction["failure_reasons"] = [{"code": "worker_startup_failed"}]
-        elif isinstance(failures, list):
+        else:
             transaction["failure_reasons"] = [
                 {
                     "code": str(item.get("code") or "plugin_import_failed"),
@@ -1093,18 +1398,15 @@ def rollback_pending_transaction(failed: list[dict[str, Any]] | None = None) -> 
                         for path in item.get("paths", [])
                         if isinstance(path, str)
                     ][:20],
+                    "detail": issue_text(item),
                 }
                 for item in failures
-                if isinstance(item, dict)
-                and (
-                    not transaction.get("module_name")
-                    or item.get("module_name") == transaction.get("module_name")
-                )
-            ][:10]
-            if not transaction["failure_reasons"]:
-                transaction["failure_reasons"] = [
-                    {"code": "plugin_startup_verification_failed"}
-                ]
+            ] or [{"code": "plugin_startup_verification_failed"}]
+            transaction["error_details"] = [
+                item["detail"]
+                for item in transaction["failure_reasons"]
+                if item.get("detail")
+            ]
         write_json(PENDING_FILE, transaction)
         record_manual_operations(transaction, "rolled_back", "failed")
     restored = load_manifest().get("active_generation")

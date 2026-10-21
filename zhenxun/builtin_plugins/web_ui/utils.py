@@ -159,7 +159,6 @@ def authentication():
     """权限验证
 
     异常:
-        JWTError: JWTError
         HTTPException: HTTPException
     """
 

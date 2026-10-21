@@ -345,6 +345,24 @@ async def build_sort_image(
     return A
 
 
+def average_hash(image: Image.Image) -> str:
+    """计算图片的平均哈希
+
+    灰度化并缩放到 8x8 后，亮度高于平均值的像素记为 1，按行拼接为 64 位。
+
+    参数:
+        image: 图片
+
+    返回:
+        str: 16 位十六进制哈希值
+    """
+    gray = image.convert("L").resize((8, 8), Image.Resampling.LANCZOS)
+    pixels = list(gray.tobytes())
+    mean = sum(pixels) / len(pixels)
+    bits = "".join("1" if pixel > mean else "0" for pixel in pixels)
+    return f"{int(bits, 2):016x}"
+
+
 def get_img_hash(image_file: str | Path) -> str:
     """获取图片的hash值
 
@@ -352,25 +370,14 @@ def get_img_hash(image_file: str | Path) -> str:
         image_file: 图片文件路径
 
     返回:
-        str: 哈希值
+        str: 哈希值，读取失败时为空字符串
     """
     try:
-        import imagehash
-    except ImportError:
-        logger.warning(
-            "imagehash 未安装或其依赖（numpy/scipy/PyWavelets）不可用，"
-            "图片哈希功能不可用",
-            "禁言检测",
-        )
-        return ""
-    hash_value = ""
-    try:
-        with open(image_file, "rb") as fp:
-            with Image.open(fp) as image:
-                hash_value = imagehash.average_hash(image)
+        with Image.open(image_file) as image:
+            return average_hash(image)
     except Exception as e:
         logger.warning("获取图片Hash出错", "禁言检测", e=e)
-    return str(hash_value)
+    return ""
 
 
 async def get_download_image_hash(url: str, mark: str, use_proxy: bool = False) -> str:

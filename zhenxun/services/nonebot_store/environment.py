@@ -89,7 +89,8 @@ def dependency_roots(
 ) -> list[tuple[str, str]]:
     """收集各依赖来源声明的依赖
 
-    来源包括核心 pyproject.toml、手动依赖、托管的 NoneBot 插件，以及传入的商店插件依赖。
+    来源包括核心 pyproject.toml、手动依赖、插件 requirements 文件、托管的 NoneBot
+    插件，以及传入的商店插件依赖。
 
     参数:
         manifest: 依赖层清单
@@ -105,6 +106,13 @@ def dependency_roots(
     roots.extend(
         (f"manual:{name}", raw)
         for name, requirements in manual_requirements(manifest).items()
+        for raw in requirements
+    )
+    roots.extend(
+        (str(path), str(raw))
+        for path, requirements in sorted(
+            (manifest.get("plugin_requirements") or {}).items()
+        )
         for raw in requirements
     )
     for plugin in manifest.get("plugins", {}).values():
@@ -559,11 +567,25 @@ def verify_effective_environment() -> dict:
     return report
 
 
-def validate_candidate(path: Path, transaction: dict[str, Any]) -> dict:
-    """Reject new conflicts and verify every planned version before publication."""
+def validate_candidate(
+    path: Path,
+    transaction: dict[str, Any],
+    *,
+    snapshot: EnvironmentSnapshot | None = None,
+) -> dict:
+    """校验候选依赖层：包版本与计划一致，不引入新的依赖冲突
+
+    参数:
+        path: 候选依赖层目录
+        transaction: 依赖层事务
+        snapshot: 已按目标清单与候选依赖层采集的环境快照
+
+    返回:
+        dict: state 为 passed / partial，remaining_conflicts 为保留的冲突
+    """
     from .dependencies import DependencyAnalysisError, protected_core
 
-    snapshot = capture_environment(
+    snapshot = snapshot or capture_environment(
         manifest=transaction["target_manifest"], candidate_path=path
     )
     expected = {

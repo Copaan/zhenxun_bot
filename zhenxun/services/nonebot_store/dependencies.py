@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 import contextlib
+from copy import deepcopy
 from hashlib import sha256
 import importlib.metadata
 import json
@@ -13,7 +14,7 @@ import re
 import subprocess
 import sys
 import tempfile
-from typing import Any, Literal
+from typing import Any
 from urllib.parse import quote
 
 from dotenv import dotenv_values
@@ -37,30 +38,36 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10
 from .storage import LAYER_ROOT, load_manifest
 
 SOLVER_POLICY_VERSION = 11
-COORDINATED_TRANSITIVE_PACKAGES = frozenset({"aiofiles", "idna"})
 LOCK_FILE = Path("uv.lock")
 _REQ_LINE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)==([^\s;]+)")
 _SENSITIVE = re.compile(r"(?i)(authorization|token|password|secret)=?[^\s]*")
 PROJECT_FILE = Path("pyproject.toml")
 PROJECT_NAME = "zhenxun-bot"
-IMMUTABLE_ANCHORS = frozenset(
+IMMUTABLE_PACKAGES = frozenset(
     {
         "nonebot2",
-        "pydantic",
-        "pydantic-core",
-        "pydantic-settings",
-        "fastapi",
-        "uvicorn",
-        "starlette",
         "nonebot-adapter-onebot",
         "nonebot-adapter-qq",
         "nonebot-plugin-alconna",
+        "arclet-alconna",
+        "arclet-alconna-tools",
+        "nepattern",
+        "tarina",
         "nonebot-plugin-apscheduler",
         "nonebot-plugin-session",
         "nonebot-plugin-uninfo",
         "nonebot-plugin-waiter",
         "nonebot-plugin-htmlrender",
+        "playwright",
+        "pydantic",
+        "pydantic-core",
+        "pydantic-settings",
+        "fastapi",
+        "starlette",
+        "uvicorn",
         "tortoise-orm",
+        "pypika-tortoise",
+        "aiosqlite",
         "asyncpg",
         "aiomysql",
         "pymysql",
@@ -69,9 +76,6 @@ IMMUTABLE_ANCHORS = frozenset(
     }
 )
 FORBIDDEN_LAYER_PACKAGES = frozenset({PROJECT_NAME, "pip", "uv"})
-DependencyTier = Literal[
-    "immutable_core", "shared_compatible", "plugin_private", "external_extra"
-]
 
 
 class DependencyAnalysisError(RuntimeError):
@@ -245,26 +249,29 @@ def project_closure() -> dict[str, str]:
 
 
 def protected_core() -> dict[str, str]:
-    graph, lock_versions, _ = _lock_packages()
+    """核心不可变包的锁定版本
+
+    只包含本体依赖中属于 IMMUTABLE_PACKAGES 的包，依赖层不能改变它们的版本。
+
+    返回:
+        dict[str, str]: 包名 -> uv.lock 中的版本
+    """
     closure = project_closure()
-    protected: set[str] = set()
-    queue = deque(
-        name for name in IMMUTABLE_ANCHORS | FORBIDDEN_LAYER_PACKAGES if name in closure
-    )
-    while queue:
-        name = queue.popleft()
-        if name in protected:
-            continue
-        protected.add(name)
-        queue.extend(graph.get(name, set()) - protected)
     return {
-        name: lock_versions[name]
-        for name in protected
-        if lock_versions.get(name) and name not in COORDINATED_TRANSITIVE_PACKAGES
+        name: version
+        for name, version in closure.items()
+        if name in IMMUTABLE_PACKAGES or name in FORBIDDEN_LAYER_PACKAGES
     }
 
 
 def shared_dependencies() -> dict[str, str]:
+    """本体依赖中可变包的锁定版本
+
+    这些包可以随插件需要在依赖层中升级，解析时以锁定版本作为下限，不会降级。
+
+    返回:
+        dict[str, str]: 包名 -> uv.lock 中的版本
+    """
     closure = project_closure()
     immutable = protected_core()
     return {name: version for name, version in closure.items() if name not in immutable}
@@ -452,11 +459,15 @@ def environment_report(*, check_lock: bool = False, snapshot=None) -> dict[str, 
         "repairable": bool(
             not interpreter_mismatch
             and not lock_stale
-            and not layer_mismatch
-            and (immutable_drift or incompatible_shared_drift or requirement_conflicts)
+            and (
+                layer_mismatch
+                or immutable_drift
+                or incompatible_shared_drift
+                or requirement_conflicts
+            )
             and LOCK_FILE.is_file()
         ),
-        "repair_mode": "base" if immutable_drift else "layer",
+        "repair_mode": "base" if immutable_drift and not layer_mismatch else "layer",
     }
     payload["fingerprint"] = sha256(
         json.dumps(
@@ -474,6 +485,7 @@ def environment_report(*, check_lock: bool = False, snapshot=None) -> dict[str, 
                         "packages",
                         "plugins",
                         "manual_requirements",
+                        "plugin_requirements",
                         "generation_digest",
                         "pending_verification",
                     )
@@ -621,19 +633,40 @@ def metadata_compatibility(metadata: dict[str, Any]) -> list[dict[str, str]]:
     return reasons
 
 
-def _write_constraints(path: Path, values: dict[str, str]) -> None:
-    path.write_text(
-        "".join(f"{name}=={version}\n" for name, version in sorted(values.items())),
-        encoding="utf-8",
+def _write_constraints(
+    path: Path, values: dict[str, str], floors: dict[str, str] | None = None
+) -> None:
+    """写入 uv 约束文件
+
+    参数:
+        path: 约束文件
+        values: 固定版本的包
+        floors: 不低于给定版本的包，已固定版本的包忽略
+    """
+    lines = [f"{name}=={version}\n" for name, version in sorted(values.items())]
+    lines.extend(
+        f"{name}>={version}\n"
+        for name, version in sorted((floors or {}).items())
+        if name not in values
     )
+    path.write_text("".join(lines), encoding="utf-8")
 
 
-def _parse_compiled(path: Path) -> dict[str, str]:
+def _parse_compiled(
+    path: Path, graph: dict[str, set[str]] | None = None
+) -> dict[str, str]:
     result: dict[str, str] = {}
     for line in path.read_text(encoding="utf-8").splitlines():
         match = _REQ_LINE.match(line.strip())
         if match:
-            result[canonicalize_name(match.group(1))] = match.group(2)
+            name = canonicalize_name(match.group(1))
+            result[name] = match.group(2)
+            if graph is not None and "# via " in line:
+                graph[name] = {
+                    canonicalize_name(item.strip())
+                    for item in line.split("# via ", 1)[1].split(",")
+                    if item.strip() and not item.strip().startswith("-")
+                }
     if not result:
         raise DependencyAnalysisError("dependency_plan_empty")
     return result
@@ -648,6 +681,9 @@ async def _compile(
     preferences: dict[str, str] | None = None,
     no_dependencies: bool = False,
     allow_build: bool = False,
+    target: tuple[str, str] | None = None,
+    graph: dict[str, set[str]] | None = None,
+    floors: dict[str, str] | None = None,
     _metadata_links: tuple[Path, ...] = (),
 ) -> tuple[dict[str, str] | None, str]:
     from zhenxun.services.installer_network import (
@@ -665,7 +701,7 @@ async def _compile(
         constraint_file = directory / "constraints.txt"
         output = directory / "requirements.txt"
         source.write_text("\n".join(requirements) + "\n", encoding="utf-8")
-        _write_constraints(constraint_file, constraints)
+        _write_constraints(constraint_file, constraints, floors)
         if preferences:
             # uv reuses existing output pins as preferences, not hard constraints.
             _write_constraints(output, preferences)
@@ -676,6 +712,12 @@ async def _compile(
             command.append("--no-build")
         if no_dependencies:
             command.append("--no-deps")
+        if target is not None:
+            command.extend(
+                ["--python-platform", target[0], "--python-version", target[1]]
+            )
+        if graph is not None:
+            command.extend(["--annotate", "--annotation-style", "line"])
         environment = installer_environment()
         if _metadata_links:
             # Command-line --find-links replaces UV_FIND_LINKS, so carry the
@@ -752,6 +794,8 @@ async def _compile(
                     ]
                     if name in constraints:
                         specifiers.append("==" + constraints[name])
+                    elif floors and name in floors:
+                        specifiers.append(">=" + floors[name])
                     if await project_static_sources(
                         name, projection, installer_environment(), specifiers
                     ):
@@ -762,10 +806,43 @@ async def _compile(
                             restricted_packages=restricted_packages,
                             preferences=preferences,
                             no_dependencies=no_dependencies,
+                            target=target,
+                            graph=graph,
+                            floors=floors,
                             _metadata_links=(*_metadata_links, projection),
                         )
             return None, details
-        return _parse_compiled(output), details
+        return _parse_compiled(output, graph), details
+
+
+async def dependency_graph(
+    requirements: list[str],
+    preferences: dict[str, str],
+    target: tuple[str, str] | None = None,
+) -> dict[str, set[str]]:
+    """解析依赖声明，得到每个包被哪些包直接依赖
+
+    参数:
+        requirements: 依赖声明
+        preferences: 优先选用的版本
+        target: 解析的目标平台（uv --python-platform 的取值）与 Python 版本，
+            为 None 时按当前解释器解析
+
+    返回:
+        dict[str, set[str]]: 包名 -> 直接依赖它的包名，只由依赖声明引入的包为空集
+    """
+    graph: dict[str, set[str]] = {}
+    resolved, details = await _compile(
+        requirements,
+        {},
+        wheels_only=False,
+        preferences=preferences,
+        target=target,
+        graph=graph,
+    )
+    if resolved is None:
+        raise DependencyAnalysisError("dependency_resolution_failed", details)
+    return graph
 
 
 async def prebuild_packages(packages: dict[str, str]) -> dict[str, str]:
@@ -839,20 +916,6 @@ def _check_resolution_failure(details: str) -> None:
         "dependency_source_required",
     }:
         raise DependencyAnalysisError(failure["code"], details)
-
-
-def _package_changes(
-    resolved: dict[str, str], current: dict[str, str]
-) -> dict[str, list[dict[str, str]]]:
-    added = []
-    changed = []
-    for name, version in sorted(resolved.items()):
-        existing = current.get(name)
-        if existing is None:
-            added.append({"name": name, "version": version})
-        elif existing != version:
-            changed.append({"name": name, "from": existing, "to": version})
-    return {"added": added, "changed": changed, "removed": []}
 
 
 def _active_metadata_requirements(metadata: dict[str, Any]) -> list[Requirement]:
@@ -949,6 +1012,194 @@ def _compatibility_overrides(
     return overrides, inputs
 
 
+async def _diagnose_failure(
+    requests: list[str], detail: str, *, allow_build: bool, invalid_code: str
+) -> DependencyAnalysisError:
+    """依赖层解析失败时判断原因
+
+    参数:
+        requests: 本次请求的依赖声明
+        detail: 解析失败的输出
+        allow_build: 是否允许构建源码包读取依赖信息
+        invalid_code: 请求自身无法解析时的错误码
+
+    返回:
+        DependencyAnalysisError: 与其他依赖冲突、与本体依赖冲突或请求自身无效
+    """
+    core, core_error = await _compile(
+        [*project_requirements(), *requests],
+        protected_core(),
+        wheels_only=False,
+        allow_build=allow_build,
+        floors=shared_dependencies(),
+    )
+    if core is not None:
+        return DependencyAnalysisError("third_party_dependency_conflict", detail)
+    free, free_error = await _compile(
+        requests, {}, wheels_only=False, allow_build=allow_build
+    )
+    if free is not None:
+        return DependencyAnalysisError(
+            "project_dependency_conflict", core_error or detail
+        )
+    return DependencyAnalysisError(invalid_code, free_error or core_error or detail)
+
+
+async def resolve_layer(
+    requests: list[str],
+    *,
+    snapshot,
+    manifest: dict[str, Any],
+    sources: dict[str, list[str]] | None = None,
+    replaced: frozenset[str] = frozenset(),
+    allow_build: bool = False,
+    restore: bool = False,
+    preferences: dict[str, str] | None = None,
+    invalid_code: str = "dependency_resolution_failed",
+) -> dict[str, Any]:
+    """解析本次请求后的依赖层，所有安装入口共用
+
+    从请求的包出发解析，新解析到的包连同其他来源（本体、NoneBot 插件、真寻商店
+    插件、手动依赖、已安装包）对它们的声明一起加入下一轮，直到不再出现新包。
+    核心不可变包与已安装的 ORM 包固定版本，其余本体依赖不低于锁定版本，当前版本
+    优先保留；请求之外的包在必要时也会变化，作为连带变化列出。
+    解析失败且放开 ORM 固定后会改变已安装的 ORM 与数据库驱动时，提示需在控制台操作。
+
+    参数:
+        requests: 本次请求的依赖声明
+        snapshot: 当前环境快照
+        manifest: 目标清单，其中的依赖来源与依赖层包参与解析
+        sources: 真寻商店插件的依赖声明，键为 store_key
+        replaced: 声明不再参与解析的来源（被更新或替换的插件）
+        allow_build: 是否允许构建源码包读取依赖信息
+        restore: 是否为恢复备份，允许改变 ORM 与数据库驱动
+        preferences: 当前环境中没有的包优先选用的版本
+        invalid_code: 请求自身无法解析时的错误码
+
+    返回:
+        dict[str, Any]: resolved 为解析出的包版本，packages 为目标依赖层的包，
+            changes 为相对当前环境的版本变化，scope 为首轮解析到的包，
+            source_build_required 为变化的包是否需要源码构建，diagnostic 为说明
+    """
+    from .environment import dependency_roots
+    from .policy import ORM_PACKAGES, external_requirements, guard_orm_changes
+
+    def active(values: list[str]) -> list[str]:
+        result = []
+        for raw in values:
+            marker = Requirement(raw).marker
+            if (not marker or marker.evaluate()) and raw not in result:
+                result.append(raw)
+        return result
+
+    current = snapshot.versions
+    base = {name: dist.version for name, dist in snapshot.base.items()}
+    core = protected_core()
+    packages = deepcopy(manifest.get("packages", {}))
+    frozen = {
+        **({} if restore else {n: current[n] for n in ORM_PACKAGES if n in current}),
+        **core,
+    }
+    preferred = {
+        **(preferences or {}),
+        **current,
+        **{name: str(info["version"]) for name, info in packages.items()},
+    }
+    roots = [
+        (owner, raw)
+        for owner, raw in dependency_roots(manifest, sources)
+        if owner not in replaced
+    ]
+    requests = active(requests)
+    scope = {canonicalize_name(Requirement(raw).name) for raw in requests}
+    first: set[str] | None = None
+    resolved: dict[str, str] = {}
+    for _ in range(6):
+        requirements = active(
+            [
+                *requests,
+                *(
+                    raw
+                    for _, raw in roots
+                    if canonicalize_name(Requirement(raw).name) in scope
+                ),
+                *external_requirements(snapshot, scope, replaced),
+            ]
+        )
+        result, detail = await _compile(
+            requirements,
+            frozen,
+            wheels_only=False,
+            allow_build=allow_build,
+            preferences=preferred,
+            floors=shared_dependencies(),
+        )
+        if result is None:
+            if set(frozen) - set(core):
+                relaxed, _ = await _compile(
+                    requirements,
+                    core,
+                    wheels_only=False,
+                    allow_build=allow_build,
+                    preferences=preferred,
+                    floors=shared_dependencies(),
+                )
+                if relaxed is not None:
+                    guard_orm_changes(current, {**current, **relaxed})
+            raise await _diagnose_failure(
+                requests, detail, allow_build=allow_build, invalid_code=invalid_code
+            )
+        resolved = result
+        first = set(resolved) | scope if first is None else first
+        if set(resolved) <= scope:
+            break
+        scope |= set(resolved)
+    core_changes = [
+        {"name": name, "tier": "immutable_core", "expected": core[name], "to": version}
+        for name, version in resolved.items()
+        if name in core and core[name] != version
+    ]
+    if core_changes:
+        raise DependencyAnalysisError("core_dependency_conflict", details=core_changes)
+    if not restore:
+        guard_orm_changes(current, {**current, **resolved})
+    for name, version in resolved.items():
+        if name in core or name in FORBIDDEN_LAYER_PACKAGES:
+            continue
+        if base.get(name) == version:
+            packages.pop(name, None)
+        else:
+            packages[name] = {**packages.get(name, {}), "version": version}
+    effective = {
+        **base,
+        **{name: str(info["version"]) for name, info in packages.items()},
+    }
+    changes = [
+        {"name": name, "from": current.get(name), "to": effective.get(name)}
+        for name in sorted(set(current) | set(effective))
+        if current.get(name) != effective.get(name)
+    ]
+    installed = {name: dist.version for name, dist in snapshot.layer.items()}
+    changed = [
+        f"{name}=={info['version']}"
+        for name, info in packages.items()
+        if installed.get(name) != str(info["version"])
+    ]
+    wheels, diagnostic = (
+        await _compile(changed, {}, wheels_only=True, no_dependencies=True)
+        if changed
+        else ({}, "")
+    )
+    return {
+        "resolved": resolved,
+        "packages": packages,
+        "changes": changes,
+        "scope": sorted(first or scope),
+        "source_build_required": wheels is None,
+        "diagnostic": diagnostic if wheels is None else "",
+    }
+
+
 async def solve_install(
     plugin: dict[str, Any],
     metadata: dict[str, Any],
@@ -970,6 +1221,7 @@ async def solve_install(
         dict[str, Any]: 安装计划
     """
     from .environment import capture_environment
+    from .policy import guard_orm_request, retained_conflicts
 
     snapshot = capture_environment()
     report = environment_report(snapshot=snapshot)
@@ -1003,235 +1255,60 @@ async def solve_install(
             details=blocking_drift,
         )
     manifest = manifest or load_manifest()
-    from .environment import dependency_roots
-
-    excluded_owners = {"pyproject.toml", canonicalize_name(plugin["project_link"])}
-    managed_requirements = [
-        raw for owner, raw in dependency_roots(manifest) if owner not in excluded_owners
-    ]
-    candidate = f"{plugin['project_link']}=={plugin['version']}"
+    candidate_name = canonicalize_name(str(plugin["project_link"]))
     current = snapshot.versions
-    base = {name: dist.version for name, dist in snapshot.base.items()}
-    immutable = protected_core()
-    shared = shared_dependencies()
-    from .policy import (
-        ORM_PACKAGES,
-        external_requirements,
-        guard_orm_changes,
-        guard_orm_request,
-        retained_conflicts,
-        scoped_roots,
-    )
-
-    guard_orm_request({canonicalize_name(str(plugin["project_link"]))}, current)
-    frozen = {
-        **immutable,
-        **{name: current[name] for name in ORM_PACKAGES if name in current},
-    }
+    guard_orm_request({candidate_name}, current)
     overrides, candidate_dependencies = _compatibility_overrides(
         metadata,
-        immutable=immutable,
-        shared=shared,
+        immutable=protected_core(),
+        shared=shared_dependencies(),
         current=current,
     )
     if not prefer_existing:
         overrides = []
-    candidate_inputs = candidate_dependencies if overrides else [candidate]
-    candidate_name = canonicalize_name(str(plugin["project_link"]))
-    baseline = {
-        name: version for name, version in current.items() if name != candidate_name
-    }
-    # Pending transactions are not yet active; only their explicit plan may
-    # replace the installed view. Historical active metadata is checked above.
-    if manifest.get("packages") != load_manifest().get("packages"):
-        baseline.update(
+    candidate_inputs = (
+        candidate_dependencies
+        if overrides
+        else [f"{plugin['project_link']}=={plugin['version']}"]
+    )
+    result = await resolve_layer(
+        candidate_inputs,
+        snapshot=snapshot,
+        manifest=manifest,
+        replaced=frozenset({candidate_name}),
+        allow_build=allow_build,
+        invalid_code="plugin_dependency_invalid",
+    )
+    packages = result["packages"]
+    if overrides:
+        packages[candidate_name] = {"version": str(plugin["version"])}
+    layer_packages = {name: str(info["version"]) for name, info in packages.items()}
+    shared = shared_dependencies()
+    changes = list(result["changes"])
+    if overrides and current.get(candidate_name) != str(plugin["version"]):
+        changes.append(
             {
-                name: str(info["version"])
-                for name, info in manifest.get("packages", {}).items()
-                if name != candidate_name
+                "name": candidate_name,
+                "from": current.get(candidate_name),
+                "to": str(plugin["version"]),
             }
         )
-    baseline.update(frozen)
-
-    # Discover only the requested plugin's closure. Other installed plugins
-    # participate in compatibility checks, never in the scope allowed to move.
-    candidate_probe, candidate_error = await _compile(
-        candidate_inputs,
-        baseline,
-        wheels_only=False,
-        allow_build=allow_build,
-        preferences=baseline,
-    )
-    if candidate_probe is None:
-        candidate_probe, candidate_error = await _compile(
-            candidate_inputs,
-            frozen,
-            wheels_only=False,
-            allow_build=allow_build,
-            preferences=baseline,
-        )
-    if candidate_probe is None:
-        raise DependencyAnalysisError("plugin_dependency_invalid", candidate_error)
-    candidate_scope = set(candidate_probe) | {candidate_name}
-    # Keep requirements imposed by external owners on the candidate closure.
-    active_requirements = [
-        *scoped_roots(managed_requirements, candidate_scope),
-        *external_requirements(snapshot, candidate_scope),
-    ]
-    requirements = [
-        *scoped_roots(project_requirements(), candidate_scope),
-        *active_requirements,
-        *candidate_inputs,
-    ]
-    strict_constraints = {**baseline, **frozen}
-    scoped_constraints = {
-        **{
-            name: version
-            for name, version in baseline.items()
-            if name not in candidate_scope
-        },
-        **frozen,
+    package_changes = {
+        "added": [
+            {"name": item["name"], "version": item["to"]}
+            for item in changes
+            if item["to"] and not item["from"]
+        ],
+        "changed": [item for item in changes if item["to"] and item["from"]],
+        "removed": [],
     }
-    for name, version in current.items():
-        if name.startswith("nonebot-plugin-") and name != candidate_name:
-            scoped_constraints[name] = version
-
-    resolved, strict_error = await _compile(
-        requirements,
-        strict_constraints,
-        wheels_only=False,
-        allow_build=allow_build,
-        preferences=baseline,
-    )
-    if resolved is None:
-        resolved, relaxed_error = await _compile(
-            requirements,
-            scoped_constraints,
-            wheels_only=False,
-            allow_build=allow_build,
-            preferences=baseline,
-        )
-        if resolved is None:
-            candidate_requirements = [*project_requirements(), *candidate_inputs]
-            candidate_core, candidate_core_error = await _compile(
-                candidate_requirements,
-                immutable,
-                wheels_only=False,
-                allow_build=allow_build,
-            )
-            if candidate_core is not None:
-                raise DependencyAnalysisError(
-                    "third_party_dependency_conflict",
-                    relaxed_error or strict_error,
-                )
-            candidate_free, candidate_free_error = await _compile(
-                candidate_inputs, {}, wheels_only=False, allow_build=allow_build
-            )
-            if candidate_free is not None:
-                raise DependencyAnalysisError(
-                    "project_dependency_conflict",
-                    candidate_core_error or relaxed_error or strict_error,
-                )
-            raise DependencyAnalysisError(
-                "plugin_dependency_invalid",
-                candidate_free_error
-                or candidate_core_error
-                or relaxed_error
-                or strict_error,
-            )
-
-    core_changes = [
-        {
-            "name": name,
-            "tier": "immutable_core",
-            "kind": "version_mismatch",
-            "expected": immutable[name],
-            "actual": version,
-            "from": immutable[name],
-            "to": version,
-        }
-        for name, version in resolved.items()
-        if name in immutable and immutable[name] != version
-    ]
-    if core_changes:
-        raise DependencyAnalysisError("core_dependency_conflict", details=core_changes)
-    unrelated_changes = [
-        {"name": name, "from": baseline[name], "to": version}
-        for name, version in resolved.items()
-        if name in baseline
-        and name not in candidate_scope
-        and version != baseline[name]
-    ]
-    if unrelated_changes:
-        raise DependencyAnalysisError(
-            "third_party_dependency_conflict", details=unrelated_changes
-        )
-
-    final_candidate, final_error = await _compile(
-        candidate_inputs, resolved, wheels_only=False, allow_build=allow_build
-    )
-    if final_candidate is None:
-        raise DependencyAnalysisError("dependency_resolution_failed", final_error)
-    candidate_scope = set(final_candidate) | {candidate_name}
-
-    plugin_inputs = [*active_requirements, *candidate_inputs]
-    plugin_resolved, plugin_error = await _compile(
-        plugin_inputs,
-        resolved,
-        wheels_only=False,
-        allow_build=allow_build,
-        restricted_packages=tuple(sorted(resolved)),
-    )
-    if plugin_resolved is None:
-        plugin_resolved, source_error = await _compile(
-            plugin_inputs, resolved, wheels_only=False, allow_build=allow_build
-        )
-        if plugin_resolved is None:
-            raise DependencyAnalysisError(
-                "dependency_resolution_failed", source_error or plugin_error
-            )
-        source_required = True
-    else:
-        source_required = False
-    if overrides:
-        plugin_resolved[canonicalize_name(str(plugin["project_link"]))] = str(
-            plugin["version"]
-        )
-    guard_orm_changes(current, {**current, **resolved, **plugin_resolved})
-    for managed_plugin in manifest.get("plugins", {}).values():
-        if (
-            isinstance(managed_plugin, dict)
-            and managed_plugin.get("state") == "managed"
-            and managed_plugin.get("resolution_inputs")
-            and canonicalize_name(str(managed_plugin["project_link"])) != candidate_name
-        ):
-            plugin_resolved[canonicalize_name(str(managed_plugin["project_link"]))] = (
-                str(managed_plugin["version"])
-            )
-    shared_changes = [
-        {"name": name, "from": current.get(name), "to": version}
-        for name, version in sorted(resolved.items())
-        if name in shared and current.get(name) != version
-    ]
-    layer_packages = {
-        name: version
-        for name, version in plugin_resolved.items()
-        if name not in immutable
-        and name not in FORBIDDEN_LAYER_PACKAGES
-        and base.get(name) != version
-    }
-    # A new install must not silently remove packages retained in the active layer.
-    for name, info in manifest.get("packages", {}).items():
-        if (
-            name not in layer_packages
-            and name not in immutable
-            and name not in FORBIDDEN_LAYER_PACKAGES
-        ):
-            layer_packages[name] = resolved.get(name, str(info["version"]))
-    changes = _package_changes(layer_packages, current)
-    affected = {
-        candidate_name,
-        *(item["name"] for item in [*changes["added"], *changes["changed"]]),
+    shared_changes = [item for item in changes if item["name"] in shared]
+    scope = set(result["scope"]) | {candidate_name}
+    active_packages = load_manifest().get("packages", {})
+    pending = {
+        name
+        for name, info in (manifest.get("packages") or {}).items()
+        if active_packages.get(name) != info
     }
     change_sources = {
         item["name"]: {
@@ -1239,38 +1316,41 @@ async def solve_install(
                 "requested_plugin"
                 if item["name"] == candidate_name
                 else "candidate_dependency"
-                if item["name"] in candidate_scope
+                if item["name"] in scope
                 else "pending_transaction"
+                if item["name"] in pending
+                else "linked_change"
             ),
-            "required_by": candidate_name if item["name"] in candidate_scope else None,
+            "required_by": candidate_name if item["name"] in scope else None,
         }
-        for item in [*changes["added"], *changes["changed"], *shared_changes]
+        for item in changes
     }
     wheel_status = _wheel_availability(metadata)
     pure_root_wheel = any(
         filename.endswith(("-py3-none-any.whl", "-py2.py3-none-any.whl"))
         for filename in wheel_status["compatible_wheel_files"]
     )
-    source_required = source_required or allow_build or not wheel_status["compatible"]
+    source_required = result["source_build_required"] or not wheel_status["compatible"]
     candidate_requirement_names = {
         canonicalize_name(requirement.name)
         for requirement in _active_metadata_requirements(metadata)
     }
     database_migration_possible = (
-        canonicalize_name(str(plugin["project_link"])) == "nonebot-plugin-orm"
+        candidate_name == "nonebot-plugin-orm"
         or "nonebot-plugin-orm" in candidate_requirement_names
     )
-    database_type = orm_database_type() if database_migration_possible else "none"
     return {
-        "requirements": requirements,
+        "requirements": candidate_inputs,
         "resolved_packages": layer_packages,
-        "package_changes": changes,
+        "package_changes": package_changes,
         "change_sources": change_sources,
-        "candidate_packages": sorted(candidate_scope),
+        "candidate_packages": sorted(scope),
         "shared_changes": shared_changes,
         "compatibility_overrides": overrides,
-        "remaining_conflicts": retained_conflicts(snapshot, affected),
-        "non_core_changes": [*shared_changes, *changes["changed"]],
+        "remaining_conflicts": retained_conflicts(
+            snapshot, {candidate_name, *(item["name"] for item in changes)}
+        ),
+        "non_core_changes": [*shared_changes, *package_changes["changed"]],
         "source_build_required": source_required,
         "pure_python_candidate": (
             pure_root_wheel and not source_required and not overrides
@@ -1278,7 +1358,9 @@ async def solve_install(
         "solver_policy_version": SOLVER_POLICY_VERSION,
         "candidate_inputs": candidate_inputs,
         "database_migration_possible": database_migration_possible,
-        "database_type": database_type,
+        "database_type": (
+            orm_database_type() if database_migration_possible else "none"
+        ),
     }
 
 
@@ -1295,45 +1377,23 @@ def orm_database_type() -> str:
     return "external"
 
 
-def _plugin_released_packages(
-    manifest: dict[str, Any], project: str
-) -> tuple[list[str], list[dict[str, Any]]]:
-    """计算卸载 NoneBot 插件后可释放的依赖，分析失败时不释放
-
-    参数:
-        manifest: 依赖层清单
-        project: 规范化的插件包名
-
-    返回:
-        tuple[list[str], list[dict[str, Any]]]: 可释放的包，因仍被导入而保留的包
-    """
-    from copy import deepcopy
-
-    from zhenxun.services.plugin_store.plugin_store_receipts import (
-        receipt_dependency_inputs,
-    )
-
-    from .environment import released_packages
-
-    after = deepcopy(manifest)
-    after["plugins"] = {
-        key: item
-        for key, item in manifest.get("plugins", {}).items()
-        if canonicalize_name(str(item.get("project_link") or "")) != project
-    }
-    try:
-        sources = receipt_dependency_inputs()
-        released, imported = released_packages(
-            manifest, after, sources_before=sources, sources_after=sources
-        )
-    except (DependencyAnalysisError, OSError, KeyError, TypeError):
-        return [], []
-    return [name for name in released if name != project], imported
-
-
 def uninstall_plan(
     plugin: dict[str, Any], *, manifest: dict[str, Any] | None = None
 ) -> dict[str, Any]:
+    """生成卸载 NoneBot 插件的依赖计划
+
+    只移除插件包本身，插件的依赖保留在依赖层中；插件包仍被其他来源声明时同样保留。
+
+    参数:
+        plugin: 已安装的插件信息
+        manifest: 作为基线的依赖层清单，为空时使用当前清单
+
+    返回:
+        dict[str, Any]: 卸载计划
+    """
+    from .environment import capture_environment
+    from .policy import guard_orm_request, retained_conflicts
+
     manifest = manifest or load_manifest()
     packages = {
         canonicalize_name(name): str(info["version"])
@@ -1341,9 +1401,6 @@ def uninstall_plan(
         if isinstance(info, dict) and info.get("version")
     }
     project = canonicalize_name(str(plugin["project_link"]))
-    from .environment import capture_environment
-    from .policy import guard_orm_request, retained_conflicts
-
     snapshot = capture_environment()
     guard_orm_request({project}, snapshot.versions)
     owners = sorted(
@@ -1355,9 +1412,6 @@ def uninstall_plan(
     )
     if not owners:
         packages.pop(project, None)
-    released, imported = _plugin_released_packages(manifest, project)
-    for name in released:
-        packages.pop(canonicalize_name(name), None)
     return {
         "requirements": [],
         "resolved_packages": packages,
@@ -1374,16 +1428,7 @@ def uninstall_plan(
                         "reason": "plugin",
                     }
                 ]
-            )
-            + [
-                {
-                    "name": name,
-                    "version": snapshot.versions.get(name),
-                    "reason": "released",
-                }
-                for name in released
-                if name not in packages
-            ],
+            ),
         },
         "shared_changes": [],
         "compatibility_overrides": [],
@@ -1397,8 +1442,7 @@ def uninstall_plan(
             ]
             if owners
             else []
-        )
-        + imported,
+        ),
         "remaining_conflicts": retained_conflicts(
             snapshot, set() if owners else {project}
         ),

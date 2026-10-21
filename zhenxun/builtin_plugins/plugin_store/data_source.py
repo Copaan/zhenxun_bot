@@ -17,9 +17,8 @@ from zhenxun.services.log import logger
 from zhenxun.services.network_proxy import core_network_operation
 from zhenxun.services.plugin_init import PluginInitManager
 from zhenxun.services.plugin_store.plugin_store_receipts import (
-    delete_store_receipt,
+    StoreReceiptStore,
     store_receipt,
-    write_store_receipt,
 )
 from zhenxun.services.plugin_store.plugin_store_transaction import stage_operation
 from zhenxun.services.runtime_mutation import (
@@ -667,7 +666,7 @@ class StoreManager:
         with tempfile.TemporaryDirectory(prefix="zhenxun_plugin_store_") as temp_dir:
             root = Path(temp_dir)
             candidate, result = await cls._download_plugin(
-                plugin_info, source, root, confirm_source_build
+                plugin_info, source, root, store_key, confirm_source_build
             )
             receipt = store_receipt(
                 source="community" if is_external else "official",
@@ -723,7 +722,7 @@ class StoreManager:
                 raise
             operation = runtime.public_dict()
             if runtime.mode is ApplyMode.HOT_RELOADED:
-                write_store_receipt(store_key, receipt)
+                StoreReceiptStore.set(store_key, receipt)
             elif runtime.mode is ApplyMode.FAILED:
                 logger.warning(
                     f"插件 {plugin_info.name} 加载失败: {runtime.reason}，撤销本次安装",
@@ -800,6 +799,7 @@ class StoreManager:
         plugin_info: StorePluginInfo,
         source: str | None,
         root: Path,
+        store_key: str,
         confirm_source_build: bool = False,
         branch: str = "main",
     ) -> tuple[Path, StoreInstallResult]:
@@ -810,6 +810,7 @@ class StoreManager:
             source: 强制使用的源，ali 为阿里云，git 为 GitHub；
                 不指定时优先阿里云，失败后回退 GitHub
             root: 临时目录
+            store_key: 商店插件标识
             confirm_source_build: 是否允许从源码构建依赖
             branch: 默认分支
 
@@ -857,7 +858,9 @@ class StoreManager:
 
             try:
                 dependency_plan = await preflight_source_requirements(
-                    requirement_files, allow_build=confirm_source_build
+                    requirement_files,
+                    store_key=store_key,
+                    allow_build=confirm_source_build,
                 )
             except DependencyAnalysisError as error:
                 if error.code == "dependency_source_metadata_unavailable":
@@ -1173,7 +1176,7 @@ class StoreManager:
                 raise
         if pending_reason:
             plugin_host.clear_pending_restart(pending_reason)
-        delete_store_receipt(store_key, path)
+        StoreReceiptStore.delete(store_key)
         await PluginInitManager.remove(plugin_info.module_path)
         for plugin_record in await PluginInfo.get_plugins(
             load_status=None,

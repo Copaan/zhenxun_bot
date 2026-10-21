@@ -47,6 +47,10 @@ def execute(action: str) -> None:
             from zhenxun.services.nonebot_store.runtime import apply_pending_transaction
 
             result["value"] = apply_pending_transaction()
+        elif action == "nonebot-resync":
+            from zhenxun.services.nonebot_store.runtime import stage_environment_resync
+
+            result["value"] = stage_environment_resync()
         elif action == "source-apply":
             from zhenxun.services.plugin_store.plugin_store_transaction import (
                 apply_pending_transaction,
@@ -145,6 +149,9 @@ async def run(action: str, paths: list[str] | None = None) -> bool:
 async def sync_dependencies(paths: list[str]) -> None:
     """按变更文件同步核心依赖或插件依赖，结果写入依赖同步状态
 
+    核心依赖同步后依赖层随之重新同步；依赖层需要重建时，由重建后的启动验证
+    代替依赖检查。
+
     参数:
         paths: 发生变化的依赖文件
     """
@@ -156,8 +163,10 @@ async def sync_dependencies(paths: list[str]) -> None:
     context = dependency_sync_status()
     save_dependency_sync_status({**context, "status": "running", "paths": paths})
     try:
+        resynced = False
         if any(path in {"pyproject.toml", "uv.lock"} for path in paths):
             await run("sync-core")
+            resynced = await run("nonebot-resync")
         requirement_paths = [
             path
             for path in paths
@@ -165,7 +174,8 @@ async def sync_dependencies(paths: list[str]) -> None:
         ]
         if requirement_paths:
             await run("plugin-requirements", requirement_paths)
-        await run("verify-dependencies")
+        if not resynced:
+            await run("verify-dependencies")
     except Exception as error:
         launcher_log(
             "dependency sync failed; restarting worker with the "

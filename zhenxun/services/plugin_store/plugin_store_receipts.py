@@ -190,40 +190,10 @@ def store_receipt(
     return receipt
 
 
-def write_store_receipt(store_key: str, receipt: dict[str, Any]) -> None:
-    """写入已生效的商店插件回执，并登记不再需要的旧依赖
-
-    参数:
-        store_key: 商店插件标识
-        receipt: 安装回执
-    """
-    from zhenxun.services.nonebot_store.storage import release_source_dependencies
-
-    release_source_dependencies(
-        {store_key: list(receipt.get("dependency_inputs") or [])}
-    )
-    StoreReceiptStore.set(store_key, receipt)
-
-
-def delete_store_receipt(store_key: str, path: Path) -> None:
-    """删除已移除商店插件的回执，并登记不再需要的依赖
-
-    参数:
-        store_key: 商店插件标识
-        path: 已移除的插件源码路径
-    """
-    from zhenxun.services.nonebot_store.storage import release_source_dependencies
-
-    release_source_dependencies({store_key: None}, [path])
-    StoreReceiptStore.delete(store_key)
-
-
 __all__ = [
     "StoreReceiptStore",
     "artifact_version",
-    "delete_store_receipt",
     "receipt_dependency_inputs",
     "source_digest",
     "store_receipt",
-    "write_store_receipt",
 ]

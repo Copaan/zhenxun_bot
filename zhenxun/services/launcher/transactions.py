@@ -26,7 +26,15 @@ class PluginTransactions:
         return self.verify_nonebot or self.verify_source
 
     async def apply(self) -> None:
-        """在启动 worker 前应用待处理事务，并记录需要验证的部分"""
+        """在启动 worker 前应用待处理事务，并记录需要验证的部分
+
+        解释器或核心虚拟环境变化后先按当前环境重新同步依赖层；已确认回滚的失败
+        依赖层事务随后归档，不再阻挡新的依赖操作。
+        """
+        if nonebot_runtime.environment_resync_required() and await run_maintenance(
+            "nonebot-resync"
+        ):
+            launcher_log("解释器或核心依赖已变化，依赖层将按当前环境重新同步")
         source_before = source_store.pending_transaction()
         dependencies_ready = source_store.prepare_dependency_transaction()
         nonebot_before = nonebot_storage.pending_transaction()
@@ -82,9 +90,10 @@ class PluginTransactions:
         self.verify_nonebot = bool(
             nonebot_storage.load_manifest().get("pending_verification") and not recovery
         )
+        nonebot_storage.archive_settled()
 
     def failures(self, ready: bool) -> list[dict[str, Any]] | None:
-        """检查 worker 启动后的插件加载结果
+        """检查 worker 启动后的插件加载结果，依赖层只有告警时视为通过
 
         参数:
             ready: worker 是否在限定时间内完成 warmup
@@ -106,17 +115,20 @@ class PluginTransactions:
         if nonebot_ok and source_ok:
             return None
         failed = [
-            *(nonebot_result.get("failed") or []),
+            *(nonebot_result.get("failures") or []),
             *(source_result.get("failed") or []),
         ]
         launcher_log(
             "managed plugin verification failed, rolling back transaction: "
-            + ", ".join(str(item.get("store_key", "unknown")) for item in failed)
+            + ", ".join(
+                str(item.get("store_key") or item.get("code") or "unknown")
+                for item in failed
+            )
         )
         return failed
 
     def rollback(self, failed: list[dict[str, Any]]) -> None:
-        """回滚未通过验证的事务（worker 必须已停止）
+        """回滚未通过验证的事务并归档已确认回滚的依赖层事务（worker 必须已停止）
 
         参数:
             failed: 失败项
@@ -126,6 +138,7 @@ class PluginTransactions:
         )
         if self.verify_source and rolled_back:
             source_store.rollback_pending_transaction(failed)
+        nonebot_storage.archive_settled()
 
     def finalize(self) -> None:
         """确认已通过验证的事务并清除对应的待重启项"""

@@ -741,20 +741,6 @@ def _operation_result(
     }
 
 
-def _release_only(transaction: dict[str, Any] | None) -> bool:
-    """待处理事务是否只登记了运行期释放的依赖，可随热处理一并生效"""
-    if not transaction:
-        return False
-    return bool(
-        transaction.get("state") == "pending_restart"
-        and not transaction.get("operations")
-        and not isinstance(transaction.get("generation"), int)
-        and not transaction.get("source_transaction_revision")
-        and not transaction.get("source_build_confirmed")
-        and not transaction.get("database_migration_possible")
-    )
-
-
 def _hot_candidate(
     action: str,
     plugin: dict[str, Any],
@@ -778,7 +764,7 @@ def _hot_candidate(
         for item in plan["package_changes"]["changed"]
     )
     return bool(
-        (pending is None or _release_only(pending))
+        pending is None
         and not plan["source_build_required"]
         and not dependency_changed
         and not plan.get("shared_changes")
