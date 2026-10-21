@@ -11,9 +11,9 @@ from .dependencies import (
     FORBIDDEN_LAYER_PACKAGES,
     DependencyAnalysisError,
     _compile,
+    dependency_floors,
     environment_report,
     protected_core,
-    shared_dependencies,
 )
 from .environment import capture_environment
 
@@ -129,7 +129,7 @@ async def preview_layer_repair(report: dict[str, Any]) -> dict[str, Any]:
     manifest, current = snapshot.manifest, snapshot.versions
     base = {name: dist.version for name, dist in snapshot.base.items()}
     core = protected_core()
-    floors = shared_dependencies()
+    floors = dependency_floors()
     plugins = {name for name in current if name.startswith("nonebot-plugin-")}
     plugins.update(
         canonicalize_name(p["project_link"]) for p in manifest["plugins"].values()

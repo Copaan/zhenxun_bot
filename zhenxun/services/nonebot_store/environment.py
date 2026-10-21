@@ -23,6 +23,8 @@ from packaging.version import InvalidVersion, Version
 from .storage import LAYER_ROOT, generation_path, load_manifest
 
 SOURCE_PLUGIN_ROOT = Path("zhenxun") / "plugins"
+REQUIREMENT_FILES = ("requirement.txt", "requirements.txt")
+"""源码插件声明依赖的文件名"""
 
 
 def _invalid(owner: str, value: str):
@@ -82,6 +84,18 @@ def distributions(paths=None) -> tuple[dict, dict]:
         else:
             selected[name] = distribution
     return selected, duplicates
+
+
+def base_distributions() -> tuple[dict, dict]:
+    """核心虚拟环境中的包，不含依赖层
+
+    返回:
+        tuple[dict, dict]: 包名 -> 已安装的包，以及重复安装的包所在路径
+    """
+    root = LAYER_ROOT.resolve()
+    return distributions(
+        [value for value in sys.path if not Path(value).resolve().is_relative_to(root)]
+    )
 
 
 def dependency_roots(
@@ -235,6 +249,47 @@ def imported_modules(
     return result
 
 
+def _restorable_downgrades(snapshot, kept: set[str], roots: list[str]) -> list[str]:
+    """依赖层中低于本体版本、且剩余依赖都接受本体版本的包
+
+    参数:
+        snapshot: 变化前的环境快照
+        kept: 变化后仍被需要的包
+        roots: 变化后各来源的依赖声明
+
+    返回:
+        list[str]: 可以从依赖层释放、改回本体版本的包
+    """
+    downgraded = {}
+    for name, distribution in snapshot.layer.items():
+        if (base := snapshot.base.get(name)) is None:
+            continue
+        try:
+            if Version(distribution.version) < Version(base.version):
+                downgraded[name] = base.version
+        except InvalidVersion:
+            continue
+    if not downgraded:
+        return []
+    values = list(roots)
+    for name in kept:
+        if (distribution := snapshot.selected.get(name)) is not None:
+            values.extend(distribution.requires or [])
+    specifiers: dict[str, list[SpecifierSet]] = {name: [] for name in downgraded}
+    for raw in values:
+        try:
+            requirement = Requirement(raw)
+        except InvalidRequirement:
+            continue
+        if (name := canonicalize_name(requirement.name)) in specifiers:
+            specifiers[name].append(requirement.specifier)
+    return sorted(
+        name
+        for name, version in downgraded.items()
+        if all(item.contains(version, prereleases=True) for item in specifiers[name])
+    )
+
+
 def released_packages(
     before: dict[str, Any],
     after: dict[str, Any],
@@ -247,7 +302,8 @@ def released_packages(
     """计算依赖来源变化后可以从依赖层释放的包
 
     只释放变化前有来源需要、变化后不再被任何来源需要的包；变化前就没有来源需要
-    的包及其依赖视为保留来源。仍被源码插件导入的包不会释放。
+    的包及其依赖视为保留来源。仍被源码插件导入的包不会释放。依赖层中低于本体
+    版本的包，在变化后的依赖都接受本体版本时一并释放，改回使用本体版本。
 
     参数:
         before: 变化前的清单
@@ -281,14 +337,14 @@ def released_packages(
         [*roots(after, sources_after), *sorted(layer - needed)], selected
     )
     candidates = (needed - kept) & layer - set(protected_core()) - ORM_PACKAGES
+    released = _restorable_downgrades(snapshot, kept, roots(after, sources_after))
     if not candidates:
-        return [], []
+        return released, []
     imports = imported_modules(
         [SOURCE_PLUGIN_ROOT, *added_paths], excluded=removed_paths
     )
-    released: list[str] = []
     retained: list[dict[str, Any]] = []
-    for name in sorted(candidates):
+    for name in sorted(candidates - set(released)):
         modules = sorted(distribution_modules(selected[name]) & set(imports))
         if not modules:
             released.append(name)
@@ -302,7 +358,7 @@ def released_packages(
                 "files": sorted({imports[module] for module in modules}),
             }
         )
-    return released, retained
+    return sorted(released), retained
 
 
 @dataclass
@@ -327,14 +383,21 @@ class EnvironmentSnapshot:
 def capture_environment(
     *, manifest=None, candidate_path: Path | None = None
 ) -> EnvironmentSnapshot:
-    """Read base and selected generation metadata without importing plugins."""
+    """读取核心环境与依赖层的包元数据并收集各来源的依赖声明，不导入插件
+
+    本体的依赖以 pyproject.toml 为准，不读取已安装本体元数据中的依赖声明。
+
+    参数:
+        manifest: 依赖层清单，为空时使用当前清单
+        candidate_path: 代替激活代的候选依赖层目录
+
+    返回:
+        EnvironmentSnapshot: 环境快照
+    """
+    from .dependencies import PROJECT_NAME
+
     manifest = load_manifest() if manifest is None else manifest
-    root = LAYER_ROOT.resolve()
-    paths = []
-    for value in sys.path:
-        if not Path(value).resolve().is_relative_to(root):
-            paths.append(value)
-    base, duplicates = distributions(paths)
+    base, duplicates = base_distributions()
     generation = manifest.get("active_generation")
     layer_path = candidate_path
     if layer_path is None and isinstance(generation, int):
@@ -347,7 +410,8 @@ def capture_environment(
     roots = dependency_roots(manifest)
     requirements = {}
     for name, distribution in selected.items():
-        requirements[name] = list(distribution.requires or [])
+        if name != PROJECT_NAME:
+            requirements[name] = list(distribution.requires or [])
     extras: dict[str, set[str]] = {}
     declarations: dict[tuple[str, str], dict] = {}
     pending = roots + [
@@ -538,6 +602,59 @@ def conflict_key(issue: dict) -> tuple:
             "kind",
             "layer",
         )
+    )
+
+
+def core_packages(snapshot: EnvironmentSnapshot) -> set[str]:
+    """按核心虚拟环境中已安装的本体元数据计算本体依赖的包
+
+    依赖同步不重装本体，已安装本体的元数据保留上次完整安装时的依赖声明。
+
+    参数:
+        snapshot: 环境快照
+
+    返回:
+        set[str]: 本体及其依赖的规范化包名
+    """
+    from .dependencies import PROJECT_NAME
+
+    return reachable_packages([PROJECT_NAME], snapshot.base)
+
+
+def dropped_core_packages(previous: set[str]) -> list[str]:
+    """本体依赖变化后可以从核心虚拟环境移除的包
+
+    只移除变化前属于本体依赖、变化后不再被任何依赖来源（含当前 pyproject.toml）
+    需要的包；被源码插件导入的包，以及 ORM 包保留。
+
+    参数:
+        previous: 变化前本体依赖的包，见 core_packages
+
+    返回:
+        list[str]: 可以移除的包
+    """
+    from zhenxun.services.plugin_store.plugin_store_receipts import (
+        receipt_dependency_inputs,
+    )
+
+    from .dependencies import PROJECT_NAME
+    from .policy import ORM_PACKAGES
+
+    snapshot = capture_environment()
+    candidates = (previous - {PROJECT_NAME}) & set(snapshot.base) - ORM_PACKAGES
+    if not candidates:
+        return []
+    roots = [raw for _, raw in dependency_roots(snapshot.manifest)]
+    roots.extend(
+        raw for values in receipt_dependency_inputs().values() for raw in values
+    )
+    roots.extend(sorted(snapshot.layer))
+    candidates -= reachable_packages(roots, snapshot.selected)
+    imports = set(imported_modules([SOURCE_PLUGIN_ROOT]))
+    return sorted(
+        name
+        for name in candidates
+        if not distribution_modules(snapshot.base[name]) & imports
     )
 
 

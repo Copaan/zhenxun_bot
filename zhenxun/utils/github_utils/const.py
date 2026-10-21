@@ -51,8 +51,8 @@ ALIYUN_ORG_ID = "67a361cf556e6cdab537117a"
 ALIYUN_ENDPOINT = "devops.cn-hangzhou.aliyuncs.com"
 """阿里云 endpoint"""
 
-ALIYUN_REGION = "cn-hangzhou"
-"""阿里云区域"""
+ALIYUN_API_VERSION = "2021-06-25"
+"""阿里云云效 OpenAPI 版本"""
 
 Aliyun_AccessKey_ID = "LTAI5tNmf7KaTAuhcvRobAQs"
 """阿里云AccessKey ID"""

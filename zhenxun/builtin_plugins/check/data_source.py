@@ -1,11 +1,11 @@
 import contextlib
 from dataclasses import dataclass
+from functools import cache
 import os
 from pathlib import Path
 import platform
 import subprocess
 
-import cpuinfo
 import nonebot
 from nonebot.utils import run_sync
 import psutil
@@ -64,6 +64,57 @@ def get_arm_cpu_freq_safe():
                     freq = float(line.split(":")[1].strip())
                     return round(freq / 1000, 2)  # 转换为GHz
     return 0  # 如果所有方法都失败，返回0
+
+
+@cache
+def get_cpu_brand() -> str:
+    """获取 CPU 型号
+
+    依次读取 Windows 注册表、macOS sysctl、Linux /proc/cpuinfo 与 lscpu，
+    都无法获取时使用 platform.processor()。
+
+    返回:
+        str: CPU 型号，无法获取时为 Unknown
+    """
+    system = platform.system()
+    if system == "Windows":
+        with contextlib.suppress(OSError):
+            import winreg
+
+            with winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                r"HARDWARE\DESCRIPTION\System\CentralProcessor\0",
+            ) as key:
+                if brand := str(winreg.QueryValueEx(key, "ProcessorNameString")[0]):
+                    return brand.strip()
+    elif system == "Darwin":
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            result = subprocess.run(
+                ["sysctl", "-n", "machdep.cpu.brand_string"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()
+    else:
+        with contextlib.suppress(OSError, UnicodeDecodeError):
+            with open("/proc/cpuinfo", encoding="utf-8") as f:
+                for line in f:
+                    key, _, value = line.partition(":")
+                    if key.strip() == "model name" and value.strip():
+                        return value.strip()
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            env = os.environ.copy()
+            env["LC_ALL"] = "C"
+            result = subprocess.run(
+                ["lscpu"], capture_output=True, text=True, env=env, timeout=5
+            )
+            for line in result.stdout.splitlines():
+                key, _, value = line.partition(":")
+                if key.strip() == "Model name" and value.strip():
+                    return value.strip()
+    return platform.processor() or "Unknown"
 
 
 @dataclass
@@ -212,7 +263,7 @@ async def get_status_info() -> dict:
 
     system = platform.uname()
     data = data.get_system_info()
-    data["brand_raw"] = cpuinfo.get_cpu_info().get("brand_raw", "Unknown")
+    data["brand_raw"] = await run_sync(get_cpu_brand)()
     baidu, google = await __get_network_info()
     data["baidu"] = "#8CC265" if baidu else "red"
     data["google"] = "#8CC265" if google else "red"

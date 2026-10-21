@@ -25,7 +25,7 @@ DEPENDENCIES = "dependencies.json"
 BACKUP_DIR = Path("data/backups")
 CATEGORIES = ("configuration", "data", "plugins", "resources")
 DEFAULT_CATEGORIES = ("configuration", "data", "plugins")
-_ROOTS = ("data", "resources", "zhenxun/plugins", "plugins", "certs")
+_ROOTS = ("data", "resources", "zhenxun/plugins", "certs")
 _EXCLUDED_DIRS = frozenset(
     {
         ".git",
@@ -68,7 +68,7 @@ def category_for(relative: str) -> str | None:
     path = relative.casefold()
     if path.startswith(_EXCLUDED_PREFIXES) or path.endswith(_EXCLUDED_SUFFIXES):
         return None
-    if path.startswith(("zhenxun/plugins/", "plugins/")):
+    if path.startswith("zhenxun/plugins/"):
         return "plugins"
     if path.startswith("resources/"):
         return "resources"

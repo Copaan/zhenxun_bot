@@ -66,7 +66,7 @@ def execute(action: str) -> None:
             from zhenxun.services.update.update_service import _sync_dependencies
 
             guard_orm_sync()
-            _sync_dependencies(verify_environment=True)
+            _sync_dependencies()
             result["value"] = True
         elif action == "plugin-requirements":
             from zhenxun.services.nonebot_store.manual import stage_requirement_files
@@ -155,12 +155,17 @@ async def sync_dependencies(paths: list[str]) -> None:
     参数:
         paths: 发生变化的依赖文件
     """
+    from zhenxun.services.nonebot_store.environment import REQUIREMENT_FILES
     from zhenxun.services.nonebot_store.storage import (
         dependency_sync_status,
         save_dependency_sync_status,
     )
 
-    context = dependency_sync_status()
+    context = {
+        key: value
+        for key, value in dependency_sync_status().items()
+        if key not in {"code", "details"}
+    }
     save_dependency_sync_status({**context, "status": "running", "paths": paths})
     try:
         resynced = False
@@ -168,9 +173,7 @@ async def sync_dependencies(paths: list[str]) -> None:
             await run("sync-core")
             resynced = await run("nonebot-resync")
         requirement_paths = [
-            path
-            for path in paths
-            if Path(path).name in {"requirement.txt", "requirements.txt"}
+            path for path in paths if Path(path).name in REQUIREMENT_FILES
         ]
         if requirement_paths:
             await run("plugin-requirements", requirement_paths)

@@ -214,24 +214,24 @@ async def request_restart(
 
 
 def _validated_dependency_paths(paths: set[Path]) -> list[str]:
+    from zhenxun.services.nonebot_store.environment import (
+        REQUIREMENT_FILES,
+        SOURCE_PLUGIN_ROOT,
+    )
+
     root = Path().resolve()
     root_files = {
         (root / "pyproject.toml").resolve(),
         (root / "uv.lock").resolve(),
     }
-    plugin_roots = [
-        (root / "zhenxun" / "plugins").resolve(),
-        (root / "zhenxun" / "builtin_plugins").resolve(),
-    ]
+    plugin_root = (root / SOURCE_PLUGIN_ROOT).resolve()
     result: list[str] = []
     for raw_path in paths:
         path = raw_path.resolve()
         if path in root_files:
             result.append(path.relative_to(root).as_posix())
             continue
-        if path.name not in {"requirement.txt", "requirements.txt"} or not any(
-            path.is_relative_to(base) for base in plugin_roots
-        ):
+        if path.name not in REQUIREMENT_FILES or not path.is_relative_to(plugin_root):
             raise ValueError("dependency_path_not_allowed")
         result.append(path.relative_to(root).as_posix())
     return sorted(set(result))

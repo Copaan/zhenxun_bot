@@ -496,9 +496,9 @@ def _write_files(request: dict, root: Path, files: _Files) -> None:
     from dotenv import dotenv_values, set_key
 
     from zhenxun.services.nonebot_store.storage import read_json, write_json
+    from zhenxun.services.plugin_store.plugin_store_receipts import RECEIPT_FILE
 
     from . import backup
-    from .deps import RECEIPTS_FILE
 
     files.protect(_environment_file(root))
     local = {
@@ -517,9 +517,9 @@ def _write_files(request: dict, root: Path, files: _Files) -> None:
                     _keep_local_keys(root / relative, local[relative])
     if "plugins" in request["categories"]:
         saved = json.loads((PACKAGE / backup.DEPENDENCIES).read_text("utf-8"))
-        files.protect(RECEIPTS_FILE.as_posix())
-        receipts = read_json(root / RECEIPTS_FILE, {})
-        write_json(root / RECEIPTS_FILE, {**receipts, **saved["store_receipts"]})
+        files.protect(RECEIPT_FILE.as_posix())
+        receipts = read_json(root / RECEIPT_FILE, {})
+        write_json(root / RECEIPT_FILE, {**receipts, **saved["store_receipts"]})
     environment = _environment_file(root)
     files.protect(environment)
     set_key(root / environment, "DB_URL", request["db_url"], quote_mode="always")

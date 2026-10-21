@@ -14,7 +14,7 @@ from packaging.specifiers import SpecifierSet
 from packaging.utils import canonicalize_name
 from packaging.version import InvalidVersion, Version
 
-from .deps import FORMAT, KINDS, _parse, _plugin_requirements, _version
+from .deps import KINDS, plugin_requirement_files
 
 _NEARBY_LIMIT = 5
 _PLATFORMS = {
@@ -30,77 +30,10 @@ _PLATFORMS = {
 }
 """备份记录的平台 -> uv 解析使用的目标平台"""
 _IMPLIED_KINDS = {"venv", "layer"}
-_DEV_TOOLS = {
-    "black",
-    "coverage",
-    "flake8",
-    "isort",
-    "mypy",
-    "nonebug",
-    "nox",
-    "pre-commit",
-    "pylint",
-    "pyright",
-    "pytest",
-    "respx",
-    "ruff",
-    "tox",
-}
-"""开发与测试工具，没有插件声明时恢复不安装"""
 _UNAVAILABLE = re.compile(
     r"([A-Za-z0-9][A-Za-z0-9._-]*)(?:==\S+)?\s+ha(?:s|ve)\s+no\s+wheels\s+with\s+"
     r"a\s+matching\s+(platform|Python)"
 )
-
-
-def _legacy_extras(saved: dict, files: Path) -> dict[str, dict]:
-    """旧格式备份没有记录的真寻商店插件依赖与插件目录声明的依赖
-
-    参数:
-        saved: 备份中的 dependencies.json
-        files: 备份包解压后的 files 目录
-
-    返回:
-        dict[str, dict]: 包名 -> {kind, requirements, version}
-    """
-    from zhenxun.services.nonebot_store.dependencies import project_closure
-
-    skip = (
-        set(project_closure())
-        | set(saved["extra_requirements"])
-        | {canonicalize_name(name) for name in saved["manual_requirements"]}
-        | {
-            canonicalize_name(str(item.get("project_link") or ""))
-            for item in saved["plugins"].values()
-        }
-    )
-    result: dict[str, dict] = {}
-
-    def add(name: str, kind: str, requirements: list[str]) -> None:
-        if name in skip:
-            return
-        item = result.setdefault(
-            name,
-            {
-                "kind": kind,
-                "requirements": [],
-                "version": _version(saved["packages"].get(name)),
-            },
-        )
-        for raw in requirements:
-            if raw not in item["requirements"]:
-                item["requirements"].append(raw)
-
-    for receipt in (saved.get("store_receipts") or {}).values():
-        if not isinstance(receipt, dict):
-            continue
-        for raw in receipt.get("dependency_inputs") or []:
-            requirement = _parse(str(raw))
-            if requirement:
-                add(canonicalize_name(requirement.name), "store", [str(requirement)])
-    for name, item in _plugin_requirements(files).items():
-        add(name, "plugin", item["requirements"])
-    return result
 
 
 def describe(details) -> str:
@@ -178,15 +111,13 @@ def layer_status(revision: str) -> dict:
     return {"state": "done", **({"warnings": warnings} if warnings else {})}
 
 
-def _roots(saved: dict, files: Path | None) -> dict[str, dict]:
+def _roots(saved: dict) -> dict[str, dict]:
     """备份中需要恢复的顶层依赖：商店插件、手动依赖与其他依赖
 
-    旧格式备份会从 files 中的商店回执与插件目录补齐依赖。随本体安装的包不按备份
-    版本固定，由解析器优先沿用当前环境中的版本。
+    随本体安装的包不按备份版本固定，由解析器优先沿用当前环境中的版本。
 
     参数:
         saved: 备份中的 dependencies.json
-        files: 备份包解压后的 files 目录
 
     返回:
         dict[str, dict]: 键 -> {kind, name, requirements, version, url, plugin}，
@@ -195,9 +126,6 @@ def _roots(saved: dict, files: Path | None) -> dict[str, dict]:
     from zhenxun.services.nonebot_store.dependencies import project_closure
 
     shared = set(project_closure())
-    extras = dict(saved["extra_requirements"])
-    if saved.get("format", 1) < FORMAT and files is not None:
-        extras.update(_legacy_extras(saved, files))
     roots: dict[str, dict] = {}
     for key, plugin in saved["plugins"].items():
         roots[key] = {
@@ -214,12 +142,14 @@ def _roots(saved: dict, files: Path | None) -> dict[str, dict]:
             {
                 "kind": "manual",
                 "requirements": list(values),
-                "version": _version(saved["packages"].get(canonicalize_name(name))),
+                "version": (saved["packages"].get(canonicalize_name(name)) or {}).get(
+                    "version"
+                ),
             },
         )
         for name, values in saved["manual_requirements"].items()
     ]
-    for name, item in [*items, *extras.items()]:
+    for name, item in [*items, *saved["extra_requirements"].items()]:
         roots[name] = {
             "kind": item.get("kind") or "venv",
             "name": name,
@@ -451,7 +381,7 @@ async def _combine(
         packages = singles.get(key) or {}
         return sum(
             any(
-                name in items and _version(items[name]) != _version(value)
+                name in items and items[name]["version"] != value["version"]
                 for name, value in packages.items()
             )
             for other, items in singles.items()
@@ -488,6 +418,46 @@ async def _combine(
             skip(key, f"与其他依赖冲突：{reason}")
             roots.pop(key)
     return plan
+
+
+def _declared_files(files: Path | None, packages: dict) -> dict[str, list[str]]:
+    """恢复的插件代码中可以登记为插件依赖的 requirements 文件
+
+    文件中的依赖声明都有效，且适用于当前环境的依赖都能由恢复后的环境满足时登记。
+
+    参数:
+        files: 备份包解压后的 files 目录，未恢复插件代码时为 None
+        packages: 恢复后依赖层中的包
+
+    返回:
+        dict[str, list[str]]: 文件路径 -> 依赖声明
+    """
+    from zhenxun.services.nonebot_store.dependencies import (
+        DependencyAnalysisError,
+        parse_requirement,
+    )
+    from zhenxun.services.nonebot_store.environment import base_distributions
+
+    if files is None:
+        return {}
+    versions = {name: dist.version for name, dist in base_distributions()[0].items()}
+    versions.update({name: str(item["version"]) for name, item in packages.items()})
+    result: dict[str, list[str]] = {}
+    for path, lines in plugin_requirement_files(files).items():
+        try:
+            requirements = [parse_requirement(line) for line in lines]
+        except DependencyAnalysisError:
+            continue
+        if requirements and all(
+            not _applies(str(item))
+            or (
+                item.name in versions
+                and item.specifier.contains(versions[item.name], prereleases=True)
+            )
+            for item in requirements
+        ):
+            result[path] = [str(item) for item in requirements]
+    return result
 
 
 def _source_target(saved: dict) -> tuple[str, str] | None:
@@ -596,16 +566,17 @@ async def stage_restore(
     """把备份中的依赖解析为当前环境可用的版本，写入待应用的依赖层事务
 
     平台条件不适用于当前环境的依赖声明不参与解析，全部声明都不适用的列入
-    platform_only；虚拟环境与依赖层中的开发、测试工具列入 dev_tools，不安装。
-    再按备份时的平台与 Python 版本解析全部顶层依赖（商店插件、手动依赖、插件声明
-    与虚拟环境中的包），被其他顶层依赖间接需要的虚拟环境包与依赖层包只作为子依赖，
-    由解析器按当前平台决定是否安装；被间接需要的手动依赖与插件声明不再固定备份时
-    的版本。其余顶层依赖优先使用备份时的版本；整体解析失败时逐个检查，备份时的
-    版本不可用的依次改用次版本号相同、主版本号相同的相近版本，商店插件以外的依赖
-    最后放开版本。之后按来源与版本分歧逐个合并，冲突的依赖放开版本或改用相近版本，
+    platform_only。再按备份时的平台与 Python 版本解析全部顶层依赖（商店插件、
+    手动依赖、插件声明与虚拟环境中的包），被其他顶层依赖间接需要的虚拟环境包与
+    依赖层包只作为子依赖，由解析器按当前平台决定是否安装；被间接需要的手动依赖
+    与插件声明不再固定备份时的版本。其余顶层依赖优先使用备份时的版本；整体解析
+    失败时逐个检查，备份时的版本不可用的依次改用次版本号相同、主版本号相同的相近
+    版本，商店插件以外的依赖最后放开版本。之后按来源与版本分歧逐个合并，冲突的依赖放开版本或改用相近版本，
     仍不可用的按 skip_failed 决定中止或跳过。子依赖由解析器补齐并优先沿用备份时
     的版本，允许构建源码包，构建失败的包所属的顶层依赖同样跳过。核心依赖保持当前
     环境的版本。pip、uv 等安装工具只能在控制台安装，列入 unsupported_requirements。
+    恢复插件代码时，恢复后的环境能满足的插件 requirements 文件登记为插件依赖，其中
+    声明的插件目录依赖不再作为手动依赖。
 
     参数:
         saved: 备份中的 dependencies.json
@@ -613,7 +584,7 @@ async def stage_restore(
         files: 备份包解压后的 files 目录，恢复插件代码时传入
 
     返回:
-        dict: {staged, revision, restored, implied, nearby, platform_only, dev_tools,
+        dict: {staged, revision, restored, implied, nearby, platform_only,
             skipped_plugins, skipped_requirements, skip_reasons,
             unsupported_requirements}，implied 为作为子依赖处理的顶层依赖 -> 需要
             它的顶层依赖，nearby 为改用其他版本的顶层依赖 -> [备份时版本, 安装版本]，
@@ -627,7 +598,7 @@ async def stage_restore(
     from zhenxun.services.nonebot_store.manual import stage_plan
     from zhenxun.services.nonebot_store.storage import pending_transaction
 
-    roots = _roots(saved, files)
+    roots = _roots(saved)
     tools = {
         key for key, root in roots.items() if root["name"] in FORBIDDEN_LAYER_PACKAGES
     }
@@ -637,7 +608,6 @@ async def stage_restore(
         "implied": {},
         "nearby": {},
         "platform_only": {},
-        "dev_tools": [],
         "skipped_plugins": [],
         "skipped_requirements": [],
         "skip_reasons": {},
@@ -653,14 +623,8 @@ async def stage_restore(
             markers = {str(Requirement(raw).marker) for raw in root["requirements"]}
             report["platform_only"][key] = "；".join(sorted(markers))
             roots.pop(key)
-        elif root["kind"] in _IMPLIED_KINDS and (
-            root["name"] in _DEV_TOOLS or root["name"].startswith("pytest-")
-        ):
-            report["dev_tools"].append(key)
-            roots.pop(key)
         else:
             root["requirements"] = applicable
-    report["dev_tools"].sort()
 
     def skip(key: str, reason: str) -> None:
         url = roots.get(key, {}).get("url")
@@ -673,7 +637,7 @@ async def stage_restore(
         report["skip_reasons"][key] = reason + (f"；原安装地址 {url}" if url else "")
 
     preferences = {
-        **{name: _version(value) for name, value in saved["packages"].items()},
+        **{name: value["version"] for name, value in saved["packages"].items()},
         **(saved.get("installed") or {}),
     }
     if len(roots) > 1:
@@ -703,7 +667,7 @@ async def stage_restore(
     while plan and plan["source_build_required"]:
         failed = await prebuild_packages(
             {
-                name: str(_version(value))
+                name: str(value["version"])
                 for name, value in plan["target_manifest"]["packages"].items()
             }
         )
@@ -728,12 +692,24 @@ async def stage_restore(
     report["nearby"] = {
         key: [
             root["version"],
-            pins[key] or _version(packages.get(root["name"])) or "当前环境中的版本",
+            pins[key]
+            or (packages.get(root["name"]) or {}).get("version")
+            or "当前环境中的版本",
         ]
         for key, root in roots.items()
         if root["version"] and pins[key] != root["version"]
     }
     if plan:
+        target = plan["target_manifest"]
+        target["plugin_requirements"] = _declared_files(files, packages)
+        declared = {
+            canonicalize_name(Requirement(raw).name)
+            for values in target["plugin_requirements"].values()
+            for raw in values
+        }
+        for root in roots.values():
+            if root["kind"] == "plugin" and root["name"] in declared:
+                target["manual_requirements"].pop(root["name"], None)
         report["staged"] = stage_plan(plan, plan["requirements"], restore=True)
     if report["staged"]:
         report["revision"] = (pending_transaction() or {}).get("revision")

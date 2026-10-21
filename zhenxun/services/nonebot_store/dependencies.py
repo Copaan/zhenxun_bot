@@ -5,7 +5,6 @@ from collections import deque
 import contextlib
 from copy import deepcopy
 from hashlib import sha256
-import importlib.metadata
 import json
 import os
 from pathlib import Path
@@ -35,9 +34,9 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - Python 3.10
     import tomli as tomllib
 
-from .storage import LAYER_ROOT, load_manifest
+from .storage import load_manifest
 
-SOLVER_POLICY_VERSION = 11
+SOLVER_POLICY_VERSION = 12
 LOCK_FILE = Path("uv.lock")
 _REQ_LINE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)==([^\s;]+)")
 _SENSITIVE = re.compile(r"(?i)(authorization|token|password|secret)=?[^\s]*")
@@ -75,6 +74,8 @@ IMMUTABLE_PACKAGES = frozenset(
         "aiocache",
     }
 )
+# 本体代码在 pyproject 声明的整个版本范围内都兼容的包，依赖层可在范围内改用更低版本
+RANGE_PACKAGES = frozenset({"aiofiles", "cryptography", "numpy", "pillow"})
 FORBIDDEN_LAYER_PACKAGES = frozenset({PROJECT_NAME, "pip", "uv"})
 
 
@@ -89,28 +90,6 @@ def safe_process_error(value: str) -> str:
     value = re.sub(r"https?://[^\s<>]+", "<package-source>", value)
     value = _SENSITIVE.sub(r"\1=<redacted>", value)
     return " ".join(value.split())[-1200:]
-
-
-def _distribution_inventory(*, include_layer: bool) -> dict[str, str]:
-    result: dict[str, str] = {}
-    layer_root = LAYER_ROOT.resolve()
-    for distribution in importlib.metadata.distributions():
-        name = distribution.metadata.get("Name")
-        if not name:
-            continue
-        if not include_layer:
-            try:
-                location = Path(distribution.locate_file("")).resolve()
-                if location.is_relative_to(layer_root):
-                    continue
-            except (OSError, ValueError):
-                pass
-        result.setdefault(canonicalize_name(name), distribution.version)
-    return result
-
-
-def base_installed_inventory() -> dict[str, str]:
-    return _distribution_inventory(include_layer=False)
 
 
 def installed_inventory() -> dict[str, str]:
@@ -141,11 +120,11 @@ def _lock_package_enabled(package: dict[str, Any]) -> bool:
 _lock_cache: tuple[tuple[str, int, int], Any] | None = None
 
 
-def _lock_packages() -> tuple[dict[str, set[str]], dict[str, str], set[str]]:
+def _lock_packages() -> tuple[dict[str, set[str]], dict[str, str], set[str], set[str]]:
     """解析 uv.lock 中项目可达的依赖图，按文件修改时间和大小缓存
 
     返回:
-        tuple: 依赖图、锁定版本、项目直接依赖
+        tuple: 依赖图、锁定版本、项目直接依赖、开发依赖组可达的包
     """
     global _lock_cache
     if not LOCK_FILE.is_file():
@@ -154,15 +133,18 @@ def _lock_packages() -> tuple[dict[str, set[str]], dict[str, str], set[str]]:
     key = (str(LOCK_FILE.resolve()), stat.st_mtime_ns, stat.st_size)
     if _lock_cache is None or _lock_cache[0] != key:
         _lock_cache = (key, _parse_lock_packages())
-    graph, versions, roots = _lock_cache[1]
+    graph, versions, roots, dev = _lock_cache[1]
     return (
         {name: set(items) for name, items in graph.items()},
         dict(versions),
         set(roots),
+        set(dev),
     )
 
 
-def _parse_lock_packages() -> tuple[dict[str, set[str]], dict[str, str], set[str]]:
+def _parse_lock_packages() -> (
+    tuple[dict[str, set[str]], dict[str, str], set[str], set[str]]
+):
     data = tomllib.loads(LOCK_FILE.read_text(encoding="utf-8"))
     packages: dict[str, dict[str, Any]] = {}
     for package in data.get("package", []):
@@ -180,55 +162,73 @@ def _parse_lock_packages() -> tuple[dict[str, set[str]], dict[str, str], set[str
             raise DependencyAnalysisError("project_lock_branch_ambiguous", name)
         packages[name] = package
 
-    graph: dict[str, set[str]] = {}
     versions: dict[str, str] = {
         name: str(package["version"])
         for name, package in packages.items()
         if package.get("version")
     }
-    selected_extras: dict[str, set[str]] = {}
-    visited: set[str] = set()
-    queue: deque[tuple[str, frozenset[str]]] = deque([(PROJECT_NAME, frozenset())])
-    while queue:
-        name, extras = queue.popleft()
-        previous_extras = selected_extras.setdefault(name, set())
-        new_extras = set(extras) - previous_extras
-        first_visit = name not in visited
-        if not first_visit and not new_extras:
-            continue
-        visited.add(name)
-        previous_extras.update(extras)
-        package = packages.get(name, {})
-        dependencies = list(package.get("dependencies", [])) if first_visit else []
-        optional = package.get("optional-dependencies", {})
-        for extra in extras if first_visit else new_extras:
-            dependencies.extend(optional.get(extra, []))
-        for item in dependencies:
-            if (
-                not isinstance(item, dict)
-                or not item.get("name")
-                or not _lock_dependency_enabled(item)
-            ):
+
+    def walk(declared: list) -> dict[str, set[str]]:
+        graph: dict[str, set[str]] = {}
+        selected_extras: dict[str, set[str]] = {}
+        visited: set[str] = set()
+        queue: deque[tuple[str, frozenset[str]]] = deque([(PROJECT_NAME, frozenset())])
+        while queue:
+            name, extras = queue.popleft()
+            previous_extras = selected_extras.setdefault(name, set())
+            new_extras = set(extras) - previous_extras
+            first_visit = name not in visited
+            if not first_visit and not new_extras:
                 continue
-            dependency = canonicalize_name(str(item["name"]))
-            selected = packages.get(dependency)
-            if (
-                selected is None
-                or (item.get("version") and item["version"] != selected.get("version"))
-                or (item.get("source") and item["source"] != selected.get("source"))
-            ):
-                raise DependencyAnalysisError(
-                    "project_lock_branch_ambiguous", dependency
+            visited.add(name)
+            previous_extras.update(extras)
+            package = packages.get(name, {})
+            dependencies = []
+            if first_visit:
+                dependencies = (
+                    list(declared)
+                    if name == PROJECT_NAME
+                    else list(package.get("dependencies", []))
                 )
-            graph.setdefault(name, set()).add(dependency)
-            queue.append(
-                (
-                    dependency,
-                    frozenset(str(extra) for extra in item.get("extra", [])),
+            optional = package.get("optional-dependencies", {})
+            for extra in extras if first_visit else new_extras:
+                dependencies.extend(optional.get(extra, []))
+            for item in dependencies:
+                if (
+                    not isinstance(item, dict)
+                    or not item.get("name")
+                    or not _lock_dependency_enabled(item)
+                ):
+                    continue
+                dependency = canonicalize_name(str(item["name"]))
+                selected = packages.get(dependency)
+                if (
+                    selected is None
+                    or (
+                        item.get("version")
+                        and item["version"] != selected.get("version")
+                    )
+                    or (item.get("source") and item["source"] != selected.get("source"))
+                ):
+                    raise DependencyAnalysisError(
+                        "project_lock_branch_ambiguous", dependency
+                    )
+                graph.setdefault(name, set()).add(dependency)
+                queue.append(
+                    (
+                        dependency,
+                        frozenset(str(extra) for extra in item.get("extra", [])),
+                    )
                 )
-            )
+        return graph
+
+    project = packages.get(PROJECT_NAME, {})
+    graph = walk(list(project.get("dependencies", [])))
+    groups = project.get("dev-dependencies") or {}
+    dev_graph = walk([item for values in groups.values() for item in values])
+    dev = {name for items in dev_graph.values() for name in items}
     roots = set(graph.get(PROJECT_NAME, set()))
-    return graph, versions, roots
+    return graph, versions, roots, dev
 
 
 def _lock_dependency_enabled(item: dict[str, Any]) -> bool:
@@ -236,7 +236,7 @@ def _lock_dependency_enabled(item: dict[str, Any]) -> bool:
 
 
 def project_closure() -> dict[str, str]:
-    graph, versions, roots = _lock_packages()
+    graph, versions, roots, _ = _lock_packages()
     selected: set[str] = set()
     queue = deque(roots)
     while queue:
@@ -246,6 +246,16 @@ def project_closure() -> dict[str, str]:
         selected.add(name)
         queue.extend(graph.get(name, set()) - selected)
     return {name: versions[name] for name in selected if versions.get(name)}
+
+
+def dev_packages() -> set[str]:
+    """uv.lock 中只被开发依赖组需要的包，依赖同步不安装它们
+
+    返回:
+        set[str]: 规范化包名
+    """
+    *_, dev = _lock_packages()
+    return dev - set(project_closure())
 
 
 def protected_core() -> dict[str, str]:
@@ -267,7 +277,7 @@ def protected_core() -> dict[str, str]:
 def shared_dependencies() -> dict[str, str]:
     """本体依赖中可变包的锁定版本
 
-    这些包可以随插件需要在依赖层中升级，解析时以锁定版本作为下限，不会降级。
+    这些包可以随插件需要在依赖层中改变版本，解析时的约束见 dependency_floors。
 
     返回:
         dict[str, str]: 包名 -> uv.lock 中的版本
@@ -275,6 +285,26 @@ def shared_dependencies() -> dict[str, str]:
     closure = project_closure()
     immutable = protected_core()
     return {name: version for name, version in closure.items() if name not in immutable}
+
+
+def dependency_floors() -> dict[str, str]:
+    """解析依赖层时本体可变依赖的版本约束
+
+    一般不低于锁定版本；RANGE_PACKAGES 中的包限定在 pyproject 声明的范围内，插件
+    需要时可以改用范围内更低的版本。
+
+    返回:
+        dict[str, str]: 包名 -> 版本约束，如 ">=1.2.0"
+    """
+    requirements = _project_requirement_map()
+    floors = {}
+    for name, version in shared_dependencies().items():
+        requirement = requirements.get(name)
+        if name in RANGE_PACKAGES and requirement and requirement.specifier:
+            floors[name] = str(requirement.specifier)
+        else:
+            floors[name] = f">={version}"
+    return floors
 
 
 def project_requirements() -> list[str]:
@@ -523,7 +553,14 @@ async def preflight_environment_repair() -> tuple[bool, str]:
     from zhenxun.services.installer_network import project_environment, uv_command
 
     process = await asyncio.create_subprocess_exec(
-        *uv_command("sync", "--locked", "--inexact", "--dry-run"),
+        *uv_command(
+            "sync",
+            "--locked",
+            "--inexact",
+            "--no-install-project",
+            "--no-dev",
+            "--dry-run",
+        ),
         cwd=str(Path.cwd()),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -536,9 +573,10 @@ async def preflight_environment_repair() -> tuple[bool, str]:
 
 def guard_orm_sync() -> None:
     """Reject lock synchronization that would change any ORM distribution."""
+    from .environment import base_distributions
     from .policy import guard_orm_changes
 
-    current = base_installed_inventory()
+    current = {name: dist.version for name, dist in base_distributions()[0].items()}
     guard_orm_changes(current, {**current, **project_closure()})
 
 
@@ -641,12 +679,12 @@ def _write_constraints(
     参数:
         path: 约束文件
         values: 固定版本的包
-        floors: 不低于给定版本的包，已固定版本的包忽略
+        floors: 包名 -> 版本约束，已固定版本的包忽略
     """
     lines = [f"{name}=={version}\n" for name, version in sorted(values.items())]
     lines.extend(
-        f"{name}>={version}\n"
-        for name, version in sorted((floors or {}).items())
+        f"{name}{specifier}\n"
+        for name, specifier in sorted((floors or {}).items())
         if name not in values
     )
     path.write_text("".join(lines), encoding="utf-8")
@@ -795,7 +833,7 @@ async def _compile(
                     if name in constraints:
                         specifiers.append("==" + constraints[name])
                     elif floors and name in floors:
-                        specifiers.append(">=" + floors[name])
+                        specifiers.append(floors[name])
                     if await project_static_sources(
                         name, projection, installer_environment(), specifiers
                     ):
@@ -1031,7 +1069,7 @@ async def _diagnose_failure(
         protected_core(),
         wheels_only=False,
         allow_build=allow_build,
-        floors=shared_dependencies(),
+        floors=dependency_floors(),
     )
     if core is not None:
         return DependencyAnalysisError("third_party_dependency_conflict", detail)
@@ -1061,9 +1099,10 @@ async def resolve_layer(
 
     从请求的包出发解析，新解析到的包连同其他来源（本体、NoneBot 插件、真寻商店
     插件、手动依赖、已安装包）对它们的声明一起加入下一轮，直到不再出现新包。
-    核心不可变包与已安装的 ORM 包固定版本，其余本体依赖不低于锁定版本，当前版本
-    优先保留；请求之外的包在必要时也会变化，作为连带变化列出。
-    解析失败且放开 ORM 固定后会改变已安装的 ORM 与数据库驱动时，提示需在控制台操作。
+    核心不可变包与已安装的 ORM 包固定版本，其余本体依赖按 dependency_floors 约束，
+    当前版本优先保留（RANGE_PACKAGES 优先使用本体版本）；请求之外的包在必要时也会
+    变化，作为连带变化列出。
+    解析失败且放开 ORM 固定后会改变已安装的 ORM 包时，提示需在控制台操作。
 
     参数:
         requests: 本次请求的依赖声明
@@ -1072,7 +1111,7 @@ async def resolve_layer(
         sources: 真寻商店插件的依赖声明，键为 store_key
         replaced: 声明不再参与解析的来源（被更新或替换的插件）
         allow_build: 是否允许构建源码包读取依赖信息
-        restore: 是否为恢复备份，允许改变 ORM 与数据库驱动
+        restore: 是否为恢复备份，允许改变 ORM 包
         preferences: 当前环境中没有的包优先选用的版本
         invalid_code: 请求自身无法解析时的错误码
 
@@ -1095,6 +1134,7 @@ async def resolve_layer(
     current = snapshot.versions
     base = {name: dist.version for name, dist in snapshot.base.items()}
     core = protected_core()
+    floors = dependency_floors()
     packages = deepcopy(manifest.get("packages", {}))
     frozen = {
         **({} if restore else {n: current[n] for n in ORM_PACKAGES if n in current}),
@@ -1104,6 +1144,7 @@ async def resolve_layer(
         **(preferences or {}),
         **current,
         **{name: str(info["version"]) for name, info in packages.items()},
+        **{name: base[name] for name in RANGE_PACKAGES if name in base},
     }
     roots = [
         (owner, raw)
@@ -1132,7 +1173,7 @@ async def resolve_layer(
             wheels_only=False,
             allow_build=allow_build,
             preferences=preferred,
-            floors=shared_dependencies(),
+            floors=floors,
         )
         if result is None:
             if set(frozen) - set(core):
@@ -1142,7 +1183,7 @@ async def resolve_layer(
                     wheels_only=False,
                     allow_build=allow_build,
                     preferences=preferred,
-                    floors=shared_dependencies(),
+                    floors=floors,
                 )
                 if relaxed is not None:
                     guard_orm_changes(current, {**current, **relaxed})
@@ -1467,13 +1508,28 @@ def read_requirement_files(files: list[Path]) -> list[str]:
     返回:
         list[str]: 依赖声明
     """
-    requirements: list[str] = []
-    for path in files:
-        for raw_line in path.read_text(encoding="utf-8-sig").splitlines():
-            line = re.sub(r"\s+#.*$", "", raw_line).strip()
-            if line and not line.startswith("#"):
-                requirements.append(str(parse_requirement(line)))
-    return requirements
+    return [
+        str(parse_requirement(line))
+        for path in files
+        for line in requirement_lines(path)
+    ]
+
+
+def requirement_lines(path: Path) -> list[str]:
+    """读取 requirements 文件中去掉注释与空行后的各行
+
+    参数:
+        path: requirements 文件
+
+    返回:
+        list[str]: 依赖声明行
+    """
+    lines = []
+    for raw_line in path.read_text(encoding="utf-8-sig").splitlines():
+        line = re.sub(r"\s+#.*$", "", raw_line).strip()
+        if line and not line.startswith("#"):
+            lines.append(line)
+    return lines
 
 
 def parse_requirement(value: str) -> Requirement:

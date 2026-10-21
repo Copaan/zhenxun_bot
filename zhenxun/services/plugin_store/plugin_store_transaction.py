@@ -514,7 +514,7 @@ async def preflight_source_requirements(
     """按依赖层规则预检商店插件的 requirements 文件
 
     与其他依赖来源（包括已安装和待应用的商店插件）一起解析，确认可解析、不改动
-    核心依赖与已安装的 ORM 和数据库驱动。
+    核心依赖与已安装的 ORM 包。
 
     参数:
         files: 插件源码中的 requirements 文件
@@ -526,7 +526,7 @@ async def preflight_source_requirements(
 
     异常:
         DependencyAnalysisError: 依赖声明无效、环境漂移、与核心依赖冲突、需要
-            安装工具或会改变已安装的 ORM 与数据库驱动
+            安装工具或会改变已安装的 ORM 包
     """
     from zhenxun.services.nonebot_store import dependencies
     from zhenxun.services.nonebot_store.dependencies import DependencyAnalysisError

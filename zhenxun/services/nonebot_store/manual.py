@@ -74,7 +74,7 @@ async def preview_manual_dependencies(
 
     安装时与其他依赖来源一起解析；卸载时移除不再被其他来源声明的包，以及只为它们
     安装、未被源码插件导入的子依赖。恢复备份时 restore 为 True：解析允许构建源码包，
-    ORM 与数据库驱动中不属于核心依赖的包可以随计划安装或变更。
+    ORM 包可以随计划安装或变更。
 
     参数:
         values: 依赖声明
@@ -220,9 +220,10 @@ async def preview_manual_dependencies(
 def stage_requirement_files(files: list[Path]) -> bool:
     """按插件 requirements 文件更新依赖声明，写入待应用的依赖层事务
 
-    每个文件的依赖记在该文件路径名下，替换它此前的声明；文件已删除或为空时只移除
-    声明，已安装的包保留。依赖不变且没有待应用事务时直接保存清单；否则由启动器在
-    下次启动 worker 前构建依赖层，核心虚拟环境不会被修改。
+    每个文件的依赖记在该文件路径名下，替换它此前的声明；文件已删除或为空时移除
+    声明。不再被任何来源需要、也未被源码插件导入的依赖层包随之释放。依赖不变且
+    没有待应用事务时直接保存清单；否则由启动器在下次启动 worker 前构建依赖层，
+    核心虚拟环境不会被修改。
 
     参数:
         files: requirements 文件，路径相对于项目根目录
@@ -241,7 +242,7 @@ def stage_requirement_files(files: list[Path]) -> bool:
         read_requirement_files,
         resolve_layer,
     )
-    from .environment import capture_environment
+    from .environment import capture_environment, released_packages
     from .policy import retained_conflicts
     from .storage import (
         defer_transaction,
@@ -270,13 +271,14 @@ def stage_requirement_files(files: list[Path]) -> bool:
     if target == original:
         return False
     snapshot = capture_environment()
+    sources = receipt_dependency_inputs()
     if requests:
         result = asyncio.run(
             resolve_layer(
                 requests,
                 snapshot=snapshot,
                 manifest=target,
-                sources=receipt_dependency_inputs(),
+                sources=sources,
                 replaced=frozenset(owners),
             )
         )
@@ -285,6 +287,11 @@ def stage_requirement_files(files: list[Path]) -> bool:
                 "source_build_confirmation_required", result["diagnostic"]
             )
         target["packages"] = result["packages"]
+    released, _ = released_packages(
+        original, target, sources_before=sources, sources_after=sources
+    )
+    for name in released:
+        target.get("packages", {}).pop(name, None)
     before, after = original.get("packages", {}), target.get("packages", {})
     if not pending and before == after:
         save_manifest(target)
@@ -323,7 +330,7 @@ def stage_plan(
 ) -> bool:
     """把依赖计划写入待应用的依赖层事务，由启动器在下次启动 worker 前构建
 
-    恢复备份的计划允许构建源码包，并允许安装非核心的 ORM 与数据库驱动；
+    恢复备份的计划允许构建源码包，并允许改变 ORM 包；
     目标依赖包含 nonebot-plugin-orm 时，启动器在启动 worker 前执行数据库迁移，
     迁移时同时加载带迁移脚本的源码插件。
 

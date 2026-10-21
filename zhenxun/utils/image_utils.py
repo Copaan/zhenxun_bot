@@ -16,8 +16,6 @@ from ._build_image import BuildImage, ColorAlias
 from ._build_mat import BuildMat, MatType  # noqa: F401
 from ._image_template import ImageTemplate, RowStyle  # noqa: F401
 
-# TODO: text2image 长度错误
-
 
 async def text2image(
     text: str,
@@ -59,121 +57,77 @@ async def text2image(
             ph = padding * 2
             top_padding = left_padding = padding
         elif isinstance(padding, tuple):
-            pw = padding[0] + padding[2]
-            ph = padding[1] + padding[3]
+            pw = padding[1] + padding[3]
+            ph = padding[0] + padding[2]
             top_padding = padding[0]
             left_padding = padding[1]
     _font = BuildImage.load_font(font, font_size)
     if auto_parse and re.search(r"<f(.*)>(.*)</f>", text):
-        _data = []
+        styled = []
         new_text = ""
-        placeholder_index = 0
         for s in text.split("</f>"):
             r = re.search(r"<f(.*)>(.*)", s)
             if r:
-                start, end = r.span()
-                if start != 0 and (t := s[:start]):
-                    new_text += t
-                _data.append(
-                    [
-                        (start, end),
-                        f"[placeholder_{placeholder_index}]",
-                        r.group(1).strip(),
+                new_text += s[: r.start()]
+                _font_name, _font_size, _font_color = font, font_size, font_color
+                for e in r.group(1).split():
+                    key, _, value = e.partition("=")
+                    value = value.strip("'\"")
+                    if key == "font":
+                        _font_name = value
+                    elif key in ("font_size", "fs") and value.isdigit():
+                        _font_size = min(max(int(value), 1), 1000)
+                    elif key in ("font_color", "fc"):
+                        _font_color = value
+                new_text += f"[placeholder_{len(styled)}]"
+                styled.append(
+                    await BuildImage.build_text_image(
                         r.group(2),
-                    ]
-                )
-                new_text += f"[placeholder_{placeholder_index}]"
-                placeholder_index += 1
-        new_text += text.split("</f>")[-1]
-        image_list = []
-        current_placeholder_index = 0
-        # 切分换行，每行为单张图片
-        for s in new_text.split("\n"):
-            _tmp_text = s
-            img_width = 0
-            img_height = BuildImage.get_text_size("正", _font)[1]
-            _tmp_index = current_placeholder_index
-            for _ in range(s.count("[placeholder_")):
-                placeholder = _data[_tmp_index]
-                if "font_size" in placeholder[2]:
-                    r = re.search(r"font_size=['\"]?(\d+)", placeholder[2])
-                    if r:
-                        w, h = BuildImage.get_text_size(
-                            placeholder[3], font, int(r.group(1))
-                        )
-                        img_height = img_height if img_height > h else h
-                        img_width += w
-                else:
-                    img_width += BuildImage.get_text_size(placeholder[3], _font)[0]
-                _tmp_text = _tmp_text.replace(f"[placeholder_{_tmp_index}]", "")
-                _tmp_index += 1
-            img_width += BuildImage.get_text_size(_tmp_text, _font)[0]
-            # 开始画图
-            A = BuildImage(
-                img_width, img_height, color=color, font=font, font_size=font_size
-            )
-            basic_font_h = A.getsize("正")[1]
-            current_width = 0
-            # 遍历占位符
-            for _ in range(s.count("[placeholder_")):
-                if not s.startswith(f"[placeholder_{current_placeholder_index}]"):
-                    slice_ = s.split(f"[placeholder_{current_placeholder_index}]")
-                    await A.text(
-                        (current_width, A.height - basic_font_h - 1),
-                        slice_[0],
-                        font_color,
+                        font=_font_name,
+                        size=_font_size,
+                        font_color=_font_color,
                     )
-                    current_width += A.getsize(slice_[0])[0]
-                placeholder = _data[current_placeholder_index]
-                # 解析配置
-                _font = font
-                _font_size = font_size
-                _font_color = font_color
-                for e in placeholder[2].split():
-                    if e.startswith("font="):
-                        _font = e.split("=")[-1]
-                    if e.startswith("font_size=") or e.startswith("fs="):
-                        _font_size = int(e.split("=")[-1])
-                        if _font_size > 1000:
-                            _font_size = 1000
-                        if _font_size < 1:
-                            _font_size = 1
-                    if e.startswith("font_color") or e.startswith("fc="):
-                        _font_color = e.split("=")[-1]
-                text_img = await BuildImage.build_text_image(
-                    placeholder[3], font=_font, size=_font_size, font_color=_font_color
                 )
-                _img_h = (
-                    int(A.height / 2 - text_img.height / 2)
-                    if new_text == "[placeholder_0]"
-                    else A.height - text_img.height
-                )
-                await A.paste(text_img, (current_width, _img_h - 1))
-                current_width += text_img.width
-                s = s[
-                    s.index(f"[placeholder_{current_placeholder_index}]")
-                    + len(f"[placeholder_{current_placeholder_index}]") :
-                ]
-                current_placeholder_index += 1
-            if s:
-                slice_ = s.split(f"[placeholder_{current_placeholder_index}]")
-                await A.text((current_width, A.height - basic_font_h), slice_[0])
-                current_width += A.getsize(slice_[0])[0]
-            await A.crop((0, 0, current_width, A.height))
-            # A.show()
+        new_text += text.split("</f>")[-1]
+        basic_font_h = BuildImage.get_text_size("正", _font)[1]
+        image_list = []
+        # 切分换行，每行为单张图片
+        for line in new_text.split("\n"):
+            pieces: list[BuildImage | str] = []
+            for part in re.split(r"(\[placeholder_\d+\])", line):
+                if r := re.fullmatch(r"\[placeholder_(\d+)\]", part):
+                    pieces.append(styled[int(r.group(1))])
+                elif part:
+                    pieces.append(part)
+            widths = [
+                p.width if isinstance(p, BuildImage) else int(_font.getlength(p))
+                for p in pieces
+            ]
+            line_h = max(
+                [basic_font_h] + [p.height for p in pieces if isinstance(p, BuildImage)]
+            )
+            A = BuildImage(
+                max(sum(widths), 1), line_h, color=color, font=font, font_size=font_size
+            )
+            current_width = 0
+            for piece, piece_width in zip(pieces, widths):
+                if isinstance(piece, BuildImage):
+                    y = line_h - piece.height
+                    if new_text == "[placeholder_0]":
+                        y = (line_h - piece.height) // 2
+                    await A.paste(piece, (current_width, y))
+                else:
+                    y = line_h - basic_font_h
+                    await A.text((current_width, y), piece, font_color)
+                current_width += piece_width
             image_list.append(A)
-        height = 0
-        width = 0
-        for img in image_list:
-            height += img.h
-            width = width if width > img.w else img.w
-        width += pw
-        height += ph
-        A = BuildImage(width + left_padding, height + top_padding, color=color)
+        width = max(img.width for img in image_list) + pw
+        height = sum(img.height for img in image_list) + ph
+        A = BuildImage(width, height, color=color)
         current_height = top_padding
         for img in image_list:
             await A.paste(img, (left_padding, current_height))
-            current_height += img.h
+            current_height += img.height
     else:
         width = 0
         height = 0

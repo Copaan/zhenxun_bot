@@ -12,7 +12,7 @@ from zhenxun.utils.atomic_json import (
     write_json_locked,
 )
 
-_RECEIPT_FILE = Path("data/runtime/plugin-store-receipts-v1.json")
+RECEIPT_FILE = Path("data/runtime/plugin-store-receipts-v1.json")
 
 
 def source_digest(path: Path, *, python_only: bool = False) -> str | None:
@@ -52,24 +52,24 @@ def source_digest(path: Path, *, python_only: bool = False) -> str | None:
 class StoreReceiptStore:
     @staticmethod
     def load() -> dict[str, dict[str, Any]]:
-        data = read_json_locked(_RECEIPT_FILE, {})
+        data = read_json_locked(RECEIPT_FILE, {})
         return data if isinstance(data, dict) else {}
 
     @staticmethod
     def save(data: dict[str, dict[str, Any]]) -> None:
-        write_json_locked(_RECEIPT_FILE, data)
+        write_json_locked(RECEIPT_FILE, data)
 
     @classmethod
     def set(cls, store_key: str, receipt: dict[str, Any]) -> None:
         def update(data: dict[str, dict[str, Any]]) -> None:
             data[store_key] = receipt
 
-        mutate_json_locked(_RECEIPT_FILE, {}, update)
+        mutate_json_locked(RECEIPT_FILE, {}, update)
 
     @classmethod
     def delete(cls, store_key: str) -> None:
         mutate_json_locked(
-            _RECEIPT_FILE,
+            RECEIPT_FILE,
             {},
             lambda data: data.pop(store_key, None),
         )

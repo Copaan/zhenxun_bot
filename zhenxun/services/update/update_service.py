@@ -12,6 +12,7 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import time
 from typing import Any, Literal
 from uuid import uuid4
@@ -1068,19 +1069,26 @@ def _restore_bot_update(backup: Path) -> None:
     _sync_dependencies(raise_on_error=False)
 
 
-def _sync_dependencies(
-    *, raise_on_error: bool = True, verify_environment: bool = False
-) -> None:
-    """按 uv.lock 同步核心虚拟环境，保留锁文件之外已安装的包
+def _sync_dependencies(*, raise_on_error: bool = True) -> None:
+    """按 uv.lock 同步核心虚拟环境
+
+    本体为可编辑安装，入口程序被运行中的启动器占用，同步时不重装本体，也不安装
+    开发依赖组。本体不再依赖、也没有其他来源需要的包随之移除，锁文件之外的其他
+    已安装包保留。
 
     参数:
         raise_on_error: 同步失败时是否抛出异常
-        verify_environment: 同步后是否校验有效依赖环境
     """
     if not (_ROOT / "uv.lock").is_file():
         return
     from zhenxun.services.installer_network import project_environment, uv_executable
     from zhenxun.services.network_proxy import ProxyPolicyError
+    from zhenxun.services.nonebot_store.dependencies import DependencyAnalysisError
+    from zhenxun.services.nonebot_store.environment import (
+        capture_environment,
+        core_packages,
+        dropped_core_packages,
+    )
 
     uv = uv_executable()
     if uv is None:
@@ -1093,26 +1101,35 @@ def _sync_dependencies(
         if raise_on_error:
             raise UpdateServiceError("dependency_sync_failed") from None
         return
+    try:
+        previous = core_packages(capture_environment())
+    except DependencyAnalysisError:
+        previous = set()
     result = subprocess.run(
-        [uv, "sync", "--locked", "--inexact"],
+        [uv, "sync", "--locked", "--inexact", "--no-install-project", "--no-dev"],
         cwd=_ROOT,
         capture_output=True,
         timeout=900,
         check=False,
         env=environment,
     )
+    if result.returncode == 0:
+        try:
+            dropped = dropped_core_packages(previous)
+        except DependencyAnalysisError:
+            dropped = []
+        if dropped:
+            logger.info("移除本体不再依赖的包: %s", ", ".join(dropped))
+            result = subprocess.run(
+                [uv, "pip", "uninstall", "--python", sys.executable, *dropped],
+                cwd=_ROOT,
+                capture_output=True,
+                timeout=300,
+                check=False,
+                env=environment,
+            )
     if result.returncode and raise_on_error:
         raise UpdateServiceError("dependency_sync_failed")
-    if result.returncode == 0 and verify_environment:
-        from zhenxun.services.nonebot_store.environment import (
-            verify_effective_environment,
-        )
-
-        try:
-            verify_effective_environment()
-        except RuntimeError:
-            if raise_on_error:
-                raise
 
 
 def _apply_resource_update(staged: Path, backup: Path, *, force: bool = False) -> None:

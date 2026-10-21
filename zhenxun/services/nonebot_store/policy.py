@@ -10,42 +10,19 @@ import sys
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 
-ORM_PACKAGES = frozenset(
-    {
-        "nonebot-plugin-orm",
-        "tortoise-orm",
-        "sqlalchemy",
-        "alembic",
-        "greenlet",
-        "aiosqlite",
-        "asyncpg",
-        "aiomysql",
-        "pymysql",
-        "psycopg",
-        "psycopg-binary",
-        "psycopg2",
-        "psycopg2-binary",
-        "mysqlclient",
-        "asyncmy",
-        "sqlmodel",
-        "databases",
-        "ormar",
-        "peewee",
-        "piccolo",
-        "gino",
-    }
-)
+# nonebot-plugin-orm 的数据库迁移依赖的包，已安装时只能在控制台改变版本
+ORM_PACKAGES = frozenset({"nonebot-plugin-orm", "sqlalchemy", "alembic"})
 
 
 def guard_orm_changes(before: dict, after: dict) -> None:
-    """已安装的 ORM 与数据库驱动只能在控制台改变版本，新增与移除不受限制
+    """已安装的 ORM 包只能在控制台改变版本，新增与移除不受限制
 
     参数:
         before: 变更前的包版本
         after: 变更后的包版本
 
     异常:
-        DependencyAnalysisError: 已安装的 ORM 或数据库驱动版本会变化
+        DependencyAnalysisError: 已安装的 ORM 包版本会变化
     """
     from .dependencies import DependencyAnalysisError
 
@@ -61,14 +38,14 @@ def guard_orm_changes(before: dict, after: dict) -> None:
 
 
 def guard_orm_request(names, installed) -> None:
-    """已安装的 ORM 与数据库驱动只能在控制台安装、升级或卸载
+    """已安装的 ORM 包只能在控制台安装、升级或卸载
 
     参数:
         names: 本次操作的包名
         installed: 当前已安装的包
 
     异常:
-        DependencyAnalysisError: 操作涉及已安装的 ORM 或数据库驱动
+        DependencyAnalysisError: 操作涉及已安装的 ORM 包
     """
     from .dependencies import DependencyAnalysisError
 

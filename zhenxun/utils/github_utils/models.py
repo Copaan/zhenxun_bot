@@ -1,9 +1,12 @@
-import asyncio
 import base64
 import contextlib
-import importlib
+from email.utils import formatdate
+import hashlib
+import hmac
 import sys
-from typing import TYPE_CHECKING, ClassVar, Protocol
+from typing import Any, ClassVar, Protocol
+from urllib.parse import quote
+import uuid
 
 from aiocache import cached
 from nonebot.compat import model_dump
@@ -11,19 +14,16 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from zhenxun.utils.http_utils import AsyncHttpx
 
-if TYPE_CHECKING:
-    from alibabacloud_devops20210625.client import Client as devops20210625Client
-
 if sys.version_info >= (3, 11):
     from enum import StrEnum
 else:
     from strenum import StrEnum
 
 from .const import (
+    ALIYUN_API_VERSION,
     ALIYUN_ENDPOINT,
     ALIYUN_EXTERNAL_PLUGIN_GROUPS,
     ALIYUN_ORG_ID,
-    ALIYUN_REGION,
     ALIYUN_REPO_MAPPING,
     CACHED_API_TTL,
     GIT_API_COMMIT_FORMAT,
@@ -322,26 +322,64 @@ class AliyunFileInfo:
     _dynamic_repo_cache: ClassVar[dict[str, str]] = {}
 
     @classmethod
-    async def get_client(cls) -> "devops20210625Client":
-        """获取阿里云客户端，首次调用时在线程中导入 SDK，避免阻塞事件循环"""
-        await asyncio.to_thread(
-            importlib.import_module, "alibabacloud_devops20210625.client"
-        )
-        from alibabacloud_devops20210625.client import (
-            Client as devops20210625Client,
-        )
-        from alibabacloud_tea_openapi import models as open_api_models
+    async def _request(cls, pathname: str, **query: str | int) -> Any:
+        """请求云效 Codeup OpenAPI
 
-        config = open_api_models.Config(
-            access_key_id=Aliyun_AccessKey_ID,
-            access_key_secret=base64.b64decode(
-                Aliyun_Secret_AccessKey_encrypted.encode()
+        参数:
+            pathname: 接口路径，路径参数需已编码
+            **query: 查询参数
+
+        返回:
+            Any: 响应中的 result
+
+        异常:
+            ValueError: 请求失败
+        """
+        query = {
+            "organizationId": ALIYUN_ORG_ID,
+            "accessToken": base64.b64decode(
+                RDC_access_token_encrypted.encode()
             ).decode(),
-            endpoint=ALIYUN_ENDPOINT,
-            region_id=ALIYUN_REGION,
+            **query,
+        }
+        headers = {
+            "date": formatdate(usegmt=True),
+            "accept": "application/json",
+            "x-acs-signature-nonce": uuid.uuid4().hex,
+            "x-acs-signature-method": "HMAC-SHA1",
+            "x-acs-signature-version": "1.0",
+            "x-acs-version": ALIYUN_API_VERSION,
+        }
+        canonical_headers = "".join(
+            f"{key}:{headers[key]}\n"
+            for key in sorted(headers)
+            if key.startswith("x-acs-")
         )
-
-        return devops20210625Client(config)
+        canonical_query = "&".join(
+            f"{key}={query[key]}" if query[key] != "" else key for key in sorted(query)
+        )
+        string_to_sign = (
+            f"GET\n{headers['accept']}\n\n\n{headers['date']}\n"
+            f"{canonical_headers}{pathname}?{canonical_query}"
+        )
+        secret = base64.b64decode(Aliyun_Secret_AccessKey_encrypted.encode())
+        signature = hmac.new(secret, string_to_sign.encode(), hashlib.sha1).digest()
+        headers["authorization"] = (
+            f"acs {Aliyun_AccessKey_ID}:{base64.b64encode(signature).decode()}"
+        )
+        response = await AsyncHttpx.get(
+            f"https://{ALIYUN_ENDPOINT}{pathname}",
+            params=query,
+            headers=headers,
+            accept_status_codes=range(400, 600),
+        )
+        data = response.json()
+        if response.status_code >= 400 or not data.get("success"):
+            raise ValueError(
+                f"阿里云请求失败: {data.get('errorCode') or data.get('Code')} - "
+                f"{data.get('errorMessage') or data.get('Message')}"
+            )
+        return data.get("result")
 
     @classmethod
     @cached(ttl=CACHED_API_TTL)
@@ -355,70 +393,36 @@ class AliyunFileInfo:
             list[dict]: 仓库信息列表，每个元素包含 id, name, path 等
         """
         try:
-            client = await cls.get_client()
-            from alibabacloud_devops20210625 import models as devops_20210625_models
-            from alibabacloud_tea_util import models as util_models
-
             result = []
             page = 1
             per_page = 100
 
             while True:
-                request = devops_20210625_models.ListRepositoriesRequest(
-                    organization_id=ALIYUN_ORG_ID,
-                    access_token=base64.b64decode(
-                        RDC_access_token_encrypted.encode()
-                    ).decode(),
-                    page=page,
-                    per_page=per_page,
+                repos = (
+                    await cls._request("/repository/list", page=page, perPage=per_page)
+                    or []
                 )
+                for repo_dict in repos:
+                    path_with_ns = (
+                        repo_dict.get("pathWithNamespace")
+                        or repo_dict.get("path")
+                        or ""
+                    )
+                    # pathWithNamespace 格式: {org_id}/{group_path}/{repo_name}
+                    # 只保留属于该分组的仓库
+                    if f"/{group_path}/" in path_with_ns:
+                        result.append(repo_dict)
+                        # 同时更新缓存
+                        repo_name = repo_dict.get("name", "")
+                        # 注意：阿里云API返回的ID字段是 "Id" (大写I)
+                        repo_id = str(repo_dict.get("Id") or repo_dict.get("id") or "")
+                        if repo_name and repo_id:
+                            cls._dynamic_repo_cache[repo_name] = repo_id
 
-                runtime = util_models.RuntimeOptions()
-                headers = {}
-
-                response = await client.list_repositories_with_options_async(
-                    request, headers, runtime
-                )
-
-                if response and response.body:
-                    if not response.body.success:
-                        raise ValueError(
-                            f"阿里云请求失败: {response.body.error_code} - "
-                            f"{response.body.error_message}"
-                        )
-
-                    repos = response.body.result or []
-                    if not repos:
-                        break
-
-                    for repo in repos:
-                        repo_dict = repo.to_map()
-                        # 尝试多种可能的字段名
-                        path_with_ns = (
-                            repo_dict.get("pathWithNamespace")
-                            or repo_dict.get("path_with_namespace")
-                            or repo_dict.get("path")
-                            or ""
-                        )
-                        # pathWithNamespace 格式: {org_id}/{group_path}/{repo_name}
-                        # 只保留属于该分组的仓库
-                        if f"/{group_path}/" in path_with_ns:
-                            result.append(repo_dict)
-                            # 同时更新缓存
-                            repo_name = repo_dict.get("name", "")
-                            # 注意：阿里云API返回的ID字段是 "Id" (大写I)
-                            repo_id = str(
-                                repo_dict.get("Id") or repo_dict.get("id") or ""
-                            )
-                            if repo_name and repo_id:
-                                cls._dynamic_repo_cache[repo_name] = repo_id
-
-                    # 如果返回的数量小于请求的数量，说明已经没有更多数据
-                    if len(repos) < per_page:
-                        break
-                    page += 1
-                else:
+                # 如果返回的数量小于请求的数量，说明已经没有更多数据
+                if len(repos) < per_page:
                     break
+                page += 1
 
             return result
         except Exception as e:
@@ -461,50 +465,6 @@ class AliyunFileInfo:
         return None
 
     @classmethod
-    async def debug_list_all_repositories(cls) -> list[dict]:
-        """调试方法：列出组织下的所有仓库信息
-
-        返回:
-            list[dict]: 所有仓库信息列表
-        """
-        try:
-            client = await cls.get_client()
-            from alibabacloud_devops20210625 import models as devops_20210625_models
-            from alibabacloud_tea_util import models as util_models
-
-            result = []
-
-            request = devops_20210625_models.ListRepositoriesRequest(
-                organization_id=ALIYUN_ORG_ID,
-                access_token=base64.b64decode(
-                    RDC_access_token_encrypted.encode()
-                ).decode(),
-                page=1,
-                per_page=100,
-            )
-
-            runtime = util_models.RuntimeOptions()
-            headers = {}
-
-            response = await client.list_repositories_with_options_async(
-                request, headers, runtime
-            )
-
-            if response and response.body and response.body.result:
-                for repo in response.body.result:
-                    repo_dict = repo.to_map()
-                    result.append(repo_dict)
-                    # 同时填充缓存
-                    repo_name = repo_dict.get("name", "")
-                    repo_id = str(repo_dict.get("Id") or repo_dict.get("id") or "")
-                    if repo_name and repo_id:
-                        cls._dynamic_repo_cache[repo_name] = repo_id
-
-            return result
-        except Exception as e:
-            raise ValueError(f"列出仓库失败: {e}")
-
-    @classmethod
     async def _get_repository_id_or_raise(cls, repo: str) -> str:
         """获取仓库ID，如果未找到则抛出异常
 
@@ -538,30 +498,12 @@ class AliyunFileInfo:
         """
         try:
             repository_id = await cls._get_repository_id_or_raise(repo)
-
-            client = await cls.get_client()
-            from alibabacloud_devops20210625 import models as devops_20210625_models
-
-            request = devops_20210625_models.GetFileBlobsRequest(
-                organization_id=ALIYUN_ORG_ID,
-                file_path=file_path,
-                ref=ref,
-                access_token=base64.b64decode(
-                    RDC_access_token_encrypted.encode()
-                ).decode(),
+            result = await cls._request(
+                f"/repository/{repository_id}/files/blobs", filePath=file_path, ref=ref
             )
-
-            response = await client.get_file_blobs_async(repository_id, request)
-
-            if response and response.body and response.body.result:
-                if not response.body.success:
-                    raise ValueError(
-                        f"阿里云请求失败: {response.body.error_code} - "
-                        f"{response.body.error_message}"
-                    )
-                return response.body.result.content or ""
-
-            raise ValueError("获取阿里云文件内容失败")
+            if not result:
+                raise ValueError("获取阿里云文件内容失败")
+            return result.get("content") or ""
         except Exception as e:
             raise ValueError(f"获取阿里云文件内容失败: {e}")
 
@@ -589,38 +531,13 @@ class AliyunFileInfo:
         """
         try:
             repository_id = await cls._get_repository_id_or_raise(repo)
-
-            client = await cls.get_client()
-            from alibabacloud_devops20210625 import models as devops_20210625_models
-            from alibabacloud_tea_util import models as util_models
-
-            request = devops_20210625_models.ListRepositoryTreeRequest(
-                organization_id=ALIYUN_ORG_ID,
+            result = await cls._request(
+                f"/repository/{repository_id}/files/tree",
                 path=path,
-                access_token=base64.b64decode(
-                    RDC_access_token_encrypted.encode()
-                ).decode(),
-                ref_name=ref,
+                refName=ref,
                 type=search_type,
             )
-
-            runtime = util_models.RuntimeOptions()
-            headers = {}
-
-            response = await client.list_repository_tree_with_options_async(
-                repository_id, request, headers, runtime
-            )
-
-            if response and response.body:
-                if not response.body.success:
-                    raise ValueError(
-                        f"阿里云请求失败: {response.body.error_code} - "
-                        f"{response.body.error_message}"
-                    )
-                return [
-                    AliyunTree(**item.to_map()) for item in (response.body.result or [])
-                ]
-            raise ValueError("获取仓库树信息失败")
+            return [AliyunTree(**item) for item in result or []]
         except Exception as e:
             raise ValueError(f"获取仓库树信息失败: {e}")
 
@@ -635,33 +552,10 @@ class AliyunFileInfo:
         """
         try:
             repository_id = await cls._get_repository_id_or_raise(repo)
-
-            client = await cls.get_client()
-            from alibabacloud_devops20210625 import models as devops_20210625_models
-            from alibabacloud_tea_util import models as util_models
-
-            request = devops_20210625_models.GetRepositoryCommitRequest(
-                organization_id=ALIYUN_ORG_ID,
-                access_token=base64.b64decode(
-                    RDC_access_token_encrypted.encode()
-                ).decode(),
+            result = await cls._request(
+                f"/repository/{repository_id}/commits/{quote(branch, safe='~')}"
             )
-
-            runtime = util_models.RuntimeOptions()
-            headers = {}
-
-            response = await client.get_repository_commit_with_options_async(
-                repository_id, branch, request, headers, runtime
-            )
-
-            if response and response.body:
-                if not response.body.success:
-                    raise ValueError(
-                        f"阿里云请求失败: {response.body.error_code} - "
-                        f"{response.body.error_message}"
-                    )
-                return response.body.result.id or ""
-            raise ValueError("获取仓库commit信息失败")
+            return (result or {}).get("id") or ""
         except Exception as e:
             raise ValueError(f"获取仓库commit信息失败: {e}")
 
