@@ -33,7 +33,9 @@ class BotGroupPolicyService:
     def __init__(self):
         self._epoch = 0
         self._policies = {}
+        self._revisions = {}
         self._stale = set()
+        self._stale_marks = 0
         self._refresh_tasks = {}
         self._memberships = set()
         self._pending = set()
@@ -45,6 +47,7 @@ class BotGroupPolicyService:
         self._epoch += 1
         self.context = context
         self._policies.clear()
+        self._revisions.clear()
         self._stale.clear()
         for row in await BotGroupPluginPolicy.all():
             self._accept_row(
@@ -68,6 +71,7 @@ class BotGroupPolicyService:
         self.context = None
         self._pending.clear()
         self._policies.clear()
+        self._revisions.clear()
         self._stale.clear()
         self._memberships.clear()
         while not self._queue.empty():
@@ -107,10 +111,18 @@ class BotGroupPolicyService:
             return self._policies[key][int(task)]
         return (), ()
 
-    def _accept_row(self, key, row):
-        if row is None:
+    def _accept_row(self, key, row, *, clear_stale=True):
+        """写入内存策略，修订号比已加载的旧时保留已加载的策略
+
+        参数:
+            key: 策略键
+            row: 策略行，为空表示没有记录
+            clear_stale: 是否清除待刷新标记
+        """
+        revision = row.revision if row is not None else -1
+        if row is None and revision >= self._revisions.get(key, -1):
             self._policies.pop(key, None)
-        else:
+        elif row is not None and revision >= self._revisions.get(key, -1):
             self._policies[key] = tuple(
                 (frozenset(forced or []), frozenset(local or []))
                 for forced, local in (
@@ -118,14 +130,34 @@ class BotGroupPolicyService:
                     (row.forced_tasks, row.block_tasks),
                 )
             )
-        self._stale.discard(key)
+            self._revisions[key] = revision
+        if clear_stale:
+            self._stale.discard(key)
+
+    def mark_stale(self, *keys):
+        """将策略标记为待刷新，使用前从数据库重新读取
+
+        参数:
+            keys: 策略键
+        """
+        self._stale.update(keys)
+        self._stale_marks += 1
+
+    def mark_all_stale(self):
+        """将已加载的群聊与私聊策略全部标记为待刷新，使用前从数据库重新读取"""
+        self.mark_stale(*self._policies)
 
     async def refresh_policy(self, key):
-        epoch = self._epoch
+        """从数据库重新读取策略，读取期间有新的待刷新标记时保留标记
+
+        参数:
+            key: 策略键
+        """
+        epoch, marks = self._epoch, self._stale_marks
         row = await BotGroupPluginPolicy.get_or_none(**key_fields(key))
         if epoch != self._epoch:
             return
-        self._accept_row(key, row)
+        self._accept_row(key, row, clear_stale=marks == self._stale_marks)
 
     async def ensure_fresh(self, bot_id, scope, group_id, channel_id=None):
         key = group_key(
@@ -213,12 +245,15 @@ class BotGroupPolicyService:
                     )
                     key = group_key(**fields)
                     keys.add(key)
-                    if (
-                        not await BotGroupPluginPolicy.filter(**fields)
+                    row = (
+                        await BotGroupPluginPolicy.filter(**fields)
                         .using_db(connection)
-                        .exists()
-                    ):
+                        .first()
+                    )
+                    if row is None:
                         await self._write(key, lambda current: current)
+                    elif key not in self._policies:
+                        self._accept_row(key, row)
             self._memberships.update(keys)
 
     async def list_groups(self, bot_id):
@@ -467,14 +502,14 @@ class BotGroupPolicyService:
                             self._accept_row(key, row)
                             require_publication(self._publish_policy_revision(key))
                         except BaseException:
-                            self._stale.add(key)
+                            self.mark_stale(key)
                             raise
 
                     if not defer(("bot_group_policy", *key), publish):
                         raise RuntimeError("policy_transaction_publication_unavailable")
             except BaseException:
                 if written:
-                    self._stale.add(key)
+                    self.mark_stale(key)
                 raise
         return await self._view(key)
 
@@ -936,4 +971,4 @@ bot_group_policy_service = BotGroupPolicyService()
 @on_publication_failed
 def _mark_policy_stale(key: tuple | None) -> None:
     if key and key[0] == "bot_group_policy":
-        bot_group_policy_service._stale.add(tuple(key[1:]))
+        bot_group_policy_service.mark_stale(tuple(key[1:]))

@@ -66,7 +66,7 @@ _blmt = BanCheckLimiter(
 _MALICIOUS_CHECK_MODES = {"off", "blacklist", "whitelist"}
 _EVENT_PLUGIN_DEDUPE_TTL = 30.0
 _EVENT_PLUGIN_DEDUPE_MAX = 4096
-_event_plugin_seen: dict[str, float] = {}
+_event_plugin_seen: dict[str, tuple[float, bool]] = {}
 
 
 def _malicious_check_mode() -> str:
@@ -116,33 +116,37 @@ def _event_plugin_key(event: Event, user_id: str, module: str) -> str:
     return f"{message_id}:{user_id}:{module}"
 
 
-def _remember_event_plugin_once(key: str) -> bool:
-    now = time.monotonic()
-    expires_at = _event_plugin_seen.get(key)
-    if expires_at is not None and expires_at > now:
-        return False
+def _event_plugin_verdict(key: str) -> bool | None:
+    """获取同一消息中该用户触发该插件的恶意检测结果
 
-    _event_plugin_seen[key] = now + _EVENT_PLUGIN_DEDUPE_TTL
+    参数:
+        key: 消息、用户与插件组成的去重键
+
+    返回:
+        bool | None: 未检测过为 None，否则为是否判定为恶意触发
+    """
+    entry = _event_plugin_seen.get(key)
+    if entry is not None and entry[0] > time.monotonic():
+        return entry[1]
+    return None
+
+
+def _remember_event_plugin(key: str, malicious: bool) -> None:
+    """记录同一消息中该用户触发该插件的恶意检测结果
+
+    参数:
+        key: 消息、用户与插件组成的去重键
+        malicious: 是否判定为恶意触发
+    """
+    now = time.monotonic()
+    _event_plugin_seen[key] = (now + _EVENT_PLUGIN_DEDUPE_TTL, malicious)
     if len(_event_plugin_seen) > _EVENT_PLUGIN_DEDUPE_MAX:
         target_size = _EVENT_PLUGIN_DEDUPE_MAX // 2
-        for cache_key, cache_expires_at in list(_event_plugin_seen.items()):
+        for cache_key, (cache_expires_at, _) in list(_event_plugin_seen.items()):
             if cache_expires_at <= now or len(_event_plugin_seen) > target_size:
                 _event_plugin_seen.pop(cache_key, None)
             if len(_event_plugin_seen) <= target_size:
                 break
-    return True
-
-
-def _mark_event_plugin_checked(
-    state: T_State, event: Event, user_id: str, module: str
-) -> bool:
-    checked = state.setdefault("_zx_malicious_checked_plugins", set())
-    if isinstance(checked, set):
-        if module in checked:
-            return False
-        checked.add(module)
-
-    return _remember_event_plugin_once(_event_plugin_key(event, user_id, module))
 
 
 def _get_positive_config(key: str, cast_type: type[int] | type[float]) -> int | float:
@@ -202,7 +206,11 @@ async def _(
     else:
         return
 
-    if not _mark_event_plugin_checked(state, event, user_id, module):
+    # 同一消息中同插件的多个 matcher 只统计一次，并沿用首次的检测结果
+    event_key = _event_plugin_key(event, user_id, module)
+    if (verdict := _event_plugin_verdict(event_key)) is not None:
+        if verdict:
+            raise IgnoredException("检测到恶意触发命令")
         return
 
     # 只统计通过模式过滤、非被动且同事件同插件去重后的有效触发。
@@ -211,7 +219,9 @@ async def _(
     malicious_ban_count = int(_get_positive_config("MALICIOUS_BAN_COUNT", int))
     malicious_ban_time = int(_get_positive_config("MALICIOUS_BAN_TIME", int))
     _blmt.configure(malicious_check_time, malicious_ban_count)
-    if _blmt.check(limiter_key):
+    malicious = _blmt.check(limiter_key)
+    _remember_event_plugin(event_key, malicious)
+    if malicious:
         await BanConsole.ban(
             user_id,
             group_id,

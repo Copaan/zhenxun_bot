@@ -75,6 +75,7 @@ __plugin_meta__ = PluginMetadata(
         author="HibiKier",
         version="1.3",
         plugin_type=PluginType.SUPERUSER,
+        supported_platform_scopes={"qq_client"},
         configs=[
             RegisterConfig(
                 module="_task",

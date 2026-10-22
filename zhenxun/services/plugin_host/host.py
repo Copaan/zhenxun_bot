@@ -1024,6 +1024,7 @@ class PluginHost:
                 logger.error(f"插件 {module_name} 热加载失败", _LOG_COMMAND, e=error)
                 await self._commit([], [], notes)
                 from zhenxun.services.nonebot_store.runtime import (
+                    import_error_summary,
                     missing_config_key,
                 )
 
@@ -1036,7 +1037,7 @@ class PluginHost:
                     if missing
                     else f"plugin_configuration_required:{config_key}"
                     if config_key
-                    else f"plugin_import_failed:{type(error).__name__}",
+                    else f"plugin_import_failed:{import_error_summary(error)}",
                     notes,
                 )
             await self._commit(plugins, [], notes)

@@ -104,6 +104,34 @@ def scoped_group_id(group_id, scope: str | None = None):
     return _scoped(group_id, scope, "group:")
 
 
+def native_id(
+    value, scope: str, *, group: bool = False, bot_id: str = ""
+) -> str | None:
+    """把持久化使用的用户/群组 id 还原为适配器中的 id
+
+    参数:
+        value: 持久化或适配器中的 id
+        scope: 发送所用 Bot 的平台作用域
+        group: 是否为群组 id
+        bot_id: 发送所用 Bot 的 id，QQ 官方 Bot 的群组 id 中带有 AppID
+
+    返回:
+        str | None: 适配器中的 id，属于其他平台或其他 Bot 时为 None
+    """
+    value = str(value or "")
+    if scope == "qq_api":
+        prefix = f"qq_api:{bot_id}:group:" if group else ""
+    elif is_namespaced_scope(scope):
+        prefix = f"{scope}:group:" if group else f"{scope}:"
+    else:
+        prefix = ""
+    if prefix and value.startswith(prefix):
+        value = value[len(prefix) :]
+    elif ":" in value:
+        return None
+    return value or None
+
+
 def scope_owns(*ids, scope: str | None = None) -> bool:
     """判断记录 id 是否属于当前平台作用域
 

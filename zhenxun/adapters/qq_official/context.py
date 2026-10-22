@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
-from contextvars import ContextVar, Token
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from functools import wraps
@@ -32,7 +32,6 @@ from .cache import (
     RECEIPT_CACHE,
     REPLY_STATE_CACHE,
     ReplyState,
-    record_database_fallback,
 )
 from .models import QQOfficialIdentity, QQOfficialPrincipal, QQWebhookReceipt
 
@@ -67,31 +66,11 @@ class OfficialQQEventContext:
     guild_direct: bool = False
     interaction_id: str = ""
     message_id: str = ""
-    guild_event: GuildMessageEvent | None = field(
-        default=None, repr=False, compare=False
-    )
     reply_event: Event | None = field(default=None, repr=False, compare=False)
-
-    @property
-    def reply_address(self) -> dict[str, str]:
-        if self.scene == "guild":
-            raise ValueError("Guild replies must use the adapter's channel/DM API")
-        address = {
-            "scene": self.scene,
-            "openid": (self.actor_openid if self.scene == "c2c" else self.group_openid),
-            self.source_kind: self.source_id,
-        }
-        return address
 
 
 CURRENT_OFFICIAL_CONTEXT: ContextVar[OfficialQQEventContext | None] = ContextVar(
     "zhenxun_qq_official_context", default=None
-)
-_OFFICIAL_CONTEXT_TOKEN: ContextVar[Token | None] = ContextVar(
-    "zhenxun_qq_official_context_token", default=None
-)
-_PLATFORM_SCOPE_TOKEN: ContextVar[Token | None] = ContextVar(
-    "zhenxun_qq_platform_scope_token", default=None
 )
 
 
@@ -106,27 +85,6 @@ def event_official_context(event: Event) -> OfficialQQEventContext | None:
 
 def bind_event_official_context(event: Event, context: OfficialQQEventContext) -> None:
     object.__setattr__(event, "_zhenxun_official_context", context)
-
-
-def activate_event_official_context(event: Event) -> OfficialQQEventContext | None:
-    context = event_official_context(event)
-    if context is not None:
-        _OFFICIAL_CONTEXT_TOKEN.set(CURRENT_OFFICIAL_CONTEXT.set(context))
-        _PLATFORM_SCOPE_TOKEN.set(CURRENT_PLATFORM_SCOPE.set("qq_api"))
-    return context
-
-
-def deactivate_event_official_context() -> None:
-    """Restore context values after an event finishes dispatching."""
-
-    context_token = _OFFICIAL_CONTEXT_TOKEN.get()
-    if context_token is not None:
-        CURRENT_OFFICIAL_CONTEXT.reset(context_token)
-        _OFFICIAL_CONTEXT_TOKEN.set(None)
-    scope_token = _PLATFORM_SCOPE_TOKEN.get()
-    if scope_token is not None:
-        CURRENT_PLATFORM_SCOPE.reset(scope_token)
-        _PLATFORM_SCOPE_TOKEN.set(None)
 
 
 def with_official_event_context(
@@ -251,7 +209,6 @@ async def _resolve_principal(
     if cached := await IDENTITY_CACHE.get(key):
         return cached
 
-    record_database_fallback()
     identity = await QQOfficialIdentity.get_or_none(
         app_id=app_id,
         scene=scene,
@@ -345,8 +302,7 @@ async def prepare_event_context(
         guild_id=str(getattr(event, "guild_id", "") or ""),
         channel_id=str(getattr(event, "channel_id", "") or ""),
         guild_direct=isinstance(event, DirectMessageCreateEvent),
-        guild_event=event if isinstance(event, GuildMessageEvent) else None,
-        reply_event=event if interaction else None,
+        reply_event=event,
     )
     bind_event_official_context(event, context)
     return context
@@ -471,40 +427,18 @@ async def finish_reply(state: ReplyState, *, successful: bool) -> None:
             state.successful += 1
 
 
-async def invalidate_principal(principal_id: UUID) -> None:
-    identities = await QQOfficialIdentity.filter(principal_id=principal_id).values(
-        "app_id", "scene", "group_scope", "openid_digest"
-    )
-    await asyncio.gather(
-        *(
-            IDENTITY_CACHE.delete(
-                (
-                    str(item["app_id"]),
-                    str(item["scene"]),
-                    str(item["group_scope"]),
-                    str(item["openid_digest"]),
-                )
-            )
-            for item in identities
-        )
-    )
-
-
 __all__ = [
     "ANSWERABLE_INTERACTION_TYPES",
     "OfficialQQEventContext",
     "OfficialReplyExhausted",
     "OfficialReplyExpired",
     "OfficialReplyUnavailable",
-    "activate_event_official_context",
     "allocate_reply_sequence",
     "bind_event_official_context",
-    "deactivate_event_official_context",
     "digest_identifier",
     "event_official_context",
     "finish_reply",
     "get_current_official_context",
-    "invalidate_principal",
     "prepare_event_context",
     "receipt_seen",
     "release_webhook_receipt",

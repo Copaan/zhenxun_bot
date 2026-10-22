@@ -422,6 +422,18 @@ def apply_uninfo_onebot11_patch() -> None:
     global _ORIGINAL_ONEBOT11_GROUP_MESSAGE, _PATCHED
     global _ORIGINAL_QQ_C2C_MESSAGE, _ORIGINAL_QQ_GROUP_AT_MESSAGE
     global _ORIGINAL_QQ_GUILD_MESSAGE
+    with contextlib.suppress(Exception):
+        from nonebot_plugin_uninfo.adapters import INFO_FETCHER_MAPPING
+
+        if telegram_fetcher := INFO_FETCHER_MAPPING.get("Telegram"):
+            from nonebot.adapters.telegram.event import (
+                ForumTopicEditedMessageEvent,
+                ForumTopicMessageEvent,
+            )
+
+            # 论坛话题消息按所在群组解析，群组的开关、权限与封禁对话题同样生效
+            for event_type in (ForumTopicMessageEvent, ForumTopicEditedMessageEvent):
+                telegram_fetcher.endpoint.pop(event_type, None)
     if _PATCHED:
         return
 

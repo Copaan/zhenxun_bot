@@ -6,6 +6,7 @@ from nonebot_plugin_session import EventSession
 from zhenxun.models.ban_console import BanConsole
 from zhenxun.models.level_user import LevelUser
 from zhenxun.services.log import logger
+from zhenxun.services.platform_identity import scoped_group_id
 from zhenxun.utils.image_utils import BuildImage, ImageTemplate
 
 
@@ -106,6 +107,8 @@ class BanManage:
     ) -> tuple[bool, str]:
         """unban目标用户
 
+        非超级用户按自己在该群的权限等级判断，按 id 解除时只能解除该群的记录。
+
         参数:
             user_id: 用户id
             group_id: 群组id
@@ -117,12 +120,18 @@ class BanManage:
             tuple[bool, str | Non]: 是否unban成功, 群组/用户id或提示
         """
         user_level = 9999
-        if not is_superuser and user_id and session.id1:
-            user_level = await LevelUser.get_user_level(session.id1, group_id)
+        if not is_superuser:
+            user_level = (
+                await LevelUser.get_user_level(session.id1, group_id)
+                if session.id1
+                else 0
+            )
         if idx:
             ban_data = await BanConsole.get_ban(id=idx)
             if not ban_data:
                 return False, "该用户/群组不在黑名单中捏..."
+            if not is_superuser and ban_data.group_id != scoped_group_id(group_id):
+                return False, "只能解除本群的黑名单记录捏..."
             if ban_data.ban_level > user_level:
                 return False, "unBan权限等级不足捏..."
             await ban_data.delete()

@@ -21,9 +21,27 @@ from .manager import manager
 
 ABSENCE_FILE = DATA_PATH / "runtime" / "plugin-absence-v1.json"
 """插件连续未找到的启动次数"""
-ABSENCE_LIMIT = 5
-"""连续未找到达到该次数后清理插件数据"""
+CONFIG_MODULE = "plugin_cleanup"
 LOG_COMMAND = "插件清理"
+
+Config.add_plugin_config(
+    CONFIG_MODULE,
+    "ABSENCE_LIMIT",
+    5,
+    help="插件文件连续多少次启动未找到后清理其配置与插件数据（插件自己的数据表保留），"
+    "0 为不清理",
+    default_value=5,
+    type=int,
+    ui={
+        "label": "未找到后清理",
+        "section": "插件清理",
+        "component": "number",
+        "order": 10,
+        "minimum": 0,
+        "unit": "次启动",
+    },
+)
+Config.set_name(CONFIG_MODULE, "插件清理")
 
 
 def _has_source(path: Path) -> bool:
@@ -191,7 +209,8 @@ async def _clean_plugins(module_paths: set[str], tasks: set[str]) -> list[str]:
 
 
 async def prune_absent_plugins(loaded: set[str]) -> None:
-    """记录未加载且文件已不存在的插件，连续 ABSENCE_LIMIT 次启动未找到时清理其数据
+    """记录未加载且文件已不存在的插件，连续未找到的启动次数达到配置 ABSENCE_LIMIT
+    时清理其数据，配置为 0 时不记录也不清理
 
     插件文件仍在（导入失败、被禁用）时重新计数；依赖层事务未结束或最近一次失败/回滚时
     不累加次数。首次未找到时从插件索引记下其被动技能，索引中已没有记录的插件清理时
@@ -203,6 +222,11 @@ async def prune_absent_plugins(loaded: set[str]) -> None:
     """
     from zhenxun.services.plugin_host import plugin_host
 
+    limit = Config.get_config(CONFIG_MODULE, "ABSENCE_LIMIT")
+    if not isinstance(limit, int) or limit <= 0:
+        if ABSENCE_FILE.exists():
+            write_json_locked(ABSENCE_FILE, {})
+        return
     saved = read_json_locked(ABSENCE_FILE, {})
     if not isinstance(saved, dict):
         saved = {}
@@ -230,12 +254,12 @@ async def prune_absent_plugins(loaded: set[str]) -> None:
             "tasks": tasks,
         }
     counts = {path: record["count"] for path, record in records.items()}
-    expired = {path for path, count in counts.items() if count >= ABSENCE_LIMIT}
+    expired = {path for path, count in counts.items() if count >= limit}
     if pending := sorted(set(counts) - expired):
         logger.warning(
-            f"{len(pending)} 个插件的文件已不存在，连续 {ABSENCE_LIMIT} 次启动未找到后"
-            "将清理其配置与插件数据: "
-            + ", ".join(f"{path}({counts[path]}/{ABSENCE_LIMIT})" for path in pending),
+            f"{len(pending)} 个插件的文件已不存在，连续 {limit} 次启动未找到后"
+            "将清理其配置与插件数据（可在插件清理配置中调整，0 为不清理）: "
+            + ", ".join(f"{path}({counts[path]}/{limit})" for path in pending),
             LOG_COMMAND,
         )
     if expired:
@@ -260,7 +284,7 @@ async def prune_absent_plugins(loaded: set[str]) -> None:
         await PluginInfoMemoryCache.refresh()
         await TaskInfoMemoryCache.refresh()
         logger.info(
-            f"已清理连续 {ABSENCE_LIMIT} 次启动未找到的插件: {', '.join(cleaned)}，"
+            f"已清理连续 {limit} 次启动未找到的插件: {', '.join(cleaned)}，"
             "插件自己的数据表保留",
             LOG_COMMAND,
         )

@@ -310,6 +310,7 @@ async def handle_restart_connect(bot: Bot) -> None:
         user_id=str(receipt.get("user_id") or "") or None,
         group_id=str(receipt.get("group_id") or "") or None,
         channel_id=str(receipt.get("channel_id") or "") or None,
+        bot=bot,
     )
     if not target:
         logger.warning("未找到重启回执目标，已跳过发送。", "重启")

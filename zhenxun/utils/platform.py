@@ -17,6 +17,7 @@ from zhenxun.models.friend_user import FriendUser
 from zhenxun.models.group_console import GroupConsole
 from zhenxun.services.log import logger
 from zhenxun.services.network_proxy import ManagedAsyncClient
+from zhenxun.services.platform_identity import native_id
 from zhenxun.utils.exception import AllURIsFailedError, NotFindSuperuser
 from zhenxun.utils.http_utils import AsyncHttpx
 from zhenxun.utils.message import MessageUtils
@@ -245,21 +246,24 @@ class PlatformUtils:
             )
 
     @classmethod
-    def _qq_superusers(cls, bot: Bot) -> list[str]:
-        """从 SUPERUSERS 中取出可用于该 QQ Bot 的超级用户id
+    def _config_superusers(cls, bot: Bot) -> list[str]:
+        """从 SUPERUSERS 中取出可用于该 Bot 的超级用户id
 
         参数:
             bot: Bot
 
         返回:
-            list[str]: 裸 id 与 `适配器:id` 形式中的 id
+            list[str]: `适配器:id` 形式中的 id，QQ 平台另含裸 id
         """
         adapter = _adapter_name(bot).split(maxsplit=1)
         prefix = f"{adapter[0]}:" if adapter else None
+        bare = cls.get_platform(bot) == "qq"
         result = []
         for item in bot.config.superusers:
             item = str(item).strip()
             if ":" not in item:
+                if not bare:
+                    continue
                 user_id = item
             elif prefix and item.startswith(prefix):
                 user_id = item[len(prefix) :]
@@ -279,7 +283,7 @@ class PlatformUtils:
         """发送消息给超级用户
 
         参数:
-            bot: Bot，没有传入时使用get_bot随机获取
+            bot: Bot，未传入或为 QQ 官方 Bot 时使用唯一在线的 OneBot
             message: 消息
             superuser_id: 指定超级用户id.
 
@@ -289,7 +293,8 @@ class PlatformUtils:
         返回:
             Receipt | None: Receipt
         """
-        if not bot:
+        if not bot or cls.get_platform_scope(bot) == "qq_api":
+            # QQ 官方 Bot 不能主动私聊，改由 OneBot 发送
             bot = cls._resolve_unique_qq_client_bot("PlatformUtils:send_superuser")
             if bot is None:
                 return []
@@ -300,8 +305,8 @@ class PlatformUtils:
             superuser_ids = [
                 uid for uid in BotConfig.get_superuser(platform) if str(uid).strip()
             ]
-            if not superuser_ids and platform == "qq":
-                superuser_ids = cls._qq_superusers(bot)
+            if not superuser_ids:
+                superuser_ids = cls._config_superusers(bot)
             if not superuser_ids:
                 raise NotFindSuperuser()
         if isinstance(message, str):
@@ -582,12 +587,15 @@ class PlatformUtils:
     ) -> Receipt | None:
         """发送消息
 
+        QQ 官方 Bot 指定的群与事件所在群不同或不在事件中时向该群发送主动消息，
+        未指定群时回复到事件所在会话，不支持主动私聊。
+
         参数:
             bot: Bot
             user_id: 用户id
             group_id: 群组id或频道id
             message: 消息文本
-            official_context: QQ 官方事件上下文，被动回复不可用时按配置改用主动消息
+            official_context: QQ 官方事件上下文，默认取当前事件
 
         返回:
             Receipt | None: 是否发送成功
@@ -596,117 +604,66 @@ class PlatformUtils:
             MessageUtils.build_message(message) if isinstance(message, str) else message
         )
         if cls.get_platform_scope(bot) == "qq_api":
-            from zhenxun.adapters.qq_official.context import (
-                OfficialQQEventContext,
-                OfficialReplyUnavailable,
-                finish_reply,
-                get_current_official_context,
-                reserve_passive_reply,
+            from zhenxun.adapters.qq_official.bot import (
+                ZhenxunQQBot,
+                send_official_message,
             )
 
-            context = official_context or get_current_official_context()
-            if not isinstance(context, OfficialQQEventContext):
-                raise OfficialReplyUnavailable(
-                    "QQ official sends require a current reply context"
-                )
-            if context.app_id != str(bot.self_id):
-                raise OfficialReplyUnavailable("QQ official reply context bot mismatch")
-            if context.interaction_id:
-                if context.reply_event is None:
-                    raise OfficialReplyUnavailable(
-                        "QQ interaction reply event is missing"
-                    )
-                return await send_message.send(target=context.reply_event, bot=bot)
-            if context.scene == "guild":
-                if context.guild_event is None:
-                    raise OfficialReplyUnavailable("QQ guild reply event is missing")
-                # A DM event's guild_id is the existing private session, not
-                # the source guild required by Target's post_dms() path.
-                return await send_message.send(target=context.guild_event, bot=bot)
-            reserved = await reserve_passive_reply(context)
-            target = Target(
-                id=(
-                    context.actor_openid
-                    if context.scene == "c2c"
-                    else context.group_openid
-                ),
-                private=context.scene == "c2c",
-                source=context.source_id if reserved else "",
-                self_id=str(bot.self_id),
-                adapter="QQ",
-                scope=SupportScope.qq_api,
-                extra={"qq.reply_seq": reserved[1] - 1} if reserved else None,
+            return await send_official_message(
+                cast(ZhenxunQQBot, bot), send_message, group_id, official_context
             )
-            if reserved is None:
-                return await send_message.send(target=target, bot=bot)
-            state = reserved[0]
-            successful = False
-            try:
-                receipt = await send_message.send(target=target, bot=bot)
-                successful = True
-                return receipt
-            finally:
-                await finish_reply(state, successful=successful)
-        if target := cls.get_target(user_id=user_id, group_id=group_id):
+        if target := cls.get_target(user_id=user_id, group_id=group_id, bot=bot):
             return await send_message.send(target=target, bot=bot)
         return None
 
     @classmethod
     async def update_group(cls, bot: Bot) -> int:
-        """更新群组信息
+        """更新群组信息，只写入群名与人数有变化的群，群缓存在提交后从数据库刷新
 
         参数:
             bot: Bot
 
         返回:
-            int: 更新个数
+            int: 新增个数
         """
+        from tortoise.transactions import in_transaction
+
         create_list = []
-        update_list = []
+        update_list: list[tuple[int, dict]] = []
         group_list, platform = await cls.get_group_list(bot)
         if group_list:
-            db_group = await GroupConsole.all()
-            db_group_id: list[tuple[str, str]] = [
-                (group.group_id, group.channel_id) for group in db_group
-            ]
+            db_group = {
+                (group.group_id, group.channel_id): group
+                for group in await GroupConsole.all()
+            }
             for group in group_list:
                 group.platform = platform
-                if (group.group_id, group.channel_id) not in db_group_id:
+                current = db_group.get((group.group_id, group.channel_id))
+                if current is None:
                     create_list.append(group)
                     logger.debug(
                         "群聊信息更新成功",
                         "更新群信息",
                         target=f"{group.group_id}:{group.channel_id}",
                     )
-                else:
-                    _group = next(
-                        g
-                        for g in db_group
-                        if g.group_id == group.group_id
-                        and g.channel_id == group.channel_id
+                    continue
+                values = {
+                    "group_name": group.group_name,
+                    "max_member_count": group.max_member_count,
+                    "member_count": group.member_count,
+                }
+                if any(getattr(current, k) != v for k, v in values.items()):
+                    update_list.append((current.id, values))
+        if create_list or update_list:
+            async with in_transaction() as connection:
+                if create_list:
+                    await GroupConsole.bulk_create(create_list, 10, using_db=connection)
+                for group_id, values in update_list:
+                    await (
+                        GroupConsole.filter(id=group_id)
+                        .using_db(connection)
+                        .update(**values)
                     )
-                    _group.group_name = group.group_name
-                    _group.max_member_count = group.max_member_count
-                    _group.member_count = group.member_count
-                    update_list.append(_group)
-        if create_list:
-            await GroupConsole.bulk_create(create_list, 10)
-            new_ids = [g.group_id for g in create_list]
-            fresh = await GroupConsole.filter(group_id__in=new_ids).all()
-            from zhenxun.services.cache.runtime_cache import GroupMemoryCache
-
-            for group in fresh:
-                await GroupMemoryCache.upsert_from_model(group)
-        if group_list:
-            # 使用逐条保存替代 bulk_update，避免 SQLite 兼容性问题
-            for group in update_list:
-                await group.save(
-                    update_fields=[
-                        "group_name",
-                        "max_member_count",
-                        "member_count",
-                    ]
-                )
         return len(create_list)
 
     @classmethod
@@ -871,18 +828,29 @@ class PlatformUtils:
         user_id: str | None = None,
         group_id: str | None = None,
         channel_id: str | None = None,
-    ):
-        """获取发生Target
+        bot: Bot | None = None,
+    ) -> Target | None:
+        """获取发送Target
 
         参数:
-            bot: Bot
             user_id: 用户id
             group_id: 频道id或群组id
             channel_id: 频道id
+            bot: 发送所用的 Bot，传入时把持久化的 id 还原为该 Bot 平台中的 id
 
         返回:
-            target: 对应平台Target
+            Target | None: 对应平台Target，id 不属于该 Bot 的平台时为 None
         """
+        if bot is not None:
+            scope = cls.get_platform_scope(bot)
+            if group_id:
+                group_id = native_id(
+                    group_id, scope, group=True, bot_id=str(bot.self_id)
+                )
+                if group_id is None:
+                    return None
+            elif user_id:
+                user_id = native_id(user_id, scope)
         target = None
         if group_id and channel_id:
             target = Target(channel_id, parent_id=group_id, channel=True)
@@ -918,10 +886,9 @@ class BroadcastEngine:
         异常:
             ValueError: 没有可用的Bot对象
         """
-        if ignore_group is None:
-            ignore_group = []
         self.message = MessageUtils.build_message(message)
-        self.ignore_group = ignore_group
+        self.ignore_group = list(ignore_group or [])
+        self.sent: set[str] = set()
         self.check_func = check_func
         self.log_cmd = log_cmd
         self.platform = platform
@@ -930,7 +897,7 @@ class BroadcastEngine:
         if bot:
             self.bot_list = [bot] if isinstance(bot, Bot) else bot
         if isinstance(bot_id, str):
-            bot_id = set(bot_id)
+            bot_id = {bot_id}
         if bot_id:
             for i in bot_id:
                 try:
@@ -975,15 +942,40 @@ class BroadcastEngine:
                 group_id=group.group_id,
             )
             return
-        if target := PlatformUtils.get_target(
-            group_id=group.group_id,
-            channel_id=group.channel_id,
+        if PlatformUtils.get_platform_scope(bot) == "qq_api":
+            sending = PlatformUtils.send_message(
+                bot, None, group.group_id, self.message
+            )
+        elif target := PlatformUtils.get_target(
+            group_id=group.group_id, channel_id=group.channel_id, bot=bot
         ):
-            self.ignore_group.append(key)
-            await MessageUtils.build_message(self.message).send(target, bot)
-            logger.debug("广播消息发送成功...", self.log_cmd, target=key)
+            sending = MessageUtils.build_message(self.message).send(target, bot)
         else:
             logger.warning("广播消息获取Target失败...", self.log_cmd, target=key)
+            return
+        self.sent.add(key)
+        await sending
+        logger.debug("广播消息发送成功...", self.log_cmd, target=key)
+
+    @classmethod
+    async def _group_list(cls, bot: Bot) -> list[GroupConsole]:
+        """获取广播的群组
+
+        参数:
+            bot: Bot
+
+        返回:
+            list[GroupConsole]: 群组列表，QQ 官方 Bot 为已开启主动消息的群
+        """
+        if PlatformUtils.get_platform_scope(bot) == "qq_api":
+            from zhenxun.adapters.qq_official.proactive import proactive_groups
+
+            return [
+                GroupConsole(group_id=group_id)
+                for group_id in await proactive_groups(str(bot.self_id))
+            ]
+        group_list, _ = await PlatformUtils.get_group_list(bot)
+        return group_list
 
     async def broadcast(self) -> int:
         """广播消息
@@ -994,13 +986,14 @@ class BroadcastEngine:
         for bot in self.bot_list:
             if self.platform and self.platform != PlatformUtils.get_platform(bot):
                 continue
-            group_list, _ = await PlatformUtils.get_group_list(bot)
+            group_list = await self._group_list(bot)
             if not group_list:
                 continue
             for group in group_list:
                 if (
                     group.group_id in self.ignore_group
                     or group.channel_id in self.ignore_group
+                    or f"{group.group_id}:{group.channel_id}" in self.sent
                 ):
                     continue
                 try:
@@ -1018,7 +1011,7 @@ async def broadcast_group(
     message: str | UniMessage,
     bot: Bot | list[Bot] | None = None,
     bot_id: str | set[str] | None = None,
-    ignore_group: list[str] = [],
+    ignore_group: list[str] | None = None,
     check_func: Callable[[Bot, str], Awaitable] | None = None,
     log_cmd: str | None = None,
     platform: str | None = None,

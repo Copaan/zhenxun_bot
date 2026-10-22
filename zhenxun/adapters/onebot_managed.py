@@ -1,12 +1,16 @@
 """Managed OneBot ingress; protocol logic follows the locked upstream adapter."""
 
 import asyncio
+from collections.abc import Awaitable, Callable
 import contextlib
 import hashlib
+import hmac
 import inspect
 import json
-from typing import Any, cast
+import time
+from typing import Any, ClassVar, cast
 
+from nonebot.adapters import Bot as BaseBot
 from nonebot.adapters.onebot.store import ResultStore
 from nonebot.adapters.onebot.v11 import Adapter, Bot
 from nonebot.adapters.onebot.v11.adapter import RECONNECT_INTERVAL
@@ -16,10 +20,147 @@ from nonebot.adapters.onebot.v11.utils import handle_api_result, log
 from nonebot.drivers import URL, Request, Response, WebSocket
 from nonebot.exception import WebSocketClosed
 from nonebot.utils import DataclassEncoder, escape_tag
+from starlette.datastructures import Headers
 
 from zhenxun.services.startup import startup_coordinator
+from zhenxun.utils.exception import DependencyUnavailable
+from zhenxun.utils.network import public_client_address
 
 _ADMISSION_TIMEOUT = 30.0
+_INGRESS_PREFIX = "/onebot/"
+_REJECTED_LIMIT = 1024
+_QUEUED_APIS = frozenset(
+    {
+        "send_msg",
+        "send_group_msg",
+        "send_private_msg",
+        "send_forward_msg",
+        "send_group_forward_msg",
+        "send_private_forward_msg",
+        "send_like",
+    }
+)
+_SEND_INTERVAL = 0.05
+_QUEUE_LIMIT = 500
+_DRAIN_TIMEOUT = 3.0
+
+
+class SendRejected(DependencyUnavailable):
+    """发送请求未交给协议端，调用方不能视为发送成功"""
+
+
+class _BotQueue:
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.size = 0
+        self.last = 0.0
+
+
+class SendQueue:
+    """OneBot 发送队列：每个 Bot 按到达顺序逐条发送，相邻两条保持最小间隔"""
+
+    _bots: ClassVar[dict[str, _BotQueue]] = {}
+    _pending: ClassVar[int] = 0
+    _stopping: ClassVar[bool] = False
+    _closed: ClassVar[bool] = False
+    _drained: ClassVar[asyncio.Event | None] = None
+
+    @classmethod
+    async def call(cls, self_id: str, send: Callable[[], Awaitable[Any]]) -> Any:
+        """排队发送
+
+        参数:
+            self_id: Bot id
+            send: 实际发送的调用
+
+        返回:
+            Any: 发送结果
+
+        异常:
+            SendRejected: 队列已满或正在关闭，消息未发送
+        """
+        if cls._stopping:
+            raise SendRejected("send_queue_stopping")
+        queue = cls._bots.setdefault(self_id, _BotQueue())
+        if queue.size >= _QUEUE_LIMIT:
+            log("WARNING", f"Bot {escape_tag(self_id)} 发送队列已满，拒绝发送")
+            raise SendRejected("send_queue_full")
+        queue.size += 1
+        cls._pending += 1
+        try:
+            async with queue.lock:
+                if cls._closed:
+                    raise SendRejected("send_queue_stopping")
+                wait = queue.last + _SEND_INTERVAL - time.monotonic()
+                if wait > 0:
+                    await asyncio.sleep(wait)
+                try:
+                    return await send()
+                finally:
+                    queue.last = time.monotonic()
+        finally:
+            queue.size -= 1
+            cls._pending -= 1
+            if cls._pending == 0 and cls._drained is not None:
+                cls._drained.set()
+
+    @classmethod
+    def forget(cls, self_id: str) -> None:
+        """Bot 断开后移除其队列，已排队的消息仍按原顺序发送"""
+        cls._bots.pop(self_id, None)
+
+    @classmethod
+    def start(cls) -> None:
+        """恢复接收发送请求"""
+        cls._stopping = cls._closed = False
+
+    @classmethod
+    async def stop(cls) -> None:
+        """停止接收发送请求，等待已排队的消息发出，超时后丢弃剩余消息"""
+        cls._stopping = True
+        if cls._pending:
+            cls._drained = asyncio.Event()
+            try:
+                await asyncio.wait_for(cls._drained.wait(), _DRAIN_TIMEOUT)
+            except asyncio.TimeoutError:
+                cls._closed = True
+                log("WARNING", f"发送队列关闭超时，丢弃未发送的消息 {cls._pending} 条")
+            finally:
+                cls._drained = None
+        cls._bots.clear()
+
+
+class _PublicIngressGuard:
+    """拒绝缺少认证的公网 OneBot 接入，本机与内网来源不受影响"""
+
+    def __init__(self, app, adapter: "ManagedOneBotAdapter"):
+        self.app = app
+        self.adapter = adapter
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] in {"http", "websocket"} and str(
+            scope.get("path", "")
+        ).startswith(_INGRESS_PREFIX):
+            if self.adapter._public_rejected(scope):
+                if scope["type"] == "websocket":
+                    await receive()
+                    await send({"type": "websocket.close", "code": 1008})
+                else:
+                    await send(
+                        {
+                            "type": "http.response.start",
+                            "status": 403,
+                            "headers": [(b"content-type", b"text/plain")],
+                        }
+                    )
+                    await send(
+                        {
+                            "type": "http.response.body",
+                            "body": b"Authentication required for public source",
+                        }
+                    )
+                return
+        await self.app(scope, receive, send)
 
 
 class ManagedResultStore(ResultStore):
@@ -35,18 +176,20 @@ class ManagedOneBotAdapter(Adapter):
     _result_store = ManagedResultStore()
 
     async def _call_api(self, bot: Bot, api: str, **data: Any) -> Any:
-        from zhenxun.services import send_queue
-
-        if send_queue._PATCHED:
-            return await send_queue._queued_call_api(self, bot, api, **data)
+        if api in _QUEUED_APIS:
+            return await SendQueue.call(
+                bot.self_id, lambda: self._call_api_unqueued(bot, api, **data)
+            )
         return await self._call_api_unqueued(bot, api, **data)
+
+    def bot_disconnect(self, bot: BaseBot) -> None:
+        SendQueue.forget(bot.self_id)
+        super().bot_disconnect(bot)
 
     async def _call_api_unqueued(self, bot: Bot, api: str, **data: Any) -> Any:
         websocket = self.connections.get(bot.self_id)
         if websocket is None:
-            from zhenxun.services.send_queue import _ORIG_CALL_API
-
-            return await _ORIG_CALL_API(self, bot, api, **data)
+            return await super()._call_api(bot, api, **data)
         timeout = data.get("_timeout", self.config.api_timeout)
         store = self._result_store
         sequence = store.get_seq()
@@ -91,6 +234,54 @@ class ManagedOneBotAdapter(Adapter):
         log("WARNING", f"Bot {escape_tag(self_id)} 接入超时，等待协议端重连")
         return False
 
+    def _public_rejected(self, scope: dict) -> bool:
+        """公网来源的接入请求是否因缺少认证被拒绝
+
+        反向 WebSocket 需设置 ONEBOT_ACCESS_TOKEN，由适配器校验；HTTP 上报需设置
+        ONEBOT_SECRET 由适配器校验签名，或携带 ONEBOT_ACCESS_TOKEN。本机与内网
+        来源不受限制。每个来源地址只记录一次拒绝原因。
+
+        参数:
+            scope: ASGI 连接信息
+
+        返回:
+            bool: 是否拒绝
+        """
+        headers = Headers(scope=scope)
+        client = scope.get("client")
+        address = public_client_address(client[0] if client else None, headers)
+        if address is None:
+            return False
+        token = self.onebot_config.onebot_access_token
+        if scope["type"] == "websocket":
+            if token:
+                return False
+            reason = "未设置 ONEBOT_ACCESS_TOKEN"
+        else:
+            if self.onebot_config.onebot_secret or (
+                token
+                and hmac.compare_digest(
+                    headers.get("authorization", "").encode(),
+                    f"Bearer {token}".encode(),
+                )
+            ):
+                return False
+            reason = (
+                "未携带有效的 ONEBOT_ACCESS_TOKEN"
+                if token
+                else "未设置 ONEBOT_SECRET 或 ONEBOT_ACCESS_TOKEN"
+            )
+        if address not in self._rejected:
+            if len(self._rejected) >= _REJECTED_LIMIT:
+                self._rejected.clear()
+            self._rejected.add(address)
+            log(
+                "WARNING",
+                f"已拒绝公网来源 {escape_tag(address)} 的 OneBot 接入：{reason}，"
+                "公网接入必须认证，本机与局域网连接不受影响",
+            )
+        return True
+
     def __init__(self, *args, **kwargs):
         for name, expected in _UPSTREAM_HASHES.items():
             source = inspect.getsource(getattr(Adapter, name)).rstrip()
@@ -101,6 +292,20 @@ class ManagedOneBotAdapter(Adapter):
             if hashlib.sha256(source.encode()).hexdigest() != expected:
                 raise RuntimeError(f"onebot_receipt_version_unsupported:{name}")
         super().__init__(*args, **kwargs)
+        self._rejected: set[str] = set()
+        app = getattr(self.driver, "server_app", None)
+        if app is not None and not any(
+            item.cls is _PublicIngressGuard for item in app.user_middleware
+        ):
+            if app.middleware_stack is not None:
+                raise RuntimeError("onebot_ingress_guard_unavailable")
+            app.add_middleware(_PublicIngressGuard, adapter=self)
+        if not self.onebot_config.onebot_access_token:
+            log(
+                "INFO",
+                "未设置 ONEBOT_ACCESS_TOKEN：OneBot 只接受本机与局域网的无认证接入，"
+                "公网来源将被拒绝；使用内网穿透（frp 等）时也请设置该项",
+            )
 
     def _offer_event(self, bot: Bot, event):
         task = asyncio.create_task(bot.handle_event(event))
@@ -143,19 +348,20 @@ class ManagedOneBotAdapter(Adapter):
             log("WARNING", "Missing X-Self-ID Header")
             await websocket.close(1008, "Missing X-Self-ID Header")
             return
-        if not await self._admit(self_id):
-            await websocket.close(1013, "Runtime starting")
-            return
-        if self_id in self.bots:
-            log("WARNING", f"There's already a bot {self_id}, ignored")
-            await websocket.close(1008, "Duplicate X-Self-ID")
-            return
 
         # check access_token
         response = self._check_access_token(websocket.request)
         if response is not None:
             content = cast(str, response.content)
             await websocket.close(1008, content)
+            return
+
+        if not await self._admit(self_id):
+            await websocket.close(1013, "Runtime starting")
+            return
+        if self_id in self.bots:
+            log("WARNING", f"There's already a bot {self_id}, ignored")
+            await websocket.close(1008, "Duplicate X-Self-ID")
             return
 
         await websocket.accept()

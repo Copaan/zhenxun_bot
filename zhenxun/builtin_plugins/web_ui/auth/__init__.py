@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 
 from zhenxun.configs.config import Config
 from zhenxun.services.log import logger
+from zhenxun.utils.network import public_client_address
 from zhenxun.utils.webui_session import decode_token, session_response
 
 from ..api.configure.persistence import persist_webui_credentials
@@ -54,6 +55,29 @@ class PasswordResetRequest(BaseModel):
 
 def _client_key(request: Request) -> str:
     return request.client.host if request.client else "unknown"
+
+
+def _transport_warning(request: Request) -> str | None:
+    """通过公网明文 HTTP 访问 WebUI 时的安全提醒，只提醒不拦截
+
+    参数:
+        request: 请求
+
+    返回:
+        str | None: 提醒内容，通过 HTTPS 或从本机、内网访问时为 None
+    """
+    proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip()
+    if request.url.scheme == "https" or proto.lower() == "https":
+        return None
+    address = public_client_address(
+        request.client.host if request.client else None, request.headers
+    )
+    if address is None:
+        return None
+    logger.warning(
+        f"WebUI 正通过公网明文 HTTP 登录（来源 {address}），建议开启 HTTPS", "WebUi"
+    )
+    return "当前通过公网明文 HTTP 访问，账号密码可能被窃听，建议开启 HTTPS"
 
 
 async def _remember_token(access_token: str) -> None:
@@ -101,10 +125,13 @@ async def login_get_token(
     )
     await _remember_token(access_token)
     return Result.ok(
-        session_response(
-            access_token,
-            decode_token(access_token, Config.get_config("web-ui", "secret")),
-        ),
+        {
+            **session_response(
+                access_token,
+                decode_token(access_token, Config.get_config("web-ui", "secret")),
+            ),
+            "transport_warning": _transport_warning(request),
+        },
         "欢迎回家, 欧尼酱!",
     )
 
@@ -122,6 +149,7 @@ async def console_connect(request: Request, payload: ConsoleConnectRequest) -> R
                 **session_response(
                     setup_token, decode_token(setup_token, setup_access.secret)
                 ),
+                "transport_warning": _transport_warning(request),
             },
             "控制台连接已授权，请继续完成首次配置。",
         )
@@ -145,6 +173,7 @@ async def console_connect(request: Request, payload: ConsoleConnectRequest) -> R
                 access_token,
                 decode_token(access_token, Config.get_config("web-ui", "secret")),
             ),
+            "transport_warning": _transport_warning(request),
         },
         "已通过本次启动的控制台链接临时登录。",
     )

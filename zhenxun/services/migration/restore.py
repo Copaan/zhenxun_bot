@@ -170,6 +170,12 @@ def inspect(path: Path, password: str | None = None) -> dict:
     current = f"{sys.platform}-{platform.machine()}".lower()
     if saved["platform"] != current:
         warnings.append(f"备份来自 {saved['platform']}，部分依赖可能需要重新解析")
+    if skipped := manifest["unrestorable_files"]:
+        names = "、".join(name.removeprefix("files/") for name in skipped[:5])
+        warnings.append(
+            f"{len(skipped)} 个文件的文件名在当前系统上无效，恢复时将跳过：{names}"
+            + ("等" if len(skipped) > 5 else "")
+        )
     return {
         **manifest,
         "plugins": sorted(saved["plugins"]),
@@ -295,6 +301,8 @@ async def request_restore(
 ) -> dict:
     """准备从备份包恢复并请求重启
 
+    所选分类中文件名在当前系统上无效的文件不恢复，记录在 unrestorable_files。
+
     参数:
         path: 备份包路径
         password: 加密备份的密码
@@ -330,12 +338,18 @@ async def request_restore(
     except BaseException:
         shutil.rmtree(STATE_DIR, ignore_errors=True)
         raise
+    unrestorable = [
+        name.removeprefix("files/")
+        for name in manifest["unrestorable_files"]
+        if backup.category_for(name.removeprefix("files/")) in categories
+    ]
     return await _submit(
         {
             "kind": "restore",
             "state": "pending",
             "name": path.name,
             "categories": sorted(categories),
+            "unrestorable_files": unrestorable,
             "skip_failed": skip_failed,
             "db_url": db_url or current,
             "previous_db_url": current,

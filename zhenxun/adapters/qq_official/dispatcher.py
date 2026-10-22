@@ -22,7 +22,8 @@ class DispatchItem:
 
 
 class QQWebhookDispatcher:
-    """Bounded sharded executor preserving per-conversation event order."""
+    """按会话分片的有界分发器，同一会话按到达顺序开始处理，事件之间并发执行，
+    使 prompt 等待中的会话能收到后续消息"""
 
     def __init__(
         self,
@@ -35,6 +36,7 @@ class QQWebhookDispatcher:
         self._queues = [asyncio.Queue[DispatchItem]() for _ in range(self._shard_count)]
         self._ordering_locks = [asyncio.Lock() for _ in range(self._shard_count)]
         self._workers: list[asyncio.Task[None]] = []
+        self._running: set[asyncio.Task[None]] = set()
         self._admitted = 0
         self._in_flight = 0
         self._accepting = False
@@ -98,24 +100,39 @@ class QQWebhookDispatcher:
             item = await queue.get()
             async with self._lock:
                 self._in_flight += 1
-            try:
-                await item.handler(item.event)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                self._counts["handler_failed"] += 1
-                logger.error(
-                    "QQ Webhook 分片事件执行失败",
-                    "QQOfficialWebhook",
-                    e=exc,
-                )
-            else:
-                self._counts["handled"] += 1
-            finally:
-                async with self._lock:
-                    self._in_flight = max(0, self._in_flight - 1)
-                    self._admitted = max(0, self._admitted - 1)
-                queue.task_done()
+            task = asyncio.create_task(
+                self._run(queue, item), name=f"qq-dispatch-event-{index}"
+            )
+            self._running.add(task)
+            task.add_done_callback(self._running.discard)
+
+    async def _run(
+        self, queue: asyncio.Queue[DispatchItem], item: DispatchItem
+    ) -> None:
+        """执行单个事件，结束后归还名额
+
+        参数:
+            queue: 事件所在分片队列
+            item: 分发项
+        """
+        try:
+            await item.handler(item.event)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._counts["handler_failed"] += 1
+            logger.error(
+                "QQ Webhook 分片事件执行失败",
+                "QQOfficialWebhook",
+                e=exc,
+            )
+        else:
+            self._counts["handled"] += 1
+        finally:
+            async with self._lock:
+                self._in_flight = max(0, self._in_flight - 1)
+                self._admitted = max(0, self._admitted - 1)
+            queue.task_done()
 
     async def stop(self) -> None:
         async with self._lock:
@@ -129,11 +146,12 @@ class QQWebhookDispatcher:
                 asyncio.gather(*(queue.join() for queue in self._queues)),
                 timeout=SHUTDOWN_DRAIN_SECONDS,
             )
-        except TimeoutError:
+        except asyncio.TimeoutError:
             self._counts["shutdown_timeout"] += 1
-        for worker in workers:
-            worker.cancel()
-        await asyncio.gather(*workers, return_exceptions=True)
+        tasks = [*workers, *self._running]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         for queue in self._queues:
             while not queue.empty():
                 queue.get_nowait()

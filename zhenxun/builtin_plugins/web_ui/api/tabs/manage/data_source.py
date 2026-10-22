@@ -57,13 +57,21 @@ class ApiDataSource:
     @classmethod
     @managed_mutation("group_configuration")
     async def update_group(cls, group: UpdateGroup):
-        """更新群组数据
+        """更新群组数据，只修改页面上改动过的项，超级用户锁定保持不变
 
         参数:
             group: UpdateGroup
         """
+
+        def merge(current: list[str], enable: list[str], disable: list[str]):
+            return sorted((set(current) - set(enable)) | set(disable))
+
         policy = await cls._group_policy(group.group_id, group.bot_id)
-        task_list = await TaskInfo.get_modules(load_status=None)
+        changes = {
+            name: value
+            for name, value in (("level", group.level), ("status", group.status))
+            if value is not None
+        }
         async with policy_transaction():
             await bot_group_policy_service.update_group(
                 policy["bot_id"],
@@ -71,22 +79,21 @@ class ApiDataSource:
                 group.group_id,
                 "",
                 expected_revision=group.expected_revision or policy["revision"],
-                block_plugins=[
-                    module
-                    for module in group.close_plugins
-                    if module not in policy["forced_plugins"]
-                ],
-                block_tasks=[
-                    module
-                    for module in task_list
-                    if module not in group.task and module not in policy["forced_tasks"]
-                ],
+                block_plugins=merge(
+                    policy["block_plugins"], group.enable_plugins, group.disable_plugins
+                ),
+                block_tasks=merge(
+                    policy["block_tasks"], group.enable_tasks, group.disable_tasks
+                ),
             )
+            if not changes:
+                return
             db_group = await GroupConsole.get_group_db(group.group_id)
             if db_group is None:
                 raise PluginPolicyError("群资料不存在")
-            db_group.level, db_group.status = group.level, group.status
-            await db_group.save(update_fields=["level", "status"])
+            for name, value in changes.items():
+                setattr(db_group, name, value)
+            await db_group.save(update_fields=list(changes))
 
     @classmethod
     async def get_request_list(cls) -> ReqResult:

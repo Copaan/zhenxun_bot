@@ -11,6 +11,7 @@ import uuid
 
 from fastapi import APIRouter, Query
 from fastapi.responses import JSONResponse
+from nonebot.plugin import get_plugin_by_module_name
 from packaging.utils import canonicalize_name
 from pydantic import BaseModel, Field
 
@@ -37,9 +38,10 @@ from zhenxun.services.nonebot_store.runtime import (
     finalize_orm_migration,
     finalize_pending_transaction,
     generation_native_extensions,
+    issue_text,
     module_source_path,
     prepare_generation,
-    probe_missing_config,
+    probe_plugin_import,
     record_manual_operations,
     rollback_pending_transaction,
     stage_generation,
@@ -358,6 +360,7 @@ def _failure_reasons(transaction: dict[str, Any], project_link: str) -> list[dic
                     for path in failure.get("paths") or []
                     if isinstance(path, str)
                 ][:20],
+                "message": str(failure.get("detail") or "") or None,
             }
         )
     return reasons or [
@@ -460,6 +463,12 @@ def _catalog_item(
         "version": str(plugin.get("version") or ""),
         "time": str(plugin.get("time") or ""),
         "install_state": install_state,
+        "load_failed": bool(
+            managed
+            and not pending_action
+            and plugin.get("module_name")
+            and get_plugin_by_module_name(str(plugin["module_name"])) is None
+        ),
         "update_available": update_available,
         "blocked_reasons": reasons,
         "warnings": _registry_warnings(plugin),
@@ -1643,24 +1652,33 @@ async def _apply_analysis(payload: ApplyPayload, binding: str) -> Result[dict]:
                 return _completed(
                     analysis, operation_id, binding, result, _hot_apply_info(action)
                 )
-            # 需要重启才能生效时，先试导入一次，缺少配置则不进入待重启
-            if action != "uninstall" and (
-                config_key := await asyncio.to_thread(
-                    probe_missing_config, module_name, build["path"]
-                )
+            # 需要重启才能生效时先试导入：更新缺少配置时不进入待重启，
+            # 新装插件的问题随结果提示，重启后加载失败也会保留安装
+            failure = (
+                await asyncio.to_thread(probe_plugin_import, module_name, build["path"])
+                if action != "uninstall"
+                else None
+            )
+            if (
+                failure
+                and action == "update"
+                and failure.get("code") == "plugin_configuration_required"
             ):
-                raise RuntimeError(f"plugin_configuration_required:{config_key}")
+                raise RuntimeError(
+                    f"plugin_configuration_required:{'、'.join(failure['paths'])}"
+                )
             stage_generation(transaction, build)
             staged = True
+            result = _operation_result(
+                "restart_pending",
+                _restart_reasons(analysis, source_runtime, native_changed),
+            )
+            if failure:
+                result["diagnostic"] = (
+                    f"试导入未通过，重启后可能无法加载：{issue_text(failure)}"
+                )
             return _completed(
-                analysis,
-                operation_id,
-                binding,
-                _operation_result(
-                    "restart_pending",
-                    _restart_reasons(analysis, source_runtime, native_changed),
-                ),
-                "插件事务已准备，重启后生效",
+                analysis, operation_id, binding, result, "插件事务已准备，重启后生效"
             )
     except asyncio.CancelledError:
         with contextlib.suppress(Exception):
@@ -1701,9 +1719,11 @@ async def _apply_analysis(payload: ApplyPayload, binding: str) -> Result[dict]:
             "nonebot_plugin_apply_failed"
         )
         stage = "dependency_build" if build_error else "dependency_transaction"
-        reason, _, config_key = str(error).partition(":")
+        reason, _, detail = str(error).partition(":")
         if reason == "plugin_configuration_required":
-            code, stage, diagnostic = reason, "plugin_load", f"缺少配置项 {config_key}"
+            code, stage, diagnostic = reason, "plugin_load", f"缺少配置项 {detail}"
+        elif reason == "plugin_import_failed" and detail:
+            code, stage, diagnostic = reason, "plugin_load", detail
         logger.error(f"NoneBot 插件应用失败: {code}", "WebUi", e=error)
         _record_failure(analysis, operation_id, binding, code, diagnostic)
         return Result.fail(

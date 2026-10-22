@@ -38,6 +38,24 @@ class PolicyContext:
 class PolicyDecisionPoint:
     """基于权限快照的无副作用权限判定，限制、金币等副作用由 auth_checker 处理"""
 
+    @staticmethod
+    def superuser_exempt(snapshot: AuthSnapshot) -> bool:
+        """超级用户是否免除账号休眠、群组与管理员权限、限制与金币检查
+
+        超级用户插件或未开启 limit_superuser 的插件免除；插件全局关闭与账号屏蔽仍由
+        decide_plugin 判断，账号或群组数据缺失时仍拒绝。
+
+        参数:
+            snapshot: 权限快照
+
+        返回:
+            bool: 是否免除
+        """
+        profile = snapshot.profile
+        return snapshot.is_superuser and (
+            profile.plugin_type == PluginType.SUPERUSER or not profile.limit_superuser
+        )
+
     def decide(self, context: PolicyContext) -> PolicyDecision:
         snapshot = context.snapshot
         profile = snapshot.profile
@@ -51,7 +69,11 @@ class PolicyDecisionPoint:
         bot_data = context.snapshot.bot_data
         if bot_data is None:
             return PolicyDecision("deny", "bot_not_found")
-        if not bot_data.status and not context.allow_sleep_bypass:
+        if (
+            not bot_data.status
+            and not context.allow_sleep_bypass
+            and not self.superuser_exempt(context.snapshot)
+        ):
             return PolicyDecision("deny", "bot_sleeping")
         return PolicyDecision("allow", "bot_allowed")
 
@@ -62,6 +84,8 @@ class PolicyDecisionPoint:
         group = snapshot.group
         if group is None:
             return PolicyDecision("deny", "group_not_found")
+        if self.superuser_exempt(snapshot):
+            return PolicyDecision("allow", "superuser")
         if group.level < 0:
             return PolicyDecision("deny", "group_blacklisted")
         if (
@@ -105,6 +129,8 @@ class PolicyDecisionPoint:
                 return PolicyDecision("allow", "superuser")
             if profile.plugin_type == PluginType.SUPERUSER:
                 return PolicyDecision("deny", "superuser_required")
+        if self.superuser_exempt(snapshot):
+            return PolicyDecision("allow", "superuser")
         if not profile.admin_level:
             return PolicyDecision("skip", "admin_level_empty")
         global_user, group_user = snapshot.admin_levels or (None, None)

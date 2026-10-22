@@ -4,12 +4,15 @@ import asyncio
 from collections import Counter
 import hashlib
 import inspect
+import re
 import time
 from typing import Any, cast
 from typing_extensions import override
 
+import nonebot
 from nonebot.adapters.qq.adapter import Adapter as QQAdapter
 from nonebot.adapters.qq.adapter import audit_result
+from nonebot.adapters.qq.config import BotInfo
 from nonebot.adapters.qq.event import MessageAuditEvent
 from nonebot.adapters.qq.models import Dispatch, WebhookVerify
 from nonebot.drivers import URL, ASGIMixin, HTTPServerSetup, Request, Response
@@ -20,6 +23,7 @@ from zhenxun.services.log import logger
 from . import models as _models  # noqa: F401
 from . import runtime as _runtime
 from .bot import ZhenxunQQBot
+from .config import QQOfficialConfig
 from .context import (
     digest_identifier,
     prepare_event_context,
@@ -39,6 +43,10 @@ from .diagnostics import (
 from .dispatcher import QQWebhookDispatcher, dispatch_routing_key
 
 ACK_BODY = '{"op":12}'
+# 回调地址验证会用事件验签的密钥签名请求方提供的内容，只接受数字时间戳与短令牌，
+# 防止借此为伪造的事件 JSON 取得签名。
+_VERIFY_EVENT_TS = re.compile(r"\d{1,20}")
+_VERIFY_PLAIN_TOKEN = re.compile(r"[A-Za-z0-9_-]{1,128}")
 
 # These upstream boundaries parse and dispatch the events intercepted below.
 # Refuse an unreviewed adapter upgrade instead of silently bypassing persistence.
@@ -51,6 +59,24 @@ _INGRESS_HASHES = {
         "e9ba3afb175835942ae7049a2276379c74a7397cc0e81e11fa32dcf38aab5e44"
     ),
 }
+
+
+def project_bot_infos(qq_bots: list[BotInfo], config: QQOfficialConfig) -> list:
+    """按本项目的 QQ_BOTS 配置重建上游 BotInfo，未填写的连接方式与订阅事件使用
+    本项目默认值（Webhook、不订阅频道事件），与配置校验和 WebUI 显示一致
+
+    参数:
+        qq_bots: 上游解析的 BotInfo
+        config: 本项目解析的配置
+
+    返回:
+        list[BotInfo]: 重建后的 BotInfo
+    """
+    bots = {bot.id: bot for bot in config.qq_bots}
+    return [
+        BotInfo.model_validate(bots[info.id].model_dump()) if info.id in bots else info
+        for info in qq_bots
+    ]
 
 
 class ZhenxunQQAdapter(QQAdapter):
@@ -73,6 +99,9 @@ class ZhenxunQQAdapter(QQAdapter):
         self._dispatcher = QQWebhookDispatcher()
         self._metrics: Counter[str] = Counter()
         super().__init__(driver, **kwargs)
+        self.qq_config.qq_bots = project_bot_infos(
+            self.qq_config.qq_bots, nonebot.get_plugin_config(QQOfficialConfig)
+        )
         _runtime.register_adapter_runtime(self)
 
     @override
@@ -519,9 +548,9 @@ class ZhenxunQQAdapter(QQAdapter):
         self.tasks.add(task)
 
     def _resolve_webhook_bot(self, app_id: str) -> ZhenxunQQBot | None:
-        if app_id in self.bots:
-            return cast(ZhenxunQQBot, self.bots[app_id])
-        return self._webhook_bots.get(app_id)
+        if app_id not in self._webhook_bots:
+            return None
+        return cast(ZhenxunQQBot, self.bots.get(app_id) or self._webhook_bots[app_id])
 
     @staticmethod
     def _ack() -> Response:
@@ -548,6 +577,12 @@ class ZhenxunQQAdapter(QQAdapter):
             return Response(400, content="Invalid request content")
 
         if isinstance(payload, WebhookVerify):
+            if not (
+                _VERIFY_EVENT_TS.fullmatch(payload.data.event_ts)
+                and _VERIFY_PLAIN_TOKEN.fullmatch(payload.data.plain_token)
+            ):
+                self._record("verify_rejected")
+                return Response(400, content="Invalid verify payload")
             response = self._webhook_verify(bot, payload)
             response.headers["Content-Type"] = "application/json"
             return response

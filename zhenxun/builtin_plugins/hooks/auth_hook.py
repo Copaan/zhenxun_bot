@@ -22,7 +22,6 @@ from zhenxun.services.runtime_bootstrap import register_runtime_bootstrap
 from zhenxun.utils.exception import DependencyUnavailable
 from zhenxun.utils.manager.priority_manager import PriorityLifecycle
 
-from .auth.auth_limit import LimitManager
 from .auth.config import LOGGER_COMMAND
 from .auth.context import (
     get_event_context,
@@ -459,15 +458,8 @@ async def _unblock_after_matcher(
     commit = side_effects.commits.get(module)
     if commit is None or commit.committed or commit.owner_matcher_id != id(matcher):
         return
-    side_effects.commits.pop(module, None)
-    if exception is None:
-        try:
-            await commit.commit_all()
-            side_effects.auth_results[module] = (True, None)
-        except Exception as exc:
-            await commit.rollback_all("commit_failed")
-            logger.error("auth side effect commit failed", LOGGER_COMMAND, e=exc)
-    else:
-        await commit.rollback_all("matcher_exception")
-    if commit.limit_should_auto_unblock and (entity := commit.limit_entity):
-        LimitManager.unblock(module, entity.user_id, entity.group_id, entity.channel_id)
+    try:
+        if await commit.finish(commit=exception is None, reason="matcher_exception"):
+            side_effects.settled.add(module)
+    finally:
+        side_effects.commits.pop(module, None)

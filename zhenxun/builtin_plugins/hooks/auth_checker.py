@@ -237,23 +237,10 @@ async def _check_ban(prep: AuthPreparation, matcher: Matcher, session: Uninfo) -
     await auth_ban(matcher, session, prep.plugin, context=prep.permission_context)
 
 
-def _is_superuser_exempt(prep: AuthPreparation) -> bool:
-    """超级用户是否免除限制与金币消耗
-
-    参数:
-        prep: 权限检查准备数据
-
-    返回:
-        bool: 是否免除
-    """
-    profile = prep.profile
-    return prep.permission_context.is_superuser and (
-        profile.plugin_type == PluginType.SUPERUSER or not profile.limit_superuser
-    )
-
-
 async def _reserve_gold(
     prep: AuthPreparation,
+    bot: Bot,
+    event: Event,
     session: Uninfo,
     cost_gold: int,
     commit: SideEffectCommit,
@@ -262,16 +249,19 @@ async def _reserve_gold(
 
     参数:
         prep: 权限检查准备数据
+        bot: Bot
+        event: Event
         session: Uninfo
         cost_gold: 金币数量
         commit: 副作用提交器
 
     异常:
         DependencyUnavailable: 数据库不可用，跳过本条消息
-        SkipPluginException: 当前平台无法解析业务身份或金币不足
+        SkipPluginException: 当前平台或发送者无法解析业务身份，或金币不足
     """
     from zhenxun.services.business_identity import (
-        business_user_id,
+        BusinessIdentityError,
+        resolve_business_identity,
         supports_business_identity,
     )
 
@@ -284,8 +274,14 @@ async def _reserve_gold(
     if is_db_unhealthy():
         raise DependencyUnavailable("cost_database_unavailable")
     try:
+        identity = await resolve_business_identity(bot, event, session)
+    except BusinessIdentityError as error:
+        raise SkipPluginException(
+            f"{module} 无法解析业务身份，已取消执行...", tip_message=str(error)
+        ) from None
+    try:
         reservation = await UserConsole.reserve_gold(
-            await business_user_id(session),
+            identity.storage_key,
             cost_gold,
             GoldHandle.PLUGIN,
             module,
@@ -331,7 +327,7 @@ async def _run_auth(
         await _check_ban(prep, matcher, session)
     if _check_policy(prep, event):
         return
-    if _is_superuser_exempt(prep):
+    if _AUTH_PDP.superuser_exempt(prep.snapshot):
         raise IsSuperuserException()
     bot_filter(session, context=prep.permission_context)
     if prep.profile.has_limit:
@@ -341,7 +337,7 @@ async def _run_auth(
             )
         )
     if prep.profile.cost_gold > 0:
-        await _reserve_gold(prep, session, prep.profile.cost_gold, commit)
+        await _reserve_gold(prep, bot, event, session, prep.profile.cost_gold, commit)
 
 
 async def auth(
@@ -382,6 +378,7 @@ async def auth(
         owner_matcher_id=id(matcher),
         limit_entity=limit_entity,
     )
+    side_effect_cache.issued.append(commit)
     # result: None 表示不缓存，否则为 (是否放行, 拒绝原因)
     result: tuple[bool, str | None] | None = None
     async with side_effect_cache.lock_for(module):
@@ -394,6 +391,12 @@ async def auth(
             if cached is not None:
                 if not cached[0]:
                     raise SkipPluginException(cached[1] or "auth cached skip")
+                return
+            # 同一事件中该插件已预留或已提交限制与金币，不再重复预留
+            if (
+                module in side_effect_cache.commits
+                or module in side_effect_cache.settled
+            ):
                 return
             await _run_auth(
                 matcher, event, bot, session, context, skip_ban, state, commit

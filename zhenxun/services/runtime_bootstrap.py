@@ -10,7 +10,6 @@ import anyio.to_thread
 
 from zhenxun.services.log import install_asyncio_exception_handler, logger
 from zhenxun.services.memory_governor import start_memory_governor, stop_memory_governor
-from zhenxun.services.send_queue import start_send_queue, stop_send_queue
 from zhenxun.services.startup import startup_coordinator
 from zhenxun.services.uninfo_patch import apply_uninfo_onebot11_patch
 from zhenxun.utils.manager.priority_manager import PriorityLifecycle
@@ -279,15 +278,17 @@ def register_runtime_bootstrap(_driver) -> None:
     @PriorityLifecycle.on_startup(
         priority=-80,
         component_id="runtime:send_queue",
-        depends_on=("management:runtime_concurrency",),
-        pass_context=True,
     )
-    async def _setup_send_queue(context) -> None:
-        await start_send_queue(context)
+    async def _setup_send_queue() -> None:
+        from zhenxun.adapters.onebot_managed import SendQueue
+
+        SendQueue.start()
 
     @PriorityLifecycle.on_shutdown(priority=70, component_id="runtime:send_queue")
     async def _shutdown_send_queue() -> None:
-        await stop_send_queue()
+        from zhenxun.adapters.onebot_managed import SendQueue
+
+        await SendQueue.stop()
 
     @PriorityLifecycle.on_startup(
         priority=-79,

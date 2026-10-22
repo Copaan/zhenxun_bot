@@ -29,6 +29,7 @@ RUNTIME_CACHE_REVISION_PREFIX = f"{RUNTIME_CACHE_SYNC_CHANNEL}:REVISION"
 RUNTIME_CACHE_LOAD_RETRY_SECONDS = 1.0
 RUNTIME_CACHE_STARTUP_REFRESH_SKIP_SECONDS = 5.0
 RUNTIME_CACHE_DB_TIMEOUT_SECONDS = 3.0
+RUNTIME_CACHE_REVISION_AUDIT_SECONDS = 30.0
 
 INSTANCE_ID = uuid.uuid4().hex
 _LIFECYCLE_CONTEXT: Any | None = None
@@ -152,6 +153,7 @@ class RuntimeCacheSync:
     _last_revision: ClassVar[dict[str, int]] = {}
     _local_mutation: ClassVar[dict[str, int]] = {}
     _revision_reconcile: ClassVar[set[str]] = set()
+    _audited_revision: ClassVar[dict[str, int]] = {}
 
     @classmethod
     def _sync_enabled(cls) -> bool:
@@ -253,6 +255,7 @@ class RuntimeCacheSync:
         cls._last_revision.clear()
         cls._local_mutation.clear()
         cls._revision_reconcile.clear()
+        cls._audited_revision.clear()
 
     @classmethod
     def refresh_revision(cls, cache_type: str) -> tuple[int | None, int]:
@@ -312,6 +315,26 @@ class RuntimeCacheSync:
             logger.error("runtime cache sync publish failed", LOG_COMMAND, e=exc)
 
     @classmethod
+    def _reconcile(cls, cache_type: str, reason: str) -> None:
+        """缓存事件缺失或无法应用时，改为从数据库重新加载该缓存
+
+        权限策略将已加载的群聊与私聊策略标记为待刷新，使用前逐个重新读取。
+
+        参数:
+            cache_type: 缓存类型
+            reason: 原因
+        """
+        if cache_type == "permission":
+            from zhenxun.services.bot_group_policy import bot_group_policy_service
+
+            bot_group_policy_service.mark_all_stale()
+            RuntimeCacheMutation.revision += 1
+        elif cache_cls := RUNTIME_CACHES.get(cache_type):
+            cls._revision_reconcile.add(cache_type)
+            RuntimeCacheMutation.mark_error(cache_cls, RuntimeError(reason))
+            runtime_cache_refresh_coordinator.request_refresh(cache_cls)
+
+    @classmethod
     async def _accept_revision(cls, cache_type: str, revision: Any) -> bool:
         """Reject stale events and reconcile a detected Pub/Sub gap."""
         cache_cls = RUNTIME_CACHES.get(cache_type)
@@ -320,12 +343,7 @@ class RuntimeCacheSync:
         except (TypeError, ValueError):
             # Older workers did not publish revisions. A refresh is safer than
             # applying an unversioned snapshot over a versioned one.
-            if cache_cls is not None:
-                cls._revision_reconcile.add(cache_type)
-                RuntimeCacheMutation.mark_error(
-                    cache_cls, RuntimeError("runtime_cache_legacy_event")
-                )
-                runtime_cache_refresh_coordinator.request_refresh(cache_cls)
+            cls._reconcile(cache_type, "runtime_cache_legacy_event")
             return False
         if current <= 0:
             return False
@@ -345,33 +363,76 @@ class RuntimeCacheSync:
             runtime_cache_refresh_coordinator.request_refresh(cache_cls)
             return False
         if previous is not None and current > previous + 1:
-            if cache_cls is not None:
-                cls._revision_reconcile.add(cache_type)
-                RuntimeCacheMutation.mark_error(
-                    cache_cls,
-                    RuntimeError(f"runtime_cache_revision_gap:{previous}->{current}"),
-                )
-                runtime_cache_refresh_coordinator.request_refresh(cache_cls)
+            cls._reconcile(
+                cache_type, f"runtime_cache_revision_gap:{previous}->{current}"
+            )
             return False
         return True
 
     @classmethod
+    async def _audit_revisions(cls) -> None:
+        """核对 Redis 中的修订号，发现事件丢失或计数器回退时全量对账
+
+        上一轮核对时已分配的修订号到本轮仍未收到，说明事件在断线或发布失败时丢失；
+        Redis 中的修订号小于已收到的修订号，说明计数器被重置，以 Redis 中的值为准。
+        """
+        if cls._redis is None:
+            return
+        cache_types = (*RUNTIME_CACHES, "permission")
+        values = await cls._redis.mget(
+            [f"{RUNTIME_CACHE_REVISION_PREFIX}:{name}" for name in cache_types]
+        )
+        for cache_type, value in zip(cache_types, values):
+            try:
+                current = int(value or 0)
+            except (TypeError, ValueError):
+                continue
+            received = cls._last_revision.get(cache_type, 0)
+            audited = cls._audited_revision.get(cache_type, 0)
+            if current < received:
+                cls._last_revision[cache_type] = current
+                cls._reconcile(
+                    cache_type, f"runtime_cache_revision_reset:{received}->{current}"
+                )
+            elif received < audited:
+                cls._last_revision[cache_type] = audited
+                cls._reconcile(
+                    cache_type, f"runtime_cache_event_lost:{received}->{audited}"
+                )
+            cls._audited_revision[cache_type] = current
+
+    @classmethod
     async def _listen_loop(cls) -> None:
+        """接收其他实例的缓存事件并定期核对修订号，连接中断时等待自动重连"""
         if cls._pubsub is None:
             return
-        try:
-            while True:
+        failed = False
+        audit_at = time.monotonic() + RUNTIME_CACHE_REVISION_AUDIT_SECONDS
+        while True:
+            try:
+                if time.monotonic() >= audit_at:
+                    audit_at = time.monotonic() + RUNTIME_CACHE_REVISION_AUDIT_SECONDS
+                    await cls._audit_revisions()
                 message = await cls._pubsub.get_message(
                     ignore_subscribe_messages=True, timeout=1.0
                 )
-                if not message:
-                    await asyncio.sleep(0.05)
-                    continue
-                await cls._handle_message(message.get("data"))
-        except asyncio.CancelledError:
-            return
-        except Exception as exc:
-            logger.error("runtime cache sync listener failed", LOG_COMMAND, e=exc)
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                if not failed:
+                    logger.error(
+                        "runtime cache sync listener failed", LOG_COMMAND, e=exc
+                    )
+                failed = True
+                await asyncio.sleep(1.0)
+                continue
+            if failed:
+                failed = False
+                logger.info("runtime cache sync listener recovered", LOG_COMMAND)
+            if not message:
+                await asyncio.sleep(0.05)
+                continue
+            await cls._handle_message(message.get("data"))
 
     @classmethod
     async def _handle_message(cls, raw: Any) -> None:
@@ -388,14 +449,14 @@ class RuntimeCacheSync:
             payload = json.loads(raw)
         except Exception:
             return
-        if payload.get("source") == INSTANCE_ID:
-            return
         cache_type = payload.get("type")
         action = payload.get("action")
         data = payload.get("data") or {}
         if not isinstance(cache_type, str) or not await cls._accept_revision(
             cache_type, payload.get("revision")
         ):
+            return
+        if payload.get("source") == INSTANCE_ID:
             return
         token = _APPLYING_REMOTE_CACHE_EVENT.set(True)
         try:
@@ -417,6 +478,13 @@ class RuntimeCacheSync:
                         )
                     )
                 RuntimeCacheMutation.revision += 1
+        except Exception as exc:
+            logger.warning(
+                f"runtime cache sync event apply failed: {cache_type}",
+                LOG_COMMAND,
+                e=exc,
+            )
+            cls._reconcile(cache_type, "runtime_cache_sync_apply_failed")
         finally:
             _APPLYING_REMOTE_CACHE_EVENT.reset(token)
 
@@ -731,9 +799,6 @@ class RuntimeCacheRefreshCoordinator:
             await asyncio.gather(
                 *(self._refresh_entry(RUNTIME_CACHES[name]) for name in due_names)
             )
-
-
-runtime_cache_refresh_coordinator = RuntimeCacheRefreshCoordinator()
 
 
 runtime_cache_refresh_coordinator = RuntimeCacheRefreshCoordinator()

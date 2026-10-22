@@ -41,28 +41,6 @@ class BusinessIdentityLink(Model):
         return ["DROP TABLE IF EXISTS business_event_accounts"]
 
 
-class AccountBindingRequest(Model):
-    id = fields.CharField(64, pk=True)
-    identity = fields.ForeignKeyField(
-        "models.BusinessIdentityLink",
-        related_name="requests",
-        on_delete=fields.RESTRICT,
-    )
-    code_digest = fields.CharField(64, unique=True)
-    target_qq = fields.CharField(32)
-    initiator_id = fields.CharField(64)
-    action = fields.CharField(16, default="bind")
-    state = fields.CharField(16, default="pending")
-    revision = fields.IntField()
-    expires_at = fields.DatetimeField()
-    result = fields.JSONField(default=dict)
-    created_at = fields.DatetimeField(auto_now_add=True)
-
-    class Meta:
-        table = "account_binding_requests"
-        indexes = (("identity_id", "state"),)
-
-
 class AccountBindingChange(Model):
     id = fields.CharField(64, pk=True)
     identity = fields.ForeignKeyField(

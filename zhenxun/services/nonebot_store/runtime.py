@@ -714,7 +714,15 @@ def finalize_orm_migration() -> None:
 
 
 def record_manual_operations(transaction: dict, mode: str, status: str) -> None:
-    """Persist the outcome of store and manual requests sharing this generation."""
+    """记录同一依赖层事务中各商店与手动操作的最终结果
+
+    生效时附带启动验证的告警并标记未能加载的插件，回滚时附带失败说明。
+
+    参数:
+        transaction: 依赖层事务
+        mode: 生效方式
+        status: 操作状态
+    """
     operations = [
         item
         for item in transaction.get("operations", [])
@@ -731,10 +739,16 @@ def record_manual_operations(transaction: dict, mode: str, status: str) -> None:
         record_operation,
     )
 
+    applied = mode == "applied"
+    load_failures = (load_manifest().get("load_failures") or {}) if applied else {}
+    details = transaction.get("warnings" if applied else "error_details") or []
     for operation in operations:
         identity = operation["operation_id"]
         previous = (operation_status(identity) or {}).get("result") or {}
         previous.pop("cleanup_error", None)
+        if applied or details:
+            previous["diagnostic"] = "；".join(map(str, details))
+        previous["load_failed"] = operation.get("module_name") in load_failures
         record_operation(
             "dependencies:manual"
             if operation.get("kind") == "manual_dependencies"
@@ -996,8 +1010,13 @@ def _load_managed_plugin(module_name: str, *, purge: bool = True) -> None:
         raise
 
 
+_LOCALSTORE_DEFAULT_PATH_KEY = "I_AM_SURE_I_WANT_TO_USE_DEFAULT_LOCALSTORE_FILE_PATH"
+
+
 def missing_config_key(error: BaseException) -> str | None:
-    """导入失败原因是读取了未配置的 NoneBot 全局配置项时，返回对应的环境变量名
+    """导入失败原因是缺少 NoneBot 全局配置项时，返回对应的环境变量名
+
+    包括读取了未配置的配置项，以及 cookit 系插件拒绝使用 localstore 默认存储位置。
 
     参数:
         error: 导入时的异常
@@ -1017,6 +1036,11 @@ def missing_config_key(error: BaseException) -> str | None:
             and current.name
         ):
             return current.name.upper()
+        # 确认使用默认存储位置不会改变已安装插件的 localstore 数据目录
+        if isinstance(current, RuntimeError) and _LOCALSTORE_DEFAULT_PATH_KEY in str(
+            current
+        ):
+            return _LOCALSTORE_DEFAULT_PATH_KEY
         current = current.__cause__ or current.__context__
     return None
 
@@ -1024,17 +1048,17 @@ def missing_config_key(error: BaseException) -> str | None:
 _PROBE_MARKER = "ZX_CONFIG_PROBE "
 
 
-def probe_missing_config(module_name: str, layer: Path) -> str | None:
-    """在独立子进程中按正式启动的配置试导入候选依赖层里的插件，返回缺少的配置项
+def probe_plugin_import(module_name: str, layer: Path) -> dict[str, Any] | None:
+    """在独立子进程中按正式启动的配置试导入候选依赖层里的插件，返回导入失败说明
 
-    试导入出现其它错误、超时或子进程异常时不作判断，交由重启后的启动验证处理。
+    超时或子进程异常时不作判断，交由重启后的启动验证处理。
 
     参数:
         module_name: 插件模块名
         layer: 候选依赖层目录
 
     返回:
-        str | None: 缺少的环境变量名
+        dict[str, Any] | None: 导入失败说明，格式同启动状态中的加载失败项
     """
     code = (
         "import sys;"
@@ -1058,8 +1082,8 @@ def probe_missing_config(module_name: str, layer: Path) -> str | None:
     for line in reversed((completed.stdout or "").splitlines()):
         if line.startswith(_PROBE_MARKER):
             with contextlib.suppress(ValueError):
-                missing = json.loads(line[len(_PROBE_MARKER) :]).get("missing")
-                return str(missing) if missing else None
+                failure = json.loads(line[len(_PROBE_MARKER) :]).get("failure")
+                return failure if isinstance(failure, dict) else None
     return None
 
 
@@ -1070,7 +1094,7 @@ def _probe_config_main(module_name: str, layer: str) -> None:
         module_name: 插件模块名
         layer: 候选依赖层目录
     """
-    missing = None
+    failure = None
     try:
         sys.path.insert(0, layer)
         import nonebot
@@ -1086,14 +1110,34 @@ def _probe_config_main(module_name: str, layer: str) -> None:
         migrate_orm_data_dir()
         _load_managed_plugin(module_name, purge=False)
     except Exception as error:
-        missing = missing_config_key(error)
-    sys.stdout.write(f"\n{_PROBE_MARKER}{json.dumps({'missing': missing})}\n")
+        failure = {"module_name": module_name, **_safe_plugin_import_failure(error)}
+    sys.stdout.write(f"\n{_PROBE_MARKER}{json.dumps({'failure': failure})}\n")
     sys.stdout.flush()
     os._exit(0)
 
 
+def import_error_summary(error: BaseException) -> str:
+    """把插件导入异常整理为脱敏后的简短说明
+
+    参数:
+        error: 导入时的异常
+
+    返回:
+        str: 异常类型与说明
+    """
+    text = safe_process_error(str(error))[:300]
+    return f"{type(error).__name__}: {text}" if text else type(error).__name__
+
+
 def _safe_plugin_import_failure(error: Exception) -> dict[str, Any]:
-    """Reduce an import failure to stable diagnostics without exception contents."""
+    """把插件导入失败整理为错误码、缺少或无效的配置项与异常摘要
+
+    参数:
+        error: 导入时的异常
+
+    返回:
+        dict[str, Any]: code、paths，无法归为配置问题时附带 detail
+    """
     if key := missing_config_key(error):
         return {"code": "plugin_configuration_required", "paths": [key]}
     current: BaseException | None = error
@@ -1103,7 +1147,11 @@ def _safe_plugin_import_failure(error: Exception) -> dict[str, Any]:
             break
         seen.add(id(current))
         if isinstance(current, ImportError):
-            return {"code": "dependency_import_failed", "paths": []}
+            return {
+                "code": "dependency_import_failed",
+                "paths": [],
+                "detail": import_error_summary(current),
+            }
         errors = getattr(current, "errors", None)
         if callable(errors) and type(current).__module__.startswith("pydantic"):
             try:
@@ -1139,7 +1187,11 @@ def _safe_plugin_import_failure(error: Exception) -> dict[str, Any]:
                 "paths": sorted(set(paths))[:20],
             }
         current = current.__cause__ or current.__context__
-    return {"code": "plugin_import_failed", "paths": []}
+    return {
+        "code": "plugin_import_failed",
+        "paths": [],
+        "detail": import_error_summary(error),
+    }
 
 
 def issue_text(item: dict[str, Any]) -> str:
@@ -1154,7 +1206,10 @@ def issue_text(item: dict[str, Any]) -> str:
     code = str(item.get("code") or "")
     if item.get("module_name") or item.get("store_key"):
         name = item.get("module_name") or item.get("store_key")
-        return f"插件 {name} 加载失败（{code}）"
+        if code == "plugin_configuration_required" and item.get("paths"):
+            return f"插件 {name} 缺少配置项 {'、'.join(map(str, item['paths']))}"
+        detail = f"：{item['detail']}" if item.get("detail") else ""
+        return f"插件 {name} 加载失败（{code}）{detail}"
     if code == "loaded_source_mismatch":
         return (
             f"{item.get('name')} 已从 {item.get('loaded_path')} 加载，"
@@ -1184,8 +1239,8 @@ def startup_verification() -> tuple[bool, dict[str, Any]]:
 
     worker 未使用当前依赖层、依赖层文件与记录不符、核心依赖被改动或未从依赖层加载、
     运行环境在加载后发生变化时验证失败。插件加载失败、非核心依赖冲突与非核心包未从
-    依赖层加载记为告警：恢复备份的事务保留依赖层并记录告警，其他事务只允许此前已
-    记录的插件加载失败。
+    依赖层加载记为告警：恢复备份的事务保留依赖层并记录告警，其他事务只允许本次新装
+    插件与此前已记录插件的加载失败，新装插件保留安装、跳过加载。
 
     返回:
         tuple[bool, dict[str, Any]]: 是否通过，启动状态；failures 为导致验证失败的
@@ -1272,7 +1327,13 @@ def startup_verification() -> tuple[bool, dict[str, Any]]:
             conflicts(error.code, error.details)
         else:
             fatal.append({"code": error.code, "details": error.details})
-    known = set(manifest.get("load_failures") or {})
+    known = set(manifest.get("load_failures") or {}) | {
+        str(item.get("module_name"))
+        for item in transaction.get("operations") or []
+        if isinstance(item, dict)
+        and item.get("action") == "install"
+        and item.get("module_name")
+    }
     rejected = (
         []
         if transaction.get("restore")
@@ -1314,8 +1375,8 @@ def finalize_pending_transaction() -> None:
     transaction.pop("cleanup_error", None)
     try:
         write_json(PENDING_FILE, transaction)
-        finalize_orm_migration()
         record_manual_operations(transaction, "applied", "completed")
+        finalize_orm_migration()
         active = manifest.get("active_generation")
         retained = referenced_generations()
         if isinstance(active, int):

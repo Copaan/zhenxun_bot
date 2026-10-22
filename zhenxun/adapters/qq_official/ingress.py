@@ -118,7 +118,12 @@ class QQWebhookIngress:
                 )
             finally:
                 await self._close_response(response)
-        except (aiohttp.ClientError, TimeoutError, json.JSONDecodeError, ValueError):
+        except (
+            aiohttp.ClientError,
+            asyncio.TimeoutError,
+            json.JSONDecodeError,
+            ValueError,
+        ):
             ready = False
         return JSONResponse(
             {"status": "ready" if ready else "degraded"},
@@ -152,7 +157,7 @@ class QQWebhookIngress:
                     self._read_bounded_body(request),
                     timeout=REQUEST_READ_TIMEOUT_SECONDS,
                 )
-            except TimeoutError:
+            except asyncio.TimeoutError:
                 self._counts["body_timeout"] += 1
                 return Response("Request body timed out", status_code=503)
             if body is None:
@@ -185,7 +190,7 @@ class QQWebhookIngress:
                     }
                 finally:
                     await self._close_response(upstream)
-            except (aiohttp.ClientError, TimeoutError):
+            except (aiohttp.ClientError, asyncio.TimeoutError):
                 self._counts["worker_unavailable"] += 1
                 return Response("Webhook worker unavailable", status_code=503)
             self._counts[f"upstream_{status}"] += 1

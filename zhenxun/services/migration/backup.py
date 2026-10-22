@@ -8,7 +8,9 @@ from datetime import datetime
 import json
 import os
 from pathlib import Path, PurePosixPath
+import re
 import shutil
+import sys
 import tempfile
 from typing import ClassVar, Literal
 import zipfile
@@ -48,6 +50,11 @@ _EXCLUDED_DIRS = frozenset(
 )
 _EXCLUDED_PREFIXES = ("data/runtime/", "data/web_ui/", "data/db/", "resources/temp/")
 _EXCLUDED_SUFFIXES = (".pyc", ".log", SUFFIX, ".part")
+_WINDOWS_INVALID = re.compile(r'[<>:"|?*\\\x00-\x1f]')
+_WINDOWS_DEVICES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"{name}{index}" for name in ("COM", "LPT") for index in range(1, 10)}
+)
 
 Progress = Callable[[str, int, int, str], None]
 
@@ -310,6 +317,41 @@ def _read_json(archive, name: str) -> dict:
         raise BackupError(f"备份包中的 {name} 已损坏") from error
 
 
+def _unrestorable(names: list[str]) -> list[str]:
+    """备份包中无法在当前系统上按原名写出的文件
+
+    Windows 的文件名不能包含 <>:"|?*、反斜杠与控制字符，不能以点或空格结尾，也不能
+    使用 CON、NUL 等设备名；Windows 与 macOS 不区分大小写，只有大小写不同的文件只
+    保留第一个。
+
+    参数:
+        names: 备份包中的文件名
+
+    返回:
+        list[str]: 无法写出的文件名
+    """
+    windows = os.name == "nt"
+    folded = windows or sys.platform == "darwin"
+    seen: set[str] = set()
+    result = []
+    for name in names:
+        if name.endswith("/"):
+            continue
+        key = name.casefold() if folded else name
+        if key in seen or (
+            windows
+            and any(
+                _WINDOWS_INVALID.search(part)
+                or part.endswith((".", " "))
+                or part.split(".", 1)[0].rstrip().upper() in _WINDOWS_DEVICES
+                for part in PurePosixPath(name).parts
+            )
+        ):
+            result.append(name)
+        seen.add(key)
+    return result
+
+
 def read_manifest(path: Path, password: str | None = None) -> dict:
     """读取备份包清单与依赖清单
 
@@ -318,7 +360,8 @@ def read_manifest(path: Path, password: str | None = None) -> dict:
         password: 加密备份的密码
 
     返回:
-        dict: 清单，dependencies 字段为依赖清单
+        dict: 清单，dependencies 字段为依赖清单，unrestorable_files 为当前系统上
+            无法按原名写出、恢复时跳过的文件
     """
     if is_encrypted(path) and not password:
         raise BackupError("备份包已加密，需要密码")
@@ -327,11 +370,15 @@ def read_manifest(path: Path, password: str | None = None) -> dict:
         if manifest.get("format") != FORMAT:
             raise BackupError(f"不支持的备份格式: {manifest.get('format')}")
         manifest["dependencies"] = _read_json(archive, DEPENDENCIES)
+        manifest["unrestorable_files"] = _unrestorable(archive.namelist())
     return manifest
 
 
 def extract(path: Path, target: Path, password: str | None = None) -> dict:
     """解压备份包到目标目录，拒绝越出目标目录的路径
+
+    当前系统上无法按原名写出的文件（见 unrestorable_files）跳过，类 Unix 系统上保留
+    文件的可执行权限。
 
     参数:
         path: 备份包路径
@@ -342,28 +389,31 @@ def extract(path: Path, target: Path, password: str | None = None) -> dict:
         dict: 备份清单
     """
     manifest = read_manifest(path, password)
+    skipped = set(manifest["unrestorable_files"])
     target = target.resolve()
     with _open(path, "r", password) as archive:
         for info in archive.infolist():
             name = PurePosixPath(info.filename)
-            if (
-                info.filename.startswith("/")
-                or ".." in name.parts
-                or ":" in info.filename
-                or "\\" in info.filename
-            ):
+            if info.filename.startswith("/") or ".." in name.parts:
                 raise BackupError(f"备份包包含非法路径: {info.filename}")
-            if info.is_dir():
+            if info.is_dir() or info.filename in skipped:
                 continue
             output = target.joinpath(*name.parts)
-            output.parent.mkdir(parents=True, exist_ok=True)
             try:
+                output.parent.mkdir(parents=True, exist_ok=True)
                 with archive.open(info) as source, output.open("wb") as file:
                     shutil.copyfileobj(source, file, 1024 * 1024)
             except RuntimeError as error:
                 raise BackupError("备份包密码错误") from error
             except zipfile.BadZipFile as error:
                 raise BackupError(f"备份包文件已损坏: {info.filename}") from error
+            except OSError as error:
+                raise BackupError(
+                    f"无法解压备份中的文件 {info.filename}: {error}"
+                ) from error
+            mode = info.external_attr >> 16 & 0o777
+            if os.name != "nt" and mode & 0o111:
+                output.chmod(mode)
     return manifest
 
 

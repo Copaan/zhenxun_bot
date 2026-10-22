@@ -92,6 +92,8 @@ class PermissionSideEffectCache:
     auth_results: dict[str, tuple[bool, str | None]] = field(default_factory=dict)
     module_locks: dict[str, asyncio.Lock] = field(default_factory=dict)
     commits: dict[str, "SideEffectCommit"] = field(default_factory=dict)
+    settled: set[str] = field(default_factory=set)
+    issued: list["SideEffectCommit"] = field(default_factory=list)
 
     def lock_for(self, module: str) -> asyncio.Lock:
         lock = self.module_locks.get(module)

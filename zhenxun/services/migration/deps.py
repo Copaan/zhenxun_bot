@@ -114,34 +114,38 @@ def _direct_url(distribution) -> str | None:
     return f"{vcs['vcs']}+{data['url']}{commit}"
 
 
-def _venv_extras(known: set[str], base: dict) -> list[str]:
-    """核心虚拟环境中不随本体安装、不属于开发依赖、不在依赖层、也不被其他已安装包
-    依赖的包
+def _venv_roots(base: dict) -> list[str]:
+    """核心虚拟环境中的顶层包：不是本体或安装工具、不属于开发依赖、也不被其他可以
+    恢复的已安装包依赖
+
+    依赖安装工具的包（如 nb-cli）不能由恢复安装，它们依赖的其他包仍是顶层包；本体
+    的元数据可能停留在初次安装时的版本，同样不计入。
 
     参数:
-        known: 已纳管的包名
         base: 核心虚拟环境中的包
 
     返回:
         list[str]: 包名
     """
     from zhenxun.services.nonebot_store.dependencies import (
-        PROJECT_NAME,
+        FORBIDDEN_LAYER_PACKAGES,
         dev_packages,
-        project_closure,
     )
     from zhenxun.services.nonebot_store.environment import reachable_packages
 
-    excluded = set(project_closure()) | dev_packages() | known | {PROJECT_NAME}
     required = []
     for name, distribution in base.items():
+        if _unsupported(name, base):
+            continue
         for raw in distribution.requires or []:
             try:
                 if canonicalize_name(Requirement(raw).name) != name:
                     required.append(raw)
             except InvalidRequirement:
                 continue
-    excluded |= reachable_packages(required, base)
+    excluded = (
+        dev_packages() | FORBIDDEN_LAYER_PACKAGES | reachable_packages(required, base)
+    )
     return sorted(set(base) - excluded)
 
 
@@ -235,7 +239,7 @@ def inventory(root: Path | None = None) -> list[dict]:
                 add(name, "plugin", item["requirements"], source)
     packages = set(manifest["packages"])
     used = reachable_packages(items, selected)
-    for name in _venv_extras(core | packages | used, environment.base):
+    for name in set(_venv_roots(environment.base)) - core - packages - used:
         add(name, "venv", [], ".venv")
     for name in sorted(packages - core - used):
         add(name, "layer", [], "layer")
@@ -253,13 +257,16 @@ def inventory(root: Path | None = None) -> list[dict]:
 def snapshot(items: list[dict] | None = None) -> dict:
     """生成备份中的 dependencies.json
 
+    core 记录随本体安装的顶层包，恢复到不再包含它们的本体版本时按虚拟环境中的包
+    恢复。
+
     参数:
         items: 要记录的依赖（inventory 的返回项），为 None 时记录全部依赖
 
     返回:
         dict: 依赖清单
     """
-    from zhenxun.services.nonebot_store.dependencies import LOCK_FILE
+    from zhenxun.services.nonebot_store.dependencies import LOCK_FILE, project_closure
     from zhenxun.services.nonebot_store.environment import capture_environment
     from zhenxun.services.plugin_store.plugin_store_receipts import StoreReceiptStore
 
@@ -267,6 +274,7 @@ def snapshot(items: list[dict] | None = None) -> dict:
     selected = {item["name"] for item in items}
     environment = capture_environment()
     manifest = environment.manifest
+    core = set(project_closure())
     version = Path("__version__")
     return {
         "format": FORMAT,
@@ -303,6 +311,14 @@ def snapshot(items: list[dict] | None = None) -> dict:
         },
         "unsupported_requirements": {
             item["name"]: item["unsupported"] for item in items if item["unsupported"]
+        },
+        "core": {
+            name: {
+                "version": environment.versions.get(name),
+                "unsupported": _unsupported(name, environment.selected),
+            }
+            for name in _venv_roots(environment.base)
+            if name in core
         },
         "store_receipts": StoreReceiptStore.load(),
     }

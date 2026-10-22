@@ -267,6 +267,7 @@ async def _plugin_blocked(owner: str | None, bot: Bot, context) -> bool:
         PluginInfoMemoryCache,
     )
     from zhenxun.services.db_context.write import CacheUnavailable
+    from zhenxun.services.platform_identity import scoped_group_id
     from zhenxun.services.plugin_policy import (
         PluginPolicyNotReady,
         plugin_policy_service,
@@ -274,8 +275,13 @@ async def _plugin_blocked(owner: str | None, bot: Bot, context) -> bool:
 
     group_id = getattr(context, "group_id", None)
     user_id = getattr(context, "user_id", None)
+    scope = PlatformUtils.get_platform_scope(bot)
     try:
-        group = GroupMemoryCache.get_if_ready(group_id) if group_id else None
+        group = (
+            GroupMemoryCache.get_if_ready(scoped_group_id(group_id, scope))
+            if group_id
+            else None
+        )
         if plugin_policy_service.owner_blocked(
             owner, super_group=bool(group and group.is_super)
         ):
@@ -288,7 +294,6 @@ async def _plugin_blocked(owner: str | None, bot: Bot, context) -> bool:
         return True
     if profile is None:
         return False
-    scope = PlatformUtils.get_platform_scope(bot)
     bot_id = PlatformUtils.get_storage_bot_id(bot)
     await bot_group_policy_service.ensure_fresh(bot_id, scope, group_id, None)
     return bool(

@@ -10,7 +10,7 @@ Config.add_plugin_config(
     "catchphrase",
     "CATCHPHRASE",
     "",
-    help="小真寻的口癖，在文本末尾添加指定文字~",
+    help="小真寻的口癖，在文本末尾添加指定文字，仅对 QQ 客户端（OneBot）生效~",
     default_value="",
 )
 

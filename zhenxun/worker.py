@@ -266,8 +266,13 @@ def run_worker(project_root: Path) -> None:
         (time.monotonic() - phase_started) * 1000,
     )
     if managed_status["failed"]:
+        from zhenxun.services.nonebot_store.storage import load_manifest
+
         nonebot.logger.error(
-            "部分 WebUI 托管的 NoneBot 插件加载失败，已隔离: {}",
+            "部分 WebUI 托管的 NoneBot 插件加载失败，已跳过加载{}: {}",
+            "，等待启动验证决定保留或回滚"
+            if load_manifest().get("pending_verification")
+            else "",
             ", ".join(item["store_key"] for item in managed_status["failed"]),
         )
 

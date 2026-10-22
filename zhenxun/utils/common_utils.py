@@ -46,12 +46,24 @@ class CommonUtils:
         if not group_id and isinstance(session, Session):
             group_id = session.group.id if session.group else None
         from zhenxun.services.bot_group_policy import bot_group_policy_service
+        from zhenxun.services.platform_identity import (
+            is_namespaced_scope,
+            scoped_group_id,
+        )
         from zhenxun.services.plugin_policy import plugin_policy_service
         from zhenxun.utils.platform import PlatformUtils
 
         scope = PlatformUtils.get_platform_scope(session)
         bot_id = PlatformUtils.storage_bot_id(scope, str(session.self_id))
         channel_id = getattr(getattr(session, "channel", None), "id", None)
+        stored_group_id = scoped_group_id(group_id, scope)
+        group = (
+            GroupMemoryCache.get_if_ready(
+                stored_group_id, None if is_namespaced_scope(scope) else channel_id
+            )
+            if group_id
+            else None
+        )
         await bot_group_policy_service.ensure_fresh(bot_id, scope, group_id, channel_id)
         bot_snapshot = await BotMemoryCache.get(bot_id)
         if bot_snapshot and not bot_snapshot.status:
@@ -61,7 +73,7 @@ class CommonUtils:
         if profile is not None and plugin_policy_service.availability(
             profile,
             bot_snapshot,
-            GroupMemoryCache.get_if_ready(group_id, channel_id) if group_id else None,
+            group,
             bot_id=bot_id,
             platform_scope=scope,
             group_id=group_id,
@@ -71,11 +83,10 @@ class CommonUtils:
             """被动全局状态、账号与群聊/私聊禁用"""
             return True
         if group_id:
-            if g := GroupMemoryCache.get_if_ready(group_id, None):
+            if group and group.level < 0:
                 """群组权限是否小于0"""
-                if g.level < 0:
-                    return True
-            if BanMemoryCache.is_banned(None, group_id):
+                return True
+            if BanMemoryCache.is_banned(None, stored_group_id):
                 """群组是否被ban"""
                 return True
         return False

@@ -7,13 +7,13 @@ Only an explicit business entry point calls this module.
 from __future__ import annotations
 
 import asyncio
-from collections import defaultdict
-from collections.abc import Callable
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
+from datetime import datetime
 from hashlib import sha256
 import json
+from zoneinfo import ZoneInfo
 
 from nonebot.adapters.onebot.v11 import Bot as OneBot
 from nonebot.adapters.onebot.v11 import MessageEvent as OneBotMessage
@@ -22,6 +22,7 @@ from tortoise.transactions import in_transaction
 
 from zhenxun.models.business_identity import (
     AccountBindingChange,
+    BusinessDailyClaim,
     BusinessIdentityLink,
 )
 from zhenxun.models.user_console import UserConsole
@@ -66,14 +67,6 @@ _current: ContextVar[BusinessIdentity | None] = ContextVar(
 )
 _links = BoundedTTLCache("BUSINESS_IDENTITY", ttl_seconds=30, max_items=2048)
 _inflight: dict[str, asyncio.Task] = {}
-_resolvers: dict[str, Callable] = {}
-
-
-def register_business_identity_resolver(scope: str, resolver: Callable) -> None:
-    """Register an adapter's explicit user/tenant domain, without guessing it."""
-    if scope in {"qq_api", "qq_client"} or scope in _resolvers:
-        raise ValueError("Business identity resolver already registered")
-    _resolvers[scope] = resolver
 
 
 def platform_identity(bot, event, session) -> ProtocolIdentity:
@@ -85,7 +78,7 @@ def platform_identity(bot, event, session) -> ProtocolIdentity:
         session: Uninfo
 
     异常:
-        BusinessIdentityError: 发送者与事件不一致或为 Bot 自身
+        BusinessIdentityError: 发送者与事件不一致、为 Bot 自身或以群组/频道身份发送
 
     返回:
         ProtocolIdentity: 协议身份
@@ -98,6 +91,8 @@ def platform_identity(bot, event, session) -> ProtocolIdentity:
         sender = str(event.get_user_id())
     except ValueError:
         sender = ""
+    if getattr(event, "sender_chat", None) is not None:
+        raise BusinessIdentityError("匿名或以群组/频道身份发送的消息无法使用该功能")
     if not raw or sender != raw or raw == str(bot.self_id):
         raise BusinessIdentityError("只接受真实入站消息的发送者")
     subject = sha256(raw.encode()).hexdigest()
@@ -105,15 +100,19 @@ def platform_identity(bot, event, session) -> ProtocolIdentity:
     return ProtocolIdentity(key, scope, "", "user", "", subject, raw, f"identity:{key}")
 
 
-def _resolver(scope: str) -> Callable | None:
+def _platform_scope(scope: str) -> bool:
+    """平台作用域是否配置为按平台全局解析业务身份
+
+    参数:
+        scope: 平台作用域
+
+    返回:
+        bool: 是否在 business_identity_scopes 中
+    """
     from zhenxun.configs.config import BotConfig
     from zhenxun.services.platform_identity import is_namespaced_scope
 
-    if resolver := _resolvers.get(scope):
-        return resolver
-    if is_namespaced_scope(scope) and scope in BotConfig.business_identity_scopes:
-        return platform_identity
-    return None
+    return is_namespaced_scope(scope) and scope in BotConfig.business_identity_scopes
 
 
 def supports_business_identity(scope: str) -> bool:
@@ -123,9 +122,9 @@ def supports_business_identity(scope: str) -> bool:
         scope: 平台作用域
 
     返回:
-        bool: QQ 两个作用域、已注册解析器或配置为按平台全局解析的作用域为 True
+        bool: QQ 两个作用域或配置为按平台全局解析的作用域为 True
     """
-    return scope in {"qq_api", "qq_client"} or _resolver(scope) is not None
+    return scope in {"qq_api", "qq_client"} or _platform_scope(scope)
 
 
 @contextmanager
@@ -174,9 +173,10 @@ def protocol_identity(bot, event, session) -> ProtocolIdentity:
         principal = str(context.principal_id)
         original = context.storage_user_id
     elif isinstance(bot, OneBot) and isinstance(event, OneBotMessage):
+        if getattr(event, "anonymous", None) is not None:
+            raise BusinessIdentityError("匿名消息无法使用该功能")
         if (
-            getattr(event, "anonymous", None) is not None
-            or event.user_id <= 0
+            event.user_id <= 0
             or str(event.user_id) != raw
             or str(event.user_id) == str(bot.self_id)
             or str(event.self_id) != str(bot.self_id)
@@ -184,26 +184,10 @@ def protocol_identity(bot, event, session) -> ProtocolIdentity:
         ):
             raise BusinessIdentityError("只接受真实 OneBot 入站消息的发送者")
         domain, app, scene, group, original = "qq_client", "", "user", "", raw
+    elif _platform_scope(scope):
+        return platform_identity(bot, event, session)
     else:
-        if resolver := _resolver(scope):
-            resolved = resolver(bot, event, session)
-            if (
-                not isinstance(resolved, ProtocolIdentity)
-                or resolved.domain in {"qq_api", "qq_client"}
-                or resolved.raw_user_id != raw
-                or resolved.key
-                != identity_digest(
-                    resolved.domain,
-                    resolved.app_id,
-                    resolved.scene,
-                    resolved.group_scope,
-                    resolved.subject_digest,
-                )
-                or resolved.original_key != f"identity:{resolved.key}"
-            ):
-                raise BusinessIdentityError("适配器业务身份解析器返回无效结果")
-            return resolved
-        raise BusinessIdentityError("该适配器尚未注册业务身份解析器")
+        raise BusinessIdentityError("该平台未开启业务身份解析")
     subject = sha256(raw.encode()).hexdigest()
     key = identity_digest(domain, app, scene, group, subject)
     return ProtocolIdentity(
@@ -401,12 +385,28 @@ async def resolve_business_identity(bot, event, session) -> BusinessIdentity:
 
 
 async def business_identity_for_session(session) -> BusinessIdentity:
-    """Convenience for existing business services called by a NoneBot handler."""
-    from nonebot.matcher import current_bot, current_event
+    """在 matcher 处理流程中解析当前发送者的业务身份，无法解析时回复原因并结束 matcher
 
-    return await resolve_business_identity(
-        current_bot.get(), current_event.get(), session
-    )
+    参数:
+        session: Uninfo
+
+    异常:
+        BusinessIdentityError: 不在 matcher 处理流程中且无法解析业务身份
+
+    返回:
+        BusinessIdentity: 业务身份
+    """
+    from nonebot.matcher import current_bot, current_event, current_matcher
+
+    try:
+        return await resolve_business_identity(
+            current_bot.get(), current_event.get(), session
+        )
+    except BusinessIdentityError as error:
+        matcher = current_matcher.get(None)
+        if matcher is None:
+            raise
+        await matcher.finish(str(error))
 
 
 async def business_user_id(session) -> str:
@@ -474,39 +474,44 @@ async def invalidate_identity(key: str) -> None:
     await _links.delete(key)
 
 
-async def migration_preview() -> list[dict]:
-    """Read only. NULL/qq and identifier shape are deliberately not evidence."""
-    from zhenxun.adapters.qq_official.models import QQOfficialPrincipal
+async def identity_daily_claimed(db) -> bool:
+    """当前业务身份今天是否已领取每日奖励，换绑账号后不能重复领取
 
-    principals = {
-        f"principal:{value}"
-        for value in await QQOfficialPrincipal.all().values_list("id", flat=True)
-    }
-    links = defaultdict(list)
-    for row in await BusinessIdentityLink.all():
-        links[row.original_account_id].append(row)
-    rows = []
-    for user in await UserConsole.all().order_by("id"):
-        candidates = links[user.id]
-        status = "ambiguous"
-        if len({row.domain for row in candidates}) > 1 or (
-            user.user_id in principals and user.platform == "qq_client"
-        ):
-            status = "conflict"
-        elif candidates and all(row.verified for row in candidates):
-            status = "verified_mapping"
-        elif user.user_id in principals:
-            status = "official_principal"
-        elif user.platform == "qq_client":
-            status = "explicit_onebot"
-        rows.append(
-            {
-                "account_id": user.id,
-                "storage_key": user.user_id,
-                "platform": user.platform,
-                "status": status,
-                "identity_ids": [row.id for row in candidates],
-                "automatic_rewrite": False,
-            }
+    参数:
+        db: 当前资产事务连接
+
+    返回:
+        bool: 是否已领取
+    """
+    actor = current_business_identity()
+    if actor is None:
+        return False
+    today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+    return (
+        await BusinessDailyClaim.filter(
+            id=identity_digest(actor.protocol.key, str(today))
         )
-    return rows
+        .using_db(db)
+        .exists()
+    )
+
+
+async def record_identity_daily_claim(db) -> None:
+    """记录当前业务身份今天已领取每日奖励
+
+    参数:
+        db: 当前资产事务连接
+    """
+    actor = current_business_identity()
+    if actor is None:
+        return
+    today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+    await BusinessDailyClaim.get_or_create(
+        using_db=db,
+        id=identity_digest(actor.protocol.key, str(today)),
+        defaults={
+            "identity_id": actor.protocol.key,
+            "day": today,
+            "account_id": actor.account_id,
+        },
+    )

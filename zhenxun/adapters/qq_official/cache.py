@@ -33,13 +33,6 @@ REPLY_STATE_CACHE = BoundedTTLCache[ReplyCacheKey, ReplyState](
     "qq_official_reply_state", ttl_seconds=65 * 60, max_items=20_000
 )
 
-_database_fallbacks = 0
-
-
-def record_database_fallback() -> None:
-    global _database_fallbacks
-    _database_fallbacks += 1
-
 
 async def clear_qq_official_caches() -> None:
     await asyncio.gather(
@@ -49,21 +42,10 @@ async def clear_qq_official_caches() -> None:
     )
 
 
-async def qq_official_cache_stats() -> dict[str, object]:
-    return {
-        "identity": (await IDENTITY_CACHE.stats()).to_dict(),
-        "receipt": (await RECEIPT_CACHE.stats()).to_dict(),
-        "reply_state": (await REPLY_STATE_CACHE.stats()).to_dict(),
-        "database_fallbacks": _database_fallbacks,
-    }
-
-
 __all__ = [
     "IDENTITY_CACHE",
     "RECEIPT_CACHE",
     "REPLY_STATE_CACHE",
     "ReplyState",
     "clear_qq_official_caches",
-    "qq_official_cache_stats",
-    "record_database_fallback",
 ]

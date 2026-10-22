@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 import ipaddress
 import socket
@@ -33,6 +34,57 @@ def internal_connect_host(bind_host: str) -> str:
 
 def _is_private_ipv4(address: ipaddress.IPv4Address) -> bool:
     return any(address in network for network in _IPV4_PRIVATE_NETWORKS)
+
+
+def _parse_address(value: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """解析地址文本，去掉引号、方括号与端口
+
+    参数:
+        value: 地址文本
+
+    返回:
+        IPv4Address | IPv6Address | None: 地址，IPv4 映射的 IPv6 地址转为 IPv4，
+            无法解析时为 None
+    """
+    text = value.strip().strip('"')
+    if text.startswith("["):
+        text = text[1:].split("]", 1)[0]
+    elif text.count(":") == 1:
+        text = text.split(":", 1)[0]
+    try:
+        address = ipaddress.ip_address(text)
+    except ValueError:
+        return None
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+        return address.ipv4_mapped
+    return address
+
+
+def public_client_address(host: str | None, headers: Mapping[str, str]) -> str | None:
+    """请求来源中的公网地址
+
+    依次检查直接连接地址与反向代理转发头（X-Forwarded-For、X-Real-IP、
+    Forwarded）中的客户端地址；本机、局域网与 CGNAT 等非公网地址以及无法解析的
+    地址不计入。
+
+    参数:
+        host: 直接连接的客户端地址
+        headers: 请求头
+
+    返回:
+        str | None: 第一个公网地址，来源都不是公网地址时为 None
+    """
+    candidates = [host or "", headers.get("x-real-ip") or ""]
+    candidates += (headers.get("x-forwarded-for") or "").split(",")
+    for item in (headers.get("forwarded") or "").replace(",", ";").split(";"):
+        key, _, value = item.partition("=")
+        if key.strip().lower() == "for":
+            candidates.append(value)
+    for value in candidates:
+        address = _parse_address(value)
+        if address is not None and address.is_global:
+            return str(address)
+    return None
 
 
 def private_ipv4_addresses() -> list[str]:
@@ -179,4 +231,5 @@ __all__ = [
     "local_access_urls",
     "private_ipv4_addresses",
     "private_ipv6_addresses",
+    "public_client_address",
 ]

@@ -47,4 +47,23 @@ class QQWebhookReceipt(Model):
         indexes = (("app_id", "expires_at"),)
 
 
-__all__ = ["QQOfficialIdentity", "QQOfficialPrincipal", "QQWebhookReceipt"]
+class QQProactivePermission(Model):
+    id = fields.BigIntField(pk=True, generated=True)
+    app_id = fields.CharField(max_length=64)
+    scene = fields.CharField(max_length=24)
+    target = fields.CharField(max_length=128)
+    """群为 group_openid，单聊为 openid 摘要"""
+    allowed = fields.BooleanField()
+    updated_at = fields.DatetimeField(auto_now=True)
+
+    class Meta:  # pyright: ignore[reportIncompatibleVariableOverride]
+        table = "qq_proactive_permissions"
+        unique_together = (("app_id", "scene", "target"),)
+
+
+__all__ = [
+    "QQOfficialIdentity",
+    "QQOfficialPrincipal",
+    "QQProactivePermission",
+    "QQWebhookReceipt",
+]

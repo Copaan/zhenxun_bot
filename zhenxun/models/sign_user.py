@@ -119,7 +119,7 @@ class SignUser(Model):
             from hashlib import sha256
             from zoneinfo import ZoneInfo
 
-            from zhenxun.services.account_binding import (
+            from zhenxun.services.business_identity import (
                 identity_daily_claimed,
                 record_identity_daily_claim,
             )

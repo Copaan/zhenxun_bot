@@ -345,36 +345,6 @@ def _normalize_qq_self_at_message(bot: Bot, event: Event) -> None:
             message.append(segment.MessageSegment.text(""))
 
 
-def _is_account_binding_command(event: Event, bot: Bot) -> bool:
-    """账号绑定指令不交给 ChatInter 兜底 matcher 处理
-
-    参数:
-        event: Event
-        bot: Bot
-
-    返回:
-        bool: 是否为账号绑定指令
-    """
-    from zhenxun.services.account_binding import (
-        bare_binding_code,
-        binding_command,
-    )
-
-    return (
-        binding_command(event) is not None or bare_binding_code(bot, event) is not None
-    )
-
-
-def _is_chatinter_matcher(matcher: type[Matcher]) -> bool:
-    plugin = getattr(matcher, "plugin", None)
-    module = str(
-        getattr(plugin, "module_name", "") or getattr(plugin, "module", "") or ""
-    )
-    return module == "zhenxun.plugins.chatinter" or module.startswith(
-        "zhenxun.plugins.chatinter."
-    )
-
-
 def has_active_dispatch() -> bool:
     """是否有 matcher 正在执行
 
@@ -390,7 +360,6 @@ def _select_matchers(
     context: ActivationContext,
     bot: Bot,
     indexed: bool,
-    reserve_binding: bool,
 ) -> list[type[Matcher]]:
     selected = None
     if indexed:
@@ -410,8 +379,6 @@ def _select_matchers(
                 matcher_supported_adapters(matcher), bot.adapter
             )
         ]
-    if reserve_binding:
-        selected = [m for m in selected if not _is_chatinter_matcher(m)]
     return selected
 
 
@@ -467,6 +434,28 @@ async def _dispatch_priority(
             tg.start_soon(run, matcher)
 
 
+async def _release_pending_side_effects(state: dict) -> None:
+    """事件结束时回滚没有提交的金币与限制预留
+
+    其他前置检查拒绝或 matcher 被取消时不会执行 postprocessor，预留在此回滚。
+
+    参数:
+        state: 事件 state
+    """
+    with anyio.CancelScope(shield=True):
+        for commit in get_permission_side_effect_cache(state=state).issued:
+            if not commit.has_pending:
+                continue
+            try:
+                await commit.finish(commit=False, reason="event_finished")
+            except Exception as exc:
+                logger.warning(
+                    f"事件结束时回滚权限预留失败: {commit.module}",
+                    LOGGER_COMMAND,
+                    e=exc,
+                )
+
+
 async def _admit_event(event: Event) -> Callable[[], None]:
     """普通消息占用处理名额，命令消息与非消息事件不占用
 
@@ -509,7 +498,6 @@ async def handle_event(bot: Bot, event: Event) -> None:
         event: Event
     """
     _normalize_qq_self_at_message(bot, event)
-    reserve_binding = _is_account_binding_command(event, bot)
     show_log = True
     log_msg = f"<m>{escape_tag(bot.type)} {escape_tag(bot.self_id)}</m> | "
     try:
@@ -539,6 +527,7 @@ async def handle_event(bot: Bot, event: Event) -> None:
                 "Error while parsing command for event"
             )
         context = await _prepare_dispatch_state(bot, event, state)
+        stack.push_async_callback(_release_pending_side_effects, state)
         indexed = True
         try:
             _HANDLER_ACTIVATION_INDEX.ensure_fresh(matchers)
@@ -571,7 +560,7 @@ async def handle_event(bot: Bot, event: Event) -> None:
                 }
             ):
                 selected = _select_matchers(
-                    priority, priority_matchers, context, bot, indexed, reserve_binding
+                    priority, priority_matchers, context, bot, indexed
                 )
                 if selected:
                     await _dispatch_priority(

@@ -30,6 +30,7 @@ _PLATFORMS = {
 }
 """备份记录的平台 -> uv 解析使用的目标平台"""
 _IMPLIED_KINDS = {"venv", "layer"}
+"""自动记录的依赖来源：被其他依赖间接需要时只作为子依赖，无法安装时总是跳过"""
 _UNAVAILABLE = re.compile(
     r"([A-Za-z0-9][A-Za-z0-9._-]*)(?:==\S+)?\s+ha(?:s|ve)\s+no\s+wheels\s+with\s+"
     r"a\s+matching\s+(platform|Python)"
@@ -114,18 +115,24 @@ def layer_status(revision: str) -> dict:
 def _roots(saved: dict) -> dict[str, dict]:
     """备份中需要恢复的顶层依赖：商店插件、手动依赖与其他依赖
 
-    随本体安装的包不按备份版本固定，由解析器优先沿用当前环境中的版本。
+    备份时随本体安装、当前本体已不再包含的顶层包按虚拟环境中的包恢复。随本体
+    安装的包不按备份版本固定，由解析器优先沿用当前环境中的版本。
 
     参数:
         saved: 备份中的 dependencies.json
 
     返回:
-        dict[str, dict]: 键 -> {kind, name, requirements, version, url, plugin}，
-            商店插件以插件键为键，其余以包名为键
+        dict[str, dict]: 键 -> {kind, name, requirements, version, url, plugin,
+            unsupported}，商店插件以插件键为键，其余以包名为键
     """
     from zhenxun.services.nonebot_store.dependencies import project_closure
 
     shared = set(project_closure())
+    dropped = [
+        (name, {"kind": "venv", **item})
+        for name, item in (saved.get("core") or {}).items()
+        if name not in shared
+    ]
     roots: dict[str, dict] = {}
     for key, plugin in saved["plugins"].items():
         roots[key] = {
@@ -149,7 +156,7 @@ def _roots(saved: dict) -> dict[str, dict]:
         )
         for name, values in saved["manual_requirements"].items()
     ]
-    for name, item in [*items, *saved["extra_requirements"].items()]:
+    for name, item in [*dropped, *items, *saved["extra_requirements"].items()]:
         roots[name] = {
             "kind": item.get("kind") or "venv",
             "name": name,
@@ -157,6 +164,7 @@ def _roots(saved: dict) -> dict[str, dict]:
             "version": None if name in shared else item.get("version"),
             "url": item.get("url"),
             "plugin": None,
+            "unsupported": item.get("unsupported"),
         }
     return roots
 
@@ -571,16 +579,18 @@ async def stage_restore(
     依赖层包只作为子依赖，由解析器按当前平台决定是否安装；被间接需要的手动依赖
     与插件声明不再固定备份时的版本。其余顶层依赖优先使用备份时的版本；整体解析
     失败时逐个检查，备份时的版本不可用的依次改用次版本号相同、主版本号相同的相近
-    版本，商店插件以外的依赖最后放开版本。之后按来源与版本分歧逐个合并，冲突的依赖放开版本或改用相近版本，
-    仍不可用的按 skip_failed 决定中止或跳过。子依赖由解析器补齐并优先沿用备份时
-    的版本，允许构建源码包，构建失败的包所属的顶层依赖同样跳过。核心依赖保持当前
-    环境的版本。pip、uv 等安装工具只能在控制台安装，列入 unsupported_requirements。
+    版本，商店插件以外的依赖最后放开版本。之后按来源与版本分歧逐个合并，冲突的依赖
+    放开版本或改用相近版本，仍不可用的虚拟环境包与依赖层包直接跳过，其余按
+    skip_failed 决定中止或跳过。子依赖由解析器补齐并优先沿用备份时的版本，允许构建
+    源码包，构建失败的包所属的顶层依赖同样跳过。核心依赖保持当前环境的版本。
+    pip、uv 等安装工具及依赖它们的包只能在控制台安装，列入 unsupported_requirements。
     恢复插件代码时，恢复后的环境能满足的插件 requirements 文件登记为插件依赖，其中
     声明的插件目录依赖不再作为手动依赖。
 
     参数:
         saved: 备份中的 dependencies.json
-        skip_failed: 是否跳过无法安装的插件与依赖
+        skip_failed: 是否跳过无法安装的插件与声明的依赖，虚拟环境包与依赖层包
+            总是跳过
         files: 备份包解压后的 files 目录，恢复插件代码时传入
 
     返回:
@@ -600,7 +610,9 @@ async def stage_restore(
 
     roots = _roots(saved)
     tools = {
-        key for key, root in roots.items() if root["name"] in FORBIDDEN_LAYER_PACKAGES
+        key
+        for key, root in roots.items()
+        if root["name"] in FORBIDDEN_LAYER_PACKAGES or root.get("unsupported")
     }
     report = {
         "staged": False,
@@ -627,8 +639,9 @@ async def stage_restore(
             root["requirements"] = applicable
 
     def skip(key: str, reason: str) -> None:
-        url = roots.get(key, {}).get("url")
-        if not skip_failed:
+        root = roots.get(key, {})
+        url = root.get("url")
+        if not skip_failed and root.get("kind") not in _IMPLIED_KINDS:
             raise DependencyAnalysisError(
                 "dependency_restore_failed", details=[f"{key}：{reason}"]
             )

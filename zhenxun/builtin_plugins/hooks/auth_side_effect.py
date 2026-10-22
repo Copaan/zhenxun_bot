@@ -231,3 +231,33 @@ class SideEffectCommit:
         for name in order:
             await self.commit(name)
         self.committed = True
+
+    async def finish(self, *, commit: bool, reason: str) -> bool:
+        """提交或回滚全部预留，提交失败时回滚，最后解除限制的 block
+
+        参数:
+            commit: 是否提交
+            reason: 回滚原因
+
+        返回:
+            bool: 是否已提交
+        """
+        from .auth.auth_limit import LimitManager
+
+        try:
+            if commit:
+                try:
+                    await self.commit_all()
+                except Exception as exc:
+                    logger.error(
+                        "auth side effect commit failed", LOGGER_COMMAND, e=exc
+                    )
+                    await self.rollback_all("commit_failed")
+            else:
+                await self.rollback_all(reason)
+        finally:
+            if self.limit_should_auto_unblock and (entity := self.limit_entity):
+                LimitManager.unblock(
+                    self.module, entity.user_id, entity.group_id, entity.channel_id
+                )
+        return self.committed

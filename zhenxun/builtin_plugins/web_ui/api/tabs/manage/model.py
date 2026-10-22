@@ -81,17 +81,21 @@ class UpdateGroup(BaseModel):
     """
 
     group_id: str
+    """群号"""
     bot_id: str | None = None
     expected_revision: str | None = None
-    """群号"""
-    status: bool
-    """状态"""
-    level: int
-    """群权限"""
-    task: list[str]
-    """被动状态"""
-    close_plugins: list[str]
-    """关闭插件"""
+    status: bool | None = None
+    """状态，为空时不修改"""
+    level: int | None = None
+    """群权限，为空时不修改"""
+    enable_plugins: list[str] = []
+    """开启的插件"""
+    disable_plugins: list[str] = []
+    """关闭的插件"""
+    enable_tasks: list[str] = []
+    """开启的被动"""
+    disable_tasks: list[str] = []
+    """关闭的被动"""
 
 
 class FriendRequestResult(BaseModel):
