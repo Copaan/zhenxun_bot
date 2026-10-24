@@ -19,34 +19,6 @@ class Group(BaseModel):
     """群组最大人数"""
 
 
-class Task(BaseModel):
-    """
-    被动技能
-    """
-
-    name: str
-    """被动名称"""
-    zh_name: str
-    """被动中文名称"""
-    status: bool
-    """状态"""
-    is_super_block: bool
-    """是否超级用户禁用"""
-
-
-class Plugin(BaseModel):
-    """
-    插件
-    """
-
-    module: str
-    """模块名"""
-    plugin_name: str
-    """中文名"""
-    is_super_block: bool
-    """是否超级用户禁用"""
-
-
 class GroupResult(BaseModel):
     """
     群组返回数据
@@ -82,20 +54,10 @@ class UpdateGroup(BaseModel):
 
     group_id: str
     """群号"""
-    bot_id: str | None = None
-    expected_revision: str | None = None
     status: bool | None = None
     """状态，为空时不修改"""
     level: int | None = None
     """群权限，为空时不修改"""
-    enable_plugins: list[str] = []
-    """开启的插件"""
-    disable_plugins: list[str] = []
-    """关闭的插件"""
-    enable_tasks: list[str] = []
-    """开启的被动"""
-    disable_tasks: list[str] = []
-    """关闭的被动"""
 
 
 class FriendRequestResult(BaseModel):
@@ -213,10 +175,9 @@ class GroupDetail(BaseModel):
     """
 
     group_id: str
-    bot_id: str | None = None
-    policy_revision: str | None = None
-    policy_effective: dict = Field(default_factory=dict)
     """群组id"""
+    bot_id: str | None = None
+    """数据所属账号"""
     ava_url: str
     """头像url"""
     name: str
@@ -235,10 +196,6 @@ class GroupDetail(BaseModel):
     """群权限"""
     status: bool
     """状态（睡眠）"""
-    close_plugins: list[Plugin]
-    """关闭的插件"""
-    task: list[Task]
-    """被动列表"""
 
 
 class MessageItem(BaseModel):

@@ -12,6 +12,7 @@ from .strategy import get_strategy
 
 BLOCK_REASON_LABELS = {
     "not_loaded": "未加载",
+    "bot_disabled": "机器人全局开关关闭",
     "global_disabled": "全局关闭",
     "global_group_disabled": "全局群聊关闭",
     "global_private_disabled": "全局私聊关闭",

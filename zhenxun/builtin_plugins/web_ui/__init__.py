@@ -23,6 +23,7 @@ from .api.logs import router as ws_log_routes
 from .api.menu import router as menu_router
 from .api.protocol import router as protocol_router
 from .api.tabs.ai import router as ai_router
+from .api.tabs.backup import file_router as backup_file_router
 from .api.tabs.backup import router as backup_router
 from .api.tabs.backup import setup_router as backup_setup_router
 from .api.tabs.dashboard import router as dashboard_router
@@ -103,6 +104,7 @@ BaseApiRouter.include_router(plugin_router)
 BaseApiRouter.include_router(plugin_policy_router)
 BaseApiRouter.include_router(network_proxy_router)
 BaseApiRouter.include_router(backup_router)
+BaseApiRouter.include_router(backup_file_router)
 BaseApiRouter.include_router(backup_setup_router)
 BaseApiRouter.include_router(system_router)
 BaseApiRouter.include_router(menu_router)

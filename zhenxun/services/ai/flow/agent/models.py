@@ -18,7 +18,7 @@ from zhenxun.services.ai.core.messages import (
     ToolCallPart,
     UsageInfo,
 )
-from zhenxun.services.ai.core.models import ModelCapabilities
+from zhenxun.services.ai.core.models import ModelProfile
 from zhenxun.services.ai.core.options import GenerationConfig
 from zhenxun.services.ai.flow.core.models import BaseRuntimeConfig
 from zhenxun.services.ai.run import RunContext
@@ -173,5 +173,5 @@ class AgentRunResources(BaseModel):
     """Agent 全局与运行时的统一策略配置"""
     generation_config: GenerationConfig | None = None
     """大模型生成配置"""
-    model_capabilities: ModelCapabilities | None = None
-    """当前底层大模型的能力配置（合并了用户自定义覆盖）"""
+    model_profile: ModelProfile | None = None
+    """当前模型的能力档案"""

@@ -8,7 +8,6 @@ from typing import Any
 _EXPORTS: dict[str, tuple[str, str]] = {
     "AudioResponse": ("zhenxun.services.ai.core.messages", "AudioResponse"),
     "ChatResponse": ("zhenxun.services.ai.core.messages", "ChatResponse"),
-    "IntentBuilder": ("zhenxun.services.ai.llm.builder", "IntentBuilder"),
     "LLMContentPart": ("zhenxun.services.ai.core.messages", "LLMContentPart"),
     "LLMException": ("zhenxun.services.ai.core.exceptions", "LLMException"),
     "LLMMessage": ("zhenxun.services.ai.core.messages", "LLMMessage"),
@@ -23,6 +22,10 @@ _EXPORTS: dict[str, tuple[str, str]] = {
         "generate_structured",
     ),
     "get_default_model": ("zhenxun.services.ai.llm.manager", "get_default_model"),
+    "list_available_models": (
+        "zhenxun.services.ai.llm.manager",
+        "list_available_models",
+    ),
     "rerank": ("zhenxun.services.ai.llm.api", "rerank"),
 }
 

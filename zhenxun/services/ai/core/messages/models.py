@@ -141,18 +141,6 @@ class LLMMessage(BaseModel, Generic[RoleT, ContentT]):
         self.metadata["scope"] = value
 
     @property
-    def thought_signature(self) -> str | None:
-        """获取连续对话中用于保持思考一致性的加密签名 (Gemini 专属)"""
-        return self.metadata.get("thought_signature") if self.metadata else None
-
-    @thought_signature.setter
-    def thought_signature(self, value: str | None):
-        """设置思考加密签名"""
-        if self.metadata is None:
-            self.metadata = {}
-        self.metadata["thought_signature"] = value
-
-    @property
     def token_cost(self) -> int | None:
         """获取该消息自身消耗的预估或真实 Token 数"""
         return self.metadata.get("token_cost") if self.metadata else None

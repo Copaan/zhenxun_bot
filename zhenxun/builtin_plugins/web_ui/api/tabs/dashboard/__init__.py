@@ -1,5 +1,5 @@
 from fastapi import APIRouter
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from nonebot import require
 
 from zhenxun.services.log import logger
@@ -59,3 +59,19 @@ async def _(query: QueryModel) -> Result[BaseResultModel]:
     except Exception as e:
         logger.error(f"{router.prefix}/get_connect_log 调用错误", "WebUi", e=e)
         return Result.fail("连接记录读取失败，请稍后重试。")
+
+
+@router.get(
+    "/log_file",
+    dependencies=[authentication()],
+    description="下载当天的运行日志",
+)
+async def _():
+    path = ApiDataSource.today_log_file()
+    if path is None:
+        return JSONResponse({"detail": "今天还没有写入日志文件"}, 404)
+    return StreamingResponse(
+        ApiDataSource.read_log_file(path, path.stat().st_size),
+        media_type="text/plain; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="zhenxun-{path.name}"'},
+    )

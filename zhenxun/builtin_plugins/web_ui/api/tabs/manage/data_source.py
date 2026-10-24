@@ -4,14 +4,11 @@ from zhenxun.models.ban_console import BanConsole
 from zhenxun.models.chat_history import ChatHistory
 from zhenxun.models.fg_request import FgRequest
 from zhenxun.models.group_console import GroupConsole
-from zhenxun.models.plugin_info import PluginInfo
 from zhenxun.models.statistics import Statistics
-from zhenxun.models.task_info import TaskInfo
 from zhenxun.services.bot_group_policy import bot_group_policy_service
 from zhenxun.services.plugin_policy import (
     PluginPolicyError,
     plugin_policy_service,
-    policy_transaction,
 )
 from zhenxun.services.runtime_mutation import managed_mutation
 from zhenxun.utils.enum import RequestType
@@ -24,9 +21,7 @@ from .model import (
     FriendRequestResult,
     GroupDetail,
     GroupRequestResult,
-    Plugin,
     ReqResult,
-    Task,
     UpdateGroup,
     UserDetail,
 )
@@ -57,43 +52,24 @@ class ApiDataSource:
     @classmethod
     @managed_mutation("group_configuration")
     async def update_group(cls, group: UpdateGroup):
-        """更新群组数据，只修改页面上改动过的项，超级用户锁定保持不变
+        """更新群唤醒状态与群权限，只修改页面上改动过的项
 
         参数:
             group: UpdateGroup
         """
-
-        def merge(current: list[str], enable: list[str], disable: list[str]):
-            return sorted((set(current) - set(enable)) | set(disable))
-
-        policy = await cls._group_policy(group.group_id, group.bot_id)
         changes = {
             name: value
             for name, value in (("level", group.level), ("status", group.status))
             if value is not None
         }
-        async with policy_transaction():
-            await bot_group_policy_service.update_group(
-                policy["bot_id"],
-                policy["platform_scope"],
-                group.group_id,
-                "",
-                expected_revision=group.expected_revision or policy["revision"],
-                block_plugins=merge(
-                    policy["block_plugins"], group.enable_plugins, group.disable_plugins
-                ),
-                block_tasks=merge(
-                    policy["block_tasks"], group.enable_tasks, group.disable_tasks
-                ),
-            )
-            if not changes:
-                return
-            db_group = await GroupConsole.get_group_db(group.group_id)
-            if db_group is None:
-                raise PluginPolicyError("群资料不存在")
-            for name, value in changes.items():
-                setattr(db_group, name, value)
-            await db_group.save(update_fields=list(changes))
+        if not changes:
+            return
+        db_group = await GroupConsole.get_group_db(group.group_id)
+        if db_group is None:
+            raise PluginPolicyError("群资料不存在")
+        for name, value in changes.items():
+            setattr(db_group, name, value)
+        await db_group.save(update_fields=list(changes))
 
     @classmethod
     async def get_request_list(cls) -> ReqResult:
@@ -180,54 +156,6 @@ class ApiDataSource:
         )
 
     @classmethod
-    async def __get_group_detail_disable_plugin(cls, policy: dict) -> list[Plugin]:
-        """获取群组禁用插件
-
-        参数:
-            policy: 群策略数据
-
-        返回:
-            list[Plugin]: 禁用插件数据列表
-        """
-        plugins = await PluginInfo.get_plugins()
-        module2name = {p.module: p.name for p in plugins}
-        forced = set(policy["forced_plugins"])
-        modules = dict.fromkeys([*policy["block_plugins"], *policy["forced_plugins"]])
-        return [
-            Plugin(
-                module=module,
-                plugin_name=module2name.get(module) or module,
-                is_super_block=module in forced,
-            )
-            for module in modules
-            if module
-        ]
-
-    @classmethod
-    async def __get_group_detail_task(cls, policy: dict) -> list[Task]:
-        """获取群组被动技能状态
-
-        参数:
-            policy: 群策略数据
-
-        返回:
-            list[Task]: 群组被动列表
-        """
-        all_task = await TaskInfo.get_tasks(load_status=None)
-        task_module2name = {task.module: task.name for task in all_task}
-        sbp = set(policy["forced_tasks"])
-        tasks = set(policy["block_tasks"])
-        return [
-            Task(
-                name=task.module,
-                zh_name=task_module2name.get(task.module) or task.module,
-                status=task.module not in tasks and task.module not in sbp,
-                is_super_block=task.module in sbp,
-            )
-            for task in all_task
-        ]
-
-    @classmethod
     async def get_group_detail(
         cls, group_id: str, bot_id: str | None = None
     ) -> GroupDetail | None:
@@ -251,13 +179,9 @@ class ApiDataSource:
                 "Manage.like_plugin",
             )
         }
-        disable_plugins = await cls.__get_group_detail_disable_plugin(policy)
-        task_list = await cls.__get_group_detail_task(policy)
         return GroupDetail(
             group_id=group_id,
             bot_id=storage_bot_id,
-            policy_revision=policy["revision"],
-            policy_effective=policy["effective"],
             ava_url=GROUP_AVA_URL.format(group_id, group_id),
             name=group.group_name,
             member_count=group.member_count,
@@ -273,6 +197,4 @@ class ApiDataSource:
             like_plugin=like_plugin,
             level=group.level,
             status=group.status,
-            close_plugins=disable_plugins,
-            task=task_list,
         )

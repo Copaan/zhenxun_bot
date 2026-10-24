@@ -63,6 +63,7 @@ _PROTOCOL_ENV_KEYS = {
     "ONEBOT_ACCESS_TOKEN",
     "QQ_ADAPTER_LOAD",
     "QQ_BOTS",
+    "QQ_PROACTIVE_FALLBACK",
     "QQ_VERIFY_WEBHOOK",
     "QQ_WEBHOOK_MODE",
     "QQ_WEBHOOK_PUBLIC_BASE_URL",
@@ -70,12 +71,14 @@ _PROTOCOL_ENV_KEYS = {
     "QQ_WEBHOOK_LISTEN_PORT",
     "QQ_WEBHOOK_TLS_CERTFILE",
     "QQ_WEBHOOK_TLS_KEYFILE",
+    "TELEGRAM_ADAPTER_LOAD",
 }
 _PROTOCOL_DEFAULTS: dict[str, Any] = {
     "ONEBOT_REVERSE_WS_HOST": "",
     "ONEBOT_ACCESS_TOKEN": "",
     "QQ_ADAPTER_LOAD": False,
     "QQ_BOTS": [],
+    "QQ_PROACTIVE_FALLBACK": True,
     "QQ_VERIFY_WEBHOOK": True,
     "QQ_WEBHOOK_MODE": "external",
     "QQ_WEBHOOK_PUBLIC_BASE_URL": "",
@@ -83,6 +86,7 @@ _PROTOCOL_DEFAULTS: dict[str, Any] = {
     "QQ_WEBHOOK_LISTEN_PORT": 443,
     "QQ_WEBHOOK_TLS_CERTFILE": "",
     "QQ_WEBHOOK_TLS_KEYFILE": "",
+    "TELEGRAM_ADAPTER_LOAD": False,
 }
 
 
@@ -105,6 +109,8 @@ class ProtocolConfigurationUpdate(BaseModel):
     onebot_reverse_ws_host: str | None = Field(default=None, max_length=253)
     qq_enabled: bool
     qq_bots: list[QQBotForm] = Field(default_factory=list)
+    qq_proactive_fallback: bool | None = None
+    telegram_enabled: bool | None = None
     qq_webhook_mode: Literal["external", "builtin_https"] = "external"
     qq_webhook_public_base_url: str = ""
     qq_webhook_listen_host: str = "0.0.0.0"
@@ -170,7 +176,12 @@ def _parse_bots(raw: object) -> list[dict[str, Any]]:
 
 
 def _normalized_protocol_value(key: str, value: Any) -> Any:
-    if key in {"QQ_ADAPTER_LOAD", "QQ_VERIFY_WEBHOOK"}:
+    if key in {
+        "QQ_ADAPTER_LOAD",
+        "QQ_PROACTIVE_FALLBACK",
+        "QQ_VERIFY_WEBHOOK",
+        "TELEGRAM_ADAPTER_LOAD",
+    }:
         if isinstance(value, bool):
             return value
         return str(value or "").strip().casefold() in {"1", "true", "yes", "on"}
@@ -260,6 +271,10 @@ def _public_configuration(content: str) -> dict[str, Any]:
             in {"true", "1", "yes", "on"},
             "bots": bots,
             "bot_modes": bot_modes,
+            "proactive_fallback": _normalized_protocol_value(
+                "QQ_PROACTIVE_FALLBACK",
+                values.get("QQ_PROACTIVE_FALLBACK", "true"),
+            ),
             "webhook_mode": str(values.get("QQ_WEBHOOK_MODE") or "external"),
             "public_base_url": base_url,
             "callback_url": _callback_url(base_url),
@@ -267,6 +282,11 @@ def _public_configuration(content: str) -> dict[str, Any]:
             "listen_port": int(values.get("QQ_WEBHOOK_LISTEN_PORT") or 443),
             "tls_certfile": str(values.get("QQ_WEBHOOK_TLS_CERTFILE") or ""),
             "tls_keyfile": str(values.get("QQ_WEBHOOK_TLS_KEYFILE") or ""),
+        },
+        "telegram": {
+            "enabled": _normalized_protocol_value(
+                "TELEGRAM_ADAPTER_LOAD", values.get("TELEGRAM_ADAPTER_LOAD")
+            ),
         },
     }
 
@@ -440,6 +460,10 @@ async def save_protocol_configuration(
             raise HTTPException(status_code=422, detail=str(error)) from error
     if payload.onebot_access_token is not None:
         changed["ONEBOT_ACCESS_TOKEN"] = payload.onebot_access_token.strip()
+    if payload.qq_proactive_fallback is not None:
+        changed["QQ_PROACTIVE_FALLBACK"] = payload.qq_proactive_fallback
+    if payload.telegram_enabled is not None:
+        changed["TELEGRAM_ADAPTER_LOAD"] = payload.telegram_enabled
 
     bots: list[QQOfficialBotConfig] = []
     base_url = ""

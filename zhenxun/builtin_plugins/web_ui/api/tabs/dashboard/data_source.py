@@ -1,8 +1,11 @@
+from collections.abc import Iterator
 from datetime import datetime, timedelta
+from pathlib import Path
 
 from tortoise.expressions import RawSQL
 from tortoise.functions import Count
 
+from zhenxun.configs.path_config import LOG_PATH
 from zhenxun.models.bot_connect_log import BotConnectLog
 from zhenxun.models.chat_history import ChatHistory
 from zhenxun.models.statistics import Statistics
@@ -105,3 +108,32 @@ class ApiDataSource:
                 )
             )
         return BaseResultModel(total=total, data=result_list)
+
+    @classmethod
+    def today_log_file(cls) -> Path | None:
+        """获取当天的运行日志文件
+
+        返回:
+            Path | None: 日志文件，当天尚未写入日志时为 None
+        """
+        path = LOG_PATH / f"{datetime.now():%Y-%m-%d}.log"
+        return path if path.is_file() else None
+
+    @classmethod
+    def read_log_file(cls, path: Path, size: int) -> Iterator[bytes]:
+        """分块读取日志文件的前 size 字节，读取期间新写入的内容不会被包含
+
+        参数:
+            path: 日志文件
+            size: 读取的字节数
+
+        返回:
+            Iterator[bytes]: 文件内容分块
+        """
+        with path.open("rb") as file:
+            while size > 0:
+                chunk = file.read(min(size, 64 * 1024))
+                if not chunk:
+                    break
+                size -= len(chunk)
+                yield chunk

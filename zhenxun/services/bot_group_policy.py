@@ -392,6 +392,7 @@ class BotGroupPolicyService:
                 local=state[f"block_{kind}"],
                 forced=state[f"forced_{kind}"],
                 super_group=super_group,
+                bot_enabled=account["bot_enabled"],
             )
             for kind in ("plugins", "tasks")
         }
@@ -401,6 +402,7 @@ class BotGroupPolicyService:
             "scope_label": "所有私聊" if private else "当前账号群聊设置",
             "account_block_plugins": account["block_plugins"],
             "account_block_tasks": account["block_tasks"],
+            "bot_enabled": account["bot_enabled"],
             "group_block_plugins": state["forced_plugins"],
             "group_block_tasks": state["forced_tasks"],
             "private_policy_exists": row is not None,

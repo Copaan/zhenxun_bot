@@ -10,7 +10,6 @@ from zhenxun.services.ai.core.options import (
     LLMEmbeddingConfig,
     TTSConfig,
 )
-from zhenxun.utils.pydantic_compat import model_dump
 
 from .models import LLMMessage
 from .parts import EmbedBatch
@@ -24,24 +23,6 @@ class BaseRequest(BaseModel):
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    def get_cache_hash_payload(self) -> dict[str, Any]:
-        """获取用于计算缓存 Hash 的安全载荷，排除所有运行时动态变量"""
-        request_dict = model_dump(self, exclude_none=True)
-
-        if "config" in request_dict and isinstance(request_dict["config"], dict):
-            custom_kwargs = request_dict["config"].get("custom_kwargs", {})
-            if "__cache_ttl__" in custom_kwargs:
-                custom_kwargs.pop("__cache_ttl__")
-
-        if "extra" in request_dict:
-            request_dict["extra"] = {
-                k: v
-                for k, v in request_dict["extra"].items()
-                if not k.startswith("_")
-                and k not in ("run_context", "output_processor", "guardrails")
-            }
-        return request_dict
-
 
 class ChatRequest(BaseRequest):
     """对话生成请求 DTO"""
@@ -50,23 +31,6 @@ class ChatRequest(BaseRequest):
     config: GenerationConfig | None = None
     tools: list[Any] | None = None
     tool_choice: str | dict[str, Any] | ToolChoice | None = None
-
-    def get_cache_hash_payload(self) -> dict[str, Any]:
-        payload = super().get_cache_hash_payload()
-        for msg in payload.get("messages", []):
-            msg.pop("created_at", None)
-            msg.pop("token_cost", None)
-            msg.pop("metadata", None)
-
-        if "tools" in payload and isinstance(payload["tools"], list):
-            safe_tools = []
-            for t in payload["tools"]:
-                if isinstance(t, dict | str):
-                    safe_tools.append(t)
-                else:
-                    safe_tools.append(getattr(t, "name", type(t).__name__))
-            payload["tools"] = safe_tools
-        return payload
 
 
 class EmbeddingRequest(BaseRequest):

@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 from zhenxun.services.ai.config import get_llm_config
 from zhenxun.services.ai.context.memory.models import MemoryConfig
 from zhenxun.services.ai.core.engine.token_counter import token_counter
+from zhenxun.services.ai.core.exceptions import ConfigurationException
 from zhenxun.services.ai.core.messages import (
     AudioPart,
     FilePart,
@@ -16,10 +17,9 @@ from zhenxun.services.ai.core.messages import (
     TextPart,
     VideoPart,
 )
-from zhenxun.services.ai.core.models import ModelCapabilities
+from zhenxun.services.ai.core.models import ModelProfile
 from zhenxun.services.ai.llm.api import chat, generate_structured
-from zhenxun.services.ai.llm.manager import get_default_model
-from zhenxun.services.ai.llm.system.capabilities import get_model_capabilities
+from zhenxun.services.ai.llm.manager import get_default_model, resolve_model_profile
 from zhenxun.services.ai.utils.logger import log_memory as logger
 from zhenxun.utils.pydantic_compat import model_copy
 
@@ -515,17 +515,18 @@ class CondenserPipeline:
     def create_from_configs(
         cls,
         memory_config: MemoryConfig | None,
-        capabilities: ModelCapabilities | None,
+        profile: ModelProfile | None,
         model_name: str,
     ) -> "CondenserPipeline":
         """基于全局和局部配置组装压缩管线工厂方法"""
         config = get_llm_config().context_settings
         pipeline_reducers = []
-        caps = (
-            capabilities
-            if capabilities is not None
-            else get_model_capabilities(model_name)
-        )
+        if profile is None:
+            try:
+                profile = resolve_model_profile(model_name or None)
+            except ConfigurationException:
+                profile = ModelProfile()
+        context_window = profile.context_window
 
         vw = config.vision_window_size
         if memory_config and memory_config.compression.vision_window is not None:
@@ -536,7 +537,7 @@ class CondenserPipeline:
         tp = config.tool_pruning
         if tp.enable:
             tp_limit = (
-                int(caps.max_input_tokens * tp.trigger_threshold)
+                int(context_window * tp.trigger_threshold)
                 if tp.trigger_threshold <= 1.0
                 else int(tp.trigger_threshold)
             )
@@ -557,9 +558,7 @@ class CondenserPipeline:
                 threshold = memory_config.compression.threshold
 
             limit = (
-                int(caps.max_input_tokens * threshold)
-                if threshold <= 1.0
-                else int(threshold)
+                int(context_window * threshold) if threshold <= 1.0 else int(threshold)
             )
 
             max_turns = config.llm_summary.max_history_turns

@@ -1,11 +1,16 @@
+import contextvars
 from functools import lru_cache
 from typing import Any
 
 from zhenxun.configs.config import Config
 from zhenxun.configs.utils import parse_as
+from zhenxun.services.log import logger
 from zhenxun.utils.pydantic_compat import model_dump
 
 from .models import DebugLogOptions, LLMConfig, ProviderConfig
+from .presets import GEMINI_SAFETY_CATEGORIES, detect_preset
+
+LOG_COMMAND = "AIConfig"
 
 
 def get_ai_config():
@@ -13,104 +18,170 @@ def get_ai_config():
     return Config.get("AI")
 
 
-def get_default_providers() -> list[dict[str, Any]]:
-    """获取默认提供商配置列表。"""
-    return [
-        {
-            "name": "DeepSeek",
-            "api_key": "YOUR_API_KEY",
-            "api_base": "https://api.deepseek.com",
-            "api_type": "deepseek",
-            "models": [
-                {
-                    "model_name": "deepseek-v4-pro",
-                    "reasoning_effort": "high",
-                },
-                {
-                    "model_name": "deepseek-v4-flash",
-                },
-            ],
-        },
-        {
-            "name": "Doubao",
-            "api_key": "YOUR_ARK_API_KEY",
-            "api_base": "https://ark.cn-beijing.volces.com/api",
-            "api_type": "doubao",
-            "models": [
-                {"model_name": "doubao-seed-1-6-250615"},
-                {"model_name": "doubao-seed-1-6-flash-250615"},
-            ],
-        },
-        {
-            "name": "siliconflow",
-            "api_key": "YOUR_ARK_API_KEY",
-            "api_base": "https://api.siliconflow.cn",
-            "api_type": "openai",
-            "models": [
-                {"model_name": "deepseek-ai/DeepSeek-V4-Flash"},
-                {"model_name": "BAAI/bge-m3"},
-                {"model_name": "BAAI/bge-reranker-v2-m3"},
-            ],
-        },
-        {
-            "name": "GLM",
-            "api_key": "YOUR_API_KEY",
-            "api_base": "https://open.bigmodel.cn",
-            "api_type": "glm",
-            "models": [
-                {"model_name": "glm-4.6v-flash"},
-                {"model_name": "glm-5v-turbo"},
-            ],
-        },
-        {
-            "name": "Gemini",
-            "api_key": [
-                "AIzaSy*****************************",
-                "AIzaSy*****************************",
-            ],
-            "api_base": "https://generativelanguage.googleapis.com",
-            "api_type": "gemini",
-            "models": [
-                {"model_name": "gemini-3.5-flash"},
-                {"model_name": "gemini-3.1-flash-lite"},
-                {"model_name": "gemini-2.5-flash-image"},
-                {"model_name": "gemini-embedding-2"},
-                {"model_name": "gemini-3.1-flash-tts-preview"},
-            ],
-        },
-        {
-            "name": "OpenRouter",
-            "api_key": "YOUR_OPENROUTER_API_KEY",
-            "api_base": "https://openrouter.ai/api",
-            "api_type": "openrouter",
-            "models": [
-                {"model_name": "google/gemini-3.1-flash-lite"},
-                {"model_name": "x-ai/grok-4"},
-            ],
-        },
-        {
-            "name": "MiniMax",
-            "api_key": "YOUR_API_KEY",
-            "api_base": "https://api.minimaxi.com",
-            "api_type": "minimax",
-            "models": [
-                {"model_name": "MiniMax-M3"},
-                {"model_name": "MiniMax-M2.7"},
-                {"model_name": "MiniMax-M2.7-highspeed"},
-            ],
-        },
-        {
-            "name": "MiMo",
-            "api_key": "YOUR_MIMO_API_KEY",
-            "api_base": "https://api.xiaomimimo.com",
-            "api_type": "mimo",
-            "models": [
-                {"model_name": "mimo-v2.5-pro"},
-                {"model_name": "mimo-v2.5"},
-                {"model_name": "mimo-v2.5-tts"},
-            ],
-        },
-    ]
+_LEGACY_TYPES = {
+    "openai": ("openai", "openai_chat", "v1"),
+    "deepseek": ("deepseek", "openai_chat", "v1"),
+    "doubao": ("ark", "openai_chat", "v3"),
+    "glm": ("glm", "openai_chat", "api/paas/v4"),
+    "zhipu": ("glm", "openai_chat", "api/paas/v4"),
+    "gemini": ("gemini", "gemini", "v1beta"),
+    "openrouter": ("openrouter", "openai_chat", "v1"),
+    "minimax": ("minimax", "openai_chat", "v1"),
+    "mimo": ("mimo", "openai_chat", "v1"),
+    "jina": ("jina", "openai_chat", "v1"),
+    "openai_responses": (None, "openai_responses", "v1"),
+    "smart": (None, "openai_chat", "v1"),
+}
+
+_LEGACY_TASKS = (
+    ("embed", "embedding"),
+    ("rerank", "rerank"),
+    ("tts", "tts"),
+    ("speech", "tts"),
+    ("image", "image"),
+)
+
+
+def _legacy_url(api_base: str, prefix: str | None, version: str) -> str:
+    base = api_base.rstrip("/")
+    for segment in (prefix, version):
+        segment = (segment or "").strip("/")
+        if segment and not base.lower().endswith("/" + segment.lower()):
+            first, _, rest = segment.partition("/")
+            if base.rsplit("/", 1)[-1].lower() == first.lower():
+                segment = rest
+            base = f"{base}/{segment}" if segment else base
+    return base
+
+
+def _legacy_type(api_type: Any) -> tuple[str | None, str, str]:
+    return _LEGACY_TYPES.get(str(api_type or "openai").lower(), _LEGACY_TYPES["openai"])
+
+
+def _migrate_legacy_model(
+    raw: dict[str, Any], provider_type: str, api_base: str | None
+) -> dict[str, Any]:
+    model: dict[str, Any] = {"name": str(raw.get("model_name") or raw.get("name"))}
+    if raw.get("is_available") is False:
+        model["enabled"] = False
+    params = {
+        new: raw[old]
+        for old, new in (
+            ("temperature", "temperature"),
+            ("max_output_tokens", "max_tokens"),
+            ("reasoning_effort", "reasoning_effort"),
+        )
+        if raw.get(old) is not None
+    }
+    if params:
+        model["params"] = params
+    profile: dict[str, Any] = {}
+    if raw.get("max_input_tokens"):
+        profile["context_window"] = raw["max_input_tokens"]
+    task_type = str(raw.get("task_type") or "").lower()
+    if task := next((t for key, t in _LEGACY_TASKS if key in task_type), None):
+        profile["tasks"] = [task]
+    if profile:
+        model["profile"] = profile
+    model_type = str(raw.get("api_type") or provider_type).lower()
+    if model_type == "smart" and "gemini" in model["name"].lower():
+        model_type = "gemini"
+    _, protocol, version = _legacy_type(model_type)
+    _, provider_protocol, provider_version = _legacy_type(provider_type)
+    if protocol != provider_protocol:
+        model["protocol"] = protocol
+    if api_base and (raw.get("path_prefix") or version != provider_version):
+        model["base_url"] = _legacy_url(api_base, raw.get("path_prefix"), version)
+    if raw.get("endpoint"):
+        logger.warning(
+            f"模型 {model['name']} 的 endpoint 配置已不再支持，已忽略: "
+            f"{raw['endpoint']}",
+            LOG_COMMAND,
+        )
+    return model
+
+
+def _migrate_legacy_provider(
+    raw: dict[str, Any], gemini_threshold: str | None
+) -> dict[str, Any]:
+    api_type = str(raw.get("api_type") or "openai").lower()
+    preset, protocol, version = _legacy_type(api_type)
+    api_base = raw.get("api_base") or None
+    preset = detect_preset(api_base) or preset
+    if api_type == "openai_responses" and preset != "openai":
+        preset = None
+    keys = raw.get("api_key") or raw.get("api_keys") or []
+    provider: dict[str, Any] = {
+        "name": raw.get("name"),
+        "preset": preset,
+        "protocol": protocol,
+        "base_url": _legacy_url(api_base, None, version) if api_base else "",
+        "api_keys": [keys] if isinstance(keys, str) else list(keys),
+        "timeout": raw.get("timeout") or 120,
+        "models": [
+            _migrate_legacy_model(m, api_type, api_base)
+            for m in raw.get("models") or []
+            if isinstance(m, dict)
+        ],
+    }
+    params = {
+        new: raw[old]
+        for old, new in (
+            ("temperature", "temperature"),
+            ("max_output_tokens", "max_tokens"),
+        )
+        if raw.get(old) is not None
+    }
+    if protocol == "gemini" and gemini_threshold and gemini_threshold != "BLOCK_NONE":
+        params["safetySettings"] = [
+            {"category": category, "threshold": gemini_threshold}
+            for category in GEMINI_SAFETY_CATEGORIES
+        ]
+    if params:
+        provider["params"] = params
+    return provider
+
+
+def _is_legacy_provider(raw: Any) -> bool:
+    if not isinstance(raw, dict):
+        return False
+    if {"api_key", "api_base", "api_type"} & raw.keys():
+        return True
+    return any(
+        isinstance(m, dict) and "model_name" in m for m in raw.get("models") or []
+    )
+
+
+def migrate_legacy_ai_config() -> bool:
+    """把旧版 AI 配置结构转换为当前结构并写回配置文件
+
+    返回:
+        bool: 是否发生了迁移
+    """
+    changed = False
+    providers = Config.get_config("AI", "PROVIDERS", build_model=False)
+    if isinstance(providers, list) and any(map(_is_legacy_provider, providers)):
+        provider_settings = Config.get_config(
+            "AI", "PROVIDER_SETTINGS", build_model=False
+        )
+        threshold = None
+        if isinstance(provider_settings, dict):
+            threshold = (provider_settings.get("gemini") or {}).get("safety_threshold")
+        migrated = [
+            _migrate_legacy_provider(p, threshold) if _is_legacy_provider(p) else p
+            for p in providers
+        ]
+        Config.set_config("AI", "PROVIDERS", migrated)
+        changed = True
+    client_settings = Config.get_config("AI", "CLIENT_SETTINGS", build_model=False)
+    if isinstance(client_settings, dict) and "timeout" in client_settings:
+        client_settings = {k: v for k, v in client_settings.items() if k != "timeout"}
+        Config.set_config("AI", "CLIENT_SETTINGS", client_settings)
+        changed = True
+    if changed:
+        Config.save(save_simple_data=True)
+        logger.info("已将旧版 AI 服务商配置转换为新结构并写回配置文件", LOG_COMMAND)
+    return changed
 
 
 def register_llm_configs():
@@ -129,7 +200,12 @@ def register_llm_configs():
         "AI",
         "default_models",
         model_dump(llm_config.default_models),
-        help="不同任务类型的全局默认模型配置字典",
+        help=(
+            "不同任务类型的全局默认模型，值为 服务商/模型 或路由组名。\n"
+            "键: chat(对话), embedding(向量嵌入), tts(语音合成), "
+            "image(图像生成), rerank(文本重排), "
+            "vision(视觉模型，对话模型不支持图片时先用它把图片转为文字描述)"
+        ),
         type=dict,
         ui={
             "label": "默认模型",
@@ -144,8 +220,10 @@ def register_llm_configs():
         model_dump(llm_config.client_settings),
         help=(
             "LLM客户端高级设置。\n"
-            "包含: timeout(超时秒数), max_retries(重试次数), "
-            "retry_delay(重试延迟), structured_retries(结构化生成重试)"
+            "包含: max_retries(同线路重试次数), retry_delay(重试延迟), "
+            "structured_retries(结构化生成重试), rate_limit_cooldown(限流冷却秒数), "
+            "quota_cooldown(额度耗尽冷却秒数), route_cooldown(线路熔断冷却秒数), "
+            "catalog_url(模型能力库下载地址，models.dev 格式)"
         ),
         type=dict,
         ui={
@@ -228,7 +306,9 @@ def register_llm_configs():
         model_dump(llm_config.agent_settings),
         help=(
             "Agent 执行引擎默认设置。\n"
-            "包含: max_cycles(最大工具循环数), enable_parallel_calls(允许并行), "
+            "包含: max_cycles(最大工具循环数), "
+            "global_max_cycles(跨嵌套智能体的总循环上限), "
+            "enable_parallel_calls(允许并行), "
             "reflexion_retries(反思重试次数), "
             "enable_fallback_summary(达到最大循环时兜底总结), "
             "enable_hitl(是否允许智能体主动向用户求助), "
@@ -265,36 +345,54 @@ def register_llm_configs():
 
     Config.add_plugin_config(
         "AI",
-        "provider_settings",
-        model_dump(llm_config.provider_settings),
-        help=("厂商专属高级设置。\n包含各厂商全局的特有策略开关"),
+        "web_search",
+        model_dump(llm_config.web_search),
+        help=(
+            "联网搜索设置。\n"
+            "mode: auto(模型支持原生联网时用原生，否则用搜索接口) / native(只用原生) / "
+            "api(只用搜索接口) / off(关闭)。\n"
+            "原生联网只在厂商官方接口上默认启用，中转站需核验通过或在模型能力中强制开启。\n"
+            "provider: 搜索接口 deepseek / kimi / glm / jina / tavily / bocha；\n"
+            "api_key: 搜索接口密钥，留空时复用同厂商服务商的密钥；"
+            "max_results: 每次搜索的结果数。"
+        ),
         type=dict,
         ui={
-            "label": "厂商高级设置",
-            "section": "advanced",
+            "label": "联网搜索",
+            "section": "web_search",
             "component": "object",
-            "order": 90,
-            "advanced": True,
+            "order": 25,
+            "secret": True,
         },
     )
 
     Config.add_plugin_config(
         "AI",
         "PROVIDERS",
-        get_default_providers(),
+        [],
         help=(
             "配置多个 AI 服务提供商及其模型信息。\n"
-            "注意：可以在特定模型配置下添加 'api_type' 以覆盖提供商的全局设置。\n"
-            "支持的 api_type 包括:\n"
-            "- 'openai': 标准 OpenAI 格式 (DeepSeek, SiliconFlow等)\n"
-            "- 'gemini': Google Gemini API\n"
-            "- 'glm': 智谱 AI (GLM)\n"
-            "- 'doubao': 字节跳动火山引擎 (Doubao)\n"
-            "- 'jina': Jina AI (专精于多模态嵌入与重排)\n"
-            "- 'openrouter': OpenRouter 聚合平台\n"
-            "- 'openai_responses': 支持新版 responses 格式的 OpenAI 兼容接口\n"
-            "- 'smart': 智能路由模式 (主要用于第三方中转场景，自动根据模型名"
-            "分发请求到 openai 或 gemini)"
+            "preset: 厂商预设 (openai/deepseek/ark/glm/kimi/mimo/dashscope/"
+            "siliconflow/minimax/openrouter/jina/gemini/anthropic)，"
+            "用于补全默认协议与地址。\n"
+            "protocol: 接口协议 (openai_chat/openai_responses/anthropic/gemini)。\n"
+            "base_url: 与对应协议官方 SDK 一致的地址，如 https://api.openai.com/v1。\n"
+            "api_keys: 密钥列表，多个轮询；headers: 附加请求头；timeout: 超时秒数；\n"
+            "params: 默认生成参数，非通用参数原样并入请求体。\n"
+            "models: 模型列表，可直接写模型名，或写 name / enabled / protocol / "
+            "base_url / reference(能力库参照名) / profile / params。\n"
+            "profile: 手动指定的能力，留空的字段依次取实测核验、模型发现、"
+            "能力库、名称推断，常用字段:\n"
+            "  - tasks: chat / embedding / rerank / tts / image\n"
+            "  - input_modalities: text / image / audio / video / file\n"
+            "  - tools: true / false 强制开关函数调用\n"
+            "  - structured_output: json_schema / json_object / none\n"
+            "  - native_tools / native_tools_off: 强制开启 / 关闭的内置工具 "
+            "(web_search / code_execution / url_context)\n"
+            "  - context_window / max_output_tokens / reasoning_levels\n"
+            "未经核验的已启用对话模型在启动后自动核验一次，"
+            "结果保存在 data/ai/model_observations.json；\n"
+            "强制开启的能力被接口拒绝时只对当次请求降级重试，并在控制台警告。"
         ),
         default_value=[],
         type=list[ProviderConfig],
@@ -306,6 +404,8 @@ def register_llm_configs():
             "secret": True,
         },
     )
+    # 在空上下文中读取，避免把正在导入的插件登记为 AI 配置项的导入期读取方
+    contextvars.Context().run(migrate_legacy_ai_config)
 
 
 @lru_cache(maxsize=1)
@@ -330,12 +430,7 @@ def get_llm_config() -> LLMConfig:
         "model_groups": ai_config.get("MODEL_GROUPS", {}),
         "agent_settings": ai_config.get("agent_settings", {}),
         "sandbox": ai_config.get("sandbox", {}),
-        "provider_settings": ai_config.get("provider_settings", {}),
+        "web_search": ai_config.get("web_search", {}),
     }
 
     return parse_as(LLMConfig, config_data)
-
-
-def get_gemini_safety_threshold() -> str:
-    """获取 Gemini 安全过滤阈值配置。"""
-    return get_llm_config().provider_settings.gemini.safety_threshold

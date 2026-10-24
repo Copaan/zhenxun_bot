@@ -29,7 +29,7 @@ from zhenxun.services.ai.core.stream_events import (
     ToolStreamChunkEvent,
 )
 from zhenxun.services.ai.flow.agent.models import AgentRunResources, AgentState
-from zhenxun.services.ai.llm.engine.router import LLMOrchestrator
+from zhenxun.services.ai.llm.api import invoke
 from zhenxun.services.ai.run import AgentRunResult, RunContext
 from zhenxun.services.ai.run.models import OutputDataT
 from zhenxun.services.ai.run.session import session_manager
@@ -269,17 +269,6 @@ class StandardAgentExecutor(BaseAgentExecutor):
 
         await run_context.run.emit(LLMEndEvent(response=response))
 
-        assistant_content = (
-            response.content_parts if response.content_parts else response.text
-        )
-        if response.thought_signature and isinstance(assistant_content, list):
-            for part in assistant_content:
-                if part.type == "thought":
-                    if part.metadata is None:
-                        part.metadata = {}
-                    part.metadata["thought_signature"] = response.thought_signature
-                    break
-
         assistant_message = AssistantMessage(content=response.content_parts)
 
         if hasattr(response, "parsed_obj") and response.parsed_obj is not None:
@@ -330,13 +319,7 @@ class StandardAgentExecutor(BaseAgentExecutor):
         combined_cap = CombinedCapability(sys_caps)
 
         async def inner_handler(ctx: LLMContext[Any, Any]) -> ChatResponse:
-            return await LLMOrchestrator.invoke(
-                request=ctx.request,
-                model_name=model_name,
-                task="chat",
-                override_config=config,
-                cancellation_token=ctx.cancellation_token,
-            )
+            return await invoke("chat", ctx.request, model_name, ctx.cancellation_token)
 
         return await combined_cap.wrap_model_request(
             run_context, llm_context, inner_handler

@@ -1,4 +1,6 @@
 import asyncio
+import secrets
+import time
 from typing import Annotated
 from urllib.parse import urlsplit
 
@@ -17,9 +19,51 @@ from ..configure.model import DatabaseConfig
 from ..configure.setup_access import SetupSession, require_setup_token, setup_access
 
 router = APIRouter(prefix="/backup", dependencies=[authentication()])
+file_router = APIRouter(prefix="/backup")
 setup_router = APIRouter(
     prefix="/configure/backup", dependencies=[Depends(require_setup_token)]
 )
+
+
+DOWNLOAD_TTL = 7200
+"""下载凭证的有效期（秒），每次使用后顺延"""
+_download_tickets: dict[str, tuple[str, float]] = {}
+
+
+def issue_download_ticket(name: str) -> str:
+    """为备份包签发下载凭证
+
+    参数:
+        name: 备份包文件名
+
+    返回:
+        str: 下载凭证
+    """
+    now = time.monotonic()
+    for token, (_, expires) in list(_download_tickets.items()):
+        if expires <= now:
+            del _download_tickets[token]
+    token = secrets.token_urlsafe(32)
+    _download_tickets[token] = (name, now + DOWNLOAD_TTL)
+    return token
+
+
+def use_download_ticket(token: str, name: str) -> bool:
+    """校验下载凭证并顺延有效期
+
+    参数:
+        token: 下载凭证
+        name: 请求的备份包文件名
+
+    返回:
+        bool: 凭证是否有效且属于该备份包
+    """
+    ticket = _download_tickets.get(token)
+    now = time.monotonic()
+    if ticket is None or ticket[0] != name or ticket[1] <= now:
+        return False
+    _download_tickets[token] = (name, now + DOWNLOAD_TTL)
+    return True
 
 
 class ExportPayload(BaseModel):
@@ -137,8 +181,21 @@ async def _() -> Result[list[dict]]:
     return Result.ok(await asyncio.to_thread(backup.list_backups))
 
 
-@router.get("/download/{name}", description="下载备份包")
-async def _(name: str):
+@router.post(
+    "/download/{name}", response_class=JSONResponse, description="签发下载凭证"
+)
+async def _(name: str) -> Result[str]:
+    try:
+        backup.backup_path(name)
+    except backup.BackupError as error:
+        return Result.fail(str(error), 404)
+    return Result.ok(issue_download_ticket(name))
+
+
+@file_router.get("/file/{token}/{name}", description="凭下载凭证下载备份包")
+async def _(token: str, name: str):
+    if not use_download_ticket(token, name):
+        return JSONResponse({"detail": "下载链接无效或已过期，请重新下载"}, 403)
     try:
         path = backup.backup_path(name)
     except backup.BackupError as error:

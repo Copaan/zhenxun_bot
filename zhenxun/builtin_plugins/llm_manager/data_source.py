@@ -5,8 +5,10 @@ from typing import Any
 from zhenxun.configs.path_config import DATA_PATH
 from zhenxun.services.ai.core.exceptions import LLMException
 from zhenxun.services.ai.llm.manager import (
-    get_model_instance,
+    find_model_config,
+    get_profile,
     list_available_models,
+    parse_provider_model_string,
 )
 from zhenxun.services.ai.tools.providers.mcp.provider import mcp_provider
 
@@ -25,15 +27,18 @@ class DataSource:
     @staticmethod
     async def get_model_details(model_name_str: str) -> dict[str, Any] | None:
         """获取指定模型的详细信息"""
-        try:
-            model = await get_model_instance(model_name_str)
-            return {
-                "provider_config": model.provider_config,
-                "model_detail": model.model_detail,
-                "capabilities": model.capabilities,
-            }
-        except LLMException:
+        provider_name, model_name = parse_provider_model_string(model_name_str)
+        if not provider_name or not model_name:
             return None
+        found = find_model_config(provider_name, model_name)
+        if not found:
+            return None
+        provider, model = found
+        return {
+            "provider": provider,
+            "model": model,
+            "profile": get_profile(provider, model),
+        }
 
     @staticmethod
     async def test_model_connectivity(model_name_str: str) -> tuple[bool, str]:
@@ -76,22 +81,8 @@ class DataSource:
         ]
 
         def sort_key(item: dict[str, Any]):
-            status_map = {
-                "DISABLED": 0,
-                "ERROR": 1,
-                "COOLDOWN": 2,
-                "WARNING": 3,
-                "HEALTHY": 4,
-                "UNUSED": 5,
-            }
-            status_str = item.get("status", "HEALTHY")
-            if (
-                item.get("successes", 0) == 0
-                and item.get("failures", 0) == 0
-                and status_str == "HEALTHY"
-            ):
-                status_str = "UNUSED"
-            status_priority = status_map.get(status_str, 5)
+            status_map = {"invalid": 0, "cooldown": 1, "healthy": 2}
+            status_priority = status_map.get(item.get("status", "healthy"), 2)
             total = item.get("successes", 0) + item.get("failures", 0)
             success_rate = (
                 (item.get("successes", 0) / total * 100) if total > 0 else 100.0

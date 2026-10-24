@@ -3,7 +3,7 @@ from typing import cast
 
 from zhenxun.services.ai.core.engine.context_renderer import ContextConverter
 from zhenxun.services.ai.core.messages import AgentMessage
-from zhenxun.services.ai.core.models import ModelCapabilities
+from zhenxun.services.ai.core.models import ModelProfile
 from zhenxun.services.ai.run.context import RunContext
 from zhenxun.services.ai.utils.logger import log_memory as logger
 from zhenxun.utils.pydantic_compat import model_copy
@@ -43,7 +43,7 @@ class SessionMemoryContext:
     async def read(
         self,
         model_name: str,
-        capabilities: ModelCapabilities | None = None,
+        profile: ModelProfile | None = None,
         override_history: Sequence[AgentMessage] | None = None,
         base_overhead: int = 0,
     ) -> list[AgentMessage]:
@@ -72,7 +72,7 @@ class SessionMemoryContext:
                 )
 
             pipeline = CondenserPipeline.create_from_configs(
-                self.memory_config, capabilities, model_name
+                self.memory_config, profile, model_name
             )
             if pipeline.reducers:
                 flattened_to_reduce = ContextConverter.flatten_to_llm_messages(

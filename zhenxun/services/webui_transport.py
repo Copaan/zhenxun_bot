@@ -9,6 +9,14 @@ import weakref
 
 CLOSE_GRACE_SECONDS = 0.3
 SHUTDOWN_ABORT_SECONDS = 2.0
+GRACEFUL_SHUTDOWN_TIMEOUT = 15
+SERVER_OPTIONS: dict[str, Any] = {
+    "access_log": False,
+    "ws_per_message_deflate": False,
+    "limit_concurrency": 512,
+    "backlog": 2048,
+    "timeout_keep_alive": 15,
+}
 
 
 def install_websocket_drain_lock() -> None:
@@ -33,7 +41,10 @@ def install_websocket_drain_lock() -> None:
 
 
 def install_uvicorn_shutdown_hook() -> None:
-    """uvicorn 收到退出信号时立即进入关闭状态，并回收等待关闭握手的连接"""
+    """uvicorn 收到退出信号时立即进入关闭状态
+
+    同时停止 HTTP 兼容入口，并回收等待关闭握手的连接。
+    """
     import uvicorn
 
     original = uvicorn.Server.handle_exit
@@ -42,6 +53,9 @@ def install_uvicorn_shutdown_hook() -> None:
     tasks: weakref.WeakKeyDictionary[Any, asyncio.Task] = weakref.WeakKeyDictionary()
 
     def start(server: Any) -> None:
+        from zhenxun.services.webui_http import webui_http_compat
+
+        webui_http_compat.stop()
         if server not in tasks:
             tasks[server] = asyncio.create_task(
                 _abort_closing_connections(server), name="webui-close-connections"
@@ -85,4 +99,9 @@ async def _abort_closing_connections(server: Any) -> None:
         await asyncio.sleep(0.05)
 
 
-__all__ = ["install_uvicorn_shutdown_hook", "install_websocket_drain_lock"]
+__all__ = [
+    "GRACEFUL_SHUTDOWN_TIMEOUT",
+    "SERVER_OPTIONS",
+    "install_uvicorn_shutdown_hook",
+    "install_websocket_drain_lock",
+]

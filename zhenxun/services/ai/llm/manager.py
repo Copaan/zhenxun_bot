@@ -1,334 +1,318 @@
 """
 LLM 模型管理器
-对外提供统一的配置查询、模型发现与实例化入口。
+
+负责模型名称与路由组解析、能力档案查询、密钥状态管理与启动关闭，
+并在后台定期更新能力库和各提供商的模型列表、核验从未核验过的模型。
 """
 
+import asyncio
+import time
 from typing import Any
 
-from zhenxun.services.ai.config import (
-    ProviderConfig,
-    get_ai_config,
-    get_llm_config,
-)
+from zhenxun.services.ai.config import ModelConfig, ProviderConfig, get_llm_config
 from zhenxun.services.ai.core.exceptions import ConfigurationException
-from zhenxun.services.ai.core.models import ModelCapabilities, ModelDetail
-from zhenxun.services.ai.core.options import GenerationConfig
+from zhenxun.services.ai.core.models import ModelProfile
 from zhenxun.services.ai.utils.logger import log_llm as logger
 from zhenxun.utils.manager.priority_manager import PriorityLifecycle
-from zhenxun.utils.pydantic_compat import model_copy, model_dump
 
-from .system.cache import clear_model_cache, get_or_create_model
-from .system.capabilities import get_model_capabilities
-from .system.network import health_manager
+from .capability import check_unverified_models, get_observation
+from .client import Route
+from .discovery import (
+    DISCOVERY_MAX_AGE,
+    discover_models,
+    get_discovery,
+    get_snapshot,
+    save_snapshots,
+)
+from .health import health_manager
+from .profile import (
+    CATALOG_MAX_AGE,
+    catalog_status,
+    refresh_catalog,
+    resolve_profile,
+)
 
-_RESOLVED_GROUP_CACHE: dict[str, list[str]] = {}
-"""路由组解析缓存，避免每次调用重复打印剔除警告并提升性能"""
+_group_cache: dict[str, list[str]] = {}
+_profile_cache: dict[str, ModelProfile] = {}
 
 
-def clear_resolved_group_cache() -> None:
-    global _RESOLVED_GROUP_CACHE
-    _RESOLVED_GROUP_CACHE.clear()
+def parse_provider_model_string(name: str | None) -> tuple[str | None, str | None]:
+    """解析 "提供商/模型" 格式的名称
 
+    参数:
+        name: 模型全名
 
-def parse_provider_model_string(name_str: str | None) -> tuple[str | None, str | None]:
-    """解析 'ProviderName/ModelName' 格式的字符串"""
-    if not name_str or "/" not in name_str:
+    返回:
+        tuple[str | None, str | None]: 提供商名称与模型名称，格式无效时均为 None
+    """
+    if not name or "/" not in name:
         return None, None
-    parts = name_str.split("/", 1)
-    if len(parts) == 2 and parts[0].strip() and parts[1].strip():
-        return parts[0].strip(), parts[1].strip()
-    return None, None
-
-
-def _get_group_name(name_str: str) -> str | None:
-    """判断名称是否是组名，如果是则提取并返回组名，否则返回 None"""
-    name_str = name_str.strip()
-    if "/" not in name_str:
-        return name_str
-    return None
-
-
-def get_default_api_base_for_type(api_type: str) -> str | None:
-    """根据API类型获取默认的API基础地址"""
-    default_api_bases = {
-        "openai": "https://api.openai.com",
-        "doubao": "https://ark.cn-beijing.volces.com/api",
-        "deepseek": "https://api.deepseek.com",
-        "jina": "https://api.jina.ai",
-        "glm": "https://open.bigmodel.cn",
-        "gemini": "https://generativelanguage.googleapis.com",
-        "openrouter": "https://openrouter.ai/api",
-        "smart": None,
-        "openai_responses": None,
-    }
-    return default_api_bases.get(api_type)
+    provider, model = (part.strip() for part in name.split("/", 1))
+    return (provider, model) if provider and model else (None, None)
 
 
 def get_configured_providers() -> list[ProviderConfig]:
-    """从配置中获取Provider列表"""
-    ai_config = get_ai_config()
-    providers = ai_config.get("PROVIDERS", [])
-    if not isinstance(providers, list):
-        logger.error("配置项 AI.PROVIDERS 的值不是一个列表，将使用空列表。")
-        return []
-    valid_providers = []
-    for i, item in enumerate(providers):
-        if isinstance(item, ProviderConfig):
-            if not item.api_base:
-                default_api_base = get_default_api_base_for_type(item.api_type)
-                if default_api_base:
-                    item.api_base = default_api_base
-            valid_providers.append(item)
-        else:
-            logger.warning(
-                f"配置文件中第 {i + 1} 项未能正确解析为 ProviderConfig 对象，已跳过。"
-            )
-    return valid_providers
+    """获取已配置的提供商列表"""
+    return get_llm_config().providers
 
 
 def find_model_config(
     provider_name: str, model_name: str
-) -> tuple[ProviderConfig, ModelDetail] | None:
-    """在配置中查找指定 Provider 与 ModelDetail。"""
-    providers = get_configured_providers()
-    for provider in providers:
+) -> tuple[ProviderConfig, ModelConfig] | None:
+    """查找提供商与模型配置，名称不区分大小写"""
+    for provider in get_configured_providers():
         if provider.name.lower() == provider_name.lower():
-            for model_detail in provider.models:
-                if model_detail.model_name.lower() == model_name.lower():
-                    return provider, model_detail
+            model = provider.get_model(model_name)
+            return (provider, model) if model else None
     return None
 
 
-def _resolve_model_group(group_name: str, visited: set | None = None) -> list[str]:
-    """递归解析模型组，展开为扁平的真实模型列表，并防止循环嵌套。"""
-    global _RESOLVED_GROUP_CACHE
-    if visited is None and group_name in _RESOLVED_GROUP_CACHE:
-        return _RESOLVED_GROUP_CACHE[group_name]
-    if visited is None:
-        visited = set()
-    if group_name in visited:
-        logger.warning(f"检测到模型路由组嵌套死循环: {group_name}，已安全跳过该分支。")
+def _resolve_group(name: str, visited: frozenset[str] = frozenset()) -> list[str]:
+    if name in visited:
+        logger.warning(f"模型路由组嵌套循环: {name}，已跳过")
         return []
-    visited.add(group_name)
-    llm_config = get_llm_config()
-    if group_name not in llm_config.model_groups:
-        logger.warning(f"模型路由组 '{group_name}' 不存在于配置中。")
+    groups = get_llm_config().model_groups
+    if name not in groups:
         return []
-    resolved_models = []
-    for item in llm_config.model_groups[group_name]:
-        item = item.strip()
-        sub_group = _get_group_name(item)
-        if sub_group:
-            resolved_models.extend(_resolve_model_group(sub_group, visited.copy()))
+    result: list[str] = []
+    for item in (item.strip() for item in groups[name]):
+        if "/" not in item:
+            members = _resolve_group(item, visited | {name})
+        elif all(parse_provider_model_string(item)) and find_model_config(
+            *parse_provider_model_string(item)  # type: ignore[misc]
+        ):
+            members = [item]
         else:
-            prov_mod = parse_provider_model_string(item)
-            if prov_mod[0] and prov_mod[1]:
-                if find_model_config(prov_mod[0], prov_mod[1]):
-                    if item not in resolved_models:
-                        resolved_models.append(item)
-                else:
-                    logger.warning(
-                        f"⚠️ [Router] 路由组 '{group_name}' 中的模型 "
-                        f"'{item}' 未在配置，已被自动剔除！"
-                    )
-            else:
-                logger.warning(f"路由组 '{group_name}' 包含无效格式的项目 '{item}'。")
-    if len(visited) == 1:
-        _RESOLVED_GROUP_CACHE[group_name] = resolved_models
-    return resolved_models
-
-
-def _get_model_identifiers(provider_name: str, model_detail: ModelDetail) -> list[str]:
-    """获取模型的所有可用标识符"""
-    return [f"{provider_name}/{model_detail.model_name}"]
-
-
-def list_available_models() -> list[dict[str, Any]]:
-    """列出所有已配置的可用模型及其信息。"""
-    providers = get_configured_providers()
-    model_list = []
-    for provider in providers:
-        for model_detail in provider.models:
-            caps = get_model_capabilities(model_detail.model_name)
-            model_info = {
-                "provider_name": provider.name,
-                "model_name": model_detail.model_name,
-                "full_name": f"{provider.name}/{model_detail.model_name}",
-                "api_type": provider.api_type or "auto-detect",
-                "api_base": provider.api_base,
-                "is_available": model_detail.is_available,
-                "is_embedding_model": caps.is_embedding_model,
-                "max_input_tokens": caps.max_input_tokens,
-                "available_identifiers": _get_model_identifiers(
-                    provider.name, model_detail
-                ),
-            }
-            model_list.append(model_info)
-    return model_list
-
-
-def list_embedding_models() -> list[dict[str, Any]]:
-    """列出所有支持嵌入能力的模型。"""
-    all_models = list_available_models()
-    return [model for model in all_models if model.get("is_embedding_model", False)]
-
-
-def list_model_identifiers() -> dict[str, list[str]]:
-    """列出所有模型的可用标识符映射。"""
-    providers = get_configured_providers()
-    result = {}
-    for provider in providers:
-        for model_detail in provider.models:
-            full_name = f"{provider.name}/{model_detail.model_name}"
-            identifiers = _get_model_identifiers(provider.name, model_detail)
-            result[full_name] = identifiers
+            logger.warning(f"路由组 '{name}' 中的模型 '{item}' 未配置，已忽略")
+            members = []
+        result.extend(m for m in members if m not in result)
     return result
 
 
+def resolve_model_names(name: str) -> list[str]:
+    """把模型名或路由组名展开为模型全名列表
+
+    参数:
+        name: 模型全名或路由组名
+
+    返回:
+        list[str]: 模型全名列表
+    """
+    name = name.strip()
+    if "/" in name:
+        return [name]
+    if name not in _group_cache:
+        _group_cache[name] = _resolve_group(name)
+    return _group_cache[name]
+
+
 def get_default_model(task: str = "chat") -> str | None:
-    """根据任务类型获取默认模型名称"""
-    config = get_llm_config()
-    return getattr(config.default_models, task, None) or None
+    """获取任务的默认模型名称"""
+    return getattr(get_llm_config().default_models, task, None) or None
 
 
-async def resolve_model_capabilities(
-    provider_model_name: str | None = None, task: str = "chat"
-) -> ModelCapabilities:
-    """解析并合并带有用户自定义覆盖(如 max_input_tokens) 的模型能力。"""
-    resolved_name = provider_model_name
-    if resolved_name is None:
-        resolved_name = get_default_model(task)
-        if resolved_name is None:
-            raise ConfigurationException(
-                f"尚未配置 {task} 默认模型，请选择模型后再调用。"
+def get_profile(provider: ProviderConfig, model: ModelConfig) -> ModelProfile:
+    """获取模型能力档案 (带缓存)"""
+    key = f"{provider.name}/{model.name}"
+    if key not in _profile_cache:
+        _profile_cache[key] = resolve_profile(
+            provider,
+            model,
+            get_snapshot(provider, model.name),
+            get_observation(provider, model),
+        )
+    return _profile_cache[key]
+
+
+def resolve_routes(name: str | None, task: str = "chat") -> list[Route]:
+    """把模型名或路由组名解析为可调用的线路
+
+    参数:
+        name: 模型全名或路由组名，为空时使用任务默认模型
+        task: 任务类型
+
+    返回:
+        list[Route]: 已启用且支持该任务的线路
+    """
+    name = name or get_default_model(task)
+    if not name:
+        raise ConfigurationException(f"尚未配置 {task} 默认模型，请选择模型后再调用。")
+    routes = []
+    for full_name in resolve_model_names(name):
+        found = find_model_config(*parse_provider_model_string(full_name))  # type: ignore[arg-type]
+        if not found:
+            continue
+        provider, model = found
+        if not model.enabled:
+            continue
+        profile = get_profile(provider, model)
+        if profile.supports_task(task):
+            routes.append(Route(provider, model, profile))
+        else:
+            logger.debug(f"模型 {full_name} 不支持 {task} 任务，已跳过")
+    if not routes:
+        raise ConfigurationException(f"'{name}' 没有可用于 {task} 任务的已启用模型")
+    return routes
+
+
+def resolve_model_profile(name: str | None = None, task: str = "chat") -> ModelProfile:
+    """获取模型 (路由组取首个线路) 的能力档案"""
+    return resolve_routes(name, task)[0].profile
+
+
+def list_available_models() -> list[dict[str, Any]]:
+    """列出全部已配置模型及其能力摘要"""
+    result = []
+    for provider in get_configured_providers():
+        for model in provider.models:
+            profile = get_profile(provider, model)
+            result.append(
+                {
+                    "provider_name": provider.name,
+                    "model_name": model.name,
+                    "full_name": f"{provider.name}/{model.name}",
+                    "protocol": model.protocol or provider.protocol,
+                    "base_url": model.base_url or provider.base_url,
+                    "is_available": model.enabled,
+                    "tasks": sorted(profile.tasks),
+                    "context_window": profile.context_window,
+                    "is_embedding_model": profile.supports_task("embedding"),
+                }
             )
+    return result
 
-    group_name = _get_group_name(resolved_name)
-    if group_name is not None:
-        model_names = _resolve_model_group(group_name)
-        if model_names:
-            resolved_name = model_names[0]
 
-    prov_name, mod_name = parse_provider_model_string(resolved_name)
-    caps = get_model_capabilities(mod_name or resolved_name)
-
-    if prov_name and mod_name:
-        config_tuple = find_model_config(prov_name, mod_name)
-        if config_tuple:
-            _, model_detail = config_tuple
-            if model_detail.max_input_tokens is not None:
-                caps = model_copy(
-                    caps, update={"max_input_tokens": model_detail.max_input_tokens}
-                )
-
-    return caps
+def _find_provider(name: str) -> ProviderConfig | None:
+    return next(
+        (p for p in get_configured_providers() if p.name.lower() == name.lower()),
+        None,
+    )
 
 
 async def get_key_usage_stats() -> dict[str, Any]:
-    """获取所有 Provider 的 Key 使用统计。"""
-    providers = get_configured_providers()
-    stats = {}
-    for provider in providers:
-        keys = (
-            [provider.api_key]
-            if isinstance(provider.api_key, str)
-            else provider.api_key
-        )
-        provider_stats = {}
-        provider_state = health_manager.state.providers.get(provider.name)
-        if provider_state:
-            for k in keys:
-                stat_data = provider_state.api_keys.get(k)
-                if stat_data:
-                    provider_stats[health_manager._get_key_id(k)] = model_dump(
-                        stat_data
-                    )
-        stats[provider.name] = {
-            "total_keys": len(
-                [provider.api_key]
-                if isinstance(provider.api_key, str)
-                else provider.api_key
-            ),
-            "key_stats": provider_stats,
+    """获取各提供商的密钥使用统计，以脱敏密钥为键"""
+    return {
+        provider.name: {
+            "total_keys": len(provider.api_keys),
+            "key_stats": health_manager.key_stats(provider.name, provider.api_keys),
         }
-    return stats
+        for provider in get_configured_providers()
+    }
 
 
 async def reset_key_status(provider_name: str, api_key: str | None = None) -> bool:
-    """重置指定 Provider 的 Key 状态。"""
-    providers = get_configured_providers()
-    target_provider = None
-    for provider in providers:
-        if provider.name.lower() == provider_name.lower():
-            target_provider = provider
-            break
-    if not target_provider:
-        logger.error(f"未找到Provider: {provider_name}")
+    """重置提供商的密钥状态
+
+    参数:
+        provider_name: 提供商名称
+        api_key: 指定密钥，为空时重置全部密钥
+
+    返回:
+        bool: 是否重置成功
+    """
+    provider = _find_provider(provider_name)
+    if provider is None:
+        logger.error(f"未找到提供商: {provider_name}")
         return False
-    provider_keys = (
-        [target_provider.api_key]
-        if isinstance(target_provider.api_key, str)
-        else target_provider.api_key
+    if api_key and api_key not in provider.api_keys:
+        logger.error(f"指定的密钥不属于提供商 '{provider_name}'")
+        return False
+    health_manager.reset_keys(
+        provider.name, [api_key] if api_key else provider.api_keys
     )
-    if api_key:
-        if api_key in provider_keys:
-            await health_manager.reset_key_status(target_provider.name, api_key)
-            logger.info(f"已重置Provider '{provider_name}' 的指定Key状态")
-            return True
-        else:
-            logger.error(f"指定的Key不属于Provider '{provider_name}'")
-            return False
-    else:
-        for key in provider_keys:
-            await health_manager.reset_key_status(target_provider.name, key)
-        logger.info(f"已重置Provider '{provider_name}' 的所有Key状态")
-        return True
-
-
-async def get_model_instance(
-    provider_model_name: str | None = None,
-    override_config: dict[str, Any] | GenerationConfig | None = None,
-    task: str = "chat",
-) -> Any:
-    """作为门面 API，解析字符串并调用底层的 get_or_create_model"""
-    resolved_model_name_str = provider_model_name
-    if resolved_model_name_str is None:
-        resolved_model_name_str = get_default_model(task)
-        if resolved_model_name_str is None:
-            raise ConfigurationException(
-                f"尚未配置 {task} 默认模型，请选择模型后再调用。"
-            )
-
-    prov_name_str, mod_name_str = parse_provider_model_string(resolved_model_name_str)
-    if not prov_name_str or not mod_name_str:
-        raise ConfigurationException(f"无效的模型名称格式: '{resolved_model_name_str}'")
-
-    config_tuple_found = find_model_config(prov_name_str, mod_name_str)
-    if not config_tuple_found:
-        raise ConfigurationException(f"未找到模型: '{resolved_model_name_str}'. ")
-
-    provider_config_found, model_detail_found = config_tuple_found
-
-    return await get_or_create_model(
-        provider_config_found, model_detail_found, override_config
-    )
+    logger.info(f"已重置提供商 '{provider_name}' 的密钥状态")
+    return True
 
 
 def clear_all_cache() -> None:
+    """清空路由组与能力档案缓存"""
+    _group_cache.clear()
+    _profile_cache.clear()
+
+
+async def refresh_provider_models(
+    provider: ProviderConfig, api_keys: list[str] | None = None
+) -> tuple[str, dict[str, dict[str, Any]]]:
+    """依次尝试密钥查询提供商的模型列表，成功后保存发现结果
+
+    参数:
+        provider: 提供商配置
+        api_keys: 尝试的密钥，为空时使用提供商的全部密钥
+
+    返回:
+        tuple[str, dict[str, dict[str, Any]]]: 成功的密钥与模型名称 -> 能力字段
     """
-    清空模型实例缓存与路由组解析缓存。
-    """
-    clear_model_cache()
-    clear_resolved_group_cache()
-    logger.debug("已清空全局模型实例与路由组缓存")
+    from zhenxun.services.ai.chat_switch import scene_admitted
+
+    keys = api_keys or provider.api_keys
+    if not keys:
+        raise ConfigurationException(f"提供商 '{provider.name}' 未配置密钥")
+    error: Exception | None = None
+    for key in keys:
+        try:
+            with scene_admitted():
+                models = await discover_models(provider, key)
+        except Exception as e:
+            error = e
+            continue
+        save_snapshots(provider, models)
+        clear_all_cache()
+        return key, models
+    assert error is not None
+    raise error
+
+
+async def _refresh_model_data() -> None:
+    """定期更新能力库，刷新超过一天未查询的提供商模型列表，
+    首轮刷新后核验从未核验过的模型"""
+    attempted: dict[str, float] = {}
+    catalog_warned = False
+    checked = False
+    while True:
+        now = time.time()
+        providers = [p for p in get_configured_providers() if p.base_url and p.api_keys]
+        catalog_age = now - (catalog_status()["updated_at"] or 0)
+        if providers and catalog_age > CATALOG_MAX_AGE:
+            try:
+                await refresh_catalog()
+                clear_all_cache()
+            except Exception as e:
+                message = f"模型能力库更新失败，可在 AI 设置中更换能力库地址: {e}"
+                if catalog_warned:
+                    logger.debug(message)
+                else:
+                    logger.warning(message)
+                catalog_warned = True
+        for provider in providers:
+            last = max(
+                get_discovery(provider).get("updated_at", 0),
+                attempted.get(provider.name, 0),
+            )
+            if now - last < DISCOVERY_MAX_AGE:
+                continue
+            attempted[provider.name] = now
+            try:
+                await refresh_provider_models(provider)
+            except Exception as e:
+                logger.debug(f"提供商 '{provider.name}' 的模型列表刷新失败: {e}")
+        if not checked:
+            checked = True
+            try:
+                await check_unverified_models()
+            except Exception as e:
+                logger.warning(f"模型能力核验未完成: {e}")
+        await asyncio.sleep(3600)
 
 
 async def _shutdown_ai_runtime() -> None:
-    """关闭 MCP 工具提供者与密钥状态持久化"""
+    """关闭 MCP 工具提供者、保存密钥状态并关闭连接池"""
     from zhenxun.services.ai.tools.providers.mcp.provider import mcp_provider
+
+    from .client import close_http_clients
 
     await mcp_provider.shutdown()
     await health_manager.shutdown()
+    await close_http_clients()
 
 
 @PriorityLifecycle.on_startup(
@@ -342,21 +326,18 @@ async def _shutdown_ai_runtime() -> None:
     pass_context=True,
 )
 async def _init_llm_config_on_startup(context):
-    """启动时初始化 LLM 配置、密钥状态并预热工具提供者管理器。"""
-    logger.info("正在初始化 LLM 配置并加载遥测状态...")
-    try:
-        from zhenxun.services.ai.tools.engine.registry import tool_provider_manager
-        from zhenxun.services.ai.tools.providers.mcp.provider import mcp_provider
+    """启动时加载 LLM 配置与密钥状态，初始化工具提供者并开始后台刷新模型数据"""
+    from zhenxun.services.ai.tools.engine.registry import tool_provider_manager
+    from zhenxun.services.ai.tools.providers.mcp.provider import mcp_provider
 
-        tool_provider_manager.register(mcp_provider)
-        get_llm_config()
-        context.add_finalizer(_shutdown_ai_runtime)
-        await health_manager.initialize()
-        await tool_provider_manager.initialize()
-
-    except Exception as e:
-        logger.error(f"LLM 配置或遥测状态初始化时发生错误: {e}", e=e)
-        raise
+    tool_provider_manager.register(mcp_provider)
+    get_llm_config()
+    context.add_finalizer(_shutdown_ai_runtime)
+    await health_manager.initialize()
+    await tool_provider_manager.initialize()
+    context.spawn_task(
+        _refresh_model_data(), name="ai-model-refresh", degrade_on_error=False
+    )
 
 
 @PriorityLifecycle.on_startup(

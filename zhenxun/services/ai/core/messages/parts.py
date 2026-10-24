@@ -15,7 +15,7 @@ class BaseContentPart(BaseModel):
     """多态消息内容的底层基类"""
 
     metadata: dict[str, Any] | None = Field(default=None)
-    """该部件的内部元数据，提供如 thought_signature、解析结果等非展示用数据"""
+    """该部件的内部元数据，提供如协议回传数据、解析结果等非展示用数据"""
 
     @classmethod
     def text_part(cls, text: str) -> "TextPart":

@@ -10,7 +10,7 @@ CORE_FIELDS = {
     "ALCONNA_USE_COMMAND_START": (bool, False, "bot"),
     "IMAGE_TO_BYTES": (bool, False, "bot"),
     "WEBUI_HTTPS_ENABLED": (bool, False, "access"),
-    "WEBUI_HTTP_REDIRECT_ENABLED": (bool, False, "access"),
+    "WEBUI_HTTP_REDIRECT_ENABLED": (bool, False, "legacy"),
     "WEBUI_HTTP_MODE": (str, None, "access"),
     "WEBUI_HTTP_REDIRECT_PORT": (int, 80, "access"),
     "WEBUI_TLS_CERTFILE": (str, "", "access"),
@@ -99,7 +99,7 @@ def comparable_value(value: Any) -> Any:
 def environment_category(key: str, sources: list[str]) -> str:
     if key in {"DB_URL", "CACHE_MODE"} or key.startswith("REDIS_"):
         return "storage"
-    if key.startswith(("QQ_", "ONEBOT_")) or key == "QBOT_ID_DATA":
+    if key.startswith(("QQ_", "ONEBOT_", "TELEGRAM_")) or key == "QBOT_ID_DATA":
         return "adapters"
     if key in CORE_FIELDS:
         return CORE_FIELDS[key][2]

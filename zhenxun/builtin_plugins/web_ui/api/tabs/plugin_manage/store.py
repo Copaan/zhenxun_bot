@@ -12,6 +12,7 @@ from nonebot import get_loaded_plugins, require
 from nonebot.compat import model_dump
 from packaging.version import InvalidVersion, Version
 
+from zhenxun.services.ai.chat_switch import plugin_capabilities
 from zhenxun.services.log import logger
 from zhenxun.services.plugin_host import plugin_host
 from zhenxun.services.plugin_store.operation_journal import (
@@ -38,18 +39,6 @@ from .model import PluginIr, PluginReloadPayload
 
 router = APIRouter(prefix="/store")
 _ACTIVE_OPERATIONS: dict[str, tuple[str, asyncio.Task]] = {}
-_AI_CHAT_PLUGIN_MODULES = frozenset(
-    {
-        "ai",
-        "chatinter",
-        "bym_ai",
-        "chat_toolkit",
-        "leekchat",
-        "multimodal_ai",
-        "zhenxun_plugin_chatinter",
-        "zhipu_toolkit",
-    }
-)
 
 
 class PreviewStore:
@@ -108,14 +97,26 @@ class PreviewStore:
         self._items.pop(key or "", None)
 
 
-def _plugin_capabilities(plugin) -> list[str]:
+def _plugin_capabilities(
+    plugin, runtime_module: str | None = None, root: Path | None = None
+) -> list[str]:
+    """商店插件的能力标记：目录声明，以及已安装时插件自身声明或按源码识别的能力
+
+    参数:
+        plugin: 商店插件信息
+        runtime_module: 已安装插件的运行时模块名
+        root: 已安装插件的包目录或模块文件
+
+    返回:
+        list[str]: 能力标记
+    """
     capabilities = {
         str(item).strip()
-        for item in getattr(plugin, "capabilities", [])
+        for item in getattr(plugin, "capabilities", None) or []
         if str(item).strip()
     }
-    if plugin.module in _AI_CHAT_PLUGIN_MODULES:
-        capabilities.add("ai_chat")
+    if runtime_module:
+        capabilities |= plugin_capabilities(runtime_module, root)
     return sorted(capabilities)
 
 
@@ -509,6 +510,13 @@ async def _(
                     install_state=state,
                     update_available=update_available,
                     parked=plugin_host.is_parked(runtime_module),
+                    capabilities=_plugin_capabilities(
+                        plugin,
+                        runtime_module,
+                        StoreManager._resolve_local_plugin_path(plugin)
+                        if exists
+                        else None,
+                    ),
                     **plugin_host.classification_for(runtime_module),
                 )
             plugin_list.append(item)

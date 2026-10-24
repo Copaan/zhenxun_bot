@@ -29,8 +29,7 @@ from zhenxun.services.ai.core.templates import PromptTemplate
 from zhenxun.services.ai.flow.core.base import BaseRunnable
 from zhenxun.services.ai.flow.core.models import InterventionPolicy
 from zhenxun.services.ai.guardrails import GuardrailSource, parse_guardrails
-from zhenxun.services.ai.llm.builder import IntentBuilder
-from zhenxun.services.ai.llm.manager import resolve_model_capabilities
+from zhenxun.services.ai.llm.manager import resolve_model_profile
 from zhenxun.services.ai.message_builder import MessageBuilder
 from zhenxun.services.ai.run import (
     AgentRunResult,
@@ -196,13 +195,13 @@ class AgentBuilder(Generic[AgentDepsT, OutputDataT]):
         return self
 
     def with_generation_config(
-        self, config: GenerationConfig | IntentBuilder | dict
+        self, config: GenerationConfig | dict
     ) -> "AgentBuilder[AgentDepsT, OutputDataT]":
         """
         配置大模型基础生成参数。
 
         参数:
-            config: 默认生成配置，支持 `GenerationConfig`、`IntentBuilder` 或 dict。
+            config: 默认生成配置，支持 `GenerationConfig` 或 dict。
         """
         self._kwargs["generation_config"] = config
         return self
@@ -342,7 +341,7 @@ class Agent(
         model: str | Callable[[], str] | None = None,
         tools: Sequence[ToolSource] | None = None,
         skills: Sequence[str | Path | Skill | SkillSource] | None = None,
-        generation_config: GenerationConfig | IntentBuilder | dict | None = None,
+        generation_config: GenerationConfig | dict | None = None,
         response_model: BaseOutputDefinition | type[OutputDataT] | None = None,
         memory: bool | MemoryConfig | MemoryBuilder = False,
         knowledge: BaseKnowledge | list[BaseKnowledge] | None = None,
@@ -363,7 +362,7 @@ class Agent(
             model: 默认模型名称 (如 Provider/Model) 或返回模型名的回调。
             tools: 初始工具定义列表，支持混合使用工具对象与字符串工具名。
             skills: 注入的领域知识技能，支持 ID、目录 Path、Skill 对象或动态源。
-            generation_config: 默认生成配置，支持 GenerationConfig、IntentBuilder 或 dict。
+            generation_config: 默认生成配置，支持 GenerationConfig 或 dict。
             response_model: 结构化输出模型，若为空则按纯文本输出。
             memory: 是否开启短期记忆与上下文压缩，支持布尔值或 MemoryBuilder/Config。
             knowledge: 挂载的知识库，支持单个或列表，底层自动将其注册入工具链。
@@ -372,7 +371,7 @@ class Agent(
             capabilities: 拦截器/能力插件列表，处理整个生命周期的切面逻辑。
             executor: 核心思考大循环的执行策略。
             directive_handlers: 自定义大模型工具控制流指令处理器字典。
-        """  # noqa: E501
+        """
         self.name = name
 
         if description:
@@ -390,9 +389,6 @@ class Agent(
         self.tool_names = [t for t in (tools or []) if isinstance(t, str)]
         self.response_model = response_model
         self.directive_handlers = directive_handlers or {}
-        if isinstance(generation_config, IntentBuilder):
-            generation_config = generation_config.build()
-
         if isinstance(generation_config, dict):
             base_config = parse_as(GenerationConfig, generation_config)
         else:
@@ -407,7 +403,6 @@ class Agent(
             self._raw_response_schema = base_config.output.response_schema
             base_config.output.response_schema = None
             base_config.output.response_format = None
-            base_config.output.structured_output_strategy = None
 
         self.default_config = base_config
         self._resolved_tools: dict[str, Any] | None = None
@@ -702,9 +697,7 @@ class Agent(
                 self.model_name() if callable(self.model_name) else self.model_name
             )
 
-        resources.model_capabilities = await resolve_model_capabilities(
-            context.run.current_model
-        )
+        resources.model_profile = resolve_model_profile(context.run.current_model)
 
         return state, resources
 
@@ -778,7 +771,7 @@ class Agent(
         messages_for_run = (
             await memory_context.read(
                 model_name=context.run.current_model or "",
-                capabilities=resources.model_capabilities,
+                profile=resources.model_profile,
                 override_history=resources.config.message_history,
                 base_overhead=base_overhead,
             )

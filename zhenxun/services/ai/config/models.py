@@ -1,6 +1,32 @@
-from pydantic import BaseModel, Field
+import re
+from typing import Any
 
-from zhenxun.services.ai.core.models import ModelDetail
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+from .presets import PRESETS, PROTOCOLS, preset_base_url
+
+_PLACEHOLDER_KEYS = {"change_me", "changeme", "replace_me"}
+
+
+def is_placeholder_key(value: Any) -> bool:
+    """判断 API Key 是否为空值或示例占位符
+
+    参数:
+        value: 密钥
+
+    返回:
+        bool: 是否为空值或 YOUR_API_KEY、AIzaSy****、${KEY}、<KEY> 一类占位符
+    """
+    text = str(value or "").strip()
+    folded = text.casefold()
+    return bool(
+        not text
+        or folded in _PLACEHOLDER_KEYS
+        or folded.startswith("your_")
+        or "****" in text
+        or re.fullmatch(r"\$\{[^{}]+\}", text)
+        or re.fullmatch(r"<[^<>]+>", text)
+    )
 
 
 class DebugLogOptions(BaseModel):
@@ -18,16 +44,22 @@ class DebugLogOptions(BaseModel):
 
 
 class ClientSettings(BaseModel):
-    """LLM 客户端底层网络与重试设置"""
+    """LLM 客户端重试、冷却与能力库设置"""
 
-    timeout: int = Field(default=300, ge=1)
-    """API 请求超时时间 (秒)"""
     max_retries: int = Field(default=3, ge=0)
-    """请求失败时的最大重试次数"""
+    """同一线路上可重试错误的最大重试次数"""
     retry_delay: int = Field(default=2, ge=0)
     """请求重试的基础延迟时间 (秒)"""
     structured_retries: int = Field(default=2, ge=0)
-    """结构化生成校验失败时的最大重试次数 (IVR)"""
+    """结构化生成校验失败时的最大重试次数"""
+    rate_limit_cooldown: int = Field(default=60, ge=0)
+    """触发限流且服务端未给出 Retry-After 时，密钥的冷却时间 (秒)"""
+    quota_cooldown: int = Field(default=3600, ge=0)
+    """额度耗尽时密钥的冷却时间 (秒)"""
+    route_cooldown: int = Field(default=60, ge=0)
+    """线路连续失败后熔断的冷却时间 (秒)"""
+    catalog_url: str = "https://models.dev/api.json"
+    """模型能力库 (models.dev 格式) 的下载地址"""
 
 
 class LLMSummaryConfig(BaseModel):
@@ -39,7 +71,7 @@ class LLMSummaryConfig(BaseModel):
     """触发压缩的 Token 阈值。<=1.0 为比例，>1.0 为绝对 Token 数"""
     max_history_turns: int = Field(default=0, ge=0)
     """触发压缩的最大历史对话轮数。设为 0 表示不限制轮数（仅受 Token 阈值控制）。"""
-    summarization_model: str | None = "DeepSeek/deepseek-v4-flash"
+    summarization_model: str | None = None
     """指定用于执行总结任务的大模型名称，为空则使用全局默认"""
     summarization_prompt: str = (
         "请以客观、精炼的语言概括以下对话内容。重点保留："
@@ -78,43 +110,81 @@ class ContextManagementSettings(BaseModel):
     """工具结果过载修剪策略"""
 
 
-class GeminiProviderSettings(BaseModel):
-    """Gemini 厂商专属高级配置"""
+class ModelConfig(BaseModel):
+    """提供商下的单个模型配置"""
 
-    safety_threshold: str = Field(default="BLOCK_NONE")
-    """Gemini 安全过滤阈值 (BLOCK_LOW_AND_ABOVE, BLOCK_MEDIUM_AND_ABOVE,
-    BLOCK_ONLY_HIGH, BLOCK_NONE)"""
-
-    allow_mixed_tools: bool = Field(default=False)
-    """是否允许同时混合使用本地自定义工具和厂商云端内置工具"""
-
-
-class ProviderSettingsGroup(BaseModel):
-    """按厂商划分的高级专属设置组"""
-
-    gemini: GeminiProviderSettings = Field(default_factory=GeminiProviderSettings)
-    """Gemini 相关专属配置"""
+    name: str
+    """模型名称 (请求时发送给服务端的 model)"""
+    enabled: bool = True
+    """是否启用"""
+    protocol: str | None = None
+    """覆盖提供商的接口协议"""
+    base_url: str | None = None
+    """覆盖提供商的接口地址"""
+    reference: str | None = None
+    """能力参照：按此模型名称查询能力库，用于中转站自定义的模型别名"""
+    profile: dict[str, Any] = Field(default_factory=dict)
+    """手动指定的能力档案字段，优先级最高"""
+    params: dict[str, Any] = Field(default_factory=dict)
+    """默认生成参数，通用参数名之外的键原样合并进请求体"""
 
 
 class ProviderConfig(BaseModel):
-    """LLM 服务提供商 (接口方) 配置模型"""
+    """LLM 服务提供商配置"""
 
     name: str
     """提供商唯一标识名称"""
-    api_key: str | list[str]
-    """API 密钥或密钥列表 (支持轮询)"""
-    api_base: str | None = None
-    """API 基础 URL 路径"""
-    api_type: str = "openai"
-    """API 协议类型 (openai/gemini/zhipu/etc.)"""
-    temperature: float | None = None
-    """该提供商下模型的默认温度"""
-    max_output_tokens: int | None = None
-    """该提供商下模型的默认最大输出限制"""
-    models: list[ModelDetail]
-    """该提供商提供的具体模型列表"""
-    timeout: int = Field(default=180, ge=1)
-    """针对该提供商的特定超时时间"""
+    preset: str | None = None
+    """厂商预设，用于补全默认协议、地址和推理参数写法"""
+    protocol: str = ""
+    """接口协议：openai_chat / openai_responses / anthropic / gemini"""
+    base_url: str = ""
+    """接口地址，与对应协议官方 SDK 的 base_url 一致"""
+    api_keys: list[str] = Field(default_factory=list)
+    """API 密钥列表，多个密钥轮询使用"""
+    headers: dict[str, str] = Field(default_factory=dict)
+    """附加请求头"""
+    params: dict[str, Any] = Field(default_factory=dict)
+    """提供商级默认生成参数，优先级低于模型参数"""
+    timeout: int = Field(default=120, ge=1)
+    """请求超时时间 (秒)"""
+    models: list[ModelConfig] = Field(default_factory=list)
+    """提供的模型列表"""
+
+    @field_validator("api_keys", mode="before")
+    @classmethod
+    def _keys_as_list(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            value = [value]
+        if isinstance(value, list):
+            return [str(key).strip() for key in value if not is_placeholder_key(key)]
+        return value
+
+    @field_validator("models", mode="before")
+    @classmethod
+    def _models_from_names(cls, value: Any) -> Any:
+        if isinstance(value, list):
+            return [{"name": item} if isinstance(item, str) else item for item in value]
+        return value
+
+    @model_validator(mode="after")
+    def _apply_preset(self) -> "ProviderConfig":
+        if self.preset and self.preset not in PRESETS:
+            raise ValueError(f"未知的厂商预设: {self.preset}")
+        preset = PRESETS.get(self.preset or "")
+        if not self.protocol:
+            self.protocol = preset["protocol"] if preset else "openai_chat"
+        if not self.base_url:
+            self.base_url = preset_base_url(self.preset, self.protocol) or ""
+        self.base_url = self.base_url.rstrip("/")
+        for protocol in (self.protocol, *(m.protocol for m in self.models)):
+            if protocol and protocol not in PROTOCOLS:
+                raise ValueError(f"未知的接口协议: {protocol}")
+        return self
+
+    def get_model(self, name: str) -> ModelConfig | None:
+        """按名称查找模型配置"""
+        return next((m for m in self.models if m.name == name), None)
 
 
 class DefaultModelsConfig(BaseModel):
@@ -125,6 +195,41 @@ class DefaultModelsConfig(BaseModel):
     tts: str | None = None
     image: str | None = None
     rerank: str | None = None
+    vision: str | None = None
+    """视觉模型：对话模型不支持图片时，先用它把图片转为文字描述"""
+
+
+WEB_SEARCH_PROVIDERS = ("deepseek", "kimi", "glm", "jina", "tavily", "bocha")
+"""可用的搜索接口"""
+
+
+class WebSearchSettings(BaseModel):
+    """联网搜索设置"""
+
+    mode: str = "auto"
+    """auto: 模型支持原生联网时用原生，否则用搜索接口；
+    native: 只用原生联网；api: 只用搜索接口；off: 关闭"""
+    provider: str | None = None
+    """搜索接口：deepseek / kimi / glm / jina / tavily / bocha"""
+    api_key: str | None = None
+    """搜索接口密钥，为空时复用同厂商服务商的密钥"""
+    max_results: int = Field(default=5, ge=1, le=20)
+    """每次搜索返回的结果数"""
+
+    @field_validator("mode")
+    @classmethod
+    def _check_mode(cls, value: str) -> str:
+        if value not in ("auto", "native", "api", "off"):
+            raise ValueError(f"未知的联网方式: {value}")
+        return value
+
+    @field_validator("provider")
+    @classmethod
+    def _check_provider(cls, value: str | None) -> str | None:
+        value = (value or "").strip() or None
+        if value and value not in WEB_SEARCH_PROVIDERS:
+            raise ValueError(f"未知的搜索接口: {value}")
+        return value
 
 
 class AgentEngineSettings(BaseModel):
@@ -183,22 +288,14 @@ class LLMConfig(BaseModel):
     """Agent 执行引擎层核心默认参数配置"""
     sandbox: SandboxSettings = Field(default_factory=SandboxSettings)
     """沙箱基础设施环境相关配置"""
-    provider_settings: ProviderSettingsGroup = Field(
-        default_factory=ProviderSettingsGroup
-    )
-    """按厂商划分的专属高级全局开关与策略"""
+    web_search: WebSearchSettings = Field(default_factory=WebSearchSettings)
+    """联网搜索设置"""
 
     def validate_model_name(self, provider_model_name: str) -> bool:
         """验证模型名称在当前配置中是否存在"""
         if "/" not in provider_model_name:
             return provider_model_name.strip() in self.model_groups
-        if not provider_model_name or "/" not in provider_model_name:
-            return False
-        parts = provider_model_name.split("/", 1)
-        p_name, m_name = parts[0], parts[1]
-        for p in self.providers:
-            if p.name == p_name:
-                for m in p.models:
-                    if m.model_name == m_name:
-                        return True
-        return False
+        p_name, m_name = provider_model_name.split("/", 1)
+        return any(
+            p.name == p_name and p.get_model(m_name) is not None for p in self.providers
+        )

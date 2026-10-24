@@ -1,4 +1,4 @@
-"""WebUI HTTPS 开启时的 HTTP 兼容入口：跳转到 HTTPS 或以明文提供完整 WebUI"""
+"""WebUI HTTPS 开启时的 HTTP 兼容入口：跳转到 HTTPS 或以明文提供 WebUI"""
 
 from __future__ import annotations
 
@@ -10,9 +10,11 @@ import socket
 import sys
 from typing import Any
 
+from starlette.routing import Mount
 import uvicorn
 
 from zhenxun.services.log import logger
+from zhenxun.services.webui_transport import SERVER_OPTIONS
 
 RETRY_DELAYS = (1.0, 2.0, 5.0, 15.0, 30.0)
 _ERROR_CODES = (
@@ -20,6 +22,9 @@ _ERROR_CODES = (
     ({errno.EADDRNOTAVAIL, 10049}, "address_unavailable"),
     ({errno.EACCES, errno.EPERM, 10013}, "permission_denied"),
 )
+_WEBUI_PATHS = {"/", "/version.json", "/favicon.ico"}
+_WEBUI_PREFIXES = ("/zhenxun/api/", "/zhenxun/socket/")
+_RETRY_KEYS = ("error_code", "errno", "retry_count", "retry_in_seconds")
 
 _state: dict[str, Any] = {"mode": "disabled", "port": None, "state": "disabled"}
 
@@ -57,7 +62,7 @@ def redirect_hostname(raw_host: str) -> str:
     if separator and port.isdigit() and ":" not in hostname:
         value = hostname
     try:
-        return str(ipaddress.ip_address(value))
+        address = ipaddress.ip_address(value)
     except ValueError:
         labels = value.rstrip(".").split(".")
         valid = value == "localhost" or all(
@@ -69,6 +74,7 @@ def redirect_hostname(raw_host: str) -> str:
             for label in labels
         )
         return value.rstrip(".") if valid else "localhost"
+    return f"[{address.compressed}]" if address.version == 6 else str(address)
 
 
 def redirect_app(https_port: int):
@@ -109,6 +115,48 @@ def redirect_app(https_port: int):
     return app
 
 
+def webui_only_app(app):
+    """生成只放行 WebUI 页面、静态资源、接口与 WebSocket 的 ASGI 应用
+
+    参数:
+        app: 完整的 NoneBot ASGI 应用
+
+    返回:
+        ASGI 应用，其余路径 HTTP 返回 404，WebSocket 直接拒绝
+    """
+    static = tuple(
+        f"{route.path}/"
+        for route in app.routes
+        if isinstance(route, Mount) and (route.name or "").startswith("public_")
+    )
+    prefixes = _WEBUI_PREFIXES + static
+
+    async def guarded(scope, receive, send) -> None:
+        path = scope.get("path", "")
+        if (
+            scope["type"] not in {"http", "websocket"}
+            or path in _WEBUI_PATHS
+            or path.startswith(prefixes)
+        ):
+            await app(scope, receive, send)
+        elif scope["type"] == "websocket":
+            await send({"type": "websocket.close", "code": 1008})
+        else:
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 404,
+                    "headers": [
+                        (b"content-type", b"text/plain; charset=utf-8"),
+                        (b"content-length", b"9"),
+                    ],
+                }
+            )
+            await send({"type": "http.response.body", "body": b"Not Found"})
+
+    return guarded
+
+
 class _CompatServer(uvicorn.Server):
     """不接管进程信号的 uvicorn 实例，随 worker 主服务一起关闭"""
 
@@ -140,6 +188,23 @@ def _error_code(error: OSError) -> str:
     )
 
 
+def _degrade(error_code: str, number: int | None, retry_count: int) -> None:
+    """记录降级原因与下一次重试的等待时间
+
+    参数:
+        error_code: 错误码
+        number: 系统错误号
+        retry_count: 已重试次数
+    """
+    _state.update(
+        state="degraded",
+        error_code=error_code,
+        errno=number,
+        retry_count=retry_count + 1,
+        retry_in_seconds=RETRY_DELAYS[min(retry_count, len(RETRY_DELAYS) - 1)],
+    )
+
+
 class WebUIHttpCompat:
     """管理 HTTP 兼容入口的监听、降级重试与关闭"""
 
@@ -153,7 +218,7 @@ class WebUIHttpCompat:
 
         参数:
             context: 生命周期组件上下文
-            app: WebUI 的 ASGI 应用（serve 模式使用）
+            app: NoneBot 的 ASGI 应用，serve 模式只放行其中的 WebUI 路由
             settings: 当前生效的 WebUI TLS 设置
         """
         mode = settings.effective_http_mode
@@ -162,32 +227,37 @@ class WebUIHttpCompat:
         if mode == "disabled":
             return
         _state.update(port=settings.redirect_port, state="starting")
+        if settings.redirect_port == settings.port:
+            _state.update(state="degraded", error_code="port_conflict")
+            logger.warning(
+                f"HTTP 兼容端口 {settings.redirect_port} 与 WebUI 端口相同，"
+                "兼容入口未启动，HTTPS 不受影响",
+                "WebUi",
+            )
+            return
         self._stopping = False
         config = uvicorn.Config(
-            app if mode == "serve" else redirect_app(settings.port),
+            webui_only_app(app) if mode == "serve" else redirect_app(settings.port),
             lifespan="off",
             log_config=None,
-            access_log=False,
             timeout_graceful_shutdown=3,
+            **SERVER_OPTIONS,
         )
         sock = self._try_bind(settings, 0)
         self._task = context.spawn_task(
             self._run(config, settings, sock),
             name="webui-http-compat",
-            cancel=self._request_stop,
+            cancel=self.stop,
         )
 
     def _try_bind(self, settings, retry_count: int) -> socket.socket | None:
         try:
             sock = _bind(settings.host, settings.redirect_port)
         except OSError as error:
-            delay = RETRY_DELAYS[min(retry_count, len(RETRY_DELAYS) - 1)]
-            _state.update(
-                state="degraded",
-                error_code=_error_code(error),
-                errno=getattr(error, "winerror", None) or error.errno,
-                retry_count=retry_count + 1,
-                retry_in_seconds=delay,
+            _degrade(
+                _error_code(error),
+                getattr(error, "winerror", None) or error.errno,
+                retry_count,
             )
             if retry_count == 0:
                 logger.warning(
@@ -196,42 +266,53 @@ class WebUIHttpCompat:
                     "WebUi",
                 )
             return None
-        for key in ("error_code", "errno", "retry_count", "retry_in_seconds"):
+        for key in _RETRY_KEYS:
             _state.pop(key, None)
         _state["state"] = "ready"
         return sock
 
     async def _run(self, config, settings, sock: socket.socket | None) -> None:
         retry_count = 0
-        while not self._stopping:
-            if sock is None:
-                await asyncio.sleep(_state.get("retry_in_seconds") or 1.0)
-                if self._stopping:
-                    break
-                retry_count += 1
-                sock = self._try_bind(settings, retry_count)
+        try:
+            while not self._stopping:
                 if sock is None:
-                    continue
-                logger.info("HTTP 兼容入口已恢复监听", "WebUi")
-            retry_count = 0
-            self._server = _CompatServer(config)
-            try:
-                await self._server.serve(sockets=[sock])
-            finally:
-                self._server = None
-                with suppress(OSError):
-                    sock.close()
-                sock = None
-        _state["state"] = "stopped"
+                    await asyncio.sleep(_state.get("retry_in_seconds") or 1.0)
+                    if self._stopping:
+                        break
+                    retry_count += 1
+                    sock = self._try_bind(settings, retry_count)
+                    if sock is None:
+                        continue
+                    logger.info("HTTP 兼容入口已恢复监听", "WebUi")
+                retry_count = 0
+                self._server = _CompatServer(config)
+                try:
+                    await self._server.serve(sockets=[sock])
+                except Exception as error:
+                    _degrade("listener_failed", None, retry_count)
+                    logger.warning(
+                        "HTTP 兼容入口异常退出，HTTPS 不受影响，将自动重试",
+                        "WebUi",
+                        e=error,
+                    )
+                finally:
+                    self._server = None
+                    with suppress(OSError):
+                        sock.close()
+                    sock = None
+        finally:
+            _state["state"] = "stopped"
 
-    def _request_stop(self) -> None:
+    def stop(self) -> None:
+        """停止 HTTP 兼容入口：正在监听时优雅关闭，等待重试时直接取消"""
         self._stopping = True
         if self._server is not None:
             self._server.should_exit = True
-        elif self._task is not None:
+        elif self._task is not None and not self._task.done():
             self._task.cancel()
+            _state["state"] = "stopped"
 
 
 webui_http_compat = WebUIHttpCompat()
 
-__all__ = ["http_compat_state", "redirect_app", "webui_http_compat"]
+__all__ = ["http_compat_state", "redirect_app", "webui_http_compat", "webui_only_app"]

@@ -377,6 +377,10 @@ class InvalidRequestException(LLMException):
 
 class ContextLengthExceededException(LLMException):
     @property
+    def should_failover(self) -> bool:
+        return True
+
+    @property
     def user_friendly_message(self) -> str:
         return "输入内容过长，请缩短后重试。"
 
@@ -389,6 +393,10 @@ class ContentFilteredException(LLMException):
 
 class ConfigurationException(LLMException):
     @property
+    def should_failover(self) -> bool:
+        return True
+
+    @property
     def user_friendly_message(self) -> str:
         return "AI模型配置错误或未找到，请联系管理员检查配置。"
 
@@ -399,13 +407,31 @@ class AuthenticationException(LLMException):
         return True
 
     @property
+    def should_failover(self) -> bool:
+        return True
+
+    @property
     def user_friendly_message(self) -> str:
         return "API密钥无效或权限不足，请联系管理员更新配置。"
+
+
+class PermissionDeniedException(LLMException):
+    @property
+    def should_failover(self) -> bool:
+        return True
+
+    @property
+    def user_friendly_message(self) -> str:
+        return "当前密钥无权访问该模型或接口，请联系管理员检查配置。"
 
 
 class QuotaExceededException(LLMException):
     @property
     def should_rotate_key(self) -> bool:
+        return True
+
+    @property
+    def should_failover(self) -> bool:
         return True
 
     @property
@@ -436,6 +462,10 @@ class RateLimitException(LLMException):
         return True
 
     @property
+    def should_failover(self) -> bool:
+        return True
+
+    @property
     def user_friendly_message(self) -> str:
         return "请求过于频繁，已被AI服务限流，请稍后再试。"
 
@@ -443,11 +473,11 @@ class RateLimitException(LLMException):
 class UpstreamServerException(LLMException):
     @property
     def is_retryable(self) -> bool:
-        return not self.details.get("network_attempt_complete", False)
+        return True
 
     @property
     def should_failover(self) -> bool:
-        return not self.details.get("network_attempt_complete", False)
+        return True
 
     @property
     def user_friendly_message(self) -> str:
@@ -456,12 +486,8 @@ class UpstreamServerException(LLMException):
 
 class NetworkTimeoutException(LLMException):
     @property
-    def is_retryable(self) -> bool:
-        return not self.details.get("network_attempt_complete", False)
-
-    @property
     def should_failover(self) -> bool:
-        return not self.details.get("network_attempt_complete", False)
+        return True
 
     @property
     def user_friendly_message(self) -> str:
@@ -476,6 +502,30 @@ class ResponseParseException(LLMException):
     @property
     def user_friendly_message(self) -> str:
         return "AI服务响应解析失败，请稍后再试。"
+
+
+class EmptyResponseException(ResponseParseException):
+    """模型正常结束但没有返回任何内容"""
+
+    @property
+    def should_failover(self) -> bool:
+        return True
+
+    @property
+    def user_friendly_message(self) -> str:
+        return "AI服务返回了空回复，请稍后再试。"
+
+
+class NoImageException(ResponseParseException):
+    """生图请求的响应中没有图片，重试会再次计费，不在原线路重试"""
+
+    @property
+    def is_retryable(self) -> bool:
+        return False
+
+    @property
+    def user_friendly_message(self) -> str:
+        return "模型没有生成图片，请调整描述后再试。"
 
 
 def get_user_friendly_error_message(error: Exception) -> str:

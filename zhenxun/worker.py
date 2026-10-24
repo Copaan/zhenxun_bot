@@ -13,11 +13,6 @@ import time
 
 from zhenxun.configs.environment import sync_env_missing_items
 
-GRACEFUL_SHUTDOWN_TIMEOUT = 15
-WORKER_CONNECTION_LIMIT = 512
-WORKER_BACKLOG = 2048
-WORKER_KEEP_ALIVE_TIMEOUT = 15
-
 
 class WorkerReexec(Exception):
     pass
@@ -299,6 +294,8 @@ def run_worker(project_root: Path) -> None:
         else {}
     )
     from zhenxun.services.webui_transport import (
+        GRACEFUL_SHUTDOWN_TIMEOUT,
+        SERVER_OPTIONS,
         install_uvicorn_shutdown_hook,
         install_websocket_drain_lock,
     )
@@ -325,12 +322,8 @@ def run_worker(project_root: Path) -> None:
         install_runtime_worker_teardown(nonebot.get_app())
         nonebot.run(
             workers=1,
-            access_log=False,
-            ws_per_message_deflate=False,
-            limit_concurrency=WORKER_CONNECTION_LIMIT,
-            backlog=WORKER_BACKLOG,
-            timeout_keep_alive=WORKER_KEEP_ALIVE_TIMEOUT,
             timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_TIMEOUT,
+            **SERVER_OPTIONS,
             **tls_options,
         )
     finally:

@@ -68,6 +68,15 @@ class UrlContextTool(ServerSideTool):
         super().__init__(name="url_context", description="从指定 URL 获取上下文信息。")
 
 
+class ImageGenerationTool(ServerSideTool):
+    """原生图片生成工具"""
+
+    type_id = "image_generation"
+
+    def __init__(self):
+        super().__init__(name="image_generation", description="根据描述生成图片。")
+
+
 class Native:
     """
     云端原生工具命名空间工厂 (Namespace Factory)。
@@ -127,3 +136,12 @@ class Native:
         原生 URL 上下文拉取工具。
         """
         return UrlContextTool()
+
+    @classmethod
+    def image_generation(cls) -> ImageGenerationTool:
+        """原生图片生成工具 (如 OpenAI Responses image_generation)
+
+        返回:
+            ImageGenerationTool: 图片生成工具
+        """
+        return ImageGenerationTool()

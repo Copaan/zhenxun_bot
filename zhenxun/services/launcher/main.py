@@ -439,8 +439,13 @@ def run_launcher(cwd: Path) -> None:
     参数:
         cwd: 项目目录
     """
+    from zhenxun.configs.webui_tls import WebUITLSConfigError
+
     try:
         asyncio.run(_launcher_entry(cwd))
+    except WebUITLSConfigError as error:
+        launcher_log(f"WebUI HTTPS 配置无效：{error}，请检查 .env.dev 的 WEBUI_* 配置")
+        raise SystemExit(1) from None
     except (asyncio.CancelledError, OSError) as error:
         if launcher_supervisor.shutdown_signal is not None:
             launcher_log(

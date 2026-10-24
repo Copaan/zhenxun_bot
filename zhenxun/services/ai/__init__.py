@@ -8,7 +8,6 @@ from typing import Any
 _EXPORTS: dict[str, tuple[str, str]] = {
     "Agent": ("zhenxun.services.ai.flow", "Agent"),
     "Inject": ("zhenxun.services.ai.run", "Inject"),
-    "IntentBuilder": ("zhenxun.services.ai.llm", "IntentBuilder"),
     "LLMMessage": ("zhenxun.services.ai.core.messages", "LLMMessage"),
     "Rules": ("zhenxun.services.ai.tools", "Rules"),
     "RunContext": ("zhenxun.services.ai.run", "RunContext"),

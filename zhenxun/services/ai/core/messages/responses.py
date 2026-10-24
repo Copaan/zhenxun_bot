@@ -14,7 +14,6 @@ from .parts import (
     TextPart,
     ThoughtPart,
     ToolCallPart,
-    ToolReturnPart,
 )
 from .shared import RerankResult, UsageInfo
 
@@ -75,15 +74,6 @@ class ChatResponse(BaseModel):
             p.thought_text for p in self.content_parts if isinstance(p, ThoughtPart)
         ]
         return "\n".join(thoughts).strip() if thoughts else None
-
-    @property
-    def thought_signature(self) -> str | None:
-        """动态视图：获取当前响应中的思考指纹"""
-        for p in reversed(self.content_parts):
-            if isinstance(p, ThoughtPart | ToolCallPart | ToolReturnPart):
-                if p.metadata and "thought_signature" in p.metadata:
-                    return p.metadata["thought_signature"]
-        return None
 
     @property
     def images(self) -> list[bytes | Path | str]:

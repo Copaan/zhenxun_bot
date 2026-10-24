@@ -33,7 +33,9 @@ class WebUITLSSettings:
     def effective_http_mode(self) -> str:
         if not self.enabled:
             return "disabled"
-        return self.http_mode or "redirect"
+        if self.http_mode is None:
+            return "redirect" if self.redirect_enabled else "disabled"
+        return self.http_mode
 
     @property
     def http_compat_enabled(self) -> bool:
@@ -55,9 +57,9 @@ def _port(value: Any, field: str, default: int) -> int:
 
 
 def _http_mode(values: dict[str, Any]) -> str | None:
-    if "WEBUI_HTTP_MODE" not in values:
-        return None
     mode = str(values.get("WEBUI_HTTP_MODE") or "").strip().casefold()
+    if not mode:
+        return None
     if mode not in {"serve", "redirect", "disabled"}:
         raise WebUITLSConfigError("WEBUI_HTTP_MODE 必须是 serve、redirect 或 disabled")
     return mode
@@ -131,17 +133,33 @@ def validate_webui_tls_settings(
     *,
     qq_https_port: int | None = None,
 ) -> None:
-    if (
-        settings.http_mode is None
-        and settings.redirect_enabled
-        and not settings.enabled
-    ):
-        raise WebUITLSConfigError("启用 HTTP 重定向前必须先启用 WebUI HTTPS")
     if settings.enabled:
         _validate_certificate(settings.certfile, settings.keyfile)
     occupied = {port for port in (qq_https_port,) if port is not None}
     if settings.enabled and settings.port in occupied:
         raise WebUITLSConfigError("WebUI HTTPS 端口与 QQ Webhook HTTPS 端口冲突")
+
+
+def validate_http_compat_port(
+    settings: WebUITLSSettings,
+    *,
+    qq_https_port: int | None = None,
+) -> None:
+    """校验 HTTP 兼容端口不与 WebUI 端口或 QQ Webhook HTTPS 端口冲突
+
+    参数:
+        settings: WebUI TLS 设置
+        qq_https_port: 内置 QQ Webhook HTTPS 监听端口，未启用时为 None
+
+    异常:
+        WebUITLSConfigError: 端口冲突
+    """
+    if not settings.http_compat_enabled:
+        return
+    if settings.redirect_port == settings.port:
+        raise WebUITLSConfigError("HTTP 兼容端口不能与 WebUI 端口相同")
+    if settings.redirect_port == qq_https_port:
+        raise WebUITLSConfigError("HTTP 兼容端口与 QQ Webhook HTTPS 端口冲突")
 
 
 _runtime_settings: WebUITLSSettings | None = None
@@ -178,5 +196,6 @@ __all__ = [
     "current_webui_scheme",
     "load_webui_tls_settings",
     "settings_from_values",
+    "validate_http_compat_port",
     "validate_webui_tls_settings",
 ]

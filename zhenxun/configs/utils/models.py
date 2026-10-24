@@ -308,6 +308,8 @@ class PluginExtraData(BaseModel):
     """插件明确支持的平台作用域；未声明时沿用兼容行为"""
     required_platform_capabilities: set[str] = Field(default_factory=set)
     """插件运行所需的平台能力"""
+    capabilities: set[str] = Field(default_factory=set)
+    """插件自身提供的能力标记，ai_chat 表示 AI 聊天插件"""
 
     def to_dict(self, **kwargs):
         return model_dump(self, **kwargs)

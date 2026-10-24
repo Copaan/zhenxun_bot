@@ -15,6 +15,11 @@ _EXPORTS = {
     ),
     "tool": ("zhenxun.services.ai.tools.core.decorators", "tool"),
     "toolkit": ("zhenxun.services.ai.tools.core.decorators", "toolkit"),
+    "WebSearchToolkit": (
+        "zhenxun.services.ai.tools.providers.builtin.web",
+        "WebSearchToolkit",
+    ),
+    "web_tools": ("zhenxun.services.ai.tools.providers.builtin.web", "web_tools"),
 }
 
 __all__ = list(_EXPORTS)

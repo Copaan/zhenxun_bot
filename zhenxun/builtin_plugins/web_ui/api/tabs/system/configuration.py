@@ -23,6 +23,7 @@ from zhenxun.configs.environment import environment_file, environment_target
 from zhenxun.configs.webui_tls import (
     WebUITLSConfigError,
     settings_from_values,
+    validate_http_compat_port,
     validate_webui_tls_settings,
 )
 from zhenxun.services.log import logger
@@ -81,7 +82,8 @@ _ENV_TEMPLATE = Path(".env.example")
 _SIMPLE_FILE = Path("data/config.yaml")
 _ENV_KEY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _DELETE = object()
-_MANAGED_HELP = "历史首次导入值；当前开关以数据库插件策略为准。请在插件策略页面修改。"
+_PAGE_GROUPS = {"ai", "web-ui"}
+_HIDDEN_ENV_CATEGORIES = {"adapters", "legacy", "plugins", "storage"}
 
 
 class CustomEnvOperation(BaseModel):
@@ -118,18 +120,20 @@ def _validate_env(content: str) -> None:
         qq_port = int(values.get("QQ_WEBHOOK_LISTEN_PORT") or 443)
     except (TypeError, ValueError):
         qq_port = 443
+    qq_https_port = qq_port if qq_enabled and qq_builtin else None
+    path = "WEBUI_HTTPS_ENABLED"
     try:
-        validate_webui_tls_settings(
-            settings_from_values(values),
-            qq_https_port=qq_port if qq_enabled and qq_builtin else None,
-        )
+        settings = settings_from_values(values)
+        validate_webui_tls_settings(settings, qq_https_port=qq_https_port)
+        path = "WEBUI_HTTP_REDIRECT_PORT"
+        validate_http_compat_port(settings, qq_https_port=qq_https_port)
     except WebUITLSConfigError as error:
         raise ConfigurationValidationError(
             [
                 {
                     "code": "webui_tls_invalid",
                     "file": ".env.dev",
-                    "path": "WEBUI_HTTPS_ENABLED",
+                    "path": path,
                     "line": None,
                     "column": None,
                     "severity": "error",
@@ -201,6 +205,24 @@ def _group_owners(names: list[str]) -> tuple[list[dict[str, str]], str]:
     return owners, "plugin"
 
 
+async def _plugin_page_groups() -> set[str]:
+    """获取可在插件列表的插件详情中编辑的配置组
+
+    返回:
+        set[str]: 配置组名
+    """
+    from zhenxun.models.plugin_info import PluginInfo
+
+    from ..plugin_manage.data_source import ApiDataSource
+
+    plugins = await PluginInfo.get_plugins(load_status=True, include_parked=True)
+    return {
+        group
+        for plugin in plugins
+        for group in ApiDataSource.config_modules(plugin.module)
+    }
+
+
 def simple_config_groups(modules: set[str] | None = None) -> dict[str, Any]:
     """读取 config.yaml 的配置组与文件版本
 
@@ -215,6 +237,7 @@ def simple_config_groups(modules: set[str] | None = None) -> dict[str, Any]:
         group
         for group in _registered_groups(content)
         if (group["fields"] or not group["registered"])
+        and group["module"].casefold() not in _PAGE_GROUPS
         and (modules is None or group["module"] in modules)
     ]
     return {"groups": groups, "revision": _revision(content)}
@@ -234,18 +257,16 @@ def _registered_groups(content: str) -> list[dict[str, Any]]:
         owners, category = _group_owners(group.plugins)
         fields = []
         for key, config in group.configs.items():
-            managed = module.casefold() == "ai" and key.upper() == "CHAT_PLUGIN_ENABLED"
             fields.append(
                 {
                     "key": key,
-                    "help": _MANAGED_HELP if managed else config.help or "",
+                    "help": config.help or "",
                     "value": configuration_value(config.value),
                     "default_value": configuration_value(config.default_value),
                     "schema": config_field_schema(
                         config.type, config.value, config.default_value
                     ),
                     "ui": model_dump(config.ui, exclude_none=True) if config.ui else {},
-                    "authority": "database" if managed else "file",
                 }
             )
         fields.sort(key=lambda item: (item["ui"].get("order", 0), item["key"]))
@@ -683,6 +704,36 @@ def _update_env(content: str, fields: dict[str, Any]) -> str:
     return _rewrite_env(content, remaining)
 
 
+def _form_env_keys(registry: dict[str, dict[str, Any]]) -> set[str]:
+    """获取由配置表单或机器人接入页面管理的环境变量
+
+    插件声明的环境变量不在表单中展示，按自定义变量维护。
+
+    参数:
+        registry: 环境配置字段登记表
+
+    返回:
+        set[str]: 键名
+    """
+    return {key for key, field in registry.items() if field["category"] != "plugins"}
+
+
+def _custom_env_allowed(key: str, managed: set[str]) -> bool:
+    """判断变量能否作为自定义变量展示和修改
+
+    适配器变量即使未注册也可能包含凭据，统一由机器人接入页面或配置原文维护。
+
+    参数:
+        key: 变量名
+        managed: 由表单管理的键名
+
+    返回:
+        bool: 是否允许
+    """
+    key = key.upper()
+    return key not in managed and environment_category(key, []) != "adapters"
+
+
 def _update_custom_env(
     content: str, operations: list[CustomEnvOperation], registered: set[str]
 ) -> str:
@@ -701,7 +752,7 @@ def _update_custom_env(
         key = operation.key.strip()
         if not _ENV_KEY_PATTERN.fullmatch(key):
             raise ValueError("custom_env_key_invalid")
-        if key.upper() in registered:
+        if not _custom_env_allowed(key, registered):
             raise ValueError("custom_env_key_managed")
         if any(key.casefold() == old.casefold() for old in changes):
             raise ValueError("custom_env_key_duplicate")
@@ -738,6 +789,8 @@ def _update_simple(content: str, fields: dict[str, Any]) -> str:
     if not isinstance(data, dict):
         raise ValueError("yaml_top_level_mapping_required")
     for module, values in fields.items():
+        if str(module).casefold() in _PAGE_GROUPS:
+            raise ValueError("config_group_not_editable")
         if not isinstance(values, dict):
             raise ValueError("yaml_group_mapping_required")
         group = data.setdefault(module, {})
@@ -775,6 +828,8 @@ def _unset_fields(content: str, file: str, paths: list[list[str]]) -> str:
     for path in paths:
         if len(path) != 2:
             raise ValueError("invalid_unset_path")
+        if path[0].casefold() in _PAGE_GROUPS:
+            raise ValueError("config_group_not_editable")
         group = data.get(path[0], {})
         if isinstance(group, dict):
             key = next(
@@ -798,8 +853,9 @@ def _validation_error(file: str, error: Exception) -> HTTPException:
         "dotenv_invalid_statement": "dotenv 中存在无法解析的语句。",
         "dotenv_duplicate_key": "dotenv 中存在重复配置键。",
         "env_field_not_editable": "提交中包含不允许在此页面修改的环境配置。",
+        "config_group_not_editable": "该配置组请在 AI 配置或账号安全中修改。",
         "custom_env_key_invalid": "自定义环境变量名称不合法。",
-        "custom_env_key_managed": "该变量由系统配置表单管理，不能重复添加。",
+        "custom_env_key_managed": "该变量由配置表单或机器人接入页面管理。",
         "custom_env_key_duplicate": "自定义环境变量操作中存在重复名称。",
         "custom_env_value_required": "新增或替换环境变量时必须填写值。",
         "custom_env_raw_conflict": "高级原文与自定义变量操作不能同时提交。",
@@ -843,20 +899,30 @@ async def configuration_summary() -> Result:
         core_keys=set(KNOWN_ENV_KEYS) | set(CORE_FIELDS),
         proxy_keys=PROXY_KEYS,
     )
+    managed = _form_env_keys(registry)
     custom_env = [
         {"key": str(key), "value": value}
         for key, value in sorted(values.items(), key=lambda item: item[0].casefold())
-        if key.upper() not in registry
+        if _custom_env_allowed(key, managed)
+    ]
+    simple = simple_config_groups()
+    plugin_groups = await _plugin_page_groups()
+    simple["groups"] = [
+        group for group in simple["groups"] if group["module"] not in plugin_groups
     ]
     return Result.ok(
         {
             "env": {
-                "descriptors": list(descriptors.values()),
+                "descriptors": [
+                    field
+                    for field in descriptors.values()
+                    if field["category"] not in _HIDDEN_ENV_CATEGORIES
+                ],
                 "source_file": str(env_path),
                 "custom_env": custom_env,
                 "revision": _revision(env_content),
             },
-            "simple": simple_config_groups(),
+            "simple": simple,
             "launcher_managed": bool(os.getenv("ZHENXUN_LAUNCHER_PID")),
             "network": network_configuration_status(),
         }
@@ -920,12 +986,17 @@ def _render_update(current: str, file: str, payload: ConfigurationFileUpdate) ->
     previous = _env_values(current)
     content = payload.content
     if content is None:
-        registered = set(_environment_fields(previous))
-        if set(payload.fields or {}) - registered:
+        registry = _environment_fields(previous)
+        editable = {
+            key
+            for key, field in registry.items()
+            if field["category"] not in _HIDDEN_ENV_CATEGORIES
+        }
+        if set(payload.fields or {}) - editable:
             raise ValueError("env_field_not_editable")
         content = _update_env(current, payload.fields or {})
         content = _update_custom_env(
-            content, payload.custom_operations or [], registered
+            content, payload.custom_operations or [], _form_env_keys(registry)
         )
     content = _unset_fields(content, file, payload.unset_fields)
     _validate_env(content)

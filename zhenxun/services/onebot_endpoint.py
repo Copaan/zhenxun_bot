@@ -143,7 +143,10 @@ def reverse_ws_diagnostic(
             if not result["certificate_name_match"]
             else "tls_certificate_identity_ok"
         )
-    except (OSError, ValueError, x509.ExtensionNotFound):
+    except x509.ExtensionNotFound:
+        if host:
+            result["code"] = "tls_certificate_san_missing"
+    except (OSError, ValueError):
         pass
     return result
 

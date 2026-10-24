@@ -180,6 +180,7 @@ def block_reasons(
     forced: Collection[str] = (),
     local: Collection[str] = (),
     super_group: bool = False,
+    bot_enabled: bool = True,
 ) -> list[str]:
     """按统一顺序列出插件/被动技能不可用的原因
 
@@ -193,6 +194,7 @@ def block_reasons(
         forced: 超级管理员在当前场景禁用的模块
         local: 当前场景禁用的模块
         super_group: 当前群是否为超级群，超级群不受全局关闭影响
+        bot_enabled: 账号的全局开关是否开启
 
     返回:
         list[str]: 不可用原因，为空表示可用
@@ -201,6 +203,8 @@ def block_reasons(
     reasons = []
     if not load_status:
         reasons.append("not_loaded")
+    if not bot_enabled:
+        reasons.append("bot_disabled")
     if not status and block_type in {None, "ALL"}:
         if not (super_group and block_type == "ALL"):
             reasons.append("global_disabled")
@@ -708,6 +712,9 @@ class PluginPolicyService:
                     "policy": (
                         {"id": int(policy.id), "name": policy.name} if policy else None
                     ),
+                    "bot_enabled": record.status
+                    if (record := records.get(bot_id))
+                    else True,
                     "blocked_plugin_count": len(state["block_plugins"]),
                     "blocked_task_count": len(state["block_tasks"]),
                     "revision": state["revision"],
@@ -738,15 +745,20 @@ class PluginPolicyService:
         state = self._account_payload(bot_id, bot, binding, policy)
         catalog = catalog if catalog is not None else await self.catalog()
         plugin_modules, task_modules = self._catalog_modules(catalog)
+        bot_enabled = bool(bot.status) if bot else True
         effective = {
             kind: self.decisions(
-                catalog[kind], private=None, account=state[f"block_{kind}"]
+                catalog[kind],
+                private=None,
+                account=state[f"block_{kind}"],
+                bot_enabled=bot_enabled,
             )
             for kind in ("plugins", "tasks")
         }
         return {
             **known[bot_id],
             **state,
+            "bot_enabled": bot_enabled,
             "policy": self._policy_view(policy, [bot_id]) if policy else None,
             "missing_plugins": sorted(set(state["block_plugins"]) - plugin_modules),
             "missing_tasks": sorted(set(state["block_tasks"]) - task_modules),
@@ -765,6 +777,7 @@ class PluginPolicyService:
         local: Collection[str] = (),
         forced: Collection[str] = (),
         super_group: bool = False,
+        bot_enabled: bool = True,
     ) -> list[dict[str, Any]]:
         """计算目录中每个功能在页面上的最终状态
 
@@ -775,6 +788,7 @@ class PluginPolicyService:
             local: 群聊或私聊层禁用的模块
             forced: 超级管理员禁用的模块
             super_group: 当前群是否为超级群
+            bot_enabled: 账号的全局开关是否开启
 
         返回:
             list[dict[str, Any]]: 每个模块的本层开关、最终状态与不可用原因
@@ -793,6 +807,7 @@ class PluginPolicyService:
                 forced=forced,
                 local=local,
                 super_group=super_group,
+                bot_enabled=bot_enabled,
             )
             result.append(
                 {

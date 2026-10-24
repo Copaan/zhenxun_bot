@@ -4,6 +4,7 @@ from typing import Any, Literal
 from zhenxun import ui
 from zhenxun.services import renderer_service
 from zhenxun.services.ai.core.models import ModelModality
+from zhenxun.services.ai.llm.client import Route
 from zhenxun.ui.models import StatusBadgeCell, TextCell
 
 
@@ -34,11 +35,11 @@ class Presenters:
 
         if not models:
             table = ui.table(title=title, tip="当前没有配置任何LLM模型。").set_headers(
-                ["提供商", "模型名称", "API类型", "状态"]
+                ["提供商", "模型名称", "协议", "状态"]
             )
             return await renderer_service.render(table)
 
-        column_name = ["提供商", "模型名称", "API类型", "状态"]
+        column_name = ["提供商", "模型名称", "协议", "状态"]
         rows_data = []
         for model in models:
             is_available = model.get("is_available", True)
@@ -47,7 +48,7 @@ class Presenters:
                 [
                     TextCell(content=model.get("provider_name", "N/A")),
                     TextCell(content=f"{model.get('model_name', 'N/A')}{embed_tag}"),
-                    TextCell(content=model.get("api_type", "N/A")),
+                    TextCell(content=model.get("protocol") or "N/A"),
                     StatusBadgeCell(
                         text="可用" if is_available else "不可用",
                         status_type="ok" if is_available else "error",
@@ -66,41 +67,45 @@ class Presenters:
     @staticmethod
     async def format_model_details_as_markdown_image(details: dict[str, Any]) -> bytes:
         """将模型详情格式化为Markdown图片"""
-        provider = details["provider_config"]
-        model = details["model_detail"]
-        caps = details["capabilities"]
+        provider = details["provider"]
+        model = details["model"]
+        profile = details["profile"]
+        route = Route(provider, model, profile)
 
-        cap_list = []
-        if ModelModality.IMAGE in caps.input_modalities:
-            cap_list.append("图片")
-        if ModelModality.VIDEO in caps.input_modalities:
-            cap_list.append("视频")
-        if ModelModality.AUDIO in caps.input_modalities:
-            cap_list.append("音频")
-        if caps.supports_tool_calling:
+        modality_names = {
+            ModelModality.IMAGE: "图片",
+            ModelModality.VIDEO: "视频",
+            ModelModality.AUDIO: "音频",
+        }
+        cap_list = [
+            name
+            for modality, name in modality_names.items()
+            if modality in profile.input_modalities
+        ]
+        if profile.tools:
             cap_list.append("工具调用")
-        if caps.is_embedding_model:
-            cap_list.append("文本嵌入")
+        if profile.reasoning_levels:
+            cap_list.append(f"推理 ({'/'.join(profile.reasoning_levels)})")
 
         md = ui.markdown("")
-        md.head(f"🔎 模型详情: {provider.name}/{model.model_name}", 1)
+        md.head(f"🔎 模型详情: {route.name}", 1)
         md.text("---")
         md.head("提供商信息", 2)
         md.text(f"- **名称**: {provider.name}")
-        md.text(f"- **API 类型**: {provider.api_type}")
-        md.text(f"- **API Base**: {provider.api_base or '默认'}")
+        md.text(f"- **预设**: {provider.preset or '自定义'}")
+        md.text(f"- **协议**: {route.protocol}")
+        md.text(f"- **Base URL**: {route.base_url}")
 
         md.head("模型详情", 2)
 
-        temp_value = model.temperature or provider.temperature or "未设置"
-        input_tokens = caps.max_input_tokens
-        context_window = (
-            f"{int(input_tokens / 1000)}K"
-            if input_tokens >= 1000
-            else str(input_tokens)
-        )
+        params = route.generation_config(None).common
+        temp_value = params.temperature if params.temperature is not None else "未设置"
+        tokens = profile.context_window
+        context_window = f"{tokens // 1000}K" if tokens >= 1000 else str(tokens)
 
-        md.text(f"- **名称**: {model.model_name}")
+        md.text(f"- **名称**: {model.name}")
+        md.text(f"- **状态**: {'启用' if model.enabled else '禁用'}")
+        md.text(f"- **任务**: {', '.join(sorted(profile.tasks))}")
         md.text(f"- **默认温度**: {temp_value}")
         md.text(f"- **上下文窗口**: {context_window}")
         md.text(f"- **核心能力**: {', '.join(cap_list) or '纯文本'}")
@@ -117,15 +122,15 @@ class Presenters:
         data_list = []
 
         for key_info in sorted_stats:
-            status_str = key_info.get("status", "HEALTHY")
+            status_str = key_info.get("status", "healthy")
             successes = key_info.get("successes", 0)
             failures = key_info.get("failures", 0)
             total_calls = successes + failures
 
-            if total_calls == 0 and status_str == "HEALTHY":
-                status_str = "UNUSED"
+            if total_calls == 0 and status_str == "healthy":
+                status_str = "unused"
 
-            if status_str == "COOLDOWN":
+            if status_str == "cooldown":
                 cooldown_seconds = max(
                     0, int(key_info.get("cooldown_until", 0) - time.time())
                 )
@@ -138,11 +143,9 @@ class Presenters:
                     str,
                     tuple[str, Literal["ok", "error", "warning", "info", "success"]],
                 ] = {
-                    "DISABLED": ("永久禁用", "error"),
-                    "ERROR": ("错误", "error"),
-                    "WARNING": ("告警", "warning"),
-                    "HEALTHY": ("健康", "ok"),
-                    "UNUSED": ("未使用", "info"),
+                    "invalid": ("永久禁用", "error"),
+                    "healthy": ("健康", "ok"),
+                    "unused": ("未使用", "info"),
                 }
                 text, status_type = status_map.get(status_str, ("未知", "info"))
                 status_cell = StatusBadgeCell(text=text, status_type=status_type)
@@ -161,16 +164,14 @@ class Presenters:
                     rate_color = "#E6A23C"
             success_rate_cell = TextCell(content=success_rate_text, color=rate_color)
 
-            avg_latency_text = "N/A"
-
             last_error = key_info.get("last_error") or "-"
             if len(last_error) > 25:
                 last_error = last_error[:22] + "..."
 
             suggested_action = "-"
-            if status_str == "DISABLED":
+            if status_str == "invalid":
                 suggested_action = "检查配额或换Key"
-            elif status_str == "COOLDOWN":
+            elif status_str == "cooldown":
                 suggested_action = "等待恢复"
 
             data_list.append(
@@ -179,7 +180,6 @@ class Presenters:
                     status_cell,
                     TextCell(content=total_calls_text),
                     success_rate_cell,
-                    TextCell(content=avg_latency_text),
                     TextCell(content=last_error),
                     TextCell(content=suggested_action),
                 ]
@@ -192,7 +192,6 @@ class Presenters:
                 "状态",
                 "总调用",
                 "成功率",
-                "平均延迟(s)",
                 "上次错误",
                 "建议操作",
             ]
