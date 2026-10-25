@@ -89,14 +89,6 @@ __plugin_meta__ = PluginMetadata(
             ),
             RegisterConfig(
                 module="SchedulerManager",
-                key="SCHEDULE_ADMIN_LEVEL",
-                value=5,
-                help="设置'定时任务'系列命令的基础使用权限等级",
-                default_value=5,
-                type=int,
-            ),
-            RegisterConfig(
-                module="SchedulerManager",
                 key="DEFAULT_JITTER_SECONDS",
                 value=60,
                 help="为多目标定时任务（如 --all, -t）设置的默认触发抖动秒数，避免所有任务同时启动。",  # noqa: E501

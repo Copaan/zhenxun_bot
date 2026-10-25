@@ -74,6 +74,80 @@ def install_uvicorn_shutdown_hook() -> None:
     setattr(uvicorn.Server, "handle_exit", handle_exit)
 
 
+def install_uvicorn_pathsend(prefixes: tuple[str, ...]) -> bool:
+    """为指定路径的明文 HTTP 请求开启 ASGI pathsend 扩展
+
+    FileResponse 检测到该扩展后改为整文件交给内核发送（loop.sendfile），
+    传输过程不再逐块经过事件循环。HTTPS 连接与其他路径不声明扩展，仍按块发送。
+
+    参数:
+        prefixes: 开启扩展的请求路径前缀
+
+    返回:
+        bool: 是否成功安装，uvicorn 内部结构不符时返回 False
+    """
+    try:
+        from uvicorn.protocols.http.httptools_impl import RequestResponseCycle
+    except ImportError:
+        return False
+    if getattr(RequestResponseCycle.send, "__zhenxun_pathsend__", False):
+        return True
+    required = (
+        "transport",
+        "response_started",
+        "response_complete",
+        "chunked_encoding",
+        "expected_content_length",
+        "disconnected",
+    )
+    if not all(
+        name in RequestResponseCycle.__init__.__code__.co_names for name in required
+    ):
+        return False
+    original_run = RequestResponseCycle.run_asgi
+    original_send = RequestResponseCycle.send
+
+    @wraps(original_run)
+    async def run_asgi(cycle: Any, app: Any) -> None:
+        if (
+            cycle.scope["type"] == "http"
+            and str(cycle.scope.get("path", "")).startswith(prefixes)
+            and cycle.transport.get_extra_info("sslcontext") is None
+        ):
+            cycle.scope.setdefault("extensions", {})["http.response.pathsend"] = {}
+        await original_run(cycle, app)
+
+    @wraps(original_send)
+    async def send(cycle: Any, message: Any) -> None:
+        if message["type"] != "http.response.pathsend":
+            return await original_send(cycle, message)
+        if not cycle.response_started or cycle.response_complete:
+            raise RuntimeError("Unexpected ASGI message 'http.response.pathsend'.")
+        count = cycle.expected_content_length
+        if cycle.scope["method"] != "HEAD" and not cycle.chunked_encoding and count:
+            try:
+                file = await asyncio.to_thread(open, message["path"], "rb")
+                with file:
+                    sent = await asyncio.get_running_loop().sendfile(
+                        cycle.transport, file, count=count
+                    )
+            except (OSError, RuntimeError):
+                sent = -1
+            if sent != count:
+                cycle.disconnected = True
+                cycle.transport.close()
+                return
+            cycle.expected_content_length = 0
+        await original_send(
+            cycle, {"type": "http.response.body", "body": b"", "more_body": False}
+        )
+
+    send.__zhenxun_pathsend__ = True  # type: ignore[attr-defined]
+    setattr(RequestResponseCycle, "run_asgi", run_asgi)
+    setattr(RequestResponseCycle, "send", send)
+    return True
+
+
 async def _abort_closing_connections(server: Any) -> None:
     """中止已进入关闭状态但迟迟收不到对端确认的连接
 
@@ -102,6 +176,7 @@ async def _abort_closing_connections(server: Any) -> None:
 __all__ = [
     "GRACEFUL_SHUTDOWN_TIMEOUT",
     "SERVER_OPTIONS",
+    "install_uvicorn_pathsend",
     "install_uvicorn_shutdown_hook",
     "install_websocket_drain_lock",
 ]

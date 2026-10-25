@@ -15,11 +15,9 @@ from nonebot_plugin_alconna import (
     Match,
     Query,
 )
-from nonebot_plugin_session import EventSession
 from nonebot_plugin_uninfo import Uninfo
 
 from zhenxun.configs.config import Config
-from zhenxun.models.level_user import LevelUser
 from zhenxun.models.scheduled_job import ScheduledJob
 from zhenxun.services import scheduler_manager
 from zhenxun.services.scheduler.registry import scheduler_registry
@@ -27,31 +25,18 @@ from zhenxun.services.scheduler.types import BaseTrigger, TargetType, Trigger
 from zhenxun.utils.time_utils import TimeUtils
 
 
-async def GetCreatorPermissionLevel(
-    bot: Bot,
-    event: Event,
-    session: Uninfo,
-) -> int:
-    """
-    依赖注入函数：获取执行命令的用户的权限等级。
-    """
-    is_superuser = await SUPERUSER(bot, event)
-    if is_superuser:
-        return 999
-
-    current_group_id = session.group.id if session.group else None
-    return await LevelUser.get_user_level(session.user.id, current_group_id)
-
-
-async def RequireTaskPermission(
+async def RequireSchedule(
     matcher: AlconnaMatcher,
-    bot: Bot,
-    event: Event,
-    session: EventSession,
     schedule_id_match: Match[int] = AlconnaMatch("schedule_id"),
 ) -> ScheduledJob:
-    """
-    依赖注入函数：获取并验证用户对特定任务的操作权限。
+    """依赖注入函数：按任务 ID 获取定时任务
+
+    参数:
+        matcher: AlconnaMatcher
+        schedule_id_match: 任务 ID
+
+    返回:
+        ScheduledJob: 定时任务
     """
     if not schedule_id_match.available:
         await matcher.finish("此操作需要一个有效的任务ID。")
@@ -60,24 +45,6 @@ async def RequireTaskPermission(
     schedule = await scheduler_manager.get_schedule_by_id(schedule_id)
     if not schedule:
         await matcher.finish(f"未找到ID为 {schedule_id} 的任务。")
-
-    is_superuser = await SUPERUSER(bot, event)
-    if is_superuser:
-        return schedule
-
-    user_id = session.id1
-    if not user_id:
-        await matcher.finish("无法获取用户信息，权限检查失败。")
-
-    group_id = session.id3 or session.id2
-    user_level = await LevelUser.get_user_level(user_id, group_id)
-
-    if user_level < schedule.required_permission:
-        await matcher.finish(
-            f"权限不足！操作此任务需要 {schedule.required_permission} 级权限，"
-            f"您当前为 {user_level} 级。"
-        )
-
     return schedule
 
 
@@ -286,43 +253,23 @@ async def GetValidatedJobKwargs(
 
 
 async def GetFinalPermission(
-    matcher: AlconnaMatcher,
-    bot: Bot,
-    event: Event,
-    session: Uninfo,
     plugin_name: Match[str] = AlconnaMatch("plugin_name"),
     perm_level: Match[int] = AlconnaMatch("perm_level"),
 ) -> int:
-    """依赖注入函数：计算任务的最终权限等级"""
-    is_superuser = await SUPERUSER(bot, event)
-    current_group_id = session.group.id if session.group else None
+    """依赖注入函数：计算任务记录的权限等级
 
-    if is_superuser:
-        effective_user_level = 9
-    else:
-        effective_user_level = await LevelUser.get_user_level(
-            session.user.id, current_group_id
-        )
+    参数:
+        plugin_name: 插件名
+        perm_level: 指定的权限等级
+
+    返回:
+        int: 指定值，未指定时为插件注册的默认值，最高为 9
+    """
     if perm_level.available:
-        requested_perm_level = perm_level.result
-        if not is_superuser and requested_perm_level > effective_user_level:
-            await matcher.send(
-                f"⚠️ 警告：您指定的权限等级 ({requested_perm_level}) "
-                f"高于自身权限 ({effective_user_level})。\n"
-                f"任务的管理权限已被自动设置为 {effective_user_level} 级。"
-            )
-            return effective_user_level
-        return requested_perm_level
-
-    else:
-        base_permission = effective_user_level
-        task_meta = scheduler_registry.tasks.get(plugin_name.result)
-        if task_meta and "default_permission" in task_meta:
-            default_perm = task_meta.get("default_permission")
-            if isinstance(default_perm, int):
-                base_permission = default_perm
-
-        return min(base_permission, effective_user_level)
+        return perm_level.result
+    task_meta = scheduler_registry.tasks.get(plugin_name.result) or {}
+    default_perm = task_meta.get("default_permission")
+    return min(default_perm, 9) if isinstance(default_perm, int) else 9
 
 
 async def ResolveTargets(

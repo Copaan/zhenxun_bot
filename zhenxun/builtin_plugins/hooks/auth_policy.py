@@ -133,11 +133,7 @@ class PolicyDecisionPoint:
             return PolicyDecision("allow", "superuser")
         if not profile.admin_level:
             return PolicyDecision("skip", "admin_level_empty")
-        global_user, group_user = snapshot.admin_levels or (None, None)
-        user_level = global_user.user_level if global_user else 0
-        if snapshot.group_id and group_user:
-            user_level = max(user_level, group_user.user_level)
-        if user_level < profile.admin_level:
+        if not (snapshot.is_superuser or snapshot.is_group_admin):
             return PolicyDecision("deny", "admin_level_low")
         return PolicyDecision("allow", "admin_allowed")
 

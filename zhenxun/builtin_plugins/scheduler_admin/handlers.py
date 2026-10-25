@@ -1,15 +1,11 @@
 from typing import cast
 
-from nonebot.adapters import Bot, Event
 from nonebot.params import Depends
-from nonebot.permission import SUPERUSER
 from nonebot_plugin_alconna import (
     AlconnaMatch,
     AlconnaMatches,
-    AlconnaQuery,
     Arparma,
     Match,
-    Query,
 )
 from nonebot_plugin_uninfo import Uninfo
 
@@ -24,12 +20,11 @@ from .commands import schedule_cmd
 from .data_source import scheduler_admin_service
 from .dependencies import (
     GetBotId,
-    GetCreatorPermissionLevel,
     GetFinalPermission,
     GetTargeter,
     GetTriggerInfo,
     GetValidatedJobKwargs,
-    RequireTaskPermission,
+    RequireSchedule,
     ResolveTargets,
     _parse_trigger_from_arparma,
 )
@@ -37,20 +32,13 @@ from .dependencies import (
 
 @schedule_cmd.assign("查看")
 async def handle_view(
-    bot: Bot,
-    event: Event,
-    session: Uninfo,
     page: Match[int] = AlconnaMatch("page"),
     targeter=Depends(GetTargeter),
 ):
     """处理 '查看' 子命令"""
-    is_superuser = await SUPERUSER(bot, event)
     current_page = page.result if page.available else 1
 
     result = await scheduler_admin_service.get_schedules_view(
-        user_id=session.user.id,
-        group_id=session.group.id if session.group else None,
-        is_superuser=is_superuser,
         filters=targeter._filters,
         page=current_page,
     )
@@ -70,7 +58,6 @@ async def handle_set(
     bot_id_to_operate: str = Depends(GetBotId),
     trigger: BaseTrigger = Depends(GetTriggerInfo),
     job_kwargs: dict = Depends(GetValidatedJobKwargs),
-    creator_permission_level: int = Depends(GetCreatorPermissionLevel),
     final_permission: int = Depends(GetFinalPermission),
 ):
     """处理 '设置' 子命令"""
@@ -114,7 +101,6 @@ async def handle_set(
 
     result_message = await scheduler_admin_service.set_schedule(
         targets=target_groups,
-        creator_permission_level=creator_permission_level,
         plugin_name=p_name,
         trigger=trigger,
         job_kwargs=job_kwargs,
@@ -131,75 +117,39 @@ async def handle_set(
 
 @schedule_cmd.assign("删除")
 async def handle_delete(
-    bot: Bot,
-    event: Event,
-    session: Uninfo,
     targeter=Depends(GetTargeter),
-    all_flag: Query[bool] = AlconnaQuery("删除.all.value", False),
-    global_flag: Query[bool] = AlconnaQuery("删除.global.value", False),
 ):
     """处理 '删除' 子命令"""
-    is_superuser = await SUPERUSER(bot, event)
     result_message = await scheduler_admin_service.perform_bulk_operation(
-        operation_name="删除",
-        user_id=session.user.id,
-        group_id=session.group.id if session.group else None,
-        is_superuser=is_superuser,
-        targeter=targeter,
-        all_flag=all_flag.result,
-        global_flag=global_flag.result,
+        operation_name="删除", targeter=targeter
     )
     await schedule_cmd.finish(result_message)
 
 
 @schedule_cmd.assign("暂停")
 async def handle_pause(
-    bot: Bot,
-    event: Event,
-    session: Uninfo,
     targeter=Depends(GetTargeter),
-    all_flag: Query[bool] = AlconnaQuery("暂停.all.value", False),
-    global_flag: Query[bool] = AlconnaQuery("暂停.global.value", False),
 ):
     """处理 '暂停' 子命令"""
-    is_superuser = await SUPERUSER(bot, event)
     result_message = await scheduler_admin_service.perform_bulk_operation(
-        operation_name="暂停",
-        user_id=session.user.id,
-        group_id=session.group.id if session.group else None,
-        is_superuser=is_superuser,
-        targeter=targeter,
-        all_flag=all_flag.result,
-        global_flag=global_flag.result,
+        operation_name="暂停", targeter=targeter
     )
     await schedule_cmd.finish(result_message)
 
 
 @schedule_cmd.assign("恢复")
 async def handle_resume(
-    bot: Bot,
-    event: Event,
-    session: Uninfo,
     targeter=Depends(GetTargeter),
-    all_flag: Query[bool] = AlconnaQuery("恢复.all.value", False),
-    global_flag: Query[bool] = AlconnaQuery("恢复.global.value", False),
 ):
     """处理 '恢复' 子命令"""
-    is_superuser = await SUPERUSER(bot, event)
     result_message = await scheduler_admin_service.perform_bulk_operation(
-        operation_name="恢复",
-        user_id=session.user.id,
-        group_id=session.group.id if session.group else None,
-        is_superuser=is_superuser,
-        targeter=targeter,
-        all_flag=all_flag.result,
-        global_flag=global_flag.result,
+        operation_name="恢复", targeter=targeter
     )
     await schedule_cmd.finish(result_message)
 
 
 @schedule_cmd.assign("执行")
-async def handle_trigger(schedule: ScheduledJob = Depends(RequireTaskPermission)):
+async def handle_trigger(schedule: ScheduledJob = Depends(RequireSchedule)):
     """处理 '执行' 子命令"""
     result_message = await scheduler_admin_service.trigger_schedule_now(schedule)
     await schedule_cmd.finish(result_message)
@@ -207,7 +157,7 @@ async def handle_trigger(schedule: ScheduledJob = Depends(RequireTaskPermission)
 
 @schedule_cmd.assign("更新")
 async def handle_update(
-    schedule: ScheduledJob = Depends(RequireTaskPermission),
+    schedule: ScheduledJob = Depends(RequireSchedule),
     arp: Arparma = AlconnaMatches(),
     kwargs_str: Match[str] = AlconnaMatch("kwargs_str"),
 ):
@@ -233,7 +183,7 @@ async def handle_plugins_list():
 
 @schedule_cmd.assign("状态")
 async def handle_status(
-    schedule: ScheduledJob = Depends(RequireTaskPermission),
+    schedule: ScheduledJob = Depends(RequireSchedule),
 ):
     """处理 '状态' 子命令"""
     message = await scheduler_admin_service.get_schedule_status(schedule.id)

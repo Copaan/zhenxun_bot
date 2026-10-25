@@ -1,4 +1,5 @@
 from arclet.alconna import ArparmaBehavior
+from nonebot.permission import SUPERUSER
 from nonebot_plugin_alconna import (
     Alconna,
     Args,
@@ -10,8 +11,6 @@ from nonebot_plugin_alconna import (
     on_alconna,
     store_true,
 )
-
-from zhenxun.utils.rules import admin_check
 
 
 def create_time_options() -> list[Option]:
@@ -229,7 +228,7 @@ schedule_cmd = on_alconna(
     block=True,
     skip_for_unmatch=False,
     aliases={"schedule", "cron", "job"},
-    rule=admin_check("SchedulerManager", "SCHEDULE_ADMIN_LEVEL"),
+    permission=SUPERUSER,
 )
 
 

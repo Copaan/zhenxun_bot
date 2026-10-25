@@ -45,7 +45,7 @@ _status_matcher = on_alconna(
             ),
         ),
     ),
-    rule=admin_check("plugin_switch", "CHANGE_GROUP_SWITCH_LEVEL"),
+    rule=admin_check(),
     priority=5,
     block=True,
 )
@@ -59,7 +59,7 @@ _group_status_matcher = on_alconna(
         Option("--all", action=store_true, help_text="所有群组"),
         Option("-o|--only", action=store_true, help_text="白名单模式(仅在目标群醒来)"),
     ),
-    rule=admin_check("plugin_switch", "CHANGE_GROUP_SWITCH_LEVEL") & to_me(),
+    rule=admin_check() & to_me(),
     priority=5,
     block=True,
 )

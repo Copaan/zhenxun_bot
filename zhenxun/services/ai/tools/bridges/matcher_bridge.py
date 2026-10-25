@@ -8,6 +8,18 @@ from arclet.alconna import Alconna, Subcommand
 from nonebot.adapters import Bot, Event
 from nonebot.exception import FinishedException, PausedException, RejectedException
 from nonebot.internal.matcher import Matcher
+from nonebot.message import _apply_run_postprocessors, _apply_run_preprocessors
+from nonebot.rule import (
+    CommandRule,
+    EndswithRule,
+    FullmatchRule,
+    KeywordsRule,
+    RegexRule,
+    Rule,
+    ShellCommandRule,
+    StartswithRule,
+    ToMeRule,
+)
 from nonebot.typing import T_State
 from nonebot_plugin_alconna import UniMessage
 from nonebot_plugin_alconna.consts import (
@@ -16,6 +28,7 @@ from nonebot_plugin_alconna.consts import (
     ALCONNA_RESULT,
 )
 from nonebot_plugin_alconna.model import CommandResult
+from nonebot_plugin_alconna.rule import AlconnaRule
 from pydantic import BaseModel
 
 from zhenxun.services.ai.core.exceptions import ToolRetryError
@@ -27,6 +40,19 @@ from zhenxun.services.ai.tools.models import EndRunResult, ToolOptions, ToolResu
 from zhenxun.services.ai.utils.logger import log_tool as logger
 from zhenxun.utils.pydantic_compat import model_validate
 from zhenxun.utils.utils import infer_plugin_namespace
+
+_TEXT_RULES = (
+    CommandRule,
+    EndswithRule,
+    FullmatchRule,
+    KeywordsRule,
+    RegexRule,
+    ShellCommandRule,
+    StartswithRule,
+    ToMeRule,
+)
+"""匹配消息文本的规则，工具调用时没有指令文本，不参与检查；
+Alconna 只检查其附带的前置与后置规则"""
 
 
 class MatcherAdapter(ABC):
@@ -358,6 +384,38 @@ class MatcherTool(BaseTool):
             tool_def = self.adapter.modify_tool_definition(tool_def)
         return tool_def
 
+    async def _check_access(
+        self, bot: Bot, event: Event, state: T_State, matcher: Matcher
+    ) -> bool:
+        """检查当前用户能否执行该 Matcher
+
+        依次检查 Matcher 的权限、除指令文本匹配外的规则（含 Alconna 附带规则），
+        以及运行前处理（插件开关、封禁、权限、限制与金币）
+
+        参数:
+            bot: Bot
+            event: 触发工具调用的事件
+            state: 构造的 State
+            matcher: 将要运行的 Matcher 实例
+
+        返回:
+            bool: 是否允许执行
+        """
+        if not await self.matcher.check_perm(bot, event):
+            return False
+        checkers = []
+        for checker in self.matcher.rule.checkers:
+            if isinstance(checker.call, AlconnaRule):
+                checkers.extend(checker.call.before_rules.checkers)
+                checkers.extend(checker.call.after_rules.checkers)
+            elif not isinstance(checker.call, _TEXT_RULES):
+                checkers.append(checker)
+        if not await Rule(*checkers)(bot, event, state):
+            return False
+        return await _apply_run_preprocessors(
+            bot=bot, event=event, state=state, matcher=matcher
+        )
+
     async def execute(
         self, context: RunContext | None = None, **kwargs: Any
     ) -> ToolResult:
@@ -388,7 +446,12 @@ class MatcherTool(BaseTool):
         )
 
         matcher_inst = self.matcher()
+        if not await self._check_access(bot, event, fake_state, matcher_inst):
+            return ToolResult(
+                output="当前用户无权执行该指令，请如实告知用户。"
+            ).as_error()
 
+        exception: Exception | None = None
         try:
             await matcher_inst.run(bot, event, fake_state)
 
@@ -404,6 +467,7 @@ class MatcherTool(BaseTool):
         except RejectedException:
             return ToolResult(output="执行被拒绝（参数缺失或错误）。").as_error()
         except Exception as e:
+            exception = e
 
             def _unwrap_err(exc: BaseException) -> str:
                 exceptions = getattr(exc, "exceptions", None)
@@ -417,6 +481,10 @@ class MatcherTool(BaseTool):
                 e=e,
             )
             return ToolResult(output=f"执行时发生底层错误: {real_err}").as_error()
+        finally:
+            await _apply_run_postprocessors(
+                bot=bot, event=event, matcher=matcher_inst, exception=exception
+            )
 
         if self.terminal:
             return EndRunResult(output="执行完毕。")

@@ -230,14 +230,14 @@ class SuperuserCapability(AbstractCapability):
 
 
 class AdminLevelCapability(AbstractCapability):
-    """需要指定群聊权限等级"""
+    """需要群主或管理员权限"""
 
     def __init__(self, min_level: int):
         """
-        初始化群聊权限等级限制能力。
+        初始化群管理权限限制能力。
 
         参数:
-            min_level: 允许执行该工具的最小群聊管理权限等级。
+            min_level: 权限等级，大于 0 时要求超级用户或当前群的群主、管理员。
         """
         self.min_level = min_level
 

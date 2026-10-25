@@ -103,11 +103,12 @@ async def _(
     _is_superuser = PlatformUtils.is_superuser(bot, session.user.id)
 
     if name.available:
+        is_admin = await PlatformUtils.is_group_admin(bot, session)
         help_style = Config.get_config("help", "HELP_STYLE")
         variant = help_style if help_style != "default" else None
 
         traditional_help_result = await get_plugin_help(
-            session.user.id, name.result, _is_superuser, variant=variant
+            is_admin, name.result, _is_superuser, variant=variant
         )
 
         if traditional_help_result is not None:
@@ -117,7 +118,7 @@ async def _(
             logger.info(f"查看帮助详情: {name.result}", "帮助", session=session)
         elif Config.get_config("help", "ENABLE_LLM_HELPER"):
             logger.info(f"智能帮助处理问题: {name.result}", "帮助", session=session)
-            llm_answer = await get_llm_help(name.result, session.user.id, _is_superuser)
+            llm_answer = await get_llm_help(name.result, is_admin, _is_superuser)
             await MessageUtils.build_message(llm_answer).send(reply_to=True)
         else:
             await MessageUtils.build_message("没有查找到这个功能噢...").send(

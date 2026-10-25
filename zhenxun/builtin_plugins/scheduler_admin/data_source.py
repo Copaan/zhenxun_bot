@@ -2,12 +2,10 @@ from typing import Any
 
 from pydantic import BaseModel, ValidationError
 
-from zhenxun.models.level_user import LevelUser
 from zhenxun.models.scheduled_job import ScheduledJob
 from zhenxun.services import scheduler_manager
 from zhenxun.services.log import logger
 from zhenxun.services.scheduler.registry import scheduler_registry
-from zhenxun.services.scheduler.repository import ScheduleRepository
 from zhenxun.services.scheduler.types import (
     BaseTrigger,
     ExecutionOptions,
@@ -24,9 +22,6 @@ class SchedulerAdminService:
 
     async def get_schedules_view(
         self,
-        user_id: str,
-        group_id: str | None,
-        is_superuser: bool,
         filters: dict[str, Any],
         page: int,
     ) -> bytes | str:
@@ -39,22 +34,10 @@ class SchedulerAdminService:
         if not schedules:
             return "没有找到任何相关的定时任务。"
 
-        permitted_schedules = schedules
-        skipped_count = 0
-        if not is_superuser:
-            permitted_schedules, skipped_count = await self._filter_schedules_for_user(
-                schedules, user_id, group_id
-            )
-
-        if not permitted_schedules:
-            return (
-                f"您没有权限查看任何匹配的任务。（因权限不足跳过 {skipped_count} 个）"
-            )
-
         title = self._generate_view_title(filters)
 
         return await presenters.format_schedule_list_as_image(
-            schedules=permitted_schedules,
+            schedules=schedules,
             title=title,
             current_page=page,
             total_items=total_items,
@@ -63,7 +46,6 @@ class SchedulerAdminService:
     async def set_schedule(
         self,
         targets: list[str],
-        creator_permission_level: int,
         plugin_name: str,
         trigger: BaseTrigger,
         job_kwargs: dict,
@@ -78,7 +60,6 @@ class SchedulerAdminService:
         """创建或更新一个定时任务"""
         success_targets = []
         failed_targets = []
-        permission_denied_targets = []
         execution_options = {}
         if jitter is not None:
             execution_options["jitter"] = jitter
@@ -89,25 +70,6 @@ class SchedulerAdminService:
 
         for target_desc in targets:
             target_type, target_id = self._resolve_target_descriptor(target_desc)
-
-            existing_schedule = await ScheduleRepository.filter(
-                plugin_name=plugin_name,
-                target_type=target_type,
-                target_identifier=target_id,
-                bot_id=bot_id,
-            ).first()
-
-            if (
-                existing_schedule
-                and creator_permission_level < existing_schedule.required_permission
-            ):
-                permission_denied_targets.append(
-                    (
-                        target_desc,
-                        f"需要 {existing_schedule.required_permission} 级权限",
-                    )
-                )
-                continue
 
             if target_type in [TargetType.TAG.value, TargetType.ALL_GROUPS.value]:
                 logger.debug(
@@ -145,54 +107,21 @@ class SchedulerAdminService:
             except Exception as e:
                 failed_targets.append((target_desc, str(e)))
 
-        return self._format_set_result_message(
-            targets, success_targets, failed_targets, permission_denied_targets
-        )
+        return self._format_set_result_message(targets, success_targets, failed_targets)
 
     async def perform_bulk_operation(
         self,
         operation_name: str,
-        user_id: str,
-        group_id: str | None,
-        is_superuser: bool,
         targeter,
-        all_flag: bool,
-        global_flag: bool,
     ) -> str:
         """执行批量操作（删除、暂停、恢复）"""
-        if not is_superuser:
-            permission_denied = False
-            if all_flag or global_flag:
-                permission_denied = True
-            elif targeter._filters.get("target_type") in [
-                TargetType.TAG.value,
-                TargetType.ALL_GROUPS.value,
-            ]:
-                permission_denied = True
-
-            if permission_denied:
-                return "权限不足，只有超级用户才能对所有群组或通过标签进行批量操作。"
-
         schedules_to_operate = await targeter._get_schedules()
         if not schedules_to_operate:
             return "没有找到符合条件的可操作任务。"
 
-        permitted_schedules, skipped_count = (
-            (schedules_to_operate, 0)
-            if is_superuser
-            else await self._filter_schedules_for_user(
-                schedules_to_operate, user_id, group_id
-            )
+        final_targeter = scheduler_manager.target(
+            id__in=[s.id for s in schedules_to_operate]
         )
-
-        if not permitted_schedules:
-            return (
-                f"您没有权限{operation_name}任何匹配的任务。"
-                f"（因权限不足跳过 {skipped_count} 个）"
-            )
-
-        permitted_ids = [s.id for s in permitted_schedules]
-        final_targeter = scheduler_manager.target(id__in=permitted_ids)
 
         operation_map = {
             "删除": final_targeter.remove,
@@ -204,10 +133,7 @@ class SchedulerAdminService:
             return f"未知的批量操作: {operation_name}"
 
         count, _ = await operation_func()
-        msg = f"批量{operation_name}操作完成：\n  - 成功: {count} 个"
-        if skipped_count > 0:
-            msg += f"\n  - 因权限不足跳过: {skipped_count} 个"
-        return msg
+        return f"批量{operation_name}操作完成：\n  - 成功: {count} 个"
 
     async def trigger_schedule_now(self, schedule: ScheduledJob) -> str:
         """立即触发一个任务"""
@@ -255,14 +181,6 @@ class SchedulerAdminService:
         """获取可定时执行的插件列表"""
         return await presenters.format_plugins_list()
 
-    async def _filter_schedules_for_user(
-        self, schedules: list[ScheduledJob], user_id: str, group_id: str | None
-    ) -> tuple[list[ScheduledJob], int]:
-        user_level = await LevelUser.get_user_level(user_id, group_id)
-        permitted = [s for s in schedules if user_level >= s.required_permission]
-        skipped_count = len(schedules) - len(permitted)
-        return permitted, skipped_count
-
     def _generate_view_title(self, filters: dict) -> str:
         title = "定时任务"
         if filters.get("target_type") == TargetType.ALL_GROUPS.value:
@@ -283,7 +201,7 @@ class SchedulerAdminService:
         return TargetType.USER.value, target_desc
 
     def _format_set_result_message(
-        self, targets: list, success: list, failed: list, permission_denied: list
+        self, targets: list, success: list, failed: list
     ) -> str:
         msg = f"为 {len(targets)} 个目标设置/更新任务完成：\n"
         if success:
@@ -292,10 +210,6 @@ class SchedulerAdminService:
             msg += f"\n  - ID列表: {ids_str}"
         else:
             msg += "- 成功: 0 个"
-        if permission_denied:
-            msg += f"\n- 因权限不足跳过: {len(permission_denied)} 个"
-            for target, reason in permission_denied:
-                msg += f"\n  - 目标 {target}: {reason}"
         if failed:
             msg += f"\n- 失败: {len(failed)} 个"
             for target, reason in failed:

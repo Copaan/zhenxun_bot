@@ -93,9 +93,14 @@ class HITLController:
         return user_input
 
     async def ask_confirm(self, prompt_msg: str, timeout: float = 60.0) -> bool:
-        """
-        高阶交互：发起 Y/N 确认审批。
-        支持超管越权代批。用户拒绝或超时自动抛出异常切断循环。
+        """发起高危操作审批，仅超级用户可以批准，发起人与超级用户可以拒绝
+
+        参数:
+            prompt_msg: 审批说明
+            timeout: 超时时间，秒
+
+        返回:
+            bool: 批准时为 True，拒绝或超时抛出异常
         """
         orig_user_id = self.context.get_user_id()
         bot = self.context.get_bot()
@@ -104,7 +109,8 @@ class HITLController:
             raise ToolFatalError("非交互环境无法发起人工审批。")
 
         full_prompt = (
-            f"{prompt_msg}\n\n请在规定时间内回复 [Y/是] 确认，或 [N/否/取消] 拒绝。"
+            f"{prompt_msg}\n\n需要超级用户在规定时间内回复 [Y/是] 批准，"
+            "发起人或超级用户回复 [N/否/取消] 拒绝。"
         )
 
         start_time = time.time()
@@ -133,14 +139,13 @@ class HITLController:
             ):
                 continue
 
-            curr_user_id = str(event.get_user_id())
-            is_authorized = curr_user_id == orig_user_id or await SUPERUSER(bot, event)
-
-            if not is_authorized:
-                await bot.send(event, "⚠️ 权限不足，你无权审批此操作。")
-                continue
-
+            is_superuser = await SUPERUSER(bot, event)
+            is_requester = str(event.get_user_id()) == orig_user_id
             if text in CONFIRM_WORDS:
-                return True
-
-            raise AbortException(reason="审批被拒绝")
+                if is_superuser:
+                    return True
+                if is_requester:
+                    await bot.send(event, "⚠️ 该操作需要超级用户批准。")
+                continue
+            if is_superuser or is_requester:
+                raise AbortException(reason="审批被拒绝")

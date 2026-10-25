@@ -4,10 +4,12 @@ from typing import Literal
 from nonebot_plugin_session import EventSession
 
 from zhenxun.models.ban_console import BanConsole
-from zhenxun.models.level_user import LevelUser
 from zhenxun.services.log import logger
 from zhenxun.services.platform_identity import scoped_group_id
 from zhenxun.utils.image_utils import BuildImage, ImageTemplate
+
+ADMIN_BAN_LEVEL = 8
+"""群管理的封禁等级，超级用户为 9999，系统自动封禁为 9"""
 
 
 async def call_ban(user_id: str, reason: str | None = None, duration: int = 1):
@@ -107,7 +109,7 @@ class BanManage:
     ) -> tuple[bool, str]:
         """unban目标用户
 
-        非超级用户按自己在该群的权限等级判断，按 id 解除时只能解除该群的记录。
+        群管理只能解除群管理设下的封禁，按 id 解除时只能解除该群的记录。
 
         参数:
             user_id: 用户id
@@ -119,13 +121,7 @@ class BanManage:
         返回:
             tuple[bool, str | Non]: 是否unban成功, 群组/用户id或提示
         """
-        user_level = 9999
-        if not is_superuser:
-            user_level = (
-                await LevelUser.get_user_level(session.id1, group_id)
-                if session.id1
-                else 0
-            )
+        user_level = 9999 if is_superuser else ADMIN_BAN_LEVEL
         if idx:
             ban_data = await BanConsole.get_ban(id=idx)
             if not ban_data:
@@ -161,7 +157,5 @@ class BanManage:
             session: Session
             is_superuser: 是否为超级用户操作
         """
-        level = 9999
-        if not is_superuser and user_id and session.id1:
-            level = await LevelUser.get_user_level(session.id1, group_id)
+        level = 9999 if is_superuser else ADMIN_BAN_LEVEL
         await BanConsole.ban(user_id, group_id, level, reason, duration, session.id1)

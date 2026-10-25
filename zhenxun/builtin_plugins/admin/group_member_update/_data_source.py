@@ -1,14 +1,11 @@
 from datetime import datetime
 import re
 
-import nonebot
 from nonebot.adapters import Bot
 from nonebot_plugin_uninfo import Member, Scene, SceneType, get_interface
 
-from zhenxun.configs.config import Config
 from zhenxun.models.group_console import GroupConsole
 from zhenxun.models.group_member_info import GroupInfoUser
-from zhenxun.models.level_user import LevelUser
 from zhenxun.services.hot_query_cache import (
     invalidate_group_members,
     invalidate_member_names,
@@ -19,16 +16,13 @@ from zhenxun.utils.platform import PlatformUtils
 
 class MemberUpdateManage:
     @classmethod
-    async def __handle_user(
+    def __handle_user(
         cls,
         member: Member,
         db_user_map: dict[str, list[GroupInfoUser]],
         group_id: str,
         data_list: tuple[list[GroupInfoUser], list[GroupInfoUser], list[int]],
         platform: str | None,
-        *,
-        default_auth: int | None,
-        superusers: set[str],
     ):
         """单个成员操作
 
@@ -42,18 +36,7 @@ class MemberUpdateManage:
         nickname = re.sub(
             r"[\x00-\x09\x0b-\x1f\x7f-\x9f]", "", member.nick or member.user.name or ""
         )
-        role = member.role
         member_id = str(member.id)
-        if member_id in superusers:
-            await LevelUser.set_level(member_id, group_id, 9)
-        elif role and default_auth:
-            if role.id != "MEMBER" and not await LevelUser.is_group_flag(
-                member_id, group_id
-            ):
-                if role.id == "OWNER":
-                    await LevelUser.set_level(member_id, group_id, default_auth + 1)
-                elif role.id == "ADMINISTRATOR":
-                    await LevelUser.set_level(member_id, group_id, default_auth)
         if users := db_user_map.get(member_id):
             if len(users) > 1:
                 data_list[2].extend(u.id for u in users[1:])
@@ -137,20 +120,9 @@ class MemberUpdateManage:
                 [],
             )
             exist_member_ids: set[str] = set()
-            driver = nonebot.get_driver()
-            superusers = set(driver.config.superusers)
-            default_auth = Config.get_config("admin_bot_manage", "ADMIN_DEFAULT_AUTH")
             for member in members:
                 member_id = str(member.id)
-                await cls.__handle_user(
-                    member,
-                    db_user_map,
-                    group_id,
-                    data_list,
-                    platform,
-                    default_auth=default_auth,
-                    superusers=superusers,
-                )
+                cls.__handle_user(member, db_user_map, group_id, data_list, platform)
                 exist_member_ids.add(member_id)
             if data_list[0]:
                 try:

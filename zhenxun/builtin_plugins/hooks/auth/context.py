@@ -111,7 +111,6 @@ class PermissionContext:
     user: Any = None
     group: Any = None
     bot_data: Any = None
-    admin_levels: Any = None
 
     @property
     def entity(self) -> EntityIDs:

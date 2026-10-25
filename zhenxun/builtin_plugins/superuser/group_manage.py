@@ -27,24 +27,25 @@ __plugin_meta__ = PluginMetadata(
     name="管理群操作",
     description="管理群操作",
     usage="""
-    群权限 | 群白名单 | 退出群 操作
+    群等级 | 群白名单 | 退出群 操作
     退群，添加/删除群白名单，添加/删除群认证，当在群组中这五个命令且没有指定群号时，默认指定当前群组
     指令:
         格式:
-        group-manage modify-level [权限等级] ?[群组Id]      : 修改群权限
+        group-manage modify-level [群等级] ?[群组Id]        : 修改群等级
         group-manage super-handle [群组Id] [--del 删除操作] : 添加/删除群白名单
         group-manage auth-handle [群组Id] [--del 删除操作]  : 添加/删除群认证
         group-manage del-group [群组Id]                    : 退出指定群
 
         快捷:
-        group-manage modify-level : 修改群权限
+        group-manage modify-level : 修改群等级
         group-manage super-handle : 添加/删除群白名单
         group-manage auth-handle  : 添加/删除群认证
         group-manage del-group    : 退群
 
         示例:
-        修改群权限 7                              : 在群组中修改当前群组权限为7
-        修改群权限 7 1234556                     : 修改 123456 群组的权限等级为7
+        修改群等级 7                              : 修改当前群组的群等级为7
+        修改群等级 7 1234556                     : 修改 123456 群组的群等级为7
+        群等级需不低于功能所需等级才能使用该功能，-1 为群黑名单
         添加/删除群白名单 1234567                  : 添加/删除 1234567 为群白名单
         添加/删除群认证 1234567                    : 添加/删除 1234567 为群认证
         退群 12344566                            : 退出指定群组
@@ -63,7 +64,7 @@ _matcher = on_alconna(
         "group-manage",
         Option("--delete", action=store_true, help_text="删除"),
         Subcommand(
-            "modify-level", Args["level", int]["group_id?", int], help_text="修改群权限"
+            "modify-level", Args["level", int]["group_id?", int], help_text="修改群等级"
         ),
         Subcommand(
             "super-handle",
@@ -83,7 +84,7 @@ _matcher = on_alconna(
 )
 
 _matcher.shortcut(
-    r"修改群权限\s?(?P<level>-?\d+)\s?(?P<group_id>\d+)?",
+    r"修改群(?:等级|权限)\s?(?P<level>-?\d+)\s?(?P<group_id>\d+)?",
     command="group-manage",
     arguments=["modify-level", "{level}", "{group_id}"],
     prefix=True,
@@ -152,9 +153,9 @@ async def _(session: EventSession, arparma: Arparma, state: T_State, level: int)
     old_level = group.level
     group.level = level
     await group.save(update_fields=["level"])
-    await MessageUtils.build_message("群权限修改成功!").send(reply_to=True)
+    await MessageUtils.build_message("群等级修改成功!").send(reply_to=True)
     logger.info(
-        f"修改群权限: {old_level} -> {level}",
+        f"修改群等级: {old_level} -> {level}",
         arparma.header_result,
         session=session,
         target=gid,

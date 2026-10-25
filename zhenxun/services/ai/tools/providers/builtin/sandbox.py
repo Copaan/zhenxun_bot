@@ -1,5 +1,5 @@
 import asyncio
-from typing import Any
+from typing import Any, ClassVar
 
 from zhenxun.services.ai.core.stream_events import ToolStreamChunkEvent, UserCustomEvent
 from zhenxun.services.ai.run.context import RunContext
@@ -9,13 +9,17 @@ from zhenxun.services.ai.sandbox.models import (
 )
 from zhenxun.services.ai.tools.core.decorators import Rules, tool
 from zhenxun.services.ai.tools.core.toolkit import BaseToolkit
-from zhenxun.services.ai.tools.models import ToolResult
+from zhenxun.services.ai.tools.models import ToolkitConfig, ToolResult
 from zhenxun.services.ai.utils.logger import log_tool as logger
 from zhenxun.utils.pydantic_compat import model_copy
 
 
 class SandboxToolkit(BaseToolkit):
     default_prefix = ""
+    _default_config: ClassVar[ToolkitConfig] = ToolkitConfig(
+        shared_options=Rules.superuser()
+    )
+    """默认仅超级用户可见，实例化时传入 shared_options 可覆盖"""
 
     default_instructions = (
         "## 🖥️ 沙箱工作区交互规范\n"

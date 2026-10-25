@@ -31,7 +31,6 @@ from zhenxun.utils.enum import PluginType
 from zhenxun.utils.message import MessageUtils
 from zhenxun.utils.platform import PlatformUtils
 from zhenxun.utils.pydantic_compat import parse_as
-from zhenxun.utils.rules import admin_check
 
 __plugin_meta__ = PluginMetadata(
     name="插件配置管理",
@@ -76,14 +75,6 @@ __plugin_meta__ = PluginMetadata(
         configs=[
             RegisterConfig(
                 module="plugin_config_manager",
-                key="PCONF_ADMIN_LEVEL",
-                value=5,
-                help="管理分群配置的基础权限等级",
-                default_value=5,
-                type=int,
-            ),
-            RegisterConfig(
-                module="plugin_config_manager",
                 key="SHOW_DEFAULT_CONFIG_IN_ALL",
                 value=False,
                 help="在使用 --all 查询时，是否显示配置为默认值的群组",
@@ -124,7 +115,7 @@ pconf_cmd = on_alconna(
         Option("--all", action=store_true, help_text="操作所有群组"),
         Option("--global", action=store_true, help_text="操作全局配置"),
     ),
-    rule=admin_check("plugin_config_manager", "PCONF_ADMIN_LEVEL"),
+    permission=SUPERUSER,
     priority=5,
     block=True,
 )

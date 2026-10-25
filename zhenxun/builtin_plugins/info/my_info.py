@@ -8,7 +8,6 @@ from tortoise.functions import Count
 
 from zhenxun import ui
 from zhenxun.models.chat_history import ChatHistory
-from zhenxun.models.level_user import LevelUser
 from zhenxun.models.sign_user import SignUser
 from zhenxun.models.statistics import Statistics
 from zhenxun.models.user_console import UserConsole
@@ -169,7 +168,11 @@ async def get_chat_history(
 
 
 async def get_user_info(
-    session: Uninfo, user_id: str, group_id: str | None, nickname: str
+    session: Uninfo,
+    user_id: str,
+    group_id: str | None,
+    nickname: str,
+    permission: str,
 ) -> bytes:
     """获取用户个人信息
 
@@ -178,12 +181,12 @@ async def get_user_info(
         user_id: 用户id
         group_id: 群id
         nickname: 用户昵称
+        permission: 用户身份
 
     返回:
         bytes: 图片数据
     """
     platform = PlatformUtils.get_platform(session) or "qq"
-    official = PlatformUtils.get_platform_scope(session) == "qq_api"
     account_key = (
         await business_user_id(session) if user_id == session.user.id else user_id
     )
@@ -200,16 +203,6 @@ async def get_user_info(
         "MyInfo.user_console",
         None,
     )
-    permission_level = (
-        0
-        if official
-        else await _read_db(
-            lambda: LevelUser.get_user_level(user_id, group_id),
-            "MyInfo.level_user",
-            0,
-        )
-    )
-
     sign_level = 0
     if sign_user := await _read_db(
         lambda: SignUser.get_or_none(user_id=account_key),
@@ -273,7 +266,7 @@ async def get_user_info(
             "level": sign_level,
             "selected_indices": selected_indices,
         },
-        "permission_level": permission_level,
+        "permission_level": permission,
         "chart": {
             "labels": chart_labels,
             "data": chart_data,

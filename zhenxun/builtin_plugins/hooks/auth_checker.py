@@ -56,9 +56,8 @@ _POLICY_SKIP_MESSAGES = {
     "bot_not_found": "Bot不存在，阻断权限检测...",
     "bot_sleeping": "Bot休眠中阻断权限检测...",
     "group_not_found": "群组信息不存在...",
-    "group_blacklisted": "群组黑名单, 目标群组群权限权限-1...",
+    "group_blacklisted": "群组黑名单, 目标群组群等级为-1...",
     "group_sleeping": "群组休眠状态...",
-    "group_level_low": "群等级限制...",
     "admin_level_low": "管理员权限不足...",
 }
 # 插件策略禁止调用时发送给用户的提示
@@ -118,7 +117,7 @@ def _policy_denied(
     plugin = prep.plugin
     context = prep.permission_context
     if reason == "admin_level_low":
-        tip = f"你的权限不足喔，该功能需要的权限等级: {plugin.admin_level}"
+        tip = "你的权限不足喔，该功能仅限群主或管理员使用"
         return SkipPluginException(
             f"{plugin.name}({plugin.module}) 管理员权限不足...",
             tip_message=[At(flag="user", target=context.user_id), tip]
@@ -126,6 +125,11 @@ def _policy_denied(
             else tip,
             tip_check_tag=context.user_id,
             tip_background=True,
+        )
+    if reason == "group_level_low":
+        return SkipPluginException(
+            f"{plugin.name}({plugin.module}) 群等级限制，"
+            f"该功能需要的群等级: {prep.profile.level}..."
         )
     if tip := _PLUGIN_POLICY_TIPS.get(reason):
         sid = context.group_id or context.user_id
@@ -144,6 +148,7 @@ async def _prepare_auth_state(
     module: str,
     context: EventContext,
     bot: Bot,
+    session: Uninfo,
     state: dict | None,
 ) -> AuthPreparation:
     """从运行态缓存读取插件信息与权限快照
@@ -152,6 +157,7 @@ async def _prepare_auth_state(
         module: 插件模块
         context: EventContext
         bot: Bot
+        session: Uninfo
         state: matcher state
 
     异常:
@@ -170,12 +176,10 @@ async def _prepare_auth_state(
     permission_context = PermissionContext(event=context, module=module, plugin=plugin)
     profile = await get_plugin_auth_profile(plugin)
     snapshot = await build_auth_snapshot(
-        context=context, plugin=plugin, profile=profile, bot=bot
+        context=context, plugin=plugin, profile=profile, bot=bot, session=session
     )
     permission_context.group = snapshot.group
     permission_context.bot_data = snapshot.bot_data
-    if snapshot.admin_levels is not None:
-        permission_context.admin_levels = snapshot.admin_levels
     store_permission_context(state, permission_context)
     return AuthPreparation(
         plugin=plugin,
@@ -321,7 +325,7 @@ async def _run_auth(
         commit: 副作用提交器
     """
     prep = await _prepare_auth_state(
-        module=commit.module, context=context, bot=bot, state=state
+        module=commit.module, context=context, bot=bot, session=session, state=state
     )
     if not skip_ban:
         await _check_ban(prep, matcher, session)

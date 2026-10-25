@@ -16,16 +16,13 @@ from nonebot_plugin_alconna import (
 )
 from nonebot_plugin_uninfo import Uninfo
 
-from zhenxun.configs.config import Config
-from zhenxun.configs.utils import PluginExtraData, RegisterConfig
+from zhenxun.configs.utils import PluginExtraData
 from zhenxun.services.log import logger
 from zhenxun.utils.enum import PluginType
 from zhenxun.utils.message import MessageUtils
 from zhenxun.utils.rules import admin_check, ensure_group
 
 from .data_source import Manager
-
-base_config = Config.get("admin_bot_manage")
 
 __plugin_meta__ = PluginMetadata(
     name="自定义群欢迎消息",
@@ -47,31 +44,20 @@ __plugin_meta__ = PluginMetadata(
         author="HibiKier",
         version="0.1",
         plugin_type=PluginType.ADMIN,
-        admin_level=base_config.get("SET_GROUP_WELCOME_MESSAGE_LEVEL", 2),
-        configs=[
-            RegisterConfig(
-                module="admin_bot_manage",
-                key="SET_GROUP_WELCOME_MESSAGE_LEVEL",
-                value=2,
-                help="设置群欢迎消息所需要的管理员权限等级",
-                default_value=2,
-            )
-        ],
+        admin_level=1,
     ).to_dict(),
 )
 
 _matcher = on_command(
     "设置欢迎消息",
-    rule=admin_check("admin_bot_manage", "SET_GROUP_WELCOME_MESSAGE_LEVEL")
-    & ensure_group,
+    rule=admin_check() & ensure_group,
     priority=5,
     block=True,
 )
 
 _show_matcher = on_alconna(
     Alconna("查看欢迎消息", Args["idx?", int]),
-    rule=admin_check("admin_bot_manage", "SET_GROUP_WELCOME_MESSAGE_LEVEL")
-    & ensure_group,
+    rule=admin_check() & ensure_group,
     priority=5,
     block=True,
 )
@@ -89,8 +75,7 @@ _del_matcher: type[AlconnaMatcher] = on_alconna(
         ],
     ),
     skip_for_unmatch=False,
-    rule=admin_check("admin_bot_manage", "SET_GROUP_WELCOME_MESSAGE_LEVEL")
-    & ensure_group,
+    rule=admin_check() & ensure_group,
     priority=5,
     block=True,
 )

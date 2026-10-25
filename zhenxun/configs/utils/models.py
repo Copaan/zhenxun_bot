@@ -275,7 +275,7 @@ class PluginExtraData(BaseModel):
     menu_type: str = "功能"
     """菜单类型"""
     admin_level: int | None = None
-    """管理员插件所需权限等级"""
+    """大于 0 时仅限超级用户与群主、管理员调用"""
     configs: list[RegisterConfig] | None = None
     """插件配置"""
     setting: PluginSetting | None = None

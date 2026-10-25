@@ -180,8 +180,7 @@ class PermissionCapability(AbstractCapability):
         if admin_level > 0:
             if not await PermissionUtils.check_admin_level(context, admin_level):
                 msg = (
-                    "系统警告：用户权限不足（需要等级 "
-                    f"{admin_level}）。"
+                    "系统警告：用户权限不足（仅限群主或管理员）。"
                     "请温和地向用户解释权限不足，并拒绝执行。"
                 )
                 user_id = context.get_user_id()
@@ -190,7 +189,7 @@ class PermissionCapability(AbstractCapability):
                     f"{getattr(tool, 'name', 'unknown')}"
                 )
                 raise ToolFatalError(
-                    msg, display_content=f"❌ 权限不足: 需要等级 {admin_level}"
+                    msg, display_content="❌ 权限不足: 仅限群主或管理员"
                 )
         return await handler(arguments)
 

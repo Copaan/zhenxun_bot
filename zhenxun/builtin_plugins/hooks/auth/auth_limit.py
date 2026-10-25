@@ -9,7 +9,7 @@ from zhenxun.models.plugin_info import PluginInfo
 from zhenxun.services.cache.runtime_cache import PluginLimitMemoryCache
 from zhenxun.services.cache.runtime_snapshot import PluginLimitSnapshot
 from zhenxun.services.log import logger
-from zhenxun.utils.enum import LimitWatchType, PluginLimitType
+from zhenxun.utils.enum import LimitCheckType, LimitWatchType, PluginLimitType
 from zhenxun.utils.limiters import CountLimiter, FreqLimiter, UserBlockLimiter
 from zhenxun.utils.message import MessageUtils
 from zhenxun.utils.time_utils import TimeUtils
@@ -50,6 +50,23 @@ class LimitReservation:
             release()
         self.active = False
         self.releases.clear()
+
+
+def _limit_applies(limit: PluginLimitSnapshot, group_id: str | None) -> bool:
+    """按 check_type 判断限制是否作用于当前会话
+
+    参数:
+        limit: 插件限制
+        group_id: 群组id
+
+    返回:
+        bool: PRIVATE 仅私聊，GROUP 仅群聊，ALL 两者都生效
+    """
+    if limit.check_type == LimitCheckType.PRIVATE:
+        return not group_id
+    if limit.check_type == LimitCheckType.GROUP:
+        return bool(group_id)
+    return True
 
 
 def _limit_key(
@@ -168,7 +185,8 @@ class LimitManager:
         reservation = LimitReservation(module=module)
         try:
             for limit_type in _LIMIT_ORDER:
-                if (limit := by_type.get(limit_type)) is None:
+                limit = by_type.get(limit_type)
+                if limit is None or not _limit_applies(limit, group_id):
                     continue
                 if (state := cls._state(limit)) is None:
                     continue
@@ -205,13 +223,6 @@ class LimitManager:
             SkipPluginException: 正在限制中
         """
         limit, limiter = state.limit, state.limiter
-        is_limit = (
-            limit.watch_type == LimitWatchType.ALL
-            or (group_id and limit.watch_type == LimitWatchType.GROUP)
-            or (not group_id and limit.watch_type == LimitWatchType.USER)
-        )
-        if not is_limit:
-            return lambda: None
         key = _limit_key(limit, user_id, group_id, channel_id)
         if not limiter.check(key):
             if limit.result:

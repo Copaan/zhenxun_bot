@@ -30,6 +30,12 @@ DOWNLOAD_TTL = 7200
 _download_tickets: dict[str, tuple[str, float]] = {}
 
 
+class BackupFileResponse(FileResponse):
+    """备份包下载响应，无法交给内核发送时按 4MB 分块读取"""
+
+    chunk_size = 4 * 1024 * 1024
+
+
 def issue_download_ticket(name: str) -> str:
     """为备份包签发下载凭证
 
@@ -200,7 +206,7 @@ async def _(token: str, name: str):
         path = backup.backup_path(name)
     except backup.BackupError as error:
         return JSONResponse({"detail": str(error)}, 404)
-    return FileResponse(path, filename=path.name, media_type="application/zip")
+    return BackupFileResponse(path, filename=path.name, media_type="application/zip")
 
 
 @setup_router.post(

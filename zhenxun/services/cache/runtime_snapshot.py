@@ -333,40 +333,6 @@ class GroupSnapshot:
 
 
 @dataclass(frozen=True)
-class LevelUserSnapshot:
-    user_id: str
-    group_id: str | None
-    user_level: int
-    group_flag: int
-
-    @classmethod
-    def from_model(cls, model) -> "LevelUserSnapshot":
-        return cls(
-            user_id=str(model.user_id),
-            group_id=getattr(model, "group_id", None),
-            user_level=int(getattr(model, "user_level", 0) or 0),
-            group_flag=int(getattr(model, "group_flag", 0) or 0),
-        )
-
-    def to_payload(self) -> dict[str, Any]:
-        return {
-            "user_id": self.user_id,
-            "group_id": self.group_id,
-            "user_level": self.user_level,
-            "group_flag": self.group_flag,
-        }
-
-    @classmethod
-    def from_payload(cls, payload: dict[str, Any]) -> "LevelUserSnapshot":
-        return cls(
-            user_id=str(payload.get("user_id", "")),
-            group_id=payload.get("group_id"),
-            user_level=int(payload.get("user_level", 0) or 0),
-            group_flag=int(payload.get("group_flag", 0) or 0),
-        )
-
-
-@dataclass(frozen=True)
 class PluginLimitSnapshot:
     id: int
     module: str

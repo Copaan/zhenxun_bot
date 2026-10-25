@@ -5,10 +5,13 @@ from zhenxun.services.cache.runtime_cache import GroupMemoryCache
 from zhenxun.services.platform_identity import scoped_group_id
 from zhenxun.services.plugin_policy import scene_global_state
 from zhenxun.utils.common_utils import CommonUtils
-from zhenxun.utils.enum import BlockType
+from zhenxun.utils.enum import BlockType, PluginType
 from zhenxun.utils.platform import PlatformUtils
 
 from .strategy import get_strategy
+
+_MANAGE_TYPES = {PluginType.ADMIN, PluginType.SUPER_AND_ADMIN, PluginType.SUPERUSER}
+"""内置插件中仅超级用户可以在群内关闭的插件类型"""
 
 BLOCK_REASON_LABELS = {
     "not_loaded": "未加载",
@@ -133,6 +136,14 @@ class PluginManager:
         entity = await strategy.get_entity(name)
         if not entity:
             return f"未找到{strategy.entity_type_name}: {name}"
+        if (
+            not status
+            and not is_superuser
+            and not is_task
+            and entity.plugin_type in _MANAGE_TYPES
+            and entity.module_path.startswith("zhenxun.builtin_plugins.")
+        ):
+            return f"{entity.name} 是内置管理功能，仅超级用户可以关闭"
         to_open, to_close = await cls._calculate_affected_groups(
             target_groups, status, is_whitelist_mode, bot
         )

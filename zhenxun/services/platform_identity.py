@@ -9,7 +9,6 @@ LEGACY_IDENTITY_TABLES = frozenset(
     {
         "ban_console",
         "group_console",
-        "level_users",
         "sign_users",
         "user_console",
         "user_gold_log",
@@ -22,7 +21,7 @@ LEGACY_IDENTITY_TABLES = frozenset(
 )
 
 
-NAMESPACED_TABLES = frozenset({"ban_console", "group_console", "level_users"})
+NAMESPACED_TABLES = frozenset({"ban_console", "group_console"})
 
 
 class UnsafeLegacyIdentityWrite(RuntimeError):

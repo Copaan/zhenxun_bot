@@ -296,12 +296,14 @@ def run_worker(project_root: Path) -> None:
     from zhenxun.services.webui_transport import (
         GRACEFUL_SHUTDOWN_TIMEOUT,
         SERVER_OPTIONS,
+        install_uvicorn_pathsend,
         install_uvicorn_shutdown_hook,
         install_websocket_drain_lock,
     )
 
     install_websocket_drain_lock()
     install_uvicorn_shutdown_hook()
+    install_uvicorn_pathsend(("/zhenxun/api/backup/file/",))
     from zhenxun.services.lifecycle import lifecycle_kernel
 
     def after_server_signal(signum, frame):

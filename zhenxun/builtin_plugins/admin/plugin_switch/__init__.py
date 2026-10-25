@@ -5,8 +5,7 @@ from nonebot.plugin import PluginMetadata
 from nonebot_plugin_alconna import AlconnaMatch, AlconnaQuery, Arparma, Match, Query
 from nonebot_plugin_uninfo import Uninfo
 
-from zhenxun.configs.config import Config
-from zhenxun.configs.utils import PluginExtraData, RegisterConfig
+from zhenxun.configs.utils import PluginExtraData
 from zhenxun.services.log import logger
 from zhenxun.services.tags import tag_manager
 from zhenxun.utils.enum import BlockType, PluginType
@@ -22,9 +21,6 @@ from .ui import (
     render_group_active_status,
 )
 
-base_config = Config.get("plugin_switch")
-
-
 __plugin_meta__ = PluginMetadata(
     name="功能开关",
     description="对群组内的功能限制，超级用户可以对群组以及全局的功能被动开关限制",
@@ -33,6 +29,8 @@ __plugin_meta__ = PluginMetadata(
 - `开启/关闭被动 [被动名...]`：在当前群开启/关闭指定被动
 - `开启/关闭所有功能`：在当前群开启/关闭所有功能
 - `开启/关闭所有被动`：在当前群开启/关闭所有被动
+
+内置的管理功能（如功能开关、ban）仅超级用户可以在群内关闭。
 
 **操作示例：**
 - `关闭 签到 抽卡 色图`：在当前群批量关闭指定功能
@@ -45,7 +43,7 @@ __plugin_meta__ = PluginMetadata(
         author="HibiKier",
         version="1.0",
         plugin_type=PluginType.SUPER_AND_ADMIN,
-        admin_level=base_config.get("CHANGE_GROUP_SWITCH_LEVEL", 2),
+        admin_level=1,
         superuser_help="""### 状态查询
 - `插件列表`：查看所有插件的全局状态、群聊状态
 - `被动状态`：查看所有被动技能的状态
@@ -84,15 +82,6 @@ __plugin_meta__ = PluginMetadata(
 - `休息吧 --all`：所有群组进入休眠
 - `醒来 -t 内部测试群`：唤醒带有该标签的群组
 """,
-        configs=[
-            RegisterConfig(
-                key="CHANGE_GROUP_SWITCH_LEVEL",
-                value=2,
-                help="开关群功能权限",
-                default_value=2,
-                type=int,
-            )
-        ],
     ).to_dict(),
 )
 
@@ -163,6 +152,10 @@ async def _handle_switch_command(
 ):
     is_superuser = await SUPERUSER_PERM(bot, event)
     only_flag_value = only_flag.result if only_flag else False
+    if (use_su_field.result or only_flag_value) and not is_superuser:
+        await MessageUtils.build_message("-s 与 -o 仅限超级用户使用").finish(
+            reply_to=True
+        )
 
     is_remote = bool(
         tag.available or groups.available or all_groups_flag.result or only_flag_value

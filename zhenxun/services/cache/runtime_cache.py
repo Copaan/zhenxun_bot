@@ -15,7 +15,6 @@ from .runtime_snapshot import (
     BanEntry,
     BotSnapshot,
     GroupSnapshot,
-    LevelUserSnapshot,
     PluginInfoSnapshot,
     PluginLimitSnapshot,
     TaskInfoSnapshot,
@@ -44,7 +43,6 @@ BAN_MEM_CLEAN_INTERVAL = 60
 BAN_MEM_CLEANUP_DB = True
 BOT_MEM_REFRESH_INTERVAL = 900  # 15分钟
 GROUP_MEM_REFRESH_INTERVAL = 900  # 15分钟
-LEVEL_MEM_REFRESH_INTERVAL = 900  # 15分钟
 TASK_MEM_REFRESH_INTERVAL = 1800
 LIMIT_MEM_REFRESH_INTERVAL = 900  # 15分钟
 
@@ -420,163 +418,6 @@ class GroupMemoryCache(RuntimeMemoryCache):
             await cls.upsert_from_payload(data)
         elif action == "delete":
             await cls.remove(data.get("group_id"), data.get("channel_id"))
-        elif action == "refresh":
-            await cls.refresh()
-
-
-class LevelUserMemoryCache(RuntimeMemoryCache):
-    label = "level"
-    table = "level_users"
-    refresh_interval = LEVEL_MEM_REFRESH_INTERVAL
-    indexes = ("_by_key",)
-    _by_key: ClassVar[dict[tuple[str, str], LevelUserSnapshot]] = {}
-    _by_user_max: ClassVar[dict[str, int]] = {}
-
-    @classmethod
-    def _normalize(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        value = value.strip()
-        return value if value else ""
-
-    @classmethod
-    def _key(cls, user_id: str | None, group_id: str | None) -> tuple[str, str] | None:
-        user_id = cls._normalize(user_id)
-        if not user_id:
-            return None
-        group_id = cls._normalize(group_id) or ""
-        return (user_id, group_id)
-
-    @classmethod
-    async def _refresh_snapshot(cls) -> None:
-        from zhenxun.models.level_user import LevelUser
-
-        async with cls._lock:
-            records = await RuntimeCacheMutation.read_db(
-                cls,
-                LevelUser.all(),
-                operation="LevelUserMemoryCache.refresh",
-            )
-            if records is None:
-                return
-            by_key: dict[tuple[str, str], LevelUserSnapshot] = {}
-            by_user_max: dict[str, int] = {}
-            for record in records:
-                entry = LevelUserSnapshot.from_model(record)
-                key = cls._key(entry.user_id, entry.group_id)
-                if key:
-                    by_key[key] = entry
-                    current = by_user_max.get(entry.user_id, 0)
-                    if entry.user_level > current:
-                        by_user_max[entry.user_id] = entry.user_level
-            cls._by_key = by_key
-            cls._by_user_max = by_user_max
-            RuntimeCacheMutation.mark_refreshed(cls)
-            logger.debug(f"level cache refreshed: {len(by_key)} entries", LOG_COMMAND)
-
-    @classmethod
-    async def get(
-        cls, user_id: str | None, group_id: str | None
-    ) -> LevelUserSnapshot | None:
-        key = cls._key(user_id, group_id)
-        if not key:
-            return None
-        if not cls._loaded:
-            await cls.ensure_loaded()
-        return cls._by_key.get(key)
-
-    @classmethod
-    async def get_levels(
-        cls, user_id: str | None, group_id: str | None
-    ) -> tuple[LevelUserSnapshot | None, LevelUserSnapshot | None]:
-        if not cls._loaded:
-            await cls.ensure_loaded()
-        global_user = None
-        group_user = None
-        global_key = cls._key(user_id, "")
-        if global_key:
-            global_user = cls._by_key.get(global_key)
-        if group_id:
-            group_key = cls._key(user_id, group_id)
-            if group_key:
-                group_user = cls._by_key.get(group_key)
-        return global_user, group_user
-
-    @classmethod
-    async def get_max_level(cls, user_id: str | None) -> int:
-        user_id = cls._normalize(user_id)
-        if not user_id:
-            return 0
-        if not cls._loaded:
-            await cls.ensure_loaded()
-        return cls._by_user_max.get(user_id, 0)
-
-    @classmethod
-    async def upsert_from_model(cls, record) -> None:
-        await cls._upsert(LevelUserSnapshot.from_model(record))
-
-    @classmethod
-    @deferred_mutation
-    async def _upsert(cls, entry: LevelUserSnapshot) -> None:
-        key = cls._key(entry.user_id, entry.group_id)
-        if not key:
-            return
-        async with cls._lock:
-            prev = cls._by_key.get(key)
-            cls._by_key[key] = entry
-            current = cls._by_user_max.get(entry.user_id, 0)
-            if entry.user_level >= current:
-                cls._by_user_max[entry.user_id] = entry.user_level
-            elif prev and prev.user_level == current and entry.user_level < current:
-                cls._recalc_user_max(entry.user_id)
-        RuntimeCacheMutation.publish("level", "upsert", entry.to_payload())
-
-    @classmethod
-    async def upsert_from_payload(cls, payload: dict[str, Any]) -> None:
-        entry = LevelUserSnapshot.from_payload(payload)
-        key = cls._key(entry.user_id, entry.group_id)
-        if not key:
-            return
-        async with cls._lock:
-            prev = cls._by_key.get(key)
-            cls._by_key[key] = entry
-            current = cls._by_user_max.get(entry.user_id, 0)
-            if entry.user_level >= current:
-                cls._by_user_max[entry.user_id] = entry.user_level
-            elif prev and prev.user_level == current and entry.user_level < current:
-                cls._recalc_user_max(entry.user_id)
-
-    @classmethod
-    @deferred_mutation
-    async def remove(cls, user_id: str | None, group_id: str | None) -> None:
-        key = cls._key(user_id, group_id)
-        if not key:
-            return
-        async with cls._lock:
-            removed = cls._by_key.pop(key, None)
-            if removed and cls._by_user_max.get(removed.user_id) == removed.user_level:
-                cls._recalc_user_max(removed.user_id)
-        RuntimeCacheMutation.publish(
-            "level", "delete", {"user_id": key[0], "group_id": key[1] or None}
-        )
-
-    @classmethod
-    def _recalc_user_max(cls, user_id: str) -> None:
-        max_level = 0
-        for entry in cls._by_key.values():
-            if entry.user_id == user_id and entry.user_level > max_level:
-                max_level = entry.user_level
-        if max_level:
-            cls._by_user_max[user_id] = max_level
-        else:
-            cls._by_user_max.pop(user_id, None)
-
-    @classmethod
-    async def apply_sync_event(cls, action: str, data: dict[str, Any]) -> None:
-        if action == "upsert":
-            await cls.upsert_from_payload(data)
-        elif action == "delete":
-            await cls.remove(data.get("user_id"), data.get("group_id"))
         elif action == "refresh":
             await cls.refresh()
 

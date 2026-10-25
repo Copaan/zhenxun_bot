@@ -12,14 +12,14 @@ from nonebot_plugin_alconna import (
     store_true,
 )
 from nonebot_plugin_session import EventSession
+from nonebot_plugin_uninfo import Uninfo
 
-from zhenxun.configs.config import BotConfig, Config
+from zhenxun.configs.config import BotConfig
 from zhenxun.configs.utils import (
     AICallableParam,
     AICallableProperties,
     AICallableTag,
     PluginExtraData,
-    RegisterConfig,
 )
 from zhenxun.services.log import logger
 from zhenxun.utils.enum import PluginType
@@ -28,8 +28,6 @@ from zhenxun.utils.platform import PlatformUtils
 from zhenxun.utils.rules import admin_check
 
 from ._data_source import BanManage, call_ban
-
-base_config = Config.get("ban")
 
 __plugin_meta__ = PluginMetadata(
     name="Ban",
@@ -80,16 +78,7 @@ __plugin_meta__ = PluginMetadata(
             unban 123456789     : 从小黑屋中拉出来
             unban -g 999999     : 将群组9999999从小黑屋中拉出来
         """,
-        admin_level=base_config.get("BAN_LEVEL", 5),
-        configs=[
-            RegisterConfig(
-                key="BAN_LEVEL",
-                value=5,
-                help="ban/unban所需要的管理员权限等级",
-                default_value=5,
-                type=int,
-            )
-        ],
+        admin_level=1,
         smart_tools=[
             AICallableTag(
                 name="call_ban",
@@ -125,7 +114,7 @@ _ban_matcher = on_alconna(
         Option("-g|--group", Args["group_id", str]),
         Option("-t|--time", Args["duration", int]),
     ),
-    rule=admin_check("ban", "BAN_LEVEL"),
+    rule=admin_check(),
     priority=5,
     block=True,
 )
@@ -137,7 +126,7 @@ _unban_matcher = on_alconna(
         Option("-g|--group", Args["group_id", str]),
         Option("--id", Args["idx", int]),
     ),
-    rule=admin_check("ban", "BAN_LEVEL"),
+    rule=admin_check(),
     priority=5,
     block=True,
 )
@@ -193,6 +182,7 @@ async def _(
 async def _(
     bot: Bot,
     session: EventSession,
+    uninfo: Uninfo,
     arparma: Arparma,
     user: Match[str | At],
     reason: Match[str],
@@ -231,6 +221,13 @@ async def _(
                     " 狠狠惩戒了一番，一脚踢进了小黑屋!"
                     f" 在里面乖乖呆 {_duration_text}吧!",
                 ]
+            ).finish(reply_to=True)
+        if not is_superuser and (
+            PlatformUtils.is_superuser(bot, user_id)
+            or await PlatformUtils.is_group_admin(bot, uninfo, user_id)
+        ):
+            await MessageUtils.build_message(
+                "不能对超级用户或群管理员使用ban捏..."
             ).finish(reply_to=True)
         await BanManage.ban(
             user_id,
@@ -294,6 +291,8 @@ async def _(
             user_id = user.result
     if gid := session.id3 or session.id2:
         if group_id.available:
+            if not is_superuser:
+                await MessageUtils.build_message("权限不足捏...").finish(reply_to=True)
             gid = group_id.result
         is_unban, result = await BanManage.unban(
             user_id, gid, session, _idx, is_superuser

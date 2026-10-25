@@ -312,7 +312,7 @@ def require_superuser() -> ToolOptions:
 
 
 def require_admin_level(min_level: int = 1) -> ToolOptions:
-    """仅限满足指定群聊权限等级的用户使用。"""
+    """仅限超级用户与当前群的群主、管理员使用。"""
     return ToolOptions(
         capabilities=[AdminLevelCapability(min_level)],
         metadata={"admin_level": min_level},

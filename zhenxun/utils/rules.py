@@ -6,16 +6,15 @@ from nonebot_plugin_uninfo import Uninfo
 
 from zhenxun.configs.config import Config
 from zhenxun.models.group_console import GroupConsole
-from zhenxun.models.level_user import LevelUser
 from zhenxun.utils.platform import PlatformUtils
 
 
-def admin_check(a: int | str, key: str | None = None) -> Rule:
+def admin_check(a: int | str = 1, key: str | None = None) -> Rule:
     """
-    管理员权限等级检查
+    群管理员检查，超级用户总是通过
 
     参数:
-        a: 权限等级或 配置项 module
+        a: 权限等级或 配置项 module，等级大于 0 时要求群主或管理员
         key: 配置项 key.
 
     返回:
@@ -25,20 +24,12 @@ def admin_check(a: int | str, key: str | None = None) -> Rule:
     async def _rule(bot: Bot, event: Event, session: Uninfo) -> bool:
         if await SUPERUSER(bot, event):
             return True
-        if PlatformUtils.is_qbot(session):
-            """官bot接口，放弃所有权限检查"""
+        if not (session.group or session.guild):
             return False
-        if session.group:
-            level = a
-            if isinstance(a, str) and key:
-                level = Config.get_config(a, key)
-            if level is not None:
-                return bool(
-                    await LevelUser.check_level(
-                        session.user.id, session.group.id, int(level)
-                    )
-                )
-        return False
+        level = Config.get_config(a, key) if isinstance(a, str) and key else a
+        if level is None:
+            return False
+        return int(level) <= 0 or await PlatformUtils.is_group_admin(bot, session)
 
     return Rule(_rule)
 

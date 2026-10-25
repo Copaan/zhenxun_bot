@@ -16,7 +16,6 @@ from zhenxun.configs.path_config import DATA_PATH, IMAGE_PATH
 from zhenxun.models.fg_request import FgRequest
 from zhenxun.models.group_console import GroupConsole
 from zhenxun.models.group_member_info import GroupInfoUser
-from zhenxun.models.level_user import LevelUser
 from zhenxun.services.hot_query_cache import (
     invalidate_group_members,
     invalidate_member_names,
@@ -128,49 +127,6 @@ class GroupManager:
             )
 
     @classmethod
-    async def __refresh_level(cls, bot: Bot, group_id: str):
-        """刷新权限
-
-        参数:
-            bot: Bot
-            group_id: 群组id
-        """
-        admin_default_auth = Config.get_config("admin_bot_manage", "ADMIN_DEFAULT_AUTH")
-        member_list = await bot.get_group_member_list(group_id=group_id)
-        member_id_list = [str(user_info["user_id"]) for user_info in member_list]
-        flag2u = await LevelUser.filter(
-            user_id__in=member_id_list, group_id=group_id, group_flag=1
-        ).values_list("user_id", flat=True)
-        # 即刻刷新权限
-        for user_info in member_list:
-            user_id = str(user_info["user_id"])
-            role = user_info["role"]
-            if user_id in bot.config.superusers:
-                await LevelUser.set_level(user_id, group_id, 9)
-                logger.debug(
-                    "添加超级用户权限: 9",
-                    "入群检测",
-                    session=user_id,
-                    group_id=user_info["group_id"],
-                )
-            elif (
-                admin_default_auth is not None
-                and role in ["owner", "admin"]
-                and user_id not in flag2u
-            ):
-                await LevelUser.set_level(
-                    user_id,
-                    group_id,
-                    admin_default_auth if role == "admin" else admin_default_auth + 1,
-                )
-                logger.debug(
-                    f"添加默认群管理员权限: {admin_default_auth}",
-                    "入群检测",
-                    session=user_id,
-                    group_id=user_info["group_id"],
-                )
-
-    @classmethod
     async def add_bot(
         cls, bot: Bot, operator_id: str, group_id: str, group: GroupConsole
     ):
@@ -214,8 +170,6 @@ class GroupManager:
             )
         else:
             await cls.__handle_add_group(bot, group_id, group)
-            """刷新群管理员权限"""
-            await cls.__refresh_level(bot, group_id)
             if BotProfileManager.is_auto_send_profile():
                 file_path = await BotProfileManager.build_bot_profile_image(bot.self_id)
                 if file_path:

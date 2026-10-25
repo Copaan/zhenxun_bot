@@ -15,6 +15,7 @@ from pydantic import BaseModel
 from zhenxun.configs.config import BotConfig
 from zhenxun.models.friend_user import FriendUser
 from zhenxun.models.group_console import GroupConsole
+from zhenxun.services.cache.cache_containers import CacheDict
 from zhenxun.services.log import logger
 from zhenxun.services.network_proxy import ManagedAsyncClient
 from zhenxun.services.platform_identity import native_id
@@ -23,6 +24,11 @@ from zhenxun.utils.http_utils import AsyncHttpx
 from zhenxun.utils.message import MessageUtils
 
 driver = nonebot.get_driver()
+
+_ADMIN_ROLE_LEVEL = 10
+"""uninfo 中管理员角色的等级，群主为 100"""
+_ROLE_RETRY_EXPIRE = 30
+_GROUP_ROLE_CACHE = CacheDict[int]("PLATFORM_GROUP_ROLE", expire=300, max_items=4096)
 
 
 def _adapter_name(bot: Bot) -> str:
@@ -142,6 +148,49 @@ class PlatformUtils:
         if cls.get_platform_scope(bot) in ("qq_client", "qq_api"):
             return user_id in superusers
         return user_id in BotConfig.get_superuser(cls.get_platform(bot))
+
+    @classmethod
+    async def is_group_admin(
+        cls, bot: Bot, session: Uninfo, user_id: str | None = None
+    ) -> bool:
+        """判断用户是否为当前群聊或频道的群主、管理员
+
+        优先使用事件携带的群角色，缺失时查询一次群成员信息并缓存
+
+        参数:
+            bot: Bot
+            session: Uninfo
+            user_id: 用户id，默认为事件发送者
+
+        返回:
+            bool: 是否为群主或管理员
+        """
+        scene = session.group or session.guild
+        if scene is None:
+            return False
+        user_id = str(user_id or session.user.id)
+        role = None
+        if session.member and session.member.id == user_id:
+            role = session.member.role
+        if role is not None:
+            return role.level >= _ADMIN_ROLE_LEVEL
+        key = f"{bot.self_id}:{scene.type}:{scene.id}:{user_id}"
+        if key in _GROUP_ROLE_CACHE:
+            return _GROUP_ROLE_CACHE[key] >= _ADMIN_ROLE_LEVEL
+        level = 0
+        try:
+            if interface := get_interface(bot):
+                member = await interface.get_member(scene.type, scene.id, user_id)
+                if member and member.role:
+                    level = member.role.level
+        except Exception as e:
+            logger.debug(
+                "查询群成员角色失败", "权限", session=user_id, group_id=scene.id, e=e
+            )
+            _GROUP_ROLE_CACHE.set(key, level, expire=_ROLE_RETRY_EXPIRE)
+            return False
+        _GROUP_ROLE_CACHE[key] = level
+        return level >= _ADMIN_ROLE_LEVEL
 
     @classmethod
     def _resolve_unique_qq_client_bot(cls, log_cmd: str | None = None) -> Bot | None:

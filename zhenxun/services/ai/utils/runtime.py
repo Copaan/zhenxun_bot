@@ -212,22 +212,25 @@ class PermissionUtils:
 
     @staticmethod
     async def check_admin_level(context: Any, min_level: int) -> bool:
-        """异步校验当前用户在全局或当前群聊中的管理权限等级是否达到最低要求"""
-        if await PermissionUtils.check_superuser(context):
-            return True
+        """校验当前用户的管理权限
 
-        user_id = context.get_user_id()
-        group_id = context.get_group_id()
-        if not user_id:
+        参数:
+            context: 运行上下文
+            min_level: 权限等级，大于 0 时要求超级用户或当前群的群主、管理员
+
+        返回:
+            bool: 是否满足
+        """
+        if min_level <= 0 or await PermissionUtils.check_superuser(context):
+            return True
+        bot = context.get_bot()
+        event = context.get_event()
+        if not bot or not event:
             return False
 
-        from zhenxun.services.cache.runtime_cache import LevelUserMemoryCache
+        from nonebot_plugin_uninfo import get_session
 
-        global_user, group_users = await LevelUserMemoryCache.get_levels(
-            user_id, group_id
-        )
-        user_level = global_user.user_level if global_user else 0
-        if group_id and group_users:
-            user_level = max(user_level, group_users.user_level)
+        from zhenxun.utils.platform import PlatformUtils
 
-        return user_level >= min_level
+        session = await get_session(bot, event)
+        return bool(session) and await PlatformUtils.is_group_admin(bot, session)

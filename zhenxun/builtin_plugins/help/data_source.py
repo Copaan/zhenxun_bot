@@ -4,7 +4,6 @@ from nonebot_plugin_uninfo import Uninfo
 from zhenxun import ui
 from zhenxun.configs.config import BotConfig, Config
 from zhenxun.configs.utils import PluginExtraData
-from zhenxun.models.level_user import LevelUser
 from zhenxun.models.plugin_info import PluginInfo
 from zhenxun.models.statistics import Statistics
 from zhenxun.services import avatar_service
@@ -12,7 +11,6 @@ from zhenxun.services.ai.core.exceptions import LLMException
 from zhenxun.services.db_context import with_db_timeout
 from zhenxun.services.log import logger
 from zhenxun.services.message_load import is_db_unhealthy
-from zhenxun.services.platform_identity import CURRENT_PLATFORM_SCOPE, scoped_user_id
 from zhenxun.services.renderer.result_cache import RenderResultMemoryCache
 from zhenxun.services.startup_load import startup_load_planner
 from zhenxun.ui.models import PluginMenuCategory, PluginMenuData
@@ -152,49 +150,37 @@ async def create_help_img(
     return image_bytes
 
 
-async def get_user_allow_help(user_id: str, is_superuser: bool) -> list[str]:
+def get_user_allow_help(is_admin: bool, is_superuser: bool) -> list[str]:
     """获取用户可访问插件类型列表
 
     参数:
-        user_id: 用户id
+        is_admin: 是否为当前群的群主或管理员
         is_superuser: 是否为超级用户
 
     返回:
         list[str]: 插件类型列表
     """
     type_list = ["NORMAL", "DEPENDANT"]
-    levels = (
-        []
-        if CURRENT_PLATFORM_SCOPE.get() == "qq_api"
-        else await _read_db(
-            lambda: LevelUser.filter(user_id=scoped_user_id(user_id)).values_list(
-                "user_level", flat=True
-            ),
-            "Help.user_allow_level",
-        )
-    )
-    for level in levels:
-        if level > 0:  # type: ignore
-            type_list.extend(("ADMIN", "ADMIN_SUPER"))
-            break
+    if is_admin or is_superuser:
+        type_list.extend(("ADMIN", "ADMIN_SUPER"))
     if is_superuser:
         type_list.append("SUPERUSER")
     return type_list
 
 
 async def get_plugin_help(
-    user_id: str, name: str, is_superuser: bool, variant: str | None = None
+    is_admin: bool, name: str, is_superuser: bool, variant: str | None = None
 ) -> str | bytes | None:
     """获取功能的帮助信息
 
     参数:
-        user_id: 用户id
+        is_admin: 是否为当前群的群主或管理员
         name: 插件名称或id
         is_superuser: 是否为超级用户
         variant: 使用的皮肤/变体名称
     """
     try:
-        type_list = await get_user_allow_help(user_id, is_superuser)
+        type_list = get_user_allow_help(is_admin, is_superuser)
         if name.isdigit():
             plugin = await _read_db(
                 lambda: PluginInfo.get_or_none(id=int(name), plugin_type__in=type_list),
@@ -285,13 +271,15 @@ async def get_plugin_help(
     return None
 
 
-async def get_llm_help(question: str, user_id: str, is_superuser: bool) -> str | bytes:
+async def get_llm_help(
+    question: str, is_admin: bool, is_superuser: bool
+) -> str | bytes:
     """
     使用LLM来回答用户的自然语言求助。
 
     参数:
         question: 用户的问题。
-        user_id: 提问用户的ID。
+        is_admin: 是否为当前群的群主或管理员。
         is_superuser: 是否为超级用户。
 
     返回:
@@ -300,7 +288,7 @@ async def get_llm_help(question: str, user_id: str, is_superuser: bool) -> str |
 
     try:
         try:
-            allowed_types = await get_user_allow_help(user_id, is_superuser)
+            allowed_types = get_user_allow_help(is_admin, is_superuser)
             plugins = await _read_db(
                 lambda: PluginInfo.get_plugins(
                     load_status=True,

@@ -9,15 +9,10 @@ from zhenxun.services.cache.keyed import KeyedLocks
 from zhenxun.services.cache.runtime_cache import (
     BotMemoryCache,
     GroupMemoryCache,
-    LevelUserMemoryCache,
     PluginInfoMemoryCache,
     PluginLimitMemoryCache,
 )
-from zhenxun.services.cache.runtime_snapshot import (
-    BotSnapshot,
-    GroupSnapshot,
-    LevelUserSnapshot,
-)
+from zhenxun.services.cache.runtime_snapshot import BotSnapshot, GroupSnapshot
 from zhenxun.services.cache.runtime_sync import (
     RuntimeCacheMutation,
     RuntimeMemoryCache,
@@ -27,12 +22,14 @@ from zhenxun.services.log import logger
 from zhenxun.services.message_load import is_db_unhealthy
 from zhenxun.services.platform_identity import is_namespaced_scope
 from zhenxun.utils.enum import BlockType, PluginType
+from zhenxun.utils.platform import PlatformUtils
 
 from .auth.config import LOGGER_COMMAND
 from .auth.context import EventContext
 
 if TYPE_CHECKING:
     from nonebot.adapters import Bot
+    from nonebot_plugin_uninfo import Uninfo
 
     from zhenxun.models.plugin_info import PluginInfo
 
@@ -253,9 +250,7 @@ class AuthSnapshot:
     profile: PluginAuthProfile
     bot_data: BotSnapshot | None = None
     group: GroupSnapshot | None = None
-    admin_levels: tuple[LevelUserSnapshot | None, LevelUserSnapshot | None] | None = (
-        None
-    )
+    is_group_admin: bool = False
 
     @property
     def module(self) -> str:
@@ -284,14 +279,16 @@ async def build_auth_snapshot(
     plugin: object,
     profile: PluginAuthProfile,
     bot: Bot,
+    session: Uninfo,
 ) -> AuthSnapshot:
-    """从运行态缓存读取 Bot、群组、管理员等级，构建权限快照
+    """从运行态缓存读取 Bot、群组，并判断群管理员身份，构建权限快照
 
     参数:
         context: EventContext
         plugin: 插件信息
         profile: 插件权限配置
         bot: Bot
+        session: Uninfo
 
     异常:
         CacheUnavailable: 缓存不可用，跳过本条消息
@@ -313,15 +310,12 @@ async def build_auth_snapshot(
         if group is None:
             group = await _repair_missing_group(context)
 
-    admin_levels = None
-    if context.platform_scope == "qq_api":
-        admin_levels = (None, None)
-    elif profile.need_admin:
-        await require_cache(LevelUserMemoryCache)
-        admin_levels = await LevelUserMemoryCache.get_levels(
-            context.storage_user_id or entity.user_id,
-            context.storage_group_id or entity.group_id,
-        )
+    is_group_admin = (
+        profile.admin_level > 0
+        and not context.is_superuser
+        and bool(entity.group_id)
+        and await PlatformUtils.is_group_admin(bot, session, entity.user_id)
+    )
 
     return AuthSnapshot(
         context=context,
@@ -329,7 +323,7 @@ async def build_auth_snapshot(
         profile=profile,
         bot_data=bot_data,
         group=group,
-        admin_levels=admin_levels,
+        is_group_admin=is_group_admin,
     )
 
 

@@ -1,11 +1,11 @@
 import json
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
 from zhenxun.services.ai.core.stream_events import ToolStreamChunkEvent
 from zhenxun.services.ai.run.context import RunContext
-from zhenxun.services.ai.tools.core.decorators import tool
+from zhenxun.services.ai.tools.core.decorators import Rules, tool
 from zhenxun.services.ai.tools.core.toolkit import BaseToolkit
-from zhenxun.services.ai.tools.models import ToolResult
+from zhenxun.services.ai.tools.models import ToolkitConfig, ToolResult
 from zhenxun.services.ai.utils.logger import log_tool as logger
 from zhenxun.services.network_proxy import ManagedAsyncClient
 
@@ -17,6 +17,10 @@ class RestApiToolkit(BaseToolkit):
     """
 
     default_prefix = ""
+    _default_config: ClassVar[ToolkitConfig] = ToolkitConfig(
+        shared_options=Rules.superuser()
+    )
+    """默认仅超级用户可见，实例化时传入 shared_options 可覆盖"""
 
     default_instructions = (
         "你拥有调用外部 REST API 接口的能力。\n"
