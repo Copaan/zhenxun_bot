@@ -4,7 +4,7 @@ import time
 from typing import Annotated
 from urllib.parse import urlsplit
 
-from fastapi import APIRouter, Depends, UploadFile
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
@@ -79,6 +79,13 @@ class ExportPayload(BaseModel):
     """高级模式选择记录的依赖包名，为空时记录全部依赖"""
     password: str | None = None
     """加密密码"""
+
+
+class UploadPayload(BaseModel):
+    name: str
+    """备份包文件名"""
+    size: int
+    """备份包总字节数"""
 
 
 class InspectPayload(BaseModel):
@@ -210,17 +217,84 @@ async def _(token: str, name: str):
 
 
 @setup_router.post(
-    "/upload", response_class=JSONResponse, description="首次部署上传备份包"
+    "/upload", response_class=JSONResponse, description="首次部署开始分片上传备份包"
 )
-@router.post("/upload", response_class=JSONResponse, description="上传备份包")
-async def _(file: UploadFile) -> Result[str]:
+@router.post("/upload", response_class=JSONResponse, description="开始分片上传备份包")
+async def _(payload: UploadPayload) -> Result[dict]:
     try:
-        path = await asyncio.to_thread(
-            backup.save_upload, file.filename or "", file.file
+        upload_id = await asyncio.to_thread(
+            backup.ChunkUpload.start, payload.name, payload.size
         )
     except backup.BackupError as error:
         return Result.fail(str(error), 400)
+    return Result.ok({"id": upload_id, "chunk_size": backup.ChunkUpload.CHUNK_SIZE})
+
+
+@setup_router.get(
+    "/upload/{upload_id}", response_class=JSONResponse, description="首次部署上传进度"
+)
+@router.get("/upload/{upload_id}", response_class=JSONResponse, description="上传进度")
+async def _(upload_id: str) -> Result[int]:
+    try:
+        return Result.ok(await asyncio.to_thread(backup.ChunkUpload.offset, upload_id))
+    except backup.BackupError as error:
+        return Result.fail(str(error), 404)
+
+
+@setup_router.put(
+    "/upload/{upload_id}", response_class=JSONResponse, description="首次部署上传分片"
+)
+@router.put("/upload/{upload_id}", response_class=JSONResponse, description="上传分片")
+async def _(upload_id: str, offset: int, request: Request) -> Result[int]:
+    limit = backup.ChunkUpload.CHUNK_LIMIT
+    if int(request.headers.get("content-length") or 0) > limit:
+        return Result.fail("分片过大", 413)
+    chunk = bytearray()
+    async for data in request.stream():
+        chunk += data
+        if len(chunk) > limit:
+            return Result.fail("分片过大", 413)
+    try:
+        received = await asyncio.to_thread(
+            backup.ChunkUpload.write, upload_id, offset, bytes(chunk)
+        )
+    except backup.UploadOffsetError as error:
+        return Result.fail(str(error), 409, {"offset": error.offset})
+    except backup.BackupError as error:
+        return Result.fail(str(error), 400)
+    return Result.ok(received)
+
+
+@setup_router.post(
+    "/upload/{upload_id}/finish",
+    response_class=JSONResponse,
+    description="首次部署完成分片上传",
+)
+@router.post(
+    "/upload/{upload_id}/finish",
+    response_class=JSONResponse,
+    description="完成分片上传",
+)
+async def _(upload_id: str) -> Result[str]:
+    try:
+        path = await asyncio.to_thread(backup.ChunkUpload.finish, upload_id)
+    except backup.BackupError as error:
+        return Result.fail(str(error), 400)
     return Result.ok(path.name)
+
+
+@setup_router.delete(
+    "/upload/{upload_id}", response_class=JSONResponse, description="首次部署取消上传"
+)
+@router.delete(
+    "/upload/{upload_id}", response_class=JSONResponse, description="取消上传"
+)
+async def _(upload_id: str) -> Result:
+    try:
+        await asyncio.to_thread(backup.ChunkUpload.cancel, upload_id)
+    except backup.BackupError as error:
+        return Result.fail(str(error), 404)
+    return Result.ok()
 
 
 @setup_router.post(

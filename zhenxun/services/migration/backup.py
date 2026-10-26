@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+import contextlib
 from datetime import datetime
 import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import secrets
 import shutil
 import sys
 import tempfile
+import threading
+import time
 from typing import ClassVar, Literal
 import zipfile
 
@@ -25,6 +29,7 @@ SUFFIX = ".zx"
 MANIFEST = "manifest.json"
 DEPENDENCIES = "dependencies.json"
 BACKUP_DIR = Path("data/backups")
+UPLOAD_DIR = BACKUP_DIR / ".uploads"
 CATEGORIES = ("configuration", "data", "plugins", "resources")
 DEFAULT_CATEGORIES = ("configuration", "data", "plugins")
 _ROOTS = ("data", "resources", "zhenxun/plugins", "certs")
@@ -520,32 +525,147 @@ class ExportTask:
         return cls.status
 
 
-def save_upload(name: str, stream, root: Path | None = None) -> Path:
-    """把上传的备份包保存到备份目录，重名时自动编号
+class UploadOffsetError(BackupError):
+    """分片偏移与已接收的大小不一致"""
 
-    参数:
-        name: 上传的文件名
-        stream: 文件流
-        root: 项目根目录
+    def __init__(self, offset: int):
+        super().__init__("分片位置与已上传进度不一致")
+        self.offset = offset
 
-    返回:
-        Path: 保存后的路径
-    """
-    stem = PurePosixPath(name.replace("\\", "/")).name
-    if not stem.endswith(SUFFIX) or stem.startswith("."):
-        raise BackupError("只能上传 .zx 备份包")
-    directory = (root or Path.cwd()) / BACKUP_DIR
-    directory.mkdir(parents=True, exist_ok=True)
-    path, index = directory / stem, 1
-    while path.exists():
-        path = directory / f"{stem[: -len(SUFFIX)]}-{index}{SUFFIX}"
-        index += 1
-    part = path.with_name(path.name + ".part")
-    try:
-        with part.open("wb") as file:
-            shutil.copyfileobj(stream, file, 1024 * 1024)
-        is_encrypted(part)
-        part.replace(path)
-    finally:
-        part.unlink(missing_ok=True)
-    return path
+
+class ChunkUpload:
+    """分片上传备份包：每片单独请求，可从已接收的位置续传"""
+
+    CHUNK_SIZE = 32 * 1024 * 1024
+    """建议的分片大小，需低于反向代理的单次请求体上限"""
+    CHUNK_LIMIT = 64 * 1024 * 1024
+    """单个分片允许的最大字节数"""
+    TTL = 24 * 3600
+    """未完成上传的保留时间（秒）"""
+    _lock = threading.Lock()
+
+    @staticmethod
+    def _files(upload_id: str, root: Path | None) -> tuple[Path, Path]:
+        if not re.fullmatch(r"[\w-]{16,64}", upload_id):
+            raise BackupError("上传任务不存在或已过期")
+        directory = (root or Path.cwd()) / UPLOAD_DIR
+        return directory / f"{upload_id}.part", directory / f"{upload_id}.json"
+
+    @classmethod
+    def _meta(cls, upload_id: str, root: Path | None) -> tuple[Path, Path, dict]:
+        part, meta = cls._files(upload_id, root)
+        try:
+            return part, meta, json.loads(meta.read_text("utf-8"))
+        except (OSError, ValueError):
+            raise BackupError("上传任务不存在或已过期") from None
+
+    @classmethod
+    def start(cls, name: str, size: int, root: Path | None = None) -> str:
+        """创建上传任务，并清理过期的未完成上传
+
+        参数:
+            name: 备份包文件名
+            size: 备份包总字节数
+            root: 项目根目录
+
+        返回:
+            str: 上传任务 ID
+        """
+        stem = PurePosixPath(name.replace("\\", "/")).name
+        if not stem.endswith(SUFFIX) or stem.startswith("."):
+            raise BackupError("只能上传 .zx 备份包")
+        if size <= 0:
+            raise BackupError("备份包为空")
+        directory = (root or Path.cwd()) / UPLOAD_DIR
+        directory.mkdir(parents=True, exist_ok=True)
+        expired = time.time() - cls.TTL
+        for item in directory.iterdir():
+            with contextlib.suppress(OSError):
+                if item.stat().st_mtime < expired:
+                    item.unlink()
+        upload_id = secrets.token_urlsafe(16)
+        part, meta = cls._files(upload_id, root)
+        part.touch()
+        meta.write_text(json.dumps({"name": stem, "size": size}), "utf-8")
+        return upload_id
+
+    @classmethod
+    def offset(cls, upload_id: str, root: Path | None = None) -> int:
+        """已接收的字节数，用于断点续传
+
+        参数:
+            upload_id: 上传任务 ID
+            root: 项目根目录
+
+        返回:
+            int: 已接收的字节数
+        """
+        part, _, _ = cls._meta(upload_id, root)
+        return part.stat().st_size
+
+    @classmethod
+    def write(
+        cls, upload_id: str, offset: int, chunk: bytes, root: Path | None = None
+    ) -> int:
+        """在指定位置追加一个分片
+
+        参数:
+            upload_id: 上传任务 ID
+            offset: 分片在文件中的起始位置，须等于已接收的字节数
+            chunk: 分片内容
+            root: 项目根目录
+
+        返回:
+            int: 写入后已接收的字节数
+        """
+        with cls._lock:
+            part, _, info = cls._meta(upload_id, root)
+            received = part.stat().st_size
+            if offset != received:
+                raise UploadOffsetError(received)
+            if received + len(chunk) > info["size"]:
+                raise BackupError("上传内容超出备份包大小")
+            with part.open("ab") as file:
+                file.write(chunk)
+            return received + len(chunk)
+
+    @classmethod
+    def finish(cls, upload_id: str, root: Path | None = None) -> Path:
+        """校验已接收的备份包并移入备份目录，重名时自动编号
+
+        参数:
+            upload_id: 上传任务 ID
+            root: 项目根目录
+
+        返回:
+            Path: 保存后的路径
+        """
+        with cls._lock:
+            part, meta, info = cls._meta(upload_id, root)
+            if part.stat().st_size != info["size"]:
+                raise BackupError("备份包尚未上传完整")
+            try:
+                is_encrypted(part)
+            except BackupError:
+                cls.cancel(upload_id, root)
+                raise
+            directory = (root or Path.cwd()) / BACKUP_DIR
+            stem: str = info["name"]
+            path, index = directory / stem, 1
+            while path.exists():
+                path = directory / f"{stem[: -len(SUFFIX)]}-{index}{SUFFIX}"
+                index += 1
+            part.replace(path)
+            meta.unlink(missing_ok=True)
+            return path
+
+    @classmethod
+    def cancel(cls, upload_id: str, root: Path | None = None):
+        """放弃上传任务并删除已接收的内容
+
+        参数:
+            upload_id: 上传任务 ID
+            root: 项目根目录
+        """
+        for item in cls._files(upload_id, root):
+            item.unlink(missing_ok=True)
