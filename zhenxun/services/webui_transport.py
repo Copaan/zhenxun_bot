@@ -78,7 +78,8 @@ def install_uvicorn_pathsend(prefixes: tuple[str, ...]) -> bool:
     """为指定路径的明文 HTTP 请求开启 ASGI pathsend 扩展
 
     FileResponse 检测到该扩展后改为整文件交给内核发送（loop.sendfile），
-    传输过程不再逐块经过事件循环。HTTPS 连接与其他路径不声明扩展，仍按块发送。
+    传输过程不再逐块经过事件循环。HTTPS 连接、其他路径以及未实现 sendfile 的
+    事件循环（如 uvloop）不声明扩展，仍按块发送。
 
     参数:
         prefixes: 开启扩展的请求路径前缀
@@ -113,6 +114,7 @@ def install_uvicorn_pathsend(prefixes: tuple[str, ...]) -> bool:
             cycle.scope["type"] == "http"
             and str(cycle.scope.get("path", "")).startswith(prefixes)
             and cycle.transport.get_extra_info("sslcontext") is None
+            and _supports_sendfile()
         ):
             cycle.scope.setdefault("extensions", {})["http.response.pathsend"] = {}
         await original_run(cycle, app)
@@ -146,6 +148,15 @@ def install_uvicorn_pathsend(prefixes: tuple[str, ...]) -> bool:
     setattr(RequestResponseCycle, "run_asgi", run_asgi)
     setattr(RequestResponseCycle, "send", send)
     return True
+
+
+def _supports_sendfile() -> bool:
+    """当前事件循环是否实现 loop.sendfile
+
+    返回:
+        bool: 标准 asyncio 事件循环为 True，uvloop 等未实现的为 False
+    """
+    return isinstance(asyncio.get_running_loop(), asyncio.BaseEventLoop)
 
 
 async def _abort_closing_connections(server: Any) -> None:
