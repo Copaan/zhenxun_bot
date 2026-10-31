@@ -58,21 +58,40 @@ def _legacy_type(api_type: Any) -> tuple[str | None, str, str]:
     return _LEGACY_TYPES.get(str(api_type or "openai").lower(), _LEGACY_TYPES["openai"])
 
 
+def _legacy_params(raw: dict[str, Any], fields: tuple[str, ...]) -> dict[str, Any]:
+    """读取旧版配置中的生成参数；max_output_tokens 不大于 1 是未填写的占位值，
+    此时与它同时出现的 temperature 0 也视为未填写
+
+    参数:
+        raw: 旧版服务商或模型配置
+        fields: 要读取的旧版字段
+
+    返回:
+        dict[str, Any]: 当前结构的生成参数
+    """
+    names = {
+        "temperature": "temperature",
+        "max_output_tokens": "max_tokens",
+        "reasoning_effort": "reasoning_effort",
+    }
+    params = {names[key]: raw[key] for key in fields if raw.get(key) is not None}
+    tokens = params.get("max_tokens")
+    if isinstance(tokens, int | float) and tokens <= 1:
+        del params["max_tokens"]
+        if params.get("temperature") == 0:
+            del params["temperature"]
+    return params
+
+
 def _migrate_legacy_model(
     raw: dict[str, Any], provider_type: str, api_base: str | None
 ) -> dict[str, Any]:
     model: dict[str, Any] = {"name": str(raw.get("model_name") or raw.get("name"))}
     if raw.get("is_available") is False:
         model["enabled"] = False
-    params = {
-        new: raw[old]
-        for old, new in (
-            ("temperature", "temperature"),
-            ("max_output_tokens", "max_tokens"),
-            ("reasoning_effort", "reasoning_effort"),
-        )
-        if raw.get(old) is not None
-    }
+    params = _legacy_params(
+        raw, ("temperature", "max_output_tokens", "reasoning_effort")
+    )
     if params:
         model["params"] = params
     profile: dict[str, Any] = {}
@@ -107,7 +126,9 @@ def _migrate_legacy_provider(
     api_type = str(raw.get("api_type") or "openai").lower()
     preset, protocol, version = _legacy_type(api_type)
     api_base = raw.get("api_base") or None
-    preset = detect_preset(api_base) or preset
+    detected = detect_preset(api_base)
+    if detected or (api_base and api_type == "openai"):
+        preset = detected
     if api_type == "openai_responses" and preset != "openai":
         preset = None
     keys = raw.get("api_key") or raw.get("api_keys") or []
@@ -124,14 +145,7 @@ def _migrate_legacy_provider(
             if isinstance(m, dict)
         ],
     }
-    params = {
-        new: raw[old]
-        for old, new in (
-            ("temperature", "temperature"),
-            ("max_output_tokens", "max_tokens"),
-        )
-        if raw.get(old) is not None
-    }
+    params = _legacy_params(raw, ("temperature", "max_output_tokens"))
     if protocol == "gemini" and gemini_threshold and gemini_threshold != "BLOCK_NONE":
         params["safetySettings"] = [
             {"category": category, "threshold": gemini_threshold}

@@ -356,6 +356,7 @@ class ManagedOneBotAdapter(Adapter):
             await websocket.close(1008, content)
             return
 
+        await websocket.accept()
         if not await self._admit(self_id):
             await websocket.close(1013, "Runtime starting")
             return
@@ -364,7 +365,6 @@ class ManagedOneBotAdapter(Adapter):
             await websocket.close(1008, "Duplicate X-Self-ID")
             return
 
-        await websocket.accept()
         bot = Bot(self, self_id)
         self.bot_connect(bot)
         self.connections[self_id] = websocket

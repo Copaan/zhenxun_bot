@@ -431,7 +431,16 @@ def parse_chat(route, request: Any, payload: dict[str, Any]) -> ChatResponse:
                 parts.append(output_image(inline["data"], mime))
         elif signature and parts:
             parts[-1].metadata = deep_merge(parts[-1].metadata or {}, metadata or {})
-    ensure_content(route, parts, candidate.get("finishReason") != "MAX_TOKENS")
+    usage = payload.get("usageMetadata")
+    output_tokens = (
+        (usage.get("candidatesTokenCount") or 0)
+        + (usage.get("thoughtsTokenCount") or 0)
+        if isinstance(usage, dict)
+        else None
+    )
+    ensure_content(
+        route, parts, candidate.get("finishReason") != "MAX_TOKENS", output_tokens
+    )
     grounding = candidate.get("groundingMetadata")
     return ChatResponse(
         content_parts=parts,

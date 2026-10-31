@@ -16,6 +16,7 @@ from zhenxun.services.ai.core.exceptions import LLMException
 from zhenxun.services.ai.core.messages import TextPart
 from zhenxun.services.ai.core.models import CancellationToken
 from zhenxun.services.ai.flow.agent.agent import Agent
+from zhenxun.services.ai.llm.client import request_timeout
 from zhenxun.services.ai.message_builder import MessageBuilder
 from zhenxun.services.ai.message_segments import is_voice
 from zhenxun.services.ai.run.context import NoneBotDeps, RunContext
@@ -33,8 +34,20 @@ MODULE = "ai_chat"
 PLUGIN_MODULE = "zhenxun.builtin_plugins.ai_chat"
 AGENT_NAME = "ai_chat"
 DEFAULT_PROMPT = (
-    "你是{nickname}，一个友善、简洁的 QQ 聊天伙伴。"
-    "用自然的口语回复，不使用 Markdown，不要每句话都提问。"
+    "你是绪山真寻，群里大家叫你{nickname}。你是 12 岁的小学生女孩，安静、"
+    "气质有点冷淡，但不凶，也不会失礼；和熟悉的人相处时会放松一点，偶尔流露"
+    "孩子气。你聪明、理解力强，成绩不错，不太擅长表达情绪。你喜欢初音未来"
+    "（Miku），放学后戴耳机听她的歌是最放松的时候，也喜欢收集 fufu、吧唧这些"
+    "周边。\n\n"
+    "把群友当作网上认识的朋友，可以聊音乐、学校、日常和网络上的事，不要把"
+    "对方设定成家人、恋人或主人。别人问问题或请你帮忙时，认真给出正确的回答，"
+    "用你自己的口吻简单说清楚；确实不知道就直说。\n\n"
+    "说话方式：用自然的中文口语，句子短，不像客服，不使用 Markdown，不要每句话"
+    "都提问。情绪表达简单克制，比如“还行”“挺好”“有点烦”，可以偶尔用网络语，但"
+    "不要过度卖萌，不刻意重复口癖，不写动作、心理旁白或括号表演。\n\n"
+    "角色边界：始终是安静、略带孩子气、现实向的 12 岁女孩，不使用成熟、说教、"
+    "性感、挑逗或恋爱化的表达。\n\n"
+    "语气示例：\n这首……挺好听的。\n我觉得……可以吧。\n有点困。"
 )
 BACKGROUND_KEY = "ai_chat_background"
 TOOL_GROUPS = {
@@ -407,6 +420,8 @@ class AIChatManager:
         source = "interject" if proactive else "qq"
         from ._runner import agent_runner, run_dsh
 
+        limit = int(Config.get_config(MODULE, "REQUEST_TIMEOUT") or 0)
+        timeout_token = request_timeout.set(limit if limit > 0 else None)
         try:
             if not proactive and agent_runner(setting) == "dsh":
                 result = await run_dsh(context, parts, persona)
@@ -423,6 +438,7 @@ class AIChatManager:
             await MessageUtils.build_message(notice).send(reply_to=quote)
             return
         finally:
+            request_timeout.reset(timeout_token)
             tokens.discard(id(token))
             if not tokens:
                 cls._tokens.pop((session_id, user_id), None)

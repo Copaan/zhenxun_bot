@@ -330,7 +330,12 @@ def parse_chat(route, request: ChatRequest, payload: dict[str, Any]) -> ChatResp
         isinstance(p, TextPart | ToolCallPart) for p in parts
     ):
         raise ContentFilteredException(f"[{route.name}] 响应被内容审核拦截")
-    ensure_content(route, parts, incomplete is None)
+    ensure_content(
+        route,
+        parts,
+        incomplete is None,
+        (payload.get("usage") or {}).get("output_tokens"),
+    )
     return ChatResponse(
         content_parts=parts,
         usage_info=payload.get("usage"),

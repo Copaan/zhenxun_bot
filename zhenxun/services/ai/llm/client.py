@@ -57,6 +57,10 @@ _COMMON_FIELDS = set(CommonLLMConfig.model_fields)
 StreamSink = Callable[[str, str], Awaitable[None]]
 stream_sink: ContextVar[StreamSink | None] = ContextVar("llm_stream_sink", default=None)
 """设置后对话请求改用流式，增量以 (text / thought / reset, 文本) 回调"""
+request_timeout: ContextVar[float | None] = ContextVar(
+    "llm_request_timeout", default=None
+)
+"""设置后单次请求的超时取它与服务商超时中较小的一个（秒）"""
 _SANITIZE_CONTEXT = {
     "openai_chat": "openai",
     "openai_responses": "openai_responses",
@@ -155,13 +159,13 @@ class LLMHttpClient:
         timeout = kwargs.get("timeout") or self.timeout
         if isinstance(timeout, httpx.Timeout):
             timeout = max(v or self.timeout for v in timeout.as_dict().values())
+        limit = remaining_timeout(float(timeout))
         try:
             return await asyncio.wait_for(
-                self._request_with_recovery(client, method, url, kwargs),
-                remaining_timeout(float(timeout)),
+                self._request_with_recovery(client, method, url, kwargs), limit
             )
         except asyncio.TimeoutError as error:
-            raise httpx.ReadTimeout("LLM request budget exhausted") from error
+            raise httpx.ReadTimeout(f"超过 {limit:.0f} 秒未完成") from error
 
     async def stream(
         self,
@@ -188,11 +192,11 @@ class LLMHttpClient:
                 async with client.stream(method, url, **kwargs) as response:
                     return await handler(response)
 
-        timeout = float(kwargs.get("timeout") or self.timeout)
+        limit = remaining_timeout(float(kwargs.get("timeout") or self.timeout))
         try:
-            return await asyncio.wait_for(run(), remaining_timeout(timeout))
+            return await asyncio.wait_for(run(), limit)
         except asyncio.TimeoutError as error:
-            raise httpx.ReadTimeout("LLM request budget exhausted") from error
+            raise httpx.ReadTimeout(f"超过 {limit:.0f} 秒未完成") from error
 
     async def _request_with_recovery(
         self, client, method: str, url: str, kwargs: dict
@@ -358,7 +362,10 @@ async def send(
         )
         logger.debug(f"请求 {route.name} {call.method} {url}")
         logger.debug(f"请求体: {dump_json_safely(body, ensure_ascii=False)}")
-    kwargs: dict[str, Any] = {"headers": headers, "timeout": route.provider.timeout}
+    timeout = route.provider.timeout
+    if limit := request_timeout.get():
+        timeout = min(timeout, limit)
+    kwargs: dict[str, Any] = {"headers": headers, "timeout": timeout}
     if call.json is not None:
         kwargs["json"] = call.json
     if call.data is not None:

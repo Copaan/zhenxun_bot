@@ -334,22 +334,33 @@ def native_tool_allowed(route: "Route", type_id: str) -> bool:
     return _PROTOCOL_VENDORS.get(route.protocol) == vendor
 
 
-def ensure_content(route: "Route", parts: list[Any], finished: bool) -> None:
-    """检查对话响应是否有内容，正常结束却没有任何内容时视为空回复
+def ensure_content(
+    route: "Route", parts: list[Any], finished: bool, output_tokens: int | None = None
+) -> None:
+    """检查对话响应是否有内容：正常结束却没有任何内容，或因长度截断而一个输出
+    token 也没有生成时，视为空回复
 
     参数:
         route: 线路
         parts: 解析出的内容片段
-        finished: 是否正常结束，长度截断等未正常结束的响应不检查
+        finished: 是否正常结束
+        output_tokens: 输出 token 数（含思考），未知时为 None
 
     异常:
         EmptyResponseException: 只有空文本或思考内容
     """
-    if finished and all(
+    if not all(
         isinstance(p, ThoughtPart) or (isinstance(p, TextPart) and not p.text.strip())
         for p in parts
     ):
+        return
+    if finished:
         raise EmptyResponseException(f"[{route.name}] 模型返回了空回复")
+    if output_tokens == 0:
+        raise EmptyResponseException(
+            f"[{route.name}] 输出长度上限过小，模型没有生成任何内容，"
+            "请检查生成参数 max_tokens"
+        )
 
 
 def tool_output_text(output: Any) -> str:

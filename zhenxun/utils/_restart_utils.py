@@ -5,6 +5,7 @@ from pathlib import Path
 import time
 from typing import Any
 
+from nonebot import get_bots
 from nonebot.adapters import Bot
 
 from zhenxun.services.log import logger
@@ -273,7 +274,9 @@ async def request_dependency_restart(source: str, paths: set[Path]) -> tuple[boo
 
 
 async def handle_restart_connect(bot: Bot) -> None:
-    """目标 Bot 连接后发送一次重启回执，发送失败不再重试
+    """目标 Bot 连接后发送一次重启回执
+
+    Bot 已断开时保留回执，由下一次连接发送；在线时发送失败不再重试
 
     参数:
         bot: 已连接的 Bot
@@ -291,6 +294,8 @@ async def handle_restart_connect(bot: Bot) -> None:
             )
         if not startup_coordinator.runtime_ready:
             return
+    if not _bot_online(bot):
+        return
 
     def take(state: dict[str, Any]) -> bool:
         if state.get(_PENDING_REQUEST_KEY) != pending:
@@ -320,7 +325,26 @@ async def handle_restart_connect(bot: Bot) -> None:
             target, bot=bot
         )
     except Exception as e:
-        logger.warning(f"发送重启回执失败: {type(e).__name__}", "重启")
+        if _bot_online(bot):
+            logger.warning(f"发送重启回执失败: {type(e).__name__}", "重启")
+            return
+
+        def restore(state: dict[str, Any]) -> bool:
+            if _PENDING_REQUEST_KEY in state:
+                return False
+            state[_PENDING_REQUEST_KEY] = pending
+            return True
+
+        if not mutate_restart_state(restore, write_if=bool):
+            return
+        logger.info("Bot 已断开，重启回执将在重新连接后发送", "重启")
+        current = get_bots().get(bot.self_id)
+        if current is not None and current is not bot:
+            await handle_restart_connect(current)
+
+
+def _bot_online(bot: Bot) -> bool:
+    return get_bots().get(bot.self_id) is bot
 
 
 def _receipt_matches_bot(receipt: dict[str, Any], bot: Bot) -> bool:

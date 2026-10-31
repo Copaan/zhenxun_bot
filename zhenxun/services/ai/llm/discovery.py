@@ -98,9 +98,10 @@ def save_snapshots(
 def _openai_snapshot(item: dict[str, Any]) -> dict[str, Any]:
     """OpenAI 兼容接口通常只返回 id；OpenRouter、DeepSeek 等会额外返回
     上下文、模态与推理档位，new-api 类中转站会返回 supported_endpoint_types"""
-    top = item.get("top_provider") or {}
-    architecture = item.get("architecture") or {}
-    effort = item.get("effort") or {}
+    top, architecture, effort = (
+        value if isinstance(value := item.get(key), dict) else {}
+        for key in ("top_provider", "architecture", "effort")
+    )
     snapshot: dict[str, Any] = {
         "context_window": item.get("context_length")
         or item.get("context_window")
@@ -114,7 +115,7 @@ def _openai_snapshot(item: dict[str, Any]) -> dict[str, Any]:
             architecture.get("output_modalities") or item.get("output_modalities")
         ),
     }
-    levels = effort.get("supported_levels") if isinstance(effort, dict) else None
+    levels = effort.get("supported_levels")
     if isinstance(levels, list):
         snapshot["reasoning_levels"] = [v for v in levels if v in REASONING_LEVELS]
     parameters = item.get("supported_parameters")
@@ -126,6 +127,7 @@ def _openai_snapshot(item: dict[str, Any]) -> dict[str, Any]:
             snapshot["structured_output"] = "json_object"
     endpoints = item.get("supported_endpoint_types")
     if isinstance(endpoints, list):
+        endpoints = [e for e in endpoints if isinstance(e, str)]
         tasks = [_ENDPOINT_TASKS[e] for e in endpoints if e in _ENDPOINT_TASKS]
         snapshot["tasks"] = tasks or None
         protocols = [

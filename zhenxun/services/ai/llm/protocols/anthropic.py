@@ -368,7 +368,12 @@ def parse_chat(route, request: ChatRequest, payload: dict[str, Any]) -> ChatResp
                     args=block.get("input") or {},
                 )
             )
-    ensure_content(route, parts, payload.get("stop_reason") not in _STOP_UNFINISHED)
+    ensure_content(
+        route,
+        parts,
+        payload.get("stop_reason") not in _STOP_UNFINISHED,
+        (payload.get("usage") or {}).get("output_tokens"),
+    )
     return ChatResponse(
         content_parts=parts,
         usage_info=payload.get("usage"),

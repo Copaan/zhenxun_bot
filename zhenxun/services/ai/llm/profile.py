@@ -216,7 +216,7 @@ def parse_modalities(values: Any) -> list[str] | None:
     """
     if not isinstance(values, list):
         return None
-    mapped = ["file" if v == "pdf" else v for v in values]
+    mapped = ["file" if v == "pdf" else v for v in values if isinstance(v, str)]
     return [v for v in dict.fromkeys(mapped) if v in _MODALITIES] or None
 
 

@@ -464,7 +464,12 @@ def parse_chat(route, request: ChatRequest, payload: dict[str, Any]) -> ChatResp
     parts = parse_message(choice.get("message") or {})
     if not parts and choice.get("finish_reason") == "content_filter":
         raise ContentFilteredException(f"[{route.name}] 响应被内容审核拦截")
-    ensure_content(route, parts, choice.get("finish_reason") != "length")
+    ensure_content(
+        route,
+        parts,
+        choice.get("finish_reason") != "length",
+        (payload.get("usage") or {}).get("completion_tokens"),
+    )
     return ChatResponse(
         content_parts=parts,
         usage_info=payload.get("usage"),

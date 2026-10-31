@@ -234,6 +234,16 @@ __plugin_meta__ = PluginMetadata(
                 "AI 联网搜索前先发送的一句话，留空不发送；模型自带的联网搜索不会触发",
             ),
             _config(
+                "回复",
+                "REQUEST_TIMEOUT",
+                60,
+                int,
+                "模型响应超时",
+                "单次模型请求超过该时间未完成时换下一条线路，全部失败时提示用户；"
+                "不超过服务商设置的超时，0 为使用服务商设置",
+                unit="秒",
+            ),
+            _config(
                 "主动插话",
                 "PROACTIVE_ENABLED",
                 True,
