@@ -1,39 +1,24 @@
-import asyncio
-from collections.abc import Awaitable, Callable
 from contextlib import contextmanager
 from contextvars import ContextVar
 import dataclasses
 import inspect
-from typing import TYPE_CHECKING, Any, Generic, cast, get_origin
+from typing import Any, Generic, cast, get_origin
 from typing_extensions import TypeVar
-import uuid
-
-if TYPE_CHECKING:
-    from zhenxun.services.ai.context.memory.types import SessionMetadata
 
 from nonebot.adapters import Bot, Event
 from nonebot.matcher import Matcher, current_bot, current_event, current_matcher
 from pydantic import BaseModel, ConfigDict, Field
 
 from zhenxun.services.ai.capabilities.base import AbstractCapability
-from zhenxun.services.ai.core.engine.append_only import AppendOnlyContextManager
-from zhenxun.services.ai.core.messages import AgentEvent, AgentMessage
+from zhenxun.services.ai.core.messages import LLMMessage
 from zhenxun.services.ai.core.models import CancellationToken
 from zhenxun.services.ai.core.protocols.tool import ToolExecutable
 from zhenxun.services.ai.core.stream_events import AgentStreamEvent, EventBus
-from zhenxun.services.ai.utils import ContextUtils
-from zhenxun.services.scheduler.types import ScheduleContext
-from zhenxun.utils.platform import PlatformUtils
+from zhenxun.services.ai.utils.runtime import ContextUtils
 from zhenxun.utils.utils import infer_plugin_namespace
-
-from .blackboard import BlackboardManager
 
 AgentDepsT = TypeVar("AgentDepsT", default=Any)
 """泛型类型变量：外部环境依赖对象 (Agent Dependencies)。"""
-ProviderFunc = Callable[["RunContext"], Any | Awaitable[Any]]
-"""函数签名类型别名：依赖提供者函数 (Dependency Provider)。"""
-ToolsPrepareFunc = Callable[["RunContext[AgentDepsT]", list[Any]], Any | Awaitable[Any]]
-"""全局/Agent 级动态工具干预函数类型"""
 
 
 class NoneBotDeps(BaseModel):
@@ -79,20 +64,6 @@ class ScheduledDeps(BaseModel):
     platform: str | None = Field(default=None)
     """适配器平台标识"""
 
-    @classmethod
-    def from_schedule_context(
-        cls, bot: Bot, context: ScheduleContext
-    ) -> "ScheduledDeps":
-        """从调度器上下文中快速构造并提取依赖"""
-        return cls(
-            bot=bot,
-            group_id=getattr(context, "group_id", None),
-            user_id=getattr(context, "user_id", None),
-            schedule_id=getattr(context, "schedule_id", None),
-            platform=getattr(context, "platform_scope", None)
-            or PlatformUtils.get_platform_scope(bot),
-        )
-
 
 @dataclasses.dataclass
 class SessionContext(Generic[AgentDepsT]):
@@ -107,14 +78,8 @@ class SessionContext(Generic[AgentDepsT]):
     """强类型的外部依赖注入对象（如 Bot, Event），供跨工具共享。"""
     shared_state: dict[str, Any] = dataclasses.field(default_factory=dict)
     """共享状态字典：全局引用穿透，用于主智能体与嵌套子智能体之间的数据通信。"""
-    blackboard: BlackboardManager | None = None
-    """结构化黑板管理器，作为共享状态的高级替代方案，提供并发锁和强类型校验。"""
     namespace: str = "global"
     """触发事件的插件命名空间"""
-    append_only_manager: Any = dataclasses.field(default=None)
-    """用于大模型前缀缓存命中优化的追加写入管理器。"""
-    session_meta: "SessionMetadata | None" = dataclasses.field(default=None)
-    """隔离会话的元信息(Session ID, 命名空间, 权限等)，在状态流转中生成"""
 
 
 @dataclasses.dataclass
@@ -134,14 +99,12 @@ class AgentRunContext(Generic[AgentDepsT]):
     """当前实际调用的底层大模型名称 (Provider/Model)。"""
     user_input: str | None = None
     """当前轮次用户的原始文本输入。"""
-    messages: list[AgentMessage] = dataclasses.field(default_factory=list)
+    messages: list[LLMMessage] = dataclasses.field(default_factory=list)
     """大模型原生上下文 (LLMMessage 列表)，与执行器中的执行历史保持内存引用同步。"""
-    hitl_locks: dict[str, asyncio.Lock] = dataclasses.field(default_factory=dict)
-    """人机交互 (HITL) 并发锁，防止同群组内并发审批冲突。"""
-    delegate_depth: int = 0
-    """子智能体委派深度标记，用于防范无限递归嵌套。"""
     tool_retries: dict[str, int] = dataclasses.field(default_factory=dict)
     """记录当前轮次内各个工具的累积失败重试次数，用于系统熔断。"""
+    tool_max_retries: int = 1
+    """工具未单独配置 max_retries 时允许的连续出错次数（取自 reflexion_retries）。"""
     cancellation_token: CancellationToken | None = None
     """全局级联取消令牌，用于跨 Agent 的协程挂起中断。"""
     event_bus: EventBus | None = None
@@ -156,10 +119,6 @@ class AgentRunContext(Generic[AgentDepsT]):
         dict_key = key or prompt
         if prompt:
             self.dynamic_prompts[dict_key] = prompt
-
-    def add_event(self, event: AgentEvent) -> None:
-        """向当前运行上下文中安全追加业务事件"""
-        self.messages.append(event)
 
     async def emit(self, event: AgentStreamEvent) -> None:
         """安全地向事件总线发射流式事件（内置判空逻辑，消解业务层的样板代码）"""
@@ -195,18 +154,11 @@ class RunContext(Generic[AgentDepsT]):
     session_id: str | None = None
     """当前运行所在的会话ID，用于区分不同用户的独立上下文"""
 
-    di_cache: dict[str, Any] = dataclasses.field(default_factory=dict)
-    """依赖注入引擎的缓存容器，支持父子层级浅拷贝隔离"""
-
     state: dict[str, Any] = dataclasses.field(default_factory=dict)
     """状态字典：用于在会话轮次、工具和中间件中透传动态变量"""
 
     shared_state: dict[str, Any] = dataclasses.field(default_factory=dict)
-    """共享状态字典：全局引用穿透，用于主智能体与嵌套子智能体之间的
-    黑板模式 (Blackboard) 数据通信"""
-
-    upstream_results: dict[str, Any] = dataclasses.field(default_factory=dict)
-    """前置节点产出字典：标准化的数据流载荷契约，键为 Agent Name，值为输出内容"""
+    """共享状态字典：全局引用穿透，用于主智能体与嵌套子智能体之间的数据通信"""
 
     capabilities: list[AbstractCapability] = dataclasses.field(default_factory=list)
     """当前上下文绑定的拦截器 (Capabilities) 链，用于生命周期拦截"""
@@ -226,18 +178,6 @@ class RunContext(Generic[AgentDepsT]):
         init=False, repr=False, compare=False
     )
     """调用层上下文：承载单次工具调用的私有状态与执行引用。"""
-    _is_auto_session_id: bool = dataclasses.field(
-        default=False, init=False, repr=False, compare=False
-    )
-    """标记 session_id 是否为框架隐式生成的。"""
-
-    @classmethod
-    def from_schedule(
-        cls, bot: Bot, context: ScheduleContext, **kwargs
-    ) -> "RunContext[ScheduledDeps]":
-        """极简构造语法糖：从定时调度任务上下文中直接生成 RunContext"""
-        deps = ScheduledDeps.from_schedule_context(bot, context)
-        return cast("RunContext[ScheduledDeps]", cls(deps=cast(Any, deps), **kwargs))
 
     def get_bot(self) -> Bot | None:
         """强类型安全地提取 Bot 实例"""
@@ -252,13 +192,6 @@ class RunContext(Generic[AgentDepsT]):
             return None
         event = getattr(self.deps, "event", None)
         return event if isinstance(event, Event) else None
-
-    def get_matcher(self) -> Matcher | None:
-        """强类型安全地提取 Matcher 实例"""
-        if not self.deps:
-            return None
-        matcher = getattr(self.deps, "matcher", None)
-        return matcher if isinstance(matcher, Matcher) else None
 
     def get_user_id(self) -> str | None:
         """安全提取当前触发任务的用户 ID"""
@@ -276,23 +209,8 @@ class RunContext(Generic[AgentDepsT]):
         if self.deps is None:
             self.deps = cast(AgentDepsT, NoneBotDeps.get_current())
 
-        if not self.session_id and self.deps:
-            from zhenxun.services.ai.context.memory.types import (
-                Isolation,
-            )
-
-            bot = self.get_bot()
-            event = self.get_event()
-
-            if bot:
-                meta = ContextUtils.generate_session_meta(
-                    bot=bot,
-                    event=event,
-                    deps=self.deps,
-                    scope_builder=Isolation.AGENT_USER(),
-                )
-                self.session_id = meta.session_id
-                self._is_auto_session_id = True
+        if not self.session_id and self.get_bot():
+            self.session_id = ContextUtils.default_session_id(self.deps)
 
         ns = "global"
         if self.deps:
@@ -309,47 +227,14 @@ class RunContext(Generic[AgentDepsT]):
             namespace=ns,
         )
 
-        self.session.append_only_manager = AppendOnlyContextManager()
-
         self.run = AgentRunContext(session=self.session, state=self.state)
         self.call = ToolCallContext(run=self.run)
-
-    def clone_for_execution(self, **kwargs) -> "RunContext":
-        new_state = self.state.copy()
-        changes = {k: v for k, v in kwargs.items() if hasattr(self, k)}
-        if "state" not in changes:
-            changes["state"] = new_state
-        if "shared_state" not in changes:
-            changes["shared_state"] = self.shared_state
-
-        new_ctx = dataclasses.replace(cast(Any, self), **changes)
-        new_ctx.upstream_results = self.upstream_results.copy()
-        new_ctx.di_cache = self.di_cache.copy()
-
-        new_ctx.session = self.session
-        new_ctx.run = AgentRunContext(
-            session=new_ctx.session,
-            state=new_ctx.state,
-            agent_name=self.run.agent_name,
-            current_model=self.run.current_model,
-            user_input=self.run.user_input,
-            messages=list(self.run.messages),
-            hitl_locks=self.run.hitl_locks,
-            delegate_depth=self.run.delegate_depth,
-            tool_retries=self.run.tool_retries,
-            cancellation_token=self.run.cancellation_token,
-            event_bus=self.run.event_bus,
-            dynamic_prompts=self.run.dynamic_prompts.copy(),
-        )
-        new_ctx.call = ToolCallContext(run=new_ctx.run)
-        return new_ctx
 
     def clone_for_tool_call(self, tool_call_id: str, tool_name: str) -> "RunContext":
         """
         为每个并发的工具调用派生绝对独立的 ToolCallContext。消除多工具并行时的属性污染。
         """
         new_ctx = dataclasses.replace(cast(Any, self))
-        new_ctx.di_cache = self.di_cache.copy()
         new_ctx.session = self.session
         new_ctx.run = self.run
         new_ctx.call = ToolCallContext(
@@ -358,21 +243,6 @@ class RunContext(Generic[AgentDepsT]):
             tool_name=tool_name,
             retry_count=new_ctx.run.tool_retries.get(tool_name, 0),
         )
-        return new_ctx
-
-    def clone_for_member(self, member_name: str = "unknown") -> "RunContext":
-        """
-        为团队子成员克隆上下文。
-        强制清空消息历史并分配独立 SessionID，实现绝对的记忆沙箱物理隔离。
-        """
-        new_ctx = self.clone_for_execution()
-        new_ctx.run.delegate_depth = 0
-        new_ctx.run.messages = []
-        new_ctx.capabilities = []
-
-        base_sid = self.session_id or "default"
-        new_ctx.session_id = f"{base_sid}/sub_{member_name}_{uuid.uuid4().hex[:6]}"
-        new_ctx.session.session_id = new_ctx.session_id
         return new_ctx
 
 
@@ -423,7 +293,6 @@ __all__ = [
     "ScheduledDeps",
     "SessionContext",
     "ToolCallContext",
-    "ToolsPrepareFunc",
     "get_current_run_context",
     "set_run_context",
 ]

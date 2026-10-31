@@ -47,6 +47,7 @@ async def _():
                             PlatformUtils.get_platform_scope(bot),
                             group_id=group.group_id,
                             bot_id=PlatformUtils.get_storage_bot_id(bot),
+                            is_bot=False,
                         )
                         .annotate()
                         .order_by("-create_time")

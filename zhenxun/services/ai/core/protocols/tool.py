@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 from zhenxun.services.ai.core.models import ToolDefinition
 
 if TYPE_CHECKING:
-    from zhenxun.services.ai.run import RunContext
+    from zhenxun.services.ai.run.context import RunContext
     from zhenxun.services.ai.tools.models import (
         ResolvedToolPayload,
         ToolResult,
@@ -70,13 +70,5 @@ class ToolProvider(Protocol):
     ) -> dict[str, ToolExecutable]:
         """
         异步发现此提供者提供的所有工具。
-        """
-        ...
-
-    async def get_tool_executable(
-        self, name: str, config: dict[str, Any]
-    ) -> ToolExecutable | None:
-        """
-        如果此提供者能处理名为 'name' 的工具，则返回一个可执行实例。
         """
         ...

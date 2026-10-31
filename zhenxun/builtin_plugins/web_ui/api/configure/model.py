@@ -62,6 +62,8 @@ class ApplyRequest(BaseModel):
     password: str = Field(min_length=8, max_length=1024)
     confirm_password: str = Field(min_length=8, max_length=1024)
     superusers: list[str] = Field(default_factory=list)
+    self_nickname: str = Field(default="", max_length=32)
+    nicknames: list[str] = Field(default_factory=list)
     database: DatabaseConfig
     cache: CacheConfig = Field(default_factory=CacheConfig)
     network: NetworkConfig = Field(default_factory=NetworkConfig)

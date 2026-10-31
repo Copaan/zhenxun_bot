@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import contextvars
 from copy import deepcopy
 from typing import Any
 
@@ -10,18 +9,10 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from zhenxun.configs.config import Config
-from zhenxun.services.ai.config import PRESETS, get_llm_config
+from zhenxun.services.ai.config import PRESETS
 from zhenxun.services.ai.config.presets import preset_base_url
 from zhenxun.utils.pydantic_compat import model_dump
 
-from ....apply_result import (
-    APPLY_CONFIG_RELOADED,
-    APPLY_NEW_SESSION,
-    APPLY_NO_CHANGE,
-    APPLY_RESTART_PENDING,
-    update_pending_restart,
-)
 from ....base_model import Result
 from ....utils import authentication
 from ._store import (
@@ -48,16 +39,10 @@ _SECTIONS = {
     "default_models": "default_models",
     "context": "context_settings",
     "agent": "agent_settings",
-    "sandbox": "sandbox",
     "web_search": "web_search",
     "advanced": None,
 }
 _ADVANCED_KEYS = {"client_settings", "debug_log"}
-# 在空上下文中读取，避免把 web_ui 登记为全部 AI 配置项的导入期读取方
-_SANDBOX_STARTUP_VALUES = contextvars.Context().run(
-    lambda: model_dump(get_llm_config().sandbox)
-)
-_SANDBOX_STARTUP_KEYS = {"enable_sandbox", "sandbox_type"}
 
 
 class ProviderSettingsUpdate(BaseModel):
@@ -146,26 +131,6 @@ def _merge_models(
     ]
 
 
-def _restore_sandbox_startup_runtime() -> None:
-    group = Config.get("AI")
-    config_model = group.configs.get("SANDBOX")
-    current = deepcopy(config_model.value) if config_model else {}
-    if not isinstance(current, dict):
-        current = {}
-    for key in _SANDBOX_STARTUP_KEYS:
-        current[key] = deepcopy(_SANDBOX_STARTUP_VALUES.get(key))
-    if config_model:
-        config_model.value = current
-    ai_data = Config._simple_data.get("AI")
-    if isinstance(ai_data, dict):
-        raw_key = next(
-            (key for key in ai_data if str(key).upper() == "SANDBOX"),
-            "sandbox",
-        )
-        ai_data[raw_key] = deepcopy(current)
-    get_llm_config.cache_clear()
-
-
 def _normalize_model_groups(value: Any) -> dict[str, list[str]]:
     if isinstance(value, dict):
         rows = [{"name": name, "targets": targets} for name, targets in value.items()]
@@ -219,7 +184,7 @@ def _normalize_model_groups(value: Any) -> dict[str, list[str]]:
 
 
 def _normalize_defaults(value: Any) -> dict[str, str | None]:
-    tasks = {"chat", "vision", "embedding", "tts", "image", "rerank"}
+    tasks = {"chat", "vision", "embedding", "tts", "stt", "image", "rerank"}
     if (
         not isinstance(value, dict)
         or set(value) - tasks
@@ -384,41 +349,6 @@ async def update_models(provider_name: str, payload: ProviderModelsUpdate) -> Re
     )
 
 
-def _sandbox_apply_mode(before: dict[str, Any], after: dict[str, Any]) -> tuple:
-    """判断沙箱设置的生效方式，启动期字段的运行态保持启动时的值
-
-    参数:
-        before: 保存前的沙箱设置
-        after: 保存后的沙箱设置
-
-    返回:
-        tuple: 生效方式、变更键与重启原因
-    """
-    changed = sorted(
-        key for key in before.keys() | after.keys() if before.get(key) != after.get(key)
-    )
-    deferred = sorted(
-        key
-        for key in _SANDBOX_STARTUP_KEYS
-        if after.get(key) != _SANDBOX_STARTUP_VALUES.get(key)
-    )
-    if deferred:
-        _restore_sandbox_startup_runtime()
-    if not changed:
-        mode = APPLY_NO_CHANGE
-    elif deferred and _SANDBOX_STARTUP_KEYS.intersection(changed):
-        mode = APPLY_RESTART_PENDING
-    elif set(changed) - _SANDBOX_STARTUP_KEYS:
-        mode = APPLY_NEW_SESSION
-    else:
-        mode = APPLY_CONFIG_RELOADED
-    return (
-        mode,
-        [f"AI.SANDBOX.{key}" for key in changed],
-        [f"ai.sandbox.{key}" for key in deferred],
-    )
-
-
 @router.put(
     "/configuration/sections/{section}",
     dependencies=[authentication()],
@@ -465,34 +395,9 @@ async def update_section(section: str, payload: SectionUpdate) -> Result:
         elif key:
             update_value(ai, key, payload.value)
 
-    if section != "sandbox":
-        revision, config, operation = await persist(payload.expected_revision, mutate)
-        return Result.ok(
-            apply_response(config, revision, operation), info="AI 配置已保存。"
-        )
-    before = validate_ai(load_config(read_config())["AI"], strict_references=False)
-    revision, config, operation = await persist(
-        payload.expected_revision, mutate, reload_consumers=False
-    )
-    mode, changed_keys, reason_codes = _sandbox_apply_mode(
-        model_dump(before.sandbox), model_dump(config.sandbox)
-    )
-    update_pending_restart("webui.ai-sandbox", reason_codes)
+    revision, config, operation = await persist(payload.expected_revision, mutate)
     return Result.ok(
-        apply_response(
-            config,
-            revision,
-            operation,
-            apply_mode=mode,
-            changed_keys=changed_keys,
-            reason_codes=reason_codes,
-            pending_source="webui.ai-sandbox",
-        ),
-        info=(
-            "AI 配置已保存，需要重启后生效。"
-            if mode == APPLY_RESTART_PENDING
-            else "AI 配置已保存。"
-        ),
+        apply_response(config, revision, operation), info="AI 配置已保存。"
     )
 
 

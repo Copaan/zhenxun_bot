@@ -53,6 +53,57 @@ class HttpCall:
     """覆盖线路的 base_url"""
     raw: bool = False
     """响应为二进制数据"""
+    stream: "type[ChatStream] | None" = None
+    """流式请求的累加器类型，为空时为普通请求"""
+
+
+class ChatStream:
+    """流式对话响应的累加器：逐个接收 SSE 事件，给出文本增量，
+    结束后还原为与非流式相同的响应体，交给协议原有的解码函数"""
+
+    @classmethod
+    def prepare(cls, call: HttpCall) -> None:
+        """把请求改为流式请求
+
+        参数:
+            call: 编码后的请求
+        """
+        raise NotImplementedError
+
+    def feed(self, event: str, data: dict[str, Any]) -> list[tuple[str, str]]:
+        """接收一个 SSE 事件
+
+        参数:
+            event: 事件名，没有 event 字段时为空
+            data: 事件数据
+
+        返回:
+            list[tuple[str, str]]: 增量 (text 正文 / thought 思考, 文本)
+        """
+        raise NotImplementedError
+
+    def result(self) -> dict[str, Any]:
+        """还原出的非流式响应体
+
+        返回:
+            dict[str, Any]: 响应体
+        """
+        raise NotImplementedError
+
+
+def stream_error(data: dict[str, Any]) -> str | None:
+    """提取流式事件中携带的错误信息
+
+    参数:
+        data: 事件数据
+
+    返回:
+        str | None: 错误描述，没有错误时为空
+    """
+    error = data.get("error")
+    if isinstance(error, dict):
+        return str(error.get("message") or error)
+    return str(error) if error else None
 
 
 Build = Callable[["Route", Any], Awaitable[HttpCall]]
@@ -82,6 +133,19 @@ def get_task(protocol: str, task: str) -> tuple[Build, Parse]:
     return module.TASKS[task]
 
 
+def get_stream(protocol: str) -> type[ChatStream] | None:
+    """获取协议的流式对话累加器
+
+    参数:
+        protocol: 接口协议
+
+    返回:
+        type[ChatStream] | None: 累加器类型，协议不支持流式时为空
+    """
+    module = import_module(f"{__name__}.{_MODULES[protocol]}")
+    return getattr(module, "STREAM", None)
+
+
 _PLACEHOLDERS = {
     ImagePart: ("image", "<图片>"),
     AudioPart: ("audio", "<音频>"),
@@ -90,25 +154,53 @@ _PLACEHOLDERS = {
 }
 
 
+_MEDIA_INPUTS = frozenset({"image", "audio", "video", "file"})
+_PROTOCOL_INPUTS = {
+    "openai_responses": frozenset({"image", "file"}),
+    "anthropic": frozenset({"image", "file"}),
+}
+
+
+def encodable_inputs(protocol: str) -> frozenset[str]:
+    """协议能够编码的媒体输入模态
+
+    参数:
+        protocol: 协议名
+
+    返回:
+        frozenset[str]: 媒体模态 (image / audio / video / file)
+    """
+    return _PROTOCOL_INPUTS.get(protocol, _MEDIA_INPUTS)
+
+
 def filter_modalities(
-    messages: list[LLMMessage], profile: ModelProfile, model_name: str
+    messages: list[LLMMessage],
+    profile: ModelProfile,
+    model_name: str,
+    encodable: frozenset[str] = _MEDIA_INPUTS,
 ) -> list[LLMMessage]:
-    """把模型不支持的输入模态替换为文字占位
+    """把模型不支持或协议无法编码的输入模态替换为文字占位
 
     参数:
         messages: 原始消息
         profile: 模型能力档案
         model_name: 模型全名，用于日志
+        encodable: 协议能够编码的媒体模态
 
     返回:
         list[LLMMessage]: 处理后的消息，未改动的消息保持原对象
     """
+
+    def unusable(modality: str | None) -> bool:
+        return bool(modality) and (
+            modality not in encodable or not profile.accepts_input(modality)
+        )
+
     warned: set[str] = set()
     result = []
     for message in messages:
         if not any(
-            type(part) in _PLACEHOLDERS
-            and not profile.accepts_input(_PLACEHOLDERS[type(part)][0])
+            unusable(_PLACEHOLDERS.get(type(part), (None,))[0])
             for part in message.content
         ):
             result.append(message)
@@ -116,7 +208,7 @@ def filter_modalities(
         content = []
         for part in message.content:
             modality, placeholder = _PLACEHOLDERS.get(type(part), (None, None))
-            if modality and not profile.accepts_input(modality):
+            if modality and unusable(modality):
                 if modality not in warned:
                     warned.add(modality)
                     logger.warning(
@@ -126,6 +218,77 @@ def filter_modalities(
             else:
                 content.append(part)
         result.append(model_copy(message, update={"content": content}))
+    return result
+
+
+_MEDIA_TYPES = tuple(_PLACEHOLDERS)
+
+
+def has_media(message: LLMMessage) -> bool:
+    """消息是否包含图片、语音、视频等媒体片段
+
+    参数:
+        message: 消息
+
+    返回:
+        bool: 是否包含媒体
+    """
+    return isinstance(message.content, list) and any(
+        isinstance(p, _MEDIA_TYPES) for p in message.content
+    )
+
+
+def drop_tool_media(messages: list[LLMMessage]) -> list[LLMMessage]:
+    """去掉工具消息中的媒体片段，用于写入持久化历史
+
+    参数:
+        messages: 消息列表
+
+    返回:
+        list[LLMMessage]: 处理后的消息，未改动的消息保持原对象
+    """
+    return [
+        model_copy(
+            message,
+            update={
+                "content": [
+                    p for p in message.content if not isinstance(p, _MEDIA_TYPES)
+                ]
+            },
+        )
+        if message.role == "tool"
+        and any(isinstance(p, _MEDIA_TYPES) for p in message.content)
+        else message
+        for message in messages
+    ]
+
+
+def lift_tool_media(messages: list[LLMMessage]) -> list[LLMMessage]:
+    """把工具返回的媒体移到这组连续工具消息之后的一条用户消息中，
+    使各协议都能把媒体交给模型
+
+    参数:
+        messages: 消息列表
+
+    返回:
+        list[LLMMessage]: 处理后的消息，无工具媒体时为原列表
+    """
+    stripped = drop_tool_media(messages)
+    if all(a is b for a, b in zip(messages, stripped)):
+        return messages
+    result: list[LLMMessage] = []
+    pending: list = []
+    for original, message in zip(messages, stripped):
+        if message.role != "tool" and pending:
+            result.append(LLMMessage.user(pending))
+            pending = []
+        if message is not original:
+            name = message.tool_returns[0].tool_name
+            pending.append(TextPart(text=f"[工具 {name} 返回的内容]"))
+            pending.extend(p for p in original.content if isinstance(p, _MEDIA_TYPES))
+        result.append(message)
+    if pending:
+        result.append(LLMMessage.user(pending))
     return result
 
 

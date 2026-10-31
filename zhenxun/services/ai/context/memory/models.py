@@ -2,34 +2,57 @@
 记忆域类型定义
 """
 
+from abc import ABC, abstractmethod
+
 from pydantic import BaseModel, ConfigDict, Field
 
-from zhenxun.services.ai.utils.scope import ScopeBuilder
-
-from .storage.interfaces import (
-    BaseChatContext,
-    BaseMemoryIngestionMiddleware,
-    BaseMemoryReducer,
-)
-from .types import (
-    Isolation,
-    SessionMetadata,
-)
+from zhenxun.services.ai.core.messages import LLMMessage
 
 
-class MemoryScoringConfig(BaseModel):
-    """长期记忆的复合打分与检索配置"""
+class BaseChatContext(ABC):
+    """短期对话历史记忆接口"""
 
-    recency_weight: float = Field(default=0.3)
-    """时间衰减权重"""
-    semantic_weight: float = Field(default=0.5)
-    """语义相似度权重"""
-    importance_weight: float = Field(default=0.2)
-    """重要性权重"""
-    recency_half_life_days: int = Field(default=30)
-    """时间衰减的半衰期(天)"""
-    reinforcement_weight: float = Field(default=0.2)
-    """访问强化的加权权重 (被检索越多得分越高)"""
+    @abstractmethod
+    async def get_messages(self, session_id: str) -> list[LLMMessage]:
+        """获取会话的历史消息"""
+        ...
+
+    @abstractmethod
+    async def add_messages(self, session_id: str, messages: list[LLMMessage]) -> None:
+        """向会话追加消息"""
+        ...
+
+    @abstractmethod
+    async def clear(self, session_id: str) -> None:
+        """清空会话的历史消息"""
+        ...
+
+
+class BaseMemoryReducer(ABC):
+    """记忆压缩器基类"""
+
+    @abstractmethod
+    async def reduce(
+        self,
+        messages: list[LLMMessage],
+        current_tokens: int,
+        model_name: str,
+        base_overhead: int = 0,
+    ) -> tuple[list[LLMMessage], bool, int]:
+        """
+        执行记忆压缩处理，精简或提炼对话上下文以降低 Token 消耗。
+
+        参数:
+            messages: 需要进行压缩的原始 LLM 消息历史列表。
+            current_tokens: 压缩前消息列表的当前 Token 总数。
+            model_name: 用于判定压缩阈值或计算 Token 的底层大模型名称。
+            base_overhead: 基础系统提示词等静态开销的 Token 计数。
+
+        返回:
+            tuple[list[LLMMessage], bool, int]: 包含压缩后的新消息历史列表、
+                本次是否实际触发了压缩的布尔标记、以及压缩后的新 Token 总数。
+        """
+        ...
 
 
 class ShortTermConfig(BaseModel):
@@ -39,13 +62,8 @@ class ShortTermConfig(BaseModel):
 
     enable: bool = Field(default=True)
     """是否启用短期对话记忆上下文"""
-    backend: str | BaseChatContext | None = Field(default=None)
-    """
-    指定底层短期记忆数据库注册名称，或直接传入 BaseChatContext 实例。
-    为空则使用全局默认
-    """
-    isolation: ScopeBuilder = Field(default_factory=Isolation.AGENT_USER)
-    """单一的记忆隔离级别 (ScopeBuilder)，决定短期记忆存储边界"""
+    backend: BaseChatContext | None = Field(default=None)
+    """短期记忆存储后端，为空使用数据库后端"""
 
 
 class ContextCompressionConfig(BaseModel):
@@ -63,15 +81,6 @@ class ContextCompressionConfig(BaseModel):
     """核心记忆压缩策略管线 (List[BaseMemoryReducer])。为 None 时将应用全局默认策略。"""
 
 
-class IngestionConfig(BaseModel):
-    """记忆入库管线配置"""
-
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
-    middlewares: list[BaseMemoryIngestionMiddleware] = Field(default_factory=list)
-    """入库中间件列表（按顺序依次执行清洗过滤）"""
-
-
 class MemoryConfig(BaseModel):
     """统一的记忆配置项声明"""
 
@@ -82,17 +91,17 @@ class MemoryConfig(BaseModel):
         default_factory=ContextCompressionConfig
     )
     """上下文压缩与管理配置"""
-    ingestion: IngestionConfig = Field(default_factory=IngestionConfig)
-    """记忆入库前的清洗与过滤管线配置"""
 
+    @classmethod
+    def resolve(cls, memory: "bool | MemoryConfig | None") -> "MemoryConfig":
+        """把 Agent 的 memory 参数转换为记忆配置
 
-__all__ = [
-    "BaseMemoryIngestionMiddleware",
-    "ContextCompressionConfig",
-    "IngestionConfig",
-    "Isolation",
-    "MemoryConfig",
-    "MemoryScoringConfig",
-    "SessionMetadata",
-    "ShortTermConfig",
-]
+        参数:
+            memory: 布尔值表示是否开启短期记忆，也可以直接传入配置
+
+        返回:
+            MemoryConfig: 记忆配置
+        """
+        if isinstance(memory, MemoryConfig):
+            return memory
+        return cls(short_term=ShortTermConfig(enable=bool(memory)))

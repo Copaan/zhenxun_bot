@@ -14,6 +14,7 @@ from zhenxun.services.ai.core.exceptions import (
     ConfigurationException,
     ContentFilteredException,
     ResponseParseException,
+    UpstreamServerException,
 )
 from zhenxun.services.ai.core.messages import (
     AssistantMessage,
@@ -34,7 +35,9 @@ from zhenxun.services.ai.llm.profile import map_reasoning_effort
 from zhenxun.services.ai.utils.logger import log_llm as logger
 
 from . import (
+    ChatStream,
     HttpCall,
+    encodable_inputs,
     ensure_content,
     filter_modalities,
     native_tool_allowed,
@@ -43,6 +46,7 @@ from . import (
     replay_metadata,
     resolve_tool_choice,
     split_tools,
+    stream_error,
     tool_output_text,
 )
 from .schema import anthropic_schema, schema_instruction, tool_schema
@@ -98,7 +102,9 @@ def _assistant_blocks(message: AssistantMessage) -> list[dict[str, Any]]:
 
 
 async def _build_messages(request: ChatRequest, route) -> tuple[list[str], list]:
-    messages = filter_modalities(request.messages, route.profile, route.name)
+    messages = filter_modalities(
+        request.messages, route.profile, route.name, encodable_inputs("anthropic")
+    )
     system: list[str] = []
     result: list[dict[str, Any]] = []
 
@@ -371,4 +377,65 @@ def parse_chat(route, request: ChatRequest, payload: dict[str, Any]) -> ChatResp
     )
 
 
+class AnthropicStream(ChatStream):
+    """Messages 流式累加器"""
+
+    def __init__(self):
+        self.message: dict[str, Any] = {}
+        self.blocks: dict[int, dict[str, Any]] = {}
+        self.inputs: dict[int, str] = {}
+
+    @classmethod
+    def prepare(cls, call: HttpCall) -> None:
+        if call.json is not None:
+            call.json["stream"] = True
+        call.stream = cls
+
+    def _delta(self, index: int, delta: dict[str, Any]) -> list[tuple[str, str]]:
+        block = self.blocks.setdefault(index, {"type": "text", "text": ""})
+        kind = delta.get("type")
+        if kind == "text_delta":
+            block["text"] = block.get("text", "") + delta.get("text", "")
+            return [("text", delta.get("text", ""))]
+        if kind == "thinking_delta":
+            block["thinking"] = block.get("thinking", "") + delta.get("thinking", "")
+            return [("thought", delta.get("thinking", ""))]
+        if kind == "signature_delta":
+            block["signature"] = block.get("signature", "") + delta.get("signature", "")
+        elif kind == "input_json_delta":
+            self.inputs[index] = self.inputs.get(index, "") + delta.get(
+                "partial_json", ""
+            )
+        elif kind == "citations_delta" and delta.get("citation"):
+            block.setdefault("citations", []).append(delta["citation"])
+        return []
+
+    def feed(self, event: str, data: dict[str, Any]) -> list[tuple[str, str]]:
+        kind = data.get("type") or event
+        index = int(data.get("index") or 0)
+        if kind == "error":
+            raise UpstreamServerException(
+                f"服务端返回错误: {stream_error(data)}",
+                details={"response": str(data)[:500]},
+            )
+        if kind == "message_start":
+            self.message = dict(data.get("message") or {})
+        elif kind == "content_block_start":
+            self.blocks[index] = dict(data.get("content_block") or {})
+        elif kind == "content_block_delta":
+            return self._delta(index, data.get("delta") or {})
+        elif kind == "content_block_stop" and index in self.inputs:
+            self.blocks[index]["input"] = parse_arguments(self.inputs.pop(index))
+        elif kind == "message_delta":
+            self.message.update(data.get("delta") or {})
+            usage = self.message.setdefault("usage", {})
+            usage.update(data.get("usage") or {})
+        return []
+
+    def result(self) -> dict[str, Any]:
+        content = [self.blocks[i] for i in sorted(self.blocks)]
+        return {**self.message, "content": content} if self.message else {}
+
+
+STREAM = AnthropicStream
 TASKS = {"chat": (build_chat, parse_chat)}

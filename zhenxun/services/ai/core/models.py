@@ -49,8 +49,6 @@ class LLMContext(BaseModel, Generic[TReq, TRes]):
     request: TReq
     """强类型的各模态请求对象实体。"""
 
-    runtime_state: dict[str, Any] = Field(default_factory=dict)
-    """运行时的临时状态存储。"""
     cancellation_token: CancellationToken | None = Field(default=None)
     """全局取消令牌。"""
 
@@ -90,15 +88,12 @@ class ModelModality(str, Enum):
 REASONING_LEVELS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 """统一的推理强度等级，从低到高排列"""
 
-MODEL_TASKS = ("chat", "embedding", "rerank", "tts", "image")
-"""模型可承担的任务类型"""
-
 
 class ModelProfile(BaseModel):
     """模型能力档案，决定请求如何编码以及哪些任务可用"""
 
     tasks: set[str] = Field(default_factory=lambda: {"chat"})
-    """可承担的任务：chat / embedding / rerank / tts / image"""
+    """可承担的任务：chat / embedding / rerank / tts / stt / image"""
     input_modalities: set[ModelModality] = Field(
         default_factory=lambda: {ModelModality.TEXT}
     )
@@ -145,7 +140,6 @@ class ModelProfile(BaseModel):
 
 
 __all__ = [
-    "MODEL_TASKS",
     "REASONING_LEVELS",
     "CancellationToken",
     "LLMContext",

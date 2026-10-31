@@ -106,8 +106,22 @@ class ContextManagementSettings(BaseModel):
     vision_window_size: int = Field(default=3, ge=0)
     """多模态滑动窗口大小。0表示无限制，>0表示仅保留最近N轮包含多模态真实数据的消息，超龄则自动降级为占位符"""
 
+    image_max_side: int = Field(default=1280, ge=0, le=8192)
+    """发给模型的图片长边上限（像素），超过 512KB 时继续缩小，动图拼成 3×3。
+    0 表示不压缩"""
+
+    file_max_chars: int = Field(default=0, ge=0, le=200000)
+    """聊天中收到文件时读取内容交给模型的最大字数（txt/md/html/csv/json/epub，
+    安装文档解析组件后支持 docx/xlsx/pptx/pdf）。0 表示不读取"""
+
     tool_pruning: ToolPruningConfig = Field(default_factory=ToolPruningConfig)
     """工具结果过载修剪策略"""
+
+    history_retention_days: int = Field(default=30, ge=0)
+    """短期对话记忆的保留天数，每天清理一次超期消息。0 表示不限制"""
+
+    history_max_messages: int = Field(default=500, ge=0)
+    """每个会话最多保留的短期对话记忆条数，超出的旧消息每天清理一次。0 表示不限制"""
 
 
 class ModelConfig(BaseModel):
@@ -193,6 +207,8 @@ class DefaultModelsConfig(BaseModel):
     chat: str | None = None
     embedding: str | None = None
     tts: str | None = None
+    stt: str | None = None
+    """语音转文字模型"""
     image: str | None = None
     rerank: str | None = None
     vision: str | None = None
@@ -206,15 +222,20 @@ WEB_SEARCH_PROVIDERS = ("deepseek", "kimi", "glm", "jina", "tavily", "bocha")
 class WebSearchSettings(BaseModel):
     """联网搜索设置"""
 
-    mode: str = "auto"
-    """auto: 模型支持原生联网时用原生，否则用搜索接口；
-    native: 只用原生联网；api: 只用搜索接口；off: 关闭"""
+    mode: str = "off"
+    """off: 关闭（默认）；auto: 模型支持原生联网时用原生，否则用搜索接口；
+    native: 只用原生联网；api: 只用搜索接口"""
     provider: str | None = None
     """搜索接口：deepseek / kimi / glm / jina / tavily / bocha"""
-    api_key: str | None = None
-    """搜索接口密钥，为空时复用同厂商服务商的密钥"""
+    api_keys: list[str] = Field(default_factory=list)
+    """搜索接口密钥，可填写多个轮换使用，为空时复用同厂商服务商的密钥"""
     max_results: int = Field(default=5, ge=1, le=20)
     """每次搜索返回的结果数"""
+
+    @field_validator("api_keys")
+    @classmethod
+    def _clean_keys(cls, value: list[str]) -> list[str]:
+        return [key.strip() for key in value if key and key.strip()]
 
     @field_validator("mode")
     @classmethod
@@ -242,29 +263,40 @@ class AgentEngineSettings(BaseModel):
     enable_parallel_calls: bool = True
     """允许并行工具调用"""
     reflexion_retries: int = Field(default=1, ge=0)
-    """反思重试次数"""
+    """工具未单独配置 max_retries 时允许的连续出错次数"""
     enable_fallback_summary: bool = True
     """达到最大循环次数时，是否触发大模型兜底总结（而不是直接报错）"""
-    enable_hitl: bool = False
-    """是否允许智能体主动挂起任务，向用户求助 (Human-in-the-Loop)"""
+    tool_output_max_chars: int = Field(default=16000, ge=0)
+    """单个工具结果交给模型的最大字符数，超出部分截去中间；0 表示不限制"""
+    tool_timeout: int = Field(default=300, ge=0)
+    """单次工具调用的最长执行时间(秒)，超时后作为错误结果交给模型；0 表示不限制"""
     mcp_cleanup_timeout: int = Field(default=900, ge=0)
     """MCP 服务自动清理的闲置超时时间(秒)。0表示关闭自动清理机制（永久驻留）"""
 
 
 class SandboxSettings(BaseModel):
-    """沙箱底层基础设施环境配置"""
+    """Agent 代码沙箱（Docker）配置"""
 
     enable_sandbox: bool = Field(default=False)
-    """全局沙箱功能硬开关。关闭后将彻底不加载沙箱底层驱动(如 Docker)，
-    极大提升冷启动速度。"""
-    sandbox_type: str = Field(default="docker")
-    """沙箱底层驱动类型: docker 等"""
-    docker_image: str = Field(default="zhenxun-sandbox:latest")
-    """Docker 沙箱使用的镜像名称 (自定义 Jupyter 增强版)"""
+    """是否启用沙箱；启用且 Docker 与镜像可用时才向 Agent 提供执行类工具"""
+    docker_image: str = Field(default="python:3.12-slim")
+    """沙箱容器使用的镜像"""
+    cpus: float = Field(default=1.0, ge=0.1, le=64)
+    """单个沙箱可用的 CPU 核数"""
+    memory_mb: int = Field(default=512, ge=64, le=65536)
+    """单个沙箱可用的内存(MB)"""
+    exec_timeout: int = Field(default=60, ge=5, le=3600)
+    """单次执行代码或命令的超时时间(秒)"""
+    network: bool = Field(default=False)
+    """沙箱是否可以联网"""
     cleanup_timeout: int = Field(default=1800, ge=0)
-    """沙箱自动清理的闲置超时时间(秒)。0表示关闭，不自动清理"""
-    enable_vfs_helper: bool = Field(default=True)
-    """是否开启 VFS 路径逃逸防范探针，默认开启。遇到兼容性问题时可关闭"""
+    """沙箱闲置超过该时间(秒)后删除容器；0 表示不自动清理"""
+
+    @field_validator("docker_image")
+    @classmethod
+    def _default_image(cls, value: str) -> str:
+        value = value.strip()
+        return "python:3.12-slim" if value in {"", "zhenxun-sandbox:latest"} else value
 
 
 class LLMConfig(BaseModel):
@@ -290,12 +322,3 @@ class LLMConfig(BaseModel):
     """沙箱基础设施环境相关配置"""
     web_search: WebSearchSettings = Field(default_factory=WebSearchSettings)
     """联网搜索设置"""
-
-    def validate_model_name(self, provider_model_name: str) -> bool:
-        """验证模型名称在当前配置中是否存在"""
-        if "/" not in provider_model_name:
-            return provider_model_name.strip() in self.model_groups
-        p_name, m_name = provider_model_name.split("/", 1)
-        return any(
-            p.name == p_name and p.get_model(m_name) is not None for p in self.providers
-        )

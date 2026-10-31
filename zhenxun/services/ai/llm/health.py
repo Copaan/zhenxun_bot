@@ -63,14 +63,18 @@ class KeyState(BaseModel):
     last_error: str | None = None
 
 
+ROUTE_FAILURE_THRESHOLD = 2
+"""线路连续失败多少次后熔断"""
+
+
 class RouteState(BaseModel):
     """单条线路 (提供商/模型) 的熔断状态"""
 
     state: Literal["closed", "open", "half_open"] = "closed"
     successes: int = 0
     failures: int = 0
+    consecutive_failures: int = 0
     cooldown_until: float = 0.0
-    latency_ema: float = 0.0
     last_error: str | None = None
 
 
@@ -242,15 +246,6 @@ class HealthManager:
         self._dirty = True
         logger.debug(f"密钥 {mask_key(api_key)} 调用失败: {error}")
 
-    def reset_keys(self, provider: str, api_keys: list[str]) -> None:
-        """把指定密钥恢复为健康状态"""
-        for api_key in api_keys:
-            state = self._key_state(provider, api_key)
-            state.status = "healthy"
-            state.cooldown_until = 0.0
-            state.last_error = None
-        self._dirty = True
-
     def key_stats(self, provider: str, api_keys: list[str]) -> dict[str, Any]:
         """获取提供商的密钥统计，以脱敏密钥为键"""
         return {
@@ -278,32 +273,37 @@ class HealthManager:
             ),
         )
 
-    def record_route_success(self, route: str, latency: float) -> None:
+    def record_route_success(self, route: str) -> None:
         """记录线路成功并关闭熔断"""
         state = self.state.routes.setdefault(route, RouteState())
         state.successes += 1
-        state.latency_ema = (
-            latency
-            if not state.latency_ema
-            else 0.2 * latency + 0.8 * state.latency_ema
-        )
         if state.state != "closed":
             logger.info(f"线路 {route} 已恢复")
         state.state = "closed"
+        state.consecutive_failures = 0
         state.cooldown_until = 0.0
         state.last_error = None
         self._dirty = True
 
     def record_route_failure(self, route: str, error: Exception, cooldown: int) -> None:
-        """记录线路失败并打开熔断"""
+        """记录线路失败，连续失败达到阈值或半开探测失败时打开熔断"""
         state = self.state.routes.setdefault(route, RouteState())
         state.failures += 1
+        state.consecutive_failures += 1
         state.last_error = str(error)[:256]
-        if cooldown:
+        self._dirty = True
+        if cooldown and (
+            state.state == "half_open"
+            or state.consecutive_failures >= ROUTE_FAILURE_THRESHOLD
+        ):
             state.state = "open"
             state.cooldown_until = time.time() + cooldown
-        self._dirty = True
-        logger.warning(f"线路 {route} 请求失败，熔断 {cooldown} 秒: {error}")
+            logger.warning(f"线路 {route} 请求失败，熔断 {cooldown} 秒: {error}")
+            return
+        logger.warning(
+            f"线路 {route} 请求失败 ({state.consecutive_failures}"
+            f"/{ROUTE_FAILURE_THRESHOLD}): {error}"
+        )
 
 
 health_manager = HealthManager()

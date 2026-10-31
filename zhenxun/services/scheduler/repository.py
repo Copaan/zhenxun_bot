@@ -4,9 +4,9 @@
 封装所有对 ScheduledJob 模型的数据库操作，将数据访问逻辑与业务逻辑分离。
 """
 
-from datetime import datetime
 from typing import Any
 
+from tortoise import timezone
 from tortoise.queryset import QuerySet
 
 from zhenxun.models.scheduled_job import ScheduledJob
@@ -50,7 +50,7 @@ class ScheduleRepository:
         """
         统一更新任务的最后运行状态
         """
-        schedule.last_run_at = datetime.now()
+        schedule.last_run_at = timezone.now()
         if is_success:
             schedule.last_run_status = "SUCCESS"
             schedule.consecutive_failures = 0

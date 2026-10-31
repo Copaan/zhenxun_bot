@@ -1,4 +1,4 @@
-"""Lazy public facade for LLM APIs and contracts."""
+"""大模型调用接口，按需导入以避免循环依赖"""
 
 from __future__ import annotations
 
@@ -6,12 +6,8 @@ from importlib import import_module
 from typing import Any
 
 _EXPORTS: dict[str, tuple[str, str]] = {
-    "AudioResponse": ("zhenxun.services.ai.core.messages", "AudioResponse"),
-    "ChatResponse": ("zhenxun.services.ai.core.messages", "ChatResponse"),
-    "LLMContentPart": ("zhenxun.services.ai.core.messages", "LLMContentPart"),
     "LLMException": ("zhenxun.services.ai.core.exceptions", "LLMException"),
     "LLMMessage": ("zhenxun.services.ai.core.messages", "LLMMessage"),
-    "TTSConfig": ("zhenxun.services.ai.core.options", "TTSConfig"),
     "chat": ("zhenxun.services.ai.llm.api", "chat"),
     "create_image": ("zhenxun.services.ai.llm.api", "create_image"),
     "create_speech": ("zhenxun.services.ai.llm.api", "create_speech"),

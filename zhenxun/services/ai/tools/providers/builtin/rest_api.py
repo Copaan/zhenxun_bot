@@ -1,7 +1,6 @@
 import json
 from typing import Any, ClassVar, Literal
 
-from zhenxun.services.ai.core.stream_events import ToolStreamChunkEvent
 from zhenxun.services.ai.run.context import RunContext
 from zhenxun.services.ai.tools.core.decorators import Rules, tool
 from zhenxun.services.ai.tools.core.toolkit import BaseToolkit
@@ -66,17 +65,20 @@ class RestApiToolkit(BaseToolkit):
         发起 HTTP 请求获取外部数据。
 
         Args:
-            endpoint: API的路径(若初始化了base_url，将自动拼接)。如果是一个完整的URL(以http开头)，则直接请求该URL。
+            endpoint: API的路径。初始化了base_url时只能请求其下的接口(相对路径或以base_url开头的完整URL)，否则需为以http(s)开头的完整URL。
             method: HTTP 请求方法。
             params: URL 查询参数字典。
             json_data: JSON 请求体字典。
         """  # noqa: E501
-        if endpoint.startswith("http://") or endpoint.startswith("https://"):
-            url = endpoint
-        else:
-            url = (
-                f"{self.base_url}/{endpoint.lstrip('/')}" if self.base_url else endpoint
-            )
+        url = endpoint
+        if self.base_url and not endpoint.startswith(("http://", "https://")):
+            url = f"{self.base_url}/{endpoint.lstrip('/')}"
+        if self.base_url and not (
+            url == self.base_url or url.startswith(f"{self.base_url}/")
+        ):
+            return ToolResult(output=f"只能请求 {self.base_url} 下的接口").as_error()
+        if not url.startswith(("http://", "https://")):
+            return ToolResult(output="只能请求 http/https 地址").as_error()
 
         merged_params = self.default_params.copy()
         if params:
@@ -104,32 +106,12 @@ class RestApiToolkit(BaseToolkit):
             is_error = response.status_code >= 400
             result = ToolResult(output=result_dict)
 
-            if context:
-                msg = (
-                    f"🌐 已调用 API: {url}"
-                    if not is_error
-                    else f"❌ API 调用失败 (Status: {response.status_code})"
-                )
-                await context.run.emit(
-                    ToolStreamChunkEvent(
-                        tool_name=context.call.tool_name,
-                        content=msg,
-                    )
-                )
-
             if is_error:
                 result = result.as_error()
             return result
 
         except Exception as e:
             logger.error(f"RestApiToolkit 请求失败: {e}")
-            if context:
-                await context.run.emit(
-                    ToolStreamChunkEvent(
-                        tool_name=context.call.tool_name,
-                        content="❌ API 网络请求发生框架级错误",
-                    )
-                )
             return ToolResult(
                 output=f"网络请求失败: {type(e).__name__} - {e}"
             ).as_error()

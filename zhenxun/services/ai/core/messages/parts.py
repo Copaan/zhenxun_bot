@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Annotated, Any, Literal
 from typing_extensions import Self
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
 
 from zhenxun.services.ai.utils.logger import log_core as logger
 from zhenxun.utils.pydantic_compat import model_validator
@@ -16,107 +16,93 @@ class BaseContentPart(BaseModel):
 
     metadata: dict[str, Any] | None = Field(default=None)
     """该部件的内部元数据，提供如协议回传数据、解析结果等非展示用数据"""
-
-    @classmethod
-    def text_part(cls, text: str) -> "TextPart":
-        """创建一个纯文本片段"""
-        return TextPart(text=text)
-
-    @classmethod
-    def thought_part(cls, text: str) -> "ThoughtPart":
-        """创建一个思维链 (CoT) 思考片段"""
-        return ThoughtPart(thought_text=text)
-
-    @classmethod
-    def image_url_part(cls, url: str) -> "ImagePart":
-        """创建一个基于外网 URL 的图片片段"""
-        return ImagePart(url=url)
-
-    @classmethod
-    def image_base64_part(cls, data: str, mime_type: str = "image/png") -> "ImagePart":
-        """创建一个基于 Base64 编码数据的图片片段"""
-        return ImagePart(raw=base64.b64decode(data), mime_type=mime_type)
-
-    @classmethod
-    def audio_url_part(cls, url: str, mime_type: str = "audio/wav") -> "AudioPart":
-        """创建一个基于外网 URL 的音频片段"""
-        return AudioPart(url=url, mime_type=mime_type)
-
-    @classmethod
-    def video_url_part(cls, url: str, mime_type: str = "video/mp4") -> "VideoPart":
-        """创建一个基于外网 URL 的视频片段"""
-        return VideoPart(url=url, mime_type=mime_type)
-
-    @classmethod
-    def video_base64_part(cls, data: str, mime_type: str = "video/mp4") -> "VideoPart":
-        """创建一个基于 Base64 编码数据的视频片段"""
-        return VideoPart(raw=base64.b64decode(data), mime_type=mime_type)
-
-    @classmethod
-    def audio_base64_part(cls, data: str, mime_type: str = "audio/wav") -> "AudioPart":
-        """创建一个基于 Base64 编码数据的音频片段"""
-        return AudioPart(raw=base64.b64decode(data), mime_type=mime_type)
-
-    @classmethod
-    def file_uri_part(
-        cls,
-        file_uri: str,
-        mime_type: str | None = None,
-        metadata: dict[str, Any] | None = None,
-    ) -> "FilePart":
-        """创建一个基于云端 URI (如 Google Cloud Storage gs://) 的通用文件片段"""
-        return FilePart(url=file_uri, mime_type=mime_type, metadata=metadata or {})
-
-    @classmethod
-    def tool_call_part(
-        cls, id: str, tool_name: str, args: dict[str, Any] | str
-    ) -> "ToolCallPart":
-        """创建一个工具调用请求片段"""
-        return ToolCallPart(id=id, tool_name=tool_name, args=args)
-
-    @classmethod
-    def tool_return_part(cls, call_id: str, name: str, result: Any) -> "ToolReturnPart":
-        """创建一个工具执行结果片段"""
-        return ToolReturnPart(
-            tool_call_id=call_id,
-            tool_name=name,
-            output=result,
-        )
+    _raw_cache: bytes | None = PrivateAttr(default=None)
+    _b64_cache: str | None = PrivateAttr(default=None)
 
     async def get_raw_bytes(self) -> bytes:
-        """统一获取多模态原始字节数据 (自动适配 raw、本地 path 或自动下载公网 url)"""
+        """统一获取多模态原始字节数据 (自动适配 raw、本地 path 或自动下载公网 url)
+
+        url 只允许公网地址且有大小上限，失败时返回空字节；path 与 url 来源
+        读取成功后缓存在本部件上，多轮请求不再重复读取或下载。
+        """
         raw_data = getattr(self, "raw", None)
         if isinstance(raw_data, bytes):
             return raw_data
+        if self._raw_cache is not None:
+            return self._raw_cache
 
         path_data = getattr(self, "path", None)
-        if path_data is not None:
-            from pathlib import Path
-
-            if isinstance(path_data, Path):
-                return path_data.read_bytes()
+        if isinstance(path_data, Path):
+            self._raw_cache = path_data.read_bytes()
+            return self._raw_cache
 
         url_data = getattr(self, "url", None)
         if isinstance(url_data, str):
-            from zhenxun.utils.http_utils import AsyncHttpx
+            from zhenxun.services.ai.utils.utils import MediaFetchError, fetch_media
 
-            content = await AsyncHttpx.get_content(url_data)
-            if isinstance(content, bytes):
-                return content
-            return b""
+            try:
+                content = await fetch_media(url_data)
+            except MediaFetchError as e:
+                logger.warning(f"读取媒体 {url_data[:80]} 失败: {e}")
+                return b""
+            if content:
+                self._raw_cache = content
+            return content
 
         raise ValueError(
             f"{self.__class__.__name__} 未提供有效的数据源 (url, raw, path)"
         )
 
     async def get_base64_data(self) -> str:
-        """统一获取 Base64 编码的字符串数据"""
-        return base64.b64encode(await self.get_raw_bytes()).decode("utf-8")
+        """统一获取 Base64 编码的字符串数据，编码结果缓存在本部件上"""
+        if self._b64_cache is None:
+            raw = await self.get_raw_bytes()
+            if not raw:
+                return ""
+            self._b64_cache = base64.b64encode(raw).decode("utf-8")
+        return self._b64_cache
 
     async def get_data_uri(self, default_mime: str = "application/octet-stream") -> str:
         """统一获取 Data URI (data:mime;base64,...) 格式的字符串"""
         mime = getattr(self, "mime_type", None) or default_mime
         return f"data:{mime};base64,{await self.get_base64_data()}"
+
+    @staticmethod
+    def text_part(text: str) -> TextPart:
+        """文本片段（外部插件使用的旧工厂方法）
+
+        参数:
+            text: 文本
+
+        返回:
+            TextPart: 文本片段
+        """
+        return TextPart(text=text)
+
+    @staticmethod
+    def image_url_part(url: str) -> ImagePart:
+        """图片地址片段（外部插件使用的旧工厂方法）
+
+        参数:
+            url: 图片地址
+
+        返回:
+            ImagePart: 图片片段
+        """
+        return ImagePart(url=url)
+
+    @staticmethod
+    def image_base64_part(data: str, mime_type: str = "image/png") -> ImagePart:
+        """base64 图片片段（外部插件使用的旧工厂方法）
+
+        参数:
+            data: base64 编码的图片
+            mime_type: 图片类型
+
+        返回:
+            ImagePart: 图片片段
+        """
+        return ImagePart(raw=base64.b64decode(data), mime_type=mime_type)
 
 
 class ImagePart(BaseContentPart):
@@ -245,34 +231,6 @@ class ToolReturnPart(BaseContentPart):
     """工具执行结果的有效载荷"""
 
 
-class TextDeltaPart(BaseModel):
-    """流式文本增量片段"""
-
-    type: Literal["text_delta"] = "text_delta"
-    content_delta: str
-    """流式返回的文本增量字符串"""
-
-
-class ThoughtDeltaPart(BaseModel):
-    """流式思考链增量片段"""
-
-    type: Literal["thought_delta"] = "thought_delta"
-    content_delta: str
-    """流式返回的思考过程增量字符串"""
-
-
-class ToolCallDeltaPart(BaseModel):
-    """流式工具调用增量片段"""
-
-    type: Literal["tool_call_delta"] = "tool_call_delta"
-    tool_call_id: str | None = None
-    """(可选) 流式返回的工具调用唯一ID"""
-    tool_name_delta: str | None = None
-    """(可选) 流式返回的工具名称增量"""
-    args_delta: str | None = None
-    """(可选) 流式返回的 JSON 格式参数增量"""
-
-
 LLMContentPart = Annotated[
     TextPart
     | ImagePart
@@ -330,11 +288,8 @@ __all__ = [
     "FilePart",
     "ImagePart",
     "LLMContentPart",
-    "TextDeltaPart",
     "TextPart",
-    "ThoughtDeltaPart",
     "ThoughtPart",
-    "ToolCallDeltaPart",
     "ToolCallPart",
     "ToolReturnPart",
     "VideoPart",

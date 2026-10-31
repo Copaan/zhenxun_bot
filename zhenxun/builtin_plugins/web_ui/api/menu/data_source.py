@@ -35,6 +35,7 @@ default_menus = [
         icon="protocol",
     ),
     MenuItem(name="AI 配置", module="ai", router="/ai", icon="magic"),
+    MenuItem(name="AI 聊天", module="ai-chat", router="/ai/chat", icon="chat"),
     MenuItem(
         name="网络代理",
         module="network-proxy",

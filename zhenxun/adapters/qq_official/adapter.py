@@ -61,6 +61,18 @@ _INGRESS_HASHES = {
 }
 
 
+def _remember_voices(data: object) -> None:
+    """有附件时交给 AI 消息转换记下语音附件的 wav 地址与识别文字
+
+    参数:
+        data: QQ 官方事件数据
+    """
+    if isinstance(data, dict) and data.get("attachments"):
+        from zhenxun.services.ai.message_segments import remember_qq_voices
+
+        remember_qq_voices(data)
+
+
 def project_bot_infos(qq_bots: list[BotInfo], config: QQOfficialConfig) -> list:
     """按本项目的 QQ_BOTS 配置重建上游 BotInfo，未填写的连接方式与订阅事件使用
     本项目默认值（Webhook、不订阅频道事件），与配置校验和 WebUI 显示一致
@@ -515,6 +527,7 @@ class ZhenxunQQAdapter(QQAdapter):
 
     @override
     def dispatch_event(self, bot: ZhenxunQQBot, payload: Dispatch) -> None:
+        _remember_voices(payload.data)
         try:
             event = self.payload_to_event(payload)
         except Exception as exc:
@@ -602,6 +615,7 @@ class ZhenxunQQAdapter(QQAdapter):
         if not self.webhook_ready():
             return Response(503, content="Webhook worker not ready")
 
+        _remember_voices(payload.data)
         try:
             message_event = self.payload_to_event(payload)
             validate_official_event(app_id, message_event)

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
+import io
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any
+import wave
 
 from pydantic import BaseModel, Field
-
-from zhenxun.utils.pydantic_compat import parse_as
 
 from .parts import (
     AudioPart,
@@ -17,7 +17,11 @@ from .parts import (
 )
 from .shared import RerankResult, UsageInfo
 
-T = TypeVar("T", bound=BaseModel)
+if TYPE_CHECKING:
+    from nonebot_plugin_alconna import Voice
+
+
+_AUDIO_MIMETYPES = {"mp3": "audio/mpeg", "opus": "audio/ogg", "aac": "audio/aac"}
 
 
 class ChatResponse(BaseModel):
@@ -35,26 +39,6 @@ class ChatResponse(BaseModel):
     """联网搜索、位置等基底事实归因元数据"""
     parsed_obj: Any | None = Field(default=None)
     """在结构化输出模式下，由中间件反序列化得出的强类型 Pydantic 对象实例"""
-
-    def get_parsed_obj(self, model_class: type[T]) -> T | None:
-        """
-        从结构化生成结果中获取强类型的 Pydantic 解析对象，提供完善的 IDE 类型推导支持。
-
-        参数:
-            model_class: 期望提取的 Pydantic 模型类。
-
-        返回:
-            强类型的模型实例，如果不存在则返回 None
-        """
-        if self.parsed_obj is None:
-            return None
-        if isinstance(self.parsed_obj, model_class):
-            return self.parsed_obj
-
-        try:
-            return parse_as(model_class, self.parsed_obj)
-        except Exception:
-            return self.parsed_obj
 
     @property
     def tool_calls(self) -> list[ToolCallPart]:
@@ -134,6 +118,43 @@ class AudioResponse(BaseModel):
     model_name: str
     """实际执行任务的模型名称"""
 
+    def to_voice(self) -> Voice:
+        """转为可直接发送的语音消息段，PCM 数据先封装为 WAV
+
+        返回:
+            Voice: 语音消息段
+
+        示例:
+            res = await create_speech("你好")
+            await MessageUtils.build_message(res.to_voice()).send()
+        """
+        from nonebot_plugin_alconna import Voice
+
+        audio, audio_format = self.audio_bytes, self.audio_format.lower()
+        if audio_format == "pcm":
+            buffer = io.BytesIO()
+            with wave.open(buffer, "wb") as writer:
+                writer.setnchannels(1)
+                writer.setsampwidth(2)
+                writer.setframerate(24000)
+                writer.writeframes(audio)
+            audio, audio_format = buffer.getvalue(), "wav"
+        mimetype = _AUDIO_MIMETYPES.get(audio_format, f"audio/{audio_format}")
+        return Voice(raw=audio, mimetype=mimetype, name=f"speech.{audio_format}")
+
+
+class TranscriptionResponse(BaseModel):
+    """语音转文字响应对象"""
+
+    text: str
+    """识别出的文字"""
+    usage: UsageInfo = Field(default_factory=UsageInfo)
+    """Token 或时长消耗统计"""
+    raw_response: Any | None = None
+    """原生响应体，供高级调试使用"""
+    model_name: str
+    """实际执行任务的模型名称"""
+
 
 class ImageResponse(BaseModel):
     """图像生成响应对象"""
@@ -176,4 +197,5 @@ __all__ = [
     "EmbeddingResponse",
     "ImageResponse",
     "RerankResponse",
+    "TranscriptionResponse",
 ]

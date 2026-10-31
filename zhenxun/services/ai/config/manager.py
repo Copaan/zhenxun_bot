@@ -178,9 +178,16 @@ def migrate_legacy_ai_config() -> bool:
         client_settings = {k: v for k, v in client_settings.items() if k != "timeout"}
         Config.set_config("AI", "CLIENT_SETTINGS", client_settings)
         changed = True
+    web_search = Config.get_config("AI", "WEB_SEARCH", build_model=False)
+    if isinstance(web_search, dict) and "api_key" in web_search:
+        web_search = dict(web_search)
+        if key := web_search.pop("api_key"):
+            web_search["api_keys"] = [*(web_search.get("api_keys") or []), key]
+        Config.set_config("AI", "WEB_SEARCH", web_search)
+        changed = True
     if changed:
         Config.save(save_simple_data=True)
-        logger.info("已将旧版 AI 服务商配置转换为新结构并写回配置文件", LOG_COMMAND)
+        logger.info("已将旧版 AI 配置转换为新结构并写回配置文件", LOG_COMMAND)
     return changed
 
 
@@ -188,14 +195,6 @@ def register_llm_configs():
     """注册 LLM 服务的配置项"""
 
     llm_config = LLMConfig()
-    Config.add_plugin_config(
-        "AI",
-        "CHAT_PLUGIN_ENABLED",
-        {},
-        type=dict,
-        help="按插件模块保存的 AI 聊天即时开关，不影响新群默认状态。",
-    )
-
     Config.add_plugin_config(
         "AI",
         "default_models",
@@ -267,11 +266,15 @@ def register_llm_configs():
             "    - summarization_prompt: 指导大模型总结的系统提示词\n"
             "    - keep_recent_turns: 总结外强制原样保留的最近对话轮数\n"
             "  - vision_window_size: 多模态滑动窗口大小。0表示无限制，>0表示仅保留最近N轮包含多模态真实数据的消息，超过则自动降级为占位符\n"  # noqa: E501
+            "  - image_max_side: 发给模型的图片长边上限（像素），超过 512KB 时继续缩小，动图拼成 3×3，0 表示不压缩\n"  # noqa: E501
+            "  - file_max_chars: 收到文件时读取内容交给模型的最大字数，0 表示不读取\n"
             "  - tool_pruning: 工具结果过载修剪策略配置\n"
             "    - enable: 是否开启长工具输出结果的自动修剪\n"
             "    - trigger_threshold: 触发修剪的工具纯 Token 阈值。<=1.0为比例，>1.0为绝对 Token 数\n"  # noqa: E501
             "    - max_history_turns: 触发修剪的最大工具消息轮数。设为 0 表示不限制轮数\n"  # noqa: E501
-            "    - keep_recent_turns: 修剪时强制原样保留的最新的工具消息轮数"
+            "    - keep_recent_turns: 修剪时强制原样保留的最新的工具消息轮数\n"
+            "  - history_retention_days: 短期对话记忆保留天数，0 表示不限制\n"
+            "  - history_max_messages: 每个会话最多保留的短期对话记忆条数，0 表示不限制"
         ),
         type=dict,
         ui={
@@ -311,7 +314,8 @@ def register_llm_configs():
             "enable_parallel_calls(允许并行), "
             "reflexion_retries(反思重试次数), "
             "enable_fallback_summary(达到最大循环时兜底总结), "
-            "enable_hitl(是否允许智能体主动向用户求助), "
+            "tool_output_max_chars(单个工具结果的最大字符数), "
+            "tool_timeout(单次工具调用超时秒数), "
             "mcp_cleanup_timeout(MCP 闲置回收时间)"
         ),
         type=dict,
@@ -328,10 +332,10 @@ def register_llm_configs():
         "sandbox",
         model_dump(llm_config.sandbox),
         help=(
-            "沙箱底层环境基础设施配置。\n"
-            "包含: enable_sandbox(全局开关), sandbox_type(驱动类型), docker_image"
-            "(使用的镜像), "
-            "cleanup_timeout(空闲清理超时秒数), enable_vfs_helper(开启VFS防逃逸探针)。"
+            "Agent 代码沙箱（Docker）配置，建议在 WebUI“AI 聊天 → Agent”中设置。\n"
+            "包含: enable_sandbox(启用), docker_image(镜像), cpus(CPU 核数), "
+            "memory_mb(内存 MB), exec_timeout(执行超时秒数), network(联网), "
+            "cleanup_timeout(闲置清理秒数，0 不清理)。"
         ),
         type=dict,
         ui={
@@ -353,7 +357,8 @@ def register_llm_configs():
             "api(只用搜索接口) / off(关闭)。\n"
             "原生联网只在厂商官方接口上默认启用，中转站需核验通过或在模型能力中强制开启。\n"
             "provider: 搜索接口 deepseek / kimi / glm / jina / tavily / bocha；\n"
-            "api_key: 搜索接口密钥，留空时复用同厂商服务商的密钥；"
+            "api_keys: 搜索接口密钥，可填写多个，失败时换下一个；"
+            "留空时复用同厂商服务商的密钥；"
             "max_results: 每次搜索的结果数。"
         ),
         type=dict,

@@ -18,6 +18,7 @@ from tortoise import Tortoise
 from zhenxun.builtin_plugins.web_ui.api.configure.setup_access import setup_access
 from zhenxun.builtin_plugins.web_ui.api.protocol import build_protocol_status
 from zhenxun.builtin_plugins.web_ui.security import authenticated_websocket_count
+from zhenxun.configs.config import BotConfig
 from zhenxun.services.cache import cache_config
 from zhenxun.services.cache.config import CacheMode, normalize_cache_mode
 from zhenxun.services.cache.runtime_cache import health_snapshot
@@ -28,6 +29,7 @@ from zhenxun.services.message_load import is_db_unhealthy
 from ..main.data_source import bot_live
 from .model import (
     RuntimeBotStatus,
+    RuntimeGettingStarted,
     RuntimeIssue,
     RuntimeOverview,
     RuntimeProcessStatus,
@@ -505,6 +507,33 @@ async def build_runtime_overview(force: bool = False) -> RuntimeOverview:
         ),
         bots=bots,
         issues=issues,
+        getting_started=_getting_started(driver_config),
+    )
+
+
+def _getting_started(driver_config) -> RuntimeGettingStarted:
+    """仪表盘快速开始清单的完成情况
+
+    参数:
+        driver_config: NoneBot 驱动配置
+
+    返回:
+        RuntimeGettingStarted: 完成情况
+    """
+    from zhenxun.services.ai.config import get_llm_config
+    from zhenxun.services.ai.llm.manager import resolve_routes
+
+    ai_ready = False
+    if chat := get_llm_config().default_models.chat:
+        with contextlib.suppress(Exception):
+            ai_ready = bool(resolve_routes(chat, "chat"))
+    superusers = bool(getattr(driver_config, "superusers", None)) or any(
+        BotConfig.platform_superusers.values()
+    )
+    return RuntimeGettingStarted(
+        ai_ready=ai_ready,
+        superusers=superusers,
+        self_nickname=BotConfig.self_nickname,
     )
 
 

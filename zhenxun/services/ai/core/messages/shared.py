@@ -25,10 +25,6 @@ class UsageInfo:
     reasoning_tokens: int = 0
     """专门用于内部思考/推理链 (CoT) 消耗的 Token 数"""
 
-    @property
-    def efficiency_ratio(self) -> float:
-        return self.completion_tokens / max(self.prompt_tokens, 1)
-
     def __add__(self, other: "UsageInfo") -> "UsageInfo":
         """支持 UsageInfo 相加，用于汇聚子智能体的 Token 消耗"""
         if not isinstance(other, UsageInfo):
@@ -44,21 +40,6 @@ class UsageInfo:
             + other.prompt_cache_miss_tokens,
             reasoning_tokens=self.reasoning_tokens + other.reasoning_tokens,
         )
-
-
-class LLMCodeExecution(BaseModel):
-    """大模型代码执行（沙箱/本地）结果实体"""
-
-    code: str
-    """被执行的原始代码"""
-    output: str | None = None
-    """标准输出 (stdout)"""
-    error: str | None = None
-    """标准错误 (stderr) 或框架抛出的异常"""
-    execution_time: float | None = None
-    """代码执行耗时 (秒)"""
-    files_generated: list[str] | None = None
-    """代码执行过程中生成的工件(Artifacts)文件路径或名称列表"""
 
 
 class LLMGroundingAttribution(BaseModel):
@@ -112,7 +93,6 @@ class RerankResult(BaseModel):
 
 
 __all__ = [
-    "LLMCodeExecution",
     "LLMGroundingAttribution",
     "LLMGroundingMetadata",
     "RerankDocument",

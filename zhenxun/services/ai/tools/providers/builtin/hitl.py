@@ -1,7 +1,6 @@
 from zhenxun.services.ai.core.exceptions import AbortException, ToolFatalError
-from zhenxun.services.ai.core.stream_events import ToolStreamChunkEvent
 from zhenxun.services.ai.run.context import RunContext
-from zhenxun.services.ai.run.di import Inject
+from zhenxun.services.ai.run.hitl import HITLController
 from zhenxun.services.ai.tools.core.decorators import tool
 from zhenxun.services.ai.tools.core.toolkit import BaseToolkit
 from zhenxun.services.ai.tools.models import ResolvedToolPayload, ToolResult
@@ -36,11 +35,10 @@ class HITLToolkit(BaseToolkit):
     async def ask_user_for_help(
         self,
         question: str,
-        hitl: Inject.HITL,
         context: RunContext,
     ) -> ToolResult:
         try:
-            user_reply = await hitl.ask_text(
+            user_reply = await HITLController(context).ask_text(
                 f"🤖 [AI 提问]\n{question}\n\n(请在 60 秒内回复，或回复'取消')",
                 timeout=60.0,
             )
@@ -53,11 +51,4 @@ class HITLToolkit(BaseToolkit):
             raise e
 
         logger.info(f"收到用户求助回复: {user_reply}")
-        if context:
-            await context.run.emit(
-                ToolStreamChunkEvent(
-                    tool_name=context.call.tool_name, content="🗣️ 已收到用户的回复"
-                )
-            )
-
         return ToolResult(output=f"用户提供的回复是: {user_reply}")

@@ -240,24 +240,27 @@ async def send_official_message(
     message: UniMessage,
     group_id: str | None,
     official_context: object | None = None,
+    user_id: str | None = None,
 ) -> Any:
     """通过 QQ 官方 Bot 发送消息
 
     指定的群与事件所在群不同或不在事件中时，向该群发送主动消息；
-    未指定群时回复到事件所在会话，被动回复的序号、期限与主动消息兜底由
-    ZhenxunQQBot.send 处理。
+    未指定群时，指定的用户是当前单聊事件的用户或未指定用户则回复到事件所在会话，
+    否则向指定用户发送主动单聊消息；
+    被动回复的序号、期限与主动消息兜底由 ZhenxunQQBot.send 处理。
 
     参数:
         bot: 官方 Bot
         message: 消息
         group_id: 群 openid 或存储 id
         official_context: 官方事件上下文，默认取当前事件
+        user_id: 不在事件中时主动单聊的用户 openid 或存储 id
 
     返回:
         Any: 发送回执
 
     异常:
-        OfficialReplyUnavailable: 没有可回复的事件且未指定群，或群 id 不属于该 Bot
+        OfficialReplyUnavailable: 没有可回复的事件且未指定群或用户，或 id 不属于该 Bot
     """
     app_id = str(bot.self_id)
     group_openid = None
@@ -265,23 +268,36 @@ async def send_official_message(
         group_openid = native_id(group_id, "qq_api", group=True, bot_id=app_id)
         if group_openid is None:
             raise OfficialReplyUnavailable("群 id 不属于当前 QQ 官方 Bot")
+    user_openid = native_id(user_id, "qq_api", bot_id=app_id) if user_id else None
     context = official_context or get_current_official_context()
-    if isinstance(context, OfficialQQEventContext) and group_openid in (
-        None,
-        context.group_openid,
-    ):
+    if isinstance(context, OfficialQQEventContext):
+        if group_openid or not user_openid:
+            same = group_openid in (None, context.group_openid)
+        else:
+            same = context.scene == "c2c" and context.actor_openid == user_openid
+    else:
+        same = False
+    if isinstance(context, OfficialQQEventContext) and same:
         if context.app_id == app_id:
             if context.reply_event is None:
                 raise OfficialReplyUnavailable("QQ 官方事件上下文缺少回复事件")
             return await message.send(target=context.reply_event, bot=bot)
         if group_openid is None:
             raise OfficialReplyUnavailable("事件上下文不属于当前 QQ 官方 Bot")
-    if group_openid is None:
-        raise OfficialReplyUnavailable(
-            "QQ 官方 Bot 不在事件中时只能向群发送主动消息，不能主动私聊"
-        )
+    private = group_openid is None
+    openid = group_openid
+    if private:
+        openid = user_openid
+        if openid is None:
+            raise OfficialReplyUnavailable(
+                "QQ 官方 Bot 不在事件中且没有可发送的群或用户"
+            )
     target = Target(
-        id=group_openid, self_id=app_id, adapter="QQ", scope=SupportScope.qq_api
+        id=str(openid),
+        self_id=app_id,
+        adapter="QQ",
+        scope=SupportScope.qq_api,
+        private=private,
     )
     return await message.send(target=target, bot=bot)
 

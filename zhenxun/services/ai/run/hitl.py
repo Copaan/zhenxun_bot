@@ -2,10 +2,8 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-import time
 
 from nonebot.adapters import Event
-from nonebot.permission import SUPERUSER
 from nonebot_plugin_waiter import waiter
 
 from zhenxun.services.ai.core.exceptions import AbortException, ToolFatalError
@@ -14,8 +12,6 @@ from zhenxun.services.ai.utils.logger import log_agent as logger
 from .context import RunContext
 
 CANCEL_WORDS = {"取消", "cancel", "0", "退出", "quit"}
-CONFIRM_WORDS = {"y", "yes", "是", "1", "ok", "确认"}
-REJECT_WORDS = {"n", "no", "否", "0", "拒绝"}
 
 
 class HITLController:
@@ -91,61 +87,3 @@ class HITLController:
             raise AbortException(reason="用户主动取消了操作")
 
         return user_input
-
-    async def ask_confirm(self, prompt_msg: str, timeout: float = 60.0) -> bool:
-        """发起高危操作审批，仅超级用户可以批准，发起人与超级用户可以拒绝
-
-        参数:
-            prompt_msg: 审批说明
-            timeout: 超时时间，秒
-
-        返回:
-            bool: 批准时为 True，拒绝或超时抛出异常
-        """
-        orig_user_id = self.context.get_user_id()
-        bot = self.context.get_bot()
-
-        if not bot:
-            raise ToolFatalError("非交互环境无法发起人工审批。")
-
-        full_prompt = (
-            f"{prompt_msg}\n\n需要超级用户在规定时间内回复 [Y/是] 批准，"
-            "发起人或超级用户回复 [N/否/取消] 拒绝。"
-        )
-
-        start_time = time.time()
-        is_first_prompt = True
-
-        while True:
-            remaining = timeout - (time.time() - start_time)
-            if remaining <= 0:
-                raise ToolFatalError("审批超时")
-
-            event = await self.wait_event(
-                prompt_msg=full_prompt if is_first_prompt else None,
-                timeout=remaining,
-                strict_user=False,
-            )
-            is_first_prompt = False
-
-            if event is None:
-                raise ToolFatalError("审批超时")
-
-            text = event.get_plaintext().strip().lower()
-            if (
-                text not in CONFIRM_WORDS
-                and text not in REJECT_WORDS
-                and text not in CANCEL_WORDS
-            ):
-                continue
-
-            is_superuser = await SUPERUSER(bot, event)
-            is_requester = str(event.get_user_id()) == orig_user_id
-            if text in CONFIRM_WORDS:
-                if is_superuser:
-                    return True
-                if is_requester:
-                    await bot.send(event, "⚠️ 该操作需要超级用户批准。")
-                continue
-            if is_superuser or is_requester:
-                raise AbortException(reason="审批被拒绝")

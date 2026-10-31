@@ -4,7 +4,6 @@ import hashlib
 import json
 from typing import Any, ClassVar, cast
 
-from zhenxun.models.user_console import UserConsole
 from zhenxun.services.ai.config import get_llm_config
 from zhenxun.services.ai.core.exceptions import (
     AbortException,
@@ -13,7 +12,6 @@ from zhenxun.services.ai.core.exceptions import (
     ModelRetry,
     ResponseParseException,
     ToolFatalError,
-    ToolFinishException,
     ToolRetryError,
     UpstreamServerException,
 )
@@ -25,27 +23,14 @@ from zhenxun.services.ai.core.messages import (
 )
 from zhenxun.services.ai.core.models import LLMContext
 from zhenxun.services.ai.run.context import RunContext
-from zhenxun.services.ai.utils import PermissionUtils
 from zhenxun.services.ai.utils.logger import log_capability as logger
-from zhenxun.services.business_identity import (
-    business_account_scope,
-    current_business_identity,
-    resolve_business_identity,
-)
-from zhenxun.services.platform_identity import (
-    CURRENT_PLATFORM_SCOPE,
-    is_isolated_scope,
-)
-from zhenxun.utils.enum import GoldHandle
-from zhenxun.utils.exception import InsufficientGold
-from zhenxun.utils.platform import PlatformUtils
+from zhenxun.services.ai.utils.runtime import PermissionUtils
 
 from .base import (
     AbstractCapability,
     WrapModelRequestHandler,
     WrapToolExecuteHandler,
 )
-from .manager import capability
 
 
 def _get_tool_meta(tool: Any, key: str, default: Any = None) -> Any:
@@ -57,7 +42,6 @@ def _get_tool_meta(tool: Any, key: str, default: Any = None) -> Any:
     return meta.get(key, default)
 
 
-@capability(namespace="global", auto_apply=True)
 class StuckDetectionCapability(AbstractCapability):
     """死循环检测：使用前置请求拦截防止 LLM 陷入无限重试"""
 
@@ -131,7 +115,6 @@ class StuckDetectionCapability(AbstractCapability):
         return await handler(llm_context)
 
 
-@capability(namespace="global", auto_apply=True)
 class GlobalCycleLimitCapability(AbstractCapability):
     """全局防死循环检测中间件：跨 Agent 追踪大模型调用总次数"""
 
@@ -146,11 +129,8 @@ class GlobalCycleLimitCapability(AbstractCapability):
         )
         context.session.shared_state["__global_cycle_count__"] = global_cycles
 
-        global_max = llm_context.request.extra.get("__global_max_cycles__")
-        if global_max is None:
-            global_max = get_llm_config().agent_settings.global_max_cycles
-
-        if global_max is not None and global_cycles > global_max:
+        global_max = get_llm_config().agent_settings.global_max_cycles
+        if global_cycles > global_max:
             logger.error(
                 "🚨 触发全局防护：整个流水线执行步数已达到全局上限 "
                 f"({global_max})，强制熔断！"
@@ -164,7 +144,6 @@ class GlobalCycleLimitCapability(AbstractCapability):
         return await handler(llm_context)
 
 
-@capability(namespace="global", auto_apply=True)
 class PermissionCapability(AbstractCapability):
     """权限校验中间件：在执行前根据确定参数进行动态鉴权"""
 
@@ -194,71 +173,6 @@ class PermissionCapability(AbstractCapability):
         return await handler(arguments)
 
 
-@capability(namespace="global", auto_apply=True)
-class BillingCapability(AbstractCapability):
-    """经济系统中间件：执行前扣除金币"""
-
-    async def wrap_tool_execute(
-        self,
-        context: RunContext,
-        tool_name: str,
-        arguments: dict[str, Any],
-        handler: WrapToolExecuteHandler,
-    ) -> dict[str, Any]:
-        tool = context.call.current_tool
-        cost_gold = _get_tool_meta(tool, "cost_gold", 0)
-        if cost_gold > 0:
-            user_id = context.get_user_id()
-            platform = context.get_platform()
-            bot, event = context.get_bot(), context.get_event()
-            official = (
-                is_isolated_scope(PlatformUtils.get_platform_scope(bot))
-                if bot is not None
-                else platform == "qq_api"
-                or is_isolated_scope(CURRENT_PLATFORM_SCOPE.get())
-            )
-            if (bot is None or event is None) and (official or event is not None):
-                raise ToolFatalError("收费工具缺少可核验的消息身份")
-            try:
-                # Resolve before opening an asset transaction. Do not replace
-                # protocol IDs in the agent's permission/session context.
-                with business_account_scope(None):
-                    if bot is not None and event is not None:
-                        from nonebot_plugin_uninfo import get_session
-
-                        session = await get_session(bot, event)
-                        if session is None:
-                            raise ToolFatalError("收费工具无法解析消息会话")
-                        identity = await resolve_business_identity(bot, event, session)
-                        if current_business_identity() is None:
-                            raise ToolFatalError("收费工具缺少有效的官方身份上下文")
-                        user_id = identity.storage_key
-                        platform = identity.protocol.domain
-                    if not user_id:
-                        raise ToolFatalError("收费工具缺少业务账号")
-                    await UserConsole.reduce_gold(
-                        user_id,
-                        cost_gold,
-                        GoldHandle.PLUGIN,
-                        f"agent_tool:{getattr(tool, 'name', 'unknown')}",
-                        platform,
-                    )
-            except InsufficientGold:
-                msg = (
-                    f"系统警告：用户金币不足（需要 {cost_gold} 金币，但余额不够）。"
-                    "请向用户解释金币不足，提醒可通过签到赚取，并拒绝执行。"
-                )
-                logger.warning(
-                    f"💰 [Capability] 金币拦截: 用户 {user_id} 尝试调用 "
-                    f"{getattr(tool, 'name', 'unknown')}"
-                )
-                raise ToolFatalError(
-                    msg, display_content=f"❌ 余额不足: 需要 {cost_gold} 金币"
-                )
-        return await handler(arguments)
-
-
-@capability(namespace="global", auto_apply=True)
 class ToolRetryAndReflectionCapability(AbstractCapability):
     """
     重试与自愈反思中间件。
@@ -276,7 +190,6 @@ class ToolRetryAndReflectionCapability(AbstractCapability):
         try:
             return await handler(arguments)
         except Exception as e:
-            from zhenxun.services.ai.tools.engine.executor import ToolExecutionPolicy
             from zhenxun.services.ai.tools.models import ToolResult
 
             if isinstance(e, ControlFlowExit):
@@ -286,17 +199,11 @@ class ToolRetryAndReflectionCapability(AbstractCapability):
             retries += 1
             context.run.tool_retries[tool_name] = retries
 
-            from zhenxun.services.ai.tools.core.tool import BaseTool
-
-            tool = cast(BaseTool, context.call.current_tool)
-            policy = ToolExecutionPolicy(tool)
-            max_retries_limit = policy.max_retries
-
-            if isinstance(e, ToolFatalError | ToolFinishException):
+            if isinstance(e, ToolFatalError):
                 display_msg = getattr(e, "display_content", f"❌ 系统致命错误: {e}")
                 raise AbortException(reason=str(e), display=display_msg)
 
-            if retries > max_retries_limit:
+            if retries > context.run.tool_max_retries:
                 raise AbortException(
                     reason=f"工具 '{tool_name}' 连续出错达 {retries} 次，超出上限。",
                     display=f"🚨 工具 '{tool_name}' 已达最大重试次数，执行阻断。",
@@ -305,7 +212,6 @@ class ToolRetryAndReflectionCapability(AbstractCapability):
             return ToolResult(output=f"执行发生异常: {e}").as_error()
 
 
-@capability(namespace="global", auto_apply=True)
 class ReflexionCapability(AbstractCapability):
     """自愈反思与验证引擎 (Reflexion Engine)。
     统一处理结构化解析失败和语义护栏拦截。"""
@@ -326,14 +232,6 @@ class ReflexionCapability(AbstractCapability):
             "> {error_msg}\n\n"
             "**修正要求：** 请仔细检查缺失的必填字段、错误的数据类型或未闭合的括号，"
             "严格参考你可用的 Schema 定义，重新输出正确格式的数据。"
-        ),
-        "guardrail_violation": (
-            "### 🛡️ [业务护栏违规]\n"
-            "你输出的数据格式完全正确，但在业务逻辑层触发了合规/风控护栏。\n\n"
-            "**拦截原因报告：**\n"
-            "> {error_msg}\n\n"
-            "**修正要求：** 请结合上述反馈报告，反思你的决策逻辑或内容生成，"
-            "在保持数据格式正确的前提下，重新生成符合护栏规范的内容。"
         ),
         "default_retry": (
             "### ❌ [输出内容或格式验证失败]\n"
@@ -426,54 +324,29 @@ class ReflexionCapability(AbstractCapability):
         handler: WrapModelRequestHandler,
     ) -> ChatResponse:
         output_processor = llm_context.request.extra.get("output_processor")
-        guardrails = llm_context.request.extra.get("guardrails", [])
-
-        if not output_processor and not guardrails:
+        if not output_processor:
             return await handler(llm_context)
 
         max_retries = llm_context.request.extra.get("max_retries", 3)
-        error_template = (
-            output_processor.error_template if output_processor else "{error_msg}"
-        )
+        error_template = output_processor.error_template
 
         ivr_messages = list(llm_context.request.messages)
         last_exception: Exception | None = None
-
-        from zhenxun.services.ai.guardrails import GuardrailPipeline
-
-        pipeline = GuardrailPipeline(guardrails) if guardrails else None
 
         for attempt in range(max_retries + 1):
             llm_context.request.messages = list(ivr_messages)
             current_response_text: str = ""
 
             try:
-                if pipeline:
-                    llm_context.request.messages = await pipeline.run_input_pipeline(
-                        llm_context.request.messages, context
-                    )
-
                 response = await handler(llm_context)
                 current_response_text = response.text
 
                 if response.tool_calls:
                     return response
 
-                if output_processor:
-                    final_obj = await output_processor.validate_and_parse(
-                        current_response_text, context=context
-                    )
-                else:
-                    final_obj = current_response_text
-
-                if pipeline:
-                    resp_out, final_obj_out = await pipeline.run_output_pipeline(
-                        response, final_obj, context
-                    )
-                    response = cast("ChatResponse", resp_out)
-                    final_obj = final_obj_out
-                    current_response_text = response.text
-
+                final_obj = await output_processor.validate_and_parse(
+                    current_response_text, context=context
+                )
                 response.parsed_obj = final_obj
                 return response
 
@@ -517,3 +390,18 @@ class ReflexionCapability(AbstractCapability):
         raise UpstreamServerException(
             "反思循环耗尽，未能生成符合所有校验规则的合法结果。",
         ).with_traceback(None) from None
+
+
+def default_capabilities() -> list[AbstractCapability]:
+    """每次运行默认挂载的内置能力
+
+    返回:
+        list[AbstractCapability]: 内置能力实例列表
+    """
+    return [
+        StuckDetectionCapability(),
+        GlobalCycleLimitCapability(),
+        PermissionCapability(),
+        ToolRetryAndReflectionCapability(),
+        ReflexionCapability(),
+    ]

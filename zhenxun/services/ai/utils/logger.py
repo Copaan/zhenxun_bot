@@ -38,31 +38,12 @@ class AILoggerProxy:
         cmd = command or self._cmd
         global_logger.error(self._format(info), command=cmd, **kwargs)
 
-    def success(
-        self,
-        info: str,
-        command: str | None = None,
-        param: dict[str, Any] | None = None,
-        result: str = "",
-    ):
-        cmd = command or self._cmd
-        global_logger.success(
-            self._format(info), command=cmd, param=param, result=result
-        )
-
-    def trace(self, info: str, command: str | None = None, **kwargs: Any):
-        cmd = command or self._cmd
-        global_logger.trace(self._format(info), command=cmd, **kwargs)
-
 
 log_llm = AILoggerProxy("LLM")
 log_agent = AILoggerProxy("Agent")
-log_team = AILoggerProxy("Team")
 log_tool = AILoggerProxy("Tool")
 log_sandbox = AILoggerProxy("Sandbox")
 log_memory = AILoggerProxy("Memory")
-log_rag = AILoggerProxy("RAG")
 log_flow = AILoggerProxy("Flow")
 log_core = AILoggerProxy("Core")
-log_knowledge = AILoggerProxy("Knowledge")
 log_capability = AILoggerProxy("Capability")

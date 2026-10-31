@@ -33,7 +33,7 @@ class ApiDataSource:
         """
         now = datetime.now()
         filter_date = window_starts(now)["month"]
-        chat_query = ChatHistory
+        chat_query = ChatHistory.filter(is_bot=False)
         call_query = Statistics
         if bot_id:
             chat_query = chat_query.filter(bot_id=bot_id)

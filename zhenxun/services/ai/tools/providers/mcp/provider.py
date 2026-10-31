@@ -14,7 +14,6 @@ from zhenxun.services.ai.core.protocols.tool import (
     ToolProvider,
     ToolResolvable,
 )
-from zhenxun.services.ai.sandbox.models import SandboxBlueprint
 from zhenxun.services.ai.tools.models import ResolvedToolPayload
 from zhenxun.services.ai.utils.logger import log_tool as logger
 from zhenxun.utils.pydantic_compat import model_dump, model_validate, model_validator
@@ -27,10 +26,8 @@ MCP_PATH = DATA_PATH / "ai" / "mcp.json"
 
 
 class MCPServerConfig(BaseModel):
-    transport: Literal["stdio", "sse", "streamable-http", "sandbox_proxy"] = Field(
-        default="stdio"
-    )
-    """传输协议类型：stdio / sse / streamable-http / sandbox_proxy"""
+    transport: Literal["stdio", "sse", "streamable-http"] = Field(default="stdio")
+    """传输协议类型：stdio / sse / streamable-http"""
     url: str | None = Field(default=None)
     """远端地址（用于 sse 或 streamable-http）"""
     headers: dict[str, str] | None = Field(default=None)
@@ -38,7 +35,7 @@ class MCPServerConfig(BaseModel):
     timeout: int = Field(default=30)
     """请求超时时间(秒)"""
     command: str | None = None
-    """启动命令（用于 stdio 或 sandbox_proxy）"""
+    """启动命令（用于 stdio）"""
     args: list[str] = Field(default_factory=list)
     """命令参数列表"""
     env: dict[str, str] | None = None
@@ -53,8 +50,6 @@ class MCPServerConfig(BaseModel):
     """是否全局启用"""
     admin_level: int = Field(default=0)
     """执行该服务器工具所需的群管等级"""
-    sandbox_blueprint: SandboxBlueprint | None = Field(default=None)
-    """沙箱环境装配配置（用于 sandbox_proxy 自动处理依赖）"""
 
     @model_validator(mode="before")
     @classmethod
@@ -98,6 +93,116 @@ class GlobalMCPProvider(ToolProvider):
         self.env_provider: Callable[[Any], dict[str, str]] | None = None
         self.header_provider: Callable[[Any], dict[str, str]] | None = None
         self._code_registered_servers: dict[str, tuple[MCPServerConfig, bool]] = {}
+        self._known_tools: dict[str, dict[str, str]] = {}
+
+    def servers(self) -> dict[str, MCPServerConfig]:
+        """mcp.json 中的服务配置，尚未加载时为空
+
+        返回:
+            dict[str, MCPServerConfig]: 服务名 -> 配置
+        """
+        return dict(self._config.mcpServers) if self._config else {}
+
+    def known_tools(self) -> dict[str, dict[str, str]]:
+        """已连接过的服务提供的工具
+
+        返回:
+            dict[str, dict[str, str]]: 服务名 -> {工具名: 描述}
+        """
+        return {k: dict(v) for k, v in self._known_tools.items() if k in self._toolkits}
+
+    def _remember(self, server: str, tools: dict[str, ToolExecutable]) -> None:
+        """记录服务提供的工具名与描述"""
+        self._known_tools[server] = {
+            name: str(getattr(t, "description", "") or "") for name, t in tools.items()
+        }
+
+    async def save_server(self, name: str, conf: MCPServerConfig) -> None:
+        """新增或替换 mcp.json 中的服务，按新配置重建连接；已知工具保留到下次连接时刷新
+
+        参数:
+            name: 服务名
+            conf: 服务配置
+        """
+        await self.initialize()
+        assert self._config is not None
+        self._config.mcpServers[name] = conf
+        self._save_config()
+        if tk := self._toolkits.pop(name, None):
+            await tk.close()
+        self._setup_toolkit(name, conf)
+        self._discovered_tools = None
+
+    async def set_enabled(self, name: str, enabled: bool) -> bool:
+        """启用或停用服务，停用时关闭已建立的连接
+
+        参数:
+            name: 服务名
+            enabled: 是否启用
+
+        返回:
+            bool: 服务是否存在
+        """
+        await self.initialize()
+        assert self._config is not None
+        if not (conf := self._config.mcpServers.get(name)):
+            return False
+        if conf.enabled != enabled:
+            conf.enabled = enabled
+            if tk := self._toolkits.pop(name, None):
+                await tk.close()
+            self._setup_toolkit(name, conf)
+            self._discovered_tools = None
+            self._save_config()
+        return True
+
+    async def reload(self) -> None:
+        """关闭所有连接并重新读取 mcp.json"""
+        await self.shutdown()
+        self._config = None
+        self._discovered_tools = None
+        self._known_tools.clear()
+        await self.initialize()
+
+    async def test(
+        self, name: str, conf: MCPServerConfig, timeout: float = 30
+    ) -> dict[str, str]:
+        """用临时连接测试服务配置，返回服务提供的工具
+
+        参数:
+            name: 服务名，决定工具名前缀
+            conf: 服务配置
+            timeout: 超时秒数
+
+        返回:
+            dict[str, str]: 工具名 -> 描述
+        """
+        from .toolkit import MCPToolkit
+
+        toolkit = MCPToolkit(
+            server_name=f"{name}_test",
+            prefix=self.prefix(name),
+            transport=conf.transport,
+            command=conf.command,
+            args=conf.args,
+            url=conf.url,
+            headers=conf.headers,
+            env=conf.env,
+            cwd=conf.cwd,
+            install_command=conf.install_command,
+            timeout=conf.timeout,
+        )
+        try:
+            tools = await asyncio.wait_for(toolkit.get_tools(), timeout)
+        finally:
+            await toolkit.close()
+        self._remember(name, cast(dict[str, ToolExecutable], tools))
+        return self._known_tools[name]
+
+    @staticmethod
+    def prefix(name: str) -> str:
+        """服务的工具名前缀"""
+        return f"mcp_{re.sub(r'[^a-zA-Z0-9]', '_', name)}_"
 
     def register_server(
         self, name: str, config: MCPServerConfig, persist: bool = False
@@ -136,6 +241,8 @@ class GlobalMCPProvider(ToolProvider):
             self._save_config()
         if tk := self._toolkits.pop(name, None):
             await tk.close()
+        self._known_tools.pop(name, None)
+        self._discovered_tools = None
         logger.debug(f"🛑 MCP 代理 '{name}' 已注销并销毁所有连接")
 
     def _save_config(self) -> None:
@@ -219,11 +326,9 @@ class GlobalMCPProvider(ToolProvider):
         """辅助方法：装载单个 MCP Toolkit"""
         from .toolkit import MCPToolkit
 
-        clean_name = re.sub(r"[^a-zA-Z0-9]", "_", name)
-        prefix = f"mcp_{clean_name}_"
         self._toolkits[name] = MCPToolkit(
             server_name=name,
-            prefix=prefix,
+            prefix=self.prefix(name),
             transport=conf.transport,
             command=conf.command,
             args=conf.args,
@@ -236,7 +341,6 @@ class GlobalMCPProvider(ToolProvider):
             admin_level=conf.admin_level,
             header_provider=self.header_provider,
             env_provider=self.env_provider,
-            sandbox_blueprint=conf.sandbox_blueprint,
         )
 
     async def shutdown(self):
@@ -289,32 +393,22 @@ class GlobalMCPProvider(ToolProvider):
                     servers_to_query.append(name)
 
             all_tools: dict[str, ToolExecutable] = {}
-            tasks = []
-            for s_name in servers_to_query:
-                if tk := self._toolkits.get(s_name):
-                    tasks.append(tk.get_tools())
-
-            if tasks:
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-                for res in results:
-                    if isinstance(res, dict):
-                        for name, t in res.items():
-                            all_tools[name] = t
-                    elif isinstance(res, list):
-                        for t in res:
-                            all_tools[t.name] = t
-                    elif isinstance(res, Exception):
-                        logger.error(f"MCP 并发发现工具失败: {res}")
+            names = [s for s in servers_to_query if s in self._toolkits]
+            results = await asyncio.gather(
+                *(self._toolkits[s].get_tools() for s in names),
+                return_exceptions=True,
+            )
+            for s_name, res in zip(names, results):
+                if isinstance(res, BaseException):
+                    logger.error(f"MCP 服务 {s_name} 发现工具失败: {res}")
+                    continue
+                tools = cast(dict[str, ToolExecutable], res)
+                self._remember(s_name, tools)
+                all_tools.update(tools)
 
             if allowed_servers is None and excluded_servers is None:
                 self._discovered_tools = all_tools
             return all_tools
-
-    async def get_tool_executable(
-        self, name: str, config: dict[str, Any]
-    ) -> ToolExecutable | None:
-        _ = name, config
-        return None
 
 
 class MCPSource(BaseModel):
@@ -383,11 +477,8 @@ class MCPSource(BaseModel):
                 install_command=self.config.install_command,
                 timeout=self.config.timeout,
                 admin_level=self.config.admin_level,
-                sandbox_blueprint=self.config.sandbox_blueprint,
             )
-            payload = await inline_toolkit.resolve(context)
-            payload.toolkits.insert(0, inline_toolkit)
-            return payload
+            return await inline_toolkit.resolve(context)
 
         else:
             assert self.server_name is not None

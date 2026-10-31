@@ -4,6 +4,7 @@ from datetime import datetime
 import os
 from pathlib import Path
 import stat
+import sys
 import time
 from types import TracebackType
 from typing import Any, ClassVar
@@ -235,11 +236,17 @@ def win_on_rm_error(
 def infer_plugin_namespace(
     default: str = "global",
 ) -> str:
-    """
-    智能推断调用者所在的插件命名空间。
-    """
-    import inspect
+    """推断调用者所在的插件命名空间
 
+    优先取 NoneBot 当前插件上下文；没有时沿调用栈向上查找第一个
+    不属于 zhenxun.services / zhenxun.utils 的模块所对应的插件。
+
+    参数:
+        default: 无法推断时返回的命名空间
+
+    返回:
+        str: 插件名
+    """
     from nonebot.plugin import get_plugin_by_module_name
     from nonebot.plugin.manager import _current_plugin
 
@@ -247,33 +254,24 @@ def infer_plugin_namespace(
     if plugin:
         return plugin.name
 
-    try:
-        stack = inspect.stack()
-        for frame_info in stack[1:]:
-            module = inspect.getmodule(frame_info.frame)
-            if not module:
-                continue
-            m_name = module.__name__
-
-            if m_name.startswith("zhenxun.services.") or m_name.startswith(
-                "zhenxun.utils."
-            ):
-                continue
-
-            plugin = get_plugin_by_module_name(m_name)
-            if plugin:
-                return plugin.name
-
-            parts = m_name.split(".")
-            for keyword in ("plugins", "builtin_plugins"):
-                if keyword in parts:
-                    idx = parts.index(keyword)
-                    if len(parts) > idx + 1:
-                        return parts[idx + 1]
-
+    frame = sys._getframe(1)
+    while frame is not None:
+        m_name = frame.f_globals.get("__name__")
+        frame = frame.f_back
+        if not isinstance(m_name, str) or m_name.startswith(
+            ("zhenxun.services.", "zhenxun.utils.")
+        ):
             continue
 
-    except Exception:
-        pass
+        plugin = get_plugin_by_module_name(m_name)
+        if plugin:
+            return plugin.name
+
+        parts = m_name.split(".")
+        for keyword in ("plugins", "builtin_plugins"):
+            if keyword in parts:
+                idx = parts.index(keyword)
+                if len(parts) > idx + 1:
+                    return parts[idx + 1]
 
     return default

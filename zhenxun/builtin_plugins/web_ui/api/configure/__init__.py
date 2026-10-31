@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 import nonebot
 
-from zhenxun.configs.config import Config
+from zhenxun.configs.config import BotConfig, Config
 from zhenxun.services.startup import startup_coordinator
 from zhenxun.utils._restart_utils import issue_restart_ticket
 from zhenxun.utils.network import private_ipv4_addresses
@@ -90,9 +90,13 @@ async def configure_draft() -> Result:
     current_host = str(getattr(driver.config, "host", "0.0.0.0"))
     current_port = int(getattr(driver.config, "port", 8080))
     username = str(Config.get_config("web-ui", "username", "admin"))
+    self_nickname = BotConfig.self_nickname
+    nicknames = sorted(set(driver.config.nickname) - {self_nickname})
     return Result.ok(
         {
             "username": username,
+            "self_nickname": self_nickname,
+            "nicknames": nicknames,
             "database": {"mode": "sqlite", "path": "data/db/zhenxun.db"},
             "cache": {"mode": "MEMORY", "host": "127.0.0.1", "port": 6379},
             "network": {"mode": "lan", "host": current_host, "port": current_port},

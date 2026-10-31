@@ -100,6 +100,17 @@ async def init():
             bind_database_connection,
             inspect_database_tls,
         )
+        import zhenxun.models.ai_agent_call
+        import zhenxun.models.ai_agent_run
+        import zhenxun.models.ai_chat_group
+        import zhenxun.models.ai_chat_message
+        import zhenxun.models.ai_knowledge_base
+        import zhenxun.models.ai_knowledge_chunk
+        import zhenxun.models.ai_knowledge_doc
+        import zhenxun.models.ai_model_stat
+        import zhenxun.models.ai_persona
+        import zhenxun.models.ai_sticker
+        import zhenxun.models.ai_token_usage  # noqa: F401
         from zhenxun.models.chat_history import ensure_chat_history_nullable_columns
         from zhenxun.models.group_plugin_setting import (
             ensure_group_plugin_scope_constraint,

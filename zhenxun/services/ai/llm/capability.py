@@ -360,6 +360,27 @@ _REASONING_PROMPT = (
 """推理核验题：动态思考的模型遇到过于简单的问题会跳过思考"""
 
 
+def silent_wav(seconds: float = 0.5) -> bytes:
+    """生成一段静音 wav，用于语音识别的连通性测试
+
+    参数:
+        seconds: 时长 (秒)
+
+    返回:
+        bytes: 16kHz 单声道 16 位 wav 数据
+    """
+    import io
+    import wave
+
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as writer:
+        writer.setnchannels(1)
+        writer.setsampwidth(2)
+        writer.setframerate(16000)
+        writer.writeframes(b"\x00\x00" * int(16000 * seconds))
+    return buffer.getvalue()
+
+
 def minimal_request(task: str, protocol: str) -> Any:
     """生成用于连通性测试的最小请求
 
@@ -376,8 +397,10 @@ def minimal_request(task: str, protocol: str) -> Any:
         LLMMessage,
         RerankRequest,
         SpeechRequest,
+        TranscriptionRequest,
     )
     from zhenxun.services.ai.core.messages.parts import (
+        AudioPart,
         EmbedBatch,
         EmbedPayload,
         TextPart,
@@ -394,6 +417,10 @@ def minimal_request(task: str, protocol: str) -> Any:
         return ImageRequest(prompt="one dot")
     if task == "tts":
         return SpeechRequest(input_text="test")
+    if task == "stt":
+        return TranscriptionRequest(
+            audio=AudioPart(raw=silent_wav(), mime_type="audio/wav")
+        )
     config = GenerationConfig()
     config.common.max_tokens = 64 if protocol == "gemini" else 32
     return ChatRequest(messages=[LLMMessage.user("Reply OK")], config=config)
@@ -411,15 +438,12 @@ async def probe_once(route: Route, task: str, request: Any, api_key: str) -> Any
     返回:
         Any: 统一响应对象
     """
-    from zhenxun.services.ai.chat_switch import scene_admitted
-
     from .client import send
     from .protocols import get_task
 
     build, parse = get_task(route.protocol, task)
     call = await build(route, request)
-    with scene_admitted():
-        payload = await send(route, call, api_key)
+    payload = await send(route, call, api_key)
     return parse(route, request, payload)
 
 

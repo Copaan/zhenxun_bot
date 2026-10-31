@@ -1,7 +1,7 @@
 from contextlib import suppress
 from datetime import datetime, timedelta
 import os
-from typing import Any, ClassVar, Literal
+from typing import TYPE_CHECKING, Any, ClassVar, Literal
 from typing_extensions import Self
 
 from tortoise import Tortoise, fields
@@ -14,6 +14,9 @@ from zhenxun.services.db_context.schema_ops import (
     RenameColumn,
     SetColumnNullable,
 )
+
+if TYPE_CHECKING:
+    from nonebot_plugin_alconna import UniMessage
 
 
 async def ensure_chat_history_nullable_columns() -> None:
@@ -120,6 +123,12 @@ class ChatHistory(Model):
     """bot记录id"""
     platform = fields.CharField(255, null=True)
     """平台"""
+    message_id = fields.CharField(64, null=True)
+    """消息id"""
+    segments = fields.JSONField(null=True)
+    """结构化消息段，媒体只存地址"""
+    is_bot = fields.BooleanField(default=False)
+    """是否为 Bot 自己的发言"""
 
     class Meta:  # pyright: ignore [reportIncompatibleVariableOverride]
         table = "chat_history"
@@ -131,6 +140,56 @@ class ChatHistory(Model):
             ("bot_id", "group_id", "create_time"),
             ("bot_id", "create_time"),
         ]
+
+    @staticmethod
+    def dump_segments(message: "UniMessage") -> list[dict[str, Any]]:
+        """把消息转为可存储的结构化消息段，去掉内嵌的二进制和本地路径
+
+        参数:
+            message: 消息
+
+        返回:
+            list[dict[str, Any]]: 消息段
+        """
+        segments = []
+        for seg in message.dump():
+            if not isinstance(seg, dict):
+                continue
+            item = {}
+            for key, value in seg.items():
+                if key in ("raw", "path") or value is None:
+                    continue
+                if isinstance(value, str):
+                    if value.startswith(("base64://", "file://")):
+                        continue
+                    value = value.replace("\x00", "")
+                item[key] = value
+            segments.append(item)
+        return segments
+
+    @classmethod
+    async def cleanup(cls, segment_days: int, retention_days: int) -> tuple[int, int]:
+        """清空过期的结构化消息段，删除超过保留天数的记录，天数为 0 表示不处理
+
+        参数:
+            segment_days: 结构化消息段保留天数
+            retention_days: 记录保留天数
+
+        返回:
+            tuple[int, int]: 清空消息段的条数, 删除的条数
+        """
+        now = datetime.now()
+        cleared = deleted = 0
+        if retention_days > 0:
+            deleted = await cls.filter(
+                create_time__lt=now - timedelta(days=retention_days)
+            ).delete()
+        if segment_days > 0:
+            cleared = await cls.filter(
+                create_time__lt=now - timedelta(days=segment_days),
+                segments__isnull=False,
+            ).update(segments=None)
+        return cleared, deleted
 
     @classmethod
     def _platform_from_scope(cls, platform_scope: str | None) -> str | None:
@@ -229,7 +288,9 @@ class ChatHistory(Model):
             elif msg_type == "group":
                 query = query.filter(group_id__not_isnull=True)
         else:
-            query = cls.scoped_query(platform_scope=platform_scope, group_id=gid)
+            query = cls.scoped_query(
+                platform_scope=platform_scope, group_id=gid, is_bot=False
+            )
             if uid:
                 query = query.filter(user_id=uid)
         if days:

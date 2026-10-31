@@ -3,7 +3,7 @@ import base64
 from collections.abc import AsyncGenerator, Callable
 from contextlib import AsyncExitStack, asynccontextmanager
 import re
-from typing import Any, Literal, cast
+from typing import Any, Literal
 
 import anyio
 from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
@@ -17,8 +17,6 @@ from pydantic import ValidationError
 from zhenxun.services.ai.core.models import ToolDefinition
 from zhenxun.services.ai.core.stream_events import UserCustomEvent
 from zhenxun.services.ai.run.context import RunContext
-from zhenxun.services.ai.sandbox.addons.base import BaseMcpProxyExtension
-from zhenxun.services.ai.sandbox.models import SandboxBlueprint
 from zhenxun.services.ai.tools.core.tool import BaseTool
 from zhenxun.services.ai.tools.core.toolkit import BaseToolkit
 from zhenxun.services.ai.tools.models import ToolkitConfig, ToolResult
@@ -134,11 +132,12 @@ class MCPRemoteTool(BaseTool):
         self.original_tool_name = original_tool_name
         self.parameters = parameters
         self.toolkit = toolkit
-        self.parent_toolkit = toolkit
-        self.args_schema = None
-        self.metadata = (
-            {"admin_level": toolkit.admin_level} if toolkit.admin_level > 0 else {}
-        )
+        if toolkit.admin_level > 0:
+            from zhenxun.services.ai.tools.core.decorators import require_admin_level
+
+            self.settings = self.settings.merge(
+                require_admin_level(toolkit.admin_level)
+            )
 
     @property
     def effective_ttl(self) -> float:
@@ -163,9 +162,7 @@ class MCPRemoteTool(BaseTool):
             metadata=self.metadata or {},
         )
         if context and self.settings.capabilities:
-            from zhenxun.services.ai.capabilities import (
-                CombinedCapability,
-            )
+            from zhenxun.services.ai.capabilities.base import CombinedCapability
 
             combined_cap = CombinedCapability(self.settings.capabilities)
             defs = await combined_cap.prepare_tools(context, [tool_def])
@@ -183,12 +180,10 @@ class MCPRemoteTool(BaseTool):
                 self.toolkit.server_name, self.toolkit.effective_ttl
             )
 
-            session = await self.toolkit.get_session(context)
-            if not session:
-                return ToolResult(output="MCP 连接错误").as_error()
-
             try:
-                result = await session.call_tool(self.original_tool_name, kwargs)
+                result = await self.toolkit.call_tool(
+                    self.original_tool_name, kwargs, context
+                )
                 break
             except Exception as e:
                 last_error = e
@@ -264,9 +259,7 @@ class MCPToolkit(BaseToolkit):
         self,
         server_name: str,
         prefix: str | None = None,
-        transport: Literal[
-            "stdio", "sse", "streamable-http", "sandbox_proxy"
-        ] = "stdio",
+        transport: Literal["stdio", "sse", "streamable-http"] = "stdio",
         command: str | None = None,
         args: list[str] | None = None,
         url: str | None = None,
@@ -279,8 +272,6 @@ class MCPToolkit(BaseToolkit):
         header_provider: Callable[[RunContext], dict[str, str]] | None = None,
         env_provider: Callable[[RunContext], dict[str, str]] | None = None,
         ttl: int = 600,
-        sandbox_session_id: str | None = None,
-        sandbox_blueprint: SandboxBlueprint | None = None,
     ):
         """
         初始化模型上下文协议 (MCP) 的工具箱封装。
@@ -288,8 +279,8 @@ class MCPToolkit(BaseToolkit):
         参数:
             server_name: MCP 服务器的唯一标识名称。
             prefix: 工具名称的前缀，防止工具命名冲突。
-            transport: 连接 MCP 服务器的通信传输协议，可选 "stdio", "sse", "streamable-http", "sandbox_proxy"。
-            command: 用于 stdio 或 sandbox_proxy 模式启动服务器的可执行命令。
+            transport: 连接 MCP 服务器的通信传输协议，可选 "stdio", "sse", "streamable-http"。
+            command: 用于 stdio 模式启动服务器的可执行命令。
             args: 启动服务器时附加的命令行参数。
             url: 用于 sse 或 streamable-http 模式的服务器连接 URL。
             headers: 静态配置的 HTTP 请求头。
@@ -301,8 +292,6 @@ class MCPToolkit(BaseToolkit):
             header_provider: 动态生成 HTTP 头部信息的工厂函数。
             env_provider: 动态生成进程环境变量的工厂函数。
             ttl: 闲置清理的生存时间 (秒)，默认 600。
-            sandbox_session_id: 当 transport 为 sandbox_proxy 时指定的沙箱会话 ID。
-            sandbox_blueprint: 用于沙箱自动装配的环境蓝图配置。
         """  # noqa: E501
         super().__init__(
             config=ToolkitConfig(prefix=prefix) if prefix is not None else None
@@ -320,8 +309,6 @@ class MCPToolkit(BaseToolkit):
         self.admin_level = admin_level
         self.header_provider = header_provider
         self.env_provider = env_provider
-        self.sandbox_session_id = sandbox_session_id
-        self.sandbox_blueprint = sandbox_blueprint
         self.ttl = ttl
 
         self._shared_session: ClientSession | None = None
@@ -409,6 +396,30 @@ class MCPToolkit(BaseToolkit):
             await self.initialize(context)
         return self._shared_session
 
+    async def call_tool(
+        self, name: str, arguments: dict, context: RunContext | None = None
+    ) -> Any:
+        """调用远端工具，连接中断时立即抛出异常
+
+        参数:
+            name: 远端工具原始名称
+            arguments: 工具参数
+            context: 运行上下文
+
+        返回:
+            Any: MCP 工具调用结果
+        """
+        session = await self.get_session(context)
+        task = self._shared_task
+        if not session or not task:
+            raise ConnectionError(f"MCP 服务器 '{self.server_name}' 未连接")
+        call = asyncio.ensure_future(session.call_tool(name, arguments))
+        await asyncio.wait({call, task}, return_when=asyncio.FIRST_COMPLETED)
+        if call.done():
+            return call.result()
+        call.cancel()
+        raise ConnectionError(f"MCP 服务器 '{self.server_name}' 连接已断开")
+
     async def _spawn_session_task(self, dynamic_headers: dict, dynamic_env: dict):
         """在后台异步拉起 MCP 传输协议通道并进行服务初始化"""
         max_attempts = 2 if (self.transport == "stdio" and self.install_command) else 1
@@ -454,45 +465,11 @@ class MCPToolkit(BaseToolkit):
                             transport_ctx = streamable_http_client(
                                 url=self.url, http_client=http_client
                             )
-                        elif self.transport == "sandbox_proxy":
-                            from zhenxun.services.ai.sandbox.manager import (
-                                sandbox_manager,
-                            )
-
-                            target_session_id = (
-                                self.sandbox_session_id or "mcp_global_session"
-                            )
-                            bp = self.sandbox_blueprint or SandboxBlueprint()
-                            bp.enable_network = True
-
-                            driver = await sandbox_manager.get_or_create_session(
-                                target_session_id,
-                                blueprint=bp,
-                            )
-
-                            plugin_name = "universal_mcp"
-
-                            await driver.mount_extension(plugin_name)
-                            mcp_plugin = cast(
-                                BaseMcpProxyExtension, driver.get_extension(plugin_name)
-                            )
-
-                            if not self.command:
-                                raise ValueError("sandbox_proxy requires 'command'")
-
-                            streams = await stack.enter_async_context(
-                                mcp_plugin.connect_mcp(
-                                    self.command, self.args, dynamic_env
-                                )
-                            )
-                            read_stream, write_stream = streams[0], streams[1]
-                            transport_ctx = None
                         else:
                             raise ValueError(f"Unknown transport: {self.transport}")
 
-                        if transport_ctx:
-                            transport = await stack.enter_async_context(transport_ctx)
-                            read_stream, write_stream = transport[0], transport[1]
+                        transport = await stack.enter_async_context(transport_ctx)
+                        read_stream, write_stream = transport[0], transport[1]
 
                         client_session = await stack.enter_async_context(
                             ClientSession(read_stream, write_stream)
@@ -541,11 +518,6 @@ class MCPToolkit(BaseToolkit):
                         return
 
                 except Exception as e:
-                    from zhenxun.services.ai.core.exceptions import SandboxFatalError
-
-                    if isinstance(e, SandboxFatalError):
-                        raise e
-
                     if attempt < max_attempts:
                         logger.warning(
                             f"⚠️ [{self.server_name}] 进程启动或运行异常崩溃，"
@@ -560,6 +532,8 @@ class MCPToolkit(BaseToolkit):
                     raise e
 
         except Exception as e:
+            while getattr(e, "exceptions", None):
+                e = e.exceptions[0]  # type: ignore
             self._init_exception = e
             logger.error(
                 f"MCP 服务器 '{self.server_name}' "
@@ -573,8 +547,7 @@ class MCPToolkit(BaseToolkit):
                     "（例如：镜像中缺少 Node 环境或国内网络无法连接 npm 等）。"
                 )
         finally:
-            if not self._is_initialized:
-                self._is_initialized = False
+            self._is_initialized = False
             self._shared_session = None
             self._ready_event.set()
 

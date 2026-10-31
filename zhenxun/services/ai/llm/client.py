@@ -5,6 +5,8 @@ LLM 请求执行
 """
 
 import asyncio
+from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
 from dataclasses import dataclass
 import email.utils
 import json
@@ -42,9 +44,19 @@ from zhenxun.utils.pydantic_compat import dump_json_safely
 from zhenxun.utils.user_agent import get_user_agent
 
 from .health import health_manager, key_id
-from .protocols import HttpCall, get_task, native_tool_allowed, resolve_tool_choice
+from .protocols import (
+    HttpCall,
+    get_stream,
+    get_task,
+    native_tool_allowed,
+    resolve_tool_choice,
+)
+from .stats import ModelStats
 
 _COMMON_FIELDS = set(CommonLLMConfig.model_fields)
+StreamSink = Callable[[str, str], Awaitable[None]]
+stream_sink: ContextVar[StreamSink | None] = ContextVar("llm_stream_sink", default=None)
+"""设置后对话请求改用流式，增量以 (text / thought / reset, 文本) 回调"""
 _SANITIZE_CONTEXT = {
     "openai_chat": "openai",
     "openai_responses": "openai_responses",
@@ -101,14 +113,33 @@ def join_url(base_url: str, path: str) -> str:
     return f"{base_url.rstrip('/')}/{path.lstrip('/')}" if path else base_url
 
 
+def _is_tls_failure(error: BaseException) -> bool:
+    """判断异常链中是否包含 TLS 错误
+
+    参数:
+        error: 异常
+
+    返回:
+        bool: 是否为 TLS 握手失败
+    """
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        if isinstance(current, ssl.SSLError):
+            return True
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return False
+
+
 class LLMHttpClient:
     """LLM 请求专用的 HTTP 客户端，连接尚未建立时允许重连一次"""
 
     def __init__(self, timeout: float = 120):
         self.timeout = timeout
-        self._client: httpx.AsyncClient | None = None
+        self._client: ManagedAsyncClient | None = None
 
-    def _ensure_client(self) -> httpx.AsyncClient:
+    def _ensure_client(self) -> ManagedAsyncClient:
         if self._client is None or self._client.is_closed:
             self._client = ManagedAsyncClient(
                 headers=get_user_agent(),
@@ -120,9 +151,6 @@ class LLMHttpClient:
 
     async def request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
         """发送请求，受当前生命周期剩余时间约束"""
-        from zhenxun.services.ai.chat_switch import require_chat_enabled
-
-        require_chat_enabled()
         client = self._ensure_client()
         timeout = kwargs.get("timeout") or self.timeout
         if isinstance(timeout, httpx.Timeout):
@@ -135,68 +163,59 @@ class LLMHttpClient:
         except asyncio.TimeoutError as error:
             raise httpx.ReadTimeout("LLM request budget exhausted") from error
 
-    async def _request_with_recovery(self, client, method, url, kwargs):
-        # httpcore 的 trace 能区分“TCP 连接失败且尚未发送请求头”，
-        # 只有这种情况可以安全重连；已复用连接上的读写失败不能重放。
-        extensions = dict(kwargs.pop("extensions", {}) or {})
-        original_trace = extensions.get("trace")
-        application_started = False
-        connect_failed = False
+    async def stream(
+        self,
+        method: str,
+        url: str,
+        handler: Callable[[httpx.Response], Awaitable[Any]],
+        **kwargs: Any,
+    ) -> Any:
+        """发送流式请求并交给 handler 读取响应，受当前生命周期剩余时间约束
 
-        async def trace(event, info):
-            nonlocal application_started, connect_failed
-            if event.endswith("send_request_headers.started"):
-                request = info.get("request")
-                if getattr(request, "method", None) != b"CONNECT":
-                    application_started = True
-            if event == "connection.connect_tcp.failed":
-                connect_failed = True
-            if original_trace is not None:
-                await original_trace(event, info)
+        参数:
+            method: 请求方法
+            url: 地址
+            handler: 读取响应的协程函数
+            **kwargs: 传给 httpx 的参数
 
-        extensions["trace"] = trace
+        返回:
+            Any: handler 的返回值
+        """
+        client = self._ensure_client()
+
+        async def run() -> Any:
+            async with client.proxy_runtime.request_scope():
+                async with client.stream(method, url, **kwargs) as response:
+                    return await handler(response)
+
+        timeout = float(kwargs.get("timeout") or self.timeout)
+        try:
+            return await asyncio.wait_for(run(), remaining_timeout(timeout))
+        except asyncio.TimeoutError as error:
+            raise httpx.ReadTimeout("LLM request budget exhausted") from error
+
+    async def _request_with_recovery(
+        self, client, method: str, url: str, kwargs: dict
+    ) -> httpx.Response:
+        # httpx 只在连接建立阶段抛出 ConnectError / ConnectTimeout，此时请求
+        # 尚未发出，可以安全重连一次；TLS 握手失败重连也无济于事。
         async with client.proxy_runtime.request_scope() as scope:
-            for attempt in range(2):
-                connect_failed = False
-                try:
-                    return await client.request(
-                        method, url, extensions=extensions, **kwargs
-                    )
-                except (
-                    ProxyRequestError,
-                    httpx.ConnectError,
-                    httpx.ConnectTimeout,
-                ) as error:
-                    cause = (
-                        error.__cause__
-                        if isinstance(error, ProxyRequestError)
-                        else error
-                    )
-                    seen = set()
-                    tls_failure = False
-                    current = cause
-                    while current is not None and id(current) not in seen:
-                        seen.add(id(current))
-                        tls_failure |= isinstance(current, ssl.SSLError)
-                        current = current.__cause__ or current.__context__
-                    retry = (
-                        attempt == 0
-                        and connect_failed
-                        and not application_started
-                        and not tls_failure
-                        and isinstance(cause, httpx.ConnectError | httpx.ConnectTimeout)
-                        and not client.proxy_runtime.stopping
-                        and client.proxy_runtime.current is scope.generation
-                    )
-                    if not retry:
-                        raise
-                    await asyncio.sleep(0.2)
-                    if (
-                        client.proxy_runtime.stopping
-                        or client.proxy_runtime.current is not scope.generation
-                    ):
-                        raise
-                    logger.debug("AI 连接尚未建立，重新连接一次")
+            try:
+                return await client.request(method, url, **kwargs)
+            except (ProxyRequestError, httpx.ConnectError, httpx.ConnectTimeout) as e:
+                cause = e.__cause__ if isinstance(e, ProxyRequestError) else e
+                if not isinstance(
+                    cause, httpx.ConnectError | httpx.ConnectTimeout
+                ) or _is_tls_failure(cause):
+                    raise
+                await asyncio.sleep(0.2)
+                if (
+                    client.proxy_runtime.stopping
+                    or client.proxy_runtime.current is not scope.generation
+                ):
+                    raise
+                logger.debug("AI 连接尚未建立，重新连接一次")
+            return await client.request(method, url, **kwargs)
 
     async def close(self) -> None:
         """关闭连接池"""
@@ -329,11 +348,9 @@ async def send(
         Any: JSON 响应为 dict，raw 请求为 httpx.Response
     """
     url = join_url(call.base_url or route.base_url, call.path)
-    headers = {
-        **auth_headers(route.protocol, api_key),
-        **route.provider.headers,
-        **call.headers,
-    }
+    headers = httpx.Headers(auth_headers(route.protocol, api_key))
+    headers.update(route.provider.headers)
+    headers.update(call.headers)
     context = _SANITIZE_CONTEXT.get(route.protocol, route.protocol)
     if logger.is_enabled("debug"):
         body = sanitize_for_logging(
@@ -348,9 +365,20 @@ async def send(
         kwargs["data"] = call.data
     if call.files is not None:
         kwargs["files"] = call.files
-    request = asyncio.ensure_future(
-        get_http_client(route.provider).request(call.method, url, **kwargs)
-    )
+    sink = stream_sink.get()
+    if call.stream and sink:
+        request = asyncio.ensure_future(
+            get_http_client(route.provider).stream(
+                call.method,
+                url,
+                lambda response: _read_stream(route, call, response, sink),
+                **kwargs,
+            )
+        )
+    else:
+        request = asyncio.ensure_future(
+            get_http_client(route.provider).request(call.method, url, **kwargs)
+        )
     if token:
         token.link_future(request)
     try:
@@ -359,6 +387,8 @@ async def send(
         raise NetworkTimeoutException(f"[{route.name}] 请求超时: {e}") from e
     except httpx.HTTPError as e:
         raise NetworkTimeoutException(f"[{route.name}] 网络请求失败: {e!r}") from e
+    if isinstance(response, dict):
+        return response
     if response.status_code >= 400:
         raise map_http_error(response, route.name)
     if call.raw:
@@ -376,6 +406,69 @@ async def send(
     return payload
 
 
+async def _read_stream(
+    route: Route, call: HttpCall, response: httpx.Response, sink: StreamSink
+) -> dict[str, Any]:
+    """读取 SSE 响应，回调增量并还原为非流式响应体；服务端不支持流式而直接
+    返回 JSON 时按普通响应处理
+
+    参数:
+        route: 线路
+        call: 编码后的请求
+        response: 流式响应
+        sink: 增量回调
+
+    返回:
+        dict[str, Any]: 响应体
+    """
+    if response.status_code >= 400:
+        await response.aread()
+        raise map_http_error(response, route.name)
+    if "text/event-stream" not in response.headers.get("content-type", ""):
+        await response.aread()
+        try:
+            return response.json()
+        except ValueError as e:
+            raise ResponseParseException(
+                f"[{route.name}] 响应不是有效的 JSON",
+                details={"response": response.text[:500]},
+            ) from e
+    assert call.stream is not None
+    stream = call.stream()
+    await sink("reset", "")
+    event, lines = "", []
+
+    async def dispatch() -> None:
+        text = "\n".join(lines)
+        if not text or text == "[DONE]":
+            return
+        try:
+            data = json.loads(text)
+        except ValueError as e:
+            raise ResponseParseException(
+                f"[{route.name}] 流式响应不是有效的 JSON",
+                details={"response": text[:500]},
+            ) from e
+        if isinstance(data, dict):
+            for kind, delta in stream.feed(event, data):
+                if delta:
+                    await sink(kind, delta)
+
+    async for line in response.aiter_lines():
+        if not line:
+            await dispatch()
+            event, lines = "", []
+        elif not line.startswith(":"):
+            field, _, value = line.partition(":")
+            value = value.removeprefix(" ")
+            if field == "event":
+                event = value
+            elif field == "data":
+                lines.append(value)
+    await dispatch()
+    return stream.result()
+
+
 def _no_key_error(route: Route) -> LLMException:
     provider = route.provider
     recovery = health_manager.key_recovery_time(provider.name, provider.api_keys)
@@ -386,6 +479,14 @@ def _no_key_error(route: Route) -> LLMException:
         f"[{route.name}] 所有密钥都在冷却中，约 {wait} 秒后恢复",
         details={"retry_after": wait},
     )
+
+
+async def _build(build: Any, route: Route, task: str, request: Any) -> HttpCall:
+    """编码请求，设置了流式回调的对话请求改为流式"""
+    call = await build(route, request)
+    if task == "chat" and stream_sink.get() and (stream := get_stream(route.protocol)):
+        stream.prepare(call)
+    return call
 
 
 async def call_route(
@@ -408,7 +509,7 @@ async def call_route(
     from .capability import adapt_route, observe_response
 
     build, parse = get_task(route.protocol, task)
-    call = await build(route, request)
+    call = await _build(build, route, task, request)
     settings = get_llm_config().client_settings
     cooldowns = {"rate": settings.rate_limit_cooldown, "quota": settings.quota_cooldown}
     provider = route.provider
@@ -433,7 +534,7 @@ async def call_route(
             if adapted is not None:
                 adaptations += 1
                 route = adapted
-                call = await build(route, request)
+                call = await _build(build, route, task, request)
                 continue
             others = health_manager.available_keys(
                 provider.name, provider.api_keys, tried | {key_id(api_key)}
@@ -472,19 +573,31 @@ def request_needs(request: Any) -> set[str]:
         request: 统一请求对象
 
     返回:
-        set[str]: image (图片输入) / tools (函数工具) / web_search (原生网页搜索)
+        set[str]: image / audio / video / file (媒体输入)、tools (函数工具)、
+            web_search (原生网页搜索)
     """
-    from zhenxun.services.ai.core.messages import ChatRequest, ImagePart
+    from zhenxun.services.ai.core.messages import (
+        AudioPart,
+        ChatRequest,
+        FilePart,
+        ImagePart,
+        VideoPart,
+    )
 
     if not isinstance(request, ChatRequest):
         return set()
-    needs = set()
-    if any(
-        isinstance(part, ImagePart)
+    modalities = {
+        ImagePart: "image",
+        AudioPart: "audio",
+        VideoPart: "video",
+        FilePart: "file",
+    }
+    needs = {
+        modalities[type(part)]
         for message in request.messages
         for part in message.content
-    ):
-        needs.add("image")
+        if type(part) in modalities
+    }
     tools = request.tools or []
     items = tools.values() if isinstance(tools, dict) else tools
     for tool in items:
@@ -506,12 +619,22 @@ def unmet_needs(route: Route, needs: set[str]) -> set[str]:
     返回:
         set[str]: 线路缺少的能力
     """
+    from .protocols import encodable_inputs
+
     checks = {
-        "image": lambda: route.profile.accepts_input("image"),
         "tools": lambda: route.profile.tools,
         "web_search": lambda: native_tool_allowed(route, "web_search"),
     }
-    return {need for need in needs if not checks[need]()}
+    media = encodable_inputs(route.protocol)
+    return {
+        need
+        for need in needs
+        if not (
+            checks[need]()
+            if need in checks
+            else need in media and route.profile.accepts_input(need)
+        )
+    }
 
 
 def _order_routes(routes: list[Route], order: list[int], request: Any) -> list[int]:
@@ -548,8 +671,6 @@ async def execute(
     返回:
         Any: 统一响应对象
     """
-    from zhenxun.services.ai.chat_switch import admitted_ai_request
-
     route_cooldown = get_llm_config().client_settings.route_cooldown
     grouped = len(routes) > 1
     start = request.extra.get("_working_route_index", 0) % len(routes)
@@ -565,6 +686,7 @@ async def execute(
         try:
             response = await call_route(route, task, request, token)
         except LLMException as e:
+            ModelStats.record(route.name, task, False, time.monotonic() - started)
             local = isinstance(e, ConfigurationException) and not e.details.get(
                 "status_code"
             )
@@ -575,31 +697,35 @@ async def execute(
             ):
                 health_manager.record_route_failure(route.name, e, route_cooldown)
             raise
-        health_manager.record_route_success(route.name, time.monotonic() - started)
+        latency = time.monotonic() - started
+        health_manager.record_route_success(route.name)
+        ModelStats.record(route.name, task, True, latency, response)
         request.extra["_working_route_index"] = index
         return response
 
-    with admitted_ai_request():
-        attempted = False
-        for index in order:
-            route = routes[index]
-            if grouped and not health_manager.route_available(route.name):
-                errors.append(f"{route.name}(熔断中)")
-                continue
-            attempted = True
-            try:
-                return await attempt(index)
-            except LLMException as e:
-                if not grouped or not e.should_failover:
-                    raise
-                logger.warning(f"线路 {route.name} 失败，切换下一条: {e}")
-                errors.append(f"{route.name}({type(e).__name__})")
-                last_error = e
-        if not attempted:
-            fallback = health_manager.best_fallback([r.name for r in routes])
-            logger.warning(f"全部线路都在熔断中，强制探测 {fallback}")
-            index = next(i for i, r in enumerate(routes) if r.name == fallback)
+    attempted = False
+    for index in order:
+        route = routes[index]
+        if grouped and not health_manager.route_available(route.name):
+            errors.append(f"{route.name}(熔断中)")
+            continue
+        attempted = True
+        try:
             return await attempt(index)
+        except LLMException as e:
+            if not grouped and isinstance(e, NetworkTimeoutException):
+                logger.warning(f"线路 {route.name} 超时，重试一次: {e}")
+                return await attempt(index)
+            if not grouped or not e.should_failover:
+                raise
+            logger.warning(f"线路 {route.name} 失败，切换下一条: {e}")
+            errors.append(f"{route.name}({type(e).__name__})")
+            last_error = e
+    if not attempted:
+        fallback = health_manager.best_fallback([r.name for r in routes])
+        logger.warning(f"全部线路都在熔断中，强制探测 {fallback}")
+        index = next(i for i, r in enumerate(routes) if r.name == fallback)
+        return await attempt(index)
     raise UpstreamServerException(
         f"所有线路均失败: {', '.join(errors)}", cause=last_error
     ) from last_error

@@ -1,11 +1,5 @@
-from .agent import Agent
-from .models import (
-    AgentConfig,
-    Persona,
-)
+"""Agent 运行时"""
 
-__all__ = [
-    "Agent",
-    "AgentConfig",
-    "Persona",
-]
+from zhenxun.services.ai import forward
+
+__getattr__ = forward({"Agent": "zhenxun.services.ai.flow.agent.agent"})

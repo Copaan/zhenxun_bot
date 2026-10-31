@@ -1,6 +1,7 @@
 import asyncio
 from datetime import datetime, timedelta
 import time
+from typing import Any
 
 import nonebot
 from nonebot.adapters import Bot
@@ -52,12 +53,12 @@ def window_starts(now: datetime) -> dict[str, datetime]:
 
 
 async def get_record_counts(
-    model: type[ChatHistory | Statistics], bot_id: str | None, operation: str
+    model: Any, bot_id: str | None, operation: str
 ) -> QueryCount:
     """一次聚合查询获取总数与各时间窗口数量
 
     参数:
-        model: ChatHistory 或 Statistics
+        model: ChatHistory、Statistics 或它们的查询
         bot_id: 存储 bot id，为空时统计全部
         operation: 数据库调用标识
 
@@ -78,11 +79,11 @@ async def get_record_counts(
         .values("total_count", *(f"{key}_count" for key in starts)),
         operation,
     )
-    result = result[0] if isinstance(result, list) and result else result
-    result = result or {}
+    row = result[0] if isinstance(result, list) and result else result
+    row = row if isinstance(row, dict) else {}
     return QueryCount(
-        num=int(result.get("total_count") or 0),
-        **{key: int(result.get(f"{key}_count") or 0) for key in starts},
+        num=int(row.get("total_count") or 0),
+        **{key: int(row.get(f"{key}_count") or 0) for key in starts},
     )
 
 
@@ -290,7 +291,9 @@ class ApiDataSource:
             ChatCallCount: 聊天与调用的总数及各时间窗口数量
         """
         chat, call = await asyncio.gather(
-            get_record_counts(ChatHistory, bot_id, "Main.chat_counts"),
+            get_record_counts(
+                ChatHistory.filter(is_bot=False), bot_id, "Main.chat_counts"
+            ),
             get_record_counts(Statistics, bot_id, "Main.call_counts"),
         )
         return ChatCallCount(chat=chat, call=call)
@@ -298,7 +301,7 @@ class ApiDataSource:
     @classmethod
     def __get_query(
         cls,
-        base_query: type[ChatHistory | Statistics],
+        base_query: Any,
         date_type: QueryDateType | None = None,
         bot_id: str | None = None,
     ):
@@ -330,7 +333,7 @@ class ApiDataSource:
         返回:
             list[ActiveGroup]: 活跃群组列表
         """
-        query = cls.__get_query(ChatHistory, date_type, bot_id)
+        query = cls.__get_query(ChatHistory.filter(is_bot=False), date_type, bot_id)
         data_list = await webui_db_call(
             query.annotate(count=Count("id"))
             .filter(group_id__not_isnull=True)

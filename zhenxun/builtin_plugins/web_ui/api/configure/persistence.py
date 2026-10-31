@@ -198,6 +198,18 @@ def apply_configuration(setting: ApplyRequest) -> dict[str, Any]:
     env_text = _set_env_value(
         env_text, "SUPERUSERS", json.dumps(superusers, ensure_ascii=False)
     )
+    self_nickname = setting.self_nickname.strip()
+    nicknames = list(
+        dict.fromkeys(
+            name.strip() for name in [self_nickname, *setting.nicknames] if name.strip()
+        )
+    )
+    if self_nickname:
+        env_text = _set_env_value(env_text, "SELF_NICKNAME", _quote_env(self_nickname))
+    if nicknames:
+        env_text = _set_env_value(
+            env_text, "NICKNAME", json.dumps(nicknames, ensure_ascii=False)
+        )
     env_text = _set_env_value(env_text, "HOST", host)
     env_text = _set_env_value(env_text, "PORT", setting.network.port)
     env_text = _set_env_value(env_text, "CACHE_MODE", setting.cache.mode)

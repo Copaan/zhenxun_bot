@@ -642,7 +642,6 @@ def configuration_view(config: LLMConfig, revision: str) -> dict[str, Any]:
             "model_groups": section("MODEL_GROUPS", config.model_groups),
             "context": section("context_settings", model_dump(config.context_settings)),
             "agent": section("agent_settings", model_dump(config.agent_settings)),
-            "sandbox": section("sandbox", model_dump(config.sandbox)),
             "web_search": section("web_search", model_dump(config.web_search)),
             "advanced": {
                 "client_settings": section(

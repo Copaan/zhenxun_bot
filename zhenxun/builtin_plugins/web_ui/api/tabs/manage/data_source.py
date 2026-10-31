@@ -187,7 +187,9 @@ class ApiDataSource:
             member_count=group.member_count,
             max_member_count=group.max_member_count,
             chat_count=await webui_db_call(
-                ChatHistory.filter(bot_id=storage_bot_id, group_id=group_id).count(),
+                ChatHistory.filter(
+                    bot_id=storage_bot_id, group_id=group_id, is_bot=False
+                ).count(),
                 "Manage.group_chat_count",
             ),
             call_count=await webui_db_call(

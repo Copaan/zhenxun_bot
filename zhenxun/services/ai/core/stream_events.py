@@ -35,6 +35,19 @@ class LLMEndEvent(AgentStreamEvent):
     """大模型返回的完整响应 (ChatResponse)"""
 
 
+STREAM_TEXT_KEY = "__stream_text__"
+"""运行上下文 state 中设置为 True 时，模型请求改用流式并发出 TextDeltaEvent"""
+
+
+class TextDeltaEvent(AgentStreamEvent):
+    """流式请求中模型输出的增量"""
+
+    kind: str
+    """text 正文，thought 思考，reset 本次请求重试，丢弃已收到的增量"""
+    text: str = ""
+    """增量文本"""
+
+
 class ToolCallStartEvent(AgentStreamEvent):
     """工具调用开始事件"""
 
@@ -42,8 +55,6 @@ class ToolCallStartEvent(AgentStreamEvent):
     """调用的工具名称"""
     arguments: dict[str, Any]
     """工具调用参数"""
-    intent: str | None = None
-    """从大模型调用参数中剥离出的意图 (_intent)"""
 
 
 class ToolCallEndEvent(AgentStreamEvent):
@@ -57,17 +68,6 @@ class ToolCallEndEvent(AgentStreamEvent):
     """工具执行是否失败"""
 
 
-class ToolStreamChunkEvent(AgentStreamEvent):
-    """工具或后台任务流式进度反馈事件"""
-
-    tool_name: str
-    """工具名称"""
-    content: str
-    """当前流式输出的文本片段"""
-    metadata: dict[str, Any] | None = None
-    """流式的附加元数据 (如进度比例等)"""
-
-
 class UserCustomEvent(AgentStreamEvent):
     """自定义用户界面交互事件"""
 
@@ -75,15 +75,6 @@ class UserCustomEvent(AgentStreamEvent):
     """用于前端渲染的展示对象 (如 UniMessage, str, ImagePart)"""
     log_content: str | None = None
     """用于后台打印的日志摘要"""
-
-
-class ControlFlowEvent(AgentStreamEvent):
-    """控制流中断与流转事件"""
-
-    action: str
-    """控制流动作，如 'handoff', 'abort', 'end_run'"""
-    payload: Any = None
-    """附加的数据载荷"""
 
 
 T_Event = TypeVar("T_Event", bound=AgentStreamEvent)

@@ -598,7 +598,9 @@ async def get_chat_history_rank_cached(
         if is_db_unhealthy():
             raise CacheUnavailable("hot_query_database_unavailable")
         order_prefix = "-" if order == "DESC" else ""
-        query: Any = model.filter(group_id=gid) if gid else model
+        query: Any = model.filter(is_bot=False)
+        if gid:
+            query = query.filter(group_id=gid)
         if date_scope:
             filter_scope = (
                 date_scope[0].isoformat(" "),
@@ -637,7 +639,9 @@ async def get_chat_history_first_msg_datetime_cached(
 
         if is_db_unhealthy():
             raise CacheUnavailable("hot_query_database_unavailable")
-        query: Any = model.filter(group_id=group_id) if group_id else model.all()
+        query: Any = model.filter(is_bot=False)
+        if group_id:
+            query = query.filter(group_id=group_id)
         message = await _read_authoritative(
             query.order_by("create_time").first(),
             timeout=_AGGREGATE_DB_TIMEOUT,

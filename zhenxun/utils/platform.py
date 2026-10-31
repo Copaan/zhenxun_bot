@@ -637,7 +637,7 @@ class PlatformUtils:
         """发送消息
 
         QQ 官方 Bot 指定的群与事件所在群不同或不在事件中时向该群发送主动消息，
-        未指定群时回复到事件所在会话，不支持主动私聊。
+        未指定群时回复到事件所在会话，不在事件中时向用户发送主动单聊消息。
 
         参数:
             bot: Bot
@@ -659,7 +659,11 @@ class PlatformUtils:
             )
 
             return await send_official_message(
-                cast(ZhenxunQQBot, bot), send_message, group_id, official_context
+                cast(ZhenxunQQBot, bot),
+                send_message,
+                group_id,
+                official_context,
+                user_id,
             )
         if target := cls.get_target(user_id=user_id, group_id=group_id, bot=bot):
             return await send_message.send(target=target, bot=bot)

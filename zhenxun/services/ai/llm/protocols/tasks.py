@@ -35,6 +35,8 @@ from zhenxun.services.ai.core.messages import (
     RerankResult,
     SpeechRequest,
     TextPart,
+    TranscriptionRequest,
+    TranscriptionResponse,
     UsageInfo,
     UserMessage,
 )
@@ -362,11 +364,48 @@ def parse_image(route, request: ImageRequest, payload: dict[str, Any]):
     return ImageResponse(content_parts=parts, raw_response=payload)
 
 
+_AUDIO_SUFFIXES = {"mpeg": "mp3", "x-wav": "wav", "wave": "wav", "mp4": "m4a"}
+
+
+async def build_transcription(route, request: TranscriptionRequest) -> HttpCall:
+    """编码语音转文字请求 (OpenAI 兼容的 /audio/transcriptions)"""
+    audio = request.audio
+    mime = audio.mime_type or "audio/wav"
+    subtype = mime.split("/")[-1]
+    suffix = _AUDIO_SUFFIXES.get(subtype, subtype)
+    data: dict[str, Any] = {"model": route.model.name, "response_format": "json"}
+    if request.language:
+        data["language"] = request.language
+    if request.prompt:
+        data["prompt"] = request.prompt
+    files = [("file", (f"audio.{suffix}", await audio.get_raw_bytes(), mime))]
+    return HttpCall("/audio/transcriptions", data=data, files=files)
+
+
+def parse_transcription(
+    route, request: TranscriptionRequest, payload: Any
+) -> TranscriptionResponse:
+    """解码语音转文字响应"""
+    text = payload.get("text") if isinstance(payload, dict) else None
+    if not isinstance(text, str):
+        raise ResponseParseException(
+            f"[{route.name}] 无法解析语音识别结果",
+            details={"response": str(payload)[:500]},
+        )
+    return TranscriptionResponse(
+        text=text.strip(),
+        usage=_usage(payload),
+        raw_response=payload,
+        model_name=route.name,
+    )
+
+
 def openai_tasks() -> dict[str, tuple[Any, Any]]:
     """OpenAI 兼容协议共用的非对话任务"""
     return {
         "embedding": (build_embedding, parse_embedding),
         "rerank": (build_rerank, parse_rerank),
         "tts": (build_speech, parse_speech),
+        "stt": (build_transcription, parse_transcription),
         "image": (build_image, parse_image),
     }

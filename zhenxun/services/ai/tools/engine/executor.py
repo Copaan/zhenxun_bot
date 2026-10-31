@@ -1,24 +1,21 @@
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
 import ast
 import asyncio
 from contextlib import asynccontextmanager
 import inspect
 import json
-from typing import Any, cast
+from typing import Any
 
 import json_repair
-from nonebot.adapters import Message as PlatformMessage
 
-from zhenxun.services.ai.capabilities import CombinedCapability
+from zhenxun.services.ai.capabilities.base import CombinedCapability
 from zhenxun.services.ai.core.exceptions import (
     ControlFlowExit,
     ToolFatalError,
     ToolRetryError,
 )
 from zhenxun.services.ai.core.messages import (
-    AnyLLMMessage,
     AudioPart,
     FilePart,
     ImagePart,
@@ -33,24 +30,31 @@ from zhenxun.services.ai.core.stream_events import (
     EventBus,
     ToolCallEndEvent,
     ToolCallStartEvent,
-    ToolStreamChunkEvent,
-    UserCustomEvent,
 )
-from zhenxun.services.ai.message_builder import MessageBuilder
 from zhenxun.services.ai.run.context import RunContext, set_run_context
 from zhenxun.services.ai.run.di import DependencyInjector
-from zhenxun.services.ai.tools.core.tool import BaseTool, register_tool_runner
-from zhenxun.services.ai.tools.models import (
-    StateSyncResult,
-    ToolOptions,
-    ToolResult,
-    ToolResultChunk,
-    ValidatedToolCall,
-)
+from zhenxun.services.ai.tools.core.tool import BaseTool
+from zhenxun.services.ai.tools.models import ToolResult, ValidatedToolCall
 from zhenxun.services.ai.utils.logger import log_tool as logger
 from zhenxun.utils.pydantic_compat import dump_json_safely
 
 from .registry import ToolCollection
+
+
+def _tool_timeout(tool: Any) -> int:
+    """工具调用的超时秒数，元数据标记 no_timeout 的工具不限时
+
+    参数:
+        tool: 工具
+
+    返回:
+        int: 超时秒数，0 表示不限时
+    """
+    from zhenxun.services.ai.config import get_llm_config
+
+    if (getattr(tool, "metadata", None) or {}).get("no_timeout"):
+        return 0
+    return get_llm_config().agent_settings.tool_timeout
 
 
 class ToolExecutor:
@@ -59,17 +63,24 @@ class ToolExecutor:
     负责接收工具调用请求，解析参数，触发回调，执行工具，并返回标准化的结果。
     """
 
-    def __init__(self):
-        """初始化工具执行器。"""
-        pass
-
     @staticmethod
     def assemble_tool_message(
         original_call: ToolCallPart,
         res_or_exc: BaseException | tuple[ToolCallPart, ToolResult],
         tool_res: ToolResult | None,
+        max_chars: int = 0,
     ) -> tuple[ToolMessage, UsageInfo | None]:
-        """负责处理异常、解析多模态、序列化，并装配为最终的工具消息载体"""
+        """处理异常、分离多模态片段、序列化并截断结果，装配为工具消息
+
+        参数:
+            original_call: 原始工具调用
+            res_or_exc: 执行结果或异常
+            tool_res: 工具结果
+            max_chars: 结果文本的最大字符数，超出时保留首尾、截去中间；0 不限制
+
+        返回:
+            tuple[ToolMessage, UsageInfo | None]: 工具消息与工具产生的用量
+        """
         media_parts = []
         final_content = "Success"
         usage = None
@@ -99,6 +110,15 @@ class ToolExecutor:
 
             usage = getattr(tool_res, "usage", None)
 
+        if max_chars and len(final_content) > max_chars:
+            head = max_chars * 2 // 3
+            tail = max_chars - head
+            cut = len(final_content) - max_chars
+            final_content = (
+                f"{final_content[:head]}\n...[结果过长，已截去中间 {cut} 字]...\n"
+                f"{final_content[-tail:] if tail else ''}"
+            )
+
         msg = LLMMessage.tool_response(
             original_call.id, original_call.tool_name, final_content
         )
@@ -125,14 +145,11 @@ class ToolExecutor:
         event_bus: EventBus | None,
         tool_name: str,
         arguments: dict[str, Any],
-        intent: str | None,
     ):
         """生命周期上下文管理器：接管事件流的发送与异常包装样板代码"""
         if event_bus:
             await event_bus.emit(
-                ToolCallStartEvent(
-                    tool_name=tool_name, arguments=arguments, intent=intent
-                )
+                ToolCallStartEvent(tool_name=tool_name, arguments=arguments)
             )
         result_box: dict[str, Any] = {}
         try:
@@ -149,48 +166,38 @@ class ToolExecutor:
     @staticmethod
     def _robust_parse_args(
         args_raw: str | dict[str, Any],
-    ) -> tuple[bool, dict[str, Any], str | None, str]:
-        """容错解析参数纯函数，返回 (是否成功, 解析后的字典, intent意图, 原始字符串)"""
+    ) -> tuple[bool, dict[str, Any], str]:
+        """容错解析参数纯函数，返回 (是否成功, 解析后的字典, 原始字符串)"""
         if isinstance(args_raw, dict):
-            arguments = args_raw.copy()
-            parsed_successfully = True
-            args_str = json.dumps(args_raw, ensure_ascii=False)
-        else:
-            args_str = args_raw
-            arguments = {}
-            parsed_successfully = False
-            if not args_str.strip():
-                parsed_successfully = True
-            else:
-                try:
-                    parsed = json.loads(args_str)
-                    if isinstance(parsed, dict):
-                        arguments, parsed_successfully = parsed, True
-                except json.JSONDecodeError:
-                    try:
-                        parsed = ast.literal_eval(args_str)
-                        if isinstance(parsed, dict):
-                            arguments, parsed_successfully = parsed, True
-                    except (ValueError, SyntaxError):
-                        try:
-                            repaired_str = str(
-                                json_repair.repair_json(args_str, skip_json_loads=True)
-                            )
-                            parsed = json.loads(repaired_str)
-                            if isinstance(parsed, dict):
-                                arguments, parsed_successfully = parsed, True
-                                logger.debug(
-                                    "⚒️ 成功修复损坏的工具参数: "
-                                    f"{args_str} -> {repaired_str}"
-                                )
-                        except Exception:
-                            pass
-        intent_str = None
-        if parsed_successfully:
-            _intent = arguments.pop("_intent", None)
-            if _intent:
-                intent_str = str(_intent)
-        return parsed_successfully, arguments, intent_str, args_str
+            return True, args_raw.copy(), json.dumps(args_raw, ensure_ascii=False)
+        args_str = args_raw
+        if not args_str.strip():
+            return True, {}, args_str
+        try:
+            parsed = json.loads(args_str)
+            if isinstance(parsed, dict):
+                return True, parsed, args_str
+            return False, {}, args_str
+        except json.JSONDecodeError:
+            pass
+        try:
+            parsed = ast.literal_eval(args_str)
+            if isinstance(parsed, dict):
+                return True, parsed, args_str
+        except (ValueError, SyntaxError):
+            try:
+                repaired_str = str(
+                    json_repair.repair_json(args_str, skip_json_loads=True)
+                )
+                parsed = json.loads(repaired_str)
+                if isinstance(parsed, dict):
+                    logger.debug(
+                        f"⚒️ 成功修复损坏的工具参数: {args_str} -> {repaired_str}"
+                    )
+                    return True, parsed, args_str
+            except Exception:
+                pass
+        return False, {}, args_str
 
     def _prepare_tool_context(
         self,
@@ -199,7 +206,6 @@ class ToolExecutor:
         tool_name: str,
         executable: Any,
         event_bus: EventBus | None,
-        available_tools: ToolCollection | dict[str, Any] | None = None,
     ) -> RunContext:
         """准备/克隆工具调用所使用的隔离 RunContext"""
         safe_context = (
@@ -210,8 +216,6 @@ class ToolExecutor:
         safe_context.run.event_bus = event_bus
         safe_context.call.tool_name = tool_name
         safe_context.call.current_tool = executable
-        if available_tools is not None:
-            safe_context.state["__available_tools"] = available_tools
         return safe_context
 
     async def validate_tool_call(
@@ -219,9 +223,8 @@ class ToolExecutor:
         tool_call: ToolCallPart,
         available_tools: ToolCollection | dict[str, Any] | None,
         context: RunContext | None = None,
-        event_bus: EventBus | None = None,
     ) -> ValidatedToolCall:
-        """验证单一工具调用，完成参数解析、类型检查与交互式补全(如果触发)。"""
+        """验证单一工具调用，完成参数解析与类型检查"""
         if not available_tools:
             available_tools = {}
         if not tool_call.tool_name:
@@ -232,8 +235,8 @@ class ToolExecutor:
             )
 
         tool_name = tool_call.tool_name
-        parsed_successfully, arguments, intent_str, arguments_str = (
-            self._robust_parse_args(tool_call.args)
+        parsed_successfully, arguments, arguments_str = self._robust_parse_args(
+            tool_call.args
         )
 
         if tool_call.args and not parsed_successfully:
@@ -248,8 +251,6 @@ class ToolExecutor:
                     f"参数JSON解析失败，请检查 JSON 语法是否合法: {arguments_str}"
                 ),
             )
-        elif intent_str:
-            logger.info(f"🧠 [Agent Intent] 调用工具 {tool_name} 的意图: {intent_str}")
 
         executable = available_tools.get(tool_name)
         if not executable or not hasattr(executable, "execute"):
@@ -259,36 +260,16 @@ class ToolExecutor:
                 validation_error=ToolRetryError(f"Tool '{tool_name}' not found."),
             )
 
-        safe_context = self._prepare_tool_context(
-            context, tool_call.id, tool_name, executable, event_bus
-        )
-
-        combined_cap = self._get_combined_capability(executable, safe_context)
-
-        async def inner_validate(args_inner):
-            if isinstance(args_inner, dict) and hasattr(executable, "validate_args"):
-                sig = inspect.signature(executable.validate_args)
-                if "context" in sig.parameters:
-                    return await executable.validate_args(
-                        args_inner, context=safe_context
-                    )
-                return await executable.validate_args(args_inner)
-            return args_inner
-
         try:
-            validated_args = await combined_cap.wrap_tool_validate(
-                safe_context, tool_name, arguments, inner_validate
-            )
+            if hasattr(executable, "validate_args"):
+                arguments = await executable.validate_args(arguments)
             return ValidatedToolCall(
                 call=tool_call,
                 tool=executable,
                 args_valid=True,
-                validated_args=validated_args,
-                intent=intent_str,
+                validated_args=arguments,
             )
-        except BaseException as e:
-            if isinstance(e, asyncio.CancelledError):
-                raise e
+        except Exception as e:
             return ValidatedToolCall(
                 call=tool_call,
                 tool=executable,
@@ -299,15 +280,10 @@ class ToolExecutor:
     async def execute_tool_call(
         self,
         validated: ValidatedToolCall,
-        available_tools: ToolCollection | dict[str, Any] | None,
         context: RunContext | None = None,
-        model_name: str | None = None,
-        max_retries: int = 0,
         event_bus: EventBus | None = None,
     ) -> tuple[ToolCallPart, ToolResult]:
         """核心执行阶段。只接收已经通过 Validation 阶段的 ValidatedToolCall 载体。"""
-        if not available_tools:
-            available_tools = {}
         tool_name = validated.call.tool_name
         if not validated.args_valid or validated.tool is None:
             if isinstance(validated.validation_error, ControlFlowExit):
@@ -329,22 +305,20 @@ class ToolExecutor:
         arguments = validated.validated_args or {}
 
         safe_context = self._prepare_tool_context(
-            context,
-            validated.call.id,
-            tool_name,
-            executable,
-            event_bus,
-            available_tools,
+            context, validated.call.id, tool_name, executable, event_bus
         )
-
         combined_cap = self._get_combined_capability(executable, safe_context)
 
         async def inner_handler(args_inner: dict) -> Any:
-            return await executable.execute(context=safe_context, **args_inner)
+            call = executable.execute(context=safe_context, **args_inner)
+            if not (timeout := _tool_timeout(executable)):
+                return await call
+            try:
+                return await asyncio.wait_for(call, timeout)
+            except asyncio.TimeoutError:
+                return ToolResult(output=f"工具执行超时（{timeout} 秒）").as_error()
 
-        async with self._tool_stream_scope(
-            event_bus, tool_name, arguments, validated.intent
-        ) as box:
+        async with self._tool_stream_scope(event_bus, tool_name, arguments) as box:
             with set_run_context(safe_context):
                 try:
                     result = await combined_cap.wrap_tool_execute(
@@ -352,16 +326,8 @@ class ToolExecutor:
                     )
                     if not isinstance(result, ToolResult):
                         result = ToolResult(output=result)
-
-                    if isinstance(result, StateSyncResult) and result.state_notice:
-                        if safe_context:
-                            safe_context.run.add_system_prompt(
-                                f"[系统通知(状态同步)]：{result.state_notice}"
-                            )
                 except BaseException as e:
-                    if isinstance(e, ControlFlowExit):
-                        raise e
-                    if isinstance(e, asyncio.CancelledError):
+                    if isinstance(e, ControlFlowExit | asyncio.CancelledError):
                         raise e
                     logger.error(f"洋葱模型异常穿透: {e}")
                     result = ToolResult(output=f"System Fatal Error: {e}").as_error()
@@ -369,217 +335,99 @@ class ToolExecutor:
 
         return validated.call, box["result"]
 
+    async def execute_tool_calls(
+        self,
+        validated_calls: list[ValidatedToolCall],
+        context: RunContext | None = None,
+        event_bus: EventBus | None = None,
+        parallel: bool = True,
+    ) -> list[tuple[ToolCallPart, ToolResult] | BaseException]:
+        """执行一批工具调用，允许并行时同时执行，否则依次执行
+
+        参数:
+            validated_calls: 已校验的工具调用
+            context: 运行上下文
+            event_bus: 事件总线
+            parallel: 是否允许并行
+
+        返回:
+            list[tuple[ToolCallPart, ToolResult] | BaseException]: 与调用顺序一致的
+                结果，出错的调用对应异常对象；遇到中止或取消后不再执行后续调用
+        """
+        size = len(validated_calls)
+        chunks = [list(range(size))] if parallel else [[i] for i in range(size)]
+        results: list[tuple[ToolCallPart, ToolResult] | BaseException] = []
+        for chunk in chunks:
+            chunk_results = await asyncio.gather(
+                *[
+                    self.execute_tool_call(validated_calls[i], context, event_bus)
+                    for i in chunk
+                ],
+                return_exceptions=True,
+            )
+            results.extend(chunk_results)
+            stop = next(
+                (
+                    r
+                    for r in chunk_results
+                    if isinstance(r, ControlFlowExit | asyncio.CancelledError)
+                ),
+                None,
+            )
+            if stop is not None:
+                results.extend([stop] * (size - len(results)))
+                break
+        return results
+
     async def execute_batch(
         self,
         tool_calls: list[ToolCallPart],
         available_tools: ToolCollection | dict[str, Any] | None,
         context: RunContext | None = None,
-        model_name: str | None = None,
-        max_retries: int = 0,
-        event_bus: EventBus | None = None,
-    ) -> list[AnyLLMMessage]:
-        """批量并发执行多个工具调用。"""
-        if not available_tools:
-            available_tools = {}
-        if not tool_calls:
-            return []
+    ) -> list[ToolMessage]:
+        """校验并并行执行一批工具调用，结果装配为工具消息（外部插件使用的旧接口）
 
-        val_tasks = [
-            self.validate_tool_call(
-                call,
-                available_tools,
-                context,
-                event_bus=event_bus,
-            )
-            for call in tool_calls
-        ]
-        validated_calls = await asyncio.gather(*val_tasks)
+        参数:
+            tool_calls: 模型给出的工具调用
+            available_tools: 可用工具
+            context: 运行上下文
 
-        results: list[Any] = [None] * len(validated_calls)
-
-        async def _run_tool(index: int, val_call: ValidatedToolCall):
-            try:
-                res = await self.execute_tool_call(
-                    val_call,
-                    available_tools,
-                    context,
-                    model_name=model_name,
-                    max_retries=max_retries,
-                    event_bus=event_bus,
-                )
-                results[index] = res
-            except Exception as e:
-                results[index] = e
-
-        chunks: list[list[tuple[int, ValidatedToolCall]]] = []
-        current_chunk: list[tuple[int, ValidatedToolCall]] = []
-
-        for i, val_call in enumerate(validated_calls):
-            executable = getattr(val_call, "tool", None)
-            concurrency_mode = getattr(
-                getattr(executable, "settings", None), "concurrency", "shared"
-            )
-
-            if concurrency_mode == "exclusive":
-                if current_chunk:
-                    chunks.append(current_chunk)
-                    current_chunk = []
-                chunks.append([(i, val_call)])
-            else:
-                current_chunk.append((i, val_call))
-
-        if current_chunk:
-            chunks.append(current_chunk)
-
-        for chunk in chunks:
-            await asyncio.gather(*[_run_tool(i, call) for i, call in chunk])
-
-        tool_messages: list[AnyLLMMessage] = []
-        for index, result_pair in enumerate(results):
-            original_call = tool_calls[index]
-            func_name = original_call.tool_name
-
-            if isinstance(result_pair, BaseException):
-                if isinstance(result_pair, ControlFlowExit):
-                    raise result_pair
-                if isinstance(result_pair, asyncio.CancelledError):
-                    raise result_pair
-
-                logger.error(f"工具批量执行并发崩溃: {func_name}, 错误: {result_pair}")
-                result_pair = (
-                    original_call,
-                    ToolResult(output=f"Crash: {result_pair}").as_error(),
-                )
-
-            tool_res = None
-            if not isinstance(result_pair, BaseException):
-                _, raw_tool_res = cast(tuple[ToolCallPart, ToolResult], result_pair)
-                tool_res = raw_tool_res
-
-            msg, _ = ToolExecutor.assemble_tool_message(
-                original_call, result_pair, tool_res
-            )
-            tool_messages.append(msg)
-        return tool_messages
-
-
-class ToolExecutionPolicy:
-    """
-    工具执行策略。
-    负责解析工具私有配置与系统全局配置，决定最大重试次数、Fallback 路由目标等流转行为。
-    """
-
-    def __init__(self, tool: BaseTool, global_max_retries: int = 0):
-        """初始化工具执行策略。"""
-        self.tool = tool
-        self.settings: ToolOptions = getattr(tool, "settings", ToolOptions())
-        self.metadata: dict[str, Any] = (
-            self.settings.metadata if self.settings else getattr(tool, "metadata", {})
+        返回:
+            list[ToolMessage]: 与调用顺序一致的工具消息，出错的调用为错误结果
+        """
+        validated = await asyncio.gather(
+            *[self.validate_tool_call(c, available_tools, context) for c in tool_calls]
         )
-        self.global_max_retries = global_max_retries
-
-    @property
-    def max_retries(self) -> int:
-        """
-        计算当前工具的绝对最大重试次数。
-        优先使用工具级配置 (ToolOptions.max_retries)，如果未设置，则使用全局配置。
-        """
-        tool_retries = getattr(self.settings, "max_retries", None)
-        if tool_retries is not None:
-            return tool_retries
-        return max(self.global_max_retries, 1)
+        results = await self.execute_tool_calls(list(validated), context)
+        return [
+            self.assemble_tool_message(
+                call, result, result[1] if isinstance(result, tuple) else None
+            )[0]
+            for call, result in zip(tool_calls, results)
+        ]
 
 
-class ToolRunner(ABC):
+async def run_native_tool(
+    tool: BaseTool, context: RunContext, **kwargs: Any
+) -> ToolResult:
+    """注入依赖后运行工具函数，非 ToolResult 的返回值包装为 ToolResult
+
+    参数:
+        tool: 工具
+        context: 运行上下文
+        **kwargs: 已校验的工具参数
+
+    返回:
+        ToolResult: 工具结果
     """
-    工具运行器基类协议。
-    负责将参数请求物理落实为目标执行。
-    """
-
-    @abstractmethod
-    async def run(
-        self, tool: BaseTool, context: RunContext, **kwargs: Any
-    ) -> ToolResult:
-        """执行工具调用的抽象方法。"""
-        pass
-
-
-class NativeToolRunner(ToolRunner):
-    """
-    原生 Python 函数工具运行器。
-    负责处理依赖注入 (DI)、异步包装、生成器流式收集以及框架级的多模态消息转换。
-    """
-
-    async def run(
-        self, tool: BaseTool, context: RunContext, **kwargs: Any
-    ) -> ToolResult:
-        """运行原生 Python 函数工具并返回结果。"""
-        target_func = tool.get_execute_target()
-        signature_target = tool.get_signature_target()
-
-        if not target_func:
-            return ToolResult(output="Error: 未找到有效的执行目标(run 方法)").as_error()
-
-        call_kwargs = dict(kwargs)
-
-        try:
-            target_call_kwargs = await DependencyInjector.resolve_all(
-                sig=inspect.signature(signature_target),
-                call_kwargs=dict(call_kwargs),
-                context=context,
-            )
-        except ValueError as e:
-            logger.error(f"工具 {tool.name} 依赖注入失败: {e}", e=e)
-            raise ToolFatalError(f"框架依赖注入失败: {e}")
-
-        is_async_gen = getattr(
-            target_func, "_is_async_gen", False
-        ) or inspect.isasyncgenfunction(target_func)
-        if is_async_gen:
-            res = None
-            async for chunk in target_func(**target_call_kwargs):
-                if isinstance(chunk, ToolResult):
-                    res = chunk
-                else:
-                    chunk_obj = (
-                        chunk
-                        if isinstance(chunk, ToolResultChunk)
-                        else ToolResultChunk(content=str(chunk))
-                    )
-                    is_silent = (
-                        getattr(tool.settings, "silent", False)
-                        if tool and hasattr(tool, "settings")
-                        else False
-                    )
-                    if not is_silent:
-                        await context.run.emit(
-                            ToolStreamChunkEvent(
-                                tool_name=tool.name,
-                                content=chunk_obj.content,
-                                metadata=chunk_obj.metadata,
-                            )
-                        )
-            if res is None:
-                res = ToolResult(output="Stream finished successfully.")
-        else:
-            res = await target_func(**target_call_kwargs)
-
-        if isinstance(res, ToolResult):
-            final_result = res
-        else:
-            if str(type(res)).find("Message") != -1:
-                uni_msg = (
-                    MessageBuilder.message_to_unimessage(res)
-                    if isinstance(res, PlatformMessage)
-                    else res
-                )
-                parts = await MessageBuilder.unimsg_to_llm_parts(uni_msg)
-                await context.run.emit(UserCustomEvent(display=uni_msg))
-                final_result = ToolResult(output=parts)
-            else:
-                final_result = ToolResult(output=res)
-
-        return final_result
-
-
-register_tool_runner(NativeToolRunner)
+    try:
+        call_kwargs = await DependencyInjector.resolve_all(
+            sig=inspect.signature(tool.get_signature_target()),
+            call_kwargs=dict(kwargs),
+            context=context,
+        )
+    except ValueError as e:
+        logger.error(f"工具 {tool.name} 依赖注入失败: {e}", e=e)
+        raise ToolFatalError(f"框架依赖注入失败: {e}")
+    res = await tool.get_execute_target()(**call_kwargs)
+    return res if isinstance(res, ToolResult) else ToolResult(output=res)

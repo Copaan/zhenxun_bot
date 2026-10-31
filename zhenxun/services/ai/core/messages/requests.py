@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from zhenxun.services.ai.core.models import ToolChoice
 from zhenxun.services.ai.core.options import (
@@ -11,8 +11,14 @@ from zhenxun.services.ai.core.options import (
     TTSConfig,
 )
 
-from .models import LLMMessage
-from .parts import EmbedBatch
+from .models import (
+    AssistantMessage,
+    LLMMessage,
+    SystemMessage,
+    ToolMessage,
+    UserMessage,
+)
+from .parts import AudioPart, EmbedBatch
 
 
 class BaseRequest(BaseModel):
@@ -31,6 +37,35 @@ class ChatRequest(BaseRequest):
     config: GenerationConfig | None = None
     tools: list[Any] | None = None
     tool_choice: str | dict[str, Any] | ToolChoice | None = None
+
+    @field_validator("messages")
+    @classmethod
+    def _typed_messages(cls, messages: list[LLMMessage]) -> list[LLMMessage]:
+        """把按 role 构造的通用消息转为对应的消息类型，各协议按类型编码"""
+        return [_typed(m) for m in messages]
+
+
+_ROLE_TYPES: dict[str, Any] = {
+    "system": SystemMessage,
+    "user": UserMessage,
+    "assistant": AssistantMessage,
+    "tool": ToolMessage,
+}
+
+
+def _typed(message: LLMMessage) -> LLMMessage:
+    """通用消息转为其 role 对应的消息类型，无法转换时原样返回"""
+    target = _ROLE_TYPES.get(str(message.role))
+    if target is None or isinstance(message, target):
+        return message
+    try:
+        return target(
+            content=message.content,
+            created_at=message.created_at,
+            metadata=message.metadata,
+        )
+    except ValueError:
+        return message
 
 
 class EmbeddingRequest(BaseRequest):
@@ -64,6 +99,17 @@ class SpeechRequest(BaseRequest):
     """语音合成配置"""
 
 
+class TranscriptionRequest(BaseRequest):
+    """语音转文字请求 DTO"""
+
+    audio: AudioPart
+    """待识别的音频"""
+    language: str | None = None
+    """音频语言 (ISO-639-1，如 zh)，为空时由模型自动判断"""
+    prompt: str | None = None
+    """提示文本，用于提示专有名词或衔接上文"""
+
+
 class RerankRequest(BaseRequest):
     """文本重排请求 DTO"""
 
@@ -82,4 +128,5 @@ __all__ = [
     "ImageRequest",
     "RerankRequest",
     "SpeechRequest",
+    "TranscriptionRequest",
 ]

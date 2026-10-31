@@ -83,6 +83,22 @@ def _module_set(obj: Any, name: str) -> Collection[str]:
     return _decode_modules(getattr(obj, name, ""))
 
 
+def _module_identity(owner: str) -> str:
+    """去掉插件 id 或模块名的插件包前缀
+
+    参数:
+        owner: 插件 id 或模块名
+
+    返回:
+        str: 插件标识
+    """
+    value = owner.split(":", 1)[0]
+    for prefix in ("zhenxun.plugins.", "zhenxun.builtin_plugins."):
+        if value.startswith(prefix):
+            return value[len(prefix) :]
+    return value
+
+
 def _encode_modules(values: Iterable[str]) -> str:
     return str(BotConsole.convert_module_format(_normalize_modules(values)))
 
@@ -327,15 +343,14 @@ class PluginPolicyService:
         异常:
             PluginPolicyNotReady: 插件策略尚未就绪
         """
-        from zhenxun.services.ai.chat_switch import module_identity
         from zhenxun.services.cache.runtime_cache import PluginInfoMemoryCache
 
         values = self.global_switch_values()
         if not owner:
             return False
-        identity = module_identity(owner)
+        identity = _module_identity(owner)
         for module, enabled in values.items():
-            name = module_identity(module)
+            name = _module_identity(module)
             if enabled or (identity != name and not identity.startswith(f"{name}.")):
                 continue
             row = PluginInfoMemoryCache._by_module[module]
@@ -348,54 +363,6 @@ class PluginPolicyService:
                 continue
             return True
         return False
-
-    async def migrate_legacy_chat_switches(self):
-        from zhenxun.configs.config import Config
-        from zhenxun.models.plugin_policy import PluginPolicyMigration
-        from zhenxun.services.ai.chat_switch import module_identity
-
-        values = Config.get_config("AI", "CHAT_PLUGIN_ENABLED", {}) or {}
-        if not isinstance(values, dict):
-            return
-        async with policy_transaction() as connection:
-            plugins = (
-                await PluginInfo.all()
-                .using_db(connection)
-                .select_for_update()
-                .order_by("id")
-            )
-            for plugin in plugins:
-                relevant = {
-                    name: enabled
-                    for name, enabled in values.items()
-                    if module_identity(plugin.module_path).startswith(
-                        module_identity(name) + "."
-                    )
-                    or module_identity(name) == plugin.module
-                }
-                key = (
-                    "ai-chat:" + hashlib.sha256(plugin.module_path.encode()).hexdigest()
-                )
-                if (
-                    not relevant
-                    or await PluginPolicyMigration.filter(key=key)
-                    .using_db(connection)
-                    .exists()
-                ):
-                    continue
-                previous = {
-                    "status": plugin.status,
-                    "block_type": plugin.block_type,
-                    "file_rules": relevant,
-                }
-                if any(value is False for value in relevant.values()):
-                    plugin.status, plugin.block_type = False, BlockType.ALL
-                    await plugin.save(
-                        using_db=connection, update_fields=["status", "block_type"]
-                    )
-                await PluginPolicyMigration.create(
-                    key=key, previous=previous, using_db=connection
-                )
 
     async def global_state(self, *, task=False):
         model = TaskInfo if task else PluginInfo
@@ -434,6 +401,19 @@ class PluginPolicyService:
         task=False,
         default=False,
     ):
+        """设置插件或被动任务的全局开关
+
+        参数:
+            module: 模块名，为空时作用于全部
+            enabled: 是否启用
+            block_type: 禁用类型，为空时按 enabled 推导
+            expected_revision: 期望的策略版本
+            task: 是否为被动任务
+            default: 是否只修改新群默认状态
+
+        返回:
+            dict: 全局策略状态
+        """
         model = TaskInfo if task else PluginInfo
         async with runtime_mutation_coordinator.operation("plugin_policy_global"):
             async with policy_transaction() as connection:
@@ -1295,7 +1275,6 @@ class PluginPolicyService:
         await self._publish_accounts(affected)
 
     async def reconcile(self) -> dict[str, int]:
-        await self.migrate_legacy_chat_switches()
         changed: list[str] = []
         async with runtime_mutation_coordinator.operation("plugin_policy_reconcile"):
             bindings = await BotPluginPolicyBinding.all()

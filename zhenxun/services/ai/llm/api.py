@@ -19,6 +19,7 @@ from zhenxun.services.ai.core.exceptions import (
     get_user_friendly_error_message,
 )
 from zhenxun.services.ai.core.messages import (
+    AudioPart,
     AudioResponse,
     ChatRequest,
     ChatResponse,
@@ -33,8 +34,10 @@ from zhenxun.services.ai.core.messages import (
     RerankResult,
     SpeechRequest,
     TextPart,
+    TranscriptionRequest,
     UsageInfo,
     UserMessage,
+    VideoPart,
 )
 from zhenxun.services.ai.core.models import CancellationToken
 from zhenxun.services.ai.core.options import (
@@ -43,65 +46,156 @@ from zhenxun.services.ai.core.options import (
     OutputFormatConfig,
     TTSConfig,
 )
-from zhenxun.services.ai.guardrails import GuardrailSource, parse_guardrails
+from zhenxun.services.ai.core.templates import wrap_untrusted
 from zhenxun.services.ai.utils.logger import log_llm as logger
 from zhenxun.utils.pydantic_compat import model_copy
 
-from .client import Route, execute
+from .client import Route, execute, unmet_needs
 from .manager import get_default_model, resolve_routes
+from .protocols import lift_tool_media
 
 T = TypeVar("T", bound=BaseModel)
 
 _CAPTION_PROMPT = (
     "请客观、详细地描述这张图片的内容，包括其中出现的文字。只输出描述本身。"
 )
-_caption_cache: OrderedDict[str, str] = OrderedDict()
+_VIDEO_PROMPT = (
+    "下面是从一段 {duration} 秒的视频中按时间顺序截取的 {count} 帧画面。"
+    "请客观描述视频的内容和画面中的文字，只输出描述本身。"
+)
+_media_text_cache: OrderedDict[str, str] = OrderedDict()
+MediaPart = ImagePart | AudioPart | VideoPart
 
 
-async def _caption(
-    part: ImagePart, model: str, token: CancellationToken | None
-) -> str | None:
-    """用视觉模型描述一张图片，结果按图片地址或内容缓存
+async def _media_key(part: MediaPart) -> str:
+    """媒体片段的缓存键：http 地址原样使用，其余取内容摘要
 
     参数:
-        part: 图片片段
-        model: 视觉模型
+        part: 媒体片段
+
+    返回:
+        str: 缓存键
+    """
+    if part.url and not part.url.startswith("data:"):
+        return part.url
+    if part.url:
+        return hashlib.sha1(part.url.encode()).hexdigest()
+    return hashlib.sha1(await part.get_raw_bytes()).hexdigest()
+
+
+async def _video_request(part: VideoPart) -> ChatRequest | str | None:
+    """把视频截成几帧交给视觉模型描述；没有 ffmpeg 或无法解析时只给出元信息
+
+    参数:
+        part: 视频片段
+
+    返回:
+        ChatRequest | str | None: 描述请求，或元信息文字；读取失败时为 None
+    """
+    from zhenxun.services.ai.utils.media import video_frames
+
+    if not (raw := await part.get_raw_bytes()):
+        return None
+    frames, duration = await video_frames(raw)
+    if not frames:
+        length = f"，时长约 {duration:.0f} 秒" if duration else ""
+        return f"一段视频（{len(raw) / 1024 / 1024:.1f}MB{length}），无法查看画面"
+    prompt = _VIDEO_PROMPT.format(duration=f"{duration:.0f}", count=len(frames))
+    images = [ImagePart(raw=frame, mime_type="image/jpeg") for frame in frames]
+    return ChatRequest(
+        messages=[UserMessage(content=[TextPart(text=prompt), *images])],
+        timeout=120,
+    )
+
+
+async def _media_to_text(
+    part: MediaPart, model: str, token: CancellationToken | None
+) -> str | None:
+    """用视觉模型描述图片或视频截帧，或用语音识别模型转写语音，结果按地址或内容缓存
+
+    参数:
+        part: 图片、语音或视频片段
+        model: 视觉模型或语音识别模型
         token: 取消令牌
 
     返回:
-        str | None: 图片描述，失败时为 None
+        str | None: 描述或转写文字，失败或为空时为 None
     """
-    if part.url and not part.url.startswith("data:"):
-        key = part.url
-    elif part.url:
-        key = hashlib.sha1(part.url.encode()).hexdigest()
-    else:
-        key = hashlib.sha1(await part.get_raw_bytes()).hexdigest()
-    if key in _caption_cache:
-        _caption_cache.move_to_end(key)
-        return _caption_cache[key]
-    request = ChatRequest(
-        messages=[UserMessage(content=[TextPart(text=_CAPTION_PROMPT), part])],
-        timeout=120,
-    )
+    is_image = isinstance(part, ImagePart)
+    kind = "image" if is_image else "video" if isinstance(part, VideoPart) else "audio"
+    key = f"{kind}:{await _media_key(part)}"
+    if key in _media_text_cache:
+        _media_text_cache.move_to_end(key)
+        return _media_text_cache[key]
     try:
-        response = await invoke("chat", request, model, token)
+        if isinstance(part, VideoPart):
+            request = await _video_request(part)
+            if not isinstance(request, ChatRequest):
+                return request
+            text = (await invoke("chat", request, model, token)).text
+        elif is_image:
+            request = ChatRequest(
+                messages=[UserMessage(content=[TextPart(text=_CAPTION_PROMPT), part])],
+                timeout=120,
+            )
+            text = (await invoke("chat", request, model, token)).text
+        else:
+            request = TranscriptionRequest(audio=part, timeout=120)
+            text = (await invoke("stt", request, model, token)).text
     except LLMException as e:
-        logger.warning(f"视觉模型 {model} 描述图片失败: {e}")
+        label = {"image": "图片", "video": "视频", "audio": "语音"}[kind]
+        logger.warning(f"模型 {model} 转换{label}失败: {e}")
         return None
-    if not (text := response.text.strip()):
+    if not (text := text.strip()):
         return None
-    _caption_cache[key] = text
-    if len(_caption_cache) > 256:
-        _caption_cache.popitem(last=False)
+    _media_text_cache[key] = text
+    if len(_media_text_cache) > 256:
+        _media_text_cache.popitem(last=False)
     return text
 
 
-async def _describe_images(
+def _converter(
+    modality: str, routes: list[Route]
+) -> tuple[type[MediaPart], str, str] | None:
+    """取对话线路不支持的媒体所对应的转换模型
+
+    参数:
+        modality: image、audio 或 video
+        routes: 对话线路
+
+    返回:
+        tuple | None: (片段类型, 转换模型, 标签)，任一线路支持该模态或
+            未配置可用的转换模型时为 None
+    """
+    if any(not unmet_needs(route, {modality}) for route in routes):
+        return None
+    part_type, task, label = {
+        "image": (ImagePart, "vision", "图片描述"),
+        "audio": (AudioPart, "stt", "语音转写"),
+        "video": (VideoPart, "vision", "视频描述"),
+    }[modality]
+    if not (model := get_default_model(task)):
+        return None
+    route_task = "chat" if task == "vision" else task
+    try:
+        candidates = resolve_routes(model, route_task)
+    except LLMException as e:
+        logger.warning(f"{label}模型 {model} 不可用: {e}")
+        return None
+    if task == "vision" and all(unmet_needs(route, {"image"}) for route in candidates):
+        logger.warning(f"视觉模型 {model} 不支持图片输入，已跳过{label}")
+        return None
+    return part_type, model, label
+
+
+async def _describe_media(
     request: Any, routes: list[Route], token: CancellationToken | None
 ) -> Any:
-    """对话线路都不支持图片输入时，用视觉模型 (default_models.vision)
-    把请求中的图片替换为文字描述
+    """对话线路都不支持图片、语音或视频输入时，用视觉模型 (default_models.vision)
+    描述图片和视频截帧、用语音识别模型 (default_models.stt) 转写语音，替换为文字
+
+    转换结果同时记在原片段的 metadata["text"] 中，供短期记忆保存；转换失败或
+    未配置转换模型的媒体保持原样，由协议层替换为占位文字。
 
     参数:
         request: 对话请求
@@ -111,45 +205,44 @@ async def _describe_images(
     返回:
         Any: 处理后的请求，无需处理时为原请求
     """
-    if not isinstance(request, ChatRequest) or any(
-        route.profile.accepts_input("image") for route in routes
-    ):
+    if not isinstance(request, ChatRequest):
         return request
-    images = {
-        id(part): part
+    converters = [
+        c for m in ("image", "audio", "video") if (c := _converter(m, routes))
+    ]
+    targets = {
+        id(part): (part, model, label)
+        for part_type, model, label in converters
         for message in request.messages
         for part in message.content
-        if isinstance(part, ImagePart)
+        if isinstance(part, part_type)
     }
-    if not images or not (model := get_default_model("vision")):
-        return request
-    try:
-        vision = resolve_routes(model, "chat")
-    except LLMException as e:
-        logger.warning(f"视觉模型 {model} 不可用: {e}")
-        return request
-    if not any(route.profile.accepts_input("image") for route in vision):
-        logger.warning(f"视觉模型 {model} 不支持图片输入，已跳过图片描述")
+    if not targets:
         return request
     results = await asyncio.gather(
-        *(_caption(part, model, token) for part in images.values())
+        *(_media_to_text(part, model, token) for part, model, _ in targets.values())
     )
-    captions = {key: text for key, text in zip(images, results) if text}
-    if not captions:
+    texts = {
+        key: wrap_untrusted(text, targets[key][2])
+        for key, text in zip(targets, results)
+        if text
+    }
+    if not texts:
         return request
+    for key, text in texts.items():
+        part = targets[key][0]
+        part.metadata = {**(part.metadata or {}), "text": text}
     messages = []
     for message in request.messages:
-        if not any(id(part) in captions for part in message.content):
+        if not any(id(part) in texts for part in message.content):
             messages.append(message)
             continue
         content = [
-            TextPart(text=f"<图片描述>{captions[id(part)]}</图片描述>")
-            if id(part) in captions
-            else part
+            TextPart(text=texts[id(part)]) if id(part) in texts else part
             for part in message.content
         ]
         messages.append(model_copy(message, update={"content": content}))
-    logger.debug(f"已用视觉模型 {model} 描述 {len(captions)} 张图片")
+    logger.debug(f"已将 {len(texts)} 个媒体片段转换为文字")
     return model_copy(request, update={"messages": messages})
 
 
@@ -181,7 +274,10 @@ async def invoke(
     """
     routes = resolve_routes(model, task)
     if task == "chat":
-        request = await _describe_images(request, routes, token)
+        messages = lift_tool_media(request.messages)
+        if messages is not request.messages:
+            request = model_copy(request, update={"messages": messages})
+        request = await _describe_media(request, routes, token)
     if not request.timeout:
         return await execute(task, routes, request, token)
     try:
@@ -345,7 +441,6 @@ async def generate_structured(
     message: PromptInput | list[LLMMessage],
     response_model: type[T],
     *,
-    guardrails: list[GuardrailSource] | None = None,
     model: str | None = None,
     config: GenerationConfig | None = None,
     max_retries: int | None = None,
@@ -364,10 +459,9 @@ async def generate_structured(
     参数:
         message: 输入的消息内容，支持纯文本、UniMessage、消息对象列表等。
         response_model: 目标结构化输出的 Pydantic 模型类。
-        guardrails: 护栏来源列表，支持自然语言规则、自定义校验函数。
         model: 模型全名或路由组名，为空时使用默认模型。
         config: 生成配置。
-        max_retries: 解析或护栏校验失败时的最大自我修正次数，为空时使用全局配置。
+        max_retries: 解析失败时的最大自我修正次数，为空时使用全局配置。
         error_prompt_template: 校验失败时引导模型自我修正的提示词模板。
         instruction: 系统指令。
         timeout: 本次请求的超时时间（秒）。
@@ -402,7 +496,6 @@ async def generate_structured(
             timeout=timeout,
             extra={
                 "output_processor": processor,
-                "guardrails": parse_guardrails(guardrails),
                 "max_retries": max_retries,
                 "__sys_capabilities": [ReflexionCapability()],
             },
@@ -448,9 +541,9 @@ async def generate(
         if not capabilities:
             return await invoke("chat", request, model, token)
 
-        from zhenxun.services.ai.capabilities import CombinedCapability
+        from zhenxun.services.ai.capabilities.base import CombinedCapability
         from zhenxun.services.ai.core.models import LLMContext
-        from zhenxun.services.ai.run import RunContext
+        from zhenxun.services.ai.run.context import RunContext
 
         async def handler(ctx: LLMContext[ChatRequest, ChatResponse]) -> ChatResponse:
             return await invoke("chat", ctx.request, model, token)
@@ -495,20 +588,37 @@ async def create_image(
     model: str | None = None,
     config: GenerationConfig | None = None,
 ) -> ImageResponse:
-    """
-    多模态图片生成/编辑函数。
+    """生成或编辑图片
+
+    提示词中的文字作为图片描述，其中的图片与 images 一起作为参考图
+    （提示词中的在前）。没有参考图时生成新图片，有参考图时进行编辑。
+
+    参数:
+        prompt: 提示词，支持文本、UniMessage、LLMMessage 或消息片段列表
+        images: 额外的参考图（字节、路径、URL 或 data URI）
+        model: 图片模型全名或路由组名，为空时使用 image 默认模型
+        config: 生成配置
+
+    返回:
+        ImageResponse: 生成的图片
 
     示例:
         res = await create_image("画一只猫", model="OpenAI/gpt-image-1")
         img_bytes = res.images[0]
-
-    说明:
-        - 若 `images` 为 None，执行文本生成图片。
-        - 若提供 `images`，执行图像编辑。
     """
-    text = getattr(prompt, "extract_plain_text", lambda: str(prompt))()
-    image_list = images if isinstance(images, list) else [images] if images else []
+    from zhenxun.services.ai.message_builder import MessageBuilder
+
+    extra = images if isinstance(images, list) else [images] if images else []
     try:
+        messages = await MessageBuilder.normalize_to_llm_messages(prompt)
+        parts = [
+            part
+            for message in messages
+            if isinstance(message.content, list)
+            for part in message.content
+        ]
+        text = "\n".join(m.extract_text for m in messages if m.extract_text)
+        image_list = [p for p in parts if isinstance(p, ImagePart)] + list(extra)
         request = ImageRequest(
             prompt=text, images=image_list or None, config=config or GenerationConfig()
         )

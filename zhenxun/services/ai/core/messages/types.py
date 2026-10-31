@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-from typing import Annotated, Any
+from typing import Any
 from typing_extensions import TypeVar
 
 from nonebot_plugin_alconna import UniMessage
-from pydantic import Field
 
 from .parts import (
     AudioPart,
@@ -28,31 +27,15 @@ ContentT = TypeVar("ContentT", default=LLMContentPart, covariant=True)
 OutputDataT = TypeVar("OutputDataT", default=str)
 
 
-from .context_events import AgentEvent
 from .models import (
-    AssistantMessage,
     LLMMessage,
-    SystemMessage,
-    ToolMessage,
-    UserMessage,
 )
-
-AnyLLMMessage = Annotated[
-    SystemMessage | UserMessage | AssistantMessage | ToolMessage,
-    Field(discriminator="role"),
-]
-"""LLM 消息类型的合集联合类型"""
 
 PromptInput = str | UniMessage | LLMMessage | list[LLMContentPart] | Any
 """支持作为 LLM 输入的提示词对象联合类型，包括纯文本、UniMessage、LLMMessage 消息实体"""
 
-AgentMessage = LLMMessage | AgentEvent
-"""Agent 上下文业务事件载体与原生网络载体的联合类型"""
-
 
 __all__ = [
-    "AgentMessage",
-    "AnyLLMMessage",
     "ContentT",
     "LLMContentPart",
     "OutputDataT",

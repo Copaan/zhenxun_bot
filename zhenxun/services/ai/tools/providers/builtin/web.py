@@ -1,12 +1,15 @@
+from itertools import count
 from typing import Any
 from urllib.parse import quote
 
 from zhenxun.services.ai.config import get_llm_config
 from zhenxun.services.ai.config.presets import detect_preset
 from zhenxun.services.ai.core.exceptions import LLMException
+from zhenxun.services.ai.core.stream_events import UserCustomEvent
+from zhenxun.services.ai.run.context import RunContext
 from zhenxun.services.ai.tools.core.decorators import tool
 from zhenxun.services.ai.tools.core.toolkit import BaseToolkit
-from zhenxun.services.ai.tools.models import ToolResult
+from zhenxun.services.ai.tools.models import ResolvedToolPayload, ToolResult
 from zhenxun.services.ai.utils.logger import log_tool as logger
 from zhenxun.services.network_proxy import ManagedAsyncClient
 
@@ -18,30 +21,34 @@ _FETCH = ("deepseek", "kimi", "jina")
 """提供网页读取的搜索服务，其余服务读取网页时使用 Jina Reader"""
 _SNIPPET_LIMIT = 500
 _FETCH_LIMIT = 8000
+_ROTATION = count()
+"""多个密钥轮换使用的起始序号"""
+SEARCH_HINT = "__search_hint__"
+"""运行上下文 state 中的搜索提示语，本轮首次联网搜索前发送到会话"""
 
 
 def _search_service(
     vendor: str | None = None,
-) -> tuple[str, str | None, str | None] | None:
+) -> tuple[str, list[str], str | None] | None:
     """确定搜索服务与密钥
 
     参数:
         vendor: 指定服务，为空时使用配置的服务，未配置时取第一个可复用密钥的服务商
 
     返回:
-        tuple | None: (服务, 密钥, 接口域名)，没有可用服务时为 None
+        tuple | None: (服务, 密钥列表, 接口域名)，没有可用服务时为 None
     """
     settings = get_llm_config().web_search
     vendor = vendor or settings.provider
-    if vendor and settings.api_key and vendor == settings.provider:
-        return vendor, settings.api_key, None
+    if vendor and settings.api_keys and vendor == settings.provider:
+        return vendor, settings.api_keys, None
     for provider in get_llm_config().providers:
         preset = detect_preset(provider.base_url)
         if preset in _REUSE_KEY and provider.api_keys and preset == (vendor or preset):
             host = provider.base_url.split("://", 1)[-1].split("/", 1)[0]
-            return preset, provider.api_keys[0], host
+            return preset, provider.api_keys, host
     if vendor == "jina":
-        return vendor, None, None
+        return vendor, [], None
     return None
 
 
@@ -64,16 +71,38 @@ def _format_results(items: list[tuple[Any, Any, Any, Any]]) -> str:
 
 
 async def _request(
-    method: str, url: str, key: str | None, json: dict | None = None
+    method: str, url: str, keys: list[str], json: dict | None = None
 ) -> Any:
-    headers = {"Accept": "application/json"}
-    if key:
-        headers["Authorization"] = f"Bearer {key}"
-    async with ManagedAsyncClient(timeout=30) as client:
-        response = await client.request(method, url, json=json, headers=headers)
-    if response.status_code >= 400:
-        raise LLMException(f"HTTP {response.status_code}: {_clip(response.text, 300)}")
-    return response.json()
+    """请求搜索接口，多个密钥时轮流作为起点，请求失败换下一个密钥重试
+
+    参数:
+        method: 请求方法
+        url: 接口地址
+        keys: 密钥列表，为空时不带鉴权
+        json: 请求体
+
+    返回:
+        Any: 响应 JSON
+    """
+    start = next(_ROTATION) % len(keys) if keys else 0
+    error: Exception | None = None
+    for key in [*keys[start:], *keys[:start]] or [None]:
+        headers = {"Accept": "application/json"}
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+        try:
+            async with ManagedAsyncClient(timeout=30) as client:
+                response = await client.request(method, url, json=json, headers=headers)
+            if response.status_code < 400:
+                return response.json()
+            error = LLMException(
+                f"HTTP {response.status_code}: {_clip(response.text, 300)}"
+            )
+        except Exception as e:
+            error = e
+        if len(keys) > 1:
+            logger.warning(f"搜索接口请求失败，换下一个密钥: {error}")
+    raise error or LLMException("搜索接口请求失败")
 
 
 async def search_web(query: str, count: int | None = None) -> str:
@@ -89,14 +118,14 @@ async def search_web(query: str, count: int | None = None) -> str:
     service = _search_service()
     if service is None:
         raise LLMException("尚未配置联网搜索服务 (AI.web_search)")
-    vendor, key, host = service
+    vendor, keys, host = service
     count = count or get_llm_config().web_search.max_results
     logger.info(f"联网搜索 [{vendor}]: {query}")
     if vendor == "deepseek":
         data = await _request(
             "POST",
             f"https://{host or 'api.deepseek.com'}/v1/tools/search",
-            key,
+            keys,
             {"query": query[:128], "count": count},
         )
         items = [
@@ -107,7 +136,7 @@ async def search_web(query: str, count: int | None = None) -> str:
         data = await _request(
             "POST",
             f"https://{host or 'api.moonshot.cn'}/v1/tools/search",
-            key,
+            keys,
             {"text_query": query, "limit": min(count, 20)},
         )
         items = [
@@ -118,7 +147,7 @@ async def search_web(query: str, count: int | None = None) -> str:
         data = await _request(
             "POST",
             "https://open.bigmodel.cn/api/paas/v4/web_search",
-            key,
+            keys,
             {
                 "search_query": query[:70],
                 "search_engine": "search_std",
@@ -131,9 +160,9 @@ async def search_web(query: str, count: int | None = None) -> str:
             for r in data.get("search_result") or []
         ]
     elif vendor == "jina":
-        if not key:
+        if not keys:
             raise LLMException("Jina 搜索需要 API Key")
-        data = await _request("GET", f"https://s.jina.ai/?q={quote(query)}", key)
+        data = await _request("GET", f"https://s.jina.ai/?q={quote(query)}", keys)
         items = [
             (
                 r.get("title"),
@@ -147,7 +176,7 @@ async def search_web(query: str, count: int | None = None) -> str:
         data = await _request(
             "POST",
             "https://api.tavily.com/search",
-            key,
+            keys,
             {"query": query, "max_results": count, "search_depth": "basic"},
         )
         items = [
@@ -158,7 +187,7 @@ async def search_web(query: str, count: int | None = None) -> str:
         data = await _request(
             "POST",
             "https://api.bochaai.com/v1/web-search",
-            key,
+            keys,
             {"query": query, "count": count, "summary": False},
         )
         pages = ((data.get("data") or {}).get("webPages") or {}).get("value") or []
@@ -188,13 +217,13 @@ async def fetch_web(url: str) -> str:
     service = _search_service()
     if service is None or service[0] not in _FETCH:
         service = _search_service("jina")
-    vendor, key, host = service or ("jina", None, None)
+    vendor, keys, host = service or ("jina", [], None)
     logger.info(f"读取网页 [{vendor}]: {url}")
     if vendor == "deepseek":
         data = await _request(
             "POST",
             f"https://{host or 'api.deepseek.com'}/v1/tools/fetch",
-            key,
+            keys,
             {"url": url},
         )
         title, content = data.get("title"), data.get("content")
@@ -202,12 +231,12 @@ async def fetch_web(url: str) -> str:
         data = await _request(
             "POST",
             f"https://{host or 'api.moonshot.cn'}/v1/tools/fetch",
-            key,
+            keys,
             {"url": url},
         )
         title, content = data.get("title"), data.get("markdown")
     else:
-        data = (await _request("GET", f"https://r.jina.ai/{url}", key)).get("data")
+        data = (await _request("GET", f"https://r.jina.ai/{url}", keys)).get("data")
         data = data or {}
         title, content = data.get("title"), data.get("content")
     if not content:
@@ -224,13 +253,15 @@ class WebSearchToolkit(BaseToolkit):
     )
 
     @tool(name="web_search")
-    async def web_search(self, query: str) -> ToolResult:
+    async def web_search(self, context: RunContext, query: str) -> ToolResult:
         """
         搜索互联网，返回相关网页的标题、链接与摘要。
 
         Args:
             query: 搜索关键词，简洁明确。
         """
+        if hint := context.state.pop(SEARCH_HINT, None):
+            await context.run.emit(UserCustomEvent(display=hint))
         try:
             return ToolResult(output=await search_web(query))
         except Exception as e:
@@ -286,3 +317,23 @@ def web_tools(model: str | None = None) -> list[Any]:
         return [Native.web_search()]
     logger.debug(f"模型 {model or '默认对话模型'} 没有可用的联网搜索方式")
     return []
+
+
+class WebTools:
+    """每次运行时按当前 AI.web_search 配置提供联网工具，修改配置后立即生效"""
+
+    def __init__(self, model: str | None = None):
+        self.model = model
+
+    async def resolve(self, context: Any = None) -> ResolvedToolPayload:
+        """解析当前可用的联网工具
+
+        参数:
+            context: 运行上下文
+
+        返回:
+            ResolvedToolPayload: 工具载荷，联网关闭时为空
+        """
+        from zhenxun.services.ai.tools.engine.registry import resolve_tools
+
+        return await resolve_tools(web_tools(self.model), context)

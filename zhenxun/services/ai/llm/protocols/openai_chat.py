@@ -37,6 +37,7 @@ from zhenxun.services.ai.llm.profile import map_reasoning_effort
 from zhenxun.services.ai.utils.logger import log_llm as logger
 
 from . import (
+    ChatStream,
     HttpCall,
     dump_arguments,
     ensure_content,
@@ -48,6 +49,7 @@ from . import (
     replay_metadata,
     resolve_tool_choice,
     split_tools,
+    stream_error,
     tool_output_text,
 )
 from .schema import schema_instruction, strict_schema, tool_schema
@@ -73,6 +75,8 @@ _WEB_SEARCH_TOOLS = {
 }
 """以工具形式提供网页搜索的厂商写法；百炼改用请求体参数 enable_search"""
 
+_OPENAI_REASONING = re.compile(r"(?:.*/)?(?:o\d|gpt-5)", re.I)
+"""只接受 max_completion_tokens 的 OpenAI 推理模型"""
 _AUDIO_FORMATS = {"mpeg": "mp3", "x-wav": "wav", "wave": "wav"}
 _THINK_TAG = re.compile(r"^\s*<think>(.*?)</think>\s*", re.DOTALL)
 _MARKDOWN_IMAGE = re.compile(r"!\[[^\]]*\]\((data:image/[\w.+-]+;base64,[\w+/=\s]+)\)")
@@ -253,9 +257,10 @@ def apply_sampling(body: dict[str, Any], config: GenerationConfig, route) -> Non
     if max_tokens and route.profile.max_output_tokens:
         max_tokens = min(max_tokens, route.profile.max_output_tokens)
     if max_tokens:
+        openai = "openai" in (route.provider.preset, detect_preset(route.base_url))
         key = (
             "max_completion_tokens"
-            if route.provider.preset == "openai"
+            if openai or _OPENAI_REASONING.match(route.model.name)
             else "max_tokens"
         )
         body[key] = max_tokens
@@ -500,4 +505,108 @@ def _grounding(payload: dict[str, Any]) -> LLMGroundingMetadata | None:
     return LLMGroundingMetadata(grounding_attributions=list(sources.values()))
 
 
+class OpenAIChatStream(ChatStream):
+    """Chat Completions 流式累加器"""
+
+    def __init__(self):
+        self.payload: dict[str, Any] = {}
+        self.message: dict[str, Any] = {"role": "assistant"}
+        self.calls: dict[int, dict[str, Any]] = {}
+        self.details: dict[int, dict[str, Any]] = {}
+        self.finish_reason: str | None = None
+
+    @classmethod
+    def prepare(cls, call: HttpCall) -> None:
+        if call.json is not None:
+            call.json["stream"] = True
+            call.json["stream_options"] = {"include_usage": True}
+        call.stream = cls
+
+    def _append(self, key: str, value: Any) -> bool:
+        if not isinstance(value, str) or not value:
+            return False
+        self.message[key] = self.message.get(key, "") + value
+        return True
+
+    def _merge_detail(self, item: dict[str, Any]) -> str:
+        merged = self.details.setdefault(item.get("index", len(self.details)), {})
+        for key, value in item.items():
+            if key in ("text", "summary", "signature", "data") and isinstance(
+                value, str
+            ):
+                merged[key] = merged.get(key, "") + value
+            else:
+                merged[key] = value
+        return str(item.get("text") or item.get("summary") or "")
+
+    def _merge_call(self, call: dict[str, Any]) -> None:
+        merged = self.calls.setdefault(
+            call.get("index", len(self.calls)),
+            {"type": "function", "function": {"name": "", "arguments": ""}},
+        )
+        for key in ("id", "type"):
+            if call.get(key):
+                merged[key] = call[key]
+        function = call.get("function") or {}
+        merged["function"]["name"] = merged["function"]["name"] or (
+            function.get("name") or ""
+        )
+        arguments = function.get("arguments")
+        if isinstance(arguments, dict):
+            arguments = dump_arguments(arguments)
+        merged["function"]["arguments"] += arguments or ""
+        if extra := call.get("extra_content"):
+            merged["extra_content"] = deep_merge(
+                merged.get("extra_content") or {}, extra
+            )
+
+    def feed(self, event: str, data: dict[str, Any]) -> list[tuple[str, str]]:
+        if message := stream_error(data):
+            raise UpstreamServerException(
+                f"服务端返回错误: {message}", details={"response": str(data)[:500]}
+            )
+        for key in ("id", "model", "created", "usage", "web_search", "base_resp"):
+            if data.get(key):
+                self.payload[key] = data[key]
+        deltas: list[tuple[str, str]] = []
+        for choice in data.get("choices") or []:
+            if choice.get("index", 0) != 0:
+                continue
+            self.finish_reason = choice.get("finish_reason") or self.finish_reason
+            delta = choice.get("delta") or {}
+            if self._append("content", delta.get("content")):
+                deltas.append(("text", delta["content"]))
+            reasoning = False
+            for key in ("reasoning_content", "reasoning"):
+                if self._append(key, delta.get(key)):
+                    deltas.append(("thought", delta[key]))
+                    reasoning = True
+            for item in delta.get("reasoning_details") or []:
+                if isinstance(item, dict):
+                    text = self._merge_detail(item)
+                    if text and not reasoning:
+                        deltas.append(("thought", text))
+            self._append("refusal", delta.get("refusal"))
+            for key in ("images", "annotations"):
+                if items := delta.get(key):
+                    self.message.setdefault(key, []).extend(items)
+            for call in delta.get("tool_calls") or []:
+                if isinstance(call, dict):
+                    self._merge_call(call)
+        return deltas
+
+    def result(self) -> dict[str, Any]:
+        message = dict(self.message)
+        if self.calls:
+            message["tool_calls"] = [self.calls[i] for i in sorted(self.calls)]
+        if self.details:
+            message["reasoning_details"] = [
+                self.details[i] for i in sorted(self.details)
+            ]
+        received = len(message) > 1 or self.finish_reason
+        choice = {"index": 0, "message": message, "finish_reason": self.finish_reason}
+        return {**self.payload, "choices": [choice] if received else []}
+
+
+STREAM = OpenAIChatStream
 TASKS = {"chat": (build_chat, parse_chat), **openai_tasks()}

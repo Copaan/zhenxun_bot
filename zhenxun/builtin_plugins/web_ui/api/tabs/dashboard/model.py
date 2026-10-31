@@ -81,6 +81,15 @@ class RuntimeWebSocketStatus(BaseModel):
     connection_limit: int
 
 
+class RuntimeGettingStarted(BaseModel):
+    ai_ready: bool
+    """已设置可用的默认对话模型"""
+    superusers: bool
+    """已设置超级用户"""
+    self_nickname: str
+    """Bot 自称"""
+
+
 class RuntimeOverview(BaseModel):
     generated_at: datetime
     overall_status: RuntimeLevel
@@ -91,3 +100,4 @@ class RuntimeOverview(BaseModel):
     protocols: RuntimeProtocolStatus
     bots: list[RuntimeBotStatus]
     issues: list[RuntimeIssue]
+    getting_started: RuntimeGettingStarted

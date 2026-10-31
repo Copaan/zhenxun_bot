@@ -1,6 +1,10 @@
+from typing import Any
+
 from nonebot import on_message
+from nonebot.adapters import Bot, Event
 from nonebot.plugin import PluginMetadata
-from nonebot_plugin_alconna import UniMsg
+from nonebot_plugin_alconna import UniMsg, get_message_id
+from nonebot_plugin_apscheduler import scheduler
 from nonebot_plugin_uninfo import Uninfo
 
 from zhenxun.configs.config import Config
@@ -14,12 +18,13 @@ from zhenxun.services.low_priority_writer import (
     register_low_priority_writer,
 )
 from zhenxun.utils.enum import PluginType
+from zhenxun.utils.message import MessageUtils
 from zhenxun.utils.platform import PlatformUtils
 from zhenxun.utils.utils import get_entity_ids
 
 __plugin_meta__ = PluginMetadata(
     name="消息存储",
-    description="消息存储，被动存储群消息",
+    description="消息存储，被动存储群消息与 Bot 发出的群消息",
     usage="",
     extra=PluginExtraData(
         author="HibiKier",
@@ -33,7 +38,23 @@ __plugin_meta__ = PluginMetadata(
                 help="是否开启消息自从存储",
                 default_value=True,
                 type=bool,
-            )
+            ),
+            RegisterConfig(
+                module="chat_history",
+                key="SEGMENT_DAYS",
+                value=30,
+                help="结构化消息段保留天数，过期后只保留文本，0 为不清理",
+                default_value=30,
+                type=int,
+            ),
+            RegisterConfig(
+                module="chat_history",
+                key="RETENTION_DAYS",
+                value=0,
+                help="聊天记录保留天数，0 为不清理（发言排行依赖全部记录）",
+                default_value=0,
+                type=int,
+            ),
         ],
     ).to_dict(),
 )
@@ -49,7 +70,15 @@ _WRITER_NAME = "chat_history"
 _FLUSH_BATCH_SIZE = 200
 _FLUSH_MAX_PER_TICK = 1000
 _FLUSH_DB_TIMEOUT = 5.0
-_STRING_FIELDS = ("user_id", "group_id", "text", "plain_text", "bot_id", "platform")
+_STRING_FIELDS = (
+    "user_id",
+    "group_id",
+    "text",
+    "plain_text",
+    "bot_id",
+    "platform",
+    "message_id",
+)
 
 
 def _strip_nul(value: str) -> str:
@@ -97,24 +126,83 @@ register_low_priority_writer(
 )
 
 
+async def _append(record: ChatHistory) -> None:
+    sanitized = _sanitize_chat_history(record)
+    if sanitized:
+        logger.warning(
+            f"聊天历史入队前清理了 {sanitized} 个含 NUL 的字符串字段",
+            "chat_history",
+        )
+    await append_low_priority_record(_WRITER_NAME, record)
+
+
 @chat_history.handle()
-async def _(message: UniMsg, session: Uninfo):
+async def _(bot: Bot, event: Event, message: UniMsg, session: Uninfo):
     entity = get_entity_ids(session)
     try:
-        record = ChatHistory(
-            user_id=entity.user_id,
-            group_id=entity.group_id,
-            text=str(message),
-            plain_text=message.extract_plain_text(),
-            bot_id=PlatformUtils.get_storage_bot_id(session),
-            platform=session.platform,
-        )
-        sanitized = _sanitize_chat_history(record)
-        if sanitized:
-            logger.warning(
-                f"聊天历史入队前清理了 {sanitized} 个含 NUL 的字符串字段",
-                "chat_history",
+        try:
+            message_id = get_message_id(event, bot)
+        except Exception:
+            message_id = None
+        await _append(
+            ChatHistory(
+                user_id=entity.user_id,
+                group_id=entity.group_id,
+                text=str(message),
+                plain_text=message.extract_plain_text(),
+                bot_id=PlatformUtils.get_storage_bot_id(session),
+                platform=session.platform,
+                message_id=message_id,
+                segments=ChatHistory.dump_segments(message),
             )
-        await append_low_priority_record(_WRITER_NAME, record)
+        )
     except Exception as e:
         logger.warning("存储聊天记录失败", "chat_history", e=e)
+
+
+@Bot.on_called_api
+async def _record_bot_send(
+    bot: Bot, exception: Exception | None, api: str, data: dict[str, Any], result: Any
+):
+    if (
+        exception is not None
+        or api not in ("send_msg", "send_group_msg")
+        or not data.get("group_id")
+        or not Config.get_config("chat_history", "FLAG")
+    ):
+        return
+    try:
+        message = MessageUtils.from_onebot(data.get("message"))
+        message_id = result.get("message_id") if isinstance(result, dict) else None
+        await _append(
+            ChatHistory(
+                user_id=str(bot.self_id),
+                group_id=str(data["group_id"]),
+                text=str(message),
+                plain_text=message.extract_plain_text(),
+                bot_id=PlatformUtils.get_storage_bot_id(bot),
+                platform=PlatformUtils.get_platform(bot),
+                message_id=str(message_id) if message_id is not None else None,
+                segments=ChatHistory.dump_segments(message),
+                is_bot=True,
+            )
+        )
+    except Exception as e:
+        logger.warning("存储 Bot 发言失败", "chat_history", e=e)
+
+
+@scheduler.scheduled_job("cron", hour=4, minute=45)
+async def _cleanup_chat_history():
+    try:
+        cleared, deleted = await ChatHistory.cleanup(
+            int(Config.get_config("chat_history", "SEGMENT_DAYS") or 0),
+            int(Config.get_config("chat_history", "RETENTION_DAYS") or 0),
+        )
+    except Exception as e:
+        logger.error("清理聊天记录失败", "chat_history", e=e)
+        return
+    if cleared or deleted:
+        logger.info(
+            f"已清空 {cleared} 条过期的结构化消息段，删除 {deleted} 条过期聊天记录",
+            "chat_history",
+        )

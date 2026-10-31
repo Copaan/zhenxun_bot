@@ -58,22 +58,6 @@ class SchemaValidationError(ModelRetry):
         return "schema_validation_error"
 
 
-class GuardrailViolationError(ModelRetry):
-    """护栏违规异常。当大模型返回的数据格式正确，但违反业务规则时抛出。"""
-
-    def __init__(self, message: str, payload: dict[str, Any] | None = None):
-        """
-        初始化安全护栏校验未通过的异常。
-
-        参数：
-            message: 触发业务护栏违规拦截的详细原因说明。
-        """
-        super().__init__(message, payload)
-
-    def get_template_name(self) -> str:
-        return "guardrail_violation"
-
-
 class ControlFlowExit(BaseException):
     """控制流退出基类，继承自BaseException以避免被常规Exception捕获，用于静默中断。"""
 
@@ -100,24 +84,6 @@ class ToolFatalError(ControlFlowExit):
         super().__init__(self.message)
 
 
-class GuardrailFatalException(ControlFlowExit):
-    """护栏致命拦截异常 (触发 ABORT/REJECT 时抛出)"""
-
-    def __init__(self, guard_name: str, reason: str, display: str | None = None):
-        """
-        初始化护栏强制拦截中断异常。
-
-        参数：
-            guard_name: 拦截本次执行的安全护栏规则名称。
-            reason: 拦截或拒绝的底层业务决策详情。
-            display: 直接反馈给用户的风控友好提示消息。
-        """
-        self.guard_name = guard_name
-        self.reason = reason
-        self.display = display or f"🛡️ 安全拦截: {reason}"
-        super().__init__(f"Guardrail '{guard_name}' aborted execution: {reason}")
-
-
 class ToolRetryError(Exception):
     """
     可恢复工具异常。
@@ -134,24 +100,6 @@ class ToolRetryError(Exception):
         """
         self.message = message
         super().__init__(self.message)
-
-
-class ToolFinishException(ToolFatalError):
-    """
-    工具执行中止异常。
-    当工具开发者希望立刻停止大模型的思考循环，并直接将错误/提示信息返回给用户时抛出。
-    此异常不会被大模型进行"影子自愈(Reflexion)"，而是直接熔断 Agent 执行流。
-    """
-
-    def __init__(self, message: str, display_content: str | None = None):
-        """
-        初始化用于中断大模型思考循环并返回结果的结束异常。
-
-        参数：
-            message: 内部记录的中断异常信息.
-            display_content: 中断执行流后，向用户展现的最终文本。
-        """
-        super().__init__(message, display_content)
 
 
 class AbortException(ControlFlowExit):
@@ -173,7 +121,7 @@ class AbortException(ControlFlowExit):
 class InterventionHandledException(ControlFlowExit):
     """
     干预成功处理异常。
-    当用户的消息被成功作为 STEER 或 FOLLOW_UP 注入到后台运行中的 Agent 队列时抛出，
+    当用户的消息被追加到同一会话正在运行的 Agent 任务时抛出，
     用于中断当前的新请求生命周期，避免重复启动。
     """
 
@@ -188,135 +136,6 @@ class InterventionHandledException(ControlFlowExit):
         self.message = message
         self.display_content = display_content
         super().__init__(self.message)
-
-
-class ConcurrencyRejectException(ControlFlowExit):
-    """并发拒绝异常。当 Agent 设置为 REJECT 且正在忙碌时抛出。"""
-
-    def __init__(self, message: str, display: Any = None):
-        """
-        初始化并发调度拒绝接收新任务的异常。
-
-        参数：
-            message: 系统内部拦截的并发冲突详细说明。
-            display: 提示给并发用户的友好限流排队通知。
-        """
-        self.message = message
-        self.display = display or "⏳ 智能体正在处理您的上一个请求，请稍后再试~"
-        super().__init__(message)
-
-
-class ConcurrencyInterruptException(ControlFlowExit):
-    """并发打断异常。当 Agent 设置为 INTERRUPT 且被新请求打断时抛出。"""
-
-    def __init__(self, message: str):
-        """
-        初始化并发抢占执行被打断的异常。
-
-        参数：
-            message: 系统内部调度器生成的抢占与接管日志描述。
-        """
-        self.message = message
-        super().__init__(message)
-
-
-class NeedsInputException(Exception):
-    """
-    当工具配置了 interactive=True 且缺少必要参数（或参数验证失败）时抛出此异常，
-    用于交由外部中间件捕获并进行 HITL (Human-in-the-loop) 参数补充。
-    """
-
-    def __init__(
-        self, missing_field: str, missing_description: str, original_kwargs: dict
-    ):
-        """
-        初始化 HITL 人机交互表单输入暂停请求的异常。
-
-        参数：
-            missing_field: 缺失的必填参数字段名。
-            missing_description: 字段的提示描述（通常由 Field 描述提取）。
-            original_kwargs: 抛出异常前工具已成功收集的其它参数字典。
-        """
-        self.missing_field = missing_field
-        self.missing_description = missing_description
-        self.original_kwargs = original_kwargs
-        super().__init__(
-            f"Need input for parameter: {missing_field} - {missing_description}"
-        )
-
-
-class NeedsAuthException(Exception):
-    """
-    当工具在执行过程中发现授权失效或凭证过期时主动抛出。
-    用于交由外部中间件捕获并重新发起授权 (HITL) 流程。
-    """
-
-    def __init__(self, provider: str, message: str):
-        """
-        初始化因凭证失效需重新发起用户鉴权挂起的异常。
-
-        参数：
-            provider: 需要发起授权验证的外部 OAuth/API 服务商标识。
-            message: 授权校验失败的诊断描述。
-        """
-        self.provider = provider
-        self.message = message
-        super().__init__(f"Needs auth for: {provider} - {message}")
-
-
-class SandboxPathEscapeError(Exception):
-    """当沙箱内的路径解析结果试图逃逸出允许的工作区根目录时抛出"""
-
-    def __init__(self, path: str, resolved_path: str | None = None, reason: str = ""):
-        """
-        初始化路径安全越界逃逸拦截异常。
-
-        参数：
-            path: 引起逃逸嫌疑的原始路径参数。
-            resolved_path: 物理求值后的解析路径（如果有）。
-            reason: 触发路径校验失败的底层判决依据。
-        """
-        self.path = path
-        self.resolved_path = resolved_path
-        self.reason = reason
-        msg = f"沙箱路径逃逸拦截: {path}"
-        if resolved_path:
-            msg += f" (解析至 {resolved_path})"
-        if reason:
-            msg += f" - {reason}"
-        super().__init__(msg)
-
-
-class WorkspaceIOError(Exception):
-    """沙箱文件系统读写操作失败"""
-
-    def __init__(self, path: str, message: str, cause: Exception | None = None):
-        """
-        初始化沙箱文件系统底层读写操作失败的 IO 异常。
-
-        参数：
-            path: 读写发生故障的物理或沙箱逻辑路径。
-            message: 底层 IO 操作报错原因详细说明。
-            cause: 触发该 IO 错误的根源 Python 底层 Exception 实例。
-        """
-        self.path = path
-        self.cause = cause
-        super().__init__(f"沙箱 IO 异常 [{path}]: {message}")
-
-
-class SandboxFatalError(ToolFatalError):
-    """沙箱底层容器发生致命崩溃（如 OOM, 被宿主机强杀等）"""
-
-    def __init__(self, message: str, display_content: str | None = None):
-        """
-        初始化沙箱执行容器严重失联或崩溃的致命异常。
-
-        参数：
-            message: 容器底层抛出的系统异常详情或心跳超时诊断。
-            display_content: 向终端用户反馈的系统故障提醒。
-        """
-        display = display_content or f"❌ 沙箱不可用: {message}"
-        super().__init__(message, display_content=display)
 
 
 class LLMException(Exception):

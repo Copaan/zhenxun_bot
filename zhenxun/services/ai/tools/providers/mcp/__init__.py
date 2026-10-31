@@ -1,3 +1,5 @@
-from .provider import GlobalMCPProvider, MCPSource, mcp_provider
+"""MCP 工具"""
 
-__all__ = ["GlobalMCPProvider", "MCPSource", "mcp_provider"]
+from zhenxun.services.ai import forward
+
+__getattr__ = forward({"MCPSource": "zhenxun.services.ai.tools.providers.mcp.provider"})

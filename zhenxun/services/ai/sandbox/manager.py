@@ -1,203 +1,430 @@
 import asyncio
-from typing import Any, cast
+import hashlib
+import time
+from typing import Any, ClassVar
 
 from zhenxun.services.ai.config import get_llm_config
+from zhenxun.services.ai.config.models import SandboxSettings
 from zhenxun.services.ai.utils.logger import log_sandbox as logger
 from zhenxun.utils.lifespan import LifespanManager
 
-from .drivers.base import BaseSandboxClient, BaseSandboxSession
-from .models import SandboxBlueprint
-from .registry import SandboxRegistry
+from .docker import DockerSandbox
 
-_startup_tasks = set()
+LABEL = "zhenxun_component"
+"""标记沙箱容器的标签名"""
+TEST_CODE = (
+    "import platform, sys; " "print('ok', sys.version.split()[0], platform.machine())"
+)
+"""测试运行使用的代码"""
+
+
+class SandboxError(Exception):
+    """沙箱不可用或操作失败"""
+
+
+def _docker_error(e: Exception) -> str:
+    """提取 Docker 异常中的可读信息"""
+    message = getattr(e, "message", None) or str(e) or type(e).__name__
+    return str(message).strip()[:300]
 
 
 class SandboxManager:
-    """
-    沙箱底层环境的全局调度中心。
-    负责读取用户配置，并动态分发给对应的安全 Driver 执行。
-    """
+    """Agent 代码沙箱管理：Docker 检测、镜像安装、会话容器与闲置清理"""
 
-    def __init__(self):
-        """初始化沙箱环境管理器，配置活跃会话、会话锁及生存期管理器"""
-        self._active_sessions: dict[str, BaseSandboxSession] = {}
-        self._session_locks: dict[str, asyncio.Lock] = {}
-        self.lifespan_manager = LifespanManager()
+    _client: ClassVar[Any] = None
+    _sessions: ClassVar[dict[str, DockerSandbox]] = {}
+    _locks: ClassVar[dict[str, asyncio.Lock]] = {}
+    _lifespan: ClassVar[LifespanManager | None] = None
+    _ready: ClassVar[tuple[float, str, bool, str]] = (0.0, "", False, "")
+    _pull: ClassVar[dict[str, Any]] = {"status": "idle"}
+    _pull_task: ClassVar[asyncio.Task | None] = None
 
-    def _get_lock(self, session_id: str) -> asyncio.Lock:
-        """获取或创建指定会话的 asyncio 互斥锁，确保并发操作的安全性"""
-        if session_id not in self._session_locks:
-            self._session_locks[session_id] = asyncio.Lock()
-        return self._session_locks[session_id]
+    @classmethod
+    def settings(cls) -> SandboxSettings:
+        """当前沙箱配置
 
-    def _get_client(
-        self,
-        blueprint: SandboxBlueprint,
-    ) -> BaseSandboxClient:
-        """根据全局配置和蓝图参数决定并获取具体的沙箱驱动客户端实例"""
-        global_type = get_llm_config().sandbox.sandbox_type
+        返回:
+            SandboxSettings: 沙箱配置
+        """
+        return get_llm_config().sandbox
 
-        effective_type = (
-            blueprint.sandbox_type
-            if blueprint.sandbox_type and blueprint.sandbox_type != "auto"
-            else global_type
-        )
+    @classmethod
+    async def client(cls) -> Any:
+        """获取可用的 Docker 客户端
 
-        clients = SandboxRegistry.get_all_clients()
-
-        if effective_type not in clients:
-            raise RuntimeError(f"未找到指定的沙箱客户端: {effective_type}")
-
-        return cast(BaseSandboxClient, clients[effective_type]())
-
-    async def get_or_create_session(
-        self,
-        session_id: str,
-        blueprint: SandboxBlueprint | None = None,
-    ) -> BaseSandboxSession:
-        """根据 Session ID 获取或创建持久化沙箱环境"""
-
-        if not get_llm_config().sandbox.enable_sandbox:
-            from zhenxun.services.ai.core.exceptions import SandboxFatalError
-
-            raise SandboxFatalError(
-                "全局沙箱功能已关闭(enable_sandbox=False)，无法创建运行环境。"
-            )
-
-        async with self._get_lock(session_id):
-            if not blueprint:
-                blueprint = SandboxBlueprint()
-
-            if blueprint.setup_steps:
-                blueprint.enable_network = True
-
-            cleanup_timeout = get_llm_config().sandbox.cleanup_timeout
-            await self.lifespan_manager.register(
-                session_id,
-                ttl=float(cleanup_timeout),
-                cleanup_callback=self.close_session,
-            )
-
-            if session_id in self._active_sessions:
-                session = self._active_sessions[session_id]
-                is_alive = await session.is_alive()
-                if not is_alive:
-                    logger.warning(f"⚠️ Session '{session_id}' 容器已死亡，重建中。")
-                    await self.release_resource(session_id)
-                else:
-                    session.touch()
-                    if blueprint.setup_steps:
-                        await session.install_dependencies(blueprint)
-                    await session.apply_blueprint(blueprint)
-                    for p in blueprint.required_extensions:
-                        await session.mount_extension(p)
-                    return session
-
-            logger.info(f"为 Session '{session_id}' 创建沙箱环境...")
-            client = self._get_client(blueprint)
+        返回:
+            Any: aiodocker.Docker
+        """
+        if cls._client is not None:
             try:
-                session = await client.create(session_id, blueprint)
+                await asyncio.wait_for(cls._client.version(), timeout=5)
+                return cls._client
+            except Exception:
+                await cls._close_client()
+        import aiodocker
 
-                await session.apply_blueprint(blueprint)
+        try:
+            client = aiodocker.Docker()
+        except Exception as e:
+            raise SandboxError(f"未找到 Docker：{_docker_error(e)}") from e
+        try:
+            await asyncio.wait_for(client.version(), timeout=5)
+        except Exception as e:
+            await client.close()
+            raise SandboxError(f"无法连接 Docker：{_docker_error(e)}") from e
+        cls._client = client
+        for sandbox in cls._sessions.values():
+            sandbox.container = client.containers.container(sandbox.container.id)
+        return client
 
-                if blueprint.setup_steps:
-                    await session.install_dependencies(blueprint)
-
-                for p in blueprint.required_extensions:
-                    await session.mount_extension(p)
-
-                self._active_sessions[session_id] = session
-                return session
-            except Exception as e:
-                import traceback
-
-                from zhenxun.services.ai.core.exceptions import SandboxFatalError
-
-                err_msg = str(e) or type(e).__name__
-                logger.error(f"创建 Session 失败: {err_msg}\n{traceback.format_exc()}")
-                if not isinstance(e, SandboxFatalError):
-                    raise SandboxFatalError(f"沙箱初始化异常: {err_msg}") from e
-                raise e
-
-    async def setup_workspace_environment(
-        self, session_id: str, workspace_dir: str
-    ) -> bool:
-        """统一扫描指定工作区，通过 Provisioner 体系完成环境装配"""
-        if session_id not in self._active_sessions:
-            logger.warning(f"找不到活跃的 Session '{session_id}'，无法配置环境。")
-            return False
-
-        session = self._active_sessions[session_id]
-
-        from .environments import ProvisionerRegistry
-
-        for prov in ProvisionerRegistry.get_all().values():
-            await prov.scan_and_setup_workspace(cast(Any, session), workspace_dir)
-        return True
-
-    async def release_resource(self, resource_id: str):
-        """释放指定会话的沙箱资源并销毁底层物理容器"""
-        if resource_id in self._active_sessions:
-            session = self._active_sessions.pop(resource_id)
+    @classmethod
+    async def _close_client(cls):
+        """关闭 Docker 客户端"""
+        client, cls._client = cls._client, None
+        if client is not None:
             try:
-                client_cls = SandboxRegistry.get_client_cls(session.state.sandbox_type)
-                client = client_cls()
-                await client.delete(cast(Any, session))
-            except Exception as e:
-                logger.error(f"销毁沙箱环境失败 (Session: {resource_id}): {e}")
-
-    async def close_session(self, session_id: str) -> None:
-        """从生存期管理器中注销并销毁指定会话的沙箱环境"""
-        await self.lifespan_manager.unregister(session_id)
-        await self.release_resource(session_id)
-
-    async def shutdown_all(self) -> None:
-        """关闭所有当前活跃的沙箱环境并停止生存期监测"""
-        keys = list(self._active_sessions.keys())
-        for sid in keys:
-            await self.close_session(sid)
-        await self.lifespan_manager.stop()
-
-
-sandbox_manager = SandboxManager()
-
-
-async def _startup_sandboxes(context=None):
-    """异步初始化沙箱，触发后台自动清理孤儿容器"""
-    if not get_llm_config().sandbox.enable_sandbox:
-        return
-    clients = SandboxRegistry.get_all_clients()
-    if "docker" in clients:
-        from .drivers.docker import DockerSandboxClient
-
-        async def _delayed_silent_cleanup():
-            await asyncio.sleep(15)
-            try:
-                await DockerSandboxClient.silent_prune_orphans()
+                await client.close()
             except Exception:
                 pass
 
-        coroutine = _delayed_silent_cleanup()
-        task = (
-            context.spawn_task(
-                coroutine,
-                name="sandbox-orphan-cleanup",
-                degrade_on_error=False,
+    @classmethod
+    async def _image(cls, client: Any, image: str) -> dict[str, Any] | None:
+        """查询本地镜像
+
+        参数:
+            client: Docker 客户端
+            image: 镜像名
+
+        返回:
+            dict | None: 镜像大小与创建时间，未安装时为 None
+        """
+        try:
+            info = await client.images.inspect(image)
+        except Exception as e:
+            if getattr(e, "status", None) == 404:
+                return None
+            raise
+        return {"size": info.get("Size", 0), "created": info.get("Created", "")}
+
+    @classmethod
+    async def status(cls) -> dict[str, Any]:
+        """沙箱状态：Docker、镜像、安装进度与运行中的会话
+
+        返回:
+            dict[str, Any]: 状态信息
+        """
+        settings = cls.settings()
+        data: dict[str, Any] = {
+            "enabled": settings.enable_sandbox,
+            "docker": {"ok": False, "version": "", "error": ""},
+            "image": {"name": settings.docker_image, "installed": False},
+            "pull": dict(cls._pull),
+            "sessions": await cls.sessions(),
+        }
+        try:
+            client = await cls.client()
+            version = await client.version()
+            data["docker"].update(
+                ok=True,
+                version=version.get("Version", ""),
+                os=f"{version.get('Os', '')}/{version.get('Arch', '')}",
             )
-            if context is not None
-            else asyncio.create_task(coroutine)
+            image = await cls._image(client, settings.docker_image)
+            if image:
+                data["image"].update(installed=True, **image)
+        except Exception as e:
+            data["docker"]["error"] = _docker_error(e)
+        ready, reason = cls._judge(data)
+        cls._ready = (time.time(), settings.docker_image, ready, reason)
+        data.update(ready=ready, reason=reason)
+        return data
+
+    @classmethod
+    def _judge(cls, data: dict[str, Any]) -> tuple[bool, str]:
+        """根据状态判断沙箱能否使用"""
+        if not data["enabled"]:
+            return False, "沙箱未启用"
+        if not data["docker"]["ok"]:
+            return False, "Docker 不可用"
+        if not data["image"]["installed"]:
+            return False, f"镜像 {data['image']['name']} 未安装"
+        return True, ""
+
+    @classmethod
+    async def ready(cls) -> tuple[bool, str]:
+        """沙箱能否使用，结果缓存 60 秒
+
+        返回:
+            tuple[bool, str]: 是否可用，不可用的原因
+        """
+        settings = cls.settings()
+        if not settings.enable_sandbox:
+            return False, "沙箱未启用"
+        checked, image, ready, reason = cls._ready
+        if image == settings.docker_image and time.time() - checked < 60:
+            return ready, reason
+        data = await cls.status()
+        return data["ready"], data["reason"]
+
+    @classmethod
+    def pull(cls) -> bool:
+        """在后台拉取配置的镜像
+
+        返回:
+            bool: 是否开始拉取，已在拉取时为 False
+        """
+        if cls._pull_task and not cls._pull_task.done():
+            return False
+        image = cls.settings().docker_image
+        cls._pull = {"status": "running", "image": image, "message": "准备拉取"}
+        cls._pull_task = asyncio.create_task(cls._run_pull(image))
+        return True
+
+    @classmethod
+    async def _run_pull(cls, image: str):
+        """拉取镜像并记录进度
+
+        参数:
+            image: 镜像名
+        """
+        layers: dict[str, tuple[int, int]] = {}
+        started = time.time()
+        try:
+            client = await cls.client()
+            async for item in client.images.pull(image, stream=True):
+                if item.get("error"):
+                    raise SandboxError(item["error"])
+                detail = item.get("progressDetail") or {}
+                if item.get("id") and detail.get("total"):
+                    layers[item["id"]] = (detail.get("current", 0), detail["total"])
+                elif item.get("id") and item.get("status") in {
+                    "Pull complete",
+                    "Already exists",
+                }:
+                    total = layers.get(item["id"], (0, 0))[1]
+                    layers[item["id"]] = (total, total)
+                current = sum(c for c, _ in layers.values())
+                total = sum(t for _, t in layers.values())
+                cls._pull.update(
+                    message=item.get("status", ""),
+                    current=current,
+                    total=total,
+                    layers=len(layers),
+                )
+            cls._pull.update(status="done", message="安装完成")
+            logger.info(f"沙箱镜像 {image} 拉取完成，用时 {time.time() - started:.0f}s")
+        except Exception as e:
+            cls._pull.update(status="error", message=_docker_error(e))
+            logger.warning(f"沙箱镜像 {image} 拉取失败: {_docker_error(e)}")
+        finally:
+            cls._pull["duration"] = round(time.time() - started, 1)
+            cls._ready = (0.0, "", False, "")
+
+    @classmethod
+    def _container_config(cls, settings: SandboxSettings, key: str) -> dict[str, Any]:
+        """生成沙箱容器配置：资源上限、网络开关，不带宿主环境变量与挂载
+
+        参数:
+            settings: 沙箱配置
+            key: 会话标识
+
+        返回:
+            dict[str, Any]: 容器创建参数
+        """
+        memory = settings.memory_mb * 1024 * 1024
+        return {
+            "Image": settings.docker_image,
+            "Cmd": ["sleep", "2147483647"],
+            "WorkingDir": "/workspace",
+            "Env": ["HOME=/workspace", "LANG=C.UTF-8", "PYTHONUNBUFFERED=1"],
+            "Labels": {LABEL: "sandbox", "zhenxun_session": key[:200]},
+            "HostConfig": {
+                "NanoCpus": int(settings.cpus * 1e9),
+                "Memory": memory,
+                "MemorySwap": memory,
+                "PidsLimit": 256,
+                "NetworkMode": "bridge" if settings.network else "none",
+                "SecurityOpt": ["no-new-privileges"],
+                "CapDrop": ["NET_RAW", "MKNOD"],
+                "Init": True,
+            },
+        }
+
+    @classmethod
+    async def _create(cls, key: str) -> DockerSandbox:
+        """为会话创建并启动容器
+
+        参数:
+            key: 会话标识
+
+        返回:
+            DockerSandbox: 沙箱
+        """
+        settings = cls.settings()
+        client = await cls.client()
+        if not await cls._image(client, settings.docker_image):
+            raise SandboxError(f"镜像 {settings.docker_image} 未安装")
+        digest = hashlib.sha1(key.encode()).hexdigest()[:12]
+        name = f"zx-sandbox-{digest}-{int(time.time())}"
+        try:
+            container = await client.containers.run(
+                config=cls._container_config(settings, key), name=name
+            )
+        except Exception as e:
+            raise SandboxError(f"创建沙箱容器失败：{_docker_error(e)}") from e
+        logger.info(f"已为会话 {key} 创建沙箱容器 {name}")
+        return DockerSandbox(key, container, settings.docker_image)
+
+    @classmethod
+    async def get(cls, key: str) -> DockerSandbox:
+        """获取会话的沙箱，不存在或已停止时新建
+
+        参数:
+            key: 会话标识（会话 id 已包含 Bot、群和用户）
+
+        返回:
+            DockerSandbox: 沙箱
+        """
+        ready, reason = await cls.ready()
+        if not ready:
+            raise SandboxError(reason)
+        lock = cls._locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            sandbox = cls._sessions.get(key)
+            if sandbox and not await sandbox.alive():
+                await cls.close(key)
+                sandbox = None
+            if sandbox is None:
+                sandbox = await cls._create(key)
+                cls._sessions[key] = sandbox
+            sandbox.last_active = time.time()
+            await cls._keep(key)
+            return sandbox
+
+    @classmethod
+    def find(cls, key: str) -> DockerSandbox | None:
+        """已存在的会话沙箱，不会新建
+
+        参数:
+            key: 会话标识
+
+        返回:
+            DockerSandbox | None: 沙箱
+        """
+        return cls._sessions.get(key)
+
+    @classmethod
+    async def _keep(cls, key: str):
+        """登记或刷新会话的闲置清理时间，到期时仍在使用则续期"""
+        ttl = float(cls.settings().cleanup_timeout)
+        if cls._lifespan is None:
+            cls._lifespan = LifespanManager()
+
+        def busy() -> bool:
+            sandbox = cls._sessions.get(key)
+            return sandbox is not None and sandbox.busy(ttl)
+
+        await cls._lifespan.register(
+            key, ttl=ttl, cleanup_callback=cls.close, is_busy_callback=busy
         )
-        _startup_tasks.add(task)
-        task.add_done_callback(_startup_tasks.discard)
 
+    @classmethod
+    async def sessions(cls) -> list[dict[str, Any]]:
+        """运行中的会话沙箱
 
-async def _shutdown_sandboxes():
-    """在系统关闭时优雅关闭所有沙箱并清理 Docker 环境"""
-    if not get_llm_config().sandbox.enable_sandbox:
-        return
-    await sandbox_manager.shutdown_all()
-    clients = SandboxRegistry.get_all_clients()
-    if "docker" in clients and getattr(clients["docker"], "_engine_available", False):
-        from .drivers.docker import DockerSandboxClient
+        返回:
+            list[dict[str, Any]]: 会话、镜像、创建与最近使用时间
+        """
+        return [
+            {
+                "key": key,
+                "image": sandbox.image,
+                "created_at": int(sandbox.created_at),
+                "last_active": int(sandbox.last_active),
+                "terminal": bool(sandbox.terminal and sandbox.terminal.running),
+            }
+            for key, sandbox in cls._sessions.items()
+        ]
 
-        await DockerSandboxClient.close_env()
+    @classmethod
+    async def close(cls, key: str) -> bool:
+        """删除会话的沙箱容器
+
+        参数:
+            key: 会话标识
+
+        返回:
+            bool: 是否存在并已删除
+        """
+        sandbox = cls._sessions.pop(key, None)
+        if (lock := cls._locks.get(key)) and not lock.locked():
+            del cls._locks[key]
+        if cls._lifespan is not None:
+            await cls._lifespan.unregister(key)
+        if sandbox is None:
+            return False
+        await sandbox.close()
+        logger.info(f"已删除会话 {key} 的沙箱容器")
+        return True
+
+    @classmethod
+    async def close_all(cls) -> int:
+        """删除全部会话沙箱
+
+        返回:
+            int: 删除的数量
+        """
+        keys = list(cls._sessions)
+        for key in keys:
+            await cls.close(key)
+        return len(keys)
+
+    @classmethod
+    async def test(cls) -> dict[str, Any]:
+        """用临时容器按当前配置运行一段 Python 代码
+
+        返回:
+            dict[str, Any]: 是否成功、输出与耗时
+        """
+        started = time.time()
+        sandbox = None
+        try:
+            sandbox = await cls._create("test")
+            result = await sandbox.run_code("python", TEST_CODE, 30)
+            ok = result.exit_code == 0 and result.stdout.startswith("ok")
+            output = result.text()
+        except Exception as e:
+            ok, output = False, _docker_error(e)
+        finally:
+            if sandbox:
+                await sandbox.close()
+        return {"ok": ok, "output": output, "duration": round(time.time() - started, 2)}
+
+    @classmethod
+    async def prune(cls):
+        """删除上次运行遗留的沙箱容器"""
+        try:
+            client = await cls.client()
+            containers = await client.containers.list(
+                all=True, filters={"label": [f"{LABEL}=sandbox"]}
+            )
+        except Exception:
+            return
+        for container in containers:
+            try:
+                await container.delete(force=True)
+            except Exception:
+                pass
+        if containers:
+            logger.info(f"已清理 {len(containers)} 个遗留的沙箱容器")
+
+    @classmethod
+    async def shutdown(cls):
+        """关闭时删除全部沙箱容器并断开 Docker"""
+        await cls.close_all()
+        if cls._pull_task and not cls._pull_task.done():
+            cls._pull_task.cancel()
+        if cls._lifespan is not None:
+            await cls._lifespan.stop()
+            cls._lifespan = None
+        await cls._close_client()

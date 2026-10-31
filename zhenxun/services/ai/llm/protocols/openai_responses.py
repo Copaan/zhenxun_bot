@@ -11,6 +11,7 @@ from zhenxun.services.ai.core.exceptions import (
     ConfigurationException,
     ContentFilteredException,
     ResponseParseException,
+    UpstreamServerException,
 )
 from zhenxun.services.ai.core.messages import (
     AssistantMessage,
@@ -31,8 +32,10 @@ from zhenxun.services.ai.llm.profile import map_reasoning_effort
 from zhenxun.services.ai.utils.logger import log_llm as logger
 
 from . import (
+    ChatStream,
     HttpCall,
     dump_arguments,
+    encodable_inputs,
     ensure_content,
     filter_modalities,
     media_url,
@@ -42,6 +45,7 @@ from . import (
     replay_metadata,
     resolve_tool_choice,
     split_tools,
+    stream_error,
     tool_output_text,
 )
 from .schema import schema_instruction, strict_schema, tool_schema
@@ -99,7 +103,12 @@ def _assistant_items(message: AssistantMessage) -> list[dict[str, Any]]:
 
 
 async def _build_input(request: ChatRequest, route) -> tuple[str, list[dict]]:
-    messages = filter_modalities(request.messages, route.profile, route.name)
+    messages = filter_modalities(
+        request.messages,
+        route.profile,
+        route.name,
+        encodable_inputs("openai_responses"),
+    )
     instructions: list[str] = []
     items: list[dict[str, Any]] = []
     for message in messages:
@@ -330,4 +339,44 @@ def parse_chat(route, request: ChatRequest, payload: dict[str, Any]) -> ChatResp
     )
 
 
+class ResponsesStream(ChatStream):
+    """Responses 流式累加器：完整响应在 response.completed 事件中"""
+
+    def __init__(self):
+        self.payload: dict[str, Any] = {}
+        self.items: list[dict[str, Any]] = []
+
+    @classmethod
+    def prepare(cls, call: HttpCall) -> None:
+        if call.json is not None:
+            call.json["stream"] = True
+        call.stream = cls
+
+    def feed(self, event: str, data: dict[str, Any]) -> list[tuple[str, str]]:
+        kind = data.get("type") or event
+        if kind == "response.output_text.delta":
+            return [("text", str(data.get("delta") or ""))]
+        if kind == "response.reasoning_summary_text.delta":
+            return [("thought", str(data.get("delta") or ""))]
+        if kind == "response.output_item.done" and isinstance(data.get("item"), dict):
+            self.items.append(data["item"])
+        elif kind in ("response.created", "response.completed", "response.incomplete"):
+            self.payload = data.get("response") or self.payload
+        elif kind in ("response.failed", "error"):
+            response = data.get("response") or {}
+            message = (
+                stream_error(response) or stream_error(data) or data.get("message")
+            )
+            raise UpstreamServerException(
+                f"服务端返回错误: {message}", details={"response": str(data)[:500]}
+            )
+        return []
+
+    def result(self) -> dict[str, Any]:
+        if not self.payload.get("output") and self.items:
+            return {**self.payload, "output": self.items}
+        return self.payload
+
+
+STREAM = ResponsesStream
 TASKS = {"chat": (build_chat, parse_chat), **openai_tasks()}

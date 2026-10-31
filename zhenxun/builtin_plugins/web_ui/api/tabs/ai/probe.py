@@ -73,7 +73,7 @@ class ProviderDiscoveryRequest(BaseModel):
 
 class ModelTestRequest(BaseModel):
     model: str
-    task: Literal["chat", "embedding", "rerank", "image", "tts"] = "chat"
+    task: Literal["chat", "embedding", "rerank", "image", "tts", "stt"] = "chat"
     confirmed_paid_request: bool = False
     expected_revision: str | None = Field(default=None, min_length=64, max_length=64)
     provider_name: str | None = Field(default=None, max_length=80)
@@ -426,7 +426,7 @@ async def _run_model_probe(
     latency_ms = (time.monotonic() - started) * 1000
     if health_name:
         health_manager.record_key_success(health_name, key)
-        health_manager.record_route_success(route_name, latency_ms / 1000)
+        health_manager.record_route_success(route_name)
     return route, result, latency_ms
 
 

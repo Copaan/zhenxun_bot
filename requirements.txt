@@ -41,6 +41,7 @@ rich>=13.0
 pyyaml>=6.0
 pyzipper>=0.3.6,<0.5
 requests>=2.31
+silk-python>=0.2.9,<0.3
 tomli>=2.0.1; python_version < '3.11'
 # 可选：Telegram 适配器（uv sync --extra telegram）
 # nonebot-adapter-telegram>=0.1.0b20,<0.2

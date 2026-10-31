@@ -9,6 +9,7 @@ import contextlib
 
 from nonebot_plugin_apscheduler import scheduler
 
+from zhenxun.models.scheduled_job import ScheduledJob
 from zhenxun.services.log import logger
 from zhenxun.utils.manager.priority_manager import PriorityLifecycle
 from zhenxun.utils.pydantic_compat import model_dump
@@ -64,15 +65,18 @@ async def _load_schedules_from_db(context):
     count = 0
     for schedule in schedules:
         if schedule.plugin_name in scheduler_registry.tasks:
-            APSchedulerAdapter.add_or_reschedule_job(schedule)
-            count += 1
+            if APSchedulerAdapter.add_or_reschedule_job(schedule, catch_up=True):
+                count += 1
+            elif schedule.is_one_off:
+                await ScheduledJob.filter(id=schedule.id).delete()
+                logger.info(f"一次性任务 {schedule.id} 已错过执行时间，已删除")
         else:
             logger.warning(f"跳过加载定时任务：插件 '{schedule.plugin_name}' 未注册。")
     logger.info(f"数据库定时任务加载完成，共成功加载 {count} 个任务。")
 
     logger.info("正在检查并注册声明式默认任务...")
     declared_count = 0
-    existing_declarations = {
+    existing_declarations: set[tuple[str, str, str | None]] = {
         (
             schedule.plugin_name,
             schedule.target_identifier,

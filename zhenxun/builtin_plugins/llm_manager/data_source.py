@@ -2,7 +2,6 @@ import json
 import time
 from typing import Any
 
-from zhenxun.configs.path_config import DATA_PATH
 from zhenxun.services.ai.core.exceptions import LLMException
 from zhenxun.services.ai.llm.manager import (
     find_model_config,
@@ -10,7 +9,11 @@ from zhenxun.services.ai.llm.manager import (
     list_available_models,
     parse_provider_model_string,
 )
-from zhenxun.services.ai.tools.providers.mcp.provider import mcp_provider
+from zhenxun.services.ai.tools.providers.mcp.provider import (
+    MCPServerConfig,
+    mcp_provider,
+)
+from zhenxun.utils.pydantic_compat import model_validate
 
 
 class DataSource:
@@ -101,17 +104,14 @@ class DataSource:
     async def get_mcp_list() -> list[dict[str, Any]]:
         """获取排序后的 MCP 列表"""
         await mcp_provider.initialize()
-        if not mcp_provider._config:
-            return []
-
-        mcp_servers = mcp_provider._config.mcpServers
+        mcp_servers = mcp_provider.servers()
         sorted_names = sorted(mcp_servers.keys())
 
         result = []
         for idx, name in enumerate(sorted_names):
             conf = mcp_servers[name]
             target = ""
-            if conf.transport in ("stdio", "sandbox_proxy") and conf.command:
+            if conf.transport == "stdio" and conf.command:
                 target = f"{conf.command} {' '.join(conf.args)}"
             elif conf.transport in ("sse", "streamable-http") and conf.url:
                 target = conf.url
@@ -133,10 +133,7 @@ class DataSource:
     ) -> tuple[list[str], list[str]]:
         """将输入的 ID 或名称解析为实际的 MCP 服务名称"""
         await mcp_provider.initialize()
-        if not mcp_provider._config:
-            return [], list(map(str, targets))
-
-        mcp_servers = mcp_provider._config.mcpServers
+        mcp_servers = mcp_provider.servers()
         sorted_names = sorted(mcp_servers.keys())
 
         valid_names = []
@@ -167,37 +164,17 @@ class DataSource:
     ) -> tuple[list[str], list[str]]:
         """批量切换 MCP 状态"""
         valid_names, invalid_targets = await DataSource.resolve_mcp_targets(targets)
-        if not mcp_provider._config:
-            return [], invalid_targets
-
-        mcp_servers = mcp_provider._config.mcpServers
-        success_names = []
-
-        for target_name in valid_names:
-            conf = mcp_servers[target_name]
-            if conf.enabled != is_enable:
-                conf.enabled = is_enable
-                if not is_enable:
-                    if tk := mcp_provider._toolkits.pop(target_name, None):
-                        await tk.close()
-                else:
-                    if target_name not in mcp_provider._toolkits:
-                        mcp_provider._setup_toolkit(target_name, conf)
-            success_names.append(target_name)
-
-        if success_names:
-            mcp_provider._discovered_tools = None
-            mcp_provider._save_config()
-
+        success_names = [
+            name
+            for name in valid_names
+            if await mcp_provider.set_enabled(name, is_enable)
+        ]
         return success_names, invalid_targets
 
     @staticmethod
     async def reload_mcp_config() -> None:
         """完全重新加载 MCP 配置"""
-        await mcp_provider.shutdown()
-        mcp_provider._config = None
-        mcp_provider._discovered_tools = None
-        await mcp_provider.initialize()
+        await mcp_provider.reload()
 
     @staticmethod
     async def delete_mcp_servers(names: list[str]) -> None:
@@ -208,8 +185,6 @@ class DataSource:
     @staticmethod
     async def add_mcp_servers_from_json(json_str: str) -> tuple[bool, str]:
         """将 JSON 字符串解析并合并到 mcp.json"""
-        mcp_path = DATA_PATH / "ai" / "mcp.json"
-
         try:
             json_str = json_str.strip()
             if json_str.startswith("```"):
@@ -228,25 +203,13 @@ class DataSource:
             if not isinstance(new_servers, dict) or not new_servers:
                 return False, "❌ 'mcpServers' 不能为空且必须为 JSON 对象(dict)。"
 
-            if mcp_path.exists():
-                with mcp_path.open("r", encoding="utf-8") as f:
-                    current_config = json.load(f)
-            else:
-                current_config = {"mcpServers": {}}
-
-            if "mcpServers" not in current_config:
-                current_config["mcpServers"] = {}
-
-            added_names = []
-            for name, conf in new_servers.items():
-                current_config["mcpServers"][name] = conf
-                added_names.append(name)
-
-            mcp_path.parent.mkdir(parents=True, exist_ok=True)
-            with mcp_path.open("w", encoding="utf-8") as f:
-                json.dump(current_config, f, ensure_ascii=False, indent=2)
-
-            await DataSource.reload_mcp_config()
+            configs = {
+                str(name): model_validate(MCPServerConfig, conf)
+                for name, conf in new_servers.items()
+            }
+            for name, conf in configs.items():
+                await mcp_provider.save_server(name, conf)
+            added_names = list(configs)
 
             return True, f"✅ 成功添加/更新 MCP 服务: {', '.join(added_names)}"
 

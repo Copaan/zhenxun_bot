@@ -1,135 +1,123 @@
-from collections.abc import Sequence
-from typing import cast
+import asyncio
+from collections.abc import Awaitable, Callable, Sequence
 
-from zhenxun.services.ai.core.engine.context_renderer import ContextConverter
-from zhenxun.services.ai.core.messages import AgentMessage
+from zhenxun.services.ai.core.messages import LLMMessage
 from zhenxun.services.ai.core.models import ModelProfile
-from zhenxun.services.ai.run.context import RunContext
 from zhenxun.services.ai.utils.logger import log_memory as logger
-from zhenxun.utils.pydantic_compat import model_copy
 
-from .compression import (
-    CondenserPipeline,
-)
-from .manager import memory_manager
-from .models import MemoryConfig
-from .types import SessionMetadata
+from .compression import CondenserPipeline, summary_sink
+from .models import BaseChatContext, MemoryConfig
+from .storage import DatabaseChatContext, after_latest_summary
+
+_default_backend = DatabaseChatContext()
+_summarizing: set[str] = set()
+_summary_tasks: set[asyncio.Task] = set()
+
+
+def chat_backend(config: MemoryConfig | None) -> BaseChatContext | None:
+    """按配置取短期对话记忆后端，配置中未指定时使用数据库后端
+
+    参数:
+        config: 记忆配置
+
+    返回:
+        BaseChatContext | None: 后端，未开启短期记忆时为空
+    """
+    if not config or not config.short_term.enable:
+        return None
+    return config.short_term.backend or _default_backend
 
 
 class SessionMemoryContext:
     """
     会话记忆门面。
-    封装了当前会话记忆的读写操作、上下文压缩管线以及入库清洗中间件。
+    负责读取会话历史并执行上下文压缩，以及保存新产生的对话。
     """
 
-    def __init__(
-        self,
-        session_meta: SessionMetadata,
-        memory_config: MemoryConfig | None,
-        context: RunContext,
-    ):
-        """
-        初始化会话记忆门面。
+    def __init__(self, session_id: str, memory_config: MemoryConfig):
+        """初始化会话记忆门面
 
         参数:
-            session_meta: 会话元数据，包含 Namespace 与作用域映射等上下文信息。
-            memory_config: 记忆系统的配置对象，控制长期、短期记忆的启用与逻辑。
-            context: 必填的运行时上下文环境 (RunContext)，供中间件进行依赖注入。
+            session_id: 会话 ID
+            memory_config: 记忆配置
         """
-        self.session_meta = session_meta
+        self.session_id = session_id
         self.memory_config = memory_config
-        self.context = context
+        self.backend = chat_backend(memory_config)
 
     async def read(
         self,
         model_name: str,
         profile: ModelProfile | None = None,
-        override_history: Sequence[AgentMessage] | None = None,
         base_overhead: int = 0,
-    ) -> list[AgentMessage]:
-        """
-        拉取短期对话历史，并执行 Token 压缩与管线修剪。
-        """
-        current_history: list[AgentMessage] = []
-        if override_history is not None:
-            current_history = list(override_history)
+    ) -> list[LLMMessage]:
+        """读取最新摘要之后的历史消息，并按压缩管线修剪
 
-        chat_context = memory_manager.get_chat_context(
-            self.memory_config,
-            namespace=self.session_meta.selector.namespace or "global",
+        参数:
+            model_name: 本次请求的模型名称
+            profile: 模型能力档案
+            base_overhead: 系统提示词与工具定义等固定开销的 Token 数
+
+        返回:
+            list[LLMMessage]: 历史消息
+        """
+        if not self.backend:
+            return []
+        history = after_latest_summary(await self.backend.get_messages(self.session_id))
+        pipeline = CondenserPipeline.create_from_configs(
+            self.memory_config, profile, model_name
         )
-
-        if self.memory_config and self.memory_config.short_term.enable and chat_context:
-            if override_history is not None:
-                flattened_override = ContextConverter.flatten_to_llm_messages(
-                    override_history
-                )
-                await chat_context.set_messages(self.session_meta, flattened_override)
-            else:
-                current_history = cast(
-                    list[AgentMessage],
-                    await chat_context.get_messages(self.session_meta),
-                )
-
-            pipeline = CondenserPipeline.create_from_configs(
-                self.memory_config, profile, model_name
+        if not pipeline.reducers:
+            return history
+        token = summary_sink.set(self._summary_sink(self.backend))
+        try:
+            history, _ = await pipeline.run(
+                history, model_name=model_name, base_overhead=base_overhead
             )
-            if pipeline.reducers:
-                flattened_to_reduce = ContextConverter.flatten_to_llm_messages(
-                    current_history
-                )
-                new_history, changed = await pipeline.run(
-                    flattened_to_reduce,
-                    model_name=model_name,
-                    base_overhead=base_overhead,
-                )
-                if changed:
-                    await chat_context.set_messages(self.session_meta, new_history)
-                    logger.info(
-                        "💾 [SessionMemory] 压缩截断完毕，已同步覆写数据库。"
-                        f"压缩后条数: {len(new_history)}"
-                    )
-                current_history = cast(list[AgentMessage], new_history)
+        finally:
+            summary_sink.reset(token)
+        return history
 
-        return current_history
+    def _summary_sink(
+        self, backend: BaseChatContext
+    ) -> Callable[[Callable[[], Awaitable[LLMMessage | None]]], None]:
+        """生成后台摘要任务的提交函数，同一会话同一时间只运行一个摘要任务
 
-    async def write(
-        self,
-        new_messages: Sequence[AgentMessage],
-    ) -> None:
-        """将新产生的对话增量，经过入库中间件清洗后保存到数据库"""
-        if not new_messages:
-            return
+        参数:
+            backend: 保存摘要的短期记忆后端
 
-        messages_to_save = new_messages
+        返回:
+            Callable: 接收摘要生成函数的提交函数
+        """
+        key = f"{id(backend)}:{self.session_id}"
+        session_id = self.session_id
 
-        if self.memory_config and self.memory_config.ingestion.middlewares:
-            messages_to_save = [model_copy(m, deep=True) for m in new_messages]
+        def submit(produce: Callable[[], Awaitable[LLMMessage | None]]) -> None:
+            if key in _summarizing:
+                return
+            _summarizing.add(key)
 
-            for middleware in self.memory_config.ingestion.middlewares:
+            async def job() -> None:
                 try:
-                    messages_to_save = await middleware.process(
-                        messages_to_save, self.context
-                    )
+                    if summary := await produce():
+                        await backend.add_messages(session_id, [summary])
+                        logger.info(f"💾 [SessionMemory] 已保存会话 {key} 的摘要")
                 except Exception as e:
-                    logger.error(
-                        f"[MemoryIngestion] 中间件 {middleware.__class__.__name__} "
-                        f"执行失败: {e}",
-                        e=e,
-                    )
+                    logger.error(f"[SessionMemory] 后台生成摘要失败: {e}", e=e)
+                finally:
+                    _summarizing.discard(key)
 
-        if not messages_to_save:
-            return
+            task = asyncio.create_task(job())
+            _summary_tasks.add(task)
+            task.add_done_callback(_summary_tasks.discard)
 
-        chat_ctx = memory_manager.get_chat_context(
-            self.memory_config,
-            namespace=self.session_meta.selector.namespace or "global",
-        )
+        return submit
 
-        flattened_msgs = ContextConverter.flatten_to_llm_messages(
-            messages_to_save, self.context
-        )
+    async def write(self, new_messages: Sequence[LLMMessage]) -> None:
+        """保存新产生的对话
 
-        if chat_ctx and self.memory_config and self.memory_config.short_term.enable:
-            if flattened_msgs:
-                await chat_ctx.add_messages(self.session_meta, flattened_msgs)
+        参数:
+            new_messages: 新消息
+        """
+        if self.backend and new_messages:
+            await self.backend.add_messages(self.session_id, list(new_messages))

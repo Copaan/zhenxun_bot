@@ -499,46 +499,6 @@ def _low_priority_writers(own: Ownership) -> list[Any]:
     ]
 
 
-def _ai_tools(own: Ownership) -> list[Any]:
-    module = sys.modules.get("zhenxun.services.ai.tools.engine.registry")
-    if module is None:
-        return []
-    manager = module.tool_provider_manager
-    items: list[Any] = []
-    for tools in list(manager.local_provider._namespaced_tools.values()):
-        for item in list(tools):
-            # @tool 生成的 FunctionTool 记录原函数，matcher 工具记录 matcher
-            target = getattr(item, "_original_func", None) or getattr(
-                item, "matcher", item
-            )
-            if own.owned(target):
-                items.append((tools, item))
-    items.extend(
-        (container, item)
-        for container in (manager._providers, manager._resolvers)
-        for item in list(container)
-        if own.owned(item)
-    )
-    return items
-
-
-def _remove_ai_tools(items: list[Any]) -> None:
-    _remove_keyed(items)
-    module = sys.modules.get("zhenxun.services.ai.tools.engine.registry")
-    if module is not None:
-        tools = module.tool_provider_manager.local_provider._namespaced_tools
-        for namespace in [name for name, items in tools.items() if not items]:
-            del tools[namespace]
-
-
-def _ai_capabilities(own: Ownership) -> list[Any]:
-    module = sys.modules.get("zhenxun.services.ai.capabilities.manager")
-    if module is None:
-        return []
-    entries = module.capability_manager._entries
-    return [(entries, entry) for entry in list(entries) if own.owned(entry.cls)]
-
-
 def _publication_reconcilers() -> list:
     module = sys.modules.get("zhenxun.services.db_context.write")
     return module._RECONCILERS if module is not None else []
@@ -569,8 +529,6 @@ ADAPTERS: list[Adapter] = [
     Adapter("shop_goods", _shop_goods, _remove_shop_goods),
     Adapter("shop_manage_goods", _shop_manage_goods, _remove_keyed),
     Adapter("low_priority_writer", _low_priority_writers, _remove_keyed),
-    Adapter("ai_tool", _ai_tools, _remove_ai_tools),
-    Adapter("ai_capability", _ai_capabilities, _remove_keyed),
     _list_adapter("publication_reconciler", _publication_reconcilers),
 ]
 

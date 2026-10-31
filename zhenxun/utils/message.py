@@ -2,7 +2,7 @@ import base64
 from io import BytesIO
 from pathlib import Path
 import random
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import nonebot
 from nonebot.adapters.onebot.v11 import Message, MessageSegment
@@ -159,6 +159,26 @@ class MessageUtils:
             _data = m if isinstance(m, list) else [m]
             message_list += cls.__build_message(_data, format_args)
         return UniMessage(message_list)
+
+    @classmethod
+    def from_onebot(cls, message: Any) -> UniMessage:
+        """把 OneBot V11 接口中的消息（CQ 码字符串、消息段字典列表或 Message）
+        转为 UniMessage
+
+        参数:
+            message: 消息
+
+        返回:
+            UniMessage: 统一消息
+        """
+        if isinstance(message, list):
+            message = Message(
+                MessageSegment(item["type"], item.get("data") or {})
+                if isinstance(item, dict)
+                else item
+                for item in message
+            )
+        return UniMessage.of(Message(message or ""), adapter="OneBot V11")
 
     @classmethod
     def alc_forward_msg(

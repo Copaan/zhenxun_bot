@@ -1,4 +1,3 @@
-from abc import ABC, abstractmethod
 from collections.abc import Callable
 import inspect
 import json
@@ -8,36 +7,8 @@ from typing import Annotated, Any, get_args, get_origin, get_type_hints
 from pydantic import BaseModel, Field, create_model
 from pydantic.fields import FieldInfo
 
-from zhenxun.services.ai.run.context import RunContext
 from zhenxun.services.ai.run.di import DependencyInjector
-from zhenxun.services.ai.utils import PermissionUtils
 from zhenxun.utils.pydantic_compat import model_json_schema
-
-
-class FieldPermission(ABC):
-    """字段级权限校验基类/协议"""
-
-    @abstractmethod
-    async def check(self, context: RunContext) -> bool:
-        """返回当前上下文（用户）是否有权使用该字段"""
-        pass
-
-
-class RequireSuperUser(FieldPermission):
-    """仅限超级管理员可见的字段参数"""
-
-    async def check(self, context: RunContext) -> bool:
-        return await PermissionUtils.check_superuser(context)
-
-
-class RequireAdminLevel(FieldPermission):
-    """仅限满足群等级要求的管理员可见的字段参数"""
-
-    def __init__(self, min_level: int = 1):
-        self.min_level = min_level
-
-    async def check(self, context: RunContext) -> bool:
-        return await PermissionUtils.check_admin_level(context, self.min_level)
 
 
 def _parse_docstring(docstring: str | None) -> tuple[str, dict[str, str]]:
@@ -86,9 +57,7 @@ def _parse_docstring(docstring: str | None) -> tuple[str, dict[str, str]]:
     return main_desc, params
 
 
-def build_tool_model(
-    func: Callable, strict: bool = False
-) -> tuple[dict, type[BaseModel]]:
+def build_tool_model(func: Callable) -> tuple[dict, type[BaseModel]]:
     """利用 pydantic.create_model 从函数签名动态构建绝对严谨的 JSON Schema 及验证模型"""
     sig = inspect.signature(func)
     type_hints = get_type_hints(func, include_extras=True)
@@ -141,15 +110,13 @@ def build_tool_model(
             f"无法为工具 '{func.__name__}' 生成合法的 JSON Schema。\n"
             "原因：函数的参数中包含了大模型无法解析的复杂类型"
             "（如 Bot, Event, 自定义类等）。\n"
-            "💡 修复建议：如果该参数是底层框架依赖（如需要用到 nonebot 的 Bot），"
-            "请务必使用 `Inject.XXX` 进行注解声明（例如 `bot: Inject.Bot`），"
-            "这样系统会自动将其隐藏，不会发给大模型。\n"
+            "💡 修复建议：需要 Bot、Event 等框架对象时，"
+            "请声明 `context: RunContext` 参数并通过 context.get_bot() 等方法获取，"
+            "该参数会自动注入，不会发给大模型。\n"
             f"底层报错：{error_msg}"
         ) from e
 
     schema_def.pop("title", None)
-    if strict:
-        schema_def["additionalProperties"] = False
 
     return schema_def, DynamicModel
 
@@ -173,54 +140,3 @@ def build_schema_hint(args_schema: type[BaseModel] | None) -> str:
         return hint
     except Exception:
         return ""
-
-
-async def prune_schema_by_permissions(
-    model_class: type[BaseModel], context: RunContext, schema: dict[str, Any]
-) -> dict[str, Any]:
-    """根据当前运行时上下文 (RunContext) 动态裁剪无权限的 Schema 字段"""
-    properties = schema.get("properties", {})
-    required = schema.get("required", [])
-    fields_to_remove = []
-
-    fields = getattr(
-        model_class, "model_fields", getattr(model_class, "__fields__", {})
-    )
-
-    for field_name, field_info in fields.items():
-        for meta in field_info.metadata:
-            if isinstance(meta, FieldPermission):
-                if not await meta.check(context):
-                    fields_to_remove.append(field_name)
-                break
-
-    for field_name in fields_to_remove:
-        properties.pop(field_name, None)
-        if field_name in required:
-            required.remove(field_name)
-
-    if "required" in schema and not required:
-        schema.pop("required", None)
-
-    return schema
-
-
-async def check_field_permissions(
-    model_class: type[BaseModel], kwargs: dict[str, Any], context: RunContext
-) -> None:
-    """验证传入的参数是否绕过了权限限制"""
-    fields = getattr(
-        model_class, "model_fields", getattr(model_class, "__fields__", {})
-    )
-    for field_name, field_info in fields.items():
-        if field_name in kwargs:
-            for meta in field_info.metadata:
-                if isinstance(meta, FieldPermission):
-                    if not await meta.check(context):
-                        from zhenxun.services.ai.core.exceptions import ToolRetryError
-
-                        raise ToolRetryError(
-                            f"权限拒绝：您当前的用户身份无权使用参数 '{field_name}'。"
-                            "请移除该参数后重新规划并调用此工具。"
-                        )
-                    break

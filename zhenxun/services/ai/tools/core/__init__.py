@@ -1,24 +1,10 @@
-from .decorators import Rules, tool, toolkit
-from .schema import (
-    FieldPermission,
-    RequireAdminLevel,
-    RequireSuperUser,
-)
-from .tool import BaseTool, FunctionTool
-from .toolkit import (
-    BaseToolkit,
-    CompositeToolkit,
-)
+"""工具核心"""
 
-__all__ = [
-    "BaseTool",
-    "BaseToolkit",
-    "CompositeToolkit",
-    "FieldPermission",
-    "FunctionTool",
-    "RequireAdminLevel",
-    "RequireSuperUser",
-    "Rules",
-    "tool",
-    "toolkit",
-]
+from zhenxun.services.ai import forward
+
+__getattr__ = forward(
+    {
+        "BaseTool": "zhenxun.services.ai.tools.core.tool",
+        "FunctionTool": "zhenxun.services.ai.tools.core.tool",
+    }
+)

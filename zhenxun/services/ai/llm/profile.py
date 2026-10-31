@@ -53,6 +53,10 @@ _NO_CHAT = {"tools": False, "structured_output": "none"}
 
 _HINTS: tuple[tuple[str, dict[str, Any]], ...] = (
     (r"tts", {"tasks": ["tts"], "output_modalities": ["audio"], **_NO_CHAT}),
+    (
+        r"whisper|transcri|sensevoice|paraformer|asr",
+        {"tasks": ["stt"], "input_modalities": ["audio"], **_NO_CHAT},
+    ),
     (r"rerank|colbert", {"tasks": ["rerank"], "context_window": 8192, **_NO_CHAT}),
     (
         r"gemini-embedding-2|embeddings-v\d+-omni",
@@ -109,7 +113,7 @@ _PROFILE_FIELDS = set(ModelProfile.model_fields) - {"sources"}
 
 
 def normalize_model_name(name: str) -> str:
-    """去掉厂商前缀并转为小写，用于匹配提示表
+    """去掉厂商前缀与 ":" 后的标签并转为小写，用于匹配提示表与模型目录
 
     参数:
         name: 模型名称
@@ -117,7 +121,7 @@ def normalize_model_name(name: str) -> str:
     返回:
         str: 规范化后的名称
     """
-    return name.rsplit("/", 1)[-1].strip().lower()
+    return name.rsplit("/", 1)[-1].split(":", 1)[0].strip().lower()
 
 
 def hint_profile(name: str) -> dict[str, Any]:
@@ -216,10 +220,6 @@ def parse_modalities(values: Any) -> list[str] | None:
     return [v for v in dict.fromkeys(mapped) if v in _MODALITIES] or None
 
 
-def _catalog_key(name: str) -> str:
-    return name.rsplit("/", 1)[-1].split(":", 1)[0].strip().lower()
-
-
 def _reasoning_fields(item: dict[str, Any]) -> dict[str, Any]:
     if item.get("reasoning") is False:
         return {
@@ -314,7 +314,7 @@ def catalog_fields(name: str, protocol: str) -> dict[str, Any]:
         dict[str, Any]: 能力档案字段，未收录时为空字典
     """
     models = _load_catalog()["models"]
-    key = _catalog_key(name)
+    key = normalize_model_name(name)
     fields = models.get(key) or models.get(_DATE_SUFFIX.sub("", key))
     if not fields:
         return {}
@@ -344,7 +344,7 @@ def build_catalog(data: dict[str, Any]) -> dict[str, dict[str, Any]]:
         entry = data[vendor]
         items = entry.get("models") if isinstance(entry, dict) else None
         for model_id, item in (items or {}).items():
-            key = _catalog_key(model_id)
+            key = normalize_model_name(model_id)
             if key not in models and isinstance(item, dict):
                 models[key] = _catalog_fields(item)
     return models
@@ -421,6 +421,10 @@ def resolve_profile(
                     inputs ^= {modality}
                     merged["input_modalities"] = sorted(inputs)
                     sources["input_modalities"] = source
+    tasks = set(merged.get("tasks") or ["chat"])
+    inputs = set(merged.get("input_modalities") or ["text"])
+    if protocol == "gemini" and "chat" in tasks and "audio" in inputs:
+        merged["tasks"] = sorted(tasks | {"stt"})
     merged["native_tools"] = {t for t, supported in native.items() if supported}
     merged["native_tools_off"] = {t for t, supported in native.items() if not supported}
     levels = merged.get("reasoning_levels") or []

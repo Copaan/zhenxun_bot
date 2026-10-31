@@ -7,6 +7,7 @@
 
 import asyncio
 from collections.abc import Callable
+from datetime import datetime, timedelta
 from functools import partial
 import random
 import time
@@ -56,12 +57,17 @@ class APSchedulerAdapter:
         return f"{JOB_PREFIX}{schedule_id}"
 
     @staticmethod
-    def add_or_reschedule_job(schedule: ScheduledJob):
+    def add_or_reschedule_job(schedule: ScheduledJob, catch_up: bool = False) -> bool:
         """
         根据 ScheduledJob 添加或重新调度一个 APScheduler 任务
 
         参数:
             schedule: 定时任务对象，包含任务的所有配置信息。
+            catch_up: 是否补跑停机期间错过且仍在补跑窗口内的一次执行；
+                指定时间的任务已过补跑窗口时不再调度
+
+        返回:
+            bool: 是否已调度，指定时间的任务已过期时为 False
         """
         job_id = APSchedulerAdapter._get_job_id(schedule.id)
 
@@ -77,7 +83,7 @@ class APSchedulerAdapter:
                 f"任务 {schedule.id} 的 trigger_config 不是字典类型: "
                 f"{type(schedule.trigger_config)}"
             )
-            return
+            return False
 
         trigger_params = schedule.trigger_config.copy()
         execution_options = (
@@ -90,9 +96,10 @@ class APSchedulerAdapter:
                 trigger_params["jitter"] = jitter
 
         concurrency_policy = execution_options.get("concurrency_policy", "ALLOW")
+        grace = execution_options.get("misfire_grace_time")
         job_params = {
             "id": job_id,
-            "misfire_grace_time": 300,
+            "misfire_grace_time": grace or 300,
             "args": [schedule.id],
         }
 
@@ -103,15 +110,84 @@ class APSchedulerAdapter:
             job_params["max_instances"] = 1
             job_params["coalesce"] = False
 
-        scheduler.add_job(
+        if catch_up and schedule.trigger_type == "date":
+            run_at = trigger_params.get("run_date")
+            if isinstance(run_at, str):
+                run_at = datetime.fromisoformat(run_at)
+            passed = (
+                time.time() - run_at.timestamp() if isinstance(run_at, datetime) else 0
+            )
+            if passed > job_params["misfire_grace_time"]:
+                return False
+            if passed > 0:
+                scheduler.add_job(
+                    _catch_up_when_ready,
+                    trigger="date",
+                    run_date=datetime.now(scheduler.timezone),
+                    id=f"{job_id}_catch_up",
+                    args=[
+                        schedule.id,
+                        schedule.bot_id,
+                        time.time() - passed + job_params["misfire_grace_time"],
+                    ],
+                    replace_existing=True,
+                )
+                return True
+        job = scheduler.add_job(
             _execute_persistent_job,
             trigger=schedule.trigger_type,
             **job_params,
             **trigger_params,
         )
+        if catch_up and grace and schedule.trigger_type != "date":
+            APSchedulerAdapter._catch_up(schedule, job, grace)
         logger.debug(
             f"已添加或更新APScheduler任务: {job_id} | 并发策略: {concurrency_policy}, "
             f"抖动: {trigger_params.get('jitter', '无')}"
+        )
+        return True
+
+    @staticmethod
+    def _catch_up(schedule: ScheduledJob, job, grace: int) -> None:
+        """上次执行之后的下一次触发已错过且仍在补跑窗口内时，立即补跑一次
+
+        参数:
+            schedule: 定时任务
+            job: APScheduler 任务
+            grace: 补跑窗口(秒)
+        """
+        since = schedule.last_run_at or schedule.create_time
+        if since is None:
+            return
+        zone = scheduler.timezone
+        since = since.astimezone(zone)
+        now = datetime.now(zone)
+        interval = getattr(job.trigger, "interval", None)
+        missed = (
+            since + interval
+            if isinstance(interval, timedelta)
+            else job.trigger.get_next_fire_time(None, since)
+        )
+        upcoming = getattr(job, "next_run_time", None)
+        if (
+            missed is None
+            or missed >= now
+            or (now - missed).total_seconds() > grace
+            or (upcoming and missed >= upcoming)
+        ):
+            return
+        deadline = missed.timestamp() + grace
+        scheduler.add_job(
+            _catch_up_when_ready,
+            trigger="date",
+            run_date=now,
+            id=f"{job.id}_catch_up",
+            args=[schedule.id, schedule.bot_id, deadline],
+            misfire_grace_time=grace,
+            replace_existing=True,
+        )
+        logger.info(
+            f"定时任务 {schedule.id} 错过了 {missed:%m-%d %H:%M} 的执行，补跑一次"
         )
 
     @staticmethod
@@ -228,8 +304,6 @@ async def _run_dependent_task(
     func: Callable, injected_params: dict, bot: Bot, state: T_State
 ):
     """将普通函数包装为 NoneBot Dependent 并执行的内部辅助方法"""
-    from zhenxun.services.ai.chat_switch import scene_admitted
-
     owner = getattr(func, "__zhenxun_registration_owner__", None) or getattr(
         func, "__module__", None
     )
@@ -240,8 +314,7 @@ async def _run_dependent_task(
         return await func(bot=bot, **injected_params)
 
     dependent = Dependent.parse(call=wrapper, allow_types=Matcher.HANDLER_PARAM_TYPES)
-    with scene_admitted():
-        return await dependent(bot=bot, state=state)
+    return await dependent(bot=bot, state=state)
 
 
 async def _plugin_blocked(owner: str | None, bot: Bot, context) -> bool:
@@ -480,10 +553,23 @@ class ExecutionDispatcher:
                 await asyncio.gather(*tasks_to_run, return_exceptions=True)
 
 
+def _detach_event_context() -> None:
+    """清除从事件处理中带入的会话上下文：APScheduler 的唤醒回调复制调用 add_job 时的
+    上下文，任务不应沿用该事件的回复目标、平台与业务身份"""
+    from zhenxun.adapters.qq_official.context import CURRENT_OFFICIAL_CONTEXT
+    from zhenxun.services.business_identity import _current
+    from zhenxun.services.platform_identity import CURRENT_PLATFORM_SCOPE
+
+    CURRENT_OFFICIAL_CONTEXT.set(None)
+    CURRENT_PLATFORM_SCOPE.set("")
+    _current.set(None)
+
+
 async def _execute_ephemeral_job(context: ScheduleContext):
     """
     执行临时的、内存态的定时任务 (Ephemeral Job)
     """
+    _detach_event_context()
     plugin_name = context.plugin_name
     task_meta = scheduler_registry.tasks.get(plugin_name)
     if not task_meta or not task_meta["func"]:
@@ -510,10 +596,31 @@ async def _execute_ephemeral_job(context: ScheduleContext):
         logger.error(f"执行临时任务 '{plugin_name}' 时发生错误", e=e)
 
 
+async def _catch_up_when_ready(
+    schedule_id: int, bot_id: str | None, deadline: float
+) -> None:
+    """等任务的 Bot 连接后补跑一次，到补跑窗口结束仍未连接时放弃
+
+    参数:
+        schedule_id: 定时任务ID
+        bot_id: 任务指定的 Bot，为空时等待任意 Bot
+        deadline: 补跑窗口结束的时间戳
+    """
+    import nonebot
+
+    while not (bot_id in nonebot.get_bots() if bot_id else nonebot.get_bots()):
+        if time.time() >= deadline:
+            logger.warning(f"定时任务 {schedule_id} 的 Bot 未连接，已放弃补跑")
+            return
+        await asyncio.sleep(5)
+    await _execute_persistent_job(schedule_id)
+
+
 async def _execute_persistent_job(schedule_id: int, force: bool = False):
     """
     执行数据库中持久化的定时任务 (Persistent Job)
     """
+    _detach_event_context()
     schedule = None
 
     global _LAST_PRESSURE_SKIP
@@ -562,7 +669,7 @@ async def _execute_persistent_job(schedule_id: int, force: bool = False):
         await ScheduleRepository.update_run_status(schedule, is_success=True)
         logger.info(f"任务 {schedule.id} 执行完成 | 目标总数={len(resolved_targets)}")
 
-        if schedule.is_one_off:
+        if schedule.is_one_off and not force:
             logger.info(f"一次性任务 {schedule.id} 执行成功，将被删除。")
             await ScheduledJob.filter(id=schedule.id).delete()
             APSchedulerAdapter.remove_job(schedule.id)

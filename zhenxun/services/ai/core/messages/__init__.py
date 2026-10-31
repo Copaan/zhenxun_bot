@@ -4,11 +4,6 @@
 
 from zhenxun.utils.pydantic_compat import model_rebuild
 
-from .context_events import (
-    AgentEvent,
-    HandoffEvent,
-    TaskLifecycleEvent,
-)
 from .models import (
     AssistantMessage,
     LLMMessage,
@@ -24,11 +19,8 @@ from .parts import (
     FilePart,
     ImagePart,
     LLMContentPart,
-    TextDeltaPart,
     TextPart,
-    ThoughtDeltaPart,
     ThoughtPart,
-    ToolCallDeltaPart,
     ToolCallPart,
     ToolReturnPart,
     VideoPart,
@@ -40,6 +32,7 @@ from .requests import (
     ImageRequest,
     RerankRequest,
     SpeechRequest,
+    TranscriptionRequest,
 )
 from .responses import (
     AudioResponse,
@@ -47,9 +40,9 @@ from .responses import (
     EmbeddingResponse,
     ImageResponse,
     RerankResponse,
+    TranscriptionResponse,
 )
 from .shared import (
-    LLMCodeExecution,
     LLMGroundingAttribution,
     LLMGroundingMetadata,
     RerankDocument,
@@ -57,8 +50,6 @@ from .shared import (
     UsageInfo,
 )
 from .types import (
-    AgentMessage,
-    AnyLLMMessage,
     ContentT,
     PromptInput,
     RoleT,
@@ -75,9 +66,6 @@ model_rebuild(RerankResponse)
 
 
 __all__ = [
-    "AgentEvent",
-    "AgentMessage",
-    "AnyLLMMessage",
     "AssistantMessage",
     "AudioPart",
     "AudioResponse",
@@ -91,11 +79,9 @@ __all__ = [
     "EmbeddingRequest",
     "EmbeddingResponse",
     "FilePart",
-    "HandoffEvent",
     "ImagePart",
     "ImageRequest",
     "ImageResponse",
-    "LLMCodeExecution",
     "LLMContentPart",
     "LLMGroundingAttribution",
     "LLMGroundingMetadata",
@@ -108,15 +94,13 @@ __all__ = [
     "RoleT",
     "SpeechRequest",
     "SystemMessage",
-    "TaskLifecycleEvent",
-    "TextDeltaPart",
     "TextPart",
-    "ThoughtDeltaPart",
     "ThoughtPart",
-    "ToolCallDeltaPart",
     "ToolCallPart",
     "ToolMessage",
     "ToolReturnPart",
+    "TranscriptionRequest",
+    "TranscriptionResponse",
     "UsageInfo",
     "UserContentUnion",
     "UserMessage",

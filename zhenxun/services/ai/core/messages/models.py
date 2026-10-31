@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import base64
 from collections.abc import Sequence
 import time
 from typing import Annotated, Any, Generic, Literal, cast
@@ -12,12 +11,10 @@ from typing_extensions import Self, TypeVar
 
 from pydantic import BaseModel, Field
 
-from zhenxun.utils.pydantic_compat import model_copy, model_dump, model_validator
+from zhenxun.utils.pydantic_compat import model_copy, model_validator
 
 from .parts import (
     BaseContentPart,
-    FilePart,
-    ImagePart,
     LLMContentPart,
     TextPart,
     ToolCallPart,
@@ -180,30 +177,6 @@ class LLMMessage(BaseModel, Generic[RoleT, ContentT]):
         return msg
 
     @classmethod
-    def assistant_tool_calls(
-        cls,
-        tool_calls: list[ToolCallPart],
-        content: str | Sequence[Any] = "",
-        scope: str | None = None,
-    ) -> "AssistantMessage":
-        """
-        工厂方法：创建一条包含工具调用请求的 Assistant (助手) 角色消息。
-
-        参数:
-            tool_calls: 大模型发出的工具调用片段列表。
-            content: 伴随工具调用的其他文本或思维过程。
-            scope: 可选，消息关联的会话作用域。
-        """
-        if isinstance(content, str):
-            _content: list[Any] = [TextPart(text=content)] if content else []
-        else:
-            _content = list(content)
-        _content.extend(tool_calls)
-        msg = AssistantMessage(content=cast(Any, _content))
-        msg.scope = scope
-        return msg
-
-    @classmethod
     def assistant_text_response(
         cls,
         content: str | Sequence[Any],
@@ -223,28 +196,6 @@ class LLMMessage(BaseModel, Generic[RoleT, ContentT]):
         msg = AssistantMessage(content=cast(Any, content))
         msg.scope = scope
         return msg
-
-    def add_text(self, text: str) -> Self:
-        """链式添加文本内容"""
-        self.content.append(cast(Any, TextPart(text=text)))
-        return self
-
-    def add_image_url(self, url: str) -> Self:
-        """链式添加网络图片"""
-        self.content.append(cast(Any, ImagePart(url=url)))
-        return self
-
-    def add_image_base64(self, b64_data: str, mime_type: str = "image/png") -> Self:
-        """链式添加 Base64 图片"""
-        self.content.append(
-            cast(Any, ImagePart(raw=base64.b64decode(b64_data), mime_type=mime_type))
-        )
-        return self
-
-    def add_file_url(self, url: str, mime_type: str | None = None) -> Self:
-        """链式添加文件链接"""
-        self.content.append(cast(Any, FilePart(url=url, mime_type=mime_type)))
-        return self
 
     @classmethod
     def tool_response(
@@ -292,18 +243,6 @@ class LLMMessage(BaseModel, Generic[RoleT, ContentT]):
         msg = SystemMessage(content=cast(Any, content))
         msg.scope = scope
         return msg
-
-    def to_storage_dict(self) -> dict[str, Any]:
-        """数据库瘦身存储，仅保留核心字段"""
-        return model_dump(
-            self,
-            exclude_none=True,
-            include={
-                "role",
-                "content",
-                "metadata",
-            },
-        )
 
 
 class SystemMessage(LLMMessage[Literal["system"], TextPart]):

@@ -1,38 +1,46 @@
-"""Lazy public facade for the AI runtime."""
+"""AI 运行时，顶层按需转发 `llm` 的对外接口与 Agent"""
 
-from __future__ import annotations
-
+from collections.abc import Callable
 from importlib import import_module
 from typing import Any
 
-_EXPORTS: dict[str, tuple[str, str]] = {
-    "Agent": ("zhenxun.services.ai.flow", "Agent"),
-    "Inject": ("zhenxun.services.ai.run", "Inject"),
-    "LLMMessage": ("zhenxun.services.ai.core.messages", "LLMMessage"),
-    "Rules": ("zhenxun.services.ai.tools", "Rules"),
-    "RunContext": ("zhenxun.services.ai.run", "RunContext"),
-    "Team": ("zhenxun.services.ai.flow", "Team"),
-    "Workflow": ("zhenxun.services.ai.flow", "Workflow"),
-    "chat": ("zhenxun.services.ai.llm.api", "chat"),
-    "generate_structured": (
-        "zhenxun.services.ai.llm.api",
-        "generate_structured",
-    ),
-    "tool": ("zhenxun.services.ai.tools", "tool"),
-}
 
-__all__ = list(_EXPORTS)
+def forward(names: dict[str, str]) -> Callable[[str], Any]:
+    """生成按需导入的模块级 `__getattr__`
+
+    参数:
+        names: 名称到定义模块的映射
+
+    返回:
+        Callable[[str], Any]: 模块级 `__getattr__`
+    """
+
+    def __getattr__(name: str) -> Any:
+        if name not in names:
+            raise AttributeError(name)
+        return getattr(import_module(names[name]), name)
+
+    return __getattr__
+
+
+_forward = forward(
+    {
+        "Agent": "zhenxun.services.ai.flow.agent.agent",
+        "RunContext": "zhenxun.services.ai.run.context",
+    }
+)
 
 
 def __getattr__(name: str) -> Any:
-    try:
-        module_name, attribute = _EXPORTS[name]
-    except KeyError as error:
-        raise AttributeError(name) from error
-    value = getattr(import_module(module_name), attribute)
-    globals()[name] = value
-    return value
+    """转发 `zhenxun.services.ai.llm` 导出的名称及 Agent、RunContext
 
+    参数:
+        name: 属性名
 
-def __dir__() -> list[str]:
-    return sorted({*globals(), *__all__})
+    返回:
+        Any: 对应对象
+    """
+    llm = import_module("zhenxun.services.ai.llm")
+    if name in llm.__all__:
+        return getattr(llm, name)
+    return _forward(name)

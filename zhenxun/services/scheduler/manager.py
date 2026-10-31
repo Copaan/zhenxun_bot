@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable, Coroutine
 from datetime import datetime
 import inspect
@@ -51,6 +52,7 @@ class SchedulerManager:
     ALL_GROUPS: ClassVar[str] = scheduler_registry.ALL_GROUPS
 
     def __init__(self):
+        self._manual_runs: set[asyncio.Task] = set()
         self._register_builtin_resolvers()
 
     def _register_builtin_resolvers(self):
@@ -702,20 +704,20 @@ class SchedulerManager:
 
     async def trigger_now(self, schedule_id: int) -> tuple[bool, str]:
         """
-        立即手动触发指定的定时任务
+        立即手动触发指定的定时任务：在后台执行，不等待完成，
+        不影响任务原定的执行（一次性任务手动执行后不会被删除）
         """
         schedule = await ScheduleRepository.get_by_id(schedule_id)
         if not schedule:
             return False, f"未找到 ID 为 {schedule_id} 的定时任务。"
         if schedule.plugin_name not in scheduler_registry.tasks:
             return False, f"插件 '{schedule.plugin_name}' 没有注册可用的定时任务。"
-
-        try:
-            await _execute_persistent_job(schedule.id, force=True)
-            return True, f"已手动触发任务 (ID: {schedule.id})。"
-        except Exception as e:
-            logger.error(f"手动触发任务失败: {e}")
-            return False, f"手动触发任务失败: {e}"
+        if schedule.id in scheduler_registry.running_tasks:
+            return False, f"任务 (ID: {schedule.id}) 正在执行。"
+        task = asyncio.create_task(_execute_persistent_job(schedule.id, force=True))
+        self._manual_runs.add(task)
+        task.add_done_callback(self._manual_runs.discard)
+        return True, f"已手动触发任务 (ID: {schedule.id})。"
 
     async def get_schedule_by_id(self, schedule_id: int) -> "ScheduledJob | None":
         """

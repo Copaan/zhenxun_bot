@@ -140,6 +140,8 @@ class ExecutionOptions(BaseModel):
     """重试次数"""
     retry_delay_seconds: int = 30
     """重试延迟时间(秒)"""
+    misfire_grace_time: int | None = Field(None)
+    """错过执行时间后仍补跑的窗口(秒)，设置后启动时补跑停机期间错过的一次"""
 
 
 class ScheduleContext(BaseModel):

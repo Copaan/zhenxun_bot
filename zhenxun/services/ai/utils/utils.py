@@ -2,8 +2,9 @@ import asyncio
 from collections.abc import Callable
 import functools
 import inspect
+import ipaddress
 import threading
-from typing import Any
+from urllib.parse import urljoin, urlsplit
 
 
 def wrap_to_async(func: Callable) -> Callable:
@@ -58,35 +59,94 @@ def wrap_to_async(func: Callable) -> Callable:
     return async_wrapper
 
 
-def parse_routing_string(route_str: str, default_namespace: str) -> dict[str, Any]:
+MEDIA_MAX_BYTES = 20 * 1024 * 1024
+"""单个媒体允许下载的最大字节数"""
+_MEDIA_MAX_REDIRECTS = 5
+_FAKE_IP_NETWORK = ipaddress.ip_network("198.18.0.0/15")
+"""代理软件 fake-ip 模式使用的地址段，域名都会解析到这里，不视为内网"""
+
+
+class MediaFetchError(Exception):
+    """媒体下载失败"""
+
+    def __init__(self, message: str, too_large: bool = False):
+        super().__init__(message)
+        self.too_large = too_large
+
+
+async def _ensure_public_host(host: str) -> None:
+    """确认主机解析到的地址都是公网地址
+
+    参数:
+        host: 主机名或 IP
+
+    异常:
+        MediaFetchError: 解析到内网、回环、链路本地或保留地址
     """
-    统一的声明式路由字符串解析函数。
+    try:
+        addresses = [ipaddress.ip_address(host.strip("[]"))]
+    except ValueError:
+        loop = asyncio.get_running_loop()
+        try:
+            infos = await loop.getaddrinfo(host, None)
+        except OSError:
+            return
+        addresses = [
+            ipaddress.ip_address(str(info[4][0]).split("%")[0]) for info in infos
+        ]
+    for address in addresses:
+        if address.is_global or address in _FAKE_IP_NETWORK:
+            continue
+        raise MediaFetchError(f"拒绝访问非公网地址: {host}")
 
-    支持格式:
-    - "namespace.target"
-    - "*.target" (等价于 global.target)
-    - "target" (使用 default_namespace)
 
-    target 支持:
-    - "*" (全选)
-    - "#tag1#tag2" (按标签筛选)
-    - "name" (按精确名称筛选)
+async def fetch_media(
+    url: str, max_bytes: int = MEDIA_MAX_BYTES, allow_private: bool = False
+) -> bytes:
+    """下载媒体内容，限制大小并逐跳检查重定向目标
+
+    参数:
+        url: http/https 地址
+        max_bytes: 允许的最大字节数
+        allow_private: 是否允许访问内网地址（仅用于协议端提供的地址）
+
+    返回:
+        bytes: 媒体内容
+
+    异常:
+        MediaFetchError: 地址不合法、访问被拒绝、请求失败或超过大小上限
     """
-    if "." in route_str:
-        ns, target = route_str.split(".", 1)
-        if ns == "*":
-            ns = "global"
-    else:
-        ns = default_namespace
-        target = route_str
+    from zhenxun.utils.http_utils import get_client
 
-    result: dict[str, Any] = {"namespace": ns}
-
-    if target == "*":
-        pass
-    elif target.startswith("#"):
-        result["tags"] = [t for t in target.split("#") if t]
-    else:
-        result["name"] = target
-
-    return result
+    client = get_client()
+    for _ in range(_MEDIA_MAX_REDIRECTS + 1):
+        parts = urlsplit(url)
+        if parts.scheme not in ("http", "https") or not parts.hostname:
+            raise MediaFetchError(f"只能下载 http/https 地址: {url[:80]}")
+        if not allow_private:
+            await _ensure_public_host(parts.hostname)
+        try:
+            async with client.stream(
+                "GET", url, follow_redirects=False, timeout=30
+            ) as response:
+                if response.is_redirect and "location" in response.headers:
+                    url = urljoin(url, response.headers["location"])
+                    continue
+                if response.status_code >= 400:
+                    raise MediaFetchError(f"下载失败 HTTP {response.status_code}")
+                length = response.headers.get("content-length", "")
+                if length.isdigit() and int(length) > max_bytes:
+                    raise MediaFetchError("媒体超过大小上限", too_large=True)
+                chunks: list[bytes] = []
+                size = 0
+                async for chunk in response.aiter_bytes():
+                    size += len(chunk)
+                    if size > max_bytes:
+                        raise MediaFetchError("媒体超过大小上限", too_large=True)
+                    chunks.append(chunk)
+                return b"".join(chunks)
+        except MediaFetchError:
+            raise
+        except Exception as e:
+            raise MediaFetchError(f"下载失败: {type(e).__name__} {e}") from e
+    raise MediaFetchError("重定向次数过多")
