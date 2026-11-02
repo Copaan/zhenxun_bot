@@ -65,8 +65,10 @@ def distributions(paths=None) -> tuple[dict, dict]:
     for distribution in metadata.distributions(
         path=paths if paths is not None else sys.path
     ):
-        if type(distribution) is metadata.PathDistribution:
-            distribution = _CachedDistribution(distribution._path)
+        if not isinstance(distribution, _CachedDistribution) and hasattr(
+            distribution, "_path"
+        ):
+            distribution = _CachedDistribution(distribution._path)  # pyright: ignore[reportAttributeAccessIssue]
         raw_name = distribution.metadata.get("Name")
         if not raw_name:
             continue

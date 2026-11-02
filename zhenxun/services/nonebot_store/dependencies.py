@@ -92,10 +92,40 @@ def safe_process_error(value: str) -> str:
     return " ".join(value.split())[-1200:]
 
 
+_inventory_cache: tuple[tuple, dict[str, str]] | None = None
+
+
+def _inventory_key() -> tuple:
+    from .environment import generation_path
+
+    generation = load_manifest().get("active_generation")
+    paths = list(sys.path)
+    if isinstance(generation, int):
+        paths.append(str(generation_path(generation)))
+    key: list[tuple[str, int]] = [("generation", int(generation or -1))]
+    for value in paths:
+        try:
+            key.append((value, os.stat(value or ".").st_mtime_ns))
+        except OSError:
+            continue
+    return tuple(key)
+
+
 def installed_inventory() -> dict[str, str]:
+    """已安装包的版本，搜索路径与依赖层目录都没有变化时复用上次的结果
+
+    返回:
+        dict[str, str]: 包名 -> 版本
+    """
+    global _inventory_cache
     from .environment import capture_environment
 
-    return capture_environment().versions
+    key = _inventory_key()
+    if _inventory_cache is not None and _inventory_cache[0] == key:
+        return dict(_inventory_cache[1])
+    versions = capture_environment().versions
+    _inventory_cache = (key, versions)
+    return dict(versions)
 
 
 def _marker_enabled(marker: Any) -> bool:

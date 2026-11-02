@@ -95,6 +95,20 @@ def memory_mode() -> str:
     return mode if mode in ("inject", "tool") else "off"
 
 
+def embedding_model() -> str:
+    """长期记忆使用的 embedding 模型
+
+    返回:
+        str: 模型名，关闭向量或没有可用模型时为空，只用关键词召回
+    """
+    from zhenxun.services.ai.llm.manager import get_default_model
+
+    if not _cfg("MEMORY_EMBEDDING", True):
+        return ""
+    model = str(_cfg("MEMORY_EMBEDDING_MODEL", "")).strip()
+    return model or get_default_model("embedding") or ""
+
+
 def session_scope(session_id: str) -> Scope | None:
     """聊天会话对应的记忆范围，主动任务与控制台会话没有
 
@@ -273,7 +287,7 @@ class Memory:
     async def _embed(
         cls, texts: list[str], task: Literal["document", "query"] = "document"
     ) -> list[bytes | None]:
-        """分批计算文本向量，没有可用的 embedding 模型或失败时为空
+        """分批计算文本向量，关闭向量、没有可用的 embedding 模型或失败时为空
 
         参数:
             texts: 文本
@@ -283,10 +297,8 @@ class Memory:
             list[bytes | None]: 归一化的 float32 向量
         """
         from zhenxun.services.ai.llm.api import embed
-        from zhenxun.services.ai.llm.manager import get_default_model
 
-        model = str(_cfg("MEMORY_EMBEDDING_MODEL", "")).strip()
-        model = model or get_default_model("embedding")
+        model = embedding_model()
         if not model or not texts:
             return [None] * len(texts)
         out: list[bytes | None] = []

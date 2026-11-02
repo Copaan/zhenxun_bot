@@ -49,6 +49,10 @@ class RecallPayload(ScopePayload):
     top_k: int | None = Field(default=None, ge=1, le=20)
 
 
+class EmbeddingPayload(BaseModel):
+    enabled: bool
+
+
 class SummarizePayload(BaseModel):
     session_id: str = Field(min_length=1, max_length=255)
 
@@ -89,10 +93,13 @@ async def _get_memory(memory_id: int) -> Any:
 @router.get("/memory/status", dependencies=[authentication()], response_model=Result)
 async def memory_status() -> Result:
     from zhenxun.builtin_plugins.ai_chat._data_source import MODULE
-    from zhenxun.builtin_plugins.ai_chat._memory import Memory, memory_mode
+    from zhenxun.builtin_plugins.ai_chat._memory import (
+        Memory,
+        embedding_model,
+        memory_mode,
+    )
     from zhenxun.configs.config import Config
     from zhenxun.models.ai_memory import AIMemory
-    from zhenxun.services.ai.llm.manager import get_default_model
 
     rows = (
         await AIMemory.filter(archived=False)
@@ -100,12 +107,13 @@ async def memory_status() -> Result:
         .group_by("group_id", "user_id")
         .values("group_id", "user_id", "n")
     )
-    model = str(Config.get_config(MODULE, "MEMORY_EMBEDDING_MODEL") or "").strip()
+    enabled = Config.get_config(MODULE, "MEMORY_EMBEDDING")
     return Result.ok(
         {
             "mode": memory_mode(),
             "rebuilding": Memory.rebuilding,
-            "embedding_model": model or get_default_model("embedding"),
+            "embedding_enabled": enabled is None or bool(enabled),
+            "embedding_model": embedding_model(),
             "scopes": sorted(
                 (
                     {
@@ -233,3 +241,19 @@ async def rebuild() -> Result:
     if not Memory.rebuild():
         return Result.fail("正在重算向量。")
     return Result.ok(info="已开始重算向量。")
+
+
+@router.put("/memory/embedding", dependencies=[authentication()], response_model=Result)
+async def update_embedding(payload: EmbeddingPayload) -> Result:
+    from zhenxun.builtin_plugins.ai_chat._data_source import MODULE
+    from zhenxun.configs.config import Config
+    from zhenxun.services.log import logger
+
+    Config.set_config(MODULE, "MEMORY_EMBEDDING", payload.enabled)
+    Config.save(save_simple_data=True)
+    logger.info(f"WebUI 修改了长期记忆向量召回: 开启={payload.enabled}", "WebUi")
+    return Result.ok(
+        info="已开启向量召回。"
+        if payload.enabled
+        else "已关闭向量召回，只用关键词召回。"
+    )

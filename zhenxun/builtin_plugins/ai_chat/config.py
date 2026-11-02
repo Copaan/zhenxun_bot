@@ -497,6 +497,16 @@ CONFIGS = [
     ),
     _config(
         "长期记忆",
+        "MEMORY_EMBEDDING",
+        True,
+        bool,
+        "向量召回",
+        "用 embedding 模型计算记忆向量，按语义加关键词召回；关闭后只用关键词召回，"
+        "不再调用 embedding 模型",
+        visible_when=_when("MEMORY_MODE", "off", "neq"),
+    ),
+    _config(
+        "长期记忆",
         "MEMORY_EMBEDDING_MODEL",
         "",
         str,

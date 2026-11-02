@@ -47,6 +47,7 @@ _PLUGIN_STORE_DATA_CACHE = BoundedTTLCache[
 )
 _PLUGIN_STORE_DATA_LOCK = asyncio.Lock()
 _PLUGIN_STORE_GENERATION = 0
+_PLUGIN_STORE_STALE: tuple[list[StorePluginInfo], list[StorePluginInfo]] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,6 +103,7 @@ def row_style(column: str, text: str) -> RowStyle:
 
 class StoreManager:
     _catalog_files: ClassVar[dict[RepoType, tuple[float, set[str] | None]]] = {}
+    _refresh_tasks: ClassVar[dict[str, asyncio.Task]] = {}
     _SOURCE_NAMES: ClassVar[dict[RepoType, str]] = {
         RepoType.ALIYUN: "阿里云",
         RepoType.GITHUB: "GitHub",
@@ -141,11 +143,36 @@ class StoreManager:
         return ".".join(path.with_suffix("").parts)
 
     @classmethod
+    def _refresh_later(cls, key: str, refresh) -> None:
+        """在后台刷新过期的缓存，同一项同时只刷新一次
+
+        参数:
+            key: 缓存项
+            refresh: 返回刷新协程的函数
+        """
+        task = cls._refresh_tasks.get(key)
+        if task is not None and not task.done():
+            return
+
+        async def run():
+            try:
+                await refresh()
+            except Exception as error:
+                logger.warning(
+                    f"后台刷新插件商店缓存 {key} 失败: {type(error).__name__}",
+                    LOG_COMMAND,
+                )
+
+        cls._refresh_tasks[key] = asyncio.create_task(
+            run(), name=f"plugin-store-refresh-{key}"
+        )
+
+    @classmethod
     @core_network_operation
     async def get_data(
         cls, *, refresh: bool = False, source: str | None = None
     ) -> tuple[list[StorePluginInfo], list[StorePluginInfo]]:
-        """获取插件信息数据
+        """获取插件信息数据，缓存过期后先返回上次的数据并在后台重新拉取
 
         参数:
             refresh: 是否忽略缓存重新拉取
@@ -155,7 +182,7 @@ class StoreManager:
             tuple[list[StorePluginInfo], list[StorePluginInfo]]:
                 原生插件信息数据，第三方插件信息数据
         """
-        global _PLUGIN_STORE_GENERATION
+        global _PLUGIN_STORE_GENERATION, _PLUGIN_STORE_STALE
 
         cache_key = "plugins_json"
         requested_generation = _PLUGIN_STORE_GENERATION
@@ -182,6 +209,11 @@ class StoreManager:
             cached_data = await _PLUGIN_STORE_DATA_CACHE.get(cache_key)
             if cached_data is not None:
                 return deepcopy(cached_data)
+            if _PLUGIN_STORE_STALE is not None:
+                cls._refresh_later(
+                    cache_key, lambda: cls.get_data(refresh=True, source=source)
+                )
+                return deepcopy(_PLUGIN_STORE_STALE)
 
         async with _PLUGIN_STORE_DATA_LOCK:
             cached_data = await _PLUGIN_STORE_DATA_CACHE.get(cache_key)
@@ -204,15 +236,17 @@ class StoreManager:
                 parse_entries(extra_plugins, "community"),
             )
             await _PLUGIN_STORE_DATA_CACHE.set(cache_key, result)
+            _PLUGIN_STORE_STALE = result
             _PLUGIN_STORE_GENERATION += 1
             return deepcopy(result)
 
     @classmethod
     async def invalidate_cache(cls) -> None:
-        global _PLUGIN_STORE_GENERATION
+        global _PLUGIN_STORE_GENERATION, _PLUGIN_STORE_STALE
 
         async with _PLUGIN_STORE_DATA_LOCK:
             await _PLUGIN_STORE_DATA_CACHE.delete("plugins_json")
+            _PLUGIN_STORE_STALE = None
             _PLUGIN_STORE_GENERATION += 1
             cls._catalog_files = {}
 
@@ -221,7 +255,8 @@ class StoreManager:
     async def catalog_files(
         cls, repo_type: RepoType, *, refresh: bool = False
     ) -> set[str] | None:
-        """列出下载源中官方仓库的文件，成功结果缓存 5 分钟，失败结果缓存 1 分钟
+        """列出下载源中官方仓库的文件，成功结果缓存 5 分钟，失败结果缓存 1 分钟，
+        成功结果过期后先返回上次的结果并在后台重新列出
 
         参数:
             repo_type: 下载源
@@ -234,6 +269,12 @@ class StoreManager:
         if not refresh and (cached := cls._catalog_files.get(repo_type)):
             checked_at, files = cached
             if now - checked_at < (5 * 60 if files is not None else 60):
+                return files
+            if files is not None:
+                cls._refresh_later(
+                    f"catalog-{repo_type.value}",
+                    lambda: cls.catalog_files(repo_type, refresh=True),
+                )
                 return files
         try:
             listed = await RepoFileManager.list_directory_files(
