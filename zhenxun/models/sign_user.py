@@ -115,18 +115,17 @@ class SignUser(Model):
         )
         identity = user_id.user_id if isinstance(user_id, SignUser) else user_id
         async with asset_transaction(identity, platform):
-            from datetime import datetime
             from hashlib import sha256
-            from zoneinfo import ZoneInfo
 
             from zhenxun.services.business_identity import (
                 identity_daily_claimed,
                 record_identity_daily_claim,
             )
+            from zhenxun.utils.time_utils import TimeUtils
 
             from .asset_operation import AssetOperation
 
-            today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+            today = TimeUtils.now().date()
             key = sha256(f"daily-sign:{identity}:{today}".encode()).hexdigest()
             user = locked or await cls.get_user(identity, platform)
             connection = current_asset_connection()
@@ -139,9 +138,7 @@ class SignUser(Model):
             if (
                 (
                     previous
-                    and previous.create_time.astimezone(
-                        ZoneInfo("Asia/Shanghai")
-                    ).date()
+                    and previous.create_time.astimezone(TimeUtils.zone()).date()
                     == today
                 )
                 or (await identity_daily_claimed(connection))

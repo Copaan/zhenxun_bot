@@ -55,6 +55,7 @@ TOOL_GROUPS = {
     "send": "发消息与戳一戳",
     "sticker": "表情包",
     "knowledge": "知识库检索",
+    "memory": "长期记忆（在聊天设置中开启）",
     "character": "角色识别",
     "web_search": "联网搜索（在 AI 设置中开启）",
     "task": "主动任务",
@@ -228,9 +229,10 @@ class AIChatManager:
         from ._agent import AgentCapability, SubagentToolkit
         from ._characters import CharacterToolkit
         from ._knowledge import KnowledgeToolkit
+        from ._memory_tools import MemoryToolkit
         from ._send import QQSendToolkit
         from ._skills import SkillToolkit
-        from ._stickers import StickerToolkit
+        from ._sticker_tools import StickerToolkit
         from ._tasks import TaskToolkit
         from ._tools import QQToolkit
 
@@ -250,6 +252,7 @@ class AIChatManager:
             "send": QQSendToolkit,
             "sticker": StickerToolkit,
             "knowledge": KnowledgeToolkit,
+            "memory": MemoryToolkit,
             "character": CharacterToolkit,
             "web_search": lambda: WebTools(model),
             "task": TaskToolkit,
@@ -328,7 +331,11 @@ class AIChatManager:
 
     @classmethod
     async def chat(
-        cls, bot: Bot, event: Event, message: UniMessage, proactive: bool = False
+        cls,
+        bot: Bot,
+        event: Event,
+        message: UniMessage,
+        proactive: str | None = None,
     ) -> None:
         """处理一条唤醒消息：频率限制、安全词与额度检查，按人设运行 Agent
         （选用 dsh 执行器时由 dsh 回复）、计费并回复。
@@ -339,7 +346,8 @@ class AIChatManager:
             bot: Bot
             event: 事件
             message: 消息
-            proactive: 是否为按概率触发的主动插话
+            proactive: 主动插话时给 AI 的提示（概率触发时为空字符串），为 None 时
+                不是主动插话
         """
         from ._proactive import Proactive
         from ._reply import parse_silent, quote_reply, send_reply
@@ -354,7 +362,7 @@ class AIChatManager:
         platform = PlatformUtils.get_platform(bot)
         session_id = cls.session_id(bot, event)
         unsafe = Safety.check_input(message.extract_plain_text())
-        if proactive:
+        if proactive is not None:
             if unsafe or not group_id or session_manager.live_tasks.get(session_id):
                 return
         else:
@@ -389,7 +397,8 @@ class AIChatManager:
         from ._agent import record_run, start_run
 
         if group_id:
-            head = f"{sender_name(event, user_id)}({user_id}): "
+            mark = f" #{message_id}" if message_id else ""
+            head = f"{sender_name(event, user_id)}({user_id}){mark}: "
             if background := ChatBuffer.take(
                 bot.self_id,
                 group_id,
@@ -403,8 +412,11 @@ class AIChatManager:
         context = RunContext(deps=deps, session_id=session_id)
         if setting and setting.model:
             context.run.current_model = setting.model
-        if proactive:
-            context.run.add_system_prompt(PROACTIVE_PROMPT, "proactive")
+        if proactive is not None:
+            prompt = PROACTIVE_PROMPT
+            if proactive:
+                prompt += f"\n你决定接话的原因：{proactive}"
+            context.run.add_system_prompt(prompt, "proactive")
         elif hint := str(Config.get_config(MODULE, "SEARCH_HINT") or "").strip():
             from zhenxun.services.ai.tools.providers.builtin.web import SEARCH_HINT
 
@@ -417,13 +429,13 @@ class AIChatManager:
         started = time.monotonic()
         name = persona.name if persona else None
         text = summarize(message)
-        source = "interject" if proactive else "qq"
+        source = "qq" if proactive is None else "interject"
         from ._runner import agent_runner, run_dsh
 
         limit = int(Config.get_config(MODULE, "REQUEST_TIMEOUT") or 0)
         timeout_token = request_timeout.set(limit if limit > 0 else None)
         try:
-            if not proactive and agent_runner(setting) == "dsh":
+            if proactive is None and agent_runner(setting) == "dsh":
                 result = await run_dsh(context, parts, persona)
             else:
                 result = await cls.get_agent(persona).run(parts, context=context)
@@ -432,7 +444,7 @@ class AIChatManager:
             if not isinstance(e, LLMException):
                 raise
             logger.warning(f"AI 聊天失败: {e}", MODULE, session=user_id)
-            if proactive:
+            if proactive is not None:
                 return
             notice = (persona and persona.error_message) or e.user_friendly_message
             await MessageUtils.build_message(notice).send(reply_to=quote)
@@ -443,12 +455,15 @@ class AIChatManager:
             if not tokens:
                 cls._tokens.pop((session_id, user_id), None)
         await record_run(context, source, name, text, started, result=result)
-        if proactive:
+        from ._memory import Memory
+
+        Memory.after_chat(session_id)
+        if proactive is not None:
             Proactive.spend(group_id or "", result.usage.total_tokens)
         if result.stopped or not str(result.output).strip():
             return
         reply = parse_silent(str(result.output))
-        if not proactive:
+        if proactive is None:
             await AITokenUsage.add_usage(user_id, result.usage.total_tokens)
             if cost := int(Config.get_config(MODULE, "COST_GOLD") or 0):
                 try:
@@ -468,7 +483,7 @@ class AIChatManager:
             await send_reply(reply, group_id, voice_input, voice)
         if sticker_id is not None:
             await send_marked(context, sticker_id)
-        if proactive and group_id:
+        if proactive is not None and group_id:
             Proactive.sent(bot.self_id, group_id)
 
     @classmethod

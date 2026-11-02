@@ -3,7 +3,6 @@ from hashlib import sha256
 import os
 from pathlib import Path
 import random
-from zoneinfo import ZoneInfo
 
 import aiofiles
 import nonebot
@@ -17,6 +16,7 @@ from zhenxun.models.sign_user import SignUser
 from zhenxun.models.user_console import UserConsole
 from zhenxun.services.avatar_service import avatar_service
 from zhenxun.utils.manager.priority_manager import PriorityLifecycle
+from zhenxun.utils.time_utils import TimeUtils
 
 from .config import (
     SIGN_TODAY_CARD_PATH,
@@ -52,8 +52,8 @@ LG_MESSAGE = [
 
 
 def _now() -> datetime:
-    """签到日期使用的北京时间"""
-    return datetime.now(ZoneInfo("Asia/Shanghai"))
+    """签到日期使用的 Bot 时区时间"""
+    return TimeUtils.now()
 
 
 def _cached(card_file: Path) -> bool:

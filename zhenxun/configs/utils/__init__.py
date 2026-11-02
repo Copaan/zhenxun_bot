@@ -601,18 +601,80 @@ class ConfigsManager:
         with open(path, "w", encoding="utf8") as f:
             _yaml.dump(save_data, f)
 
-    def remove_groups(self, modules: set[str]) -> None:
-        """删除配置组并保存到 plugins2config.yaml
+    def remove_groups(
+        self, modules: set[str], keys: dict[str, set[str]] | None = None
+    ) -> None:
+        """删除配置组或其中的配置项，并保存 plugins2config.yaml 与 config.yaml
 
         参数:
-            modules: 配置组名称
+            modules: 整组删除的配置组名称
+            keys: 只删除部分配置项的配置组及其配置键
         """
-        if not modules & set(self._data):
+        keys = {module: set(items) for module, items in (keys or {}).items() if items}
+        targets = (modules | set(keys)) & (set(self._data) | set(self._simple_data))
+        if not targets:
             return
+        simple_changed = bool(modules & set(self._simple_data))
+        dropped = {f"{module}:".lower() for module in modules}
+        self.add_module = [
+            item for item in self.add_module if not item.startswith(tuple(dropped))
+        ]
         for module in modules:
             self._data.pop(module, None)
             self._simple_data.pop(module, None)
-        self.save()
+        for module, items in keys.items():
+            upper = {key.upper() for key in items}
+            entries = {f"{module}:{key}".lower() for key in upper}
+            self.add_module = [item for item in self.add_module if item not in entries]
+            if group := self._data.get(module):
+                for key in [key for key in group.configs if key.upper() in upper]:
+                    group.configs.pop(key)
+                if not group.configs:
+                    self._data.pop(module)
+            stored = self._simple_data.get(module)
+            if isinstance(stored, dict):
+                for key in [key for key in stored if str(key).upper() in upper]:
+                    stored.pop(key)
+                    simple_changed = True
+                if not stored:
+                    self._simple_data.pop(module)
+        self.save(save_simple_data=simple_changed)
+
+    def plugin_groups(self, plugins: set[str]) -> set[str]:
+        """只属于这些插件的配置组：由它们注册且没有其他插件共用，或与插件同名且
+        没有其他插件注册
+
+        参数:
+            plugins: 插件名
+
+        返回:
+            set[str]: 配置组名
+        """
+        return {
+            module
+            for module, group in self._data.items()
+            if ((owners := set(group.plugins)) and owners <= plugins)
+            or (not owners and module in plugins)
+        }
+
+    def stale_configs(self) -> dict[str, list[str]]:
+        """本次运行中没有插件注册的配置项，以及没有配置项也没有插件注册的空配置组，
+        通常来自已卸载的插件或插件旧版本
+
+        返回:
+            dict[str, list[str]]: 配置组名到未注册配置键的映射
+        """
+        registered = set(self.add_module)
+        result = {}
+        for module, group in self._data.items():
+            stale = [
+                key
+                for key in group.configs
+                if f"{module}:{key}".lower() not in registered
+            ]
+            if stale or not (group.configs or group.plugins):
+                result[module] = stale
+        return result
 
     def snapshot_runtime_values(self) -> tuple[dict, dict[str, dict[str, Any]]]:
         """Capture mutable config values for transactional runtime reloads."""

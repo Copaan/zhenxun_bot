@@ -1,8 +1,7 @@
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 import nonebot
 from nonebot_plugin_apscheduler import scheduler
-import pytz
 
 from zhenxun.configs.config import Config
 from zhenxun.models.chat_history import ChatHistory
@@ -11,6 +10,7 @@ from zhenxun.services.bot_group_policy import bot_group_policy_service
 from zhenxun.services.log import logger
 from zhenxun.services.message_load import should_pause_db_tasks
 from zhenxun.utils.platform import PlatformUtils
+from zhenxun.utils.time_utils import TimeUtils
 
 Config.add_plugin_config(
     "chat_check",
@@ -54,7 +54,7 @@ async def _():
                         .first()
                     )
                     if last_message:
-                        now = datetime.now(pytz.timezone("Asia/Shanghai"))
+                        now = TimeUtils.now()
                         if now - timedelta(days=2) > last_message.create_time:
                             await bot_group_policy_service.set_features(
                                 PlatformUtils.get_storage_bot_id(bot),

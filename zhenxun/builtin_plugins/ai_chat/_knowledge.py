@@ -64,6 +64,20 @@ def _image_ext(data: bytes) -> str:
     return ".jpg" if fmt == "jpeg" else f".{fmt}"
 
 
+def _split_tokens(text: str, size: int, overlap: int) -> list[tuple[str, str]]:
+    """切分文本并对每个分块分词
+
+    参数:
+        text: 文本
+        size: 分块大小
+        overlap: 重叠字数
+
+    返回:
+        list[tuple[str, str]]: (分块, 用空格连接的分词结果)
+    """
+    return [(p, " ".join(tokenize(p))) for p in split_text(text, size, overlap)]
+
+
 def _titled(doc: AIKnowledgeDoc, content: str) -> str:
     """计算向量时在内容前加上文档名"""
     return f"《{doc.filename}》\n{content}"
@@ -390,19 +404,21 @@ class KnowledgeManage:
     async def _text_chunks(
         cls, kb: AIKnowledgeBase, doc: AIKnowledgeDoc, text: str
     ) -> list[AIKnowledgeChunk]:
-        """切分文本并计算向量，返回未保存的分块"""
-        pieces = split_text(text, kb.chunk_size, kb.chunk_overlap)
-        vectors = await cls._embed(kb, [_titled(doc, p) for p in pieces])
+        """在线程中切分文本并分词，计算向量后返回未保存的分块"""
+        pieces = await asyncio.to_thread(
+            _split_tokens, text, kb.chunk_size, kb.chunk_overlap
+        )
+        vectors = await cls._embed(kb, [_titled(doc, p) for p, _ in pieces])
         return [
             AIKnowledgeChunk(
                 kb_id=kb.id,
                 doc_id=doc.id,
                 seq=i,
                 content=piece,
-                tokens=" ".join(tokenize(piece)),
+                tokens=tokens,
                 vector=vector,
             )
-            for i, (piece, vector) in enumerate(zip(pieces, vectors))
+            for i, ((piece, tokens), vector) in enumerate(zip(pieces, vectors))
         ]
 
     @classmethod

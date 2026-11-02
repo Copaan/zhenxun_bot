@@ -32,6 +32,7 @@ _MEDIA_NAMES = {
     VideoPart: "视频",
     FilePart: "文件",
 }
+_CONTENT_PART = TypeAdapter(LLMContentPart)
 
 
 def is_summary(message: LLMMessage) -> bool:
@@ -101,7 +102,6 @@ class DBMessageSerializer:
         """反序列化数据库中的 JSON 数据为 LLMMessage 消息内容部件列表"""
         content_parts: list[LLMContentPart] = []
         if isinstance(content_raw, list):
-            adapter = TypeAdapter(LLMContentPart)
             for p in content_raw:
                 if isinstance(p, dict):
                     for k in list(p.keys()):
@@ -110,7 +110,7 @@ class DBMessageSerializer:
                             if orig_k in p and isinstance(p[orig_k], str):
                                 p[orig_k] = base64.b64decode(p[orig_k])
                             p.pop(k, None)
-                    content_parts.append(adapter.validate_python(p))
+                    content_parts.append(_CONTENT_PART.validate_python(p))
         elif isinstance(content_raw, str):
             content_parts.append(TextPart(text=content_raw))
         return content_parts

@@ -17,7 +17,6 @@ from nonebot_plugin_alconna import (
 )
 from nonebot_plugin_uninfo import Uninfo
 
-from zhenxun.configs.config import Config
 from zhenxun.models.scheduled_job import ScheduledJob
 from zhenxun.services import scheduler_manager
 from zhenxun.services.scheduler.registry import scheduler_registry
@@ -61,7 +60,6 @@ def parse_daily_time(time_str: str) -> dict:
             "day": "*",
             "month": "*",
             "day_of_week": "*",
-            "timezone": Config.get_config("SchedulerManager", "SCHEDULER_TIMEZONE"),
         }
         if second is not None:
             if not (0 <= int(second) <= 59):

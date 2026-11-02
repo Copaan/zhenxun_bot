@@ -1,12 +1,21 @@
+import asyncio
+import hashlib
 import os
 from pathlib import Path
 import shutil
-from typing import Any
+import time
+from typing import Any, Literal
 
 import aiofiles
-from fastapi import APIRouter, Request
+from cryptography import x509
+from cryptography.exceptions import UnsupportedAlgorithm
+from cryptography.hazmat.primitives import serialization
+from dotenv import dotenv_values
+from fastapi import APIRouter, File, Form, Request, UploadFile
 from fastapi.responses import JSONResponse
 
+from zhenxun.configs.environment import environment_file
+from zhenxun.configs.path_config import DATA_PATH
 from zhenxun.services.lifecycle import lifecycle_kernel
 from zhenxun.services.startup import startup_coordinator
 from zhenxun.utils._build_image import BuildImage
@@ -39,6 +48,16 @@ router = APIRouter(prefix="/system")
 router.include_router(configuration_router)
 router.include_router(update_router)
 router.include_router(restart_router)
+
+TLS_DIR = DATA_PATH / "web_ui" / "tls"
+"""WebUI 上传的 HTTPS 证书与私钥目录"""
+TLS_MAX_SIZE = 1024 * 1024
+TLS_ENV_KEYS = (
+    "WEBUI_TLS_CERTFILE",
+    "WEBUI_TLS_KEYFILE",
+    "QQ_WEBHOOK_TLS_CERTFILE",
+    "QQ_WEBHOOK_TLS_KEYFILE",
+)
 
 
 def _with_http_compat_degradation(value: dict[str, Any]) -> dict[str, Any]:
@@ -394,6 +413,79 @@ async def _(full_path: str) -> Result[str]:
         return Result.ok(BuildImage.open(path).pic2bs4())
     except Exception as e:
         return Result.warning_(f"获取图片失败: {e!s}")
+
+
+def _check_tls_file(kind: str, data: bytes) -> str | None:
+    """检查上传的证书或私钥是否为可用的 PEM
+
+    参数:
+        kind: cert 为证书，key 为私钥
+        data: 文件内容
+
+    返回:
+        str | None: 错误信息，可用时为 None
+    """
+    try:
+        if kind == "cert":
+            x509.load_pem_x509_certificates(data)
+        else:
+            serialization.load_pem_private_key(data, password=None)
+    except TypeError:
+        return "私钥已加密，请上传未加密的 PEM 私钥"
+    except (ValueError, UnsupportedAlgorithm):
+        name = "证书" if kind == "cert" else "私钥"
+        return f"{name}不是有效的 PEM 文件，请选择 PEM 格式（如 Nginx 版本）的{name}"
+    return None
+
+
+def _save_tls_file(kind: str, data: bytes) -> Path:
+    """按内容哈希保存证书或私钥，并清理超过一天且未被环境配置引用的旧文件
+
+    参数:
+        kind: cert 为证书，key 为私钥
+        data: 文件内容
+
+    返回:
+        Path: 保存后的绝对路径
+    """
+    TLS_DIR.mkdir(parents=True, exist_ok=True)
+    path = (TLS_DIR / f"{kind}-{hashlib.sha256(data).hexdigest()[:16]}.pem").resolve()
+    temp = path.with_suffix(".part")
+    temp.write_bytes(data)
+    if os.name != "nt":
+        temp.chmod(0o600)
+    os.replace(temp, path)
+    values = dotenv_values(environment_file())
+    used = {
+        Path(str(values[key])).expanduser().resolve()
+        for key in TLS_ENV_KEYS
+        if values.get(key)
+    }
+    expire = time.time() - 24 * 3600
+    for old in TLS_DIR.glob("*.pem"):
+        old = old.resolve()
+        if old != path and old not in used and old.stat().st_mtime < expire:
+            old.unlink(missing_ok=True)
+    return path
+
+
+@router.post(
+    "/tls/upload",
+    dependencies=[authentication()],
+    response_model=Result[dict],
+    response_class=JSONResponse,
+    description="上传 HTTPS 证书或私钥",
+)
+async def _(
+    kind: Literal["cert", "key"] = Form(...), file: UploadFile = File(...)
+) -> Result[dict]:
+    data = await file.read(TLS_MAX_SIZE + 1)
+    if len(data) > TLS_MAX_SIZE:
+        return Result.fail("文件超过 1MB，请确认选择的是证书或私钥文件")
+    if error := _check_tls_file(kind, data):
+        return Result.fail(error)
+    path = await asyncio.to_thread(_save_tls_file, kind, data)
+    return Result.ok({"path": str(path)}, info="已上传")
 
 
 @router.get(

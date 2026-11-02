@@ -101,9 +101,7 @@ def row_style(column: str, text: str) -> RowStyle:
 
 
 class StoreManager:
-    _catalog_files: ClassVar[
-        dict[str | None, tuple[float, list[set[str]], list[str]]]
-    ] = {}
+    _catalog_files: ClassVar[dict[RepoType, tuple[float, set[str] | None]]] = {}
     _SOURCE_NAMES: ClassVar[dict[RepoType, str]] = {
         RepoType.ALIYUN: "阿里云",
         RepoType.GITHUB: "GitHub",
@@ -221,45 +219,31 @@ class StoreManager:
     @classmethod
     @core_network_operation
     async def catalog_files(
-        cls, *, refresh: bool = False, source: str | None = None
-    ) -> tuple[list[set[str]], list[str]]:
-        """并发列出各下载源官方仓库中的文件，成功结果缓存 5 分钟，失败结果缓存 1 分钟
+        cls, repo_type: RepoType, *, refresh: bool = False
+    ) -> set[str] | None:
+        """列出下载源中官方仓库的文件，成功结果缓存 5 分钟，失败结果缓存 1 分钟
 
         参数:
+            repo_type: 下载源
             refresh: 是否忽略缓存重新拉取
-            source: 下载源，ali / git，为空时同时列出阿里云和 GitHub
 
         返回:
-            tuple[list[set[str]], list[str]]: 成功源的文件集合，失败源的错误类型
+            set[str] | None: 文件路径集合，列出失败时为 None
         """
         now = time.monotonic()
-        cached = cls._catalog_files.get(source)
-        if not refresh and cached:
-            checked_at, source_files, source_errors = cached
-            if now - checked_at < (60 if source_errors else 5 * 60):
-                return source_files, source_errors
-        results = await asyncio.gather(
-            *(
-                RepoFileManager.list_directory_files(
-                    DEFAULT_GITHUB_URL, "", "main", repo_type=repo_type
-                )
-                for repo_type in cls._get_source_order(source)
-            ),
-            return_exceptions=True,
-        )
-        source_files: list[set[str]] = []
-        source_errors: list[str] = []
-        for files in results:
-            if isinstance(files, BaseException):
-                if not isinstance(files, Exception):
-                    raise files
-                source_errors.append(type(files).__name__)
-                continue
-            source_files.append(
-                {Path(file.path).as_posix() for file in files if not file.is_dir}
+        if not refresh and (cached := cls._catalog_files.get(repo_type)):
+            checked_at, files = cached
+            if now - checked_at < (5 * 60 if files is not None else 60):
+                return files
+        try:
+            listed = await RepoFileManager.list_directory_files(
+                DEFAULT_GITHUB_URL, "", "main", repo_type=repo_type
             )
-        cls._catalog_files[source] = (now, source_files, source_errors)
-        return source_files, source_errors
+            files = {Path(file.path).as_posix() for file in listed if not file.is_dir}
+        except Exception:
+            files = None
+        cls._catalog_files[repo_type] = (now, files)
+        return files
 
     @classmethod
     async def catalog_health(
@@ -269,47 +253,49 @@ class StoreManager:
         refresh: bool = False,
         source: str | None = None,
     ) -> dict[str, dict[str, Any]]:
-        """检查官方插件在下载源目录中是否存在
+        """按下载顺序检查官方插件在下载源目录中是否存在，前面的源已包含全部插件时
+        不再列出后面的源
 
         参数:
             plugins: 插件信息
             refresh: 是否忽略缓存重新检查
-            source: 检查的下载源，ali / git，为空时检查阿里云和 GitHub
+            source: 检查的下载源，ali / git，为空时先阿里云后 GitHub
 
         返回:
             dict[str, dict[str, Any]]: 模块名: 检查结果
         """
-        source_files, source_errors = await cls.catalog_files(
-            refresh=refresh, source=source
-        )
-        all_sources_checked = not source_errors
-        result = {}
+        result: dict[str, dict[str, Any]] = {}
+        expected: dict[str, str] = {}
         for plugin in plugins:
             if plugin.github_url not in {None, DEFAULT_GITHUB_URL} or plugin.ali_url:
                 result[plugin.module] = {"status": "unknown", "reason": None}
                 continue
             module_path = plugin.module_path.replace(".", "/").strip("/")
-            expected = (
+            expected[plugin.module] = (
                 f"{module_path}/__init__.py" if plugin.is_dir else f"{module_path}.py"
             )
-            available = any(expected in files for files in source_files)
-            result[plugin.module] = {
-                "status": (
-                    "available"
-                    if available
-                    else "missing"
-                    if all_sources_checked
-                    else "unknown"
-                ),
-                "reason": (
-                    None
-                    if available
-                    else "catalog_source_missing"
-                    if all_sources_checked
-                    else "catalog_health_unavailable"
-                ),
-                "expected_path": expected,
-                "failed_sources": source_errors,
+        found: set[str] = set()
+        failed: list[str] = []
+        for repo_type in cls._get_source_order(source):
+            if len(found) == len(expected):
+                break
+            files = await cls.catalog_files(repo_type, refresh=refresh)
+            if files is None:
+                failed.append(repo_type.value)
+                continue
+            found.update(module for module, path in expected.items() if path in files)
+        for module, path in expected.items():
+            if module in found:
+                status, reason = "available", None
+            elif failed:
+                status, reason = "unknown", "catalog_health_unavailable"
+            else:
+                status, reason = "missing", "catalog_source_missing"
+            result[module] = {
+                "status": status,
+                "reason": reason,
+                "expected_path": path,
+                "failed_sources": failed,
             }
         return result
 
@@ -1099,7 +1085,7 @@ class StoreManager:
         *,
         operation_id: str | None = None,
     ) -> dict[str, Any]:
-        """卸载并删除插件，无法热卸载的插件写入待重启事务，重启后删除
+        """卸载并删除插件及只属于它的配置组，无法热卸载的插件写入待重启事务，重启后删除
 
         参数:
             plugin_info: 插件信息
@@ -1109,6 +1095,9 @@ class StoreManager:
         返回:
             dict[str, Any]: 操作结果
         """
+        from nonebot import get_loaded_plugins
+
+        from zhenxun.configs.config import Config
         from zhenxun.services.plugin_host import ApplyMode, plugin_host
 
         path = cls._resolve_local_plugin_path(plugin_info)
@@ -1157,6 +1146,15 @@ class StoreManager:
             "reason": None,
             "generation": plugin_host.generation,
         }
+        config_groups = Config.plugin_groups(
+            {plugin_info.module, module.rsplit(".", 1)[-1]}
+            | {
+                plugin.name
+                for plugin in get_loaded_plugins()
+                if plugin.module_name == module
+                or plugin.module_name.startswith(f"{module}.")
+            }
+        )
         if loaded:
             runtime = await plugin_host.unload_plugin(module)
             operation = runtime.public_dict()
@@ -1176,6 +1174,7 @@ class StoreManager:
                 raise
         if pending_reason:
             plugin_host.clear_pending_restart(pending_reason)
+        Config.remove_groups(config_groups)
         StoreReceiptStore.delete(store_key)
         await PluginInitManager.remove(plugin_info.module_path)
         for plugin_record in await PluginInfo.get_plugins(

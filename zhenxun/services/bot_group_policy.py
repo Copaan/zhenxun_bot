@@ -143,6 +143,19 @@ class BotGroupPolicyService:
         self._stale.update(keys)
         self._stale_marks += 1
 
+    def forget_bot(self, bot_id):
+        """移除账号已加载的群聊与私聊策略和已知群
+
+        参数:
+            bot_id: 账号
+        """
+        bot_id = str(bot_id)
+        for store in (self._policies, self._revisions):
+            for key in [key for key in store if key[0] == bot_id]:
+                store.pop(key, None)
+        self._stale = {key for key in self._stale if key[0] != bot_id}
+        self._memberships = {key for key in self._memberships if key[0] != bot_id}
+
     def mark_all_stale(self):
         """将已加载的群聊与私聊策略全部标记为待刷新，使用前从数据库重新读取"""
         self.mark_stale(*self._policies)

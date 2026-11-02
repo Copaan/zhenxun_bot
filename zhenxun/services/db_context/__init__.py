@@ -64,7 +64,7 @@ def get_config(endpoint=None) -> dict:
                 "default_connection": "default",
             }
         },
-        "timezone": "Asia/Shanghai",
+        "timezone": BotConfig.timezone,
     }
 
     from zhenxun.configs.database import DatabaseConnection
@@ -107,9 +107,12 @@ async def init():
         import zhenxun.models.ai_knowledge_base
         import zhenxun.models.ai_knowledge_chunk
         import zhenxun.models.ai_knowledge_doc
+        import zhenxun.models.ai_memory
+        import zhenxun.models.ai_memory_cursor
         import zhenxun.models.ai_model_stat
         import zhenxun.models.ai_persona
         import zhenxun.models.ai_sticker
+        import zhenxun.models.ai_sticker_block
         import zhenxun.models.ai_token_usage  # noqa: F401
         from zhenxun.models.chat_history import ensure_chat_history_nullable_columns
         from zhenxun.models.group_plugin_setting import (

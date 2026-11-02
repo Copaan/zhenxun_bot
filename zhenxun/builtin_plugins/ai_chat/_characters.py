@@ -28,7 +28,7 @@ from zhenxun.utils.http_utils import get_async_client
 
 from ._char_local import TAGGERS, Candidate, LocalModels, normalize
 from ._data_source import MODULE
-from ._stickers import _image_source, _locate
+from ._tools import image_source, locate_images, pick_images
 
 TIERS = ("off", "cloud", "lite", "full")
 """识别档位"""
@@ -42,6 +42,8 @@ MIN_SIZE = 256
 """长边小于该像素的图片不识别"""
 IMAGE_MAX_BYTES = 10 * 1024 * 1024
 """识别图片的最大字节数"""
+RECOGNIZE_CONCURRENCY = 2
+"""一次识别多张图片时同时识别的张数"""
 BANGUMI = "https://api.bgm.tv"
 BANGUMI_TTL = 7 * 86400
 """Bangumi 资料缓存秒数"""
@@ -137,12 +139,12 @@ def _tag(name: str) -> str:
     return name.strip().lower().replace(" ", "_")
 
 
-async def _saucenao(client: httpx.AsyncClient, data: bytes) -> list[Candidate]:
+async def _saucenao(client: httpx.AsyncClient, jpeg: bytes) -> list[Candidate]:
     key = str(Config.get_config(MODULE, "CHARACTER_SAUCENAO_KEY") or "")
     response = await client.post(
         "https://saucenao.com/search.php",
         params={"output_type": 2, "api_key": key, "db": 999, "numres": 6},
-        files={"file": ("image.jpg", _jpeg(data), "image/jpeg")},
+        files={"file": ("image.jpg", jpeg, "image/jpeg")},
     )
     body = response.json()
     status = (body.get("header") or {}).get("status", 0)
@@ -166,10 +168,10 @@ async def _saucenao(client: httpx.AsyncClient, data: bytes) -> list[Candidate]:
     return list(best.values())
 
 
-async def _dio(client: httpx.AsyncClient, data: bytes) -> list[Candidate]:
+async def _dio(client: httpx.AsyncClient, jpeg: bytes) -> list[Candidate]:
     response = await client.post(
         "https://dio.jite.me/api/recognize",
-        files={"file": ("image.jpg", _jpeg(data), "image/jpeg")},
+        files={"file": ("image.jpg", jpeg, "image/jpeg")},
     )
     response.raise_for_status()
     result = []
@@ -188,11 +190,11 @@ async def _dio(client: httpx.AsyncClient, data: bytes) -> list[Candidate]:
     return result
 
 
-async def _animetrace(client: httpx.AsyncClient, data: bytes) -> list[Candidate]:
+async def _animetrace(client: httpx.AsyncClient, jpeg: bytes) -> list[Candidate]:
     response = await client.post(
         "https://api.animetrace.com/v1/search",
         data={"is_multi": 1, "ai_detect": 0, "model": "animetrace-yuri-4.2"},
-        files={"file": ("image.jpg", _jpeg(data), "image/jpeg")},
+        files={"file": ("image.jpg", jpeg, "image/jpeg")},
     )
     body = response.json()
     if body.get("code") not in (0, 200, 17720):
@@ -212,7 +214,7 @@ async def _animetrace(client: httpx.AsyncClient, data: bytes) -> list[Candidate]
 
 
 CLOUD = {"saucenao": _saucenao, "dio": _dio, "animetrace": _animetrace}
-"""云端来源"""
+"""云端来源，参数为客户端与压缩后的 JPEG"""
 
 
 def fuse(
@@ -272,7 +274,7 @@ class CharacterRecognizer:
     async def recognize(
         cls, data: bytes, level: str | None = None, use_cache: bool = True
     ) -> Recognition:
-        """识别图片中的角色
+        """识别图片中的角色，上传云端的 JPEG 在线程中压缩一次后供各云端来源共用
 
         参数:
             data: 图片
@@ -293,13 +295,25 @@ class CharacterRecognizer:
         if level == "off":
             return Recognition([])
         has_key = bool(Config.get_config(MODULE, "CHARACTER_SAUCENAO_KEY"))
+        cloud = [
+            key
+            for key in CLOUD
+            if config[key]["enabled"] and (key != "saucenao" or has_key)
+        ]
+        failed: list[tuple[str, list[Candidate], dict[str, Any]]] = []
+        jpeg = b""
+        if cloud:
+            try:
+                jpeg = await asyncio.to_thread(_jpeg, data)
+            except Exception as e:
+                error = str(e) or type(e).__name__
+                failed = [(key, [], {"ms": 0, "error": error}) for key in cloud]
+                cloud = []
         async with get_async_client(
             headers={"User-Agent": USER_AGENT}, timeout=CLOUD_TIMEOUT + 2
         ) as client:
             jobs = [
-                cls._run(key, func(client, data), CLOUD_TIMEOUT)
-                for key, func in CLOUD.items()
-                if config[key]["enabled"] and (key != "saucenao" or has_key)
+                cls._run(key, CLOUD[key](client, jpeg), CLOUD_TIMEOUT) for key in cloud
             ]
             local = level in TAGGERS and (
                 config["tagger"]["enabled"] or config["library"]["enabled"]
@@ -308,7 +322,7 @@ class CharacterRecognizer:
                 jobs.append(
                     cls._run("local", LocalModels.recognize(data, level), LOCAL_TIMEOUT)
                 )
-            results = await asyncio.gather(*jobs)
+            results = failed + list(await asyncio.gather(*jobs))
         candidates: list[Candidate] = []
         sources = []
         for key, result, info in results:
@@ -374,7 +388,8 @@ class CharacterRecognizer:
 
     @classmethod
     async def character_info(cls, name: str, work: str = "") -> str | None:
-        """从 Bangumi 查询角色资料，按作品过滤同名角色，结果缓存 7 天
+        """从 Bangumi 查询角色资料，按作品过滤同名角色，结果缓存 7 天，
+        写入缓存时丢弃过期的资料
 
         参数:
             name: 角色名
@@ -412,7 +427,10 @@ class CharacterRecognizer:
                     found = (item, works)
                     break
         text = _format_character(*found) if found else ""
-        cls._info[key] = (time.time(), text)
+        cls._info.pop(key, None)
+        cls._info[key] = (now := time.time(), text)
+        while next(iter(cls._info.values()))[0] < now - BANGUMI_TTL:
+            del cls._info[next(iter(cls._info))]
         return text or None
 
 
@@ -476,35 +494,64 @@ class CharacterToolkit(BaseToolkit):
         name="recognize_character",
         description=(
             "识别图片里的动漫 / 游戏角色。只在需要知道图中是谁时调用，"
-            "message_id 为空时取当前消息（或它引用的消息）里的图片。"
-            "结果是候选列表，可能有误。"
+            "message_id 为空时取当前消息（或它引用的消息）里的图片；"
+            "indexes 是要识别第几张图片（从 1 开始），为空时识别全部，"
+            "多张图片一次调用即可。结果是候选列表，可能有误。"
         ),
     )
     async def recognize_character(
-        self, context: RunContext, message_id: str = ""
+        self,
+        context: RunContext,
+        message_id: str = "",
+        indexes: list[int] | None = None,
     ) -> ToolResult:
-        located = await _locate(context, message_id.strip().lstrip("#"))
+        located = await locate_images(context, message_id.strip().lstrip("#"))
         if isinstance(located, str):
             return ToolResult(output=located).as_error()
-        raw, url, _ = _image_source(located[0])
+        picked = pick_images(located[0], indexes)
+        if isinstance(picked, str):
+            return ToolResult(output=picked).as_error()
+        semaphore = asyncio.Semaphore(RECOGNIZE_CONCURRENCY)
+
+        async def run(segment) -> tuple[str, bool]:
+            async with semaphore:
+                return await self._recognize_one(segment)
+
+        results = await asyncio.gather(*(run(segment) for _, segment in picked))
+        lines = [
+            f"第 {index} 张：{text}" if len(picked) > 1 else text
+            for (index, _), (text, _) in zip(picked, results)
+        ]
+        result = ToolResult(output="\n".join(lines))
+        return result if any(ok for _, ok in results) else result.as_error(False)
+
+    @staticmethod
+    async def _recognize_one(segment) -> tuple[str, bool]:
+        """识别一张图片
+
+        参数:
+            segment: 图片消息段
+
+        返回:
+            tuple[str, bool]: 识别说明或失败原因、是否完成识别
+        """
+        raw, url, _ = image_source(segment)
         if raw is None:
             if not url:
-                return ToolResult(output="读取不到这张图片。").as_error()
+                return "读取不到这张图片。", False
             try:
                 raw = await fetch_media(
                     url, max_bytes=IMAGE_MAX_BYTES, allow_private=True
                 )
             except MediaFetchError as e:
                 logger.debug(f"下载识别图片失败: {e}", "AI角色识别")
-                return ToolResult(
-                    output="图片太大。" if e.too_large else "图片下载失败。"
-                ).as_error(False)
+                return ("图片太大。" if e.too_large else "图片下载失败。"), False
         if not _large(raw):
-            return ToolResult(output="图片太小，无法识别。").as_error(False)
+            return "图片太小，无法识别。", False
         result = await CharacterRecognizer.recognize(raw)
         if not result.ran:
-            return ToolResult(output="角色识别暂时不可用。").as_error(False)
-        return ToolResult(output=CharacterRecognizer.note(result))
+            return "角色识别暂时不可用。", False
+        return CharacterRecognizer.note(result), True
 
     @tool(
         name="character_info",

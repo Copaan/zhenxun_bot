@@ -15,6 +15,13 @@ from PIL import Image
 
 TEXT_TYPES = {".txt", ".md", ".markdown", ".html", ".htm", ".csv", ".json", ".epub"}
 """只依赖标准库即可解析的类型"""
+PLAIN_TYPES = {
+    *(".log", ".ini", ".cfg", ".conf", ".toml", ".yaml", ".yml", ".xml", ".srt"),
+    *(".py", ".js", ".ts", ".tsx", ".jsx", ".vue", ".java", ".kt", ".go", ".rs"),
+    *(".c", ".h", ".cpp", ".hpp", ".cs", ".php", ".rb", ".lua", ".sh", ".bat"),
+    *(".ps1", ".sql", ".css", ".scss", ".tex", ".rst", ".properties"),
+}
+"""聊天中按纯文本读取的代码、配置与日志类型"""
 DOC_TYPES = {".docx", ".xlsx", ".pptx", ".pdf"}
 """需要安装文档解析组件的类型"""
 IMAGE_TYPES = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
@@ -337,7 +344,7 @@ def parse(data: bytes, ext: str, extract_images: bool = False) -> Parsed:
             return Parsed(_parse_docx(data), images)
         images = _zip_images(data, "ppt/media/") if extract_images else []
         return Parsed(_parse_pptx(data), images)
-    if ext not in TEXT_TYPES:
+    if ext not in TEXT_TYPES | PLAIN_TYPES:
         raise ValueError(f"不支持的文件类型：{ext or '无扩展名'}")
     if ext == ".epub":
         return Parsed(_parse_epub(data))

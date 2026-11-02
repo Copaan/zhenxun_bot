@@ -20,7 +20,6 @@ import nonebot
 from nonebot.adapters import Bot
 from pydantic import BaseModel, ValidationError
 
-from zhenxun.configs.config import Config
 from zhenxun.models.scheduled_job import ScheduledJob
 from zhenxun.services.log import logger
 from zhenxun.utils.pydantic_compat import dump_json_safely, model_dump, model_validate
@@ -379,7 +378,6 @@ class SchedulerManager:
             "hour": hour,
             "minute": minute,
             "second": second,
-            "timezone": Config.get_config("SchedulerManager", "SCHEDULER_TIMEZONE"),
         }
 
         trigger = Trigger.cron(**trigger_config)

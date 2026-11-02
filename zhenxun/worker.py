@@ -144,6 +144,9 @@ def run_worker(project_root: Path) -> None:
 
     from zhenxun.adapters.onebot_managed import ManagedOneBotAdapter as OneBotV11Adapter
     from zhenxun.configs.config import BotConfig
+    from zhenxun.utils.time_utils import apply_process_timezone
+
+    apply_process_timezone(BotConfig.timezone)
 
     driver = nonebot.get_driver()
     driver.register_adapter(OneBotV11Adapter)
@@ -185,6 +188,11 @@ def run_worker(project_root: Path) -> None:
         "nonebot_plugin_waiter",
     ):
         nonebot.require(library_plugin)
+    from zoneinfo import ZoneInfo
+
+    from nonebot_plugin_apscheduler import scheduler
+
+    scheduler.timezone = ZoneInfo(BotConfig.timezone)
     from nonebot_plugin_uninfo.adapters import alter_get_fetcher
 
     for adapter in nonebot.get_adapters().values():

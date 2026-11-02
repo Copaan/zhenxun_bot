@@ -6,6 +6,7 @@ from .configuration import router as configuration_router
 from .console import router as console_router
 from .knowledge import router as knowledge_router
 from .mcp import router as mcp_router
+from .memory import router as memory_router
 from .proactive import router as proactive_router
 from .probe import router as probe_router
 from .sandbox import router as sandbox_router
@@ -24,6 +25,7 @@ router.include_router(console_router)
 router.include_router(stats_router)
 router.include_router(social_router)
 router.include_router(knowledge_router)
+router.include_router(memory_router)
 router.include_router(characters_router)
 router.include_router(mcp_router)
 

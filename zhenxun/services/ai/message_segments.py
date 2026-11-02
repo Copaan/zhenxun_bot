@@ -36,9 +36,9 @@ FORWARD_MAX_DEPTH = 6
 """合并转发最多展开的嵌套层数"""
 FORWARD_MAX_CALLS = 8
 """单条消息内最多调用 get_forward_msg 的次数"""
-FORWARD_MAX_NODES = 30
+FORWARD_MAX_NODES = 60
 """每个合并转发最多展开的消息条数"""
-FORWARD_MAX_MEDIA = 4
+FORWARD_MAX_MEDIA = 9
 """每个合并转发内保留为媒体的图片、语音、视频数量，超出部分改为占位文字"""
 
 QQ_VOICE_CACHE_SIZE = 512
@@ -327,13 +327,18 @@ async def _read_file(seg: File) -> TextPart | None:
     """
     from zhenxun.services.ai.config import get_llm_config
     from zhenxun.services.ai.core.templates import wrap_untrusted
-    from zhenxun.services.ai.utils.doc_parse import DOC_TYPES, TEXT_TYPES, parse
+    from zhenxun.services.ai.utils.doc_parse import (
+        DOC_TYPES,
+        PLAIN_TYPES,
+        TEXT_TYPES,
+        parse,
+    )
     from zhenxun.services.ai.utils.utils import MediaFetchError, fetch_media
 
     limit = get_llm_config().context_settings.file_max_chars
     name = seg.name or ""
     ext = Path(name).suffix.lower()
-    if not limit or ext not in TEXT_TYPES | DOC_TYPES:
+    if not limit or ext not in TEXT_TYPES | DOC_TYPES | PLAIN_TYPES:
         return None
     data = seg.raw if isinstance(seg.raw, bytes) else None
     try:

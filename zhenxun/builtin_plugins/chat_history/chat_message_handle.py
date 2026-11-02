@@ -13,7 +13,6 @@ from nonebot_plugin_alconna import (
     store_true,
 )
 from nonebot_plugin_session import EventSession
-import pytz
 
 from zhenxun import ui
 from zhenxun.configs.config import Config
@@ -26,6 +25,7 @@ from zhenxun.services.log import logger
 from zhenxun.ui.models import ImageCell, TextCell
 from zhenxun.utils.enum import PluginType
 from zhenxun.utils.message import MessageUtils
+from zhenxun.utils.time_utils import TimeUtils
 
 __plugin_meta__ = PluginMetadata(
     name="消息统计",
@@ -178,9 +178,9 @@ async def _(
         if not date_scope:
             first_msg_time = await ChatHistory.get_group_first_msg_datetime(group_id)
             if first_msg_time:
-                date_scope_start = first_msg_time.astimezone(
-                    pytz.timezone("Asia/Shanghai")
-                ).replace(microsecond=0)
+                date_scope_start = first_msg_time.astimezone(TimeUtils.zone()).replace(
+                    microsecond=0
+                )
                 date_str = f"{str(date_scope_start).split('+')[0]} - 至今"
             else:
                 date_str = f"{time_now.replace(microsecond=0)} - 至今"

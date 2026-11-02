@@ -3,7 +3,7 @@ import time
 from typing import Any
 
 from nonebot.adapters import Bot
-from nonebot_plugin_alconna import UniMessage
+from nonebot_plugin_alconna import Image, Other, Reply, Segment, UniMessage
 
 from zhenxun.models.chat_history import ChatHistory
 from zhenxun.models.group_member_info import GroupInfoUser
@@ -375,6 +375,95 @@ class GroupHistory:
             "（当前平台不提供成员资料，以上来自本地记录）",
         ]
         return lines
+
+
+MAX_IMAGES = 9
+"""一次工具调用最多处理的图片数"""
+
+
+def image_source(segment: Segment) -> tuple[bytes | None, str | None, str]:
+    """取图片或商城表情消息段的内容、地址和自带说明"""
+    if isinstance(segment, Image):
+        raw = segment.raw if isinstance(segment.raw, bytes) else None
+        return raw, segment.url, ""
+    origin = getattr(segment, "origin", None)
+    data = getattr(origin, "data", None) or {}
+    return None, data.get("url"), str(data.get("summary") or "").strip("[]")
+
+
+def _find_images(message: UniMessage) -> list[Segment]:
+    """找出消息中的全部图片与商城表情"""
+    return [
+        seg
+        for seg in message
+        if isinstance(seg, Image)
+        or (isinstance(seg, Other) and getattr(seg.origin, "type", "") == "mface")
+    ]
+
+
+async def locate_images(
+    context: RunContext, message_id: str
+) -> tuple[list[Segment], str | None] | str:
+    """找到要处理的图片：指定消息、当前消息或当前消息引用的消息中的全部图片
+
+    参数:
+        context: 运行上下文
+        message_id: 消息 id，为空时用当前消息
+
+    返回:
+        tuple[list[Segment], str | None] | str: 图片消息段与发送者，找不到时为原因
+    """
+    bot, group_id = context.get_bot(), context.get_group_id()
+    if bot is None:
+        return "当前不在会话中。"
+    candidates: list[tuple[UniMessage, str | None]] = []
+    if message_id:
+        if not group_id:
+            return "私聊中只能处理当前消息里的图片。"
+        found = await GroupHistory.message(bot, group_id, message_id)
+        if found is None:
+            return "当前群里没有找到这条消息。"
+        candidates.append((found[3], found[1]))
+    elif event := context.get_event():
+        message = UniMessage.of(event.get_message(), bot)
+        candidates.append((message, context.get_user_id()))
+        reply = getattr(event, "reply", None)
+        if reply is not None:
+            sender = getattr(getattr(reply, "sender", None), "user_id", None)
+            candidates.append(
+                (UniMessage.of(reply.message, bot), str(sender) if sender else None)
+            )
+        else:
+            replied = next((s for s in candidates[0][0] if isinstance(s, Reply)), None)
+            if replied and group_id:
+                found = await GroupHistory.message(bot, group_id, str(replied.id))
+                if found:
+                    candidates.append((found[3], found[1]))
+    for message, owner in candidates:
+        if segments := _find_images(message):
+            return segments, owner
+    return "这条消息里没有图片。"
+
+
+def pick_images(
+    segments: list[Segment], numbers: list[int] | None
+) -> list[tuple[int, Segment]] | str:
+    """按编号选出图片，编号从 1 开始，为空时选全部
+
+    参数:
+        segments: 消息中的图片
+        numbers: 图片编号
+
+    返回:
+        list[tuple[int, Segment]] | str: 编号与图片，编号超出范围时为原因
+    """
+    numbers = list(dict.fromkeys(numbers or range(1, len(segments) + 1)))
+    if bad := [n for n in numbers if not 1 <= n <= len(segments)]:
+        return (
+            f"这条消息里只有 {len(segments)} 张图片，没有第 "
+            f"{'、'.join(map(str, bad))} 张。"
+        )
+    return [(n, segments[n - 1]) for n in numbers[:MAX_IMAGES]]
 
 
 class QQToolkit(BaseToolkit):

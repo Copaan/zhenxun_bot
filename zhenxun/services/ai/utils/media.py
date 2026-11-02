@@ -2,6 +2,7 @@
 
 import asyncio
 import io
+import math
 from pathlib import Path
 import re
 import shutil
@@ -26,9 +27,9 @@ GIF_FRAMES = 9
 
 
 def compress_image(data: bytes, max_side: int) -> tuple[bytes, str, bool] | None:
-    """压缩发给模型的图片：长边不超过 max_side，有透明通道的存 PNG，否则存 JPEG
-    （质量 85），仍超过 512KB 时继续缩小；动图均匀抽 9 帧拼成 3×3。
-    已在限制内的 JPEG / PNG 不处理
+    """压缩发给模型的图片：长边不超过 max_side（长图按像素量放宽），有透明通道的
+    存 PNG，否则存 JPEG（质量 85），仍超过 512KB 时继续缩小；动图均匀抽 9 帧
+    拼成 3×3。已在限制内的 JPEG / PNG 原样返回并给出实际 MIME
 
     参数:
         data: 图片
@@ -36,13 +37,15 @@ def compress_image(data: bytes, max_side: int) -> tuple[bytes, str, bool] | None
 
     返回:
         tuple[bytes, str, bool] | None: (图片, MIME, 是否为动图拼图)，
-            无需处理或无法解析时为空
+            无法解析时为空
     """
     from PIL import Image, ImageOps
 
     try:
         img = Image.open(io.BytesIO(data))
         frames = getattr(img, "n_frames", 1)
+        width, height = img.size
+        bound = _long_side(width, height, max_side)
         if frames > 1:
             picks = sorted(
                 {round(i * (frames - 1) / (GIF_FRAMES - 1)) for i in range(GIF_FRAMES)}
@@ -62,16 +65,17 @@ def compress_image(data: bytes, max_side: int) -> tuple[bytes, str, bool] | None
         else:
             if (
                 img.format in ("JPEG", "PNG")
-                and max(img.size) <= max_side
+                and max(img.size) <= bound
                 and len(data) <= IMAGE_TARGET_BYTES
             ):
-                return None
+                return data, f"image/{img.format.lower()}", False
             img = ImageOps.exif_transpose(img)
             alpha = img.mode in ("RGBA", "LA", "PA") or (
                 img.mode == "P" and "transparency" in img.info
             )
             img = img.convert("RGBA" if alpha else "RGB")
-        side = max_side
+            bound = _long_side(*img.size, max_side)
+        side = bound
         while True:
             out = img.copy()
             out.thumbnail((side, side))
@@ -87,6 +91,24 @@ def compress_image(data: bytes, max_side: int) -> tuple[bytes, str, bool] | None
         logger.debug(f"图片压缩失败，使用原图: {e}")
         return None
     return buffer.getvalue(), "image/png" if alpha else "image/jpeg", frames > 1
+
+
+def _long_side(width: int, height: int, max_side: int) -> int:
+    """压缩后长边的上限：普通图片为 max_side；长宽比超过 2 的长图按
+    max_side² 的像素量计算，最多为 max_side 的 4 倍，避免长截图被压得太窄
+
+    参数:
+        width: 宽
+        height: 高
+        max_side: 长边上限
+
+    返回:
+        int: 长边上限
+    """
+    long, short = max(width, height), max(1, min(width, height))
+    if long / short <= 2:
+        return max_side
+    return min(max_side * 4, int(max_side * math.sqrt(long / short)))
 
 
 def ffmpeg_path() -> str | None:

@@ -47,6 +47,11 @@ _IMAGE = re.compile(r"image|vision|vlm|multimodal|多模态|图片|图像")
 _UNSUPPORTED = re.compile(
     r"not\s+support|unsupported|not\s+a\s+vlm|does\s*n[o']t|unknown variant|不支持"
 )
+_IMAGE_FORMAT = re.compile(
+    r"media.?type|mime|image.?format|unsupported image|invalid image|could not process"
+    r"|too large|exceeds|dimension|格式|过大"
+)
+"""图片本身格式、类型或尺寸不被接受的报错，不代表模型不能看图"""
 _THINKING = re.compile(r"thinking|budget_tokens|adaptive")
 _REASONING_FLIP = {
     "anthropic": {"adaptive": "budget", "budget": "adaptive"},
@@ -281,6 +286,7 @@ def adapt_route(
         and profile.accepts_input("image")
         and _IMAGE.search(text)
         and _UNSUPPORTED.search(text)
+        and not _IMAGE_FORMAT.search(text)
     ):
         _warn_or_record(
             route,

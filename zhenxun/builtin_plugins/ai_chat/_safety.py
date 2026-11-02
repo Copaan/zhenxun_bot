@@ -7,7 +7,7 @@ import asyncio
 from collections import deque
 import re
 import time
-from typing import ClassVar
+from typing import Any, ClassVar
 
 from zhenxun.configs.config import Config
 from zhenxun.services.log import logger
@@ -34,6 +34,23 @@ SECRET_PATTERNS = re.compile(
 """常见密钥格式"""
 MIN_SECRET = 8
 """参与泄漏检查的已配置密钥最短长度"""
+
+
+def prune(
+    times: dict[Any, deque[float]], now: float, window: float, keep: Any = ()
+) -> None:
+    """丢弃没有记录或最近一次记录已超出时间窗口的键
+
+    参数:
+        times: 键 -> 按时间先后排列的记录
+        now: 当前时间
+        window: 时间窗口秒数
+        keep: 不丢弃的键
+    """
+    stale = [k for k, v in times.items() if not v or now - v[-1] >= window]
+    for key in stale:
+        if key not in keep:
+            del times[key]
 
 
 def _secrets() -> set[str]:
@@ -136,10 +153,13 @@ class RateLimit:
 
     _times: ClassVar[dict[str, deque[float]]] = {}
     _notified: ClassVar[dict[str, float]] = {}
+    _swept: ClassVar[float] = 0
+    """上次清理过期用户的时间"""
 
     @classmethod
     def take(cls, user_id: str) -> str | None:
-        """记录一次唤醒，超出 USER_RATE_LIMIT 时返回提示
+        """记录一次唤醒，超出 USER_RATE_LIMIT 时返回提示；每分钟最多清理一次
+        超过一分钟没有唤醒的用户
 
         参数:
             user_id: 用户id
@@ -151,6 +171,11 @@ class RateLimit:
         if limit <= 0:
             return None
         now = time.time()
+        if now - cls._swept >= 60:
+            cls._swept = now
+            prune(cls._times, now, 60)
+            for key in [k for k, t in cls._notified.items() if now - t >= 60]:
+                del cls._notified[key]
         times = cls._times.setdefault(user_id, deque())
         while times and now - times[0] >= 60:
             times.popleft()
@@ -170,12 +195,15 @@ class SessionLimit:
     _times: ClassVar[dict[str, deque[float]]] = {}
     _waiting: ClassVar[dict[str, int]] = {}
     _queues: ClassVar[dict[str, asyncio.Lock]] = {}
+    _swept: ClassVar[float] = 0
+    """上次清理过期会话的时间"""
     QUEUE = 10
     """每个会话最多排队的消息数（含等待会话锁的运行）"""
 
     @classmethod
     async def acquire(cls, session_id: str) -> bool:
-        """占用一次 SESSION_RATE_LIMIT 名额，名额用完时按到达顺序等到有空位
+        """占用一次 SESSION_RATE_LIMIT 名额，名额用完时按到达顺序等到有空位；
+        每分钟最多清理一次超过一分钟没有对话且无人排队的会话
 
         参数:
             session_id: 会话id
@@ -192,6 +220,9 @@ class SessionLimit:
         limit = int(Config.get_config(MODULE, "SESSION_RATE_LIMIT") or 0)
         if limit <= 0:
             return True
+        if (now := time.monotonic()) - cls._swept >= 60:
+            cls._swept = now
+            prune(cls._times, now, 60, cls._waiting)
         cls._waiting[session_id] = waiting + 1
         try:
             async with cls._queues.setdefault(session_id, asyncio.Lock()):

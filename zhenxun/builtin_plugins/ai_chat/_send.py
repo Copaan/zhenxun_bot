@@ -17,7 +17,7 @@ from zhenxun.utils.platform import PlatformUtils
 from ._buffer import ChatBuffer, ChatLine
 from ._data_source import MODULE
 from ._reply import clean_markdown
-from ._safety import Safety
+from ._safety import Safety, prune
 from ._tools import GroupHistory
 
 SEND_MAX_MESSAGES = 5
@@ -120,6 +120,8 @@ class SendQuota:
     也用于收藏表情等其他按会话限速的操作"""
 
     _times: ClassVar[dict[tuple[str, str], deque[float]]] = {}
+    _swept: ClassVar[float] = 0
+    """上次清理过期会话的时间"""
 
     @classmethod
     def take(
@@ -128,14 +130,17 @@ class SendQuota:
         count: int = 1,
         per_minute: int | None = None,
         per_hour: int | None = None,
+        unit: str = "次",
     ) -> str | None:
-        """占用发送次数，超出每分钟或每小时上限时返回原因
+        """占用发送次数，超出每分钟或每小时上限时返回原因，原因中提示模型不要等待重试；
+        每小时最多清理一次超过一小时没有发送的会话
 
         参数:
             key: 会话键
             count: 次数
             per_minute: 每分钟上限，为空使用发送工具配置，0 为不限
             per_hour: 每小时上限，为空使用发送工具配置，0 为不限
+            unit: 原因中的计数单位
 
         返回:
             str | None: 超限原因，未超限为 None
@@ -145,19 +150,28 @@ class SendQuota:
         if per_hour is None:
             per_hour = int(Config.get_config(MODULE, "SEND_PER_HOUR") or 0)
         now = time.time()
+        if now - cls._swept >= 3600:
+            cls._swept = now
+            prune(cls._times, now, 3600)
         times = cls._times.setdefault(key, deque())
         while times and now - times[0] >= 3600:
             times.popleft()
         if per_minute and sum(now - t < 60 for t in times) + count > per_minute:
-            return f"太频繁了（每分钟最多 {per_minute} 次），过一会儿再试。"
+            return (
+                f"已达到每分钟 {per_minute} {unit}的上限，本轮不要等待或重试，"
+                "直接回复，告诉对方稍后再来。"
+            )
         if per_hour and len(times) + count > per_hour:
-            return f"这一小时的次数已用完（每小时最多 {per_hour} 次）。"
+            return (
+                f"已达到每小时 {per_hour} {unit}的上限，本轮不要等待或重试，"
+                "直接回复，告诉对方稍后再来。"
+            )
         times.extend([now] * count)
         return None
 
     @classmethod
     def refund(cls, key: tuple[str, str], count: int) -> None:
-        """退还未实际发送的次数
+        """退还未实际发送的次数，退完后丢弃该会话的记录
 
         参数:
             key: 会话键
@@ -166,6 +180,8 @@ class SendQuota:
         times = cls._times.get(key)
         for _ in range(min(count, len(times or ()))):
             times.pop()  # type: ignore
+        if times is not None and not times:
+            del cls._times[key]
 
 
 class QQSendToolkit(BaseToolkit):

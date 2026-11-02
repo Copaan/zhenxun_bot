@@ -3,9 +3,9 @@ import base64
 from collections.abc import Awaitable, Callable
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, ClassVar, TypeVar, cast
 
-from nonebot.adapters import Bot, Event
 from nonebot.adapters import Message as PlatformMessage
 from nonebot.matcher import current_bot, current_event, current_matcher
 from nonebot_plugin_alconna import UniMessage
@@ -53,6 +53,7 @@ SegmentHandler = Callable[
     [Any], Awaitable[LLMContentPart | list[LLMContentPart] | None]
 ]
 """消息段处理器：把一个 Uniseg 消息段转换为内容片段"""
+_USER_CONTENT = TypeAdapter(UserContentUnion)
 
 
 class MessageBuilder:
@@ -87,7 +88,7 @@ class MessageBuilder:
     async def _transform_to_content_part(cls, item: Any) -> UserContentUnion:
         """将任意输入项转换为符合 LLM 规范的内容部件"""
         if isinstance(item, BaseContentPart):
-            return TypeAdapter(UserContentUnion).validate_python(model_dump(item))
+            return _USER_CONTENT.validate_python(model_dump(item))
         if isinstance(item, str):
             return TextPart(text=item)
         raise TypeError(f"不支持的输入类型用于构建 ContentPart: {type(item)}")
@@ -145,41 +146,47 @@ class MessageBuilder:
         return merged_parts
 
     @classmethod
-    async def _fetch_reply_as_parts(
+    async def reply_to_parts(
         cls,
-        bot: "Bot",
-        event: "Event",
+        reply: Reply,
         namespace: str | None = None,
         allowed_modalities: set[str] | None = None,
     ) -> list[LLMContentPart] | None:
-        """获取并解析引用消息的内容片段"""
-        try:
-            orig_msg = await reply_fetch(event, bot)
-            if not orig_msg or not orig_msg.msg:
-                return None
+        """把引用消息转为内容片段，标出被引用者并与当前消息分隔；
+        引用段不带原消息时向适配器获取
 
-            orig_content = orig_msg.msg
-            if isinstance(orig_content, PlatformMessage):
-                uni_msg = UniMessage.of(orig_content)
-            else:
-                uni_msg = UniMessage.text(str(orig_content))
+        参数:
+            reply: 引用消息段
+            namespace: 插件命名空间
+            allowed_modalities: 允许的模态，为空时不限制
 
-            uni_msg = uni_msg.exclude(Reply)
-
-            parts = await cls.unimsg_to_llm_parts(
-                uni_msg, namespace=namespace, allowed_modalities=allowed_modalities
-            )
-            if not parts:
-                return None
-
-            if isinstance(parts[0], TextPart):
-                parts[0].text = f"[引用] {parts[0].text}"
-            else:
-                parts.insert(0, TextPart(text="[引用] "))
-            return cast(list[LLMContentPart], parts)
-        except Exception as e:
-            logger.debug(f"拉取引用消息失败: {e}")
+        返回:
+            list[LLMContentPart] | None: 内容片段，取不到原消息时为空
+        """
+        if reply.msg is None:
+            reply = await _fetch_reply(reply) or reply
+        if not reply.msg:
             return None
+        if isinstance(reply.msg, PlatformMessage):
+            uni_msg = UniMessage.of(reply.msg)
+        else:
+            uni_msg = UniMessage.text(str(reply.msg))
+        parts = await cls.unimsg_to_llm_parts(
+            uni_msg.exclude(Reply),
+            namespace=namespace,
+            allowed_modalities=allowed_modalities,
+        )
+        if not parts:
+            return None
+        sender = getattr(reply.origin, "sender", None)
+        user_id = getattr(sender, "user_id", None)
+        name = getattr(sender, "card", None) or getattr(sender, "nickname", None)
+        who = f" {name or user_id}({user_id}) 的消息" if user_id else "消息"
+        return [
+            TextPart(text=f"[引用{who}]\n"),
+            *cast(list[LLMContentPart], parts),
+            TextPart(text="\n[引用结束]\n"),
+        ]
 
     @classmethod
     async def normalize_to_llm_messages(
@@ -350,22 +357,21 @@ async def _handle_image(
     from zhenxun.services.ai.config import get_llm_config
     from zhenxun.services.ai.utils.media import compress_image
 
+    if "raw" not in kwargs and "path" not in kwargs:
+        return ImagePart(**kwargs)
+    try:
+        data = kwargs.get("raw") or await asyncio.to_thread(kwargs["path"].read_bytes)
+    except OSError as e:
+        logger.debug(f"读取图片失败: {e}")
+        return ImagePart(**kwargs)
     max_side = get_llm_config().context_settings.image_max_side
-    if max_side and ("raw" in kwargs or "path" in kwargs):
-        try:
-            data = kwargs.get("raw") or await asyncio.to_thread(
-                kwargs["path"].read_bytes
-            )
-        except OSError as e:
-            logger.debug(f"读取图片失败: {e}")
-            data = None
-        if data and (result := await asyncio.to_thread(compress_image, data, max_side)):
-            raw, mime, animated = result
-            part = ImagePart(raw=raw, mime_type=mime)
-            if animated:
-                return [TextPart(text="[动图，按时间顺序抽取 9 帧拼成 3×3]"), part]
-            return part
-    return ImagePart(**kwargs)
+    if max_side and (result := await asyncio.to_thread(compress_image, data, max_side)):
+        raw, mime, animated = result
+        part = ImagePart(raw=raw, mime_type=mime)
+        if animated:
+            return [TextPart(text="[动图，按时间顺序抽取 9 帧拼成 3×3]"), part]
+        return part
+    return ImagePart(raw=data, mime_type=kwargs["mime_type"])
 
 
 async def _download_segment(
@@ -489,19 +495,57 @@ async def _handle_video(seg: Video) -> VideoPart | TextPart | None:
     return VideoPart(**kwargs) if kwargs else None
 
 
-@MessageBuilder.register_segment_handler(Reply, scope="global")
-async def _handle_reply(seg: Reply) -> list[LLMContentPart] | LLMContentPart | None:
-    try:
-        bot = current_bot.get(None)
-        event = current_event.get(None)
-        if not bot or not event:
-            return None
+async def _fetch_reply(reply: Reply) -> Reply | None:
+    """获取引用段对应的原消息：是当前事件的引用时由适配器提供，
+    OneBot V11 下其他消息按消息 id 查询
 
-        ctx = get_current_run_context()
-        ns = getattr(ctx.session, "namespace", "global") if ctx else "global"
-        return await MessageBuilder._fetch_reply_as_parts(bot, event, namespace=ns)
+    参数:
+        reply: 不带原消息的引用段
+
+    返回:
+        Reply | None: 带原消息的引用段，取不到时为空
+    """
+    bot, event = current_bot.get(None), current_event.get(None)
+    if not bot or not event:
+        return None
+    fetched = await reply_fetch(event, bot)
+    if fetched is not None and str(fetched.id) == str(reply.id):
+        return fetched
+    if (
+        bot.adapter.get_name() != "OneBot V11"
+        or not str(reply.id).lstrip("-").isdigit()
+    ):
+        return None
+    from nonebot.adapters.onebot.v11 import Message as V11Message
+    from nonebot.adapters.onebot.v11 import MessageSegment as V11Segment
+
+    data = await bot.call_api("get_msg", message_id=int(reply.id))
+    message = data.get("message") if isinstance(data, dict) else None
+    if isinstance(message, list):
+        message = V11Message(
+            V11Segment(str(s.get("type")), s.get("data") or {})
+            for s in message
+            if isinstance(s, dict)
+        )
+    elif isinstance(message, str):
+        message = V11Message(message)
+    else:
+        return None
+    sender = data.get("sender")
+    sender = {str(k): v for k, v in sender.items()} if isinstance(sender, dict) else {}
+    return Reply(
+        str(reply.id), message, SimpleNamespace(sender=SimpleNamespace(**sender))
+    )
+
+
+@MessageBuilder.register_segment_handler(Reply, scope="global")
+async def _handle_reply(seg: Reply) -> list[LLMContentPart] | None:
+    ctx = get_current_run_context()
+    ns = getattr(ctx.session, "namespace", "global") if ctx else "global"
+    try:
+        return await MessageBuilder.reply_to_parts(seg, namespace=ns)
     except Exception as e:
-        logger.warning(f"拉取引用消息代理失败: {e}")
+        logger.debug(f"读取引用消息失败: {e}")
         return None
 
 

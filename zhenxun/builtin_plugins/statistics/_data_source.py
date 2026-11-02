@@ -25,16 +25,12 @@ def _get_statistics_period(search_type: str | None) -> _StatisticsPeriod:
     if search_type == "week":
         return _StatisticsPeriod(
             "周(7天)",
-            TimeUtils.get_day_start(
-                datetime.now(TimeUtils.DEFAULT_TIMEZONE) - timedelta(days=6)
-            ),
+            TimeUtils.get_day_start(TimeUtils.now() - timedelta(days=6)),
         )
     if search_type == "month":
         return _StatisticsPeriod(
             "月(30天)",
-            TimeUtils.get_day_start(
-                datetime.now(TimeUtils.DEFAULT_TIMEZONE) - timedelta(days=29)
-            ),
+            TimeUtils.get_day_start(TimeUtils.now() - timedelta(days=29)),
         )
     return _StatisticsPeriod("", None)
 

@@ -1088,6 +1088,59 @@ class PluginPolicyService:
         }
 
     @_policy_transaction
+    async def delete_account(self, bot_id: str, expected_revision: str) -> str:
+        """删除离线账号的插件策略、群聊与私聊设置和已知群记录
+
+        参数:
+            bot_id: 账号
+            expected_revision: 页面读取到的账号修订
+
+        返回:
+            str: 被删除的账号
+        """
+        from zhenxun.models.bot_group_policy import (
+            BotGroupMembership,
+            BotGroupPluginPolicy,
+        )
+        from zhenxun.services.bot_group_policy import bot_group_policy_service
+        from zhenxun.services.db_context.write import defer
+
+        known = await self._known_accounts()
+        current = await self.get_account(bot_id, known=known)
+        bot_id = current["bot_id"]
+        self._check_revision(expected_revision, current["revision"])
+        if current["connected"]:
+            raise PluginPolicyInUse("在线账号不能删除，请先断开连接")
+        try:
+            from zhenxun.adapters.qq_official.config import QQOfficialConfig
+
+            configured = {
+                f"qq_api:{item.id}"
+                for item in nonebot.get_plugin_config(QQOfficialConfig).qq_bots
+            }
+        except Exception:
+            configured = set()
+        if bot_id in configured:
+            raise PluginPolicyInUse(
+                "该账号仍在 QQ 官方机器人配置中，请先在机器人接入中移除"
+            )
+        connection = current_connection()
+        for model in (
+            BotPluginPolicyBinding,
+            BotGroupPluginPolicy,
+            BotGroupMembership,
+            BotConsole,
+        ):
+            await model.filter(bot_id=bot_id).using_db(connection).delete()
+
+        async def forget():
+            bot_group_policy_service.forget_bot(bot_id)
+
+        if not defer(("bot_group_policy", "forget", bot_id), forget):
+            await forget()
+        return bot_id
+
+    @_policy_transaction
     async def copy_account(
         self,
         *,

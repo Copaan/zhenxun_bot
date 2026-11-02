@@ -61,7 +61,6 @@ _WEB_SEARCH_TOOLS = {
     "mimo": {
         "type": "web_search",
         "max_keyword": 3,
-        "force_search": True,
         "limit": 1,
     },
     "glm": {

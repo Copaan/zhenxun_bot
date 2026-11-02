@@ -406,13 +406,12 @@ async def _(
         )
 
         source = None if download_source == "auto" else download_source
-        (official_plugins, community_plugins), _, _ = await asyncio.gather(
+        (official_plugins, community_plugins), _ = await asyncio.gather(
             StoreManager.get_data(refresh=refresh, source=source),
-            StoreManager.catalog_files(refresh=refresh, source=source),
             asyncio.to_thread(_warm_reload_classification),
         )
         catalog_health = await StoreManager.catalog_health(
-            official_plugins, source=source
+            official_plugins, refresh=refresh, source=source
         )
         installed_plugins = await StoreManager.get_installed_plugins()
         receipts = StoreReceiptStore.load()

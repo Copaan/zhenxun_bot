@@ -40,6 +40,7 @@ from zhenxun.utils._restart_utils import issue_restart_ticket
 from zhenxun.utils.pydantic_compat import (
     model_dump,
 )
+from zhenxun.utils.time_utils import check_timezone
 
 from ....apply_result import (
     APPLY_NO_CHANGE,
@@ -100,6 +101,11 @@ class ConfigurationFileUpdate(BaseModel):
     unset_fields: list[list[str]] = Field(default_factory=list)
 
 
+class ConfigurationCleanup(BaseModel):
+    expected_revision: str = Field(min_length=64, max_length=64)
+    modules: list[str] = Field(min_length=1, max_length=1000)
+
+
 class ConfigurationValidation(BaseModel):
     file: Literal["env", "simple"]
     content: str
@@ -114,6 +120,28 @@ def _validate_env(content: str) -> None:
     validate_dotenv(content)
     values = dict(dotenv_values(stream=StringIO(content)))
     ProxyPolicy.from_values(values)
+    zone = next(
+        (
+            str(value or "").strip()
+            for key, value in values.items()
+            if key.upper() == "TIMEZONE"
+        ),
+        "",
+    )
+    if zone and (error := check_timezone(zone)):
+        raise ConfigurationValidationError(
+            [
+                {
+                    "code": "timezone_invalid",
+                    "file": ".env.dev",
+                    "path": "TIMEZONE",
+                    "line": None,
+                    "column": None,
+                    "severity": "error",
+                    "message": error,
+                }
+            ]
+        )
     qq_enabled = str(values.get("QQ_ADAPTER_LOAD") or "").casefold() == "true"
     qq_builtin = str(values.get("QQ_WEBHOOK_MODE") or "") == "builtin_https"
     try:
@@ -223,11 +251,38 @@ async def _plugin_page_groups() -> set[str]:
     }
 
 
-def simple_config_groups(modules: set[str] | None = None) -> dict[str, Any]:
+def _stale_configs() -> dict[str, list[str]]:
+    """没有插件注册的残留配置项，启动完成前不判定；插件文件仍在但未加载（禁用、
+    加载失败）时，与其同名的配置组不计入
+
+    返回:
+        dict[str, list[str]]: 配置组名到残留配置键的映射
+    """
+    from zhenxun.services.startup import startup_coordinator
+    from zhenxun.services.startup_load import startup_load_planner
+
+    if not startup_coordinator.runtime_ready:
+        return {}
+    kept = {
+        entry.module_name.rsplit(".", 1)[-1]
+        for entry in startup_load_planner.entries.values()
+    }
+    return {
+        module: keys
+        for module, keys in Config.stale_configs().items()
+        if module not in kept
+    }
+
+
+def simple_config_groups(
+    modules: set[str] | None = None, stale: dict[str, list[str]] | None = None
+) -> dict[str, Any]:
     """读取 config.yaml 的配置组与文件版本
 
     参数:
         modules: 只返回这些配置组，为空时返回全部
+        stale: 残留配置项，传入时这些配置项与 config.yaml 中的未注册配置项
+            单独列为残留配置组
 
     返回:
         dict[str, Any]: 配置组列表与文件版本
@@ -235,7 +290,7 @@ def simple_config_groups(modules: set[str] | None = None) -> dict[str, Any]:
     content = _read(_SIMPLE_FILE)
     groups = [
         group
-        for group in _registered_groups(content)
+        for group in _registered_groups(content, stale)
         if (group["fields"] or not group["registered"])
         and group["module"].casefold() not in _PAGE_GROUPS
         and (modules is None or group["module"] in modules)
@@ -243,11 +298,14 @@ def simple_config_groups(modules: set[str] | None = None) -> dict[str, Any]:
     return {"groups": groups, "revision": _revision(content)}
 
 
-def _registered_groups(content: str) -> list[dict[str, Any]]:
+def _registered_groups(
+    content: str, stale: dict[str, list[str]] | None = None
+) -> list[dict[str, Any]]:
     """读取插件配置组，合并 config.yaml 中的值与未注册配置
 
     参数:
         content: config.yaml 内容
+        stale: 残留配置项，传入时拆分为 source_status 为 stale 的配置组
 
     返回:
         list[dict[str, Any]]: 配置组
@@ -285,7 +343,7 @@ def _registered_groups(content: str) -> list[dict[str, Any]]:
         )
     stored = _yaml_parser().load(StringIO(content)) or {}
     if not isinstance(stored, dict):
-        return groups
+        return _split_stale(groups, stale)
     known_groups = {item["module"]: item for item in groups}
     for module, values in stored.items():
         if not isinstance(values, dict):
@@ -325,9 +383,52 @@ def _registered_groups(content: str) -> list[dict[str, Any]]:
                     "default_value": None,
                     "schema": inferred_schema(value),
                     "ui": {},
+                    "unregistered": True,
                 }
             )
-    return groups
+    return _split_stale(groups, stale)
+
+
+def _split_stale(
+    groups: list[dict[str, Any]], stale: dict[str, list[str]] | None
+) -> list[dict[str, Any]]:
+    """把已加载配置组中的残留配置项拆分为单独的残留配置组
+
+    参数:
+        groups: 配置组
+        stale: 残留配置项，为 None 时不拆分
+
+    返回:
+        list[dict[str, Any]]: 配置组
+    """
+    if stale is None:
+        return groups
+    result = []
+    for group in groups:
+        if group["source_status"] != "loaded":
+            result.append(group)
+            continue
+        keys = {key.upper() for key in stale.get(group["module"], ())}
+        live, dead = [], []
+        for field in group["fields"]:
+            leftover = field.get("unregistered") or field["key"].upper() in keys
+            (dead if leftover else live).append(field)
+        group["fields"] = live
+        if live or group["module"] not in stale:
+            result.append(group)
+        if dead or group["module"] in stale:
+            result.append(
+                {
+                    **group,
+                    "name": f"{group['name']}（残留项）" if live else group["name"],
+                    "fields": dead,
+                    "registered": False,
+                    "source_status": "stale",
+                    "readonly_reason": "这些配置项已没有插件注册，通常来自已卸载的"
+                    "插件或插件旧版本，可以清理。",
+                }
+            )
+    return result
 
 
 def _environment_models():
@@ -905,10 +1006,12 @@ async def configuration_summary() -> Result:
         for key, value in sorted(values.items(), key=lambda item: item[0].casefold())
         if _custom_env_allowed(key, managed)
     ]
-    simple = simple_config_groups()
+    simple = simple_config_groups(stale=_stale_configs())
     plugin_groups = await _plugin_page_groups()
     simple["groups"] = [
-        group for group in simple["groups"] if group["module"] not in plugin_groups
+        group
+        for group in simple["groups"]
+        if group["source_status"] == "stale" or group["module"] not in plugin_groups
     ]
     return Result.ok(
         {
@@ -1127,6 +1230,44 @@ async def update_configuration_file(
     else:
         info = "配置已保存并热加载。"
     return Result.ok(data, info=info)
+
+
+@router.post(
+    "/cleanup",
+    dependencies=[authentication()],
+    response_model=Result,
+    response_class=JSONResponse,
+)
+@managed_mutation("webui.configuration")
+async def cleanup_configuration(payload: ConfigurationCleanup) -> Result:
+    content = _read(_SIMPLE_FILE)
+    if _revision(content) != payload.expected_revision:
+        raise HTTPException(
+            status_code=409, detail="配置文件已被外部修改，请重新加载。"
+        )
+    groups = _registered_groups(content, _stale_configs())
+    live = {group["module"] for group in groups if group["registered"]}
+    leftovers = {
+        group["module"]: {field["key"] for field in group["fields"]}
+        for group in groups
+        if group["source_status"] in {"stale", "orphaned"}
+        and group["module"].casefold() not in _PAGE_GROUPS
+    }
+    requested = set(payload.modules)
+    if missing := requested - set(leftovers):
+        raise HTTPException(
+            status_code=422,
+            detail=f"以下配置组没有可清理的残留配置：{'、'.join(sorted(missing))}",
+        )
+    Config.remove_groups(
+        {module for module in requested if module not in live},
+        {module: leftovers[module] for module in requested if module in live},
+    )
+    logger.info(f"已清理残留配置: {', '.join(sorted(requested))}", "WebUI")
+    return Result.ok(
+        {"modules": sorted(requested), "revision": _revision(_read(_SIMPLE_FILE))},
+        info=f"已清理 {len(requested)} 个配置组的残留配置。",
+    )
 
 
 @router.post(

@@ -10,10 +10,8 @@ import asyncio
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from datetime import datetime
 from hashlib import sha256
 import json
-from zoneinfo import ZoneInfo
 
 from nonebot.adapters.onebot.v11 import Bot as OneBot
 from nonebot.adapters.onebot.v11 import MessageEvent as OneBotMessage
@@ -28,6 +26,7 @@ from zhenxun.models.business_identity import (
 from zhenxun.models.user_console import UserConsole
 from zhenxun.services.cache.bounded_ttl import BoundedTTLCache
 from zhenxun.services.platform_identity import business_write_scope
+from zhenxun.utils.time_utils import TimeUtils
 
 
 class BusinessIdentityError(ValueError):
@@ -486,7 +485,7 @@ async def identity_daily_claimed(db) -> bool:
     actor = current_business_identity()
     if actor is None:
         return False
-    today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+    today = TimeUtils.now().date()
     return (
         await BusinessDailyClaim.filter(
             id=identity_digest(actor.protocol.key, str(today))
@@ -505,7 +504,7 @@ async def record_identity_daily_claim(db) -> None:
     actor = current_business_identity()
     if actor is None:
         return
-    today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+    today = TimeUtils.now().date()
     await BusinessDailyClaim.get_or_create(
         using_db=db,
         id=identity_digest(actor.protocol.key, str(today)),

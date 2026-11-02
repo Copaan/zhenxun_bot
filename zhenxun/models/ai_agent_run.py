@@ -13,7 +13,8 @@ class AIAgentRun(Model):
     run_id = fields.CharField(32, unique=True, description="运行id")
     """运行id，工具调用记录按它关联"""
     source = fields.CharField(16, description="来源")
-    """来源：qq 聊天，webui 控制台，proactive 主动对话"""
+    """来源：qq、webui、interject 插话、task 任务、listen 监听、steal 偷表情、
+    memory 记忆整理"""
     session_id = fields.CharField(255, description="会话id")
     """会话id"""
     user_id = fields.CharField(255, description="发起人")

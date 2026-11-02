@@ -30,6 +30,7 @@ from zhenxun.services.scheduler import ScheduleContext, Trigger, scheduler_manag
 from zhenxun.services.scheduler.types import BaseTrigger, ExecutionOptions, JobConfig
 from zhenxun.utils.platform import PlatformUtils
 from zhenxun.utils.pydantic_compat import model_validate
+from zhenxun.utils.time_utils import TimeUtils
 
 from ._buffer import ChatBuffer
 from ._data_source import (
@@ -96,7 +97,12 @@ def build_trigger(kind: str, value: str) -> BaseTrigger:
     try:
         day_of_week = _crontab_weekday(day_of_week)
         trigger = APCronTrigger(
-            minute=minute, hour=hour, day=day, month=month, day_of_week=day_of_week
+            minute=minute,
+            hour=hour,
+            day=day,
+            month=month,
+            day_of_week=day_of_week,
+            timezone=TimeUtils.zone(),
         )
     except ValueError as e:
         raise ValueError(f"cron 表达式无效：{e}") from e

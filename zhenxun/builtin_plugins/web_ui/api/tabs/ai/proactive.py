@@ -35,6 +35,9 @@ def _state_item(bot_id: str, group_id: str, st: Any, cooldown: int) -> dict[str,
         "group_id": group_id,
         "last_message_at": st.last_human_at or None,
         "last_proactive_at": st.last_proactive_at or None,
+        "last_judge_at": st.last_judge_at or None,
+        "pending": st.pending,
+        "unanswered": st.unanswered,
         "cooldown_left": max(0, int(left)),
     }
 
@@ -42,15 +45,26 @@ def _state_item(bot_id: str, group_id: str, st: Any, cooldown: int) -> dict[str,
 @router.get("/chat/proactive", dependencies=[authentication()], response_model=Result)
 async def proactive_state() -> Result:
     from zhenxun.builtin_plugins.ai_chat._proactive import Proactive
+    from zhenxun.builtin_plugins.ai_chat._steal import Steal
 
     states = []
     for (bot_id, group_id), st in list(Proactive._states.items()):
         cfg = await Proactive.settings(group_id)
         group_used, _ = await Proactive.used_tokens(group_id)
         item = _state_item(bot_id, group_id, st, cfg.cooldown if cfg else 0)
-        states.append({**item, "used_tokens": group_used})
+        stolen, _ = await Steal.today(group_id)
+        states.append(
+            {
+                **item,
+                "mode": cfg.mode if cfg else "off",
+                "used_tokens": group_used,
+                "count": await Proactive.count_today(group_id),
+                "stolen": stolen,
+            }
+        )
     _, total = await Proactive.used_tokens("")
-    return Result.ok({"used_tokens": total, "groups": states})
+    _, judges = await Steal.today("")
+    return Result.ok({"used_tokens": total, "steal_judges": judges, "groups": states})
 
 
 @router.put(
@@ -66,13 +80,10 @@ async def update_group_proactive(group_id: str, payload: dict[str, Any]) -> Resu
         config = ProactiveConfig.model_validate(payload)
     except ValueError as e:
         raise HTTPException(422, detail=str(e)) from e
-    data = config.model_dump()
-    default = ProactiveConfig().model_dump()
-    await AIChatGroup.save_setting(
-        group_id, proactive=None if data == default else data
-    )
-    logger.info(f"WebUI 修改了群 {group_id} 的主动插话设置", "WebUi")
-    return Result.ok(info="主动插话设置已保存。")
+    data = config.model_dump(exclude_none=True)
+    await AIChatGroup.save_setting(group_id, proactive=data or None)
+    logger.info(f"WebUI 修改了群 {group_id} 的主动对话设置", "WebUi")
+    return Result.ok(info="主动对话设置已保存。")
 
 
 def _task_error(error: ValueError) -> HTTPException:

@@ -9,6 +9,7 @@ from urllib.parse import quote
 import uuid
 
 from aiocache import cached
+from httpx import Request
 from nonebot.compat import model_dump
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -342,35 +343,42 @@ class AliyunFileInfo:
             ).decode(),
             **query,
         }
-        headers = {
-            "date": formatdate(usegmt=True),
-            "accept": "application/json",
-            "x-acs-signature-nonce": uuid.uuid4().hex,
-            "x-acs-signature-method": "HMAC-SHA1",
-            "x-acs-signature-version": "1.0",
-            "x-acs-version": ALIYUN_API_VERSION,
-        }
-        canonical_headers = "".join(
-            f"{key}:{headers[key]}\n"
-            for key in sorted(headers)
-            if key.startswith("x-acs-")
-        )
         canonical_query = "&".join(
             f"{key}={query[key]}" if query[key] != "" else key for key in sorted(query)
         )
-        string_to_sign = (
-            f"GET\n{headers['accept']}\n\n\n{headers['date']}\n"
-            f"{canonical_headers}{pathname}?{canonical_query}"
-        )
         secret = base64.b64decode(Aliyun_Secret_AccessKey_encrypted.encode())
-        signature = hmac.new(secret, string_to_sign.encode(), hashlib.sha1).digest()
-        headers["authorization"] = (
-            f"acs {Aliyun_AccessKey_ID}:{base64.b64encode(signature).decode()}"
-        )
+
+        def sign(request: Request) -> Request:
+            """每次发送（含重试）都用新的随机数和时间重新签名"""
+            headers = {
+                "date": formatdate(usegmt=True),
+                "accept": "application/json",
+                "x-acs-signature-nonce": uuid.uuid4().hex,
+                "x-acs-signature-method": "HMAC-SHA1",
+                "x-acs-signature-version": "1.0",
+                "x-acs-version": ALIYUN_API_VERSION,
+            }
+            canonical_headers = "".join(
+                f"{key}:{headers[key]}\n"
+                for key in sorted(headers)
+                if key.startswith("x-acs-")
+            )
+            string_to_sign = (
+                f"GET\n{headers['accept']}\n\n\n{headers['date']}\n"
+                f"{canonical_headers}{pathname}?{canonical_query}"
+            )
+            signature = hmac.new(secret, string_to_sign.encode(), hashlib.sha1)
+            headers["authorization"] = (
+                f"acs {Aliyun_AccessKey_ID}:"
+                f"{base64.b64encode(signature.digest()).decode()}"
+            )
+            request.headers.update(headers)
+            return request
+
         response = await AsyncHttpx.get(
             f"https://{ALIYUN_ENDPOINT}{pathname}",
             params=query,
-            headers=headers,
+            auth=sign,
             accept_status_codes=range(400, 600),
         )
         data = response.json()

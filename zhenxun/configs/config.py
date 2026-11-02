@@ -2,7 +2,9 @@ from pathlib import Path
 from typing import Literal
 
 import nonebot
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+from zhenxun.utils.time_utils import DEFAULT_TIMEZONE, check_timezone
 
 from .utils import ConfigsManager
 
@@ -34,6 +36,19 @@ class BotSetting(BaseModel):
     """是否加载 Telegram 适配器"""
     business_identity_scopes: list[str] = Field(default_factory=lambda: ["telegram"])
     """按平台全局解析业务身份（金币、签到等）的平台作用域"""
+    timezone: str = DEFAULT_TIMEZONE
+    """Bot 计算日期与时间使用的 IANA 时区"""
+
+    @field_validator("timezone", mode="before")
+    @classmethod
+    def _check_timezone(cls, value: object) -> str:
+        name = str(value or "").strip() or DEFAULT_TIMEZONE
+        if error := check_timezone(name):
+            nonebot.logger.warning(
+                f"TIMEZONE 配置无效（{error}），已使用 {DEFAULT_TIMEZONE}"
+            )
+            return DEFAULT_TIMEZONE
+        return name
 
     def get_qbot_uid(self, qbot_id: str) -> str | None:
         """获取官bot账号id

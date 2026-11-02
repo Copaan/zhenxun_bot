@@ -11,6 +11,29 @@ from zhenxun.services.ai.utils.logger import log_core as logger
 from zhenxun.utils.pydantic_compat import model_validator
 
 
+def sniff_image_mime(data: bytes) -> str | None:
+    """按文件头识别图片格式
+
+    参数:
+        data: 图片数据（至少包含文件头）
+
+    返回:
+        str | None: MIME 类型，无法识别时为 None
+    """
+    head = data[:16]
+    if head.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if head.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if head.startswith(b"RIFF") and head[8:12] == b"WEBP":
+        return "image/webp"
+    if head.startswith(b"BM"):
+        return "image/bmp"
+    return None
+
+
 class BaseContentPart(BaseModel):
     """多态消息内容的底层基类"""
 
@@ -125,6 +148,8 @@ class ImagePart(BaseContentPart):
         sources = [s for s in (self.url, self.raw, self.path) if s is not None]
         if len(sources) != 1:
             raise ValueError("ImagePart 必须且只能提供 url, raw, path 中的一个")
+        if self.raw and (mime := sniff_image_mime(self.raw)):
+            self.mime_type = mime
         return self
 
 

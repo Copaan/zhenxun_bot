@@ -110,9 +110,9 @@ class ContextManagementSettings(BaseModel):
     """发给模型的图片长边上限（像素），超过 512KB 时继续缩小，动图拼成 3×3。
     0 表示不压缩"""
 
-    file_max_chars: int = Field(default=0, ge=0, le=200000)
-    """聊天中收到文件时读取内容交给模型的最大字数（txt/md/html/csv/json/epub，
-    安装文档解析组件后支持 docx/xlsx/pptx/pdf）。0 表示不读取"""
+    file_max_chars: int = Field(default=20000, ge=0, le=200000)
+    """聊天中收到文件时读取内容交给模型的最大字数（文本、代码与配置文件、
+    html/csv/json/epub，安装文档解析组件后支持 docx/xlsx/pptx/pdf）。0 表示不读取"""
 
     tool_pruning: ToolPruningConfig = Field(default_factory=ToolPruningConfig)
     """工具结果过载修剪策略"""

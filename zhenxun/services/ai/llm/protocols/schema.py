@@ -97,9 +97,37 @@ def strict_schema(schema: dict[str, Any]) -> dict[str, Any]:
     return _walk(_inline_root(schema), visit)
 
 
+def _inline_defs(schema: dict[str, Any]) -> dict[str, Any]:
+    """把指向 $defs 的引用展开为定义本身，部分兼容接口不解析 $ref；
+    循环引用保持原样"""
+    defs = schema.get("$defs")
+    if not isinstance(defs, dict):
+        return schema
+
+    def expand(node: Any, stack: tuple[str, ...]) -> Any:
+        if isinstance(node, list):
+            return [expand(item, stack) for item in node]
+        if not isinstance(node, dict):
+            return node
+        ref = node.get("$ref")
+        if isinstance(ref, str) and ref.startswith("#/$defs/"):
+            name = ref.split("/")[-1]
+            if name in defs and name not in stack:
+                rest = {k: v for k, v in node.items() if k != "$ref"}
+                return expand({**defs[name], **rest}, (*stack, name))
+            return node
+        return {key: expand(value, stack) for key, value in node.items()}
+
+    body = {k: v for k, v in schema.items() if k != "$defs"}
+    result = expand(body, ())
+    if "$ref" in json.dumps(result):
+        result["$defs"] = defs
+    return result
+
+
 def tool_schema(schema: dict[str, Any] | None) -> dict[str, Any]:
     """整理函数工具的参数 Schema"""
-    schema = _inline_root(schema or {})
+    schema = _inline_defs(_inline_root(schema or {}))
     schema.pop("title", None)
     schema.setdefault("type", "object")
     schema.setdefault("properties", {})

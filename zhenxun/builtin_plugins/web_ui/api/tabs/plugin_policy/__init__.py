@@ -185,6 +185,23 @@ async def update_account(bot_id: str, payload: AccountPolicyUpdate) -> Result[di
         _raise_api_error(error)
 
 
+@router.delete(
+    "/accounts/{bot_id}",
+    dependencies=[authentication()],
+    response_model=Result,
+    response_class=JSONResponse,
+)
+async def delete_account(
+    bot_id: str,
+    expected_revision: str = Query(min_length=64, max_length=64),
+) -> Result:
+    try:
+        await plugin_policy_service.delete_account(bot_id, expected_revision)
+        return Result.ok(info="机器人账号已删除")
+    except (PluginPolicyError, RuntimeMutationBusyError) as error:
+        _raise_api_error(error)
+
+
 @router.get(
     "/policies",
     dependencies=[authentication()],

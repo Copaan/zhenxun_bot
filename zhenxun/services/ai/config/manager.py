@@ -281,7 +281,7 @@ def register_llm_configs():
             "    - keep_recent_turns: 总结外强制原样保留的最近对话轮数\n"
             "  - vision_window_size: 多模态滑动窗口大小。0表示无限制，>0表示仅保留最近N轮包含多模态真实数据的消息，超过则自动降级为占位符\n"  # noqa: E501
             "  - image_max_side: 发给模型的图片长边上限（像素），超过 512KB 时继续缩小，动图拼成 3×3，0 表示不压缩\n"  # noqa: E501
-            "  - file_max_chars: 收到文件时读取内容交给模型的最大字数，0 表示不读取\n"
+            "  - file_max_chars: 收到文件时读取内容交给模型的最大字数（默认 20000），0 表示不读取\n"  # noqa: E501
             "  - tool_pruning: 工具结果过载修剪策略配置\n"
             "    - enable: 是否开启长工具输出结果的自动修剪\n"
             "    - trigger_threshold: 触发修剪的工具纯 Token 阈值。<=1.0为比例，>1.0为绝对 Token 数\n"  # noqa: E501

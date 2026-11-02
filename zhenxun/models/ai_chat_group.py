@@ -31,6 +31,8 @@ class AIChatGroup(Model):
     """更新时间"""
 
     _settings: ClassVar[dict[str, "AIChatGroup"] | None] = None
+    _version: ClassVar[int] = 0
+    """设置版本，每次保存后加一"""
     OVERRIDES: ClassVar[tuple[str, ...]] = (
         "active_probability",
         "wake_words",
@@ -52,7 +54,8 @@ class AIChatGroup(Model):
 
     @classmethod
     async def get_setting(cls, group_id: str) -> Self | None:
-        """获取群的 AI 聊天设置，首次读取时整表载入内存
+        """获取群的 AI 聊天设置，首次读取时整表载入内存；载入期间有设置保存时
+        本次结果不缓存
 
         参数:
             group_id: 群号
@@ -60,13 +63,18 @@ class AIChatGroup(Model):
         返回:
             Self | None: 设置，没有时为空
         """
-        if cls._settings is None:
-            cls._settings = {row.group_id: row for row in await cls.all()}
-        return cls._settings.get(group_id)  # type: ignore[return-value]
+        settings: dict[str, AIChatGroup] | None = cls._settings
+        if settings is None:
+            version = cls._version
+            settings = {row.group_id: row for row in await cls.all()}
+            if cls._version == version:
+                cls._settings = settings
+        return settings.get(group_id)  # type: ignore[return-value]
 
     @classmethod
     async def save_setting(cls, group_id: str, **values: Any) -> Self | None:
-        """保存群的部分 AI 聊天设置，保存后各项都为空时删除该群设置
+        """保存群的部分 AI 聊天设置，保存后各项都为空时删除该群设置，
+        写入完成后丢弃内存中的设置
 
         参数:
             group_id: 群号
@@ -76,9 +84,12 @@ class AIChatGroup(Model):
         返回:
             Self | None: 保存后的设置，删除时为空
         """
-        cls._settings = None
-        setting, _ = await cls.update_or_create(group_id=group_id, defaults=values)
-        if all(getattr(setting, name) is None for name in cls.OVERRIDES):
-            await setting.delete()
-            return None
-        return setting
+        try:
+            setting, _ = await cls.update_or_create(group_id=group_id, defaults=values)
+            if all(getattr(setting, name) is None for name in cls.OVERRIDES):
+                await setting.delete()
+                return None
+            return setting
+        finally:
+            cls._settings = None
+            cls._version += 1

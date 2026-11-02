@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -20,6 +20,17 @@ class StickerUpdate(BaseModel):
     remark: str = Field(default="", max_length=64)
     tags: list[str] = Field(default_factory=list, max_length=10)
     usage: str = Field(default="", max_length=255)
+
+
+class StickerBatch(BaseModel):
+    ids: list[int] = Field(min_length=1, max_length=1000)
+    block: bool = False
+    """是否同时设为不再收集"""
+
+
+class StickerMerge(BaseModel):
+    keep_id: int
+    other_ids: list[int] = Field(min_length=1, max_length=100)
 
 
 class StickerUpload(StickerUpdate):
@@ -50,15 +61,23 @@ async def _sticker_item(sticker: Any) -> dict[str, Any]:
 
 
 @router.get("/chat/stickers", dependencies=[authentication()], response_model=Result)
-async def list_stickers(query: str = Query(default="", max_length=64)) -> Result:
+async def list_stickers(
+    query: str = Query(default="", max_length=64),
+    source: Literal["", "ai", "steal", "webui", "qq"] = "",
+    sort: Literal["used", "new", "recent"] = "used",
+) -> Result:
     from zhenxun.builtin_plugins.ai_chat._data_source import MODULE
     from zhenxun.builtin_plugins.ai_chat._stickers import Stickers
     from zhenxun.configs.config import Config
+    from zhenxun.models.ai_sticker import AISticker
+    from zhenxun.models.ai_sticker_block import AIStickerBlock
 
-    stickers = await Stickers.search(query, limit=1000)
+    stickers = await Stickers.listing(query, source, sort)
     return Result.ok(
         {
             "items": [await _sticker_item(s) for s in stickers],
+            "total": await AISticker.all().count(),
+            "blocked": await AIStickerBlock.all().count(),
             "limit": int(Config.get_config(MODULE, "STICKER_LIMIT") or 0),
         }
     )
@@ -120,6 +139,24 @@ async def import_qq_stickers() -> Result:
     )
 
 
+@router.get(
+    "/chat/stickers/{sticker_id}/image",
+    dependencies=[authentication()],
+    response_model=Result,
+)
+async def sticker_image(sticker_id: int) -> Result:
+    from zhenxun.builtin_plugins.ai_chat._stickers import Stickers
+    from zhenxun.models.ai_sticker import AISticker
+
+    sticker = await AISticker.get_or_none(id=sticker_id)
+    path = Stickers.path(sticker) if sticker else None
+    if path is None or not path.exists():
+        raise HTTPException(404, detail="表情不存在")
+    data = await asyncio.to_thread(path.read_bytes)
+    mime = {"jpg": "jpeg"}.get(path.suffix[1:], path.suffix[1:])
+    return Result.ok(f"data:image/{mime};base64,{base64.b64encode(data).decode()}")
+
+
 @router.put(
     "/chat/stickers/{sticker_id}",
     dependencies=[authentication()],
@@ -134,6 +171,45 @@ async def update_sticker(sticker_id: int, payload: StickerUpdate) -> Result:
     if sticker is None:
         raise HTTPException(404, detail="表情不存在")
     return Result.ok(await _sticker_item(sticker), info="已保存。")
+
+
+@router.post(
+    "/chat/stickers/delete",
+    dependencies=[authentication()],
+    response_model=Result,
+)
+async def delete_stickers(payload: StickerBatch) -> Result:
+    from zhenxun.builtin_plugins.ai_chat._stickers import Stickers
+
+    count = await Stickers.remove_many(payload.ids, payload.block)
+    note = "，之后不会再收集" if payload.block else ""
+    return Result.ok({"count": count}, info=f"已删除 {count} 个表情{note}。")
+
+
+@router.post(
+    "/chat/stickers/merge",
+    dependencies=[authentication()],
+    response_model=Result,
+)
+async def merge_stickers(payload: StickerMerge) -> Result:
+    from zhenxun.builtin_plugins.ai_chat._stickers import Stickers
+
+    sticker = await Stickers.merge(payload.keep_id, payload.other_ids)
+    if sticker is None:
+        raise HTTPException(404, detail="要保留的表情不存在")
+    return Result.ok(await _sticker_item(sticker), info="已合并。")
+
+
+@router.delete(
+    "/chat/stickers/blocked",
+    dependencies=[authentication()],
+    response_model=Result,
+)
+async def clear_sticker_blocks() -> Result:
+    from zhenxun.models.ai_sticker_block import AIStickerBlock
+
+    count = await AIStickerBlock.all().delete()
+    return Result.ok({"count": count}, info=f"已清空 {count} 条不再收集记录。")
 
 
 @router.delete(

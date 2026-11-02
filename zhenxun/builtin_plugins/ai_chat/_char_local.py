@@ -5,6 +5,7 @@ characters（onnxruntime），在线程中运行，同一时间只处理一张�
 """
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import csv
 from dataclasses import dataclass
 import io
@@ -240,6 +241,20 @@ def prototypes(features: np.ndarray, seed: int) -> np.ndarray:
     return c.astype(np.float16)
 
 
+def _compress(data: bytes, seed: int) -> tuple[np.ndarray, np.ndarray]:
+    """读取下载的角色特征，计算原型与归一化中心
+
+    参数:
+        data: feat.npy 内容
+        seed: 随机种子
+
+    返回:
+        tuple[np.ndarray, np.ndarray]: 原型, 中心
+    """
+    features = np.load(io.BytesIO(data), allow_pickle=False)
+    return prototypes(features, seed), centroid(features)
+
+
 class Library:
     """角色库：按合并后的角色保存原型、作品、核心外观标签与性别"""
 
@@ -317,7 +332,13 @@ class LocalModels:
     _tags: ClassVar[dict[str, tuple[np.ndarray, np.ndarray]]] = {}
     _library: ClassVar[Library | None] = None
     _lock = threading.Lock()
+    _executor: ClassVar[ThreadPoolExecutor] = ThreadPoolExecutor(
+        1, thread_name_prefix="ai-characters"
+    )
+    """推理专用线程，排队的识别不占用默认线程池"""
     _release: ClassVar[asyncio.TimerHandle | None] = None
+    _summary: ClassVar[tuple[tuple[int, int], dict[str, Any]] | None] = None
+    """角色库信息缓存：(index.json 的修改时间与大小, 信息)"""
 
     @staticmethod
     def tagger_file(tier: str) -> Path:
@@ -342,6 +363,24 @@ class LocalModels:
         )
 
     @classmethod
+    def _library_info(cls) -> dict[str, Any] | None:
+        """角色库的角色数与生成时间，index.json 未变化时使用缓存
+
+        返回:
+            dict[str, Any] | None: 角色库信息，未生成时为 None
+        """
+        try:
+            stat = (CHAR_DIR / "index.json").stat()
+        except FileNotFoundError:
+            return None
+        key = (stat.st_mtime_ns, stat.st_size)
+        if cls._summary is None or cls._summary[0] != key:
+            info = json.loads((CHAR_DIR / "index.json").read_text("utf-8"))
+            summary = {"characters": len(info["names"]), "built_at": info["built_at"]}
+            cls._summary = (key, summary)
+        return cls._summary[1]
+
+    @classmethod
     def status(cls) -> dict[str, Any]:
         """各档位与角色库的安装状态
 
@@ -349,10 +388,7 @@ class LocalModels:
             dict[str, Any]: 组件与各档位是否就绪、磁盘占用、角色库信息与任务进度
         """
         files = list(CHAR_DIR.glob("*")) if CHAR_DIR.exists() else []
-        library = None
-        if (meta := CHAR_DIR / "index.json").exists():
-            info = json.loads(meta.read_text("utf-8"))
-            library = {"characters": len(info["names"]), "built_at": info["built_at"]}
+        library = cls._library_info()
         return {
             "component": installed("characters"),
             "tiers": {tier: cls.ready(tier) for tier in TAGGERS},
@@ -447,7 +483,7 @@ class LocalModels:
                     await cls._download(client, cls._url(*CCIP), CHAR_DIR / "ccip.onnx")
                 if rebuild_library or not (CHAR_DIR / "index.npz").exists():
                     await cls._build_library(client)
-            await asyncio.to_thread(cls.unload)
+            await asyncio.get_running_loop().run_in_executor(cls._executor, cls.unload)
             cls._stage("完成")
             logger.info(f"角色识别 {tier} 档模型已就绪", "AI角色识别")
         except Exception as e:
@@ -466,12 +502,14 @@ class LocalModels:
 
     @classmethod
     async def _build_library(cls, client: httpx.AsyncClient) -> None:
-        """下载入选角色的特征，压缩为原型后生成角色库"""
+        """下载入选角色的特征，压缩为原型后生成角色库，解析与计算在线程中进行"""
         cls._stage("下载角色列表")
         response = await client.get(cls._url(INDEX_REPO, "characters.json"))
         response.raise_for_status()
-        characters: list[dict[str, Any]] = response.json()
-        variants = merge_map(characters)
+        characters: list[dict[str, Any]] = await asyncio.to_thread(
+            json.loads, response.content
+        )
+        variants = await asyncio.to_thread(merge_map, characters)
         picked = [
             c
             for c in characters
@@ -491,11 +529,9 @@ class LocalModels:
                     try:
                         r = await client.get(url)
                         r.raise_for_status()
-                        features = np.load(io.BytesIO(r.content), allow_pickle=False)
-                        protos[c["tag"]] = await asyncio.to_thread(
-                            prototypes, features, index
+                        protos[c["tag"]], centroids[c["tag"]] = await asyncio.to_thread(
+                            _compress, r.content, index
                         )
-                        centroids[c["tag"]] = centroid(features)
                         break
                     except Exception as e:
                         if attempt == 2:
@@ -509,7 +545,9 @@ class LocalModels:
         if len(failed) > len(picked) // 20:
             raise RuntimeError(f"{len(failed)} 个角色的特征下载失败，请稍后重试")
         cls._stage("生成角色库")
-        companions = companion_map(characters, variants, centroids)
+        companions = await asyncio.to_thread(
+            companion_map, characters, variants, centroids
+        )
         await asyncio.to_thread(
             cls._save_library, characters, variants, companions, protos
         )
@@ -552,7 +590,7 @@ class LocalModels:
         """删除所有本地模型与角色库"""
         if cls._job and not cls._job.done():
             raise ValueError("模型正在下载，请等待完成后再卸载。")
-        await asyncio.to_thread(cls.unload)
+        await asyncio.get_running_loop().run_in_executor(cls._executor, cls.unload)
         await asyncio.to_thread(shutil.rmtree, CHAR_DIR, True)
         cls.task = None
 
@@ -644,7 +682,7 @@ class LocalModels:
 
     @classmethod
     async def recognize(cls, data: bytes, tier: str) -> dict[str, list[Candidate]]:
-        """用本地打标模型与角色库识别图片
+        """用本地打标模型与角色库识别图片，在推理专用线程中依次执行
 
         参数:
             data: 图片
@@ -656,7 +694,8 @@ class LocalModels:
         if not cls.ready(tier):
             raise RuntimeError(f"{tier} 档模型尚未安装")
         try:
-            return await asyncio.to_thread(cls._run, data, tier)
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(cls._executor, cls._run, data, tier)
         finally:
             if cls._release:
                 cls._release.cancel()

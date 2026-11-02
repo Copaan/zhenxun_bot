@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import atexit
+import contextlib
 from datetime import timedelta
-from typing import TYPE_CHECKING, Any, overload
+import queue
+import sys
+import threading
+from typing import TYPE_CHECKING, Any, TextIO, cast, overload
 
 from loguru import logger as logger_
 import nonebot
 from nonebot import _log_patcher as _nonebot_log_patcher
 from nonebot.log import default_filter, default_format
+from nonebot.log import logger_id as nonebot_logger_id
 
 if TYPE_CHECKING:
     from nonebot_plugin_session import Session
@@ -58,6 +64,97 @@ def _session_kind(value: Any) -> str | None:
         return "uninfo"
     return None
 
+
+class ConsoleSink:
+    """控制台日志：记录先放进有上限的队列，由后台线程写出；控制台卡住或写不过来时
+    丢弃控制台副本（文件日志不受影响），恢复后补一行丢弃条数，不阻塞事件循环"""
+
+    CAPACITY = 1024
+    """等待写出的最大条数"""
+
+    def __init__(self, stream: TextIO):
+        self._original = stream
+        self._stream = stream
+        self._tty = _isatty(stream)
+        if self._tty and sys.platform == "win32" and stream is sys.__stdout__:
+            self._stream = _win_console(stream)
+        self._queue: queue.Queue[str | None] = queue.Queue(self.CAPACITY)
+        self.dropped = 0
+        self._thread = threading.Thread(
+            target=self._drain, name="zhenxun_console_log", daemon=True
+        )
+        self._thread.start()
+        atexit.register(self.close)
+
+    def isatty(self) -> bool:
+        return self._tty
+
+    def write(self, message: str) -> None:
+        try:
+            self._queue.put_nowait(message)
+        except queue.Full:
+            self.dropped += 1
+
+    def _drain(self) -> None:
+        reported = 0
+        while (message := self._queue.get()) is not None:
+            if (dropped := self.dropped) > reported:
+                message += f"[控制台日志] 输出过慢，已丢弃 {dropped - reported} 条\n"
+                reported = dropped
+            try:
+                self._stream.write(message)
+                self._stream.flush()
+            except Exception:
+                pass
+
+    def close(self) -> None:
+        """退出时最多等待 0.2 秒写完剩余日志，控制台无人读取时不卡住退出"""
+        with contextlib.suppress(queue.Full):
+            self._queue.put(None, timeout=0.2)
+        self._thread.join(0.2)
+        if self._thread.is_alive() and sys.stdout is self._original:
+            sys.stdout = None  # type: ignore
+
+
+def _isatty(stream: TextIO) -> bool:
+    try:
+        return stream.isatty()
+    except Exception:
+        return False
+
+
+def _win_console(stream: TextIO) -> TextIO:
+    """Windows 控制台开启 ANSI 转义支持，不支持时由 colorama 转换颜色
+
+    参数:
+        stream: 标准输出
+
+    返回:
+        TextIO: 可直接写入带颜色日志的流
+    """
+    from colorama import AnsiToWin32
+    from colorama.winterm import enable_vt_processing
+
+    try:
+        if enable_vt_processing(stream.fileno()):
+            return stream
+    except Exception:
+        pass
+    return cast(TextIO, AnsiToWin32(stream, convert=True, strip=True).stream)
+
+
+if sys.stdout is not None:
+    with contextlib.suppress(ValueError):
+        logger_.remove(nonebot_logger_id)
+    _console = ConsoleSink(sys.stdout)
+    logger_.add(
+        _console,
+        level=0,
+        diagnose=False,
+        colorize=_console.isatty(),
+        filter=default_filter,
+        format=default_format,
+    )
 
 _MAIN_LOG_SINK_ID = logger_.add(
     LOG_PATH / "{time:YYYY-MM-DD}.log",

@@ -168,6 +168,68 @@ class _Index:
             idf[term] * tf * (k1 + 1) / (tf + norm[self.doc] if n else tf)
         ).astype(np.float32)
         self.vocab = vocab
+        self.idf = idf
+        self.unseen_idf = float(np.log(1 + max(n - 0.5, 0) / 1.5))
+
+    def scores(
+        self, query: np.ndarray | None, words: list[str]
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """计算每行的余弦相似度与归一化 BM25 分
+
+        参数:
+            query: 归一化查询向量，为空时余弦相似度全为 0
+            words: 查询分词
+
+        返回:
+            tuple[np.ndarray, np.ndarray]: 余弦相似度, 0~1 的 BM25 分
+
+        异常:
+            ValueError: 查询向量维度与索引不一致
+        """
+        n = len(self.ids)
+        cosine = np.zeros(n, dtype=np.float32)
+        if query is not None and self.dim and n:
+            if len(query) != self.dim:
+                raise ValueError(
+                    "知识库向量与当前 embedding 模型的维度不一致，请在 WebUI 重建。"
+                )
+            cosine = self.vectors @ query
+            if self.image_vectors is not None:
+                cosine = np.where(
+                    self.has_image, (cosine + self.image_vectors @ query) / 2, cosine
+                )
+        bm25 = np.zeros(n, dtype=np.float32)
+        for tid in {self.vocab[w] for w in words if w in self.vocab}:
+            part = slice(self.indptr[tid], self.indptr[tid + 1])
+            np.add.at(bm25, self.doc[part], self.weights[part])
+        if n and bm25.max() > 0:
+            bm25 = bm25 / bm25.max()
+        return cosine, bm25
+
+    def coverage(self, words: list[str]) -> np.ndarray:
+        """每行命中的查询词按 idf 加权占全部查询词的比例，没出现在索引中的词
+        按只出现在一行计算
+
+        参数:
+            words: 查询分词
+
+        返回:
+            np.ndarray: 0~1 的覆盖度
+        """
+        n = len(self.ids)
+        hit = np.zeros(n, dtype=np.float32)
+        terms = set(words)
+        if not n or not terms:
+            return hit
+        total = 0.0
+        for w in terms:
+            if w not in self.vocab:
+                total += self.unseen_idf
+                continue
+            tid = self.vocab[w]
+            total += float(self.idf[tid])
+            hit[self.doc[self.indptr[tid] : self.indptr[tid + 1]]] += self.idf[tid]
+        return hit / total if total > 0 else hit
 
     def search(
         self, query: np.ndarray | None, words: list[str], k: int
@@ -188,23 +250,8 @@ class _Index:
         n = len(self.ids)
         if not n:
             return []
-        score = np.zeros(n, dtype=np.float32)
-        if query is not None and self.dim:
-            if len(query) != self.dim:
-                raise ValueError(
-                    "知识库向量与当前 embedding 模型的维度不一致，请在 WebUI 重建。"
-                )
-            score = self.vectors @ query
-            if self.image_vectors is not None:
-                score = np.where(
-                    self.has_image, (score + self.image_vectors @ query) / 2, score
-                )
-        bm25 = np.zeros(n, dtype=np.float32)
-        for tid in {self.vocab[w] for w in words if w in self.vocab}:
-            part = slice(self.indptr[tid], self.indptr[tid + 1])
-            np.add.at(bm25, self.doc[part], self.weights[part])
-        if bm25.max() > 0:
-            score = score + BM25_WEIGHT * bm25 / bm25.max()
+        cosine, bm25 = self.scores(query, words)
+        score = cosine + BM25_WEIGHT * bm25
         k = min(k, n)
         top = np.argpartition(-score, k - 1)[:k]
         top = top[np.argsort(-score[top])]
