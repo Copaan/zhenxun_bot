@@ -36,8 +36,6 @@ class RenderableComponent(BaseModel, Renderable):
     提供通用的样式属性（如内联样式、CSS类、变体）和链式调用方法。
     """
 
-    _is_standalone_template: bool = False
-    """标记此组件是否为独立模板"""
     inline_style: dict[str, str] | None = None
     """应用于组件根元素的内联CSS样式"""
     component_css: str | None = None

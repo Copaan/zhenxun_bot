@@ -1,4 +1,4 @@
-"""内置 AI 聊天的长期记忆管理：浏览、编辑、召回测试与重算向量"""
+"""内置 AI 聊天的长期记忆管理：召回模式、浏览、编辑、召回测试与重算向量"""
 
 from __future__ import annotations
 
@@ -51,6 +51,10 @@ class RecallPayload(ScopePayload):
 
 class EmbeddingPayload(BaseModel):
     enabled: bool
+
+
+class ModePayload(BaseModel):
+    mode: Literal["off", "inject", "tool"]
 
 
 class SummarizePayload(BaseModel):
@@ -241,6 +245,19 @@ async def rebuild() -> Result:
     if not Memory.rebuild():
         return Result.fail("正在重算向量。")
     return Result.ok(info="已开始重算向量。")
+
+
+@router.put("/memory/mode", dependencies=[authentication()], response_model=Result)
+async def update_mode(payload: ModePayload) -> Result:
+    from zhenxun.builtin_plugins.ai_chat._data_source import MODULE
+    from zhenxun.configs.config import Config
+    from zhenxun.services.log import logger
+
+    Config.set_config(MODULE, "MEMORY_MODE", payload.mode)
+    Config.save(save_simple_data=True)
+    logger.info(f"WebUI 修改了长期记忆模式: {payload.mode}", "WebUi")
+    names = {"off": "已关闭长期记忆。", "inject": "已切换为自动召回。"}
+    return Result.ok(info=names.get(payload.mode, "已切换为按需召回。"))
 
 
 @router.put("/memory/embedding", dependencies=[authentication()], response_model=Result)

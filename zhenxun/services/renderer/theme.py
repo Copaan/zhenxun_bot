@@ -803,6 +803,18 @@ class DependencyCollector:
     负责递归遍历组件树，收集 CSS/JS 依赖。
     """
 
+    @staticmethod
+    def _add_inline_css(context: "RenderContext", *css_list: str) -> None:
+        """收集内联样式，同一份样式在一次渲染中只注入一次
+
+        参数:
+            context: 渲染上下文
+            css_list: 样式内容
+        """
+        for css in css_list:
+            if css not in context.collected_inline_css:
+                context.collected_inline_css.append(css)
+
     @classmethod
     async def collect(cls, component: Renderable, context: "RenderContext"):
         hot_reload = Config.get_config("UI", "HOT_RELOAD", False)
@@ -813,7 +825,7 @@ class DependencyCollector:
 
         component_path_base = str(
             getattr(component, "template_path", None) or component.template_name
-        )
+        ).replace("\\", "/")
         variant = getattr(component, "variant", None)
         cache_key = (type(component), component_path_base, variant)
 
@@ -824,7 +836,7 @@ class DependencyCollector:
             )
 
         if cached_dep:
-            context.collected_inline_css.extend(cached_dep.inline_css)
+            cls._add_inline_css(context, *cached_dep.inline_css)
             context.collected_scripts.update(cached_dep.scripts)
             context.collected_asset_styles.update(cached_dep.asset_styles)
         else:
@@ -891,7 +903,7 @@ class DependencyCollector:
                     new_dep,
                 )
 
-            context.collected_inline_css.extend(cached_css_results)
+            cls._add_inline_css(context, *cached_css_results)
             context.collected_scripts.update(new_dep.scripts)
             context.collected_asset_styles.update(new_dep.asset_styles)
 
@@ -899,7 +911,7 @@ class DependencyCollector:
             res = component.get_extra_css(context)
             css_str = await res if inspect.isawaitable(res) else str(res)
             if css_str:
-                context.collected_inline_css.append(css_str)
+                cls._add_inline_css(context, css_str)
 
         for child in component.get_children():
             if child:

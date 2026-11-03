@@ -1,7 +1,10 @@
 """Preview independent dependency repairs without changing installed plugins."""
 
+import asyncio
 from copy import deepcopy
 from hashlib import sha256
+from pathlib import Path
+import sys
 from typing import Any
 
 from packaging.requirements import Requirement
@@ -9,6 +12,7 @@ from packaging.utils import canonicalize_name
 
 from .dependencies import (
     FORBIDDEN_LAYER_PACKAGES,
+    PROJECT_NAME,
     DependencyAnalysisError,
     _compile,
     dependency_floors,
@@ -59,6 +63,137 @@ def select_repair_groups(preview: dict, selected: list[str] | None) -> dict:
             if group["id"] in chosen
         ),
     }
+
+
+def package_usage(snapshot) -> dict[str, dict[str, Any]]:
+    """检查已安装的包是否仍在使用：依赖来源是否需要、源码是否导入、当前进程是否已加载
+
+    依赖来源包括 pyproject.toml、手动依赖、插件 requirements、托管插件、商店插件
+    回执和依赖层中的包；被源码导入或已加载的包所依赖的包也算在使用。
+
+    参数:
+        snapshot: 环境快照
+
+    返回:
+        dict[str, dict[str, Any]]: 包名 -> 使用情况
+    """
+    from zhenxun.services.plugin_store.plugin_store_receipts import (
+        receipt_dependency_inputs,
+    )
+
+    from .environment import (
+        dependency_roots,
+        distribution_modules,
+        imported_modules,
+        reachable_packages,
+    )
+
+    roots = [raw for _, raw in dependency_roots(snapshot.manifest)]
+    roots.extend(
+        raw for values in receipt_dependency_inputs().values() for raw in values
+    )
+    roots.extend(sorted(snapshot.layer))
+    declared = reachable_packages(roots, snapshot.selected)
+    imports = imported_modules([Path("zhenxun")])
+    modules = {
+        name: distribution_modules(dist)
+        for name, dist in snapshot.selected.items()
+        if name != PROJECT_NAME
+    }
+    in_code = [
+        name
+        for name, provided in modules.items()
+        if any(module in imports or module in sys.modules for module in provided)
+    ]
+    used = declared | reachable_packages(in_code, snapshot.selected)
+    dependents: dict[str, set[str]] = {}
+    for item in snapshot.declarations:
+        dependents.setdefault(item["name"], set()).add(item["owner"])
+    return {
+        name: {
+            "name": name,
+            "version": snapshot.selected[name].version,
+            "declared": name in declared,
+            "used": name in used,
+            "dependents": sorted(dependents.get(name, ())),
+            "imported_by": {m: imports[m] for m in sorted(provided) if m in imports},
+            "loaded": sorted(m for m in provided if m in sys.modules),
+        }
+        for name, provided in modules.items()
+    }
+
+
+async def _explain_blocked(groups: list[dict], snapshot, keep: set[str]) -> None:
+    """给不能修复的分组补充相关包的使用情况
+
+    提出约束的包都不再使用时标记为残留。要卸载的包包括提出约束的包、依赖它们的
+    包，以及只被这些包依赖且不再使用的包，一起卸载即可消除冲突。
+
+    参数:
+        groups: 修复分组
+        snapshot: 环境快照
+        keep: 不能卸载的包
+    """
+    blocked = [group for group in groups if group["status"] != "repairable"]
+    if not blocked:
+        return
+    usage = await asyncio.to_thread(package_usage, snapshot)
+    requires: dict[str, set[str]] = {}
+    required_by: dict[str, set[str]] = {}
+    for item in snapshot.declarations:
+        requires.setdefault(item["owner"], set()).add(item["name"])
+        required_by.setdefault(item["name"], set()).add(item["owner"])
+
+    def unused(name: str) -> bool:
+        return name in usage and not usage[name]["used"] and name not in keep
+
+    for group in blocked:
+        owners = sorted(
+            {item["owner"] for item in group["issues"] if item["owner"] in usage}
+        )
+        removable, queue = set(), [name for name in owners if unused(name)]
+        while queue:
+            name = queue.pop()
+            if name not in removable:
+                removable.add(name)
+                queue.extend(o for o in required_by.get(name, ()) if unused(o))
+        changed = True
+        while changed:
+            changed = False
+            for name in {n for r in removable for n in requires.get(r, ())}:
+                if (
+                    name not in removable
+                    and unused(name)
+                    and required_by.get(name, set()) <= removable
+                ):
+                    removable.add(name)
+                    changed = True
+        group["owners"] = owners
+        group["removable"] = sorted(removable)
+        group["leftover"] = bool(owners) and set(owners) <= removable
+        group["usage"] = [
+            usage[name]
+            for name in sorted({*group["roots"], *owners, *removable})
+            if name in usage
+        ] + [
+            {
+                "name": name,
+                "version": None,
+                "declared": False,
+                "used": False,
+                "dependents": sorted(
+                    {i["owner"] for i in group["issues"] if i["name"] == name}
+                ),
+                "imported_by": {},
+                "loaded": [],
+            }
+            for name in group["roots"]
+            if name not in usage
+        ]
+        if group["leftover"]:
+            group["uninstall_command"] = " ".join(
+                ["uv pip uninstall --python", sys.executable, *group["removable"]]
+            )
 
 
 def _layer_rebuild_preview(report: dict[str, Any], snapshot) -> dict[str, Any]:
@@ -261,6 +396,9 @@ async def preview_layer_repair(report: dict[str, Any]) -> dict[str, Any]:
         except DependencyAnalysisError as error:
             group.update(code=error.code, diagnostic=str(error), details=error.details)
             group["changes"], group["package_updates"] = [], {}
+    await _explain_blocked(
+        groups, snapshot, set(core) | set(ORM_PACKAGES) | set(FORBIDDEN_LAYER_PACKAGES)
+    )
     return {
         "base_manifest": manifest,
         "bound_conflicts": retained_conflicts(snapshot, set()),

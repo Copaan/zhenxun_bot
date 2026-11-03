@@ -14,6 +14,7 @@ import zipfile
 import aiofiles
 
 from zhenxun.configs.path_config import DATA_PATH, TEMP_PATH
+from zhenxun.configs.repo_config import GITHUB_REPOS, aliyun_mirrored, github_url
 from zhenxun.services.log import logger
 from zhenxun.services.network_proxy import core_network_operation
 from zhenxun.services.resource_install import (
@@ -41,14 +42,14 @@ class ZhenxunRepoConfig:
     """真寻仓库配置"""
 
     # Zhenxun Bot 相关配置
-    ZHENXUN_BOT_GIT = "https://github.com/zhenxun-org/zhenxun_bot.git"
-    ZHENXUN_BOT_GITHUB_URL = "https://github.com/HibiKier/zhenxun_bot/tree/main"
+    ZHENXUN_BOT_GIT = github_url("bot")
+    ZHENXUN_BOT_GITHUB_URL = github_url("bot", "main")
     ZHENXUN_BOT_DOWNLOAD_FILE_STRING = "zhenxun_bot.zip"
     ZHENXUN_BOT_DOWNLOAD_FILE = TEMP_PATH / ZHENXUN_BOT_DOWNLOAD_FILE_STRING
     ZHENXUN_BOT_UNZIP_PATH = TEMP_PATH / "zhenxun_bot"
     ZHENXUN_BOT_CODE_PATH = Path() / "zhenxun"
     ZHENXUN_BOT_RELEASES_API_URL = (
-        "https://api.github.com/repos/HibiKier/zhenxun_bot/releases/latest"
+        f"https://api.github.com/repos/{GITHUB_REPOS['bot']}/releases/latest"
     )
     ZHENXUN_BOT_BACKUP_PATH = Path() / "backup"
     # 需要替换的文件夹
@@ -73,8 +74,8 @@ class ZhenxunRepoConfig:
     ]
 
     # WEB UI 相关配置
-    WEBUI_GIT = "https://github.com/HibiKier/zhenxun_bot_webui.git"
-    WEBUI_DIST_GITHUB_URL = "https://github.com/HibiKier/zhenxun_bot_webui/tree/dist"
+    WEBUI_GIT = github_url("webui")
+    WEBUI_DIST_GITHUB_URL = github_url("webui", "dist")
     WEBUI_DOWNLOAD_FILE_STRING = "webui_assets.zip"
     WEBUI_DOWNLOAD_FILE = TEMP_PATH / WEBUI_DOWNLOAD_FILE_STRING
     WEBUI_UNZIP_PATH = TEMP_PATH / "web_ui"
@@ -82,10 +83,8 @@ class ZhenxunRepoConfig:
     WEBUI_BACKUP_PATH = DATA_PATH / "web_ui" / "backup_public"
 
     # 资源管理相关配置
-    RESOURCE_GIT = "https://github.com/zhenxun-org/zhenxun-bot-resources.git"
-    RESOURCE_GITHUB_URL = (
-        "https://github.com/zhenxun-org/zhenxun-bot-resources/tree/main"
-    )
+    RESOURCE_GIT = github_url("resource")
+    RESOURCE_GITHUB_URL = github_url("resource", "main")
     RESOURCE_ZIP_FILE_STRING = "resources.zip"
     RESOURCE_ZIP_FILE = TEMP_PATH / RESOURCE_ZIP_FILE_STRING
     RESOURCE_UNZIP_PATH = TEMP_PATH / "resources"
@@ -309,7 +308,7 @@ class ZhenxunRepoManagerClass:
             branch: 分支名称
             force: 是否强制更新
         """
-        if source == "git":
+        if source == "git" or not aliyun_mirrored("bot"):
             return await GithubRepoManager.update_via_git(
                 self.config.ZHENXUN_BOT_GIT,
                 Path(),
@@ -405,11 +404,12 @@ class ZhenxunRepoManagerClass:
         *,
         fallback: bool = False,
     ) -> RepoUpdateResult:
+        use_aliyun = source == "ali" and aliyun_mirrored("resource")
         async with _RESOURCE_UPDATE_LOCK:
             result = RepoUpdateResult(
-                repo_type=RepoType.ALIYUN if source == "ali" else RepoType.GITHUB,
+                repo_type=RepoType.ALIYUN if use_aliyun else RepoType.GITHUB,
                 repo_name="zhenxun-bot-resources",
-                owner="zhenxun-org",
+                owner=GITHUB_REPOS["resource"].split("/")[0],
                 old_version="",
                 new_version="",
             )
@@ -417,9 +417,7 @@ class ZhenxunRepoManagerClass:
             work.mkdir(parents=True)
             try:
                 if source is not None:
-                    manager = (
-                        GithubRepoManager if source == "git" else AliyunRepoManager
-                    )
+                    manager = AliyunRepoManager if use_aliyun else GithubRepoManager
                     result = await manager.update_via_git(
                         self.config.RESOURCE_GIT,
                         work / "git",
@@ -557,7 +555,7 @@ class ZhenxunRepoManagerClass:
             branch: 分支名称
             force: 是否强制更新
         """
-        if source == "git":
+        if source == "git" or not aliyun_mirrored("webui"):
             return await GithubRepoManager.update_via_git(
                 self.config.WEBUI_GIT,
                 self.config.WEBUI_PATH,

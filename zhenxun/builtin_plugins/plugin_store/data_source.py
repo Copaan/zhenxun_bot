@@ -11,6 +11,7 @@ from typing import Any, ClassVar
 import ujson as json
 
 from zhenxun.builtin_plugins.plugin_store.models import StorePluginInfo
+from zhenxun.configs.repo_config import aliyun_mirrored
 from zhenxun.models.plugin_info import PluginInfo
 from zhenxun.services.cache.bounded_ttl import BoundedTTLCache
 from zhenxun.services.log import logger
@@ -222,7 +223,8 @@ class StoreManager:
             ):
                 return deepcopy(cached_data)
 
-            repo_type = None if source is None else cls._get_source_order(source)[0]
+            order = cls._get_source_order(source, aliyun_mirrored("plugin"))
+            repo_type = order[0] if len(order) == 1 else None
             plugins, extra_plugins = await asyncio.gather(
                 RepoFileManager.get_text_content(
                     DEFAULT_GITHUB_URL, "plugins.json", repo_type=repo_type
@@ -317,7 +319,7 @@ class StoreManager:
             )
         found: set[str] = set()
         failed: list[str] = []
-        for repo_type in cls._get_source_order(source):
+        for repo_type in cls._get_source_order(source, aliyun_mirrored("plugin")):
             if len(found) == len(expected):
                 break
             files = await cls.catalog_files(repo_type, refresh=refresh)
@@ -844,7 +846,7 @@ class StoreManager:
         返回:
             tuple[Path, StoreInstallResult]: 候选源码路径与依赖预检结果
         """
-        source_order = cls._get_source_order(source)
+        source_order = cls._get_source_order(source, cls._aliyun_available(plugin_info))
         errors: list[str] = []
         staged_result: tuple[list[tuple[Path, Path]], list[Path]] | None = None
         selected_source: RepoType | None = None
@@ -948,15 +950,42 @@ class StoreManager:
         return f"{'community' if is_external else 'official'}:{plugin_info.module}"
 
     @staticmethod
-    def _get_source_order(source: str | None) -> tuple[RepoType, ...]:
-        """解析插件下载源。"""
-        if source is None:
-            return (RepoType.ALIYUN, RepoType.GITHUB)
+    def _get_source_order(
+        source: str | None, aliyun: bool = True
+    ) -> tuple[RepoType, ...]:
+        """解析插件下载源
+
+        参数:
+            source: ali 为阿里云，git 为 GitHub，为空时先阿里云后 GitHub
+            aliyun: 仓库是否有阿里云镜像，没有时只使用 GitHub
+
+        返回:
+            tuple[RepoType, ...]: 依次尝试的下载源
+        """
+        if source not in {None, "ali", "git"}:
+            raise PluginStoreException(f"源类型错误: {source}，请使用 ali 或 git")
+        if not aliyun or source == "git":
+            return (RepoType.GITHUB,)
         if source == "ali":
             return (RepoType.ALIYUN,)
-        if source == "git":
-            return (RepoType.GITHUB,)
-        raise PluginStoreException(f"源类型错误: {source}，请使用 ali 或 git")
+        return (RepoType.ALIYUN, RepoType.GITHUB)
+
+    @staticmethod
+    def _aliyun_available(plugin_info: StorePluginInfo) -> bool:
+        """判断插件是否可从阿里云下载，伴生插件仓库非官方时没有阿里云镜像
+
+        参数:
+            plugin_info: 插件信息
+
+        返回:
+            bool: 是否可从阿里云下载
+        """
+        repo_url = (plugin_info.github_url or DEFAULT_GITHUB_URL).split("/tree/")[0]
+        return (
+            bool(plugin_info.ali_url)
+            or repo_url != DEFAULT_GITHUB_URL.split("/tree/")[0]
+            or aliyun_mirrored("plugin")
+        )
 
     @staticmethod
     def _get_repository_url(plugin_info: StorePluginInfo, repo_type: RepoType) -> str:

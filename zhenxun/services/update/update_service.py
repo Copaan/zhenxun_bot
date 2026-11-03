@@ -20,6 +20,7 @@ import zipfile
 
 import httpx
 
+from zhenxun.configs.repo_config import GITHUB_REPOS, aliyun_mirrored
 from zhenxun.services.lifecycle import lifecycle_kernel
 from zhenxun.services.network_proxy import ManagedAsyncClient
 from zhenxun.services.resource_install import (
@@ -73,21 +74,7 @@ _BOT_ROOT_FILES = (
     "resources.spec",
 )
 
-_REPOSITORIES = {
-    "bot": "https://github.com/zhenxun-org/zhenxun_bot.git",
-    "resource": "https://github.com/zhenxun-org/zhenxun-bot-resources.git",
-    "webui": "https://github.com/HibiKier/zhenxun_bot_webui.git",
-}
-_ARCHIVES = {
-    "bot": "https://github.com/zhenxun-org/zhenxun_bot/archive/refs/{kind}/{ref}.zip",
-    "resource": (
-        "https://github.com/zhenxun-org/zhenxun-bot-resources/"
-        "archive/refs/{kind}/{ref}.zip"
-    ),
-    "webui": (
-        "https://github.com/HibiKier/zhenxun_bot_webui/" "archive/refs/{kind}/{ref}.zip"
-    ),
-}
+_ARCHIVE_FORMAT = "https://github.com/{repo}/archive/refs/{kind}/{ref}.zip"
 
 
 class UpdateServiceError(RuntimeError):
@@ -187,25 +174,23 @@ async def _get_text(url: str) -> str:
 async def _remote_versions(channel: UpdateChannel) -> dict[str, dict[str, Any]]:
     if channel == "release":
         release = await _get_json(
-            "https://api.github.com/repos/zhenxun-org/zhenxun_bot/releases/latest"
+            f"https://api.github.com/repos/{GITHUB_REPOS['bot']}/releases/latest"
         )
         bot_version = str(release.get("tag_name") or release.get("name") or "unknown")
         bot_ref = bot_version
     else:
         text = await _get_text(
-            "https://raw.githubusercontent.com/zhenxun-org/zhenxun_bot/main/__version__"
+            f"https://raw.githubusercontent.com/{GITHUB_REPOS['bot']}/main/__version__"
         )
         bot_version = text.split(":", 1)[-1].strip() or "unknown"
         bot_ref = "main"
 
     resource_text, webui_commit = await asyncio.gather(
         _get_text(
-            "https://raw.githubusercontent.com/zhenxun-org/"
-            "zhenxun-bot-resources/main/__version__"
+            f"https://raw.githubusercontent.com/{GITHUB_REPOS['resource']}"
+            "/main/__version__"
         ),
-        _get_json(
-            "https://api.github.com/repos/HibiKier/" "zhenxun_bot_webui/commits/dist"
-        ),
+        _get_json(f"https://api.github.com/repos/{GITHUB_REPOS['webui']}/commits/dist"),
     )
     resource_version = resource_text.split(":", 1)[-1].strip() or "unknown"
     webui_sha = str(webui_commit.get("sha") or "").strip()
@@ -215,8 +200,8 @@ async def _remote_versions(channel: UpdateChannel) -> dict[str, dict[str, Any]]:
     webui_source_commit: str | None = None
     try:
         manifest = await _get_json(
-            "https://raw.githubusercontent.com/HibiKier/"
-            "zhenxun_bot_webui/dist/version.json"
+            f"https://raw.githubusercontent.com/{GITHUB_REPOS['webui']}"
+            "/dist/version.json"
         )
         webui_version = str(manifest.get("version") or "unknown")
         webui_manifest = True
@@ -434,7 +419,7 @@ async def _latest_ref(component: UpdateComponent, channel: UpdateChannel) -> str
     if component == "resource" or channel == "main":
         return "main"
     release = await _get_json(
-        "https://api.github.com/repos/zhenxun-org/zhenxun_bot/releases/latest"
+        f"https://api.github.com/repos/{GITHUB_REPOS['bot']}/releases/latest"
     )
     ref = str(release.get("tag_name") or "").strip()
     if not ref:
@@ -449,7 +434,7 @@ async def _download_archive(
     component: UpdateComponent, ref: str, destination: Path
 ) -> str:
     kind = "heads" if ref in {"main", "dist"} else "tags"
-    url = _ARCHIVES[component].format(kind=kind, ref=ref)
+    url = _ARCHIVE_FORMAT.format(repo=GITHUB_REPOS[component], kind=kind, ref=ref)
     digest = hashlib.sha256()
     async with ManagedAsyncClient(timeout=None, follow_redirects=True) as client:
         async with client.stream("GET", url, timeout=_HTTP_TIMEOUT) as response:
@@ -516,7 +501,7 @@ def _clone_ref(
     destination: Path,
     source: UpdateSource,
 ) -> Path:
-    repo_url = _REPOSITORIES[component]
+    repo_url = f"https://github.com/{GITHUB_REPOS[component]}.git"
     authenticated_url = repo_url
     if source == "aliyun":
         from zhenxun.utils.repo_utils.utils import prepare_aliyun_url
@@ -913,6 +898,8 @@ async def create_update_job(
             raise UpdateServiceError("update_in_progress")
         if _PENDING_FILE.exists():
             raise UpdateServiceError("pending_update_exists")
+        if source == "aliyun" and not aliyun_mirrored(component):
+            source = "github"
         if source == "aliyun" and method == "download":
             method = "git"
         if component == "bot" and channel == "release":

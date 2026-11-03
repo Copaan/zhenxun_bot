@@ -6,6 +6,7 @@ from nonebot.adapters import Bot
 from packaging.specifiers import SpecifierSet
 from packaging.version import InvalidVersion, Version
 
+from zhenxun.configs.repo_config import GITHUB_REPOS, RepoKey, aliyun_mirrored
 from zhenxun.services.log import logger
 from zhenxun.utils._restart_utils import request_dependency_restart
 from zhenxun.utils.http_utils import AsyncHttpx
@@ -15,15 +16,36 @@ from zhenxun.utils.manager.zhenxun_repo_manager import (
 )
 from zhenxun.utils.platform import PlatformUtils
 from zhenxun.utils.repo_utils import RepoFileManager
+from zhenxun.utils.repo_utils.models import RepoType
 
 LOG_COMMAND = "AutoUpdate"
 
 
 class UpdateManager:
     @staticmethod
-    async def _get_latest_commit_date(owner: str, repo: str, path: str) -> str:
-        """获取文件最新 commit 日期"""
-        api_url = f"https://api.github.com/repos/{owner}/{repo}/commits"
+    def _repo_type(key: RepoKey) -> RepoType | None:
+        """获取读取仓库文件的下载源，无阿里云镜像时只使用 GitHub
+
+        参数:
+            key: 仓库标识
+
+        返回:
+            RepoType | None: 下载源，为空时先阿里云后 GitHub
+        """
+        return None if aliyun_mirrored(key) else RepoType.GITHUB
+
+    @staticmethod
+    async def _get_latest_commit_date(repo: str, path: str) -> str:
+        """获取文件最新 commit 日期
+
+        参数:
+            repo: GitHub 仓库（owner/repo）
+            path: 文件路径
+
+        返回:
+            str: commit 日期
+        """
+        api_url = f"https://api.github.com/repos/{repo}/commits"
         params = {"path": path, "page": 1, "per_page": 1}
         try:
             data = await AsyncHttpx.get_json(api_url, params=params)
@@ -31,7 +53,7 @@ class UpdateManager:
                 date_str = data[0]["commit"]["committer"]["date"]
                 return date_str.split("T")[0]
         except Exception as e:
-            logger.warning(f"获取 {owner}/{repo}/{path} 的 commit 日期失败", e=e)
+            logger.warning(f"获取 {repo}/{path} 的 commit 日期失败", e=e)
         return "获取失败"
 
     @classmethod
@@ -41,13 +63,15 @@ class UpdateManager:
 
         release_task = ZhenxunRepoManager.zhenxun_get_latest_releases_data()
         dev_version_task = RepoFileManager.get_text_content(
-            ZhenxunRepoConfig.ZHENXUN_BOT_GITHUB_URL, "__version__"
+            ZhenxunRepoConfig.ZHENXUN_BOT_GITHUB_URL,
+            "__version__",
+            repo_type=cls._repo_type("bot"),
         )
         bot_commit_date_task = cls._get_latest_commit_date(
-            "HibiKier", "zhenxun_bot", "__version__"
+            GITHUB_REPOS["bot"], "__version__"
         )
         res_commit_date_task = cls._get_latest_commit_date(
-            "zhenxun-org", "zhenxun-bot-resources", "__version__"
+            GITHUB_REPOS["resource"], "__version__"
         )
 
         (
@@ -110,7 +134,9 @@ class UpdateManager:
         res_latest_version = "获取失败"
         try:
             res_latest_version_text = await RepoFileManager.get_text_content(
-                ZhenxunRepoConfig.RESOURCE_GITHUB_URL, "__version__"
+                ZhenxunRepoConfig.RESOURCE_GITHUB_URL,
+                "__version__",
+                repo_type=cls._repo_type("resource"),
             )
             res_latest_version = res_latest_version_text.split(":")[-1].strip()
         except Exception as e:
@@ -250,7 +276,9 @@ class UpdateManager:
         if version_type == "main":
             try:
                 spec_content = await RepoFileManager.get_text_content(
-                    ZhenxunRepoConfig.ZHENXUN_BOT_GITHUB_URL, "resources.spec"
+                    ZhenxunRepoConfig.ZHENXUN_BOT_GITHUB_URL,
+                    "resources.spec",
+                    repo_type=cls._repo_type("bot"),
                 )
                 required_spec_str = None
                 for line in spec_content.splitlines():

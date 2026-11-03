@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from hashlib import sha256
 import os
 from pathlib import Path
@@ -12,6 +12,7 @@ from nonebot_plugin_uninfo import Uninfo
 from zhenxun import ui
 from zhenxun.configs.config import BotConfig, Config
 from zhenxun.configs.path_config import THEMES_PATH
+from zhenxun.models.sign_log import SignLog
 from zhenxun.models.sign_user import SignUser
 from zhenxun.models.user_console import UserConsole
 from zhenxun.services.avatar_service import avatar_service
@@ -229,6 +230,58 @@ def get_level_and_next_impression(impression: float) -> tuple[int, int | float, 
     return level_int, next_impression, previous_impression
 
 
+async def sign_history(user_id: str, today: date) -> dict:
+    """本月签到日历与连续签到天数，今天未签到时从昨天开始计算连续天数
+
+    参数:
+        user_id: 用户id
+        today: Bot 时区的今天
+
+    返回:
+        dict: offset 本月1日前的空格数，days 本月每天的状态（signed/empty/future），
+            streak 连续签到天数，month_count 本月签到天数
+    """
+    first = today.replace(day=1)
+    zone = TimeUtils.zone()
+    signed: set[date] = set()
+    streak, expected, broken = 0, today, False
+    query = SignLog.filter(user_id=user_id).order_by("-create_time")
+    offset, page = 0, 62
+    while True:
+        rows = (
+            await query.offset(offset).limit(page).values_list("create_time", flat=True)
+        )
+        day = today
+        for created in rows:
+            day = created.astimezone(zone).date()  # type: ignore
+            if day >= first:
+                signed.add(day)
+            if broken or day > expected:
+                continue
+            if streak == 0 and day == today - timedelta(days=1):
+                expected = day
+            if day == expected:
+                streak += 1
+                expected -= timedelta(days=1)
+            else:
+                broken = True
+        if len(rows) < page or (broken and day < first):
+            break
+        offset += page
+    following = (first + timedelta(days=32)).replace(day=1)
+    days = []
+    for n in range((following - first).days):
+        day = first + timedelta(days=n)
+        state = "future" if day > today else "signed" if day in signed else "empty"
+        days.append({"day": day.day, "state": state, "today": day == today})
+    return {
+        "offset": first.isoweekday() - 1,
+        "days": days,
+        "streak": streak,
+        "month_count": len(signed),
+    }
+
+
 def clear_sign_data_pic():
     """
     清空当前签到图片数据
@@ -296,32 +349,24 @@ async def _generate_html_card(
         message = f"{BotConfig.self_nickname}希望你开心！"
     bot_message = f"{BotConfig.self_nickname}说: {message}"
 
-    temperature = random.randint(1, 40)
-    weather_icon_name = f"{random.randint(0, 11)}.png"
-    tag_icon_name = f"{random.randint(0, 5)}.png"
-
-    font_size = 45
-    if len(nickname) > 6:
-        font_size = 27
-
     avatar_path = await avatar_service.get_session_avatar_path(session)
     user_info = {
         "nickname": nickname,
         "uid_str": uid_formatted,
         "avatar_url": avatar_path.as_uri() if avatar_path else "",
         "sign_count": user.sign_count,
-        "font_size": font_size,
         **_identity_display(session),
     }
 
     favorability_info = {
         "current": impression,
         "level": level,
-        "level_text": f"{level} [{lik2relation.get(str(level), '未知')}]",
-        "heart2": [1 for _ in range(level)],
-        "heart1": [1 for _ in range(len(lik2level) - level - 1)],
         "next_level_at": next_impression,
         "previous_level_at": previous_impression,
+        "levels": [
+            {"name": lik2relation[lv], "threshold": threshold}
+            for threshold, lv in sorted(lik2level.items())
+        ],
     }
 
     total_gold = None
@@ -337,9 +382,7 @@ async def _generate_html_card(
 
     page_info = {
         "date_str": str(now.replace(microsecond=0)),
-        "weather_icon_name": weather_icon_name,
-        "temperature": temperature,
-        "tag_icon_name": tag_icon_name,
+        "weekday": f"周{'一二三四五六日'[now.isoweekday() - 1]}",
     }
 
     card_data = {
@@ -354,6 +397,7 @@ async def _generate_html_card(
         "progress": progress,
         "rank": rank,
         "total_gold": total_gold,
+        "history": await sign_history(user.user_id, now.date()),
     }
 
     image_bytes = await ui.render_template(

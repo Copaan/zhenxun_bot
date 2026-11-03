@@ -24,7 +24,6 @@ __all__ = [
 class TemplateComponent(RenderableComponent):
     """基于独立模板文件的UI组件"""
 
-    _is_standalone_template: bool = True
     template_path: str | Path = Field(..., description="指向HTML模板文件的路径")  # type: ignore
     """指向HTML模板文件的路径"""
     data: dict[str, Any] = Field(..., description="传递给模板的上下文数据字典")

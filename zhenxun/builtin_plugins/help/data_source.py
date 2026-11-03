@@ -6,7 +6,6 @@ from zhenxun.configs.config import BotConfig, Config
 from zhenxun.configs.utils import PluginExtraData
 from zhenxun.models.plugin_info import PluginInfo
 from zhenxun.models.statistics import Statistics
-from zhenxun.services import avatar_service
 from zhenxun.services.ai.core.exceptions import LLMException
 from zhenxun.services.db_context import with_db_timeout
 from zhenxun.services.log import logger
@@ -16,7 +15,6 @@ from zhenxun.services.startup_load import startup_load_planner
 from zhenxun.ui.models import PluginMenuCategory, PluginMenuData
 from zhenxun.utils.common_utils import format_usage_for_markdown
 from zhenxun.utils.enum import PluginType
-from zhenxun.utils.platform import PlatformUtils
 
 from .utils import classify_plugin
 
@@ -109,11 +107,6 @@ async def create_help_img(
         plugin_count += len(value)
         active_count += sum(1 for item in value if item["status"] == 0)
 
-    platform = PlatformUtils.get_platform(session)
-    bot_id = BotConfig.get_qbot_uid(session.self_id) or session.self_id
-    bot_avatar_path = await avatar_service.get_avatar_path(platform, bot_id)
-    bot_avatar_url = bot_avatar_path.as_uri() if bot_avatar_path else ""
-
     categories_objects = []
     for category in categories_for_model:
         categories_objects.append(
@@ -122,7 +115,6 @@ async def create_help_img(
 
     menu_data = PluginMenuData(
         bot_name=BotConfig.self_nickname,
-        bot_avatar_url=bot_avatar_url,
         is_detail=is_detail,
         plugin_count=plugin_count,
         active_count=active_count,

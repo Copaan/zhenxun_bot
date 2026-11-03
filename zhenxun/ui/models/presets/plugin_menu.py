@@ -40,8 +40,6 @@ class PluginMenuData(RenderableComponent):
     """页面样式名称"""
     bot_name: str
     """机器人名称"""
-    bot_avatar_url: str
-    """机器人头像URL"""
     is_detail: bool
     """是否为详细菜单模式"""
     plugin_count: int

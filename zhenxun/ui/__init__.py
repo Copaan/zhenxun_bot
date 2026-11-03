@@ -65,7 +65,7 @@ def template(path: str | Path, data: dict[str, Any]) -> TemplateComponent:
     return TemplateComponent(template_path=path, data=data)
 
 
-def markdown(content: str = "", style: str | Path | None = "default") -> MarkdownData:
+def markdown(content: str = "", style: str | Path | None = "light") -> MarkdownData:
     """
     创建一个基于Markdown内容的UI组件。
 
@@ -357,7 +357,7 @@ async def render_template(
 
 
 async def render_markdown(
-    md: str, style: str | Path | None = "default", use_cache: bool = False, **kwargs
+    md: str, style: str | Path | None = "light", use_cache: bool = False, **kwargs
 ) -> bytes:
     """
     将Markdown字符串渲染为图片。
@@ -366,7 +366,8 @@ async def render_markdown(
 
     参数:
         md: 要渲染的Markdown内容字符串。
-        style: (可选) 样式名称或自定义CSS文件路径，默认为 "default"。
+        style: (可选) 样式名称或自定义CSS文件路径，默认为 "light"，
+            样式不存在时回退到 light。
         use_cache: (可选) 是否启用渲染缓存，默认为 False。
         **kwargs: 传递给渲染服务的额外参数。
 

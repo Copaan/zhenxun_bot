@@ -168,9 +168,19 @@ class RendererService:
         self._initialized = False
         self._initialization_task = None
 
-    async def _prepare_theme(self) -> None:
-        current_theme_name = Config.get_config("UI", "THEME", "default")
-        await self._theme_manager.load_theme(current_theme_name)
+    async def _prepare_theme(self, theme_name: str | None = None) -> str:
+        """加载主题，并同步模板加载路径、Jinja 全局主题变量与模板缓存
+
+        参数:
+            theme_name: 主题名称，默认使用配置中的主题
+
+        返回:
+            str: 已加载的主题名称
+        """
+        assert self._theme_manager is not None
+        assert self._template_engine is not None
+        theme_name = str(theme_name or Config.get_config("UI", "THEME", "default"))
+        await self._theme_manager.load_theme(theme_name)
         if self._theme_manager.current_theme:
             self._template_engine.update_theme_loaders(
                 self._theme_manager.current_theme.assets_dir.parent
@@ -181,6 +191,15 @@ class RendererService:
         self._template_engine.set_global(
             "default_theme_palette", self._theme_manager.current_default_palette
         )
+        if self._template_engine.env.cache:
+            self._template_engine.env.cache.clear()
+        return theme_name
+
+    @staticmethod
+    def _clear_ui_cache() -> None:
+        """清空 UI 图片缓存，主题变化后旧图片不再可用"""
+        for file in UI_CACHE_PATH.glob("*.png"):
+            file.unlink(missing_ok=True)
 
     async def _initialize(self):
         """
@@ -280,7 +299,14 @@ class RendererService:
                     else:
                         resolved_data_dict[key] = value
                 data_str = json.dumps(resolved_data_dict, sort_keys=True)
-                cache_key_str = f"{template_name}:{data_str}"
+                theme = context.theme_manager.current_theme
+                options_str = json.dumps(
+                    context.render_options, sort_keys=True, default=str
+                )
+                cache_key_str = (
+                    f"{template_name}:{getattr(component, 'variant', None)}:"
+                    f"{theme.name if theme else ''}:{options_str}:{data_str}"
+                )
                 cache_filename = (
                     f"{hashlib.sha256(cache_key_str.encode()).hexdigest()}.png"
                 )
@@ -318,11 +344,8 @@ class RendererService:
 
     def _select_strategy(self, component: Renderable) -> RenderStrategy:
         """
-        根据组件特性选择合适的渲染策略。
+        根据组件特性选择合适的渲染策略，模板路径为绝对路径时按独立模板文件渲染。
         """
-        if getattr(component, "_is_standalone_template", False):
-            return TemplateFileRenderStrategy()
-
         template_path = getattr(component, "template_path", None)
         if isinstance(template_path, Path) and template_path.is_absolute():
             return TemplateFileRenderStrategy()
@@ -480,15 +503,8 @@ class RendererService:
         if self._theme_manager.manifest_registry:
             self._theme_manager.manifest_registry.clear_cache()
             logger.debug("已清除UI清单缓存 (manifest cache)。")
-        current_theme_name = Config.get_config("UI", "THEME", "default")
-        await self._theme_manager.load_theme(current_theme_name)
-
-        if self._theme_manager.current_theme and self._template_engine:
-            self._template_engine.update_theme_loaders(
-                self._theme_manager.current_theme.assets_dir.parent
-            )
-        if self._template_engine and self._template_engine.env.cache:
-            self._template_engine.env.cache.clear()
+        current_theme_name = await self._prepare_theme()
+        self._clear_ui_cache()
 
         logger.info(f"主题 '{current_theme_name}' 已成功重载。")
         return current_theme_name
@@ -534,14 +550,8 @@ class RendererService:
                 f"主题 '{theme_name}' 不存在。可用主题: {', '.join(available_themes)}"
             )
 
-        await self._theme_manager.load_theme(theme_name)
-
-        if self._theme_manager.current_theme and self._template_engine:
-            self._template_engine.update_theme_loaders(
-                self._theme_manager.current_theme.assets_dir.parent
-            )
-        if self._template_engine and self._template_engine.env.cache:
-            self._template_engine.env.cache.clear()
+        await self._prepare_theme(theme_name)
+        self._clear_ui_cache()
 
         Config.set_config("UI", "THEME", theme_name, auto_save=True)
         logger.info(f"UI主题已切换为: {theme_name}")

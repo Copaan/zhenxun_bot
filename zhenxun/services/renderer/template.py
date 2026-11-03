@@ -154,6 +154,15 @@ class JinjaTemplateEngine:
 
         html_fragment = await template.render_async(**template_context)
 
+        # 页面模板继承 _base.html，自身已是完整 HTML 文档并内联了样式，直接返回。
+        html_head = html_fragment.lstrip()[:32].lower()
+        if html_head.startswith("<!doctype html") or html_head.startswith("<html"):
+            if extra_css := getattr(component, "component_css", None):
+                html_fragment = html_fragment.replace(
+                    "</head>", f"<style>{extra_css}</style>\n</head>", 1
+                )
+            return html_fragment
+
         if not kwargs.get("frameless", False):
             base_template = self.env.get_template("partials/_base.html")
             page_context = {
@@ -166,11 +175,6 @@ class JinjaTemplateEngine:
             }
             return await base_template.render_async(**page_context)
         else:
-            # 对于本身已是完整 HTML 文档的模板，直接返回，避免重复拼接大段 CSS。
-            html_head = html_fragment.lstrip()[:32].lower()
-            if html_head.startswith("<!doctype html") or html_head.startswith("<html"):
-                return html_fragment
-
             style_blocks: list[str] = []
             if theme_css_content:
                 style_blocks.append(theme_css_content)

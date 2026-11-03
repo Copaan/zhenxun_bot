@@ -273,6 +273,16 @@ class MarkdownData(ContainerComponent):
     def template_name(self) -> str:
         return "components/core/markdown"
 
+    def get_render_data(self) -> dict[str, Any]:
+        """渲染数据，并按 width 设置截图视口宽度
+
+        返回:
+            dict[str, Any]: 模板数据
+        """
+        data = super().get_render_data()
+        data["render_options"] = {"viewport": {"width": self.width, "height": 10}}
+        return data
+
     async def get_extra_css(self, context: Any) -> str:
         css_parts = []
         if self.component_css:
@@ -290,6 +300,10 @@ class MarkdownData(ContainerComponent):
             css_path = await context.theme_manager.resolve_markdown_style_path(
                 style_name, context
             )
+            if not css_path and style_name != "light":
+                css_path = await context.theme_manager.resolve_markdown_style_path(
+                    "light", context
+                )
             if css_path and css_path.exists():
                 async with aiofiles.open(css_path, encoding="utf-8") as f:
                     css_parts.append(await f.read())

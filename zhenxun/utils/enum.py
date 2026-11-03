@@ -13,19 +13,6 @@ class PriorityLifecycleType(StrEnum):
     """关闭"""
 
 
-class BankHandleType(StrEnum):
-    DEPOSIT = "DEPOSIT"
-    """存款"""
-    WITHDRAW = "WITHDRAW"
-    """取款"""
-    LOAN = "LOAN"
-    """贷款"""
-    REPAYMENT = "REPAYMENT"
-    """还款"""
-    INTEREST = "INTEREST"
-    """利息"""
-
-
 class EventLogType(StrEnum):
     GROUP_MEMBER_INCREASE = "GROUP_MEMBER_INCREASE"
     """群成员增加"""

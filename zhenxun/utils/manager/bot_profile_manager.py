@@ -143,8 +143,8 @@ class BotProfileManager:
             return None
         if not tags:
             tags = [
-                {"text": f"服务人数: {service_count}", "color": "#5e92e0"},
-                {"text": f"调用次数: {call_count}", "color": "#31e074"},
+                {"text": f"服务人数: {service_count}"},
+                {"text": f"调用次数: {call_count}"},
             ]
         profile_data = {
             "avatar": profile.avatar.absolute().as_uri() if profile.avatar else None,
