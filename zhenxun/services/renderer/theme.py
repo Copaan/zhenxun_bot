@@ -571,10 +571,8 @@ class ThemeManager:
                 "tables",
                 "fenced_code",
                 "codehilite",
-                "mdx_math",
                 "pymdownx.tilde",
             ],
-            extension_configs={"mdx_math": {"enable_dollar_delimiter": True}},
         )
 
     async def load_theme(self, theme_name: str = "default"):

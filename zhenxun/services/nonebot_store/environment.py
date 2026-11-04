@@ -88,16 +88,35 @@ def distributions(paths=None) -> tuple[dict, dict]:
     return selected, duplicates
 
 
-def base_distributions() -> tuple[dict, dict]:
+def base_paths() -> list[str]:
+    """当前进程 sys.path 中核心虚拟环境的搜索路径
+
+    不含依赖层，也不含包内自带的私有依赖目录（如 setuptools 导入时追加的
+    setuptools/_vendor）。
+
+    返回:
+        list[str]: 搜索路径
+    """
+    root = LAYER_ROOT.resolve()
+    paths = []
+    for value in sys.path:
+        path = Path(value).resolve()
+        if path.is_relative_to(root) or (path.parent / "__init__.py").is_file():
+            continue
+        paths.append(value)
+    return paths
+
+
+def base_distributions(paths: list[str] | None = None) -> tuple[dict, dict]:
     """核心虚拟环境中的包，不含依赖层
+
+    参数:
+        paths: 搜索路径，为空时使用当前进程的 base_paths
 
     返回:
         tuple[dict, dict]: 包名 -> 已安装的包，以及重复安装的包所在路径
     """
-    root = LAYER_ROOT.resolve()
-    return distributions(
-        [value for value in sys.path if not Path(value).resolve().is_relative_to(root)]
-    )
+    return distributions(base_paths() if paths is None else paths)
 
 
 def dependency_roots(
@@ -383,7 +402,10 @@ class EnvironmentSnapshot:
 
 
 def capture_environment(
-    *, manifest=None, candidate_path: Path | None = None
+    *,
+    manifest=None,
+    candidate_path: Path | None = None,
+    paths: list[str] | None = None,
 ) -> EnvironmentSnapshot:
     """读取核心环境与依赖层的包元数据并收集各来源的依赖声明，不导入插件
 
@@ -392,6 +414,7 @@ def capture_environment(
     参数:
         manifest: 依赖层清单，为空时使用当前清单
         candidate_path: 代替激活代的候选依赖层目录
+        paths: 核心虚拟环境的搜索路径，为空时使用当前进程的 base_paths
 
     返回:
         EnvironmentSnapshot: 环境快照
@@ -399,7 +422,7 @@ def capture_environment(
     from .dependencies import PROJECT_NAME
 
     manifest = load_manifest() if manifest is None else manifest
-    base, duplicates = base_distributions()
+    base, duplicates = base_distributions(paths)
     generation = manifest.get("active_generation")
     layer_path = candidate_path
     if layer_path is None and isinstance(generation, int):

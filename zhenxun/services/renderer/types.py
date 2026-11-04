@@ -12,7 +12,6 @@ from typing import TYPE_CHECKING, Any, Literal
 from pydantic import BaseModel, Field
 
 if TYPE_CHECKING:
-    from .engine import BaseScreenshotEngine
     from .service import RendererService
     from .template import JinjaTemplateEngine
     from .theme import ThemeManager
@@ -68,6 +67,7 @@ class RenderResult(BaseModel):
     """渲染服务的统一返回类型。"""
 
     image_bytes: bytes | None = None
+    image_pages: list[bytes] = Field(default_factory=list)
     html_content: str | None = None
 
 
@@ -122,6 +122,21 @@ class BaseScreenshotEngine(ABC):
     @abstractmethod
     async def render(self, html: str, base_url_path: Path, **render_options) -> bytes:
         raise NotImplementedError
+
+    async def render_pages(
+        self, html: str, base_url_path: Path, **render_options
+    ) -> list[bytes]:
+        """渲染 HTML，超长页面可分为多张图片
+
+        参数:
+            html: 页面 HTML
+            base_url_path: 相对资源的基准目录
+            **render_options: 渲染参数
+
+        返回:
+            list[bytes]: 页面图片
+        """
+        return [await self.render(html, base_url_path, **render_options)]
 
 
 class RenderStrategy(ABC):

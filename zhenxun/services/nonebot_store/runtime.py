@@ -975,11 +975,13 @@ def load_managed_plugins() -> dict[str, Any]:
     }
     if manifest.get("pending_verification"):
         from .dependencies import DependencyAnalysisError
-        from .environment import capture_environment
+        from .environment import base_paths, capture_environment
 
         try:
-            snapshot = capture_environment(manifest=manifest)
+            paths = base_paths()
+            snapshot = capture_environment(manifest=manifest, paths=paths)
             status["loaded_mismatches"] = snapshot.loaded_mismatches
+            status["environment_paths"] = paths
             status["environment_versions"] = snapshot.versions
         except DependencyAnalysisError as error:
             status["environment_error"] = {"code": error.code, "details": error.details}
@@ -1101,12 +1103,7 @@ def _probe_config_main(module_name: str, layer: str) -> None:
 
         from zhenxun.configs.environment import environment_file, migrate_orm_data_dir
 
-        nonebot.init(
-            _env_file=environment_file(),
-            htmlrender_browser_channel=None,
-            render_backend="playwright",
-            render_playwright={"channel": None},
-        )
+        nonebot.init(_env_file=environment_file())
         migrate_orm_data_dir()
         _load_managed_plugin(module_name, purge=False)
     except Exception as error:
@@ -1308,11 +1305,33 @@ def startup_verification() -> tuple[bool, dict[str, Any]]:
             conflicts(
                 "current_environment_dependency_conflict", check["remaining_conflicts"]
             )
-        snapshot = capture_environment(manifest=manifest)
+        paths = status.get("environment_paths")
+        snapshot = capture_environment(
+            manifest=manifest,
+            paths=[str(item) for item in paths] if isinstance(paths, list) else None,
+        )
+        loaded_versions = status.get("environment_versions")
         if status.get("environment_error"):
             fatal.append(dict(status["environment_error"]))
-        elif status.get("environment_versions") != snapshot.versions:
-            fatal.append({"code": "environment_changed_after_load"})
+        elif loaded_versions != snapshot.versions:
+            loaded_versions = (
+                loaded_versions if isinstance(loaded_versions, dict) else {}
+            )
+            names = set(loaded_versions) | set(snapshot.versions)
+            fatal.append(
+                {
+                    "code": "environment_changed_after_load",
+                    "details": [
+                        {
+                            "name": name,
+                            "expected": loaded_versions.get(name) or "未安装",
+                            "actual": snapshot.versions.get(name),
+                        }
+                        for name in sorted(names)
+                        if loaded_versions.get(name) != snapshot.versions.get(name)
+                    ],
+                }
+            )
         for item in status.get("loaded_mismatches") or []:
             (fatal if item.get("name") in core else warnings).append(
                 {"code": "loaded_source_mismatch", **item}

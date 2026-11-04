@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, Literal, TypeVar
@@ -5,6 +6,7 @@ from typing import Any, Literal, TypeVar
 from pydantic import BaseModel
 
 from zhenxun.services import renderer_service
+from zhenxun.services.renderer.engine import stitch_pages
 from zhenxun.services.renderer.types import Renderable, RenderResult
 
 from .models.components import (
@@ -272,6 +274,46 @@ def hstack(children: Sequence[Any], **layout_options) -> LayoutData:
     return layout
 
 
+def _build_component(
+    component_or_path: Renderable | str | Path,
+    data: dict | None,
+    template: str | Path | None,
+    is_page: bool,
+) -> Renderable:
+    """把渲染入口的参数整理为可渲染组件
+
+    参数:
+        component_or_path: 可渲染组件或模板路径
+        data: 模板数据
+        template: 强制使用的模板路径
+        is_page: 是否为完整页面
+
+    返回:
+        Renderable: 可渲染组件
+    """
+    component: Renderable
+    if isinstance(component_or_path, str | Path):
+        if data is None:
+            raise ValueError("使用模板路径渲染时必须提供 'data' 参数。")
+        component = TemplateComponent(
+            template_path=component_or_path, data=data, is_page=is_page
+        )
+    else:
+        component = component_or_path
+
+    if template:
+        if isinstance(template, Path):
+            template_str = template.as_posix()
+        else:
+            template_str = str(template).replace("\\", "/")
+        if hasattr(component, "template_path"):
+            setattr(component, "template_path", template_str)
+
+    if is_page and hasattr(component, "is_page"):
+        component.is_page = True
+    return component
+
+
 async def render(
     component_or_path: Renderable | str | Path,
     data: dict | None = None,
@@ -300,30 +342,36 @@ async def render(
         **kwargs: 传递给截图引擎的参数，如 `viewport={"width": 800, "height": 600}`
 
     返回:
-        bytes: PNG图片二进制数据
+        bytes: 图片二进制数据，超长页面拼接为一张
     """
-    component: Renderable
-    if isinstance(component_or_path, str | Path):
-        if data is None:
-            raise ValueError("使用模板路径渲染时必须提供 'data' 参数。")
-        component = TemplateComponent(
-            template_path=component_or_path, data=data, is_page=is_page
-        )
-    else:
-        component = component_or_path
-
-    if template:
-        if isinstance(template, Path):
-            template_str = template.as_posix()
-        else:
-            template_str = str(template).replace("\\", "/")
-        if hasattr(component, "template_path"):
-            setattr(component, "template_path", template_str)
-
-    if is_page and hasattr(component, "is_page"):
-        component.is_page = True
-
+    component = _build_component(component_or_path, data, template, is_page)
     return await renderer_service.render(component, use_cache=use_cache, **kwargs)
+
+
+async def render_pages(
+    component_or_path: Renderable | str | Path,
+    data: dict | None = None,
+    *,
+    template: str | Path | None = None,
+    use_cache: bool = False,
+    is_page: bool = False,
+    **kwargs,
+) -> list[bytes]:
+    """渲染为图片，超长页面分为多张，参数同 `render`
+
+    参数:
+        component_or_path: 一个 `Renderable` 实例，或一个指向模板文件的路径
+        data: 当 `component_or_path` 是路径时，必须提供此数据字典
+        template: 强制使用的模板路径（可选）
+        use_cache: 是否启用渲染结果缓存（默认为 False）
+        is_page: 标记此次渲染是否为完整页面，默认为 False
+        **kwargs: 传递给截图引擎的参数
+
+    返回:
+        list[bytes]: 页面图片
+    """
+    component = _build_component(component_or_path, data, template, is_page)
+    return await renderer_service.render_pages(component, use_cache=use_cache, **kwargs)
 
 
 async def render_template(
@@ -420,7 +468,10 @@ async def render_full_result(
         use_cache=use_cache,
         render_options={**kwargs, "_keep_html_content": True},
     )
-    return await renderer_service._render_component(context)
+    result = await renderer_service._render_component(context)
+    if result.image_bytes is None and result.image_pages:
+        result.image_bytes = await asyncio.to_thread(stitch_pages, result.image_pages)
+    return result
 
 
 __all__ = [
@@ -445,6 +496,7 @@ __all__ = [
     "render",
     "render_full_result",
     "render_markdown",
+    "render_pages",
     "render_template",
     "table",
     "template",

@@ -2,12 +2,9 @@
 
 from __future__ import annotations
 
-import contextlib
 import importlib
-import json
 import os
 from pathlib import Path
-import platform
 import signal
 import time
 
@@ -32,44 +29,6 @@ def record_process_crash(error: BaseException, *, role: str) -> None:
         # Startup can fail before the logging module is available. Keep the
         # original exception and let the process supervisor handle it.
         pass
-
-
-def _playwright_chromium_installed() -> bool:
-    """Playwright 自带的 Chromium 无头浏览器是否已安装
-
-    返回:
-        bool: 当前 Playwright 版本对应的 chromium-headless-shell 已安装完成
-    """
-    try:
-        import playwright
-
-        manifest = (
-            Path(playwright.__file__).parent / "driver" / "package" / "browsers.json"
-        )
-        revision = next(
-            item["revision"]
-            for item in json.loads(manifest.read_text("utf-8"))["browsers"]
-            if item["name"] == "chromium-headless-shell"
-        )
-    except Exception:
-        return False
-    configured = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
-    if configured == "0":
-        root = manifest.parent / ".local-browsers"
-    elif configured:
-        root = Path(configured)
-    elif platform.system() == "Windows":
-        local = os.environ.get("LOCALAPPDATA")
-        root = (Path(local) if local else Path.home() / "AppData/Local") / (
-            "ms-playwright"
-        )
-    elif platform.system() == "Darwin":
-        root = Path.home() / "Library/Caches/ms-playwright"
-    else:
-        cache = os.environ.get("XDG_CACHE_HOME")
-        root = (Path(cache) if cache else Path.home() / ".cache") / "ms-playwright"
-    marker = root / f"chromium_headless_shell-{revision}" / "INSTALLATION_COMPLETE"
-    return marker.exists()
 
 
 def run_worker(project_root: Path) -> None:
@@ -98,48 +57,12 @@ def run_worker(project_root: Path) -> None:
 
     import nonebot
 
-    htmlrender_browser_channel = None
-    system = None if _playwright_chromium_installed() else platform.system()
-
-    if system == "Windows":
-        import winreg
-
-        paths = {
-            "chrome": r"SOFTWARE\Clients\StartMenuInternet\Google Chrome\DefaultIcon",
-            "msedge": r"SOFTWARE\Clients\StartMenuInternet\Microsoft Edge\DefaultIcon",
-        }
-        for name, path in paths.items():
-            with contextlib.suppress(FileNotFoundError):
-                winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, path)
-                htmlrender_browser_channel = name
-                break
-
-    elif system == "Darwin":
-        mac_paths = {
-            "chrome": "/Applications/Google Chrome.app",
-            "msedge": "/Applications/Microsoft Edge.app",
-        }
-        for name, path in mac_paths.items():
-            if Path(path).exists():
-                htmlrender_browser_channel = name
-                break
-
-    if htmlrender_browser_channel:
-        nonebot.logger.info(
-            f"使用 {htmlrender_browser_channel} 作为 htmlrender 驱动启动..."
-        )
-
     from zhenxun.services import proxy_clients
 
     proxy_clients.install()
     from zhenxun.configs.environment import environment_file, migrate_orm_data_dir
 
-    nonebot.init(
-        _env_file=environment_file(),
-        htmlrender_browser_channel=htmlrender_browser_channel,
-        render_backend="playwright",
-        render_playwright={"channel": htmlrender_browser_channel},
-    )
+    nonebot.init(_env_file=environment_file())
     migrate_orm_data_dir(project_root)
 
     from zhenxun.adapters.onebot_managed import ManagedOneBotAdapter as OneBotV11Adapter
@@ -151,6 +74,16 @@ def run_worker(project_root: Path) -> None:
     driver = nonebot.get_driver()
     driver.register_adapter(OneBotV11Adapter)
     enabled_adapters = ["OneBot V11"]
+    # 其余适配器模块会直接导入 alconna / uninfo，需先以插件形式加载；
+    # 之后注册的适配器由 alconna / uninfo 按适配器名延迟加载。
+    for library_plugin in (
+        "nonebot_plugin_apscheduler",
+        "nonebot_plugin_alconna",
+        "nonebot_plugin_session",
+        "nonebot_plugin_uninfo",
+        "nonebot_plugin_waiter",
+    ):
+        nonebot.require(library_plugin)
     if BotConfig.qq_adapter_load:
         from zhenxun.adapters.qq_official.config import validate_qq_official_config
 
@@ -176,21 +109,11 @@ def run_worker(project_root: Path) -> None:
         driver.register_adapter(TelegramAdapter)
         enabled_adapters.append("Telegram")
 
-    from zhenxun.services.runtime_bootstrap import register_runtime_bootstrap
-
-    # Core library plugins are process infrastructure, not side effects of
-    # importing zhenxun.services. HTMLRender is loaded lazily by the renderer.
-    for library_plugin in (
-        "nonebot_plugin_apscheduler",
-        "nonebot_plugin_alconna",
-        "nonebot_plugin_session",
-        "nonebot_plugin_uninfo",
-        "nonebot_plugin_waiter",
-    ):
-        nonebot.require(library_plugin)
     from zoneinfo import ZoneInfo
 
     from nonebot_plugin_apscheduler import scheduler
+
+    from zhenxun.services.runtime_bootstrap import register_runtime_bootstrap
 
     scheduler.timezone = ZoneInfo(BotConfig.timezone)
     from nonebot_plugin_uninfo.adapters import alter_get_fetcher

@@ -244,7 +244,7 @@ class ComponentRenderStrategy(RenderStrategy):
         screenshot_options.pop("frameless", None)
         screenshot_options.pop("_keep_html_content", None)
 
-        image_bytes = await context.screenshot_engine.render(
+        pages = await context.screenshot_engine.render_pages(
             html=html_content,
             base_url_path=THEMES_PATH.parent,
             **screenshot_options,
@@ -254,7 +254,8 @@ class ComponentRenderStrategy(RenderStrategy):
         )
         debug_mode = Config.get_config("UI", "DEBUG_MODE", False)
         return RenderResult(
-            image_bytes=image_bytes,
+            image_bytes=pages[0] if len(pages) == 1 else None,
+            image_pages=pages,
             html_content=html_content if debug_mode or keep_html_content else None,
         )
 
@@ -332,7 +333,7 @@ class TemplateFileRenderStrategy(RenderStrategy):
         screenshot_options = final_render_options.copy()
         screenshot_options.pop("_keep_html_content", None)
 
-        image_bytes = await context.screenshot_engine.render(
+        pages = await context.screenshot_engine.render_pages(
             html=html_content, base_url_path=template_dir, **screenshot_options
         )
         keep_html_content = bool(
@@ -340,6 +341,7 @@ class TemplateFileRenderStrategy(RenderStrategy):
         )
         debug_mode = Config.get_config("UI", "DEBUG_MODE", False)
         return RenderResult(
-            image_bytes=image_bytes,
+            image_bytes=pages[0] if len(pages) == 1 else None,
+            image_pages=pages,
             html_content=html_content if debug_mode or keep_html_content else None,
         )

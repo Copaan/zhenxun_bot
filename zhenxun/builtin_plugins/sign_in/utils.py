@@ -383,6 +383,7 @@ async def _generate_html_card(
     page_info = {
         "date_str": str(now.replace(microsecond=0)),
         "weekday": f"周{'一二三四五六日'[now.isoweekday() - 1]}",
+        "lunar": TimeUtils.lunar_date(now.date()),
     }
 
     card_data = {

@@ -312,10 +312,11 @@ async def long_message(bot: Bot | None, text: str) -> UniMessage | None:
             bot.self_id,
             BotConfig.self_nickname or "Bot",
         )
-    from zhenxun.ui import render_markdown
+    from zhenxun.ui import markdown, render_pages
 
     try:
-        return UniMessage(Image(raw=await render_markdown(text)))
+        pages = await render_pages(markdown(text))
+        return UniMessage([Image(raw=page) for page in pages])
     except Exception as e:
         logger.warning(f"长回复转图失败，改为文字发送: {e}", MODULE)
         return None

@@ -162,7 +162,7 @@ def get_user_allow_help(is_admin: bool, is_superuser: bool) -> list[str]:
 
 async def get_plugin_help(
     is_admin: bool, name: str, is_superuser: bool, variant: str | None = None
-) -> str | bytes | None:
+) -> str | list[bytes] | None:
     """获取功能的帮助信息
 
     参数:
@@ -258,14 +258,16 @@ async def get_plugin_help(
             component = ui.template("pages/builtin/help", data=page_data)
             if variant:
                 component.variant = variant
-            return await ui.render(component, use_cache=True, device_scale_factor=2)
+            return await ui.render_pages(
+                component, use_cache=True, device_scale_factor=2
+            )
         return None
     return None
 
 
 async def get_llm_help(
     question: str, is_admin: bool, is_superuser: bool
-) -> str | bytes:
+) -> str | list[bytes]:
     """
     使用LLM来回答用户的自然语言求助。
 
@@ -275,7 +277,7 @@ async def get_llm_help(
         is_superuser: 是否为超级用户。
 
     返回:
-        str | bytes: LLM生成的回答或错误提示。
+        str | list[bytes]: LLM生成的回答或错误提示，较长的回答为图片。
     """
 
     try:
@@ -351,7 +353,7 @@ async def get_llm_help(
         if len(reply_text) > threshold:
             notebook = ui.notebook()
             notebook.text(reply_text)
-            return await ui.render(notebook)
+            return await ui.render_pages(notebook)
 
         return reply_text
 

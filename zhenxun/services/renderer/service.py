@@ -1,5 +1,6 @@
 import asyncio
 from collections.abc import Awaitable, Callable
+from datetime import datetime
 import hashlib
 from pathlib import Path
 from typing import Any, ClassVar
@@ -12,6 +13,7 @@ import ujson as json
 from zhenxun.configs.config import Config
 from zhenxun.configs.path_config import UI_CACHE_PATH
 from zhenxun.services.log import logger
+from zhenxun.services.renderer.charts import chart_svg
 from zhenxun.services.renderer.template import (
     ComponentRenderStrategy,
     JinjaTemplateEngine,
@@ -29,7 +31,7 @@ from zhenxun.utils.exception import RenderingError
 from zhenxun.utils.log_sanitizer import sanitize_for_logging
 from zhenxun.utils.pydantic_compat import _dump_pydantic_obj
 
-from .engine import engine_manager, stop_preparation
+from .engine import engine_manager, stitch_pages, stop_preparation
 from .theme import ThemeManager
 
 
@@ -61,6 +63,8 @@ class RendererService:
 
         self.filter("dump_json")(self._pydantic_tojson_filter)
         self.global_function("inline_asset")(self._inline_asset_global)
+        self.global_function("now")(datetime.now)
+        self.global_function("chart_svg")(chart_svg)
 
     def register_template_namespace(self, namespace: str, path: Path):
         """
@@ -317,7 +321,9 @@ class RendererService:
                     async with aiofiles.open(cache_path, "rb") as f:
                         image_bytes = await f.read()
                     return RenderResult(
-                        image_bytes=image_bytes, html_content="<!-- from cache -->"
+                        image_bytes=image_bytes,
+                        image_pages=[image_bytes],
+                        html_content="<!-- from cache -->",
                     )
                 logger.debug(f"UI缓存未命中: {cache_key_str[:100]}...")
             except Exception as e:
@@ -332,6 +338,7 @@ class RendererService:
             and not hot_reload
             and cache_path
             and result.image_bytes
+            and len(result.image_pages) <= 1
         ):
             try:
                 async with aiofiles.open(cache_path, "wb") as f:
@@ -379,23 +386,19 @@ class RendererService:
                 f"渲染组件 '{context.component.__class__.__name__}' 失败"
             ) from e
 
-    async def render(
-        self, component: Renderable, use_cache: bool = False, **render_options
-    ) -> bytes:
-        """
-        将组件渲染为图片字节数据。
+    async def _render_result(
+        self, component: Renderable, use_cache: bool, render_options: dict
+    ) -> RenderResult:
+        """渲染组件，结果包含分页图片
 
         参数:
             component: 需要渲染的 Renderable 组件实例
-            use_cache: 是否启用渲染缓存，默认为 False
-            **render_options: 传递给底层截图引擎的额外参数，如 `viewport` (字典), `device_scale_factor` 等
+            use_cache: 是否启用渲染缓存
+            render_options: 传递给截图引擎的参数
 
         返回:
-            bytes: 渲染后的PNG图片二进制数据
-
-        异常:
-            RenderingError: 当渲染流程中任何步骤（初始化、资源缺失、截图失败）发生错误时抛出
-        """  # noqa: E501
+            RenderResult: 渲染结果
+        """
         if not self._initialized:
             await self.initialize()
         if (
@@ -427,9 +430,50 @@ class RendererService:
                 f"{sanitized_html}\n"
                 f"--- [UI DEBUG] End of HTML ---"
             )
-        if result.image_bytes is None:
+        if not result.image_pages:
             raise RenderingError("渲染成功但未能生成图片字节数据。")
-        return result.image_bytes
+        return result
+
+    async def render(
+        self, component: Renderable, use_cache: bool = False, **render_options
+    ) -> bytes:
+        """
+        将组件渲染为图片字节数据，超长页面的分页图片会拼接为一张。
+
+        参数:
+            component: 需要渲染的 Renderable 组件实例
+            use_cache: 是否启用渲染缓存，默认为 False
+            **render_options: 传递给底层截图引擎的额外参数，如 `viewport` (字典), `device_scale_factor` 等
+
+        返回:
+            bytes: 渲染后的图片二进制数据
+
+        异常:
+            RenderingError: 当渲染流程中任何步骤（初始化、资源缺失、截图失败）发生错误时抛出
+        """  # noqa: E501
+        result = await self._render_result(component, use_cache, render_options)
+        return result.image_bytes or await asyncio.to_thread(
+            stitch_pages, result.image_pages
+        )
+
+    async def render_pages(
+        self, component: Renderable, use_cache: bool = False, **render_options
+    ) -> list[bytes]:
+        """将组件渲染为图片，超长页面分为多张
+
+        参数:
+            component: 需要渲染的 Renderable 组件实例
+            use_cache: 是否启用渲染缓存，默认为 False
+            **render_options: 传递给截图引擎的额外参数
+
+        返回:
+            list[bytes]: 页面图片
+
+        异常:
+            RenderingError: 渲染失败时抛出
+        """
+        result = await self._render_result(component, use_cache, render_options)
+        return result.image_pages
 
     async def render_to_html(
         self, component: Renderable, frameless: bool = False

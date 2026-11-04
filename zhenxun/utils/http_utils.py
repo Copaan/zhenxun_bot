@@ -31,8 +31,6 @@ from zhenxun.utils.exception import AllURIsFailedError
 from zhenxun.utils.manager.priority_manager import PriorityLifecycle
 from zhenxun.utils.user_agent import get_user_agent
 
-from .browser import AsyncPlaywright, BrowserIsNone  # noqa: F401
-
 _SENTINEL = object()
 
 _client: AsyncClient | None = None

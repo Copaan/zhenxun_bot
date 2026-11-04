@@ -34,10 +34,6 @@ RUN uv sync --frozen --no-install-project --no-dev
 # 复制应用代码
 COPY . .
 
-# 安装 Playwright 和 Chromium
-RUN uv run playwright install --with-deps chromium \
-  && rm -rf /var/lib/apt/lists/* /tmp/*
-
 COPY --from=metadata-stage /tmp/VERSION /app/VERSION
 
 VOLUME ["/app/zhenxun/data", "/app/zhenxun/resources", "/app/zhenxun/log"]

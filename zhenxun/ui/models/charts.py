@@ -87,10 +87,6 @@ class BaseChartData(RenderableComponent, ABC):
             dumped_data["option"] = self.build_option()
         return dumped_data
 
-    def get_required_scripts(self) -> list[str]:
-        """声明此组件需要 ECharts 库。"""
-        return ["js/echarts.min.js"]
-
 
 class EChartsData(BaseChartData):
     """统一的 ECharts 图表数据模型"""

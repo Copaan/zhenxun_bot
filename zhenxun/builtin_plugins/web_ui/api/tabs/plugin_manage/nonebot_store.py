@@ -160,6 +160,7 @@ async def _environment_view() -> dict[str, Any]:
     result["sync"] = dependency_sync_status()
     startup = read_json(STARTUP_STATUS_FILE, {})
     startup.pop("environment_versions", None)
+    startup.pop("environment_paths", None)
     result["startup_verification"] = startup
     pending = pending_transaction() or {}
     from zhenxun.services.nonebot_store.policy import orm_console_instructions

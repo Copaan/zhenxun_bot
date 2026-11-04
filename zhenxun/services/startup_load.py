@@ -36,8 +36,8 @@ _PRELOAD_MARKERS = {
 }
 # 导入或 require 库插件的语句，仅出现库名（如字符串常量）不算使用
 _LIBRARY_PATTERN = re.compile(
-    rb"^[ \t]*(?:from|import)[ \t][^\n]*?\b(nonebot_plugin_(?:orm|htmlrender))\b"
-    rb"|require\([ \t]*[\"'](nonebot_plugin_(?:orm|htmlrender))[\"']",
+    rb"^[ \t]*(?:from|import)[ \t][^\n]*?\b(nonebot_plugin_orm)\b"
+    rb"|require\([ \t]*[\"'](nonebot_plugin_orm)[\"']",
     re.MULTILINE,
 )
 
@@ -275,7 +275,7 @@ class StartupLoadPlanner:
         """在外部插件执行前注册库插件
 
         localstore 总是预加载，避免插件直接导入后 NoneBot 不再视其为插件；
-        ORM 与 htmlrender 仅在有插件使用时预加载。
+        ORM 仅在有插件使用时预加载。
         """
         import nonebot
 
@@ -290,18 +290,6 @@ class StartupLoadPlanner:
                 nonebot_logger.opt(exception=error).error(
                     f"核心依赖插件预加载失败: {library} ({type(error).__name__})"
                 )
-
-        if "nonebot_plugin_htmlrender" not in self._libraries:
-            return
-
-        driver = nonebot.get_driver()
-        before = set(driver._lifespan._startup_funcs)
-        nonebot.require("nonebot_plugin_htmlrender")
-        for func in list(driver._lifespan._startup_funcs):
-            if func not in before and str(getattr(func, "__module__", "")).startswith(
-                "nonebot_plugin_htmlrender"
-            ):
-                driver._lifespan._startup_funcs.remove(func)
 
     async def load_runtime(self) -> None:
         for plugin_id in self.order:

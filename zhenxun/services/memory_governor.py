@@ -108,18 +108,7 @@ async def _has_active_auth_work() -> bool:
 
 async def _has_active_render_work() -> bool:
     module = sys.modules.get("zhenxun.services.renderer.engine")
-    if module is None:
-        return False
-    tracker = getattr(module, "_HTMLRENDER_TASK_TRACKER", None)
-    if tracker is not None and tracker.active_tasks:
-        return True
-    resources = getattr(module, "browser_resources", None)
-    if resources is not None and any(not task.done() for task in resources.tasks):
-        return True
-    manager = getattr(module, "engine_manager", None)
-    engine = getattr(manager, "_instance", None)
-    busy = getattr(engine, "busy", None)
-    return bool(busy and busy())
+    return module is not None and module._GATE.active > 0
 
 
 async def _run_reclaim() -> None:
