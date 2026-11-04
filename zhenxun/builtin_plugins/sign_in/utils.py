@@ -407,7 +407,6 @@ async def _generate_html_card(
         clip_selector=".wrapper",
         clip_padding=0,
         disable_animations=True,
-        screenshot_scale="css",
     )
 
     async with aiofiles.open(card_file, "wb") as f:

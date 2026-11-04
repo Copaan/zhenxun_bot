@@ -8,6 +8,8 @@ import math
 from pathlib import Path
 import re
 from typing import Any
+from urllib.parse import urljoin, urlparse
+from urllib.request import url2pathname
 
 from PIL import Image, ImageChops
 
@@ -41,6 +43,9 @@ _NO_ANIMATION_CSS = (
     "caret-color:transparent!important}"
 )
 _CSS_URL = re.compile(r"url\(\s*['\"]?(https?://[^'\")\s]+)", re.IGNORECASE)
+_FONT_FACE = re.compile(r"@font-face\s*\{[^}]*\}", re.IGNORECASE)
+_FONT_FAMILY = re.compile(r"font-family\s*:\s*([^;}]+)", re.IGNORECASE)
+_VH_UNIT = re.compile(r"[\d.]vh\b", re.IGNORECASE)
 _MAX_BLUR = 100
 """模糊图层的最大物理半径"""
 _PAINT_RESET = (
@@ -66,6 +71,7 @@ class _HtmlScan(HTMLParser):
         self.clip: tuple[int, str, str | None] | None = None
         self.blurs: set[int] = set()
         self.hosts: dict[int, str] = {}
+        self.stylesheets: list[str] = []
         self._stack: list[tuple[str, int, str]] = []
         self._in_style = False
         self._line_starts = [0]
@@ -109,6 +115,9 @@ class _HtmlScan(HTMLParser):
             value = attrs.get(key)
             if value and value.lower().startswith(("http://", "https://")):
                 self.urls[value] = None
+        if tag == "link" and "stylesheet" in (attrs.get("rel") or "").lower():
+            if href := attrs.get("href"):
+                self.stylesheets.append(href)
         if style := attrs.get("style"):
             self._add_css_urls(style)
         radius = attrs.get("data-blur") or ""
@@ -179,6 +188,50 @@ def _mark_hosts(html: str, hosts: dict[int, str]) -> str:
         tagged = f"{text[:name_end]} data-blur-host{text[name_end:]}"
         html = html[:offset] + tagged + html[offset + len(text) :]
     return html
+
+
+def _local_css(hrefs: list[str], base_url: str) -> str:
+    """读取页面链接的本地样式表
+
+    参数:
+        hrefs: 样式表链接
+        base_url: 页面基准地址
+
+    返回:
+        str: 样式表内容
+    """
+    texts = []
+    for href in hrefs:
+        url = urljoin(base_url, href)
+        if not url.startswith("file:"):
+            continue
+        with contextlib.suppress(OSError, UnicodeDecodeError):
+            texts.append(Path(url2pathname(urlparse(url).path)).read_text("utf-8"))
+    return "\n".join(texts)
+
+
+def _prune_font_faces(html: str, context: str) -> str:
+    """删除页面没有引用的 @font-face，blitz 每次渲染都会加载全部 @font-face 字体
+
+    参数:
+        html: 页面 HTML
+        context: 页面以外的样式，如链接的样式表
+
+    返回:
+        str: 新的 HTML
+    """
+    if "@font-face" not in html.lower():
+        return html
+    used = (_FONT_FACE.sub("", html) + context).lower()
+
+    def keep(match: re.Match[str]) -> str:
+        family = _FONT_FAMILY.search(match.group(0))
+        if family is None:
+            return match.group(0)
+        name = family.group(1).strip().strip("'\"").lower()
+        return match.group(0) if name in used else ""
+
+    return _FONT_FACE.sub(keep, html)
 
 
 _BLUR_HIDDEN = "[data-blur]{visibility:hidden!important}"
@@ -383,12 +436,14 @@ class _RenderJob:
         self.root_id = _ROOT_ID
         self.clip_id: str | None = None
         self.blurs: list[int] = []
+        self.uses_vh = False
         self.urls: list[str] = []
         self.css: list[str] = [_NO_ANIMATION_CSS]
         self.resources: dict[str, bytes] = {}
 
     def prepare(self) -> None:
-        """改写内联 SVG，检查嵌套深度，收集远程资源，并给根元素与裁剪元素加上 id"""
+        """改写内联 SVG，检查嵌套深度，收集远程资源，给根元素与裁剪元素加上 id，
+        删除未引用的 @font-face，并记录页面是否使用 vh 单位"""
         self.html = normalize_svg(self.html)
         scan = _HtmlScan(self.selector)
         scan.scan(self.html)
@@ -417,6 +472,9 @@ class _RenderJob:
         self.clip_id = ids.get(_CLIP_ID)
         if self.full_page and self.min_height:
             self.css.append(f"html{{min-height:{self.min_height}px!important}}")
+        linked = _local_css(scan.stylesheets, self.base_url)
+        self.html = _prune_font_faces(self.html, linked + "".join(self.css))
+        self.uses_vh = bool(_VH_UNIT.search(self.html) or _VH_UNIT.search(linked))
 
 
 class BlitzEngine(BaseScreenshotEngine):
@@ -611,7 +669,9 @@ class BlitzEngine(BaseScreenshotEngine):
         if not job.full_page:
             height = job.min_height
             return [self._render(job, height, _fit_scale(job.width, height, job.scale))]
-        if not job.min_height and _fits(job.width, 1000, job.scale):
+        if (not job.min_height or not job.uses_vh) and _fits(
+            job.width, 1000, job.scale
+        ):
             with contextlib.suppress(ValueError):
                 return [self._render(job, None, job.scale)]
         _, y, _, height = self._box(job, job.root_id)
