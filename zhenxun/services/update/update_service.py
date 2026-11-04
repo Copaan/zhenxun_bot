@@ -684,7 +684,7 @@ async def _apply_resource_update_hot(job_id: str, staged: Path) -> dict[str, Any
 
     target = _ROOT / "resources"
     force = bool(read_job(job_id).get("force"))
-    ready = await asyncio.to_thread(resources_ready, target, _ROOT / "resources.spec")
+    ready = await asyncio.to_thread(resources_ready, target)
     transaction = await asyncio.to_thread(
         ResourceTransaction,
         staged,
@@ -1125,7 +1125,7 @@ def _apply_resource_update(staged: Path, backup: Path, *, force: bool = False) -
         staged,
         target,
         backup,
-        fill_only=not force and not resources_ready(target, _ROOT / "resources.spec"),
+        fill_only=not force and not resources_ready(target),
         spec=_ROOT / "resources.spec",
         protect_modified=not force,
     )

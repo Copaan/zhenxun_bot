@@ -363,7 +363,7 @@ class ZhenxunRepoManagerClass:
 
     def _apply_resource_candidate(self, staged: Path, work: Path, force: bool):
         target = self.config.RESOURCE_PATH
-        repair = not self.check_resources_exists() and not force
+        repair = not resources_ready(target) and not force
         transaction = ResourceTransaction(
             staged,
             target,
