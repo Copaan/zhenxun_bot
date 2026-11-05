@@ -1,1 +1,1 @@
-require_resources_version: ">=1.1.3"
+require_resources_version: ">=1.1.5"
