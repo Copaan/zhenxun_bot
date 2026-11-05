@@ -1,12 +1,15 @@
 import asyncio
+from collections import OrderedDict
 from collections.abc import AsyncIterator
 import contextlib
+import hashlib
 from html.parser import HTMLParser
 from importlib import import_module
 import io
 import math
 from pathlib import Path
 import re
+import threading
 from typing import Any
 from urllib.parse import urljoin, urlparse
 from urllib.request import url2pathname
@@ -46,6 +49,15 @@ _CSS_URL = re.compile(r"url\(\s*['\"]?(https?://[^'\")\s]+)", re.IGNORECASE)
 _FONT_FACE = re.compile(r"@font-face\s*\{[^}]*\}", re.IGNORECASE)
 _FONT_FAMILY = re.compile(r"font-family\s*:\s*([^;}]+)", re.IGNORECASE)
 _VH_UNIT = re.compile(r"[\d.]vh\b", re.IGNORECASE)
+_IMG_SRC = re.compile(r"""(?<![\w-])src\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)""", re.I)
+_SHRINK_MIN_SIDE = 128
+"""原图长边小于该值时不预先缩小"""
+_SHRINK_RATIO = 0.75
+"""所需尺寸不超过原图的该比例时预先缩小"""
+_SHRINK_URL = "https://zx-render.invalid/shrunk/"
+_SHRINK_CACHE_SIZE = 64
+_shrink_cache: OrderedDict[tuple[bytes, int, int], bytes | None] = OrderedDict()
+_shrink_lock = threading.Lock()
 _MAX_BLUR = 100
 """模糊图层的最大物理半径"""
 _PAINT_RESET = (
@@ -72,6 +84,7 @@ class _HtmlScan(HTMLParser):
         self.blurs: set[int] = set()
         self.hosts: dict[int, str] = {}
         self.stylesheets: list[str] = []
+        self.images: list[tuple[int, str, str | None, str]] = []
         self._stack: list[tuple[str, int, str]] = []
         self._in_style = False
         self._line_starts = [0]
@@ -115,6 +128,9 @@ class _HtmlScan(HTMLParser):
             value = attrs.get(key)
             if value and value.lower().startswith(("http://", "https://")):
                 self.urls[value] = None
+        src = attrs.get("src")
+        if tag == "img" and src and not src.lower().startswith("data:"):
+            self.images.append((self._offset(), text, attrs.get("id"), src))
         if tag == "link" and "stylesheet" in (attrs.get("rel") or "").lower():
             if href := attrs.get("href"):
                 self.stylesheets.append(href)
@@ -208,6 +224,71 @@ def _local_css(hrefs: list[str], base_url: str) -> str:
         with contextlib.suppress(OSError, UnicodeDecodeError):
             texts.append(Path(url2pathname(urlparse(url).path)).read_text("utf-8"))
     return "\n".join(texts)
+
+
+def _shrunk_image(data: bytes, width: float, height: float) -> bytes | None:
+    """按显示尺寸用 Lanczos 缩小图片，blitz 大幅缩小图片时采样粗糙，会出现颗粒和锯齿
+
+    参数:
+        data: 原图
+        width: 显示宽度（物理像素）
+        height: 显示高度（物理像素）
+
+    返回:
+        bytes | None: 缩小后的图片，无需缩小或无法解码时为 None
+    """
+    try:
+        image = Image.open(io.BytesIO(data))
+        if getattr(image, "n_frames", 1) > 1 or max(image.size) < _SHRINK_MIN_SIDE:
+            return None
+        factor = max(width / image.width, height / image.height)
+        if factor > _SHRINK_RATIO:
+            return None
+        size = (
+            max(math.ceil(image.width * factor), 1),
+            max(math.ceil(image.height * factor), 1),
+        )
+        alpha = image.mode in ("RGBA", "LA", "PA") or "transparency" in image.info
+        image = image.convert("RGBA" if alpha else "RGB").resize(
+            size, Image.Resampling.LANCZOS
+        )
+    except (OSError, ValueError, Image.DecompressionBombError):
+        return None
+    buffer = io.BytesIO()
+    if alpha:
+        image.save(buffer, "PNG", compress_level=1)
+    else:
+        image.save(buffer, "JPEG", quality=95, subsampling=0)
+    return buffer.getvalue()
+
+
+def _replace_img(
+    html: str, element_id: str, url: str, width: float, height: float
+) -> str:
+    """替换图片地址，并补上宽高属性以保持原有布局
+
+    参数:
+        html: 页面 HTML
+        element_id: 图片 id
+        url: 新地址
+        width: 显示宽度
+        height: 显示高度
+
+    返回:
+        str: 新的 HTML
+    """
+    pattern = re.compile(
+        rf"""<img\b[^>]*?\bid\s*=\s*["']?{re.escape(element_id)}(?=["'\s/>])[^>]*>""",
+        re.IGNORECASE,
+    )
+    match = pattern.search(html)
+    if match is None:
+        return html
+    tag = _IMG_SRC.sub(f'src="{url}"', match.group(0), count=1)
+    for name, value in (("width", width), ("height", height)):
+        if not re.search(rf"(?<![\w-]){name}\s*=", tag, re.IGNORECASE):
+            tag = f'<img {name}="{value:g}"{tag[4:]}'
+    return html[: match.start()] + tag + html[match.end() :]
 
 
 def _prune_font_faces(html: str, context: str) -> str:
@@ -437,6 +518,7 @@ class _RenderJob:
         self.clip_id: str | None = None
         self.blurs: list[int] = []
         self.uses_vh = False
+        self.images: list[tuple[str, str]] = []
         self.urls: list[str] = []
         self.css: list[str] = [_NO_ANIMATION_CSS]
         self.resources: dict[str, bytes] = {}
@@ -461,6 +543,12 @@ class _RenderJob:
                 logger.debug(f"未找到裁剪元素 {self.selector}", "Renderer")
             else:
                 edits.append((scan.clip, "div", _CLIP_ID))
+        taken = {found[0] for found, _, _ in edits if found}
+        images = []
+        for index, (offset, text, element_id, src) in enumerate(scan.images):
+            if offset not in taken:
+                images.append((f"zx-render-img-{index}", src))
+                edits.append(((offset, text, element_id), "img", images[-1][0]))
         html = self.html
         ids: dict[str, str] = {}
         for found, tag, new_id in sorted(
@@ -470,6 +558,7 @@ class _RenderJob:
         self.html = html
         self.root_id = ids[_ROOT_ID]
         self.clip_id = ids.get(_CLIP_ID)
+        self.images = [(ids[new_id], src) for new_id, src in images]
         if self.full_page and self.min_height:
             self.css.append(f"html{{min-height:{self.min_height}px!important}}")
         linked = _local_css(scan.stylesheets, self.base_url)
@@ -626,6 +715,62 @@ class BlitzEngine(BaseScreenshotEngine):
             **options,
         )
 
+    def _image_bytes(self, job: _RenderJob, src: str) -> bytes | None:
+        if data := job.resources.get(src):
+            return data
+        url = urljoin(job.base_url, src)
+        if not url.startswith("file:"):
+            return None
+        with contextlib.suppress(OSError):
+            return Path(url2pathname(urlparse(url).path)).read_bytes()
+        return None
+
+    def _shrink_images(self, job: _RenderJob) -> dict[str, tuple[float, ...]] | None:
+        """测量图片的显示尺寸，把需要大幅缩小显示的图片预先缩小
+
+        参数:
+            job: 渲染参数
+
+        返回:
+            dict[str, tuple[float, ...]] | None: 各元素的布局，没有可缩小的图片时为 None
+        """
+        sources = {}
+        for element_id, src in job.images:
+            data = self._image_bytes(job, src)
+            if data and len(data) <= 64 * 1024**2:
+                with contextlib.suppress(OSError, ValueError):
+                    if max(Image.open(io.BytesIO(data)).size) >= _SHRINK_MIN_SIDE:
+                        sources[element_id] = data
+        if not sources:
+            return None
+        template = self._blitz.Template(
+            job.html,
+            width=job.width,
+            height=max(job.min_height, 1),
+            **self._options(job),
+        )
+        boxes = template.boxes()
+        for element_id, data in sources.items():
+            _, _, width, height = boxes.get(element_id, (0, 0, 0, 0))
+            if width <= 0 or height <= 0:
+                continue
+            size = (round(width * job.scale), round(height * job.scale))
+            key = (hashlib.md5(data).digest(), *size)
+            with _shrink_lock:
+                cached = key in _shrink_cache
+                shrunk = _shrink_cache.get(key)
+            if not cached:
+                shrunk = _shrunk_image(data, *size)
+                with _shrink_lock:
+                    _shrink_cache[key] = shrunk
+                    while len(_shrink_cache) > _SHRINK_CACHE_SIZE:
+                        _shrink_cache.popitem(last=False)
+            if shrunk is not None:
+                url = f"{_SHRINK_URL}{element_id}"
+                job.resources[url] = shrunk
+                job.html = _replace_img(job.html, element_id, url, width, height)
+        return boxes
+
     def _box(self, job: _RenderJob, element_id: str) -> tuple[float, ...]:
         template = self._blitz.Template(
             job.html,
@@ -635,9 +780,14 @@ class BlitzEngine(BaseScreenshotEngine):
         )
         return template.get_box(element_id)
 
-    def _render_clip(self, job: _RenderJob) -> list[bytes] | None:
+    def _render_clip(
+        self, job: _RenderJob, boxes: dict[str, tuple[float, ...]] | None
+    ) -> list[bytes] | None:
         assert job.clip_id
-        x, y, width, height = self._box(job, job.clip_id)
+        if boxes and job.clip_id in boxes:
+            x, y, width, height = boxes[job.clip_id]
+        else:
+            x, y, width, height = self._box(job, job.clip_id)
         if width <= 0 or height <= 0:
             return None
         padding = job.clip_padding
@@ -664,17 +814,23 @@ class BlitzEngine(BaseScreenshotEngine):
         返回:
             list[bytes]: 页面图片
         """
-        if job.clip_id and (clipped := self._render_clip(job)):
+        boxes = self._shrink_images(job) if job.images else None
+        if job.clip_id and (clipped := self._render_clip(job, boxes)):
             return clipped
         if not job.full_page:
             height = job.min_height
             return [self._render(job, height, _fit_scale(job.width, height, job.scale))]
-        if (not job.min_height or not job.uses_vh) and _fits(
-            job.width, 1000, job.scale
+        if (
+            boxes is None
+            and (not job.min_height or not job.uses_vh)
+            and _fits(job.width, 1000, job.scale)
         ):
             with contextlib.suppress(ValueError):
                 return [self._render(job, None, job.scale)]
-        _, y, _, height = self._box(job, job.root_id)
+        if boxes and job.root_id in boxes:
+            _, y, _, height = boxes[job.root_id]
+        else:
+            _, y, _, height = self._box(job, job.root_id)
         total = max(math.ceil(y + height), job.min_height, 1)
         scale = _fit_scale(job.width, total, job.scale)
         if _fits(job.width, total, scale):
