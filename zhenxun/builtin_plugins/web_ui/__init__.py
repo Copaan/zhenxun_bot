@@ -210,8 +210,11 @@ async def _start_http_compat(context):
 
 @PriorityLifecycle.on_shutdown(priority=1000, component_id="management:webui")
 async def _cleanup_ready_banner():
+    from zhenxun.services.update.update_service import stop_webui_update
+
     from .api.tabs.dashboard.overview import invalidate_probes
 
+    await stop_webui_update()
     await invalidate_probes(stopping=True)
     bind_lifecycle_context(None)
     webui_ready_banner.reset()

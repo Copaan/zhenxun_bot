@@ -41,6 +41,14 @@ def _service_error(error: UpdateServiceError) -> HTTPException:
         return HTTPException(status_code=404, detail="更新任务不存在。")
     if code in {"update_in_progress", "pending_update_exists"}:
         return HTTPException(status_code=409, detail="已有更新任务正在进行。")
+    if code in {"resource_recovery_required", "resource_startup_record_invalid"}:
+        return HTTPException(
+            status_code=409,
+            detail={
+                "code": code,
+                "message": "资源更新结果待核验，请保留备份并处理后再更新。",
+            },
+        )
     if code == "release_blocked":
         return HTTPException(
             status_code=409,

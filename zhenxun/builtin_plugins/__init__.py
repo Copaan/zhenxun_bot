@@ -6,8 +6,6 @@ import uuid
 import nonebot
 from nonebot.adapters import Bot
 from nonebot.drivers import Driver
-from packaging.specifiers import SpecifierSet
-from packaging.version import Version
 from tortoise import Tortoise
 from tortoise.exceptions import OperationalError
 import ujson as json
@@ -21,7 +19,6 @@ from zhenxun.services.db_context import database_ready
 from zhenxun.services.log import logger
 from zhenxun.utils.decorator.shop import shop_register
 from zhenxun.utils.manager.priority_manager import PriorityLifecycle
-from zhenxun.utils.manager.zhenxun_repo_manager import ZhenxunRepoManager
 from zhenxun.utils.platform import PlatformUtils
 
 driver: Driver = nonebot.get_driver()
@@ -99,62 +96,31 @@ from bag_users t1
     component_id="warmup:resources",
 )
 async def _prepare_resources():
-    try:
-        should_update = False
-        resource_path = ZhenxunRepoManager.config.RESOURCE_PATH
-        default_theme_path = resource_path / "themes" / "default"
-        version_file = resource_path / "__version__"
+    from zhenxun.services.resource_install import resources_ready
 
-        if (
-            not await asyncio.to_thread(ZhenxunRepoManager.check_resources_exists)
-            or not default_theme_path.exists()
-            or not version_file.exists()
-        ):
-            should_update = True
-            logger.info(
-                "检测到资源文件(字体/主题/版本信息)缺失，准备进行初始化下载...",
-                "资源检查",
-            )
-        else:
-            spec_file = Path("resources.spec")
-            req_ver_str = ">=0.0.0"
-            if spec_file.exists():
-                try:
-                    for line in spec_file.read_text("utf-8").splitlines():
-                        if line.strip().startswith("require_resources_version:"):
-                            req_ver_str = line.split(":", 1)[1].strip().strip("'\"")
-                            break
-                except Exception:
-                    pass
+    if not await asyncio.to_thread(
+        resources_ready, Path("resources"), Path("resources.spec")
+    ):
+        raise RuntimeError("resources_waiting_for_update")
 
-            local_ver_str = "0.0.0"
-            try:
-                content = version_file.read_text("utf-8").strip()
-                local_ver_str = (
-                    content.split(":", 1)[1].strip() if ":" in content else content
-                )
-            except Exception:
-                pass
 
-            if not SpecifierSet(req_ver_str).contains(Version(local_ver_str)):
-                should_update = True
-                logger.info(
-                    f"资源版本({local_ver_str})不满足要求({req_ver_str})，准备强制更新...",
-                    "资源检查",
-                )
+@PriorityLifecycle.on_startup(
+    priority=10,
+    stage="management",
+    timeout=300,
+    component_id="management:resource-update",
+)
+async def _start_resource_update():
+    from zhenxun.services.update.update_service import start_resource_update
 
-        if should_update:
-            logger.info("开始下载资源文件，请耐心等待...", "资源检查")
-            result = await ZhenxunRepoManager.resources_update()
-            if result and not result.success:
-                raise RuntimeError("resource_initialization_failed")
-            else:
-                logger.info("资源文件下载/更新完成", "资源检查")
-        if not await asyncio.to_thread(ZhenxunRepoManager.check_resources_exists):
-            raise RuntimeError("resource_validation_failed")
-    except Exception as e:
-        logger.error(f"资源检查或更新失败: {e}", "资源检查")
-        raise
+    start_resource_update()
+
+
+@PriorityLifecycle.on_shutdown(component_id="management:resource-update")
+async def _stop_resource_update():
+    from zhenxun.services.update.update_service import stop_resource_update
+
+    await stop_resource_update()
 
 
 @PriorityLifecycle.on_startup(

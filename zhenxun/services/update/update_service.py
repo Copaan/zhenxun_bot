@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
+from contextlib import nullcontext, suppress
 from datetime import datetime, timezone
 import hashlib
 from html.parser import HTMLParser
@@ -19,6 +21,7 @@ from uuid import uuid4
 import zipfile
 
 import httpx
+from packaging.version import InvalidVersion, Version
 
 from zhenxun.configs.repo_config import GITHUB_REPOS, aliyun_mirrored
 from zhenxun.services.lifecycle import lifecycle_kernel
@@ -26,6 +29,7 @@ from zhenxun.services.network_proxy import ManagedAsyncClient
 from zhenxun.services.resource_install import (
     ResourceInstallError,
     ResourceTransaction,
+    extract_resources_zip,
     prepare_resource_overlay,
     resources_ready,
     validate_resources,
@@ -49,6 +53,17 @@ _PENDING_FILE = _UPDATE_ROOT / "pending.json"
 _APPLIED_FILE = _UPDATE_ROOT / "applied.json"
 _STATUS_CACHE_SECONDS = 300
 _WEBUI_API_VERSION = 1
+_WEBUI_LEGACY_VERSION = Version("0.1.0")
+_RESOURCE_LEGACY_VERSION = Version("1.1.1")
+_RESOURCE_RETRY_SECONDS = 600
+_RESOURCE_STARTUP_TASK: asyncio.Task[None] | None = None
+_RESOURCE_ACTIVE_TASK: asyncio.Task[None] | None = None
+_WEBUI_RETRY_SECONDS = 600
+_WEBUI_DOWNLOAD_SECONDS = 180
+_WEBUI_STARTUP_TASK: asyncio.Task[None] | None = None
+_WEBUI_REFRESH: Callable[[], Awaitable[Any]] | None = None
+_WEBUI_STARTUP_STATUS: dict[str, Any] = {}
+webui_publication_lock = asyncio.Lock()
 _HTTP_TIMEOUT = httpx.Timeout(15.0, connect=8.0)
 _STATUS_LOCK = asyncio.Lock()
 _JOB_LOCK = asyncio.Lock()
@@ -145,7 +160,7 @@ def _read_webui_version() -> tuple[str, str | None]:
             version = str(data.get("version") or "unknown")
             commit = str(data.get("commit") or "").strip() or None
             return version, commit
-        except (OSError, ValueError, TypeError):
+        except (OSError, ValueError, TypeError, AttributeError):
             pass
     return "unknown", None
 
@@ -283,7 +298,11 @@ async def check_updates(
             and now - _STATUS_CACHE[0] < _STATUS_CACHE_SECONDS
             and _STATUS_CACHE[1].get("channel") == channel
         ):
-            return {**_STATUS_CACHE[1], "pending_job": pending_job()}
+            return {
+                **_STATUS_CACHE[1],
+                "pending_job": pending_job(),
+                "resource_startup_job": resource_startup_status(),
+            }
 
         bot_current = _read_version_file(_ROOT / "__version__")
         resource_current = _read_version_file(_ROOT / "resources" / "__version__")
@@ -319,6 +338,7 @@ async def check_updates(
             },
             "errors": errors,
             "pending_job": pending_job(),
+            "resource_startup_job": resource_startup_status(),
         }
         _STATUS_CACHE = (now, result)
         return result
@@ -367,6 +387,10 @@ def job_status(job_id: str) -> dict[str, Any]:
             progress=100,
             apply_mode="failed",
         )
+    if job.get("startup_resource") and job.get("next_retry_at"):
+        latest = resource_startup_status()
+        if latest and latest["job_id"] != job_id:
+            job = {**job, "retry_job_id": latest["job_id"]}
     return job
 
 
@@ -414,8 +438,15 @@ def _git_dirty() -> bool:
 
 
 async def _latest_ref(component: UpdateComponent, channel: UpdateChannel) -> str:
-    if component == "webui":
-        return "dist"
+    if component in {"webui", "resource"}:
+        branch = "dist" if component == "webui" else "main"
+        result = await _get_json(
+            f"https://api.github.com/repos/{GITHUB_REPOS[component]}/commits/{branch}"
+        )
+        ref = str(result.get("sha") or "")
+        if not re.fullmatch(r"[0-9a-f]{40}", ref):
+            raise UpdateServiceError(f"{component}_ref_invalid")
+        return ref
     if component == "resource" or channel == "main":
         return "main"
     release = await _get_json(
@@ -435,6 +466,8 @@ async def _download_archive(
 ) -> str:
     kind = "heads" if ref in {"main", "dist"} else "tags"
     url = _ARCHIVE_FORMAT.format(repo=GITHUB_REPOS[component], kind=kind, ref=ref)
+    if component in {"webui", "resource"}:
+        url = f"https://github.com/{GITHUB_REPOS[component]}/archive/{ref}.zip"
     digest = hashlib.sha256()
     async with ManagedAsyncClient(timeout=None, follow_redirects=True) as client:
         async with client.stream("GET", url, timeout=_HTTP_TIMEOUT) as response:
@@ -484,15 +517,304 @@ def _validate_webui_staging(root: Path) -> None:
         manifest = json.loads((root / "version.json").read_text(encoding="utf-8"))
         api_version = int(manifest.get("api_version"))
         version = str(manifest.get("version") or "").strip()
-    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        Version(version)
+    except (OSError, TypeError, ValueError, AttributeError) as exc:
         raise UpdateServiceError("webui_manifest_invalid") from exc
     if not version or api_version != _WEBUI_API_VERSION:
         raise UpdateServiceError("webui_api_incompatible")
 
     parser = _WebUIAssetParser()
-    parser.feed((root / "index.html").read_text(encoding="utf-8"))
-    if not parser.paths or any(not (root / path).is_file() for path in parser.paths):
+    try:
+        parser.feed((root / "index.html").read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError) as exc:
+        raise UpdateServiceError("webui_assets_incomplete") from exc
+    if not parser.paths or any(
+        not (root / path).resolve().is_relative_to(root.resolve())
+        or not (root / path).is_file()
+        for path in parser.paths
+    ):
         raise UpdateServiceError("webui_assets_incomplete")
+
+
+def webui_resources_compatible(root: Path) -> bool:
+    """确认本地页面清单、接口协议及入口资源均可用。"""
+    try:
+        _validate_webui_staging(root)
+    except UpdateServiceError:
+        return False
+    return True
+
+
+def webui_update_required(root: Path | None = None) -> bool:
+    """判断本地页面是否需要旧版升级或完整性修复。"""
+    root = root or _ROOT / "data" / "web_ui" / "public"
+    try:
+        _validate_webui_staging(root)
+        manifest = json.loads((root / "version.json").read_text("utf-8"))
+        return Version(str(manifest["version"])) <= _WEBUI_LEGACY_VERSION
+    except (UpdateServiceError, InvalidVersion, OSError, ValueError, KeyError):
+        return True
+
+
+def resource_update_required(root: Path | None = None) -> bool:
+    """判断资源是否过旧、缺失或不满足本体要求。"""
+    root = root or _ROOT / "resources"
+    if not resources_ready(root, _ROOT / "resources.spec"):
+        return True
+    try:
+        return (
+            Version(_read_version_file(root / "__version__"))
+            <= _RESOURCE_LEGACY_VERSION
+        )
+    except (OSError, ValueError):
+        return True
+
+
+def resource_startup_status() -> dict[str, Any] | None:
+    """读取自动资源更新的持久化任务，供已授权管理页面续查。"""
+    pointer = _JOBS_ROOT.parent / "resource-startup.json"
+    if not pointer.is_file():
+        return None
+    try:
+        value = json.loads(pointer.read_text("utf-8"))
+        return read_job(value["job_id"])
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise UpdateServiceError("resource_startup_record_invalid") from exc
+
+
+async def _recover_resource_components() -> None:
+    """资源可用后依次恢复资源检查和被阻塞的渲染组件。"""
+    if lifecycle_kernel.shutdown_requested:
+        raise asyncio.CancelledError
+    await lifecycle_kernel.start_components({"warmup:resources"})
+    await lifecycle_kernel.start_components({"warmup:renderer"})
+    lifecycle_kernel.component_context("warmup:renderer")
+
+
+async def _retry_resource_update() -> None:
+    """串行提交资源更新，失败等待十分钟，未知写入保留现场。"""
+    global _RESOURCE_ACTIVE_TASK
+    try:
+        previous = resource_startup_status()
+    except UpdateServiceError:
+        logger.exception("资源自动更新记录无法读取，已暂停自动覆盖")
+        return
+    if previous and previous["state"] in {"applying", "recovery_required"}:
+        _update_job(previous["job_id"], state="recovery_required", next_retry_at=None)
+        logger.error("资源更新结果待核验，已暂停自动覆盖：%s", previous["job_id"])
+        return
+    while not lifecycle_kernel.shutdown_requested:
+        job_id = None
+        try:
+            if not await _webui_disk(resource_update_required):
+                current = resource_startup_status()
+                if current:
+                    job_id = current["job_id"]
+                await _recover_resource_components()
+                if job_id:
+                    _update_job(
+                        job_id,
+                        runtime_ready=True,
+                        next_retry_at=None,
+                        runtime_error=None,
+                        retry_resolved=current["state"] != "completed",
+                    )
+                return
+            if _ACTIVE_TASK is not None and not _ACTIVE_TASK.done():
+                await asyncio.gather(
+                    asyncio.shield(_ACTIVE_TASK), return_exceptions=True
+                )
+                continue
+            job = await create_update_job(
+                component="resource",
+                channel="main",
+                method="download",
+                source="github",
+                force=True,
+                startup_resource=True,
+            )
+            job_id = job["job_id"]
+            _RESOURCE_ACTIVE_TASK = _ACTIVE_TASK
+            if _RESOURCE_ACTIVE_TASK is not None:
+                await asyncio.shield(_RESOURCE_ACTIVE_TASK)
+            job = read_job(job_id)
+            if job["state"] == "recovery_required":
+                return
+            if job["state"] != "completed":
+                raise UpdateServiceError(job.get("error") or "resource_update_failed")
+            await _recover_resource_components()
+            _update_job(job_id, runtime_ready=True, next_retry_at=None)
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            code = (
+                str(exc) if isinstance(exc, UpdateServiceError) else type(exc).__name__
+            )
+            logger.warning("资源自动更新未完成：%s，600 秒后重试", code)
+            if job_id:
+                with suppress(OSError, UpdateServiceError):
+                    _update_job(
+                        job_id,
+                        next_retry_at=datetime.fromtimestamp(
+                            time.time() + _RESOURCE_RETRY_SECONDS, timezone.utc
+                        ).isoformat(),
+                        runtime_error=code
+                        if read_job(job_id)["state"] == "completed"
+                        else None,
+                    )
+            await asyncio.sleep(_RESOURCE_RETRY_SECONDS)
+
+
+def start_resource_update() -> None:
+    """启动归属于管理生命周期的单实例资源更新任务。"""
+    global _RESOURCE_STARTUP_TASK
+    if _RESOURCE_STARTUP_TASK is None or _RESOURCE_STARTUP_TASK.done():
+        _RESOURCE_STARTUP_TASK = lifecycle_kernel.spawn_task(
+            "management:resource-update",
+            _retry_resource_update(),
+            name="resource-startup-update",
+        )
+
+
+async def stop_resource_update() -> None:
+    """停止自动资源更新，等待当前文件事务完成回滚或提交。"""
+    global _RESOURCE_STARTUP_TASK, _RESOURCE_ACTIVE_TASK
+    tasks = [
+        task
+        for task in (_RESOURCE_STARTUP_TASK, _RESOURCE_ACTIVE_TASK)
+        if task is not None and not task.done()
+    ]
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    _RESOURCE_STARTUP_TASK = _RESOURCE_ACTIVE_TASK = None
+
+
+def webui_startup_status() -> dict[str, Any]:
+    """返回不含连接信息和内部路径的启动更新状态。"""
+    status = dict(_WEBUI_STARTUP_STATUS)
+    if job_id := status.get("job_id"):
+        try:
+            job = read_job(job_id)
+            if status.get("state") == "queued":
+                status["state"] = job.get("phase") or job["state"]
+        except UpdateServiceError:
+            pass
+    return {key: status.get(key) for key in ("state", "reason", "next_retry_at")}
+
+
+async def _webui_disk(callback: Callable, *args: Any) -> Any:
+    """取消时等待文件操作结束，避免临时目录清理与写入竞争。"""
+    task = asyncio.create_task(asyncio.to_thread(callback, *args))
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+    result = task.result()
+    if cancelled:
+        raise asyncio.CancelledError
+    return result
+
+
+async def _retry_webui_update() -> None:
+    """旧版页面立即更新，失败后每十分钟重试直到发布完成。"""
+    while await _webui_disk(webui_update_required):
+        job_id = None
+        try:
+            if _ACTIVE_TASK is not None and not _ACTIVE_TASK.done():
+                await asyncio.gather(
+                    asyncio.shield(_ACTIVE_TASK), return_exceptions=True
+                )
+                continue
+            job = await create_update_job(
+                component="webui",
+                channel="main",
+                method="download",
+                source="github",
+                force=False,
+                startup_webui=True,
+            )
+            job_id = job["job_id"]
+            _WEBUI_STARTUP_STATUS.update(
+                state="queued", job_id=job_id, reason=None, next_retry_at=None
+            )
+            if _ACTIVE_TASK is not None:
+                await asyncio.shield(_ACTIVE_TASK)
+            job = read_job(job_id)
+            if job["state"] != "completed":
+                raise UpdateServiceError(job.get("error") or "webui_update_failed")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            code = (
+                str(exc) if isinstance(exc, UpdateServiceError) else type(exc).__name__
+            )
+            logger.warning("WebUI 自动更新失败：%s，600 秒后重试", code)
+            retry_at = datetime.fromtimestamp(
+                time.time() + _WEBUI_RETRY_SECONDS, timezone.utc
+            ).isoformat()
+            _WEBUI_STARTUP_STATUS.update(
+                state="waiting_retry",
+                next_retry_at=retry_at,
+                reason=_webui_failure_reason(code),
+            )
+            if job_id:
+                try:
+                    _update_job(job_id, next_retry_at=retry_at)
+                except Exception:
+                    logger.exception("WebUI 更新重试信息保存失败")
+            await asyncio.sleep(_WEBUI_RETRY_SECONDS)
+    _WEBUI_STARTUP_STATUS.update(state="completed", reason=None, next_retry_at=None)
+
+
+def start_webui_update(refresh: Callable[[], Awaitable[Any]]) -> None:
+    """注册资源刷新回调并启动单实例旧版更新任务。"""
+    global _WEBUI_STARTUP_TASK, _WEBUI_REFRESH
+    _WEBUI_REFRESH = refresh
+    if _WEBUI_STARTUP_TASK is None or _WEBUI_STARTUP_TASK.done():
+        _WEBUI_STARTUP_STATUS.clear()
+        _WEBUI_STARTUP_TASK = lifecycle_kernel.spawn_task(
+            "management:webui", _retry_webui_update(), name="webui-startup-update"
+        )
+
+
+async def stop_webui_update() -> None:
+    """停止启动更新和未完成的页面更新任务，等待文件操作收尾。"""
+    global _WEBUI_STARTUP_TASK, _WEBUI_REFRESH
+    tasks = [
+        task
+        for task in (_WEBUI_STARTUP_TASK, _ACTIVE_TASK)
+        if task and not task.done() and task is not _RESOURCE_ACTIVE_TASK
+    ]
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    _WEBUI_STARTUP_TASK = None
+    _WEBUI_REFRESH = None
+
+
+def _webui_failure_reason(code: str) -> str:
+    """将更新错误转换为公开页面可展示的固定诊断。"""
+    reasons = {
+        "webui_candidate_not_newer": "发布源尚未提供高于 0.1.0 的新版页面",
+        "webui_api_incompatible": "发布页面与当前后端接口不兼容",
+        "webui_manifest_invalid": "发布页面的版本清单缺失或无效",
+        "webui_assets_incomplete": "下载的页面资源不完整",
+        "staged_package_incomplete": "下载的发布包不完整",
+        "update_in_progress": "另一项更新正在运行",
+        "pending_update_exists": "另一项更新正在等待重启应用",
+        "PermissionError": "资源目录被占用或没有写入权限",
+        "TimeoutError": "下载超过本轮时间限制",
+    }
+    if code in reasons:
+        return reasons[code] + "，十分钟后自动重试。"
+    safe_code = code if re.fullmatch(r"[A-Za-z0-9_]{1,80}", code) else "update_failed"
+    return f"更新未完成（{safe_code}），十分钟后自动重试。"
 
 
 def _clone_ref(
@@ -514,7 +836,7 @@ def _clone_ref(
 
     repo_url = canonicalize_git_url(authenticated_url)
     auth_env = git_auth_environment(authenticated_url, repo_url)
-    result = subprocess.run(
+    commands = [
         [
             "git",
             "clone",
@@ -525,14 +847,26 @@ def _clone_ref(
             "--single-branch",
             repo_url,
             str(destination),
-        ],
-        cwd=_ROOT,
-        capture_output=True,
-        text=True,
-        timeout=300,
-        check=False,
-        env={**os.environ, **auth_env} if auth_env else None,
-    )
+        ]
+    ]
+    if component in {"webui", "resource"}:
+        commands = [
+            ["git", "init", str(destination)],
+            ["git", "-C", str(destination), "fetch", "--depth", "1", repo_url, ref],
+            ["git", "-C", str(destination), "checkout", "--detach", "FETCH_HEAD"],
+        ]
+    for command in commands:
+        result = subprocess.run(
+            command,
+            cwd=_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=300,
+            check=False,
+            env={**os.environ, **auth_env} if auth_env else None,
+        )
+        if result.returncode:
+            break
     if result.returncode != 0:
         stderr = (result.stderr or "").lower()
         transport_markers = (
@@ -619,6 +953,8 @@ def _prune_backups(keep_job_id: str) -> None:
     if not _BACKUP_ROOT.is_dir():
         return
     for item in _BACKUP_ROOT.iterdir():
+        if (item / "resource-startup").exists():
+            continue
         if item.name != keep_job_id:
             _remove_tree(item)
 
@@ -683,32 +1019,84 @@ async def _apply_resource_update_hot(job_id: str, staged: Path) -> dict[str, Any
     from zhenxun.services.renderer.engine import drain_rendering
 
     target = _ROOT / "resources"
-    force = bool(read_job(job_id).get("force"))
+    job = read_job(job_id)
+    automatic = bool(job.get("startup_resource"))
+    force = bool(job.get("force"))
     ready = await asyncio.to_thread(resources_ready, target)
-    transaction = await asyncio.to_thread(
-        ResourceTransaction,
-        staged,
-        target,
-        _STAGING_ROOT / job_id / "resource-transaction",
-        fill_only=not force and not ready,
-        spec=_ROOT / "resources.spec",
-        protect_modified=not force,
+    work = (
+        _BACKUP_ROOT / job_id / "resource-startup"
+        if automatic
+        else _STAGING_ROOT / job_id / "resource-transaction"
+    )
+    if automatic:
+        _update_job(
+            job_id,
+            backup_path=work.relative_to(_ROOT).as_posix(),
+            backup_purpose="恢复本次自动升级覆盖的资源文件",
+            phase="preparing_transaction",
+        )
+    transaction = await _webui_disk(
+        lambda: ResourceTransaction(
+            staged,
+            target,
+            work,
+            fill_only=not force and not ready,
+            spec=_ROOT / "resources.spec",
+            protect_modified=not force,
+        )
+    )
+    render_ready = bool(renderer_service._initialized)
+    guard = (
+        drain_rendering("resource_update", timeout=15)
+        if render_ready or not automatic
+        else nullcontext()
     )
     try:
-        async with drain_rendering("resource_update", timeout=15):
-            await asyncio.to_thread(transaction.apply)
+        async with guard:
             try:
-                renderer_service.clear_runtime_caches()
-                await renderer_service.reload_theme()
-                renderer_service.clear_runtime_caches()
-                await asyncio.to_thread(shutil.rmtree, UI_CACHE_PATH, True)
-                UI_CACHE_PATH.mkdir(parents=True, exist_ok=True)
-            except Exception:
-                await asyncio.to_thread(transaction.rollback)
-                renderer_service.clear_runtime_caches()
-                await renderer_service.reload_theme()
+                _update_job(job_id, phase="applying_resources")
+                await _webui_disk(transaction.apply)
+                if render_ready or not automatic:
+                    renderer_service.clear_runtime_caches()
+                    await renderer_service.reload_theme()
+                    renderer_service.clear_runtime_caches()
+                    await _webui_disk(shutil.rmtree, UI_CACHE_PATH, True)
+                    UI_CACHE_PATH.mkdir(parents=True, exist_ok=True)
+                await _webui_disk(transaction.commit)
+            except BaseException as error:
+                if isinstance(error, ResourceInstallError) and str(error).startswith(
+                    "resource_rollback_blocked"
+                ):
+                    raise
+                try:
+                    await _webui_disk(transaction.rollback)
+                except BaseException as rollback_error:
+                    with suppress(OSError, UpdateServiceError):
+                        _update_job(
+                            job_id,
+                            first_error=type(error).__name__,
+                            rollback_error=type(rollback_error).__name__,
+                        )
+                    raise ResourceInstallError(
+                        "resource_rollback_blocked"
+                    ) from rollback_error
+                with suppress(OSError, UpdateServiceError):
+                    _update_job(
+                        job_id,
+                        rollback_state="confirmed",
+                        first_error=type(error).__name__,
+                    )
+                if render_ready:
+                    try:
+                        renderer_service.clear_runtime_caches()
+                        await renderer_service.reload_theme()
+                    except Exception as reload_error:
+                        with suppress(OSError, UpdateServiceError):
+                            _update_job(
+                                job_id,
+                                rollback_runtime_error=type(reload_error).__name__,
+                            )
                 raise
-            await asyncio.to_thread(transaction.commit)
     except TimeoutError as error:
         raise ResourceHotSwapUnavailable("resource_render_drain_timeout") from error
     except PermissionError as error:
@@ -721,49 +1109,48 @@ async def _apply_resource_update_hot(job_id: str, staged: Path) -> dict[str, Any
     }
 
 
-def _copy_visible(source: Path, destination: Path) -> None:
-    destination.mkdir(parents=True, exist_ok=True)
-    for item in destination.iterdir():
-        if item.name == ".git":
-            continue
-        if item.is_dir():
-            shutil.rmtree(item)
-        else:
-            item.unlink()
-    for item in source.iterdir():
-        if item.name == ".git":
-            continue
-        target = destination / item.name
-        if item.is_dir():
-            shutil.copytree(item, target)
-        else:
-            shutil.copy2(item, target)
-
-
 def _apply_webui(job_id: str, staged_root: Path) -> None:
+    """切换同盘候选目录，失败时恢复旧目录并保留原仓库元数据。"""
     destination = _ROOT / "data" / "web_ui" / "public"
-    backup = _BACKUP_ROOT / job_id / "webui"
+    backup = destination.parent / f".previous-{job_id}"
     if backup.exists():
-        shutil.rmtree(backup)
-    backup.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(destination, backup, ignore=shutil.ignore_patterns(".git"))
+        raise UpdateServiceError("webui_backup_exists")
+    if (staged_root / ".git").exists():
+        _remove_entry(staged_root / ".git")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    existed = destination.exists()
+    if existed:
+        os.replace(destination, backup)
     try:
-        _copy_visible(staged_root, destination)
+        os.replace(staged_root, destination)
+        if (backup / ".git").exists() and not (destination / ".git").exists():
+            os.replace(backup / ".git", destination / ".git")
     except Exception:
-        _copy_visible(backup, destination)
+        if destination.exists():
+            os.replace(destination, staged_root)
+        if existed:
+            os.replace(backup, destination)
         raise
-    _remove_tree(_BACKUP_ROOT / job_id)
+    _remove_tree(backup)
 
 
 async def _prepare_job(job_id: str) -> None:
     job = read_job(job_id)
     component = job["component"]
+    stage = (
+        _ROOT / "data" / "web_ui" / ".staging" / job_id
+        if component == "webui"
+        else _STAGING_ROOT / job_id
+    )
     try:
         _update_job(job_id, state="preparing", progress=10)
         if component == "bot" and _git_dirty() and not job["force"]:
             raise UpdateServiceError("working_tree_dirty")
-        ref = await _latest_ref(component, job["channel"])
-        stage = _STAGING_ROOT / job_id
+        ref = (
+            await asyncio.wait_for(_latest_ref(component, job["channel"]), 30)
+            if component in {"webui", "resource"}
+            else await _latest_ref(component, job["channel"])
+        )
         await asyncio.to_thread(_remove_tree, stage)
         stage.mkdir(parents=True, exist_ok=True)
         checksum: str | None = None
@@ -792,9 +1179,27 @@ async def _prepare_job(job_id: str) -> None:
             )
         else:
             archive = stage / "package.zip"
-            checksum = await _download_archive(component, ref, archive)
-            root = await asyncio.to_thread(_safe_extract, archive, stage / "content")
+            _update_job(job_id, state="preparing", phase="downloading", ref=ref)
+            download = _download_archive(component, ref, archive)
+            checksum = (
+                await asyncio.wait_for(download, _WEBUI_DOWNLOAD_SECONDS)
+                if component in {"webui", "resource"}
+                else await download
+            )
+            disk = (
+                _webui_disk if component in {"webui", "resource"} else asyncio.to_thread
+            )
+            extract = (
+                extract_resources_zip if component == "resource" else _safe_extract
+            )
+            root = await disk(extract, archive, stage / "content")
+            _update_job(job_id, effective_source="github", attempted_sources=["github"])
+        _update_job(job_id, phase="validating")
         _validate_staging(component, root)
+        if job.get("startup_webui") and webui_update_required(root):
+            raise UpdateServiceError("webui_candidate_not_newer")
+        if job.get("startup_resource") and resource_update_required(root):
+            raise UpdateServiceError("resource_candidate_not_newer")
         root_relative = str(root.resolve().relative_to(_ROOT.resolve()))
         _update_job(
             job_id,
@@ -810,16 +1215,25 @@ async def _prepare_job(job_id: str) -> None:
                 owner="webui.update",
                 phase="hot_apply",
             ):
-                await asyncio.to_thread(_apply_webui, job_id, root)
+                async with webui_publication_lock:
+                    if not job.get("startup_webui") or webui_update_required():
+                        _update_job(job_id, phase="publishing")
+                        _apply_webui(job_id, root)
+                _update_job(
+                    job_id,
+                    state="completed",
+                    progress=100,
+                    completed_at=_now_iso(),
+                    restart_required=False,
+                    apply_mode="webui_refresh",
+                    phase="completed",
+                )
+                if _WEBUI_REFRESH is not None:
+                    try:
+                        await _WEBUI_REFRESH()
+                    except Exception:
+                        logger.exception("WebUI 资源刷新失败，将在页面请求时重试")
             await asyncio.to_thread(_remove_tree, stage)
-            _update_job(
-                job_id,
-                state="completed",
-                progress=100,
-                completed_at=_now_iso(),
-                restart_required=False,
-                apply_mode="webui_refresh",
-            )
             return
 
         fallback_reason: str | None = None
@@ -834,13 +1248,14 @@ async def _prepare_job(job_id: str) -> None:
                 ):
                     result = await _apply_resource_update_hot(job_id, root)
             except ResourceHotSwapUnavailable as error:
+                if job.get("startup_resource"):
+                    raise
                 fallback_reason = str(error)
                 logger.info(
                     "WebUIUpdate: 资源热更新不可用，已降级为待重启: %s",
                     fallback_reason,
                 )
             else:
-                await asyncio.to_thread(_remove_tree, stage)
                 _update_job(
                     job_id,
                     state="completed",
@@ -848,7 +1263,9 @@ async def _prepare_job(job_id: str) -> None:
                     completed_at=_now_iso(),
                     restart_required=False,
                     **result,
+                    phase="completed",
                 )
+                await asyncio.to_thread(_remove_tree, stage)
                 return
 
         pending = {
@@ -871,16 +1288,32 @@ async def _prepare_job(job_id: str) -> None:
         from zhenxun.utils._restart_utils import mark_restart_pending
 
         mark_restart_pending(f"webui.update:{job_id}", [f"update:{component}:{job_id}"])
+    except asyncio.CancelledError:
+        if read_job(job_id).get("state") != "completed":
+            _update_job(job_id, state="cancelled", error="update_cancelled")
+        await _webui_disk(_remove_tree, stage)
+        raise
     except Exception as exc:
         code = (
             str(exc)
             if isinstance(exc, UpdateServiceError | ResourceInstallError)
+            else f"http_status_{exc.response.status_code}"
+            if isinstance(exc, httpx.HTTPStatusError)
             else exc.__class__.__name__
         )
         logger.error("WebUIUpdate: 更新任务失败 component=%s code=%s", component, code)
-        await asyncio.to_thread(_remove_tree, _STAGING_ROOT / job_id)
+        recovery_required = component == "resource" and code.startswith(
+            "resource_rollback_blocked"
+        )
+        if not recovery_required:
+            await asyncio.to_thread(_remove_tree, stage)
         _update_job(
-            job_id, state="failed", error=code, progress=100, apply_mode="failed"
+            job_id,
+            state="recovery_required" if recovery_required else "failed",
+            error=code,
+            progress=100,
+            apply_mode="failed",
+            next_retry_at=None,
         )
 
 
@@ -891,6 +1324,8 @@ async def create_update_job(
     method: UpdateMethod,
     source: UpdateSource,
     force: bool,
+    startup_webui: bool = False,
+    startup_resource: bool = False,
 ) -> dict[str, Any]:
     global _ACTIVE_TASK
     async with _JOB_LOCK:
@@ -898,6 +1333,10 @@ async def create_update_job(
             raise UpdateServiceError("update_in_progress")
         if _PENDING_FILE.exists():
             raise UpdateServiceError("pending_update_exists")
+        if component == "resource":
+            previous = resource_startup_status()
+            if previous and previous["state"] in {"applying", "recovery_required"}:
+                raise UpdateServiceError("resource_recovery_required")
         if source == "aliyun" and not aliyun_mirrored(component):
             source = "github"
         if source == "aliyun" and method == "download":
@@ -917,6 +1356,8 @@ async def create_update_job(
             "effective_source": None,
             "attempted_sources": [],
             "force": force,
+            "startup_webui": startup_webui and component == "webui",
+            "startup_resource": startup_resource and component == "resource",
             "state": "queued",
             "progress": 0,
             "error": None,
@@ -926,8 +1367,12 @@ async def create_update_job(
             "updated_at": _now_iso(),
         }
         _write_json(_job_path(job_id), job)
+        if job["startup_resource"]:
+            _write_json(_JOBS_ROOT.parent / "resource-startup.json", {"job_id": job_id})
         _ACTIVE_TASK = lifecycle_kernel.spawn_task(
-            "management:webui",
+            "management:resource-update"
+            if job["startup_resource"]
+            else "management:webui",
             _prepare_job(job_id),
             name=f"update-{component}-{job_id[:8]}",
         )
