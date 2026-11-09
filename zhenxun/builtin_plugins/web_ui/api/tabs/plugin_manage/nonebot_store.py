@@ -1585,7 +1585,7 @@ async def _apply_analysis(payload: ApplyPayload, binding: str) -> Result[dict]:
             if not operations:
                 remove_generation(pending.get("generation"))
                 finalize_orm_migration()
-                clear_pending_transaction()
+                clear_pending_transaction(pending)
                 return _completed(
                     analysis,
                     operation_id,
@@ -1769,7 +1769,7 @@ def _clear_transaction(transaction: dict[str, Any]) -> Result[dict]:
     """
     remove_generation(transaction.get("generation"))
     finalize_orm_migration()
-    clear_pending_transaction()
+    clear_pending_transaction(transaction)
     record_manual_operations(transaction, "rolled_back", "rolled_back")
     failed = transaction.get("state") == "failed"
     return Result.ok(

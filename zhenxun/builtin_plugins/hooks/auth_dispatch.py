@@ -497,6 +497,15 @@ async def handle_event(bot: Bot, event: Event) -> None:
         bot: Bot
         event: Event
     """
+    from zhenxun.utils.platform import PlatformUtils
+    from zhenxun.utils.time_utils import TimeUtils
+
+    from .auth_hook import connection_epochs
+
+    received_at = TimeUtils.now()
+    connection_epochs.observe_message(bot, event, received_at)
+    scope = PlatformUtils.get_platform_scope(bot)
+    epoch = connection_epochs.get(bot, scope)
     _normalize_qq_self_at_message(bot, event)
     show_log = True
     log_msg = f"<m>{escape_tag(bot.type)} {escape_tag(bot.self_id)}</m> | "
@@ -507,7 +516,10 @@ async def handle_event(bot: Bot, event: Event) -> None:
     if show_log:
         nb_logger.opt(colors=True).success(log_msg)
 
-    state: dict[Any, Any] = {}
+    state: dict[Any, Any] = {
+        "_zx_received_at": received_at,
+        "_zx_connection_epoch": (scope, epoch.connection_id if epoch else None),
+    }
     dependency_cache = {}
     release = await _admit_event(event)
     async with AsyncExitStack() as stack:

@@ -17,6 +17,7 @@ from zhenxun.services.lifecycle.deadline import (
     ShutdownBudget,
     current_budget,
     shutdown_budget,
+    worker_shutdown_seconds,
 )
 from zhenxun.utils.process_tree import verified_descendants
 
@@ -24,6 +25,18 @@ from zhenxun.utils.process_tree import verified_descendants
 def launcher_log(message: str) -> None:
     sys.stderr.write(f"[zx launcher] {message}\n")
     sys.stderr.flush()
+
+
+def stop_seconds(role: str) -> float:
+    """等待子进程协作退出的秒数，worker 比自身关闭预算多留 2 秒
+
+    参数:
+        role: 进程角色
+
+    返回:
+        float: 等待秒数
+    """
+    return worker_shutdown_seconds() + 2.0 if role == "worker" else 5.0
 
 
 @dataclass(slots=True)
@@ -195,7 +208,7 @@ class ProcessHandle:
         self.accepting = False
         if not self._live_processes(discover=True):
             return
-        with shutdown_budget(15.0 if self.role == "worker" else 5.0) as budget:
+        with shutdown_budget(stop_seconds(self.role)) as budget:
             started = asyncio.get_running_loop().time()
             try:
                 self.process.send_signal(
@@ -306,7 +319,7 @@ class LauncherSupervisor:
         if not restarting:
             self.shutdown_event.set()
         if self.shutdown_deadline is None:
-            self.shutdown_deadline = ShutdownBudget.start(15.0)
+            self.shutdown_deadline = ShutdownBudget.start(stop_seconds("worker"))
             self._force_budget = None
 
     async def start_process(
@@ -363,7 +376,7 @@ class LauncherSupervisor:
             handle = self.attach("worker", process)
         parent = current_budget.get()
         budget = self.shutdown_deadline or ShutdownBudget.start(
-            15.0 if handle.role == "worker" else 5.0
+            stop_seconds(handle.role)
         )
         if parent is not None:
             budget = ShutdownBudget(

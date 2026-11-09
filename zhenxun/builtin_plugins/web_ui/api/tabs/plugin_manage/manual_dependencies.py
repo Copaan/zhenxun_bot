@@ -253,6 +253,7 @@ async def _apply(payload: InstallDependenciesPayload, binding: str) -> Result:
                 "request_binding": binding,
                 "database_migration_possible": False,
                 "source_build_confirmed": payload.confirm_source_build,
+                "requested_requirements": list(payload.dependencies),
             }
             transaction["operations"].append(operation)
             if plan["source_build_required"] or (

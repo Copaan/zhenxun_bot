@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import Path
 import shutil
+import threading
 from typing import Any
 import uuid
 
@@ -14,6 +15,8 @@ from filelock import BaseFileLock, FileLock, Timeout
 
 from zhenxun.utils.atomic_json import (
     AtomicJsonLockTimeout,
+    AtomicJsonRecordError,
+    mutate_json_locked,
     read_json_locked,
     write_json_locked,
 )
@@ -28,6 +31,7 @@ REGISTRY_CACHE_FILE = STORE_ROOT / "registry-plugins-v1.json"
 REGISTRY_META_FILE = STORE_ROOT / "registry-meta-v1.json"
 SETTLED_LIMIT = 20
 _TRANSACTION_LOCKS: dict[Path, BaseFileLock] = {}
+_LOCK_CACHE_GUARD = threading.Lock()
 
 
 def utc_now() -> str:
@@ -39,7 +43,31 @@ def read_json(path: Path, default: Any) -> Any:
 
 
 def write_json(path: Path, value: Any) -> None:
-    write_json_locked(path, value)
+    if path.resolve() != PENDING_FILE.resolve():
+        write_json_locked(path, value)
+        return
+    if not isinstance(value, dict):
+        raise RuntimeError("dependency_clear_revision_required")
+    with transaction_lock():
+
+        def update(current):
+            previous = current or {}
+            if current and not isinstance(current, dict):
+                raise AtomicJsonRecordError("dependency_transaction_invalid")
+            if not previous and value.get("record_revision", 0):
+                raise RuntimeError("dependency_transaction_changed")
+            same = previous.get("revision") == value.get("revision")
+            supersedes = previous.get("revision") == value.get("supersedes_revision")
+            if previous and (
+                not (same or supersedes)
+                or previous.get("record_revision", 0) != value.get("record_revision", 0)
+            ):
+                raise RuntimeError("dependency_transaction_changed")
+            value["record_revision"] = int(previous.get("record_revision", 0)) + 1
+            current.clear()
+            current.update(deepcopy(value))
+
+        mutate_json_locked(path, {}, update, strict=True)
 
 
 @contextmanager
@@ -49,11 +77,18 @@ def transaction_lock(timeout: float = 30.0) -> Iterator[None]:
     参数:
         timeout: 等待锁的秒数
     """
-    path = PENDING_FILE.with_name(".transaction.lock")
+    from zhenxun.services.runtime_mutation import mutation_guard
+
+    path = PENDING_FILE.with_name(".transaction.lock").resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
-    lock = _TRANSACTION_LOCKS.setdefault(path, FileLock(path, thread_local=False))
+    with _LOCK_CACHE_GUARD:
+        lock = _TRANSACTION_LOCKS.setdefault(path, FileLock(path, thread_local=True))
     try:
-        lock.acquire(timeout=timeout)
+        if lock.is_locked:
+            lock.acquire(timeout=timeout)
+        else:
+            with mutation_guard():
+                lock.acquire(timeout=min(timeout, 2))
     except Timeout as error:
         raise AtomicJsonLockTimeout(str(path)) from error
     try:
@@ -77,9 +112,9 @@ def default_manifest() -> dict[str, Any]:
 
 
 def load_manifest() -> dict[str, Any]:
-    manifest = read_json(MANIFEST_FILE, default_manifest())
+    manifest = read_json_locked(MANIFEST_FILE, default_manifest(), strict=True)
     if not isinstance(manifest, dict) or manifest.get("version") != 1:
-        return default_manifest()
+        raise AtomicJsonRecordError("dependency_manifest_invalid")
     manifest.setdefault("plugins", {})
     manifest.setdefault("packages", {})
     manifest.setdefault("manual_requirements", {})
@@ -168,11 +203,13 @@ def draft_transaction(
             "database_type": "none",
             "created_at": now,
         }
+    transaction.update(fields)
+    if pending:
+        transaction["supersedes_revision"] = pending.get("revision")
     transaction.update(
         revision=uuid.uuid4().hex,
         updated_at=now,
         target_manifest=deepcopy(target_manifest),
-        **fields,
     )
     return transaction
 
@@ -187,7 +224,9 @@ def defer_transaction(transaction: dict[str, Any]) -> None:
     generation = transaction.pop("generation", None)
     transaction.pop("generation_digest", None)
     transaction["native_extensions"] = []
-    transaction["state"] = "pending_restart"
+    transaction["state"] = (
+        "preparing" if transaction.get("preparation_only") else "pending_restart"
+    )
     save_pending_transaction(transaction)
     remove_generation(generation)
 
@@ -196,6 +235,21 @@ def remove_generation(generation: int | str | None) -> None:
     if generation is None:
         return
     path = generation_path(generation)
+    manifest = load_manifest()
+    current = pending_transaction() or {}
+    referenced = {
+        manifest.get("active_generation"),
+        manifest.get("previous_generation"),
+    }
+    if not is_settled(current):
+        referenced.update(
+            {
+                current.get("generation"),
+                (current.get("base_manifest") or {}).get("active_generation"),
+            }
+        )
+    if generation in referenced:
+        return
     if path.is_dir():
         shutil.rmtree(path)
 
@@ -210,13 +264,19 @@ def prune_generations(keep: set[int]) -> None:
         except (IndexError, ValueError):
             continue
         if generation not in keep and path.is_dir():
-            shutil.rmtree(path)
+            remove_generation(generation)
 
 
 def pending_transaction() -> dict[str, Any] | None:
-    value = read_json(PENDING_FILE, None)
-    if not isinstance(value, dict):
+    value = read_json_locked(PENDING_FILE, None, strict=True)
+    if value is None:
         return None
+    if (
+        not isinstance(value, dict)
+        or not value.get("revision")
+        or not value.get("state")
+    ):
+        raise AtomicJsonRecordError("dependency_transaction_invalid")
     if value.get("state") == "verification_pending" and value.get("revision"):
         manifest = load_manifest()
         if (
@@ -238,13 +298,24 @@ def save_pending_transaction(value: dict[str, Any]) -> None:
 
 
 @transaction_lock()
-def clear_pending_transaction() -> None:
-    write_json(PENDING_FILE, None)
+def clear_pending_transaction(expected: dict[str, Any]) -> None:
+    """仅清除调用者已读取并核对修订的事务记录"""
+    current = pending_transaction()
+    if current is None:
+        return
+    if current.get("revision") != expected.get("revision") or current.get(
+        "record_revision", 0
+    ) != expected.get("record_revision", 0):
+        raise RuntimeError("dependency_transaction_changed")
+    write_json_locked(PENDING_FILE, None)
 
 
-def remove_orm_backups() -> None:
+def remove_orm_backups(revision: str | None = None) -> None:
     """删除依赖层事务结束后不再需要的数据库迁移备份"""
-    root = STORE_ROOT / "orm-backups"
+    revision = revision or str((pending_transaction() or {}).get("revision") or "")
+    if not revision or Path(revision).name != revision or revision in {".", ".."}:
+        raise AtomicJsonRecordError("dependency_backup_owner_missing")
+    root = STORE_ROOT / "orm-backups" / revision
     if root.is_dir():
         shutil.rmtree(root)
 
@@ -263,6 +334,8 @@ def is_settled(transaction: dict[str, Any] | None) -> bool:
         bool: 已结束
     """
     if not transaction or not transaction.get("revision"):
+        return False
+    if transaction.get("state") in {"settling", "rolling_back"}:
         return False
     manifest = load_manifest()
     if manifest.get("pending_verification"):
@@ -285,6 +358,8 @@ def active_transaction() -> dict[str, Any] | None:
         dict[str, Any] | None: 事务，已结束或不存在时为 None
     """
     value = pending_transaction()
+    if value is None and load_manifest().get("pending_verification"):
+        raise AtomicJsonRecordError("dependency_transaction_missing")
     return None if is_settled(value) else value
 
 
@@ -315,8 +390,9 @@ def archive_settled() -> dict[str, Any] | None:
     record = {**deepcopy(transaction), "settled_at": utc_now()}
     write_json(_settled_path(record["revision"]), record)
     for old in settled_transactions()[SETTLED_LIMIT:]:
-        _settled_path(old["revision"]).unlink(missing_ok=True)
-    clear_pending_transaction()
+        if not old.get("cleanup_error"):
+            _settled_path(old["revision"]).unlink(missing_ok=True)
+    clear_pending_transaction(transaction)
     return record
 
 
@@ -348,8 +424,21 @@ def merge_source_dependencies(
     if not layer_packages:
         return None
     current = pending_transaction()
+    if current and current.get("restore"):
+        return "cross_store_restore_owned"
     if current and current.get("state") != "pending_restart":
         return "cross_store_transaction_not_mutable"
+    source_revision = (source or {}).get("revision")
+    source_identity = (source or {}).get("transaction_id") or source_revision
+    if current:
+        bound_identity = current.get("source_transaction_id")
+        same_owner = (
+            bound_identity == source_identity
+            if bound_identity
+            else current.get("source_transaction_revision") == source_revision
+        )
+        if not source_identity or not same_owner:
+            return "cross_store_transaction_owner_changed"
     base = deepcopy(current.get("base_manifest") if current else load_manifest())
     target = deepcopy(current.get("target_manifest") if current else base) or {}
     target_packages = target.setdefault("packages", {})
@@ -375,6 +464,14 @@ def merge_source_dependencies(
         operation.get("source_build_confirmed")
         for operation in (source or {}).get("operations", [])
     )
+    if (
+        current
+        and current.get("source_transaction_revision") == source_revision
+        and target == current.get("target_manifest")
+        and bool(current.get("source_build_confirmed"))
+        == bool(current.get("source_build_confirmed") or source_build_confirmed)
+    ):
+        return current
     transaction = draft_transaction(
         current,
         target,
@@ -382,9 +479,10 @@ def merge_source_dependencies(
             (current or {}).get("source_build_confirmed") or source_build_confirmed
         ),
         state="pending_restart",
-        **({"revision": current["revision"]} if current else {"base_manifest": base}),
+        base_manifest=base,
     )
     if source is not None:
         transaction["source_transaction_revision"] = source.get("revision")
-    save_pending_transaction(transaction)
+        transaction["source_transaction_id"] = source_identity
+    defer_transaction(transaction)
     return transaction

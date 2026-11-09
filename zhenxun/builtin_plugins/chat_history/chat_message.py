@@ -3,6 +3,7 @@ from typing import Any
 from nonebot import on_message
 from nonebot.adapters import Bot, Event
 from nonebot.plugin import PluginMetadata
+from nonebot.typing import T_State
 from nonebot_plugin_alconna import UniMsg, get_message_id
 from nonebot_plugin_apscheduler import scheduler
 from nonebot_plugin_uninfo import Uninfo
@@ -20,6 +21,7 @@ from zhenxun.services.low_priority_writer import (
 from zhenxun.utils.enum import PluginType
 from zhenxun.utils.message import MessageUtils
 from zhenxun.utils.platform import PlatformUtils
+from zhenxun.utils.time_utils import TimeUtils
 from zhenxun.utils.utils import get_entity_ids
 
 __plugin_meta__ = PluginMetadata(
@@ -137,7 +139,7 @@ async def _append(record: ChatHistory) -> None:
 
 
 @chat_history.handle()
-async def _(bot: Bot, event: Event, message: UniMsg, session: Uninfo):
+async def _(bot: Bot, event: Event, message: UniMsg, session: Uninfo, state: T_State):
     entity = get_entity_ids(session)
     try:
         try:
@@ -146,6 +148,7 @@ async def _(bot: Bot, event: Event, message: UniMsg, session: Uninfo):
             message_id = None
         await _append(
             ChatHistory(
+                create_time=state.get("_zx_received_at") or TimeUtils.now(),
                 user_id=entity.user_id,
                 group_id=entity.group_id,
                 text=str(message),
@@ -193,16 +196,24 @@ async def _record_bot_send(
 
 @scheduler.scheduled_job("cron", hour=4, minute=45)
 async def _cleanup_chat_history():
-    try:
-        cleared, deleted = await ChatHistory.cleanup(
+    from zhenxun.services.scheduler.lifecycle import core_task_run
+
+    async with core_task_run("chat_history_cleanup") as run:
+        result = await ChatHistory.cleanup(
             int(Config.get_config("chat_history", "SEGMENT_DAYS") or 0),
             int(Config.get_config("chat_history", "RETENTION_DAYS") or 0),
+            progress=run,
         )
-    except Exception as e:
-        logger.error("清理聊天记录失败", "chat_history", e=e)
-        return
-    if cleared or deleted:
-        logger.info(
-            f"已清空 {cleared} 条过期的结构化消息段，删除 {deleted} 条过期聊天记录",
-            "chat_history",
+        cleared, deleted = result
+        run.update(
+            processed=cleared + deleted,
+            cleared=cleared,
+            deleted=deleted,
+            batches=result.batches,
+            scanned=result.scanned,
         )
+        if result.pause_reason:
+            run.update(
+                status="partial" if run["processed"] else "skipped",
+                reason=result.pause_reason,
+            )

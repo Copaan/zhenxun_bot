@@ -1,8 +1,10 @@
+import asyncio
 from datetime import date, datetime, timedelta
 from hashlib import sha256
 import os
 from pathlib import Path
 import random
+import threading
 
 import aiofiles
 import nonebot
@@ -16,6 +18,8 @@ from zhenxun.models.sign_log import SignLog
 from zhenxun.models.sign_user import SignUser
 from zhenxun.models.user_console import UserConsole
 from zhenxun.services.avatar_service import avatar_service
+from zhenxun.services.lifecycle import lifecycle_kernel
+from zhenxun.services.log import logger
 from zhenxun.utils.manager.priority_manager import PriorityLifecycle
 from zhenxun.utils.time_utils import TimeUtils
 
@@ -35,6 +39,10 @@ AVA_URL = "http://q1.qlogo.cn/g?b=qq&nk={}&s=160"
 driver: Driver = nonebot.get_driver()
 
 base_config = Config.get("sign_in")
+_cleanup_lock = asyncio.Lock()
+_cleanup_stop = threading.Event()
+_card_file_lock = threading.Lock()
+_writing_cards: dict[Path, int] = {}
 
 
 MORNING_MESSAGE = [
@@ -110,7 +118,7 @@ def _is_sign_card_cache_stale(card_file: Path) -> bool:
 @PriorityLifecycle.on_startup(priority=5)
 async def init_image():
     SIGN_TODAY_CARD_PATH.mkdir(exist_ok=True, parents=True)
-    clear_sign_data_pic()
+    await clear_sign_data_pic_async()
 
 
 def _card_cache_key(user, session) -> str:
@@ -282,14 +290,73 @@ async def sign_history(user_id: str, today: date) -> dict:
     }
 
 
-def clear_sign_data_pic():
-    """
-    清空当前签到图片数据
-    """
-    date = _now().date()
-    for file in os.listdir(SIGN_TODAY_CARD_PATH):
-        if str(date) not in file:
-            os.remove(SIGN_TODAY_CARD_PATH / file)
+def clear_sign_data_pic(today: date | None = None, stop=None) -> dict:
+    """清理非当日签到图片，逐文件记录异常并响应停止请求。"""
+    today_text = str(today or _now().date())
+    result = {"deleted": 0, "errors": 0, "reason": ""}
+    try:
+        with os.scandir(SIGN_TODAY_CARD_PATH) as entries:
+            for entry in entries:
+                if (
+                    stop is not None and stop.is_set()
+                ) or lifecycle_kernel.shutdown_requested:
+                    result["reason"] = (
+                        "shutdown"
+                        if lifecycle_kernel.shutdown_requested
+                        else "cancelled"
+                    )
+                    break
+                if today_text in entry.name:
+                    continue
+                path = Path(entry.path)
+                try:
+                    with _card_file_lock:
+                        if path not in _writing_cards and entry.is_file(
+                            follow_symlinks=False
+                        ):
+                            path.unlink()
+                            result["deleted"] += 1
+                except FileNotFoundError:
+                    continue
+                except OSError as error:
+                    result["errors"] += 1
+                    logger.warning(f"签到图片清理文件失败: {error}")
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        result["errors"] += 1
+        logger.warning(f"签到图片清理目录失败: {error}")
+    return result
+
+
+async def clear_sign_data_pic_async() -> dict:
+    """在线程清理签到图片，取消后等待线程实际退出再结束任务。"""
+    async with _cleanup_lock:
+        if lifecycle_kernel.shutdown_requested:
+            return {"deleted": 0, "errors": 0, "reason": "shutdown"}
+        _cleanup_stop.clear()
+        worker = asyncio.create_task(
+            asyncio.to_thread(clear_sign_data_pic, _now().date(), _cleanup_stop)
+        )
+        try:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            _cleanup_stop.set()
+            while not worker.done():
+                try:
+                    await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    continue
+            worker.result()
+            raise
+
+
+@PriorityLifecycle.on_shutdown(priority=5)
+async def _stop_sign_cleanup():
+    """停止签到清理并等待当前文件操作退出。"""
+    _cleanup_stop.set()
+    async with _cleanup_lock:
+        pass
 
 
 async def _generate_html_card(
@@ -409,7 +476,17 @@ async def _generate_html_card(
         disable_animations=True,
     )
 
-    async with aiofiles.open(card_file, "wb") as f:
-        await f.write(image_bytes)
+    with _card_file_lock:
+        _writing_cards[card_file] = _writing_cards.get(card_file, 0) + 1
+    try:
+        async with aiofiles.open(card_file, "wb") as f:
+            await f.write(image_bytes)
+    finally:
+        with _card_file_lock:
+            remaining = _writing_cards[card_file] - 1
+            if remaining:
+                _writing_cards[card_file] = remaining
+            else:
+                _writing_cards.pop(card_file)
 
     return card_file

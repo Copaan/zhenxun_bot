@@ -42,50 +42,30 @@ def execute(action: str) -> None:
     result: dict[str, Any] = {
         "startup_id": os.environ["ZHENXUN_MAINTENANCE_STARTUP_ID"]
     }
+    from contextlib import nullcontext
+
+    from zhenxun.services.migration import state as restore_tasks
+
+    owner = restore_tasks.load()
+    scope = (
+        restore_tasks.owned(owner)
+        if owner
+        and owner.get("state")
+        in {
+            "pending",
+            "snapshot_ready",
+            "importing",
+            "awaiting_orm",
+            "failed_import",
+            "committing",
+            "rollback_target",
+        }
+        and action in {"nonebot-apply", "restore-apply"}
+        else nullcontext()
+    )
     try:
-        if action == "nonebot-apply":
-            from zhenxun.services.nonebot_store.runtime import apply_pending_transaction
-
-            result["value"] = apply_pending_transaction()
-        elif action == "nonebot-resync":
-            from zhenxun.services.nonebot_store.runtime import stage_environment_resync
-
-            result["value"] = stage_environment_resync()
-        elif action == "source-apply":
-            from zhenxun.services.plugin_store.plugin_store_transaction import (
-                apply_pending_transaction,
-            )
-
-            result["value"] = apply_pending_transaction()
-        elif action == "update-apply":
-            from zhenxun.services.update.update_service import apply_pending_update
-
-            result["value"] = apply_pending_update(Path.cwd())
-        elif action == "sync-core":
-            from zhenxun.services.nonebot_store.dependencies import guard_orm_sync
-            from zhenxun.services.update.update_service import _sync_dependencies
-
-            guard_orm_sync()
-            _sync_dependencies()
-            result["value"] = True
-        elif action == "plugin-requirements":
-            from zhenxun.services.nonebot_store.manual import stage_requirement_files
-
-            paths = json.loads(os.environ.get("ZHENXUN_MAINTENANCE_PATHS", "[]"))
-            result["value"] = stage_requirement_files([Path(path) for path in paths])
-        elif action == "restore-apply":
-            from zhenxun.services.migration.restore import apply_pending
-
-            result["value"] = apply_pending()
-        elif action == "verify-dependencies":
-            from zhenxun.services.nonebot_store.environment import (
-                verify_effective_environment,
-            )
-
-            verify_effective_environment()
-            result["value"] = True
-        else:
-            raise ValueError("maintenance_action_invalid")
+        with scope:
+            _execute_action(action, result)
         result["completed"] = True
     except BaseException as error:
         result["error_code"] = getattr(error, "code", type(error).__name__)
@@ -93,6 +73,52 @@ def execute(action: str) -> None:
         raise
     finally:
         write_json_locked(Path(os.environ["ZHENXUN_MAINTENANCE_RESULT_PATH"]), result)
+
+
+def _execute_action(action: str, result: dict) -> None:
+    if action == "nonebot-apply":
+        from zhenxun.services.nonebot_store.runtime import apply_pending_transaction
+
+        result["value"] = apply_pending_transaction()
+    elif action == "nonebot-resync":
+        from zhenxun.services.nonebot_store.runtime import stage_environment_resync
+
+        result["value"] = stage_environment_resync()
+    elif action == "source-apply":
+        from zhenxun.services.plugin_store.plugin_store_transaction import (
+            apply_pending_transaction,
+        )
+
+        result["value"] = apply_pending_transaction()
+    elif action == "update-apply":
+        from zhenxun.services.update.update_service import apply_pending_update
+
+        result["value"] = apply_pending_update(Path.cwd())
+    elif action == "sync-core":
+        from zhenxun.services.nonebot_store.dependencies import guard_orm_sync
+        from zhenxun.services.update.update_service import _sync_dependencies
+
+        guard_orm_sync()
+        _sync_dependencies()
+        result["value"] = True
+    elif action == "plugin-requirements":
+        from zhenxun.services.nonebot_store.manual import stage_requirement_files
+
+        paths = json.loads(os.environ.get("ZHENXUN_MAINTENANCE_PATHS", "[]"))
+        result["value"] = stage_requirement_files([Path(path) for path in paths])
+    elif action == "restore-apply":
+        from zhenxun.services.migration.restore import apply_pending
+
+        result["value"] = apply_pending()
+    elif action == "verify-dependencies":
+        from zhenxun.services.nonebot_store.environment import (
+            verify_effective_environment,
+        )
+
+        verify_effective_environment()
+        result["value"] = True
+    else:
+        raise ValueError("maintenance_action_invalid")
 
 
 async def run(action: str, paths: list[str] | None = None) -> bool:

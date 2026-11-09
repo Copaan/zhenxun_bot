@@ -19,6 +19,7 @@ from zhenxun.utils.manager.priority_manager import PriorityLifecycle
 from zhenxun.utils.message import MessageUtils
 
 AUTO_RELOAD_JOB_ID = "zhenxun.reload_setting.auto_reload"
+_auto_reload_last_enabled: bool | None = None
 
 __plugin_meta__ = PluginMetadata(
     name="重载配置",
@@ -128,14 +129,22 @@ def _init_auto_reload_job() -> None:
 
 
 async def _auto_reload_config() -> None:
-    if not Config.get_config("reload_setting", "AUTO_RELOAD"):
+    global _auto_reload_last_enabled
+    enabled = bool(Config.get_config("reload_setting", "AUTO_RELOAD"))
+    if not enabled and _auto_reload_last_enabled is False:
         return
-    try:
-        await _reload_runtime_config()
-    except Exception as error:
-        logger.warning("自动重载config.yaml失败", "重载配置", e=error)
-        return
-    logger.debug("已自动重载配置文件...", "重载配置")
+    _auto_reload_last_enabled = enabled
+    from zhenxun.services.scheduler.lifecycle import core_task_run
+
+    async with core_task_run("configuration_auto_reload") as run:
+        if not enabled:
+            run.update(status="skipped", reason="config_disabled")
+            return
+        operation = await _reload_runtime_config()
+        mode = getattr(operation.mode, "value", str(operation.mode))
+        run.update(processed=len(operation.config_keys), apply_mode=mode)
+        if mode == "failed":
+            run["status"] = "failed"
 
 
 @_matcher.handle()

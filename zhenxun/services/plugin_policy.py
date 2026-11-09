@@ -305,7 +305,15 @@ class PluginPolicyService:
         return reasons[0] if reasons else None
 
     @staticmethod
-    def global_switch_values():
+    def global_disabled_rows() -> list[tuple[str, Any]]:
+        """全局关闭的插件
+
+        返回:
+            list[tuple[str, Any]]: 模块名与插件信息
+
+        异常:
+            PluginPolicyNotReady: 插件策略尚未就绪
+        """
         from zhenxun.services.cache.runtime_cache import PluginInfoMemoryCache
         from zhenxun.services.cache.runtime_sync import RuntimeCacheMutation
         from zhenxun.services.db_context.write import CacheUnavailable
@@ -316,14 +324,13 @@ class PluginPolicyService:
             raise PluginPolicyNotReady("插件策略尚未就绪") from error
         if not PluginInfoMemoryCache.is_loaded():
             raise PluginPolicyNotReady("插件策略尚未就绪")
-        return {
-            module: bool(
-                row.status
-                or getattr(row.block_type, "value", row.block_type)
-                in {"GROUP", "PRIVATE"}
-            )
+        return [
+            (module, row)
             for module, row in PluginInfoMemoryCache._by_module.items()
-        }
+            if not row.status
+            and getattr(row.block_type, "value", row.block_type)
+            not in {"GROUP", "PRIVATE"}
+        ]
 
     def owner_blocked(
         self, owner: str | None, *, super_group: bool = False, is_superuser=False
@@ -343,17 +350,14 @@ class PluginPolicyService:
         异常:
             PluginPolicyNotReady: 插件策略尚未就绪
         """
-        from zhenxun.services.cache.runtime_cache import PluginInfoMemoryCache
-
-        values = self.global_switch_values()
+        disabled = self.global_disabled_rows()
         if not owner:
             return False
         identity = _module_identity(owner)
-        for module, enabled in values.items():
+        for module, row in disabled:
             name = _module_identity(module)
-            if enabled or (identity != name and not identity.startswith(f"{name}.")):
+            if identity != name and not identity.startswith(f"{name}."):
                 continue
-            row = PluginInfoMemoryCache._by_module[module]
             if is_superuser and (
                 not row.limit_superuser or row.plugin_type == PluginType.SUPERUSER
             ):

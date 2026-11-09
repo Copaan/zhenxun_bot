@@ -2,15 +2,31 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Callable, Coroutine
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from functools import wraps
+import os
+from pathlib import Path
+import threading
 from typing import Any, ParamSpec, TypeVar
 import uuid
 
+from filelock import FileLock, Timeout
+
+from zhenxun.utils.atomic_json import (
+    AtomicJsonRecordError,
+    read_json_locked,
+    write_json_locked,
+)
+
 P = ParamSpec("P")
 R = TypeVar("R")
+INSTANCE_ROOT = Path(os.environ.get("ZHENXUN_PROJECT_ROOT") or Path.cwd()).resolve()
+OWNER_FILE = INSTANCE_ROOT / "data/runtime/mutation-owner-v1.json"
+_ownership: ContextVar[str | None] = ContextVar("runtime_mutation_owner", default=None)
+_owner_locks: dict[Path, FileLock] = {}
+_owner_locks_guard = threading.Lock()
 
 
 class RuntimeMutationBusyError(RuntimeError):
@@ -23,6 +39,54 @@ class StoreOperationBusyError(RuntimeError):
 
 class MutationCancelled(asyncio.CancelledError):
     """Cooperative cancellation at a transaction-owned safe point."""
+
+
+def mutation_owner() -> dict[str, Any] | None:
+    """读取跨进程变更归属，损坏记录保留并拒绝新的写入"""
+    value = read_json_locked(OWNER_FILE, None, strict=True)
+    if value is not None and (
+        not isinstance(value, dict) or not value.get("operation_id")
+    ):
+        raise AtomicJsonRecordError("mutation_owner_invalid")
+    return value
+
+
+@contextmanager
+def mutation_scope(operation_id: str | None):
+    """在受控内部调用期间绑定父任务，不向普通管理请求继承授权"""
+    token = _ownership.set(operation_id)
+    try:
+        yield
+    finally:
+        _ownership.reset(token)
+
+
+@contextmanager
+def mutation_guard(operation_id: str | None = None):
+    """短时间持有跨进程归属锁，校验当前写入属于已登记任务"""
+    path = OWNER_FILE.with_name(".mutation.lock").resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _owner_locks_guard:
+        lock = _owner_locks.setdefault(path, FileLock(path, thread_local=True))
+    try:
+        lock.acquire(timeout=2)
+    except Timeout as error:
+        raise RuntimeMutationBusyError("runtime_mutation_in_progress") from error
+    try:
+        owner = mutation_owner()
+        identity = operation_id or _ownership.get()
+        if owner and owner["operation_id"] != identity:
+            raise RuntimeMutationBusyError("migration_operation_in_progress")
+        yield owner
+    finally:
+        lock.release()
+
+
+def release_mutation(operation_id: str) -> None:
+    """仅释放本任务登记的归属，调用前必须持久化终态或提交证据"""
+    with mutation_guard(operation_id) as owner:
+        if owner:
+            write_json_locked(OWNER_FILE, None)
 
 
 class RuntimeMutationCoordinator:
@@ -53,6 +117,13 @@ class RuntimeMutationCoordinator:
     def status(self) -> dict[str, Any] | None:
         if self._current:
             return {"coordinator_state": self._state, **dict(self._current)}
+        if persisted := mutation_owner():
+            return {
+                "coordinator_state": "reserved",
+                "operation_id": persisted["operation_id"],
+                "kind": persisted.get("kind"),
+                "phase": persisted.get("phase", "recovery_required"),
+            }
         return None if self._state == "open" else {"coordinator_state": self._state}
 
     @property
@@ -171,6 +242,30 @@ class RuntimeMutationCoordinator:
         async with self._lock:
             if self._state != "open":
                 raise RuntimeMutationBusyError(f"runtime_mutation_{self._state}")
+            import psutil
+
+            inherited = _ownership.get()
+            identity = inherited or operation_id or uuid.uuid4().hex
+            registered = False
+            with mutation_guard(inherited):
+                if not inherited:
+                    write_json_locked(
+                        OWNER_FILE,
+                        {
+                            "operation_id": identity,
+                            "kind": "runtime",
+                            "operation_kind": kind,
+                            "phase": phase,
+                            "revision": 1,
+                            "executor": {
+                                "pid": os.getpid(),
+                                "created_at": psutil.Process().create_time(),
+                                "lease_id": os.environ.get("ZHENXUN_INSTANCE_LEASE_ID"),
+                            },
+                        },
+                    )
+                    registered = True
+            ownership_token = _ownership.set(identity)
             self._owner_task = asyncio.current_task()
             self._transaction = object()
             transaction_token = self._inherited_transaction.set(self._transaction)
@@ -178,7 +273,7 @@ class RuntimeMutationCoordinator:
             self._cancel_event = asyncio.Event()
             self._current = {
                 "kind": kind,
-                "operation_id": operation_id or uuid.uuid4().hex,
+                "operation_id": identity,
                 "owner": owner,
                 "phase": phase,
                 "started_at": datetime.now(timezone.utc).isoformat(),
@@ -186,13 +281,18 @@ class RuntimeMutationCoordinator:
             try:
                 yield
             finally:
-                self._current = None
-                self._cancel_event = None
-                self._owner_task = None
-                self._transaction = None
-                self._active_budget = None
-                self._inherited_transaction.reset(transaction_token)
-                self._idle.set()
+                try:
+                    if registered:
+                        release_mutation(identity)
+                finally:
+                    _ownership.reset(ownership_token)
+                    self._current = None
+                    self._cancel_event = None
+                    self._owner_task = None
+                    self._transaction = None
+                    self._active_budget = None
+                    self._inherited_transaction.reset(transaction_token)
+                    self._idle.set()
 
 
 runtime_mutation_coordinator = RuntimeMutationCoordinator()

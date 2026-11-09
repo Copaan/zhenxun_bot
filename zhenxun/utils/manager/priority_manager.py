@@ -472,14 +472,12 @@ async def _start_application_lifecycle() -> None:
 async def _shutdown_application_lifecycle():
     """在关闭预算内排空运行时变更、取消启动编排并停止全部组件"""
     global _post_management_task
-    from zhenxun.services.lifecycle.deadline import (
-        WORKER_SHUTDOWN_SECONDS,
-        remaining_timeout,
-        shutdown_budget,
-    )
+    from zhenxun.services.lifecycle.deadline import remaining_timeout, shutdown_budget
+    from zhenxun.services.migration.restore import stop_preparation
     from zhenxun.services.runtime_mutation import runtime_mutation_coordinator
 
-    with shutdown_budget(lifecycle_kernel.shutdown_remaining(WORKER_SHUTDOWN_SECONDS)):
+    await stop_preparation()
+    with shutdown_budget(lifecycle_kernel.shutdown_remaining()):
         if not await runtime_mutation_coordinator.quiesce(
             timeout=remaining_timeout(10)
         ):

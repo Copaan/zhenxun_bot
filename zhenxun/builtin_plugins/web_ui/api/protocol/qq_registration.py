@@ -435,6 +435,7 @@ async def poll_qq_registration(registration_id: str, request: Request) -> Result
             f"environment:{key}" for key in changed_keys
         ]
         result = apply_result_data(
+            restart_source="webui.protocol",
             apply_mode=(APPLY_RESTART_PENDING if restart_required else APPLY_NO_CHANGE),
             changed_keys=changed_keys,
             restart_required=restart_required,

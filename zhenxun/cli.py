@@ -34,6 +34,7 @@ def _ensure_project_root() -> Path:
         sys.exit(1)
 
     cwd_str = str(cwd)
+    os.environ["ZHENXUN_PROJECT_ROOT"] = str(cwd.resolve())
     if cwd_str not in sys.path:
         sys.path.insert(0, cwd_str)
     return cwd

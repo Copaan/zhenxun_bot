@@ -68,24 +68,35 @@ async def _(session: EventSession):
 
 
 @run_sync
-def _clear_data() -> float:
+def _clear_data(report: dict | None = None) -> float:
+    """清理过期临时文件并可选返回逐项处理数量。"""
+    report = report if report is not None else {}
+    report.update(deleted=0, errors=0)
     logger.debug("开始清理临时文件...")
     size = 0
     dir_list = [dir_ for dir_ in ResourceDirManager.temp_path if dir_.exists()]
     for dir_ in dir_list:
         logger.debug(f"尝试清理文件夹: {dir_.absolute()}", "清理临时数据")
         dir_size = 0
-        for file in os.listdir(dir_):
+        try:
+            files = os.listdir(dir_)
+        except OSError as error:
+            report["errors"] += 1
+            logger.error("无法读取临时目录", "清理临时数据", e=error)
+            continue
+        for file in files:
             file = dir_ / file
             if file.is_file():
                 try:
                     if time.time() - os.path.getatime(file) > 10:
                         file_size = os.path.getsize(file)
                         file.unlink()
+                        report["deleted"] += 1
                         size += file_size
                         dir_size += file_size
                         logger.debug(f"移除临时文件: {file.absolute()}", "清理临时数据")
                 except Exception as e:
+                    report["errors"] += 1
                     logger.error(
                         f"清理临时数据错误，临时文件夹: {dir_.absolute()}...",
                         "清理临时数据",
@@ -101,13 +112,24 @@ def _clear_data() -> float:
     minute=1,
 )
 async def _():
-    size = await _clear_data()
-    logger.info(
-        f"自动清理临时数据完成，共清理了 {size / 1024 / 1024:.2f}MB 的数据...",
-        "定时任务",
-    )
-    try:
-        count = await AssetOperation.clear_expired()
-        logger.info(f"自动清理过期资产回执完成，共 {count} 条", "定时任务")
-    except Exception as e:
-        logger.error("自动清理过期资产回执失败", "定时任务", e=e)
+    from zhenxun.services.scheduler.lifecycle import core_task_run
+
+    async with core_task_run("temporary_and_asset_cleanup") as run:
+        run.update(failed=0, bytes=0, asset_receipts=0)
+        file_report = {"deleted": 0, "errors": 0}
+        try:
+            size = await _clear_data(file_report)
+            run["bytes"] = size
+        except Exception as error:
+            run["failed"] += 1
+            logger.error("自动清理临时数据失败", "定时任务", e=error)
+        run["files_deleted"] = file_report["deleted"]
+        run["failed"] += file_report["errors"]
+        run["processed"] = file_report["deleted"]
+        try:
+            count = await AssetOperation.clear_expired()
+            run["asset_receipts"] = count
+            run["processed"] += count
+        except Exception as error:
+            run["failed"] += 1
+            logger.error("自动清理过期资产回执失败", "定时任务", e=error)

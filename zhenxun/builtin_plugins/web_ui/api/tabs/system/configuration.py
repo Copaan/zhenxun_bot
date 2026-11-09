@@ -1209,10 +1209,13 @@ async def update_configuration_file(
         launcher_managed = update_pending_restart(
             "webui.config",
             reason_codes if restart_required else [],
+            config_keys=changed_keys,
+            consumers=operation.changed if operation else [],
         )
     if restart_required and launcher_managed:
         issue_restart_ticket("webui.settings", ttl_seconds=10 * 60)
     data = apply_result_data(
+        restart_source="webui.environment" if file == "env" else "webui.config",
         apply_mode=apply_mode,
         changed_keys=changed_keys,
         restart_required=restart_required,

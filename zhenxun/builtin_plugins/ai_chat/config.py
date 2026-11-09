@@ -308,9 +308,9 @@ CONFIGS = [
         "off",
         str,
         "偷表情",
-        "自动收集群里的表情包（商城表情和协议端标为表情的图片）：概率模式按概率"
-        "直接收藏；监听模式由视觉模型判断是不是表情包并写好备注，更准但每张都消耗 "
-        "token。可按群设置",
+        "自动收集群里的表情包（商城表情和协议端标为表情的图片）：概率模式抽样候选，"
+        "监听模式检查每个候选；两种模式均由视觉模型确认表情属性与收藏价值后入库，"
+        "同时写好备注，每次判断消耗 token。可按群设置",
         options=_options(off="关闭", probability="概率", listen="监听"),
     ),
     _config(
@@ -319,7 +319,7 @@ CONFIGS = [
         0.1,
         float,
         "偷表情概率",
-        "概率模式下每个表情包被收藏的概率（0~1）",
+        "概率模式下每个表情包被选为 AI 判断候选的概率（0~1）",
         visible_when=_when("STICKER_STEAL", "probability"),
     ),
     _config(
@@ -328,8 +328,8 @@ CONFIGS = [
         "",
         str,
         "判断模型",
-        "判断是不是表情包的视觉模型，写成“服务商/模型”，留空用视觉默认模型",
-        visible_when=_when("STICKER_STEAL", "listen"),
+        "判断表情属性与收藏价值的视觉模型，写成“服务商/模型”，留空用视觉默认模型",
+        visible_when=_when("STICKER_STEAL", "off", "neq"),
     ),
     _config(
         "偷表情",
@@ -339,7 +339,7 @@ CONFIGS = [
         "每日判断次数",
         "所有群每天最多让模型判断的次数，0 为不限制",
         unit="次",
-        visible_when=_when("STICKER_STEAL", "listen"),
+        visible_when=_when("STICKER_STEAL", "off", "neq"),
     ),
     _config(
         "偷表情",
@@ -388,6 +388,15 @@ CONFIGS = [
         "每个会话里 AI 每小时最多使用发送类工具的次数，0 为不限",
         unit="次",
         visible_when=_when("SEND_TOOLS", True),
+    ),
+    _config(
+        "发送与表情",
+        "STICKER_FREQUENCY",
+        "balanced",
+        str,
+        "表情发送频率",
+        "通过提示词控制 AI 使用表情的倾向，不改变发送安全配额",
+        options=_options(high="高", balanced="均衡", low="低"),
     ),
     _config(
         "发送与表情",

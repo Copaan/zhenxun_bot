@@ -7,7 +7,10 @@ from typing import Any
 from zhenxun.services.nonebot_store import runtime as nonebot_runtime
 from zhenxun.services.nonebot_store import storage as nonebot_storage
 from zhenxun.services.plugin_store import plugin_store_transaction as source_store
-from zhenxun.utils.restart_state import clear_pending_restart_state
+from zhenxun.utils.restart_state import (
+    clear_pending_restart_state,
+    read_restart_state,
+)
 
 from .maintenance import run as run_maintenance
 from .supervisor import launcher_log
@@ -20,6 +23,33 @@ class PluginTransactions:
         self.verify_nonebot = False
         self.verify_source = False
         self.source_pending: dict[str, Any] | None = None
+        self.restart_markers: dict[str, Any] = {}
+
+    def settle_restart_markers(self, sources: list[str]) -> None:
+        """仅核销本轮已确认事务对应且没有被后续写入替换的提示。"""
+        for source in sources:
+            expected = self.restart_markers.get(source)
+            if expected is not None:
+                try:
+                    clear_pending_restart_state(source, expected=expected)
+                except Exception as error:
+                    launcher_log(
+                        f"restart marker settlement pending: {type(error).__name__}"
+                    )
+
+    def settle_source_restart_markers(self) -> None:
+        """依据原事务的操作收据核销已提交或已回滚的源码提示。"""
+        for operation in (self.source_pending or {}).get("operations", []):
+            value = {"operation_id": operation.get("operation_id")}
+            try:
+                if source_store.reconcile_operation(value):
+                    self.settle_restart_markers(
+                        [f"webui.plugin:{operation.get('store_key', '')}"]
+                    )
+            except Exception as error:
+                launcher_log(
+                    f"source restart receipt unavailable: {type(error).__name__}"
+                )
 
     @property
     def needs_verification(self) -> bool:
@@ -31,8 +61,18 @@ class PluginTransactions:
         解释器或核心虚拟环境变化后先按当前环境重新同步依赖层；已确认回滚的失败
         依赖层事务随后归档，不再阻挡新的依赖操作。
         """
-        if nonebot_runtime.environment_resync_required() and await run_maintenance(
-            "nonebot-resync"
+        from zhenxun.services.runtime_mutation import mutation_owner
+
+        try:
+            self.restart_markers = read_restart_state().get("pending_restarts", {})
+        except Exception:
+            self.restart_markers = {}
+
+        parent = mutation_owner()
+        if (
+            not parent
+            and nonebot_runtime.environment_resync_required()
+            and await run_maintenance("nonebot-resync")
         ):
             launcher_log("解释器或核心依赖已变化，依赖层将按当前环境重新同步")
         source_before = source_store.pending_transaction()
@@ -90,7 +130,16 @@ class PluginTransactions:
         self.verify_nonebot = bool(
             nonebot_storage.load_manifest().get("pending_verification") and not recovery
         )
-        nonebot_storage.archive_settled()
+        archived = nonebot_storage.archive_settled()
+        if archived:
+            self.settle_restart_markers(["webui.nonebot-store"])
+        if source_after and source_after.get("rollback_confirmed"):
+            self.settle_restart_markers(
+                [
+                    f"webui.plugin:{item.get('store_key', '')}"
+                    for item in source_after.get("operations", [])
+                ]
+            )
 
     def failures(self, ready: bool) -> list[dict[str, Any]] | None:
         """检查 worker 启动后的插件加载结果，依赖层只有告警时视为通过
@@ -113,6 +162,9 @@ class PluginTransactions:
             source_store.startup_verification() if self.verify_source else (True, {})
         )
         if nonebot_ok and source_ok:
+            child = nonebot_storage.pending_transaction() or {}
+            if child.get("parent_operation_id") and nonebot_result.get("failed"):
+                return list(nonebot_result["failed"])
             return None
         failed = [
             *(nonebot_result.get("failures") or []),
@@ -138,17 +190,27 @@ class PluginTransactions:
         )
         if self.verify_source and rolled_back:
             source_store.rollback_pending_transaction(failed)
-        nonebot_storage.archive_settled()
+            self.settle_source_restart_markers()
+        if nonebot_storage.archive_settled():
+            self.settle_restart_markers(["webui.nonebot-store"])
 
     def finalize(self) -> None:
         """确认已通过验证的事务并清除对应的待重启项"""
         if self.verify_nonebot:
+            original = nonebot_storage.pending_transaction() or {}
             nonebot_runtime.finalize_pending_transaction()
-            clear_pending_restart_state("webui.nonebot-store")
+            receipts = [
+                nonebot_storage.pending_transaction(),
+                *nonebot_storage.settled_transactions(),
+            ]
+            if any(
+                receipt
+                and receipt.get("revision") == original.get("revision")
+                and nonebot_storage.is_settled(receipt)
+                for receipt in receipts
+            ):
+                self.settle_restart_markers(["webui.nonebot-store"])
         if self.verify_source:
             source_store.finalize_pending_transaction()
-            for operation in (self.source_pending or {}).get("operations", []):
-                clear_pending_restart_state(
-                    f"webui.plugin:{operation.get('store_key', '')}"
-                )
+            self.settle_source_restart_markers()
         launcher_log("managed plugin transaction passed startup verification")

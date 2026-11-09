@@ -21,7 +21,7 @@ from uuid import uuid4
 import zipfile
 
 import httpx
-from packaging.version import InvalidVersion, Version
+from packaging.version import Version
 
 from zhenxun.configs.repo_config import GITHUB_REPOS, aliyun_mirrored
 from zhenxun.services.lifecycle import lifecycle_kernel
@@ -35,7 +35,11 @@ from zhenxun.services.resource_install import (
     validate_resources,
 )
 from zhenxun.services.runtime_mutation import runtime_mutation_coordinator
-from zhenxun.utils.atomic_json import write_json_locked
+from zhenxun.utils.atomic_json import (
+    mutate_json_locked,
+    read_json_locked,
+    write_json_locked,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +57,6 @@ _PENDING_FILE = _UPDATE_ROOT / "pending.json"
 _APPLIED_FILE = _UPDATE_ROOT / "applied.json"
 _STATUS_CACHE_SECONDS = 300
 _WEBUI_API_VERSION = 1
-_WEBUI_LEGACY_VERSION = Version("0.1.0")
 _RESOURCE_LEGACY_VERSION = Version("1.1.1")
 _RESOURCE_RETRY_SECONDS = 600
 _RESOURCE_STARTUP_TASK: asyncio.Task[None] | None = None
@@ -62,6 +65,7 @@ _WEBUI_RETRY_SECONDS = 600
 _WEBUI_DOWNLOAD_SECONDS = 180
 _WEBUI_STARTUP_TASK: asyncio.Task[None] | None = None
 _WEBUI_REFRESH: Callable[[], Awaitable[Any]] | None = None
+_WEBUI_READY_MANIFEST: dict[str, Any] | None = None
 _WEBUI_STARTUP_STATUS: dict[str, Any] = {}
 webui_publication_lock = asyncio.Lock()
 _HTTP_TIMEOUT = httpx.Timeout(15.0, connect=8.0)
@@ -213,15 +217,17 @@ async def _remote_versions(channel: UpdateChannel) -> dict[str, dict[str, Any]]:
     webui_manifest = False
     webui_api_version: int | None = None
     webui_source_commit: str | None = None
+    webui_revision: str | None = None
     try:
         manifest = await _get_json(
             f"https://raw.githubusercontent.com/{GITHUB_REPOS['webui']}"
-            "/dist/version.json"
+            f"/{webui_sha}/version.json"
         )
         webui_version = str(manifest.get("version") or "unknown")
         webui_manifest = True
         webui_api_version = int(manifest.get("api_version"))
         webui_source_commit = str(manifest.get("commit") or "").strip() or None
+        webui_revision = str(manifest.get("revision") or "").strip() or None
     except Exception:
         if webui_sha:
             webui_version = f"dist-{webui_sha[:7]}"
@@ -236,7 +242,8 @@ async def _remote_versions(channel: UpdateChannel) -> dict[str, dict[str, Any]]:
         "webui": {
             "version": webui_version,
             "ref": "dist",
-            "commit": webui_source_commit or webui_sha or None,
+            "commit": webui_source_commit,
+            "revision": webui_revision,
             "dist_commit": webui_sha or None,
             "manifest": webui_manifest,
             "api_version": webui_api_version,
@@ -250,15 +257,24 @@ def _component_status(
     current_commit: str | None,
     remote: dict[str, Any],
     channel: UpdateChannel = "main",
+    *,
+    current_revision: str | None = None,
 ) -> dict[str, Any]:
     latest_version = str(remote.get("version") or "unknown")
     latest_commit = str(remote.get("commit") or "").strip() or None
     comparable_current = (
-        current_commit if component == "webui" and current_commit else current_version
+        current_commit
+        if component == "webui" and current_commit and latest_commit
+        else current_version
     )
     comparable_latest = (
-        latest_commit if component == "webui" and latest_commit else latest_version
+        latest_commit
+        if component == "webui" and current_commit and latest_commit
+        else latest_version
     )
+    latest_revision = remote.get("revision")
+    if component == "webui" and current_revision and latest_revision:
+        comparable_current, comparable_latest = current_revision, latest_revision
     comparable = comparable_current != "unknown" and comparable_latest != "unknown"
     block_reason = (
         _blocked_release_reason(component, channel, latest_version, current_version)
@@ -271,6 +287,8 @@ def _component_status(
         "current_commit": current_commit,
         "latest_version": latest_version,
         "latest_commit": latest_commit,
+        "current_revision": current_revision,
+        "latest_revision": latest_revision,
         "ref": remote.get("ref"),
         "manifest_available": bool(remote.get("manifest")),
         "compatible": (
@@ -302,6 +320,7 @@ async def check_updates(
                 **_STATUS_CACHE[1],
                 "pending_job": pending_job(),
                 "resource_startup_job": resource_startup_status(),
+                "webui_startup_status": webui_startup_status(),
             }
 
         bot_current = _read_version_file(_ROOT / "__version__")
@@ -333,12 +352,20 @@ async def check_updates(
                     "resource", resource_current, None, remote["resource"], channel
                 ),
                 "webui": _component_status(
-                    "webui", webui_current, webui_commit, remote["webui"], channel
+                    "webui",
+                    webui_current,
+                    webui_commit,
+                    remote["webui"],
+                    channel,
+                    current_revision=_webui_manifest(_ROOT / "data/web_ui/public").get(
+                        "revision"
+                    ),
                 ),
             },
             "errors": errors,
             "pending_job": pending_job(),
             "resource_startup_job": resource_startup_status(),
+            "webui_startup_status": webui_startup_status(),
         }
         _STATUS_CACHE = (now, result)
         return result
@@ -377,6 +404,19 @@ def job_status(job_id: str) -> dict[str, Any]:
         dict[str, Any]: 任务内容
     """
     job = read_job(job_id)
+    if (
+        job.get("apply_mode") == "webui_refresh_pending"
+        and _WEBUI_READY_MANIFEST
+        and _same_webui(job.get("published_manifest") or {}, _WEBUI_READY_MANIFEST)
+    ):
+        job = _update_job(
+            job_id,
+            state="completed",
+            apply_mode="webui_refresh",
+            phase="completed",
+            completed_at=_now_iso(),
+            error=None,
+        )
     if job.get("state") in _PREPARING_JOB_STATES and (
         _ACTIVE_TASK is None or _ACTIVE_TASK.done()
     ):
@@ -399,6 +439,13 @@ def _update_job(job_id: str, **changes: Any) -> dict[str, Any]:
     job.update(changes)
     job["updated_at"] = _now_iso()
     _write_json(_job_path(job_id), job)
+    if job.get("state") in {"completed", "cancelled"} or job.get("rollback_confirmed"):
+        from zhenxun.utils.restart_state import clear_pending_restart_state
+
+        try:
+            clear_pending_restart_state(f"webui.update:{job_id}")
+        except Exception as error:
+            logger.warning("更新已结算，重启提示待核验: %s", type(error).__name__)
     return job
 
 
@@ -545,15 +592,205 @@ def webui_resources_compatible(root: Path) -> bool:
     return True
 
 
-def webui_update_required(root: Path | None = None) -> bool:
-    """判断本地页面是否需要旧版升级或完整性修复。"""
-    root = root or _ROOT / "data" / "web_ui" / "public"
+def _bot_source_identity() -> str:
+    """读取本体版本与核心源码身份，忽略运行数据和扩展插件。"""
+    try:
+        digest = hashlib.sha256((_ROOT / "__version__").read_bytes())
+        core = _ROOT / "zhenxun"
+        files = sorted(
+            path
+            for path in core.rglob("*.py")
+            if path.relative_to(core).parts[0] != "plugins" and not path.is_symlink()
+        )
+        if not files:
+            raise OSError("core_source_missing")
+        for path in files:
+            digest.update(path.relative_to(_ROOT).as_posix().encode())
+            digest.update(b"\0")
+            digest.update(path.read_bytes())
+        if (_ROOT / ".git").exists():
+            try:
+                result = subprocess.run(
+                    ["git", "rev-parse", "HEAD"],
+                    cwd=_ROOT,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    check=False,
+                )
+                if result.returncode == 0:
+                    digest.update(result.stdout.strip().encode())
+            except (OSError, subprocess.SubprocessError):
+                pass
+        return digest.hexdigest()
+    except OSError as error:
+        raise UpdateServiceError("webui_bot_identity_unavailable") from error
+
+
+def _webui_manifest(root: Path) -> dict[str, Any]:
+    """读取完整且兼容的本地页面身份，不可用时返回空映射。"""
     try:
         _validate_webui_staging(root)
-        manifest = json.loads((root / "version.json").read_text("utf-8"))
-        return Version(str(manifest["version"])) <= _WEBUI_LEGACY_VERSION
-    except (UpdateServiceError, InvalidVersion, OSError, ValueError, KeyError):
+        return json.loads((root / "version.json").read_text("utf-8"))
+    except (UpdateServiceError, OSError, ValueError):
+        return {}
+
+
+def _same_webui(left: dict, right: dict) -> bool:
+    """优先按构建修订比较页面，兼容仅记录源码提交或版本的旧清单。"""
+    if left.get("version") and right.get("version"):
+        if Version(str(left["version"])) != Version(str(right["version"])):
+            return False
+    for key in ("revision", "commit", "version"):
+        if (
+            left.get(key)
+            and right.get(key)
+            and "unknown" not in (left[key], right[key])
+        ):
+            return left[key] == right[key]
+    return False
+
+
+def record_webui_ready(manifest: dict[str, Any] | None) -> None:
+    """记录页面入口与静态挂载已确认可用的发布身份。"""
+    global _WEBUI_READY_MANIFEST
+    _WEBUI_READY_MANIFEST = dict(manifest) if manifest else None
+
+
+async def _webui_release() -> dict[str, Any]:
+    """从同一不可变发布提交读取 WebUI 版本身份。"""
+    ref = await _latest_ref("webui", "main")
+    manifest = await _get_json(
+        f"https://raw.githubusercontent.com/{GITHUB_REPOS['webui']}/{ref}/version.json"
+    )
+    try:
+        if not isinstance(manifest, dict):
+            raise ValueError
+        Version(str(manifest["version"]))
+        if int(manifest.get("api_version")) != _WEBUI_API_VERSION:
+            raise UpdateServiceError("webui_api_incompatible")
+        for key in ("revision", "commit"):
+            if manifest.get(key) is not None and not isinstance(manifest[key], str):
+                raise ValueError
+    except (KeyError, ValueError, TypeError) as error:
+        raise UpdateServiceError("webui_manifest_invalid") from error
+    return {
+        key: value
+        for key, value in {**manifest, "dist_commit": ref}.items()
+        if key in {"version", "commit", "revision", "api_version", "dist_commit"}
+    }
+
+
+def _validate_webui_check(record: Any) -> dict:
+    """验证启动检查收据，不把损坏或未知版本视为未检查。"""
+    if not isinstance(record, dict) or record.get("schema_version") != 1:
+        raise UpdateServiceError("webui_check_record_invalid")
+    for key in ("bot_identity", "checked_bot_identity", "attempt_id", "job_id"):
+        if record.get(key) is not None:
+            length = 64 if key.endswith("identity") else 32
+            if not isinstance(record[key], str) or not re.fullmatch(
+                rf"[0-9a-f]{{{length}}}", record[key]
+            ):
+                raise UpdateServiceError("webui_check_record_invalid")
+    if record.get("target") is not None and not isinstance(record["target"], dict):
+        raise UpdateServiceError("webui_check_record_invalid")
+    if record.get("target") is not None:
+        target = record["target"]
+        try:
+            Version(str(target["version"]))
+            if (
+                int(target["api_version"]) != _WEBUI_API_VERSION
+                or not re.fullmatch(r"[0-9a-f]{40}", str(target["dist_commit"]))
+                or any(
+                    target.get(key) is not None and not isinstance(target[key], str)
+                    for key in ("revision", "commit")
+                )
+            ):
+                raise ValueError
+        except (KeyError, TypeError, ValueError) as error:
+            raise UpdateServiceError("webui_check_record_invalid") from error
+    if record.get("error") is not None and not isinstance(record["error"], str):
+        raise UpdateServiceError("webui_check_record_invalid")
+    if record.get("state") not in {
+        None,
+        "checking",
+        "queued",
+        "publishing",
+        "completed",
+        "waiting_retry",
+        "refresh_pending",
+    }:
+        raise UpdateServiceError("webui_check_record_invalid")
+    if record.get("state") == "completed" and not record.get("checked_bot_identity"):
+        raise UpdateServiceError("webui_check_record_invalid")
+    if record.get("state") and not record.get("bot_identity"):
+        raise UpdateServiceError("webui_check_record_invalid")
+    if record.get("next_retry_at"):
+        try:
+            value = datetime.fromisoformat(record["next_retry_at"])
+            if value.tzinfo is None:
+                raise ValueError
+        except (TypeError, ValueError) as error:
+            raise UpdateServiceError("webui_check_record_invalid") from error
+    return record
+
+
+def _read_webui_check() -> dict:
+    """读取持久化检查结果，保留不可读记录供处理。"""
+    path = _JOBS_ROOT.parent / "webui-startup.json"
+    if not path.parent.exists():
+        return {"schema_version": 1}
+    try:
+        return _validate_webui_check(
+            read_json_locked(path, {"schema_version": 1}, strict=True)
+        )
+    except (OSError, RuntimeError, TimeoutError) as error:
+        raise UpdateServiceError("webui_check_record_invalid") from error
+
+
+def _claim_webui_check(identity: str) -> dict:
+    """为当前启动接管未完成检查，保留同一升级任务的重试时间。"""
+    path = _JOBS_ROOT.parent / "webui-startup.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    def claim(record: dict) -> dict:
+        _validate_webui_check(record)
+        if _bot_source_identity() != identity:
+            raise UpdateServiceError("webui_check_superseded")
+        if record.get("bot_identity") != identity or record.get("state") == "completed":
+            checked = record.get("checked_bot_identity")
+            record.clear()
+            record.update(
+                schema_version=1, checked_bot_identity=checked, state="checking"
+            )
+        record.update(bot_identity=identity, attempt_id=uuid4().hex)
+        return dict(record)
+
+    return mutate_json_locked(path, {"schema_version": 1}, claim, strict=True)
+
+
+def _save_webui_check(check: dict, **changes: Any) -> bool:
+    """仅当前源码身份及当前启动持有者可以更新检查收据。"""
+
+    def save(record: dict) -> bool:
+        _validate_webui_check(record)
+        if (
+            record.get("attempt_id") != check["attempt_id"]
+            or record.get("bot_identity") != check["bot_identity"]
+            or _bot_source_identity() != check["bot_identity"]
+        ):
+            return False
+        record.update(changes)
+        check.update(changes)
         return True
+
+    return mutate_json_locked(
+        _JOBS_ROOT.parent / "webui-startup.json",
+        {"schema_version": 1},
+        save,
+        write_if=bool,
+        strict=True,
+    )
 
 
 def resource_update_required(root: Path | None = None) -> bool:
@@ -705,9 +942,9 @@ def webui_startup_status() -> dict[str, Any]:
     return {key: status.get(key) for key in ("state", "reason", "next_retry_at")}
 
 
-async def _webui_disk(callback: Callable, *args: Any) -> Any:
+async def _webui_disk(callback: Callable, *args: Any, **kwargs: Any) -> Any:
     """取消时等待文件操作结束，避免临时目录清理与写入竞争。"""
-    task = asyncio.create_task(asyncio.to_thread(callback, *args))
+    task = asyncio.create_task(asyncio.to_thread(callback, *args, **kwargs))
     cancelled = False
     while not task.done():
         try:
@@ -721,32 +958,114 @@ async def _webui_disk(callback: Callable, *args: Any) -> Any:
 
 
 async def _retry_webui_update() -> None:
-    """旧版页面立即更新，失败后每十分钟重试直到发布完成。"""
-    while await _webui_disk(webui_update_required):
-        job_id = None
+    """本体升级后核对页面发布身份，未完成检查每十分钟续试。"""
+    root = _ROOT / "data" / "web_ui" / "public"
+    try:
+        identity = await _webui_disk(_bot_source_identity)
+        previous = await _webui_disk(_read_webui_check)
+        if (
+            previous.get("checked_bot_identity") == identity
+            and previous.get("state") == "completed"
+            and await _webui_disk(webui_resources_compatible, root)
+        ):
+            _WEBUI_STARTUP_STATUS.update(
+                state="completed", reason=None, next_retry_at=None
+            )
+            return
+        check = await _webui_disk(_claim_webui_check, identity)
+    except Exception as error:
+        logger.warning("WebUI 启动检查状态暂不可确认：%s", type(error).__name__)
+        _WEBUI_STARTUP_STATUS.update(
+            state="state_unknown",
+            reason="启动检查记录或本体身份暂不可确认，请检查日志。",
+            next_retry_at=None,
+        )
+        return
+    while True:
+        retry_at = check.get("next_retry_at")
+        if retry_at:
+            delay = datetime.fromisoformat(retry_at).timestamp() - time.time()
+            _WEBUI_STARTUP_STATUS.update(
+                state=check.get("state", "waiting_retry"),
+                reason=_webui_failure_reason(check.get("error") or "update_failed"),
+                next_retry_at=retry_at,
+            )
+            if delay > 0:
+                await asyncio.sleep(delay)
         try:
             if _ACTIVE_TASK is not None and not _ACTIVE_TASK.done():
                 await asyncio.gather(
                     asyncio.shield(_ACTIVE_TASK), return_exceptions=True
                 )
-                continue
-            job = await create_update_job(
-                component="webui",
-                channel="main",
-                method="download",
-                source="github",
-                force=False,
-                startup_webui=True,
-            )
-            job_id = job["job_id"]
+            if not await _webui_disk(
+                _save_webui_check, check, state="checking", next_retry_at=None
+            ):
+                return
             _WEBUI_STARTUP_STATUS.update(
-                state="queued", job_id=job_id, reason=None, next_retry_at=None
+                state="checking", reason=None, next_retry_at=None
             )
-            if _ACTIVE_TASK is not None:
-                await asyncio.shield(_ACTIVE_TASK)
-            job = read_job(job_id)
-            if job["state"] != "completed":
-                raise UpdateServiceError(job.get("error") or "webui_update_failed")
+            current = await _webui_disk(_webui_manifest, root)
+            target = check.get("target")
+            if check.get("job_id") and target and _same_webui(current, target):
+                job = await _refresh_webui_job(check["job_id"])
+                if job.get("apply_mode") == "webui_refresh_pending":
+                    raise UpdateServiceError("webui_refresh_failed")
+            else:
+                target = await asyncio.wait_for(_webui_release(), 30)
+                if not await _webui_disk(_save_webui_check, check, target=target):
+                    return
+                if not current or not (
+                    _same_webui(current, target)
+                    or Version(str(current["version"]))
+                    > Version(str(target["version"]))
+                    or (
+                        Version(str(current["version"]))
+                        == Version(str(target["version"]))
+                        and await _webui_disk(webui_resources_compatible, root)
+                    )
+                ):
+                    job = await create_update_job(
+                        component="webui",
+                        channel="main",
+                        method="download",
+                        source="github",
+                        force=False,
+                        startup_webui=True,
+                        webui_target=target,
+                        webui_baseline=current,
+                        webui_check=check,
+                    )
+                    job_id = job["job_id"]
+                    if not await _webui_disk(_save_webui_check, check, job_id=job_id):
+                        return
+                    _WEBUI_STARTUP_STATUS.update(
+                        state="queued", job_id=job_id, reason=None, next_retry_at=None
+                    )
+                    if _ACTIVE_TASK is not None:
+                        await asyncio.shield(_ACTIVE_TASK)
+                    job = read_job(job_id)
+                    if (
+                        job["state"] != "completed"
+                        or job.get("apply_mode") == "webui_refresh_pending"
+                    ):
+                        raise UpdateServiceError(
+                            job.get("error") or "webui_update_failed"
+                        )
+                elif _WEBUI_REFRESH is not None:
+                    await _WEBUI_REFRESH()
+            if await _webui_disk(
+                _save_webui_check,
+                check,
+                state="completed",
+                checked_bot_identity=identity,
+                checked_at=_now_iso(),
+                next_retry_at=None,
+                error=None,
+            ):
+                _WEBUI_STARTUP_STATUS.update(
+                    state="completed", reason=None, next_retry_at=None
+                )
+            return
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -758,21 +1077,65 @@ async def _retry_webui_update() -> None:
                 time.time() + _WEBUI_RETRY_SECONDS, timezone.utc
             ).isoformat()
             _WEBUI_STARTUP_STATUS.update(
-                state="waiting_retry",
+                state="refresh_pending"
+                if code == "webui_refresh_failed"
+                else "waiting_retry",
                 next_retry_at=retry_at,
                 reason=_webui_failure_reason(code),
             )
-            if job_id:
-                try:
-                    _update_job(job_id, next_retry_at=retry_at)
-                except Exception:
-                    logger.exception("WebUI 更新重试信息保存失败")
-            await asyncio.sleep(_WEBUI_RETRY_SECONDS)
-    _WEBUI_STARTUP_STATUS.update(state="completed", reason=None, next_retry_at=None)
+            try:
+                if not await _webui_disk(
+                    _save_webui_check,
+                    check,
+                    state=_WEBUI_STARTUP_STATUS["state"],
+                    next_retry_at=retry_at,
+                    error=code,
+                ):
+                    return
+            except Exception:
+                logger.exception("WebUI 更新重试信息保存失败")
+                _WEBUI_STARTUP_STATUS.update(
+                    state="state_unknown",
+                    reason="检查记录无法保存，请检查日志。",
+                    next_retry_at=None,
+                )
+                return
+
+
+async def _refresh_webui_job(job_id: str) -> dict[str, Any]:
+    """刷新已发布页面，失败保留可重试结果而不重新下载。"""
+    if read_job(job_id).get("component") != "webui":
+        raise UpdateServiceError("webui_check_record_invalid")
+    record_webui_ready(None)
+    try:
+        if _WEBUI_REFRESH is None:
+            raise UpdateServiceError("webui_refresh_unavailable")
+        await _WEBUI_REFRESH()
+    except Exception:
+        logger.exception("WebUI 资源已发布，刷新待重试")
+        return _update_job(
+            job_id,
+            state="completed",
+            progress=100,
+            restart_required=False,
+            apply_mode="webui_refresh_pending",
+            phase="refresh_pending",
+            error="webui_refresh_failed",
+        )
+    return _update_job(
+        job_id,
+        state="completed",
+        progress=100,
+        completed_at=_now_iso(),
+        restart_required=False,
+        apply_mode="webui_refresh",
+        phase="completed",
+        error=None,
+    )
 
 
 def start_webui_update(refresh: Callable[[], Awaitable[Any]]) -> None:
-    """注册资源刷新回调并启动单实例旧版更新任务。"""
+    """注册资源刷新回调并恢复单实例启动检查。"""
     global _WEBUI_STARTUP_TASK, _WEBUI_REFRESH
     _WEBUI_REFRESH = refresh
     if _WEBUI_STARTUP_TASK is None or _WEBUI_STARTUP_TASK.done():
@@ -801,7 +1164,11 @@ async def stop_webui_update() -> None:
 def _webui_failure_reason(code: str) -> str:
     """将更新错误转换为公开页面可展示的固定诊断。"""
     reasons = {
-        "webui_candidate_not_newer": "发布源尚未提供高于 0.1.0 的新版页面",
+        "webui_candidate_not_newer": "发布源尚未提供预期的新版页面",
+        "webui_target_mismatch": "候选页面与本次检查的发布身份不符",
+        "webui_publish_superseded": "页面已被另一项更新替换，将重新核对发布版本",
+        "webui_check_superseded": "启动检查已由新的启动接管",
+        "webui_refresh_failed": "页面已发布，刷新待重试，无需重启 Bot",
         "webui_api_incompatible": "发布页面与当前后端接口不兼容",
         "webui_manifest_invalid": "发布页面的版本清单缺失或无效",
         "webui_assets_incomplete": "下载的页面资源不完整",
@@ -1134,6 +1501,50 @@ def _apply_webui(job_id: str, staged_root: Path) -> None:
     _remove_tree(backup)
 
 
+def _publish_webui_job(job_id: str, job: dict, root: Path) -> None:
+    """按检查持有者和本地基线发布候选，防止迟到任务覆盖新页面。"""
+
+    def publish() -> None:
+        target = job.get("webui_target") or _webui_manifest(root)
+        current = _webui_manifest(_ROOT / "data/web_ui/public")
+        if not job.get("webui_check") or not _same_webui(current, target):
+            if current != job.get("webui_baseline"):
+                raise UpdateServiceError("webui_publish_superseded")
+            _update_job(job_id, phase="publishing")
+            _apply_webui(job_id, root)
+        _update_job(
+            job_id, published_manifest=_webui_manifest(_ROOT / "data/web_ui/public")
+        )
+
+    check = job.get("webui_check")
+
+    def guarded_publish(record: dict) -> None:
+        _validate_webui_check(record)
+        if job.get("webui_owner_identity") != _bot_source_identity():
+            raise UpdateServiceError("webui_check_superseded")
+        if not check:
+            publish()
+            return
+        if (
+            record.get("attempt_id") != check["attempt_id"]
+            or record.get("bot_identity") != check["bot_identity"]
+            or _bot_source_identity() != check["bot_identity"]
+        ):
+            raise UpdateServiceError("webui_check_superseded")
+        publish()
+        record.update(
+            state="refresh_pending", job_id=job_id, target=job["webui_target"]
+        )
+
+    mutate_json_locked(
+        _JOBS_ROOT.parent / "webui-startup.json",
+        {"schema_version": 1},
+        guarded_publish,
+        write_if=lambda _: bool(check),
+        strict=True,
+    )
+
+
 async def _prepare_job(job_id: str) -> None:
     job = read_job(job_id)
     component = job["component"]
@@ -1146,7 +1557,7 @@ async def _prepare_job(job_id: str) -> None:
         _update_job(job_id, state="preparing", progress=10)
         if component == "bot" and _git_dirty() and not job["force"]:
             raise UpdateServiceError("working_tree_dirty")
-        ref = (
+        ref = (job.get("webui_target") or {}).get("dist_commit") or (
             await asyncio.wait_for(_latest_ref(component, job["channel"]), 30)
             if component in {"webui", "resource"}
             else await _latest_ref(component, job["channel"])
@@ -1196,8 +1607,10 @@ async def _prepare_job(job_id: str) -> None:
             _update_job(job_id, effective_source="github", attempted_sources=["github"])
         _update_job(job_id, phase="validating")
         _validate_staging(component, root)
-        if job.get("startup_webui") and webui_update_required(root):
-            raise UpdateServiceError("webui_candidate_not_newer")
+        if job.get("webui_target") and not _same_webui(
+            _webui_manifest(root), job["webui_target"]
+        ):
+            raise UpdateServiceError("webui_target_mismatch")
         if job.get("startup_resource") and resource_update_required(root):
             raise UpdateServiceError("resource_candidate_not_newer")
         root_relative = str(root.resolve().relative_to(_ROOT.resolve()))
@@ -1216,24 +1629,13 @@ async def _prepare_job(job_id: str) -> None:
                 phase="hot_apply",
             ):
                 async with webui_publication_lock:
-                    if not job.get("startup_webui") or webui_update_required():
-                        _update_job(job_id, phase="publishing")
-                        _apply_webui(job_id, root)
-                _update_job(
-                    job_id,
-                    state="completed",
-                    progress=100,
-                    completed_at=_now_iso(),
-                    restart_required=False,
-                    apply_mode="webui_refresh",
-                    phase="completed",
-                )
-                if _WEBUI_REFRESH is not None:
-                    try:
-                        await _WEBUI_REFRESH()
-                    except Exception:
-                        logger.exception("WebUI 资源刷新失败，将在页面请求时重试")
-            await asyncio.to_thread(_remove_tree, stage)
+                    _publish_webui_job(job_id, job, root)
+                await _refresh_webui_job(job_id)
+            try:
+                await asyncio.to_thread(_remove_tree, stage)
+            except OSError:
+                logger.exception("WebUI 页面已发布，暂存目录清理待重试")
+                _update_job(job_id, cleanup_pending=True)
             return
 
         fallback_reason: str | None = None
@@ -1326,6 +1728,9 @@ async def create_update_job(
     force: bool,
     startup_webui: bool = False,
     startup_resource: bool = False,
+    webui_target: dict[str, Any] | None = None,
+    webui_baseline: dict[str, Any] | None = None,
+    webui_check: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     global _ACTIVE_TASK
     async with _JOB_LOCK:
@@ -1343,6 +1748,20 @@ async def create_update_job(
             method = "git"
         if component == "bot" and channel == "release":
             await _latest_ref(component, channel)
+        if webui_target and (
+            component != "webui"
+            or not re.fullmatch(
+                r"[0-9a-f]{40}", str(webui_target.get("dist_commit", ""))
+            )
+        ):
+            raise UpdateServiceError("webui_ref_invalid")
+        webui_owner_identity = None
+        if component == "webui":
+            webui_owner_identity = await asyncio.to_thread(_bot_source_identity)
+            if webui_baseline is None:
+                webui_baseline = await asyncio.to_thread(
+                    _webui_manifest, _ROOT / "data/web_ui/public"
+                )
         await asyncio.to_thread(_remove_tree, _STAGING_ROOT)
         job_id = uuid4().hex
         job = {
@@ -1358,6 +1777,14 @@ async def create_update_job(
             "force": force,
             "startup_webui": startup_webui and component == "webui",
             "startup_resource": startup_resource and component == "resource",
+            "webui_target": webui_target,
+            "webui_baseline": webui_baseline,
+            "webui_owner_identity": webui_owner_identity,
+            "webui_check": (
+                {key: webui_check[key] for key in ("bot_identity", "attempt_id")}
+                if webui_check
+                else None
+            ),
             "state": "queued",
             "progress": 0,
             "error": None,
@@ -1642,7 +2069,7 @@ def apply_pending_update(project_root: Path | None = None) -> bool:
         progress=100,
         completed_at=_now_iso(),
         restart_required=False,
-        apply_mode="restart_requested",
+        apply_mode="applied",
         resource_generation=_read_version_file(_ROOT / "resources" / "__version__"),
     )
     _PENDING_FILE.unlink(missing_ok=True)
@@ -1650,7 +2077,7 @@ def apply_pending_update(project_root: Path | None = None) -> bool:
 
 
 def finalize_applied_update() -> bool:
-    """Mark a Bot update complete after the replacement worker becomes healthy."""
+    """新 worker 验证通过后确认本体更新已生效。"""
     if not _APPLIED_FILE.is_file():
         return False
     applied = json.loads(_APPLIED_FILE.read_text(encoding="utf-8"))
@@ -1661,13 +2088,14 @@ def finalize_applied_update() -> bool:
         progress=100,
         completed_at=_now_iso(),
         restart_required=False,
+        apply_mode="applied",
     )
     _APPLIED_FILE.unlink(missing_ok=True)
     return True
 
 
 def rollback_applied_update() -> bool:
-    """Restore the previous Bot source after replacement-worker health failure."""
+    """恢复验证失败的本体更新并记录回退结果。"""
     if not _APPLIED_FILE.is_file():
         return False
     applied = json.loads(_APPLIED_FILE.read_text(encoding="utf-8"))
@@ -1685,6 +2113,8 @@ def rollback_applied_update() -> bool:
             state="failed",
             error=f"health_check_failed_rollback_failed:{code}",
             progress=100,
+            restart_required=False,
+            apply_mode="recovery_required",
         )
         raise
     _update_job(
@@ -1692,6 +2122,9 @@ def rollback_applied_update() -> bool:
         state="failed",
         error="health_check_failed_rolled_back",
         progress=100,
+        rollback_confirmed=True,
+        restart_required=False,
+        apply_mode="rolled_back",
     )
     _APPLIED_FILE.unlink(missing_ok=True)
     return True

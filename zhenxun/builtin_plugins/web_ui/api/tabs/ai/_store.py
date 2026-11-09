@@ -484,11 +484,15 @@ def apply_response(
     if changed_keys is None:
         changed_keys = operation.config_keys if operation is not None else []
     if required and update_pending_restart(
-        pending_source, reason_codes or ["ai_runtime_restart_required"]
+        pending_source,
+        reason_codes or ["ai_runtime_restart_required"],
+        config_keys=changed_keys,
+        consumers=operation.changed if operation else [],
     ):
         issue_restart_ticket("webui.settings", ttl_seconds=10 * 60)
     status = restart_status_data()
     return apply_result_data(
+        restart_source=pending_source,
         apply_mode=mode,
         changed_keys=changed_keys,
         restart_required=required,

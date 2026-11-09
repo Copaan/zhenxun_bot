@@ -100,6 +100,17 @@ def _safe_store_error(error: Exception) -> str:
     return redact_git_output(error).replace("\r", " ").replace("\n", " ")[:500]
 
 
+def _safe_store_details(value):
+    """清理安装诊断中的文本凭据，保留阶段和错误分类。"""
+    if isinstance(value, str):
+        return redact_git_output(value).replace("\r", " ").replace("\n", " ")[:1200]
+    if isinstance(value, dict):
+        return {key: _safe_store_details(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_safe_store_details(item) for item in value]
+    return value
+
+
 def _store_key(source: str, module: str) -> str:
     return f"{source}:{module}"
 
@@ -575,6 +586,14 @@ async def _install_or_update(param: PluginIr, action: str) -> Result:
         _record_failed_operation(journal_operation_id, journal_store_key, reason)
         if reason == "source_build_confirmation_required":
             return Result.fail(reason, code=409)
+        if error_code := getattr(e, "code", None):
+            details = _safe_store_details(getattr(e, "details", None) or {})
+            logger.warning(
+                f"插件{label}失败 | reason={error_code} | "
+                f"stage={details.get('stage', 'unknown')}",
+                "WebUi",
+            )
+            return Result.fail(error_code, details={"reason": error_code, **details})
         return Result.fail(f"{label}插件失败: {reason}")
 
 

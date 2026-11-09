@@ -1,7 +1,10 @@
 import asyncio
+from collections.abc import Callable
+from copy import deepcopy
 from datetime import datetime, timezone
 
 from zhenxun.models.bot_group_policy import BotGroupMembership, BotGroupPluginPolicy
+from zhenxun.models.group_plugin_setting import GroupPluginSetting, build_scope_key
 from zhenxun.services.db_context.write import CacheUnavailable, on_publication_failed
 from zhenxun.services.log import logger
 from zhenxun.services.plugin_policy import (
@@ -16,6 +19,11 @@ from zhenxun.services.runtime_mutation import runtime_mutation_coordinator
 
 _BLOCK_FIELDS = ("block_plugins", "block_tasks", "forced_plugins", "forced_tasks")
 _LEGACY_PLATFORMS = {None, "qq", "qq_client", "OneBot V11", "QQClient"}
+_INACTIVE_TASKS_SETTING = "__zx_inactive_tasks__"
+
+
+class _InactivePauseCancelled(Exception):
+    pass
 
 
 def group_key(bot_id, platform_scope, group_id, channel_id=None):
@@ -39,6 +47,8 @@ class BotGroupPolicyService:
         self._refresh_tasks = {}
         self._memberships = set()
         self._pending = set()
+        self._inactive_pending = set()
+        self._inactive_inflight = {}
         self._queue = asyncio.Queue(maxsize=1000)
         self.context = None
         self.loaded = False
@@ -58,6 +68,16 @@ class BotGroupPolicyService:
             group_key(row.bot_id, row.platform_scope, row.group_id, row.channel_id)
             for row in await BotGroupMembership.all()
         }
+        self._inactive_pending = {
+            group_key(row.bot_id, row.platform_scope, row.group_id, row.channel_id)
+            for row in await GroupPluginSetting.filter(
+                plugin_name=_INACTIVE_TASKS_SETTING,
+                bot_id__not_isnull=True,
+                platform_scope__not_isnull=True,
+            )
+            if row.bot_id and row.platform_scope
+        }
+        self._inactive_inflight.clear()
         self.loaded = True
         context.add_finalizer(self.close)
         context.spawn_task(self._write_memberships(), name="bot-group-memberships")
@@ -70,6 +90,8 @@ class BotGroupPolicyService:
         self.loaded = False
         self.context = None
         self._pending.clear()
+        self._inactive_pending.clear()
+        self._inactive_inflight.clear()
         self._policies.clear()
         self._revisions.clear()
         self._stale.clear()
@@ -155,10 +177,18 @@ class BotGroupPolicyService:
                 store.pop(key, None)
         self._stale = {key for key in self._stale if key[0] != bot_id}
         self._memberships = {key for key in self._memberships if key[0] != bot_id}
+        self._inactive_pending = {
+            key for key in self._inactive_pending if key[0] != bot_id
+        }
+        self._inactive_inflight = {
+            key: count
+            for key, count in self._inactive_inflight.items()
+            if key[0] != bot_id
+        }
 
     def mark_all_stale(self):
         """将已加载的群聊与私聊策略全部标记为待刷新，使用前从数据库重新读取"""
-        self.mark_stale(*self._policies)
+        self.mark_stale(*(set(self._policies) | self._inactive_pending))
 
     async def refresh_policy(self, key):
         """从数据库重新读取策略，读取期间有新的待刷新标记时保留标记
@@ -168,8 +198,11 @@ class BotGroupPolicyService:
         """
         epoch, marks = self._epoch, self._stale_marks
         row = await BotGroupPluginPolicy.get_or_none(**key_fields(key))
+        snapshot = await self._inactive_snapshot(key)
         if epoch != self._epoch:
             return
+        if marks == self._stale_marks:
+            self._accept_inactive_snapshot(key, snapshot is not None)
         self._accept_row(key, row, clear_stale=marks == self._stale_marks)
 
     async def ensure_fresh(self, bot_id, scope, group_id, channel_id=None):
@@ -446,7 +479,110 @@ class BotGroupPolicyService:
         bot_id = await plugin_policy_service._resolve_bot_id(bot_id)
         return await self._view(group_key(bot_id, "private", self.PRIVATE_KEY))
 
-    async def _write(self, key, transform, expected_revision=None):
+    @staticmethod
+    async def _inactive_snapshot(key, connection=None, *, lock=False):
+        """读取精确作用域的自动暂停收据，不继承其他账号或历史配置。"""
+        query = GroupPluginSetting.get_or_none(
+            **key_fields(key), plugin_name=_INACTIVE_TASKS_SETTING
+        ).using_db(connection)
+        if lock:
+            query = query.select_for_update()
+        return await query
+
+    def _accept_inactive_snapshot(self, key, present):
+        """更新已提交的暂停收据索引。"""
+        if present:
+            self._inactive_pending.add(key)
+        else:
+            self._inactive_pending.discard(key)
+
+    @staticmethod
+    def _inactive_snapshot_data(snapshot):
+        """校验自动暂停收据，异常材料不用于恢复。"""
+        data = snapshot.settings
+        if (
+            not isinstance(data, dict)
+            or type(data.get("version")) is not int
+            or data["version"] != 1
+            or not isinstance(data.get("tasks"), dict)
+            or not isinstance(data.get("auto_added"), list)
+            or not isinstance(data.get("paused_at"), str)
+        ):
+            raise PluginPolicyError("群被动自动暂停记录异常，保留记录等待处理")
+        tasks = data["tasks"]
+        if any(
+            not isinstance(module, str)
+            or not isinstance(state, dict)
+            or type(state.get("blocked")) is not bool
+            or type(state.get("forced")) is not bool
+            or type(state.get("effective_enabled")) is not bool
+            or not isinstance(state.get("blocked_by"), list)
+            or any(not isinstance(reason, str) for reason in state["blocked_by"])
+            for module, state in tasks.items()
+        ) or any(
+            not isinstance(module, str)
+            or module not in tasks
+            or tasks[module]["blocked"]
+            for module in data["auto_added"]
+        ):
+            raise PluginPolicyError("群被动自动暂停记录异常，保留记录等待处理")
+        return deepcopy(data)
+
+    async def pause_inactive_tasks(
+        self,
+        bot_id,
+        scope,
+        group_id,
+        modules,
+        *,
+        channel_id=None,
+        guard: Callable[[], bool] | None = None,
+    ) -> bool:
+        """记录群被动原有开关并暂停，观察结果失效时取消事务。"""
+        bot_id = await plugin_policy_service._resolve_bot_id(bot_id)
+        key = group_key(bot_id, scope, group_id, channel_id)
+        self._inactive_inflight[key] = self._inactive_inflight.get(key, 0) + 1
+        requested = set(modules)
+        try:
+            return await self._write(
+                key,
+                lambda state: {
+                    **state,
+                    "block_tasks": sorted(set(state["block_tasks"]) | requested),
+                },
+                inactive_action="pause",
+                inactive_modules=requested,
+                guard=guard,
+            )
+        except _InactivePauseCancelled:
+            return False
+        finally:
+            remaining = self._inactive_inflight.get(key, 1) - 1
+            if remaining:
+                self._inactive_inflight[key] = remaining
+            else:
+                self._inactive_inflight.pop(key, None)
+
+    async def resume_inactive_tasks(
+        self, bot_id, scope, group_id, channel_id=None
+    ) -> bool:
+        """恢复仍归自动暂停所有的本群被动开关，失败保留收据。"""
+        key = group_key(bot_id, scope, group_id, channel_id)
+        if key not in self._inactive_pending and key not in self._inactive_inflight:
+            return False
+        return await self._write(key, lambda state: state, inactive_action="resume")
+
+    async def _write(
+        self,
+        key,
+        transform,
+        expected_revision=None,
+        *,
+        touched_tasks=(),
+        inactive_action=None,
+        inactive_modules=(),
+        guard=None,
+    ):
         from zhenxun.models.bot_console import BotConsole
         from zhenxun.services.db_context.write import defer, require_publication
 
@@ -468,7 +604,26 @@ class BotGroupPolicyService:
                         plugin_policy_service._check_revision(
                             expected_revision, current["revision"]
                         )
+                    snapshot = await self._inactive_snapshot(key, connection, lock=True)
+                    snapshot_present = snapshot is not None
+                    snapshot_data = None
+                    if inactive_action == "pause" and snapshot_present:
+                        self._accept_inactive_snapshot(key, True)
+                        return False
+                    if inactive_action == "resume" and not snapshot_present:
+                        self._accept_inactive_snapshot(key, False)
+                        return False
+                    if snapshot_present:
+                        snapshot_data = self._inactive_snapshot_data(snapshot)
                     changed = transform(current)
+                    if inactive_action == "resume":
+                        changed = {
+                            **changed,
+                            "block_tasks": sorted(
+                                set(current["block_tasks"])
+                                - set(snapshot_data["auto_added"])
+                            ),
+                        }
                     modules = plugin_policy_service._catalog_modules(
                         await plugin_policy_service.catalog()
                     )
@@ -489,6 +644,46 @@ class BotGroupPolicyService:
                         preserve_plugins=current["forced_plugins"],
                         preserve_tasks=current["forced_tasks"],
                     )
+                    if guard is not None and not guard():
+                        raise _InactivePauseCancelled
+                    if inactive_action == "pause":
+                        requested = set(inactive_modules)
+                        auto_added = set(tasks) - set(current["block_tasks"])
+                        if not auto_added:
+                            return False
+                        original_view = await self._view(key)
+                        effective = {
+                            item["module"]: item
+                            for item in original_view["effective"]["tasks"]
+                        }
+                        snapshot_data = {
+                            "version": 1,
+                            "paused_at": datetime.now(timezone.utc).isoformat(),
+                            "tasks": {
+                                module: {
+                                    "blocked": module in current["block_tasks"],
+                                    "forced": module in current["forced_tasks"],
+                                    "effective_enabled": effective[module][
+                                        "effective_enabled"
+                                    ],
+                                    "blocked_by": effective[module]["blocked_by"],
+                                }
+                                for module in sorted(requested)
+                            },
+                            "auto_added": sorted(auto_added),
+                        }
+                    elif snapshot_data is not None and inactive_action is None:
+                        touched = (
+                            set(snapshot_data["auto_added"])
+                            if touched_tasks is None
+                            else set(touched_tasks)
+                            | (set(current["block_tasks"]) ^ set(tasks))
+                        )
+                        snapshot_data["auto_added"] = sorted(
+                            set(snapshot_data["auto_added"]) - touched
+                        )
+                    if guard is not None and not guard():
+                        raise _InactivePauseCancelled
                     fields = {
                         "block_plugins": plugins,
                         "block_tasks": tasks,
@@ -511,10 +706,32 @@ class BotGroupPolicyService:
                             setattr(row, name, value)
                         await row.save(using_db=connection, update_fields=list(fields))
                     written = True
+                    if inactive_action == "pause":
+                        await GroupPluginSetting.create(
+                            **key_fields(key),
+                            plugin_name=_INACTIVE_TASKS_SETTING,
+                            scope_key=build_scope_key(
+                                key[2], _INACTIVE_TASKS_SETTING, key[0], key[1], key[3]
+                            ),
+                            settings=snapshot_data,
+                            using_db=connection,
+                        )
+                        snapshot_present = True
+                    elif inactive_action == "resume":
+                        await snapshot.delete(using_db=connection)
+                        snapshot_present = False
+                    elif snapshot is not None and touched_tasks != ():
+                        snapshot.settings = snapshot_data
+                        await snapshot.save(
+                            using_db=connection, update_fields=["settings"]
+                        )
+                    if guard is not None and not guard():
+                        raise _InactivePauseCancelled
 
                     async def publish():
                         try:
                             self._accept_row(key, row)
+                            self._accept_inactive_snapshot(key, snapshot_present)
                             require_publication(self._publish_policy_revision(key))
                         except BaseException:
                             self.mark_stale(key)
@@ -526,6 +743,8 @@ class BotGroupPolicyService:
                 if written:
                     self.mark_stale(key)
                 raise
+        if inactive_action is not None:
+            return True
         return await self._view(key)
 
     async def update_group(
@@ -540,6 +759,7 @@ class BotGroupPolicyService:
         block_tasks,
         forced_plugins=None,
         forced_tasks=None,
+        touched_tasks=None,
     ):
         current = await self.get_group(bot_id, scope, group_id, channel_id)
         key = group_key(current["bot_id"], scope, group_id, channel_id)
@@ -549,6 +769,7 @@ class BotGroupPolicyService:
                 block_plugins, block_tasks, forced_plugins, forced_tasks
             ),
             expected_revision,
+            touched_tasks=touched_tasks,
         )
 
     async def update_private(
@@ -636,7 +857,9 @@ class BotGroupPolicyService:
                 },
             }
 
-        return await self._write(key, change)
+        return await self._write(
+            key, change, touched_tasks=modules if task and not force else ()
+        )
 
     async def legacy_set_feature(
         self,
@@ -968,6 +1191,7 @@ class BotGroupPolicyService:
                             "forced_tasks": item.forced_tasks,
                         },
                         row.expected_revision,
+                        touched_tasks=None,
                     )
         return len(scopes)
 

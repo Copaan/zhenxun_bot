@@ -38,6 +38,11 @@ def _reconciled(value: dict[str, Any]) -> dict[str, Any]:
 
         if reconcile_operation(value):
             return value
+    else:
+        from .plugin_store_transaction import reconcile_operation
+
+        if reconcile_operation(value):
+            return value
     if value.get("status") != "running":
         return value
     boot_id = _boot_id()

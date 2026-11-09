@@ -34,13 +34,15 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - Python 3.10
     import tomli as tomllib
 
+from zhenxun.utils.pythonpath import INSTANCE_ROOT
+
 from .storage import load_manifest
 
 SOLVER_POLICY_VERSION = 12
-LOCK_FILE = Path("uv.lock")
+LOCK_FILE = INSTANCE_ROOT / "uv.lock"
 _REQ_LINE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)==([^\s;]+)")
 _SENSITIVE = re.compile(r"(?i)(authorization|token|password|secret)=?[^\s]*")
-PROJECT_FILE = Path("pyproject.toml")
+PROJECT_FILE = INSTANCE_ROOT / "pyproject.toml"
 PROJECT_NAME = "zhenxun-bot"
 IMMUTABLE_PACKAGES = frozenset(
     {
@@ -89,6 +91,45 @@ def safe_process_error(value: str) -> str:
     value = re.sub(r"https?://[^\s<>]+", "<package-source>", value)
     value = _SENSITIVE.sub(r"\1=<redacted>", value)
     return " ".join(value.split())[-1200:]
+
+
+async def _dependency_process(
+    command: list[str], *, stage: str, env: dict[str, str], cwd: Path | None = None
+) -> asyncio.subprocess.Process:
+    """启动依赖子进程并提供不含命令参数或环境凭据的阶段诊断。"""
+    working_directory = cwd
+    if working_directory is None:
+        with contextlib.suppress(OSError):
+            working_directory = Path.cwd()
+    try:
+        return await asyncio.create_subprocess_exec(
+            *command,
+            cwd=str(cwd) if cwd is not None else None,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+    except OSError as error:
+        if working_directory is None or not working_directory.is_dir():
+            code = "dependency_working_directory_missing"
+        elif isinstance(error, FileNotFoundError):
+            code = "dependency_tool_unavailable"
+        else:
+            code = "dependency_process_start_failed"
+        raise DependencyAnalysisError(
+            code,
+            details={
+                "stage": stage,
+                "executable": safe_process_error(command[0]),
+                "working_directory": safe_process_error(
+                    str(working_directory)
+                    if working_directory is not None
+                    else "<current>"
+                ),
+                "errno": error.errno,
+                "filename": safe_process_error(str(error.filename or "")),
+            },
+        ) from None
 
 
 _inventory_cache: tuple[tuple, dict[str, str]] | None = None
@@ -581,8 +622,8 @@ async def preflight_environment_repair() -> tuple[bool, str]:
     guard_orm_sync()
     from zhenxun.services.installer_network import project_environment, uv_command
 
-    process = await asyncio.create_subprocess_exec(
-        *uv_command(
+    process = await _dependency_process(
+        uv_command(
             "sync",
             "--locked",
             "--inexact",
@@ -590,9 +631,8 @@ async def preflight_environment_repair() -> tuple[bool, str]:
             "--no-dev",
             "--dry-run",
         ),
-        cwd=str(Path.cwd()),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+        stage="environment_preflight",
+        cwd=INSTANCE_ROOT,
         env=project_environment(),
     )
     stdout, stderr = await process.communicate()
@@ -793,11 +833,10 @@ async def _compile(
             for link in [*filter(None, configured), *map(str, _metadata_links)]:
                 command.extend(["--find-links", link])
             command.append("--no-cache")
-        process = await asyncio.create_subprocess_exec(
-            *command,
-            cwd=str(Path.cwd()),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        process = await _dependency_process(
+            command,
+            stage="dependency_resolve",
+            cwd=INSTANCE_ROOT,
             env=environment,
         )
         import psutil
@@ -935,8 +974,8 @@ async def prebuild_packages(packages: dict[str, str]) -> dict[str, str]:
                 "".join(f"{name}=={packages[name]}\n" for name in names),
                 encoding="utf-8",
             )
-            process = await asyncio.create_subprocess_exec(
-                *uv_command(
+            process = await _dependency_process(
+                uv_command(
                     "pip",
                     "install",
                     "--target",
@@ -947,8 +986,7 @@ async def prebuild_packages(packages: dict[str, str]) -> dict[str, str]:
                     "--python",
                     sys.executable,
                 ),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+                stage="dependency_prebuild",
                 env=installer_environment(),
             )
             try:
@@ -1554,7 +1592,23 @@ def requirement_lines(path: Path) -> list[str]:
         list[str]: 依赖声明行
     """
     lines = []
-    for raw_line in path.read_text(encoding="utf-8-sig").splitlines():
+    try:
+        content = path.read_text(encoding="utf-8-sig")
+    except OSError as error:
+        code = (
+            "dependency_source_missing"
+            if isinstance(error, FileNotFoundError)
+            else "dependency_source_unreadable"
+        )
+        raise DependencyAnalysisError(
+            code,
+            details={
+                "stage": "dependency_requirements",
+                "file": safe_process_error(str(path)),
+                "errno": error.errno,
+            },
+        ) from None
+    for raw_line in content.splitlines():
         line = re.sub(r"\s+#.*$", "", raw_line).strip()
         if line and not line.startswith("#"):
             lines.append(line)

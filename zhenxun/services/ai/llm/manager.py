@@ -278,82 +278,161 @@ async def refresh_provider_models(
     raise error
 
 
+_model_refresh_task: asyncio.Task | None = None
+
+
 async def _refresh_model_data() -> None:
-    """定期更新能力库，刷新超过一天未查询的提供商模型列表，
-    首轮刷新后核验从未核验过的模型"""
+    """按小时检查能力库和提供商快照，失败后保留下一轮重试。"""
     attempted: dict[str, float] = {}
-    catalog_warned = False
+    warned: set[str] = set()
     checked = False
+
+    def failed(key: str, error: Exception) -> None:
+        message = f"模型后台刷新失败（{key}），下轮继续重试：{error}"
+        (logger.debug if key in warned else logger.warning)(message)
+        warned.add(key)
+
+    def recovered(key: str) -> None:
+        if key in warned:
+            warned.remove(key)
+            logger.info(f"模型后台刷新已恢复：{key}")
+
     while True:
-        now = time.time()
-        providers = [p for p in get_configured_providers() if p.base_url and p.api_keys]
-        catalog_age = now - (catalog_status()["updated_at"] or 0)
-        if providers and catalog_age > CATALOG_MAX_AGE:
+        try:
+            now = time.time()
+            providers = [
+                p for p in get_configured_providers() if p.base_url and p.api_keys
+            ]
+            recovered("configuration")
             try:
-                await refresh_catalog()
-                clear_all_cache()
-            except Exception as e:
-                message = f"模型能力库更新失败，可在 AI 设置中更换能力库地址: {e}"
-                if catalog_warned:
-                    logger.debug(message)
-                else:
-                    logger.warning(message)
-                catalog_warned = True
-        for provider in providers:
-            last = max(
-                get_discovery(provider).get("updated_at", 0),
-                attempted.get(provider.name, 0),
-            )
-            if now - last < DISCOVERY_MAX_AGE:
-                continue
-            attempted[provider.name] = now
-            try:
-                await refresh_provider_models(provider)
-            except Exception as e:
-                logger.debug(f"提供商 '{provider.name}' 的模型列表刷新失败: {e}")
-        if not checked:
-            checked = True
-            try:
-                await check_unverified_models()
-            except Exception as e:
-                logger.warning(f"模型能力核验未完成: {e}")
+                catalog_age = now - float(catalog_status()["updated_at"] or 0)
+                if providers and catalog_age > CATALOG_MAX_AGE:
+                    await refresh_catalog()
+                    clear_all_cache()
+                    logger.info("模型能力库后台刷新完成")
+                recovered("catalog")
+            except Exception as error:
+                failed("catalog", error)
+            for provider in providers:
+                key = f"provider:{provider.name}"
+                try:
+                    last = max(
+                        float(get_discovery(provider).get("updated_at", 0) or 0),
+                        attempted.get(provider.name, 0),
+                    )
+                    if now - last < DISCOVERY_MAX_AGE:
+                        continue
+                    await refresh_provider_models(provider)
+                    attempted[provider.name] = now
+                    recovered(key)
+                    logger.info(f"提供商模型列表后台刷新完成：{provider.name}")
+                except Exception as error:
+                    failed(key, error)
+            if not checked:
+                try:
+                    await check_unverified_models()
+                    checked = True
+                    recovered("verification")
+                except Exception as error:
+                    failed("verification", error)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            failed("configuration", error)
         await asyncio.sleep(3600)
 
 
 async def _shutdown_ai_runtime() -> None:
-    """关闭 MCP 工具提供者、保存密钥状态并关闭连接池"""
-    from zhenxun.services.ai.tools.providers.mcp.provider import mcp_provider
+    """在共享关闭预算内独立清理 AI 资源，并报告未完成步骤。"""
+    from zhenxun.services.lifecycle.deadline import remaining_timeout, shutdown_budget
 
-    from .client import close_http_clients
+    async def close_mcp():
+        from zhenxun.services.ai.tools.providers.mcp.provider import mcp_provider
 
-    await mcp_provider.shutdown()
-    await health_manager.shutdown()
-    await ModelStats.shutdown()
-    await close_http_clients()
+        await mcp_provider.shutdown()
+
+    async def close_http():
+        from .client import close_http_clients
+
+        await close_http_clients()
+
+    steps = (
+        ("mcp", close_mcp),
+        ("health", health_manager.shutdown),
+        ("statistics", ModelStats.shutdown),
+        ("http", close_http),
+    )
+    completed = []
+    failures = []
+    first_error = None
+    with shutdown_budget(10):
+        for index, (name, close) in enumerate(steps):
+            remaining = remaining_timeout(10)
+            if remaining <= 0:
+                unfinished = [step[0] for step in steps[index:]]
+                logger.warning(f"AI 关闭预算已耗尽，未完成步骤：{unfinished}")
+                if first_error is None:
+                    first_error = TimeoutError("ai_shutdown_budget_exhausted")
+                break
+            cleanup = asyncio.create_task(close())
+            try:
+                await asyncio.wait_for(cleanup, timeout=remaining)
+                completed.append(name)
+            except asyncio.CancelledError:
+                logger.warning(
+                    f"AI 关闭被取消，已完成步骤：{completed}，"
+                    f"未完成步骤：{[step[0] for step in steps[index:]]}"
+                )
+                raise
+            except Exception as error:
+                failures.append(name)
+                if first_error is None:
+                    first_error = error
+                logger.error(f"AI 资源关闭失败（{name}）：{error}", e=error)
+                if remaining_timeout(10) <= 0 or (
+                    isinstance(error, asyncio.TimeoutError) and cleanup.cancelled()
+                ):
+                    logger.warning(
+                        "AI 关闭预算已耗尽，未完成步骤："
+                        f"{[step[0] for step in steps[index:]]}"
+                    )
+                    break
+    if first_error is not None:
+        logger.warning(
+            f"AI 关闭未全部完成，已完成步骤：{completed}，失败步骤：{failures}"
+        )
+        raise first_error
 
 
 async def _cleanup_chat_history() -> None:
-    """按配置清理过期和超出条数的短期对话记忆，以及过期的模型调用统计"""
+    """独立清理短期对话与模型统计，汇总实际清理数和失败原因。"""
     from zhenxun.models.ai_model_stat import AIModelStat
     from zhenxun.services.ai.context.memory.storage import DatabaseChatContext
+    from zhenxun.services.scheduler.lifecycle import core_task_run
 
-    settings = get_llm_config().context_settings
-    try:
-        deleted = await DatabaseChatContext.cleanup(
-            settings.history_retention_days, settings.history_max_messages
+    async with core_task_run("ai_chat_message_cleanup") as run:
+        failures = []
+        chat_deleted = statistics_deleted = 0
+        try:
+            settings = get_llm_config().context_settings
+            chat_deleted = await DatabaseChatContext.cleanup(
+                settings.history_retention_days, settings.history_max_messages
+            )
+        except Exception as error:
+            failures.append(f"chat:{type(error).__name__}")
+            logger.error(f"清理短期对话记忆失败: {error}", e=error)
+        try:
+            statistics_deleted = await AIModelStat.cleanup()
+        except Exception as error:
+            failures.append(f"statistics:{type(error).__name__}")
+            logger.error(f"清理模型调用统计失败: {error}", e=error)
+        run["processed"] = chat_deleted + statistics_deleted
+        run["reason"] = (
+            f"chat_deleted={chat_deleted},statistics_deleted={statistics_deleted}"
+            + (";" + ",".join(failures) if failures else "")
         )
-    except Exception as e:
-        logger.error(f"清理短期对话记忆失败: {e}", e=e)
-        return
-    if deleted:
-        logger.info(f"已清理 {deleted} 条短期对话记忆")
-    try:
-        deleted = await AIModelStat.cleanup()
-    except Exception as e:
-        logger.error(f"清理模型调用统计失败: {e}", e=e)
-        return
-    if deleted:
-        logger.info(f"已清理 {deleted} 条过期的模型调用统计")
+        if failures:
+            run["status"] = "failed"
 
 
 @PriorityLifecycle.on_startup(
@@ -394,9 +473,11 @@ async def _init_llm_config_on_startup(context):
         await mcp_provider.initialize()
     except Exception as e:
         logger.error(f"MCP 工具配置初始化失败: {e}", e=e)
-    context.spawn_task(
-        _refresh_model_data(), name="ai-model-refresh", degrade_on_error=False
-    )
+    global _model_refresh_task
+    if _model_refresh_task is None or _model_refresh_task.done():
+        _model_refresh_task = context.spawn_task(
+            _refresh_model_data(), name="ai-model-refresh", degrade_on_error=False
+        )
 
 
 @PriorityLifecycle.on_startup(

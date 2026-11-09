@@ -27,6 +27,7 @@ from zhenxun.utils._restart_utils import (
     clear_restart_pending,
     clear_restart_ticket_if_idle,
     mark_restart_pending,
+    restart_value_digest,
 )
 
 ENV_APPLY_SOURCE = "webui.environment"
@@ -304,7 +305,18 @@ class RuntimeEnvironmentManager:
 
             reasons = [f"environment:{key}" for key in sorted(pending_keys)]
             if reasons:
-                mark_restart_pending(source, reasons)
+                mark_restart_pending(
+                    source,
+                    reasons,
+                    evidence={
+                        "kind": "environment",
+                        "targets": {
+                            key: restart_value_digest(after.get(key))
+                            for key in sorted(pending_keys)
+                        },
+                        "consumers": [],
+                    },
+                )
             else:
                 clear_restart_pending(source)
                 clear_restart_ticket_if_idle()

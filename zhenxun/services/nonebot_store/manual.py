@@ -202,6 +202,9 @@ async def preview_manual_dependencies(
         "retained": retained,
         "manual_requirements": roots,
         "source_build_required": source_build_required,
+        "database_migration_possible": restore
+        and action == "install"
+        and "nonebot-plugin-orm" in result["resolved"],
         "diagnostic": diagnostic,
         "no_change": target == original,
         "blocked_reasons": [],
@@ -327,10 +330,11 @@ def stage_plan(
     pending: dict | None = None,
     *,
     restore: bool = False,
+    parent_operation_id: str | None = None,
 ) -> bool:
     """把依赖计划写入待应用的依赖层事务，由启动器在下次启动 worker 前构建
 
-    恢复备份的计划允许构建源码包，并允许改变 ORM 包；
+    恢复备份的计划允许构建源码包，核心及 ORM 包仍受版本保护；
     目标依赖包含 nonebot-plugin-orm 时，启动器在启动 worker 前执行数据库迁移，
     迁移时同时加载带迁移脚本的源码插件。
 
@@ -346,7 +350,24 @@ def stage_plan(
     from packaging.utils import canonicalize_name
 
     from .dependencies import DependencyAnalysisError, orm_database_type
-    from .storage import defer_transaction, draft_transaction, utc_now
+    from .storage import (
+        active_transaction,
+        defer_transaction,
+        draft_transaction,
+        utc_now,
+    )
+
+    current = active_transaction()
+    if current and (
+        pending is None or current.get("revision") != pending.get("revision")
+    ):
+        raise DependencyAnalysisError("dependency_transaction_pending")
+    if (
+        restore
+        and current
+        and current.get("parent_operation_id") != parent_operation_id
+    ):
+        raise DependencyAnalysisError("cross_store_restore_owned")
 
     if plan["no_change"]:
         return False
@@ -354,9 +375,14 @@ def stage_plan(
         raise DependencyAnalysisError(
             "source_build_confirmation_required", plan["diagnostic"]
         )
-    migration = restore and "nonebot-plugin-orm" in {
-        canonicalize_name(name) for name in plan["target_manifest"].get("packages", {})
-    }
+    migration = restore and (
+        plan.get("database_migration_possible", False)
+        or "nonebot-plugin-orm"
+        in {
+            canonicalize_name(name)
+            for name in plan["target_manifest"].get("packages", {})
+        }
+    )
     transaction = draft_transaction(
         pending,
         plan["target_manifest"],
@@ -365,8 +391,10 @@ def stage_plan(
         **(
             {
                 "source_build_confirmed": True,
-                "orm_packages_allowed": True,
+                "orm_packages_allowed": False,
                 "restore": True,
+                "parent_operation_id": parent_operation_id,
+                "preparation_only": bool(parent_operation_id),
             }
             if restore
             else {}

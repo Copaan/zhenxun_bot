@@ -11,7 +11,7 @@ from typing import Any, Literal
 
 from strenum import StrEnum
 
-from .deadline import WORKER_SHUTDOWN_SECONDS, remaining_timeout, shutdown_budget
+from .deadline import remaining_timeout, shutdown_budget, worker_shutdown_seconds
 
 LifecycleStage = Literal["management", "runtime", "warmup"]
 FailurePolicy = Literal["fatal", "degrade"]
@@ -481,6 +481,10 @@ class LifecycleKernel:
                 raise
         finally:
             self._starting_tasks.discard(task)  # type: ignore[arg-type]
+        if registration.state is ComponentState.READY:
+            from zhenxun.services.startup import startup_coordinator
+
+            startup_coordinator.reconcile_restart_state()
 
     def _task_failed(
         self, component_id: str, task: asyncio.Task[Any], error: BaseException
@@ -498,11 +502,11 @@ class LifecycleKernel:
             e=error if isinstance(error, Exception) else None,
         )
 
-    async def stop_all(self, timeout: float = 15.0) -> None:
+    async def stop_all(self, timeout: float | None = None) -> None:
         """在关闭预算内按依赖逆序停止全部已启动组件
 
         参数:
-            timeout: 最长关闭秒数
+            timeout: 最长关闭秒数，为 None 时使用整个关闭预算
         """
         self.request_shutdown()
         with shutdown_budget(self.shutdown_remaining(timeout)):
@@ -531,7 +535,7 @@ class LifecycleKernel:
         first_request = not self._shutdown_requested
         self._shutdown_requested = True
         if self._shutdown_deadline is None:
-            self._shutdown_deadline = time.monotonic() + WORKER_SHUTDOWN_SECONDS
+            self._shutdown_deadline = time.monotonic() + worker_shutdown_seconds()
         if not first_request:
             return
         current = None
@@ -541,10 +545,19 @@ class LifecycleKernel:
             if task is not current and not task.done():
                 task.cancel()
 
-    def shutdown_remaining(self, maximum: float) -> float:
+    def shutdown_remaining(self, maximum: float | None = None) -> float:
+        """关闭预算剩余秒数
+
+        参数:
+            maximum: 上限，为 None 时不设上限
+
+        返回:
+            float: 剩余秒数，尚未开始关闭时为上限或完整关闭预算
+        """
         if self._shutdown_deadline is None:
-            return maximum
-        return min(maximum, max(0.0, self._shutdown_deadline - time.monotonic()))
+            return worker_shutdown_seconds() if maximum is None else maximum
+        remaining = max(0.0, self._shutdown_deadline - time.monotonic())
+        return remaining if maximum is None else min(maximum, remaining)
 
     @asynccontextmanager
     async def _shutdown_operation_lock(self):
@@ -742,6 +755,16 @@ class LifecycleKernel:
     def component_status(self, component_id: str) -> dict[str, Any] | None:
         registration = self._registrations.get(component_id)
         return None if registration is None else registration.public_dict()
+
+    def configuration_components(self, keys: set[str]) -> list[str]:
+        """返回读取指定配置及依赖这些读取者的组件。"""
+        normalized = {key.upper() for key in keys}
+        direct = {
+            name
+            for name, registration in self._registrations.items()
+            if normalized & {key.upper() for key in registration.spec.config_keys}
+        }
+        return sorted(self._dependent_closure(direct)) if direct else []
 
 
 lifecycle_kernel = LifecycleKernel()

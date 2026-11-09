@@ -6,6 +6,7 @@ from typing import Any, ClassVar
 
 import nonebot
 from nonebot.adapters.onebot.v11 import Message, MessageSegment
+from nonebot.compat import type_validate_python
 from nonebot_plugin_alconna import (
     At,
     AtAll,
@@ -87,6 +88,16 @@ class MessageUtils:
         """
         return cls.build_message(cls.get_failure_message())
 
+    @staticmethod
+    def _image_to_bytes() -> bool:
+        """图片路径是否转为 bytes 发送，直接读取驱动配置，不重新解析 .env
+
+        返回:
+            bool: 是否转为 bytes
+        """
+        value = getattr(driver.config, "image_to_bytes", False)
+        return type_validate_python(Config, {"image_to_bytes": value}).image_to_bytes
+
     @classmethod
     def __build_message(
         cls, msg_list: list[MESSAGE_TYPE], format_args: dict | None = None
@@ -100,7 +111,6 @@ class MessageUtils:
         返回:
             list[Text | Text]: 构造完成的消息列表
         """
-        config = nonebot.get_plugin_config(Config)
         message_list = []
         for msg in msg_list:
             if isinstance(msg, str):
@@ -120,7 +130,7 @@ class MessageUtils:
                 message_list.append(Text(str(msg)))
             elif isinstance(msg, Path):
                 if msg.exists():
-                    if config.image_to_bytes:
+                    if cls._image_to_bytes():
                         logger.debug("图片转为bytes发送", "MessageUtils")
                         message_list.append(Image(raw=msg.read_bytes()))
                     else:

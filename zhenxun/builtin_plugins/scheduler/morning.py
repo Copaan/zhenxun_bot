@@ -6,7 +6,6 @@ from nonebot_plugin_apscheduler import scheduler
 from zhenxun.configs.config import BotConfig
 from zhenxun.configs.path_config import IMAGE_PATH
 from zhenxun.configs.utils import PluginExtraData, Task
-from zhenxun.services.log import logger
 from zhenxun.utils.common_utils import CommonUtils
 from zhenxun.utils.enum import PluginType
 from zhenxun.utils.message import MessageUtils
@@ -45,9 +44,15 @@ async def check(bot: Bot, group_id: str) -> bool:
     minute=1,
 )
 async def _():
-    message = MessageUtils.build_message(["早上好", IMAGE_PATH / "zhenxun" / "zao.jpg"])
-    await broadcast_group(message, log_cmd="被动早晚安", check_func=check)
-    logger.info("每日早安发送...")
+    from zhenxun.services.scheduler.lifecycle import core_task_run
+
+    async with core_task_run("morning_greeting") as run:
+        message = MessageUtils.build_message(
+            ["早上好", IMAGE_PATH / "zhenxun" / "zao.jpg"]
+        )
+        await broadcast_group(
+            message, log_cmd="被动早晚安", check_func=check, report=run
+        )
 
 
 # # 睡觉了
@@ -57,15 +62,18 @@ async def _():
     minute=59,
 )
 async def _():
-    message = MessageUtils.build_message(
-        [
-            f"{BotConfig.self_nickname}要睡觉了，你们也要早点睡呀",
-            IMAGE_PATH / "zhenxun" / "sleep.jpg",
-        ]
-    )
-    await broadcast_group(
-        message,
-        log_cmd="被动早晚安",
-        check_func=check,
-    )
-    logger.info("每日晚安发送...")
+    from zhenxun.services.scheduler.lifecycle import core_task_run
+
+    async with core_task_run("night_greeting") as run:
+        message = MessageUtils.build_message(
+            [
+                f"{BotConfig.self_nickname}要睡觉了，你们也要早点睡呀",
+                IMAGE_PATH / "zhenxun" / "sleep.jpg",
+            ]
+        )
+        await broadcast_group(
+            message,
+            log_cmd="被动早晚安",
+            check_func=check,
+            report=run,
+        )

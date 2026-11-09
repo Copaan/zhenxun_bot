@@ -175,6 +175,7 @@ async def wait_worker_ready(
     *,
     scheme: str = "http",
     require_warmup: bool = False,
+    require_healthy: bool = False,
 ) -> bool:
     """等待 worker 进入业务可用状态
 
@@ -183,6 +184,7 @@ async def wait_worker_ready(
         settings: QQ launcher 设置
         scheme: worker 协议
         require_warmup: 是否等待 warmup 阶段结束
+        require_healthy: 是否要求各启动阶段均已完成，单个插件加载失败不影响
 
     返回:
         bool: 是否就绪；进入管理模式、退出或超时时为 False
@@ -201,6 +203,13 @@ async def wait_worker_ready(
         }:
             return False
         if bound and status_is_ready(status, require_warmup=require_warmup):
+            if require_healthy:
+                stages = status.get("stages") or {}
+                if any(
+                    stages.get(stage, {}).get("state") != "completed"
+                    for stage in ("management", "runtime", "warmup")
+                ):
+                    return False
             return True
         await asyncio.sleep(WORKER_READY_POLL_INTERVAL)
     return False

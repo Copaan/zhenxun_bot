@@ -91,12 +91,17 @@ class Launcher:
 
     async def startup(self) -> None:
         """初始化 launcher：应用待处理的恢复与更新、补齐环境配置"""
+        from zhenxun.services.migration.state import reconcile_terminal
         from zhenxun.services.update.update_service import (
             applied_update_pending,
             pending_job,
         )
 
         self.boot_id = launcher_supervisor.initialize()
+        reconcile_terminal()
+        from zhenxun.services.migration.restore import retry_cleanup
+
+        await asyncio.to_thread(retry_cleanup)
         await self.apply_restore()
         self.pending_bot_verification = applied_update_pending()
         if pending_job():
@@ -108,11 +113,16 @@ class Launcher:
 
     async def apply_restore(self) -> None:
         """执行待处理的备份恢复或切换数据库步骤"""
+        from zhenxun.services.migration import state as restore_tasks
         from zhenxun.services.migration.restore import needs_apply
 
-        if needs_apply():
+        while needs_apply():
+            before = restore_tasks.load()
             launcher_log("applying backup restore before starting worker")
             await run_maintenance("restore-apply")
+            after = restore_tasks.load()
+            if after == before:
+                raise RuntimeError("migration_maintenance_no_progress")
 
     async def wait_restore_import(self, worker: subprocess.Popen) -> None:
         """等待 worker 导入恢复数据，导入期间不计入就绪超时
@@ -142,6 +152,9 @@ class Launcher:
 
     async def prepare_round(self) -> None:
         """应用插件事务并按最新配置调整附属进程"""
+        await self.apply_restore()
+        from contextlib import nullcontext
+
         from zhenxun.adapters.qq_official.config import (
             load_qq_launcher_settings,
             validate_builtin_ingress,
@@ -152,8 +165,58 @@ class Launcher:
             load_webui_tls_settings,
             validate_webui_tls_settings,
         )
+        from zhenxun.services.migration import restore
+        from zhenxun.services.migration import state as restore_tasks
 
-        await self.transactions.apply()
+        pending = restore_tasks.load()
+        scope = (
+            restore_tasks.owned(pending)
+            if pending
+            and pending.get("record_version") == 2
+            and pending["state"] in restore.RUNNING
+            else nullcontext()
+        )
+        with scope:
+            from zhenxun.services.nonebot_store.runtime import recovery_required
+
+            if (
+                pending
+                and pending["state"] == "awaiting_orm"
+                and restore_tasks.cancellation_requested(pending)
+            ):
+                restore_tasks.save(pending, state="failed_import", error="canceled")
+                restore.rollback_after_stop(pending)
+                pending = restore_tasks.load()
+            if (
+                not recovery_required()
+                or (pending and pending["state"] == "awaiting_orm")
+            ) and (
+                not pending
+                or pending["state"]
+                not in {
+                    "recovery_required",
+                    "preparing",
+                    "applying",
+                }
+            ):
+                await self.transactions.apply()
+            pending = restore_tasks.load()
+            if pending and pending["state"] in {"importing", "awaiting_orm"}:
+                try:
+                    if not restore.defer_for_manual_orm(pending):
+                        restore.dependency_ready(pending)
+                        if pending["state"] == "awaiting_orm":
+                            restore_tasks.save(
+                                pending,
+                                state="importing",
+                                error=None,
+                                error_code=None,
+                                error_detail=None,
+                            )
+                except Exception as error:
+                    restore_tasks.save(pending, state="failed_import", error=str(error))
+                    restore.rollback_after_stop(pending)
+        await self.apply_restore()
         qq = self.qq_settings = load_qq_launcher_settings(self.cwd)
         tls = self.webui_tls = load_webui_tls_settings(self.cwd)
         sidecars.certificate_pin = (
@@ -204,6 +267,15 @@ class Launcher:
         env["ZHENXUN_LAUNCHER_PID"] = str(os.getpid())
         env["ZHENXUN_LAUNCHER_BOOT_ID"] = self.boot_id
         env["ZHENXUN_WORKER_STARTUP_ID"] = startup_id
+        from zhenxun.services.migration.restore import bind_worker
+
+        bind_worker(startup_id)
+        from zhenxun.utils.restart_state import bind_restart_worker
+
+        try:
+            bind_restart_worker(startup_id)
+        except (OSError, ValueError, RuntimeError) as error:
+            launcher_log(f"restart evidence unavailable: {type(error).__name__}")
         if self.stopping:
             raise self.stop_exit()
         return await launcher_supervisor.start_process(
@@ -230,6 +302,76 @@ class Launcher:
         )
 
         scheme = self.webui_tls.scheme
+        from zhenxun.services.migration import restore
+        from zhenxun.services.migration import state as restore_tasks
+
+        pending = restore_tasks.load()
+        if pending and pending["state"] in {
+            "importing",
+            "verifying",
+            "rollback_import",
+            "rollback_verifying",
+            "failed_import",
+        }:
+            ready = pending["state"] in {
+                "verifying",
+                "rollback_verifying",
+            } and await sidecars.wait_worker_ready(
+                worker,
+                self.qq_settings,
+                scheme=scheme,
+                require_warmup=True,
+                require_healthy=True,
+            )
+            failed = (
+                self.transactions.failures(ready)
+                if self.transactions.needs_verification
+                else (None if ready else [{"code": "worker_health_check_failed"}])
+            )
+            if failed is not None:
+                await launcher_supervisor.stop_process(worker, allow_force=True)
+                self.worker = None
+                current = restore_tasks.load()
+                if not current or any(
+                    current.get(key) != pending.get(key)
+                    for key in ("operation_id", "expected_worker_startup_id")
+                ):
+                    raise RuntimeError("migration_worker_task_changed")
+                pending = current
+                with restore_tasks.owned(pending):
+                    restore_tasks.save(
+                        pending,
+                        error=pending.get("error")
+                        or "migration_worker_verification_failed",
+                        verification_failures=failed,
+                    )
+                    if pending["state"].startswith("rollback"):
+                        restore_tasks.save(
+                            pending,
+                            state="recovery_required",
+                            rollback_error="rollback_worker_verification_failed",
+                        )
+                    else:
+                        restore.rollback_after_stop(pending)
+                return False
+            with restore_tasks.owned(pending):
+                committed = await asyncio.to_thread(restore.commit_verified)
+            if not committed:
+                await launcher_supervisor.stop_process(worker, allow_force=True)
+                self.worker = None
+                current = restore_tasks.load()
+                if not current or any(
+                    current.get(key) != pending.get(key)
+                    for key in ("operation_id", "expected_worker_startup_id")
+                ):
+                    raise RuntimeError("migration_worker_task_changed")
+                pending = current
+                with restore_tasks.owned(pending):
+                    restore_tasks.save(pending, error="migration_canceled")
+                    restore.rollback_after_stop(pending)
+                return False
+            self.transactions.verify_nonebot = False
+            self.transactions.verify_source = False
         if self.transactions.needs_verification:
             launcher_log("waiting for managed plugin transaction verification")
             ready = await sidecars.wait_worker_ready(
@@ -332,7 +474,11 @@ class Launcher:
                 state.restart_action = action
                 launcher_log("detected restart request, stopping current worker")
                 await self.stop_sidecars()
-                await stop_process(worker)
+                from zhenxun.services.migration.restore import business_blocked
+
+                await launcher_supervisor.stop_process(
+                    worker, allow_force=not business_blocked()
+                )
                 state.return_code = worker.poll()
                 return True
         return False

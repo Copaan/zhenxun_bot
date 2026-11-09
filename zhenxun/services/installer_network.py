@@ -36,12 +36,17 @@ _uv_versions: dict[str, str] = {}
 
 
 def uv_executable() -> str | None:
-    """查找 uv 可执行文件
+    """查找 uv 可执行文件，并重新定位已失效的缓存路径
 
     返回:
         str | None: uv 路径，未安装时为 None
     """
     global _uv_path
+    if _uv_path is not None and (
+        not Path(_uv_path).is_file() or not os.access(_uv_path, os.X_OK)
+    ):
+        _uv_versions.pop(_uv_path, None)
+        _uv_path = None
     if _uv_path is None:
         _uv_path = shutil.which("uv")
     return _uv_path

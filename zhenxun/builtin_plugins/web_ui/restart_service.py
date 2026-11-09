@@ -10,15 +10,15 @@ from zhenxun.configs.webui_tls import (
     load_webui_tls_settings,
     runtime_webui_settings,
 )
+from zhenxun.services.startup import startup_coordinator
 from zhenxun.services.webui_http import http_compat_state
 from zhenxun.utils._restart_utils import (
-    get_pending_restart_items,
-    get_pending_restart_reasons,
     request_restart,
 )
 from zhenxun.utils.network import AccessUrl, local_access_urls
 
 from .console_access import console_access
+from .restart_evidence import CONFIGURATION_SOURCES, reconcile_configuration_restarts
 
 
 def preferred_access_targets(
@@ -79,25 +79,35 @@ def _current_access_urls() -> list[str]:
 
 def transaction_verification_status() -> dict[str, Any]:
     sources: list[str] = []
+    known = True
     try:
-        from zhenxun.services.nonebot_store.storage import load_manifest
+        from zhenxun.services.nonebot_store.storage import (
+            load_manifest,
+            pending_transaction,
+        )
 
-        if load_manifest().get("pending_verification"):
+        transaction = pending_transaction() or {}
+        if load_manifest().get("pending_verification") or transaction.get("state") in {
+            "verification_pending",
+            "settling",
+            "committing",
+        }:
             sources.append("nonebot_store")
     except Exception:
-        pass
+        known = False
     try:
         from zhenxun.services.plugin_store.plugin_store_transaction import (
             pending_transaction,
         )
 
         transaction = pending_transaction() or {}
-        if transaction.get("state") == "verification_pending":
+        if transaction.get("state") in {"verification_pending", "committing"}:
             sources.append("zhenxun_store")
     except Exception:
-        pass
+        known = False
     return {
-        "transaction_verification_pending": bool(sources),
+        "transaction_verification_pending": bool(sources) or not known,
+        "transaction_verification_known": known,
         "transaction_verification_sources": sources,
     }
 
@@ -146,6 +156,256 @@ def access_targets(urls: list[str]) -> list[dict[str, str]]:
     ]
 
 
+def _transaction_state(transaction: dict[str, Any]) -> str:
+    if transaction.get("state") in {"settling", "committing", "rolling_back"}:
+        return "verifying"
+    if transaction.get("rollback_confirmed"):
+        return "rolled_back"
+    if transaction.get("verification_confirmed") or transaction.get("state") in {
+        "committed",
+        "cleanup_pending",
+    }:
+        return (
+            "cleanup_pending"
+            if transaction.get("cleanup_error")
+            or transaction.get("state") == "cleanup_pending"
+            else "applied"
+        )
+    if transaction.get("preparation_only"):
+        return "preparing"
+    return {
+        "preparing": "preparing",
+        "pending_restart": "restart_pending",
+        "building": "preparing",
+        "applying": "applying",
+        "rolling_back": "verifying",
+        "migration_blocked": "attention_required",
+        "verification_pending": "verifying",
+        "settling": "verifying",
+        "committing": "verifying",
+        "failed": "recovery_required",
+        "recovery_required": "recovery_required",
+    }.get(transaction.get("state"), "unknown")
+
+
+def restart_changes() -> tuple[list[dict[str, Any]], bool]:
+    """汇总变更真实状态，读取失败保留待核验提示。"""
+    from zhenxun.utils.restart_state import _PENDING_RESTARTS_KEY, read_restart_state
+
+    changes = []
+    known = True
+    try:
+        records = read_restart_state().get(_PENDING_RESTARTS_KEY, {})
+    except Exception:
+        records = {}
+        known = False
+        changes.append(
+            {
+                "source": "restart.state",
+                "state": "unknown",
+                "reason": "restart_record_unreadable",
+                "reasons": [],
+            }
+        )
+    try:
+        configuration = reconcile_configuration_restarts() if records else {}
+    except Exception:
+        configuration = {}
+        known = False
+    for source, record in records.items():
+        if source in CONFIGURATION_SOURCES:
+            item = configuration.get(
+                source,
+                {
+                    "source": source,
+                    "state": "unknown",
+                    "reason": "configuration_verification_unavailable",
+                    "reasons": record.get("reasons", []),
+                },
+            )
+            changes.append(item)
+            if item.get("reason") == "configuration_verification_unavailable":
+                known = False
+        elif source.startswith("webui.update:"):
+            try:
+                from zhenxun.services.update.update_service import read_job
+
+                job = read_job(source.split(":", 1)[1])
+                state = {
+                    "queued": "preparing",
+                    "preparing": "preparing",
+                    "staged": "preparing",
+                    "pending_restart": "restart_pending",
+                    "restart_requested": "applying",
+                    "applying": "applying",
+                    "verifying": "verifying",
+                    "completed": "applied",
+                    "cancelled": "rolled_back",
+                    "failed": "recovery_required",
+                    "recovery_required": "recovery_required",
+                }.get(job.get("state"), "unknown")
+                if job.get("rollback_confirmed"):
+                    state = "rolled_back"
+                elif state == "applied" and job.get("cleanup_error"):
+                    state = "cleanup_pending"
+                changes.append(
+                    {
+                        "source": source,
+                        "state": state,
+                        "reasons": record.get("reasons", []),
+                        "reason": "update_" + str(job.get("state", "unknown")),
+                    }
+                )
+            except Exception:
+                known = False
+                changes.append(
+                    {
+                        "source": source,
+                        "state": "unknown",
+                        "reason": "update_record_unreadable",
+                        "reasons": [],
+                    }
+                )
+        elif source != "webui.nonebot-store" and not source.startswith("webui.plugin:"):
+            changes.append(
+                {
+                    "source": source,
+                    "state": "unknown",
+                    "reason": "restart_evidence_missing",
+                    "reasons": record.get("reasons", []),
+                }
+            )
+
+    def append_transaction(transaction, source_for):
+        state = _transaction_state(transaction)
+        operations = transaction.get("operations", []) or [{}]
+        for operation in operations:
+            key = source_for(operation)
+            marker = records.get(key, {})
+            changes.append(
+                {
+                    "source": key,
+                    "state": state,
+                    "transaction_state": transaction.get("state"),
+                    "operation_id": operation.get("operation_id"),
+                    "store_key": operation.get("store_key")
+                    or operation.get("project_link"),
+                    "action": operation.get("action"),
+                    "reasons": marker.get("reasons", []),
+                    "reason": "external_database_manual_migration_required"
+                    if transaction.get("state") == "migration_blocked"
+                    else state,
+                    "cleanup_pending": state == "cleanup_pending",
+                    "revision": transaction.get("revision"),
+                }
+            )
+
+    try:
+        from zhenxun.services.nonebot_store.storage import (
+            dependency_sync_status,
+            pending_transaction,
+        )
+
+        transaction = pending_transaction()
+        sync = dependency_sync_status()
+        if transaction:
+            append_transaction(transaction, lambda _: "webui.nonebot-store")
+        elif sync.get("operation_id") and (
+            sync.get("status") not in {"succeeded", "canceled"}
+            or "webui.nonebot-store" in records
+        ):
+            state = {
+                "prepared": "restart_pending",
+                "pending": "applying",
+                "running": "applying",
+                "succeeded": "applied",
+                "canceled": "rolled_back",
+                "failed": "attention_required",
+            }.get(sync.get("status"), "unknown")
+            changes.append(
+                {
+                    "source": "webui.nonebot-store",
+                    "state": state,
+                    "operation_id": sync["operation_id"],
+                    "reason": "dependency_sync_" + str(sync.get("status")),
+                    "reasons": records.get("webui.nonebot-store", {}).get(
+                        "reasons", []
+                    ),
+                }
+            )
+        elif "webui.nonebot-store" in records:
+            changes.append(
+                {
+                    "source": "webui.nonebot-store",
+                    "state": "unknown",
+                    "reason": "transaction_receipt_unavailable",
+                    "reasons": [],
+                }
+            )
+    except Exception:
+        known = False
+        changes.append(
+            {
+                "source": "webui.nonebot-store",
+                "state": "unknown",
+                "reason": "transaction_record_unreadable",
+                "reasons": [],
+            }
+        )
+    try:
+        from zhenxun.services.plugin_store.plugin_store_transaction import (
+            public_transaction,
+        )
+
+        transaction = public_transaction()
+        if transaction:
+            append_transaction(
+                transaction, lambda op: "webui.plugin:" + str(op.get("store_key", ""))
+            )
+        covered_sources = {item["source"] for item in changes}
+        for source in records:
+            if source.startswith("webui.plugin:") and source not in covered_sources:
+                changes.append(
+                    {
+                        "source": source,
+                        "state": "unknown",
+                        "reason": "transaction_receipt_unavailable",
+                        "reasons": records[source].get("reasons", []),
+                    }
+                )
+    except Exception:
+        known = False
+        changes.append(
+            {
+                "source": "webui.plugin",
+                "state": "unknown",
+                "reason": "transaction_record_unreadable",
+                "reasons": [],
+            }
+        )
+    try:
+        from zhenxun.services.plugin_host import plugin_host
+
+        covered = {reason for item in changes for reason in item.get("reasons", [])}
+        reasons = set(plugin_host.pending_restart) - covered
+        if reasons:
+            changes.append(
+                {
+                    "source": "runtime.plugins",
+                    "state": "restart_pending",
+                    "reason": "plugin_change_requires_restart",
+                    "reasons": sorted(reasons),
+                }
+            )
+    except Exception:
+        known = False
+    unique = {}
+    for item in changes:
+        key = (item["source"], item.get("operation_id"), item.get("revision"))
+        unique[key] = item
+    return list(unique.values()), known
+
+
 def restart_status_data(*, access_urls: list[str] | None = None) -> dict[str, Any]:
     tls = runtime_webui_settings()
     desired = load_webui_tls_settings()
@@ -164,97 +424,15 @@ def restart_status_data(*, access_urls: list[str] | None = None) -> dict[str, An
         )
     )
     targets = access_targets(urls)
-    pending_reasons = set(get_pending_restart_reasons())
-    pending_items = get_pending_restart_items()
-    try:
-        from zhenxun.services.nonebot_store.storage import (
-            pending_transaction as nonebot_pending,
-        )
-
-        transaction = nonebot_pending() or {}
-        operations = transaction.get("operations", [])
-        if operations and transaction.get("state") in {
-            "pending_restart",
-            "building",
-            "migration_blocked",
-            "failed",
-        }:
-            aggregate = next(
-                (
-                    item
-                    for item in pending_items
-                    if item.get("source") == "webui.nonebot-store"
-                ),
-                None,
-            )
-            pending_items = [
-                item
-                for item in pending_items
-                if item.get("source") != "webui.nonebot-store"
-            ]
-            reasons = list((aggregate or {}).get("reasons", []))
-            for operation in operations:
-                if not isinstance(operation, dict):
-                    continue
-                pending_items.append(
-                    {
-                        "source": "webui.nonebot-store",
-                        "operation_id": operation.get("operation_id"),
-                        "store_key": f"nonebot:{operation.get('project_link', '')}",
-                        "action": operation.get("action"),
-                        "reasons": reasons,
-                        "updated_at": (aggregate or {}).get("updated_at", 0),
-                    }
-                )
-    except Exception:
-        pass
-    try:
-        from zhenxun.services.plugin_store.plugin_store_transaction import (
-            public_transaction,
-        )
-
-        transaction = public_transaction() or {}
-        existing_sources = {str(item.get("source")) for item in pending_items}
-        for operation in transaction.get("operations", []):
-            source = f"webui.plugin:{operation.get('store_key', '')}"
-            if source in existing_sources:
-                continue
-            reason = str(operation.get("reason") or "plugin_change_requires_restart")
-            pending_reasons.add(reason)
-            pending_items.append(
-                {
-                    "source": source,
-                    "operation_id": operation.get("operation_id"),
-                    "store_key": operation.get("store_key"),
-                    "action": operation.get("action"),
-                    "reasons": [reason],
-                    "updated_at": 0,
-                }
-            )
-    except Exception:
-        pass
-    try:
-        from zhenxun.services.plugin_host import plugin_host
-
-        runtime_reasons = set(plugin_host.pending_restart)
-        pending_reasons.update(runtime_reasons)
-        persisted_reasons = {
-            str(reason) for item in pending_items for reason in item.get("reasons", [])
-        }
-        uncovered_runtime_reasons = runtime_reasons - persisted_reasons
-        if uncovered_runtime_reasons:
-            pending_items.append(
-                {
-                    "source": "runtime.plugins",
-                    "reasons": sorted(uncovered_runtime_reasons),
-                    "updated_at": 0,
-                }
-            )
-    except Exception:
-        pass
+    changes, status_known = restart_changes()
+    pending_items = [item for item in changes if item["state"] == "restart_pending"]
+    pending_reasons = {
+        str(reason) for item in pending_items for reason in item.get("reasons", [])
+    }
     return {
         "launcher_managed": bool(os.getenv("ZHENXUN_LAUNCHER_PID")),
         "boot_id": console_access.current_boot_id(),
+        "worker_boot_id": startup_coordinator.boot_id,
         "access_urls": urls,
         "access_targets": targets,
         "preferred_url": urls[0] if urls else None,
@@ -265,10 +443,15 @@ def restart_status_data(*, access_urls: list[str] | None = None) -> dict[str, An
         **network_configuration_status(),
         "target_access_urls": target_urls,
         "target_access_targets": access_targets(target_urls),
-        "pending_restart": bool(pending_reasons),
+        "pending_restart": bool(pending_items),
         "pending_reasons": sorted(pending_reasons),
         "pending_count": len(pending_items),
         "pending_items": pending_items,
+        "change_items": changes,
+        "status_known": status_known,
+        "reconciliation_pending": any(
+            item["state"] in {"preparing", "applying", "verifying"} for item in changes
+        ),
         **transaction_verification_status(),
     }
 

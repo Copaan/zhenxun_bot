@@ -924,6 +924,8 @@ class BroadcastEngine:
         check_func: Callable[[Bot, str], Awaitable] | None = None,
         log_cmd: str | None = None,
         platform: str | None = None,
+        *,
+        report: dict | None = None,
     ):
         """广播引擎
 
@@ -935,6 +937,7 @@ class BroadcastEngine:
         check_func: 发送前对群聊检测方法，判断是否发送.
         log_cmd: 日志标记.
         platform: 指定平台.
+        report: 接收广播计数与原因摘要.
 
         异常:
             ValueError: 没有可用的Bot对象
@@ -947,6 +950,10 @@ class BroadcastEngine:
         self.platform = platform
         self.bot_list = []
         self.count = 0
+        self.report = report if report is not None else {}
+        self.report.update(
+            examined=0, skipped=0, failed=0, processed=0, reason_counts={}
+        )
         if bot:
             self.bot_list = [bot] if isinstance(bot, Bot) else bot
         if isinstance(bot_id, str):
@@ -980,12 +987,21 @@ class BroadcastEngine:
             is_run = self.check_func(bot, group_id)
         return cast(bool, is_run)
 
-    async def __send_message(self, bot: Bot, group: GroupConsole):
+    def _skip(self, reason: str) -> None:
+        """记录未发送群聊的原因。"""
+        self.report["skipped"] += 1
+        reasons = self.report["reason_counts"]
+        reasons[reason] = reasons.get(reason, 0) + 1
+
+    async def __send_message(self, bot: Bot, group: GroupConsole) -> bool:
         """群组发送消息
 
         参数:
             bot: Bot
             group: GroupConsole
+
+        返回:
+            bool: 是否取得成功发送回执
         """
         key = f"{group.group_id}:{group.channel_id}"
         if not await self.call_check(bot, group.group_id):
@@ -994,7 +1010,8 @@ class BroadcastEngine:
                 self.log_cmd,
                 group_id=group.group_id,
             )
-            return
+            self._skip("policy_rejected")
+            return False
         if PlatformUtils.get_platform_scope(bot) == "qq_api":
             sending = PlatformUtils.send_message(
                 bot, None, group.group_id, self.message
@@ -1005,10 +1022,14 @@ class BroadcastEngine:
             sending = MessageUtils.build_message(self.message).send(target, bot)
         else:
             logger.warning("广播消息获取Target失败...", self.log_cmd, target=key)
-            return
+            self._skip("no_target")
+            return False
         self.sent.add(key)
-        await sending
+        if await sending is None:
+            self._skip("send_unconfirmed")
+            return False
         logger.debug("广播消息发送成功...", self.log_cmd, target=key)
+        return True
 
     @classmethod
     async def _group_list(cls, bot: Bot) -> list[GroupConsole]:
@@ -1036,27 +1057,41 @@ class BroadcastEngine:
         返回:
             int: 成功发送次数
         """
+        reasons = self.report["reason_counts"]
+        if not self.bot_list:
+            reasons["no_bot"] = 1
         for bot in self.bot_list:
             if self.platform and self.platform != PlatformUtils.get_platform(bot):
+                reasons["platform_mismatch"] = reasons.get("platform_mismatch", 0) + 1
                 continue
             group_list = await self._group_list(bot)
             if not group_list:
+                reasons["empty_groups"] = reasons.get("empty_groups", 0) + 1
                 continue
             for group in group_list:
+                self.report["examined"] += 1
                 if (
                     group.group_id in self.ignore_group
                     or group.channel_id in self.ignore_group
-                    or f"{group.group_id}:{group.channel_id}" in self.sent
                 ):
+                    self._skip("ignored_group")
+                    continue
+                if f"{group.group_id}:{group.channel_id}" in self.sent:
+                    self._skip("duplicate")
                     continue
                 try:
-                    await self.__send_message(bot, group)
-                    await asyncio.sleep(random.randint(1, 3))
-                    self.count += 1
+                    sent = await self.__send_message(bot, group)
                 except Exception as e:
+                    self.report["failed"] += 1
+                    reasons["send_failed"] = reasons.get("send_failed", 0) + 1
                     logger.warning(
                         "广播消息发送失败", self.log_cmd, target=group.group_id, e=e
                     )
+                    continue
+                if sent:
+                    self.count += 1
+                    self.report["processed"] = self.count
+                    await asyncio.sleep(random.randint(1, 3))
         return self.count
 
 
@@ -1068,6 +1103,8 @@ async def broadcast_group(
     check_func: Callable[[Bot, str], Awaitable] | None = None,
     log_cmd: str | None = None,
     platform: str | None = None,
+    *,
+    report: dict | None = None,
 ) -> int:
     """获取所有Bot或指定Bot对象广播群聊
 
@@ -1079,6 +1116,7 @@ async def broadcast_group(
         check_func: 发送前对群聊检测方法，判断是否发送.
         log_cmd: 日志标记.
         platform: 指定平台
+        report: 接收群聊检查、跳过、失败与成功发送数及原因摘要
 
     返回:
         int: 成功发送次数
@@ -1093,4 +1131,5 @@ async def broadcast_group(
         check_func=check_func,
         log_cmd=log_cmd,
         platform=platform,
+        report=report,
     ).broadcast()

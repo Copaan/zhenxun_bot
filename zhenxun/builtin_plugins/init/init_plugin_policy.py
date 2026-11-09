@@ -1,3 +1,5 @@
+import os
+
 from zhenxun.services.plugin_policy import plugin_policy_service
 from zhenxun.utils.manager.priority_manager import PriorityLifecycle
 
@@ -9,6 +11,24 @@ from zhenxun.utils.manager.priority_manager import PriorityLifecycle
     failure_policy="degrade",
 )
 async def reconcile_plugin_policies():
+    from zhenxun.services.migration import state
+
+    request = state.load()
+    if request and request.get("state") in {
+        "preparing",
+        "verifying",
+        "rollback_verifying",
+    }:
+        startup_id = os.environ.get("ZHENXUN_WORKER_STARTUP_ID")
+        identity_key = (
+            "preparation_startup_id"
+            if request["state"] == "preparing"
+            else "expected_worker_startup_id"
+        )
+        if not startup_id or startup_id != request.get(identity_key):
+            raise RuntimeError("migration_worker_identity_changed")
+        with state.owned(request):
+            return await plugin_policy_service.reconcile()
     return await plugin_policy_service.reconcile()
 
 

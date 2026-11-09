@@ -4,7 +4,7 @@ import time
 from typing import Annotated
 from urllib.parse import urlsplit
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
@@ -12,9 +12,13 @@ from zhenxun.configs.webui_tls import WebUITLSConfigError, settings_from_values
 from zhenxun.services.migration import backup, restore
 
 from ...base_model import Result
-from ...restart_service import preferred_access_urls, request_webui_restart
+from ...restart_service import (
+    preferred_access_urls,
+    request_webui_restart,
+    restart_status_data,
+)
 from ...utils import authentication
-from ..configure.data_source import build_database_url, probe_database
+from ..configure.data_source import build_database_url
 from ..configure.model import DatabaseConfig
 from ..configure.setup_access import SetupSession, require_setup_token, setup_access
 
@@ -89,21 +93,29 @@ class UploadPayload(BaseModel):
 
 
 class InspectPayload(BaseModel):
-    name: str
+    name: str = ""
     """备份包文件名"""
     password: str | None = None
     """加密备份的密码"""
 
 
 class RestorePayload(InspectPayload):
-    categories: list[str]
+    operation_id: str | None = None
+    """客户端生成并跨重试续用的任务标识"""
+    categories: list[str] = []
     """恢复的文件分类"""
+    retry: bool = False
+    confirmation_digest: str | None = None
     skip_failed: bool = False
     """依赖无法安装时跳过对应插件继续"""
 
 
+class SwitchPayload(DatabaseConfig):
+    operation_id: str | None = None
+
+
 class SetupRestorePayload(RestorePayload):
-    database: DatabaseConfig
+    database: DatabaseConfig | None = None
     """恢复到的数据库，须为空库"""
 
 
@@ -141,17 +153,35 @@ class _Restart:
     恢复配置时，重启信息中的访问地址按恢复后生效的配置计算
     """
 
-    def __init__(self, categories: list[str] | None = None):
+    def __init__(self, categories: list[str] | None = None, session=None):
         self.categories = categories or []
         self.data: dict = {}
+        self.session = session
 
     async def __call__(self) -> tuple[bool, str]:
+        prepared = self.data or await self.prepare()
+        access = prepared.get("restored_access")
+        ok, message, self.data = await request_webui_restart(
+            "webui.backup-restore",
+            access_urls=(access or {}).get("access_urls") or None,
+        )
+        self.data["restored_access"] = access
+        if ok and self.session:
+            try:
+                await setup_access.mark_applied(self.session)
+            except HTTPException as error:
+                if error.status_code != 401:
+                    raise
+        return ok, message
+
+    async def prepare(self) -> dict:
+        """在停写前提供静态交接信息，让现有轮询进入重启续查。"""
+        self.data = restart_status_data()
         access = None
         if "configuration" in self.categories:
             access = _restored_access(
                 await asyncio.to_thread(restore.configuration_preview)
             )
-        ok, message, self.data = await request_webui_restart("webui.backup-restore")
         if access and access["access_urls"]:
             targets = [
                 {"url": url, "scheme": urlsplit(url).scheme}
@@ -165,7 +195,7 @@ class _Restart:
                 preferred_url=access["access_urls"][0],
             )
         self.data["restored_access"] = access
-        return ok, message
+        return self.data
 
 
 @router.get("/scan", response_class=JSONResponse, description="导出预览")
@@ -317,16 +347,30 @@ async def _(payload: InspectPayload) -> Result[dict]:
 async def _(payload: RestorePayload) -> Result[dict]:
     restart = _Restart(payload.categories)
     try:
+        if payload.retry:
+            current = restore.status(payload.operation_id)
+            status = await restore.retry_preparation(
+                str(payload.operation_id or ""),
+                password=payload.password,
+                confirmation=payload.confirmation_digest,
+                restart=_Restart(current.get("categories")),
+                inputs=payload.model_dump(exclude_unset=True),
+            )
+            return Result.ok({"restore": status}, "已续接原准备任务")
         status = await restore.request_restore(
             backup.backup_path(payload.name),
             payload.password or None,
             payload.categories,
             payload.skip_failed,
             restart,
+            operation_id=payload.operation_id,
         )
-    except (backup.BackupError, restore.RestoreError) as error:
+    except (backup.BackupError, RuntimeError, OSError) as error:
         return Result.fail(str(error), 400)
-    return Result.ok({**restart.data, "restore": status}, "已开始恢复，Bot 即将重启")
+    return Result.ok(
+        {**restart.data, "restore": status},
+        "任务已接受，在线准备通过后自动短暂停机切换",
+    )
 
 
 @setup_router.post(
@@ -336,11 +380,26 @@ async def _(
     payload: SetupRestorePayload,
     session: Annotated[SetupSession, Depends(require_setup_token)],
 ) -> Result[dict]:
-    if "configuration" not in payload.categories:
-        return Result.fail("首次部署恢复必须包含配置分类", 400)
-    probe = await probe_database(payload.database)
-    if probe.status == "error":
-        return Result.fail(probe.message, 400)
+    if payload.retry:
+        try:
+            current = restore.status(payload.operation_id)
+            inputs = payload.model_dump(exclude_unset=True)
+            if "database" in inputs:
+                if payload.database is None:
+                    return Result.fail("migration_operation_input_changed", 400)
+                inputs["db_url"] = build_database_url(payload.database)
+            status = await restore.retry_preparation(
+                str(payload.operation_id or ""),
+                password=payload.password,
+                confirmation=payload.confirmation_digest,
+                restart=_Restart(current.get("categories"), session),
+                inputs=inputs,
+            )
+            return Result.ok({"restore": status}, "已续接原准备任务")
+        except (RuntimeError, OSError) as error:
+            return Result.fail(str(error), 400)
+    if "configuration" not in payload.categories or payload.database is None:
+        return Result.fail("首次部署恢复必须包含配置分类和目标数据库", 400)
     try:
         path = backup.backup_path(payload.name)
         summary = await asyncio.to_thread(
@@ -351,7 +410,7 @@ async def _(
             return Result.fail(
                 "备份中没有 WebUI 管理员账号或密码，无法用于首次部署", 400
             )
-        restart = _Restart(payload.categories)
+        restart = _Restart(payload.categories, session)
         status = await restore.request_restore(
             path,
             payload.password or None,
@@ -359,25 +418,27 @@ async def _(
             payload.skip_failed,
             restart,
             db_url=build_database_url(payload.database),
+            operation_id=payload.operation_id,
         )
-    except (backup.BackupError, restore.RestoreError, ValueError) as error:
+    except (backup.BackupError, RuntimeError, ValueError, OSError) as error:
         return Result.fail(str(error), 400)
-    await setup_access.mark_applied(session)
-    return Result.ok({**restart.data, "restore": status}, "已开始恢复，Bot 即将重启")
+    return Result.ok(
+        {**restart.data, "restore": status},
+        "任务已接受，在线准备通过后自动短暂停机切换",
+    )
 
 
 @router.post("/switch", response_class=JSONResponse, description="切换到新数据库")
-async def _(payload: DatabaseConfig) -> Result[dict]:
-    probe = await probe_database(payload)
-    if probe.status == "error":
-        return Result.fail(probe.message, 400)
+async def _(payload: SwitchPayload) -> Result[dict]:
     restart = _Restart()
     try:
-        status = await restore.request_switch(build_database_url(payload), restart)
-    except restore.RestoreError as error:
+        status = await restore.request_switch(
+            build_database_url(payload), restart, operation_id=payload.operation_id
+        )
+    except (RuntimeError, OSError) as error:
         return Result.fail(str(error), 400)
     return Result.ok(
-        {**restart.data, "restore": status}, "已开始切换数据库，Bot 即将重启"
+        {**restart.data, "restore": status}, "任务已接受，预检通过后自动短暂停机切换"
     )
 
 
@@ -385,15 +446,29 @@ async def _(payload: DatabaseConfig) -> Result[dict]:
     "/restore", response_class=JSONResponse, description="首次部署上次恢复的状态"
 )
 @router.get("/restore", response_class=JSONResponse, description="恢复状态")
-async def _() -> Result[dict]:
-    return Result.ok(restore.status())
+async def _(operation_id: str | None = None) -> Result[dict]:
+    return Result.ok(restore.status(operation_id))
 
 
+@setup_router.delete("/restore", response_class=JSONResponse)
 @router.delete("/restore", response_class=JSONResponse, description="清除恢复记录")
-async def _() -> Result:
+async def _(operation_id: str | None = None) -> Result:
     try:
-        restore.dismiss()
-    except restore.RestoreError as error:
+        if operation_id:
+            from zhenxun.services.migration.state import request_cancellation
+
+            request_cancellation(operation_id)
+            await restore.cancel_preparation(operation_id)
+            if restore.status(operation_id).get("state") == "awaiting_orm":
+                ok, message = await restore._restart()
+                if not ok:
+                    return Result.fail(
+                        "取消请求已保存；需要停止实例后重新启动以安全回退：" + message,
+                        409,
+                    )
+        else:
+            restore.dismiss()
+    except (RuntimeError, OSError) as error:
         return Result.fail(str(error), 400)
     return Result.ok()
 

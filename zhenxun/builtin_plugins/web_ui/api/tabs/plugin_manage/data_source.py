@@ -163,6 +163,7 @@ class ApiDataSource:
                 default_status=plugin.default_status,
                 limit_superuser=plugin.limit_superuser,
                 cost_gold=plugin.cost_gold,
+                ignore_statistics=bool(plugin.ignore_statistics),
                 menu_type=plugin.menu_type,
                 version=plugin.version or "0",
                 level=plugin.level,
@@ -203,6 +204,7 @@ class ApiDataSource:
                 "menu_type",
                 "block_type",
                 "status",
+                "ignore_statistics",
             )
         }
         from zhenxun.services.plugin_policy import plugin_policy_service
@@ -219,8 +221,16 @@ class ApiDataSource:
             db_plugin.cost_gold = param.cost_gold
             db_plugin.level = param.level
             db_plugin.menu_type = param.menu_type
+            if param.ignore_statistics is not None:
+                db_plugin.ignore_statistics = param.ignore_statistics
             await db_plugin.save(
-                update_fields=["limit_superuser", "cost_gold", "level", "menu_type"]
+                update_fields=[
+                    "limit_superuser",
+                    "cost_gold",
+                    "level",
+                    "menu_type",
+                    "ignore_statistics",
+                ]
             )
         except BaseException:
             await plugin_policy_service.set_global_settings(
@@ -233,7 +243,13 @@ class ApiDataSource:
             for key, value in previous_db.items():
                 setattr(db_plugin, key, value)
             await db_plugin.save(
-                update_fields=["limit_superuser", "cost_gold", "level", "menu_type"]
+                update_fields=[
+                    "limit_superuser",
+                    "cost_gold",
+                    "level",
+                    "menu_type",
+                    "ignore_statistics",
+                ]
             )
             raise
         await db_plugin.refresh_from_db()

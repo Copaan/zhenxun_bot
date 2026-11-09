@@ -533,6 +533,7 @@ async def save_protocol_configuration(
     saved_values = dict(dotenv_values(stream=StringIO(updated)))
     return Result.ok(
         apply_result_data(
+            restart_source="webui.protocol",
             apply_mode=(APPLY_RESTART_PENDING if restart_required else APPLY_NO_CHANGE),
             changed_keys=changed_keys,
             restart_required=restart_required,
@@ -643,6 +644,7 @@ async def delete_qq_bot(
     )
     return Result.ok(
         apply_result_data(
+            restart_source="webui.protocol",
             apply_mode=(APPLY_RESTART_PENDING if restart_required else APPLY_NO_CHANGE),
             changed_keys=changed_keys,
             restart_required=restart_required,

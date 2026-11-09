@@ -69,6 +69,8 @@ def _dump_yaml(data: CommentedMap) -> str:
 
 
 def _write_simple_config_if_changed(data: CommentedMap) -> bool:
+    from zhenxun.services.migration.state import write_startup_configuration
+
     content = _dump_yaml(data)
     current = (
         SIMPLE_CONFIG_FILE.read_text(encoding="utf8")
@@ -77,7 +79,8 @@ def _write_simple_config_if_changed(data: CommentedMap) -> bool:
     )
     if current == content:
         return False
-    SIMPLE_CONFIG_FILE.write_text(content, encoding="utf8")
+    if not write_startup_configuration(SIMPLE_CONFIG_FILE, content):
+        SIMPLE_CONFIG_FILE.write_text(content, encoding="utf8")
     return True
 
 
@@ -124,13 +127,13 @@ def _generate_simple_config(exists_module: list[str]) -> bool:
             for k in _data[module].keys():
                 help_text += f"{k}: {Config[module].configs[k].help}" + "\n"
             _data.yaml_set_comment_before_after_key(after=help_text[:-1], key=module)
-        return _write_simple_config_if_changed(_data)
     except Exception as e:
         logger.error("生成简易配置注释错误...", e=e)
         return False
     finally:
         if temp_file.exists():
             temp_file.unlink()
+    return _write_simple_config_if_changed(_data)
 
 
 @PriorityLifecycle.on_startup(

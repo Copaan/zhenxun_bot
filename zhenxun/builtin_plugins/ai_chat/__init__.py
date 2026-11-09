@@ -212,11 +212,20 @@ async def _():
 
 @scheduler.scheduled_job("cron", hour=4, minute=50, id="ai_chat_token_cleanup")
 async def _():
-    deleted = await AITokenUsage.cleanup()
-    if deleted:
-        logger.info(f"已清理 {deleted} 条过期的 AI 对话用量记录", MODULE)
-    deleted = await AIAgentCall.cleanup() + await AIAgentRun.cleanup()
-    if deleted:
-        logger.info(f"已清理 {deleted} 条过期的 Agent 运行记录", MODULE)
-    if archived := await Memory.decay():
-        logger.info(f"已归档 {archived} 条淡忘的长期记忆", MODULE)
+    from zhenxun.services.scheduler.lifecycle import core_task_run
+
+    async with core_task_run("ai_usage_cleanup") as run:
+        run["failed"] = 0
+        for name, cleanup in (
+            ("token_usage", AITokenUsage.cleanup),
+            ("agent_calls", AIAgentCall.cleanup),
+            ("agent_runs", AIAgentRun.cleanup),
+            ("memory_archived", Memory.decay),
+        ):
+            try:
+                count = await cleanup()
+                run[name] = count
+                run["processed"] += count
+            except Exception as error:
+                run["failed"] += 1
+                logger.error(f"AI 定时清理失败: {name}", MODULE, e=error)

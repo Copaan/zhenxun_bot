@@ -42,7 +42,7 @@ class StickerToolkit(BaseToolkit):
         "写清备注（表情的意思）和适用场合，一条消息里的多张图片一次收藏。"
         "想用表情时在回复末尾写 `[表情:#id]`"
         "（最多一个，只发表情时回复只写这个标记），文字发出后会接着发这个表情，"
-        "不要每次都用。提醒里列出了部分表情，找别的用 `find_stickers`；"
+        "按当前表情发送倾向自然使用。提醒里列出了部分表情，找别的用 `find_stickers`；"
         "要引用某条消息发表情时用 `send_sticker`。表情说明不准时用 "
         "`update_sticker` 修改。"
     )
@@ -67,6 +67,21 @@ class StickerToolkit(BaseToolkit):
         top = await Stickers.candidates()
         if not top and "collect_sticker" in hidden:
             return ResolvedToolPayload()
+        frequency = Config.get_config(MODULE, "STICKER_FREQUENCY", "balanced")
+        hints = {
+            "high": (
+                "聊天场景合适时积极使用贴切的表情接梗、表达情绪，"
+                "但不要机械地每次都发。"
+            ),
+            "balanced": (
+                "自然穿插表情；通常用文字即可，表情能增添表达时再发，" "不要每次都用。"
+            ),
+            "low": "大多数回复只用文字；仅在表情特别贴切或用户明确要求时发送。",
+        }
+        payload.reminders.append(
+            "表情发送倾向（同时适用于回复中的 [表情:#id] 和 send_sticker 工具）："
+            + hints.get(frequency, hints["balanced"])
+        )
         payload.tools = [t for t in payload.tools if t.name not in hidden]
         if top and "send_sticker" not in hidden:
             payload.reminders.append(

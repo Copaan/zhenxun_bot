@@ -76,12 +76,31 @@ def env_change_impact(
 def update_pending_restart(
     source: str,
     reasons: list[str] | set[str],
+    *,
+    config_keys: list[str] | None = None,
+    consumers: list[str] | None = None,
 ) -> bool:
+    from .restart_evidence import (
+        CONFIGURATION_SOURCES,
+        configuration_evidence,
+        reconcile_configuration_restarts,
+        refresh_configuration_evidence,
+    )
+
     normalized = sorted({str(reason) for reason in reasons if str(reason).strip()})
     if not normalized:
-        clear_restart_pending(source)
+        if source in CONFIGURATION_SOURCES:
+            refresh_configuration_evidence(source)
+            reconcile_configuration_restarts()
+        else:
+            clear_restart_pending(source)
         return False
-    mark_restart_pending(source, normalized)
+    evidence = (
+        configuration_evidence(source, normalized, config_keys or [], consumers or [])
+        if source in CONFIGURATION_SOURCES
+        else None
+    )
+    mark_restart_pending(source, normalized, evidence=evidence)
     return bool(os.getenv("ZHENXUN_LAUNCHER_PID"))
 
 
@@ -94,8 +113,26 @@ def apply_result_data(
     reason_codes: list[str] | None = None,
     access_urls: list[str] | None = None,
     access_targets: list[dict[str, str]] | None = None,
+    restart_source: str | None = None,
     **extra: Any,
 ) -> dict[str, Any]:
+    if restart_required and restart_source:
+        from .restart_evidence import reconcile_configuration_restarts
+
+        try:
+            change = reconcile_configuration_restarts().get(restart_source)
+        except Exception:
+            change = None
+        if change is None:
+            change = {"state": "unknown", "reason": "restart_evidence_missing"}
+        extra["restart_change"] = change
+        if change["state"] != "restart_pending":
+            restart_required = False
+            apply_mode = (
+                APPLY_CONFIG_RELOADED
+                if change["state"] == "applied"
+                else change["state"]
+            )
     return {
         **extra,
         "apply_mode": apply_mode,

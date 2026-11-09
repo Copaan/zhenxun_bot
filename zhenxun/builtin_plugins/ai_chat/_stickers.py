@@ -331,18 +331,22 @@ class Stickers:
         return added, len(items)
 
     @classmethod
-    async def search(cls, query: str = "", limit: int = 20) -> list[AISticker]:
+    async def search(
+        cls, query: str = "", limit: int | None = 20, source: str = ""
+    ) -> list[AISticker]:
         """按备注、标签和适用场合搜索表情：按二元组重合度加字段权重打分，
         相关度高的在前，相同时常用的在前
 
         参数:
             query: 关键词，为空时返回最常用的
-            limit: 条数
+            limit: 条数，为空时不截断
+            source: 来源，为空时不限
 
         返回:
             list[AISticker]: 表情
         """
-        stickers = await AISticker.all().order_by("-use_count", "-id")
+        rows = AISticker.filter(source=source) if source else AISticker.all()
+        stickers = await rows.order_by("-use_count", "-id")
         grams = _grams(query)
         if not grams:
             return stickers[:limit]
@@ -379,6 +383,41 @@ class Stickers:
             return [s for s in stickers if not source or s.source == source]
         rows = AISticker.filter(source=source) if source else AISticker.all()
         return await rows.order_by(*SORTS.get(sort, SORTS["used"]))
+
+    @classmethod
+    async def listing_page(
+        cls,
+        query: str = "",
+        source: str = "",
+        sort: str = "used",
+        page: int = 1,
+        page_size: int = 30,
+    ) -> tuple[list[AISticker], int]:
+        """读取表情列表的一页与筛选后的总数
+
+        参数:
+            query: 关键词
+            source: 来源，为空时不限
+            sort: 排序方式
+            page: 页码，从 1 开始
+            page_size: 每页数量，最多 100
+
+        返回:
+            tuple[list[AISticker], int]: 当前页表情与匹配总数
+        """
+        page_size = min(100, max(1, page_size))
+        offset = (max(1, page) - 1) * page_size
+        if query.strip():
+            stickers = await cls.search(query, limit=None, source=source)
+            return stickers[offset : offset + page_size], len(stickers)
+        rows = AISticker.filter(source=source) if source else AISticker.all()
+        count = await rows.count()
+        stickers = (
+            await rows.order_by(*SORTS.get(sort, SORTS["used"]))
+            .offset(offset)
+            .limit(page_size)
+        )
+        return stickers, count
 
     @classmethod
     async def candidates(cls) -> list[AISticker]:

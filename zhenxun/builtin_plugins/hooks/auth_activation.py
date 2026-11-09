@@ -59,6 +59,7 @@ class AlconnaDescriptor:
     context_style、会改写输入的扩展、快捷指令无法读取）该 matcher 不参与预筛。
     AlconnaRule 在命令头与快捷指令都未命中时必定返回 False，before/after rule
     不影响这一结论，因此自定义 rule 不阻止预筛。
+    heads 为带前缀的字面命令头，含正则命令头时为空，用于快速排除不可能命中的文本。
     """
 
     command: str = ""
@@ -69,6 +70,7 @@ class AlconnaDescriptor:
     compact: bool = False
     prefilter: bool = False
     reply_merge: bool = False
+    heads: tuple[str, ...] = ()
 
 
 def _alconna_shortcut_signature() -> tuple | None:
@@ -329,7 +331,7 @@ def extract_matcher_rule_descriptors(
                 descriptors.append(
                     ActivationRuleDescriptor(
                         "command",
-                        getattr(call, "cmds", ()),
+                        _command_literals(getattr(call, "cmds", ())),
                         command_like=True,
                     )
                 )
@@ -337,7 +339,7 @@ def extract_matcher_rule_descriptors(
                 descriptors.append(
                     ActivationRuleDescriptor(
                         "shell_command",
-                        getattr(call, "cmds", ()),
+                        _command_literals(getattr(call, "cmds", ())),
                         command_like=True,
                     )
                 )
@@ -406,6 +408,21 @@ def extract_matcher_rule_descriptors(
         else:
             descriptors.append(ActivationRuleDescriptor("custom"))
     return tuple(descriptors)
+
+
+def _command_literals(value: Any) -> tuple[str, ...]:
+    """NoneBot 命令 rule 的规范化命令文本
+
+    参数:
+        value: CommandRule / ShellCommandRule 的 cmds
+
+    返回:
+        tuple[str, ...]: 规范化后的命令
+    """
+    commands: set[str] = set()
+    collect_command_literals(value, commands)
+    normalized = {text for item in commands if (text := normalize_command(item))}
+    return tuple(sorted(normalized))
 
 
 def normalize_rule_string_tuple(value: object) -> tuple[str, ...]:
@@ -499,17 +516,11 @@ def matcher_rule_matches_text(
             continue
         if kind in {"command", "shell_command"}:
             saw_deterministic = True
-            commands: set[str] = set()
-            collect_command_literals(descriptor.value, commands)
-            normalized_commands = {
-                normalized
-                for item in commands
-                if (normalized := normalize_command(item))
-            }
+            commands = descriptor.value if isinstance(descriptor.value, tuple) else ()
             if any(
                 matcher_command_matches(text, command)
                 for text in plain_candidates
-                for command in normalized_commands
+                for command in commands
             ):
                 matched_any = True
             else:
@@ -812,15 +823,23 @@ def _build_alconna_descriptor(call: Any, command: Any) -> AlconnaDescriptor | No
         for item in getattr(command, "aliases", ()) or ()
         if str(item).strip() and str(item).strip() != command_text
     )
+    prefixes = tuple(item for item in raw_prefixes if isinstance(item, str))
+    names = (command_text, *aliases)
+    heads = (
+        ()
+        if any(name.startswith("re:") for name in names)
+        else tuple(f"{prefix}{name}" for name in names for prefix in prefixes or ("",))
+    )
     return AlconnaDescriptor(
         command=command_text,
         aliases=aliases,
-        prefixes=tuple(item for item in raw_prefixes if isinstance(item, str)),
+        prefixes=prefixes,
         separators=separators if isinstance(separators, str) and separators else " ",
         shortcuts=shortcuts or (),
         compact=bool(getattr(meta, "compact", False)),
         prefilter=prefilter,
         reply_merge="ReplyMergeExtension" in rewrite_extensions,
+        heads=heads,
     )
 
 
@@ -910,7 +929,8 @@ def matcher_alconna_head_matches(
     saw_unknown = False
     command_heads = (alconna.command, *alconna.aliases)
     for text in candidates:
-        for command in command_heads:
+        maybe_head = not alconna.heads or text.startswith(alconna.heads)
+        for command in command_heads if maybe_head else ():
             if not command:
                 continue
             decision = _alconna_command_head_matches(text, command, alconna)

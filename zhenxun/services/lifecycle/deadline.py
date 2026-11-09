@@ -6,6 +6,20 @@ from dataclasses import dataclass
 import time
 
 WORKER_SHUTDOWN_SECONDS = 13.0
+FINAL_SNAPSHOT_SECONDS = 600.0
+
+
+def worker_shutdown_seconds() -> float:
+    """worker 关闭预算，待生成迁移最终快照时追加快照时间
+
+    返回:
+        float: 关闭预算秒数
+    """
+    from zhenxun.services.migration.restore import snapshot_pending
+
+    return WORKER_SHUTDOWN_SECONDS + (
+        FINAL_SNAPSHOT_SECONDS if snapshot_pending() else 0.0
+    )
 
 
 @dataclass

@@ -48,6 +48,8 @@ class UpdatePlugin(BaseModel):
     """菜单类型"""
     block_type: BlockType | None = None
     """禁用类型"""
+    ignore_statistics: bool | None = None
+    """是否不统计调用次数，为空时保留现有设置"""
 
 
 class PluginInfo(BaseModel):
@@ -79,6 +81,8 @@ class PluginInfo(BaseModel):
     """等级"""
     cost_gold: int
     """花费金币"""
+    ignore_statistics: bool
+    """是否不统计调用次数"""
     menu_type: str
     """菜单类型"""
     version: str

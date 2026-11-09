@@ -45,7 +45,9 @@ def _normalize_platform(platform: str | set[str] | None) -> str | None:
     return next(iter(platform), None) if isinstance(platform, set) else platform
 
 
-async def _safe_get_group_member_info(bot: Bot, group_id: str, user_id: str) -> dict:
+async def _safe_get_group_member_info(
+    bot: Bot, group_id: str, user_id: str
+) -> dict | None:
     async with _API_SEMAPHORE:
         try:
             return await asyncio.wait_for(
@@ -56,7 +58,7 @@ async def _safe_get_group_member_info(bot: Bot, group_id: str, user_id: str) -> 
             )
         except (asyncio.TimeoutError, ActionFailed, Exception) as e:
             logger.warning("获取用户信息失败", e=e)
-            return {"user_id": user_id, "group_id": group_id, "nickname": ""}
+            return None
 
 
 async def _safe_get_group_info(bot: Bot, group_id: str) -> dict | None:
@@ -75,14 +77,17 @@ async def _refresh_member_info_async(
     bot: Bot, group_id: str, user_id: str, platform: str | None
 ) -> None:
     user_info = await _safe_get_group_member_info(bot, group_id, user_id)
+    if user_info is None:
+        return
+    defaults = {"platform": platform}
+    if nickname := user_info.get("nickname"):
+        defaults["user_name"] = nickname
+    if card := user_info.get("card") or user_info.get("nickname"):
+        defaults["nickname"] = card
+    if len(defaults) == 1:
+        return
     await GroupInfoUser.update_or_create(
-        user_id=str(user_info["user_id"]),
-        group_id=str(user_info["group_id"]),
-        defaults={
-            "user_name": user_info.get("nickname") or "",
-            "nickname": user_info.get("card") or user_info.get("nickname") or "",
-            "platform": platform,
-        },
+        user_id=user_id, group_id=group_id, defaults=defaults
     )
     await invalidate_group_members(group_id, [user_id])
     await invalidate_member_names([user_id])
@@ -170,6 +175,23 @@ class GroupManager:
             )
         else:
             await cls.__handle_add_group(bot, group_id, group)
+            from zhenxun.builtin_plugins.hooks.auth_hook import connection_epochs
+            from zhenxun.services.bot_group_sync import MemberUpdateManage
+            from zhenxun.services.tags import tag_manager
+
+            connection_epochs.reset_group(
+                bot, PlatformUtils.get_platform_scope(bot), group_id
+            )
+            try:
+                await MemberUpdateManage.run_update(bot, group_id)
+                await tag_manager._invalidate_cache()
+            except Exception as e:
+                logger.error(
+                    "入群后更新群组成员信息失败",
+                    "入群检测",
+                    group_id=group_id,
+                    e=e,
+                )
             if BotProfileManager.is_auto_send_profile():
                 file_path = await BotProfileManager.build_bot_profile_image(bot.self_id)
                 if file_path:
@@ -238,9 +260,10 @@ class GroupManager:
         if not session.group:
             return
         cls._flmt.start_cd(session.group.id)
-        if json_data := cls.__get_welcome_data(session):
-            key = random.choice([k for k in json_data.keys() if json_data[k]["status"]])
-            welcome_data = json_data[key]
+        json_data = cls.__get_welcome_data(session) or {}
+        candidates = [value for value in json_data.values() if value["status"]]
+        if candidates:
+            welcome_data = random.choice(candidates)
             msg_list = UniMessage().load(welcome_data["message"])
             if welcome_data["at"]:
                 msg_list.insert(0, At("user", user_id))

@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import os
 from pathlib import Path
 import re
+import sys
 from threading import RLock
 import time
 from typing import Any, Literal
@@ -136,7 +137,9 @@ class StartupCoordinator:
 
     @property
     def runtime_ready(self) -> bool:
-        return self.state in {
+        from zhenxun.services.migration.restore import business_blocked
+
+        return not business_blocked(max_age=0.5) and self.state in {
             "runtime_ready",
             "warmup_ready",
             "degraded",
@@ -166,6 +169,18 @@ class StartupCoordinator:
                 if self._finished_monotonic is None:
                     self._finished_monotonic = time.monotonic()
                 self._set_event(self._warmup_event)
+        self.reconcile_restart_state()
+
+    def reconcile_restart_state(self) -> None:
+        """管理模块可用时核验当前 worker 已采用的配置变更。"""
+        module = sys.modules.get("zhenxun.builtin_plugins.web_ui.restart_evidence")
+        reconcile = getattr(module, "reconcile_configuration_restarts", None)
+        if reconcile is not None:
+            try:
+                reconcile()
+            except Exception:
+                # 状态接口继续呈现待核验记录，不影响管理面启动。
+                pass
 
     def enter_setup_mode(self) -> None:
         """Keep the minimal management surface alive until first setup restarts."""
@@ -284,6 +299,7 @@ class StartupCoordinator:
                 and self._stages.get("warmup", {}).get("state") == "completed"
             ):
                 self._state = "warmup_ready"
+        self.reconcile_restart_state()
 
     def record_error(
         self,
@@ -415,16 +431,21 @@ class StartupCoordinator:
         loop = asyncio.get_running_loop()
         deadline = None if timeout is None else loop.time() + timeout
         event = self._event("runtime")
-        while not event.is_set():
+        while not event.is_set() or not self.runtime_ready:
             with self._lock:
                 if self._setup_required:
-                    return True
+                    from zhenxun.services.migration.restore import business_blocked
+
+                    return not business_blocked()
             step = 1.0 if deadline is None else min(1.0, deadline - loop.time())
             if step <= 0:
                 return False
-            with contextlib.suppress(asyncio.TimeoutError):
-                await asyncio.wait_for(asyncio.shield(event.wait()), step)
-        return True
+            if event.is_set():
+                await asyncio.sleep(min(step, 0.2))
+            else:
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(asyncio.shield(event.wait()), step)
+        return self.runtime_ready
 
     async def wait_final_available(self) -> bool:
         """Wait until startup reaches its final user-facing usable state."""

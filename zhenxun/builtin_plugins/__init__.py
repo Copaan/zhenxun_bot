@@ -116,7 +116,7 @@ async def _start_resource_update():
     start_resource_update()
 
 
-@PriorityLifecycle.on_shutdown(component_id="management:resource-update")
+@PriorityLifecycle.on_shutdown(priority=10, component_id="management:resource-update")
 async def _stop_resource_update():
     from zhenxun.services.update.update_service import stop_resource_update
 

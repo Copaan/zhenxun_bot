@@ -16,10 +16,15 @@ import tempfile
 from threading import Event
 import time
 from typing import Any
+from uuid import uuid4
 
 from packaging.utils import canonicalize_name
 
-from zhenxun.utils.pythonpath import activate_dependency_layer, subprocess_pythonpath
+from zhenxun.utils.pythonpath import (
+    INSTANCE_ROOT,
+    activate_dependency_layer,
+    subprocess_pythonpath,
+)
 
 from .dependencies import protected_core, safe_process_error
 from .storage import (
@@ -57,7 +62,38 @@ class LayerBuildError(RuntimeError):
 
 def recovery_required() -> bool:
     """Keep the management surface available while rollback is unconfirmed."""
-    return (pending_transaction() or {}).get("state") == "recovery_required"
+    from zhenxun.services.migration import state as restore_state
+    from zhenxun.services.plugin_store.plugin_store_transaction import (
+        pending_transaction as source_pending,
+    )
+    from zhenxun.services.runtime_mutation import mutation_owner
+
+    try:
+        if (pending_transaction() or {}).get("state") in {
+            "recovery_required",
+            "building",
+            "rolling_back",
+        }:
+            return True
+        if (source_pending() or {}).get("state") in {"recovery_required", "applying"}:
+            return True
+        owner = mutation_owner()
+        if owner and owner.get("kind") == "runtime":
+            return True
+        restore = restore_state.load() or {}
+        return bool(
+            restore
+            and (
+                restore.get("state")
+                in {"recovery_required", "applying", "awaiting_orm"}
+                or (
+                    restore.get("record_version") != 2
+                    and restore.get("state") not in restore_state.TERMINAL
+                )
+            )
+        )
+    except (OSError, RuntimeError):
+        return True
 
 
 def environment_signature() -> dict[str, str]:
@@ -179,7 +215,6 @@ def stage_environment_resync() -> bool:
     return True
 
 
-@transaction_lock()
 def rollback_for_launcher(failed: list[dict[str, Any]] | None = None) -> bool:
     """回滚未通过启动验证的依赖层事务，回滚失败时保留为待恢复状态
 
@@ -191,18 +226,7 @@ def rollback_for_launcher(failed: list[dict[str, Any]] | None = None) -> bool:
     """
     try:
         rollback_pending_transaction(failed)
-    except Exception as error:
-        transaction = pending_transaction() or {}
-        transaction.update(
-            state="recovery_required",
-            error_code=getattr(error, "code", type(error).__name__),
-            rollback_error=safe_process_error(str(error)),
-        )
-        write_json(PENDING_FILE, transaction)
-        with contextlib.suppress(Exception):
-            record_manual_operations(
-                transaction, "recovery_required", "recovery_required"
-            )
+    except Exception:
         return False
     return True
 
@@ -366,7 +390,11 @@ def build_generation(
     return _build_generation(transaction, cancel_requested=cancel_requested)
 
 
-async def prepare_generation(transaction: dict[str, Any]) -> dict[str, Any]:
+async def prepare_generation(
+    transaction: dict[str, Any],
+    *,
+    cancel_requested: Callable[[], bool] | None = None,
+) -> dict[str, Any]:
     """Build off the event loop and finish cleanup before releasing a canceled owner."""
     from zhenxun.services.runtime_mutation import runtime_mutation_coordinator
 
@@ -376,7 +404,8 @@ async def prepare_generation(transaction: dict[str, Any]) -> dict[str, Any]:
             build_generation,
             transaction,
             cancel_requested=lambda: cancel.is_set()
-            or runtime_mutation_coordinator.cancellation_requested,
+            or runtime_mutation_coordinator.cancellation_requested
+            or bool(cancel_requested and cancel_requested()),
         )
     )
     built = None
@@ -406,7 +435,7 @@ def _run_installer(
 
     process = subprocess.Popen(
         command,
-        cwd=str(Path.cwd()),
+        cwd=str(INSTANCE_ROOT),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -613,9 +642,20 @@ def commit_generation(
     返回:
         dict[str, Any]: 新的清单
     """
+    from zhenxun.utils.atomic_json import read_json_locked
+
+    current = pending_transaction() or {}
+    if current.get("revision") != transaction.get("revision") or current.get(
+        "record_revision", 0
+    ) != transaction.get("record_revision", 0):
+        raise LayerBuildError("dependency_transaction_changed")
     previous = (
-        read_json(ROLLBACK_FILE, None) if transaction.get("rollback_saved") else None
+        read_json_locked(ROLLBACK_FILE, None, strict=True)
+        if transaction.get("rollback_saved")
+        else None
     )
+    if transaction.get("rollback_saved") and not isinstance(previous, dict):
+        raise LayerBuildError("dependency_rollback_receipt_missing")
     if not isinstance(previous, dict):
         previous = load_manifest()
         write_json(ROLLBACK_FILE, previous)
@@ -644,7 +684,9 @@ def stage_generation(transaction: dict[str, Any], build: dict[str, Any]) -> None
     transaction["generation"] = int(build["generation"])
     transaction["generation_digest"] = str(build["digest"])
     transaction["native_extensions"] = list(build.get("native_extensions") or [])
-    transaction["state"] = "pending_restart"
+    transaction["state"] = (
+        "preparing" if transaction.get("preparation_only") else "pending_restart"
+    )
     write_json(PENDING_FILE, transaction)
     if isinstance(previous, int) and previous != build["generation"]:
         remove_generation(previous)
@@ -680,6 +722,7 @@ def _run_orm_migration(action: str) -> tuple[int, str]:
     返回:
         tuple[int, str]: 退出码，失败时的诊断输出
     """
+    transaction = pending_transaction() or {}
     try:
         completed = subprocess.run(
             [
@@ -688,8 +731,14 @@ def _run_orm_migration(action: str) -> tuple[int, str]:
                 "zhenxun.services.nonebot_store.orm_migration",
                 action,
             ],
-            cwd=str(Path.cwd()),
-            env={**os.environ, "PYTHONPATH": subprocess_pythonpath()},
+            cwd=str(INSTANCE_ROOT),
+            env={
+                **os.environ,
+                "PYTHONPATH": subprocess_pythonpath(),
+                "ZHENXUN_ORM_TRANSACTION_REVISION": str(
+                    transaction.get("revision") or ""
+                ),
+            },
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -760,6 +809,8 @@ def record_manual_operations(transaction: dict, mode: str, status: str) -> None:
                 "operation_id": identity,
                 "apply_mode": mode,
                 "status": status,
+                "restart_required": mode == "restart_pending",
+                "restart_available": mode == "restart_pending",
                 "request_binding": operation.get("request_binding")
                 or previous.get("request_binding"),
                 "reason": transaction.get("error_code"),
@@ -806,7 +857,12 @@ def reconcile_operation(value: dict[str, Any]) -> bool:
                 if startup_coordinator.runtime_ready:
                     mode, status = "applied", "completed"
             value["status"], value["apply_mode"] = status, mode
-            value.setdefault("result", {}).update(status=status, apply_mode=mode)
+            value.setdefault("result", {}).update(
+                status=status,
+                apply_mode=mode,
+                restart_required=mode == "restart_pending",
+                restart_available=mode == "restart_pending",
+            )
             if sync.get("code"):
                 value["result"]["reason"] = sync["code"]
             return True
@@ -847,7 +903,12 @@ def reconcile_operation(value: dict[str, Any]) -> bool:
             "cleanup_pending": ("applied", "completed"),
         }.get(state, (value.get("apply_mode"), value.get("status")))
         value["status"], value["apply_mode"] = status, mode
-        value.setdefault("result", {}).update(status=status, apply_mode=mode)
+        value.setdefault("result", {}).update(
+            status=status,
+            apply_mode=mode,
+            restart_required=mode == "restart_pending",
+            restart_available=mode == "restart_pending",
+        )
         value["result"]["transaction_state"] = state
         if state == "migration_blocked":
             value["result"].update(
@@ -863,7 +924,6 @@ def reconcile_operation(value: dict[str, Any]) -> bool:
     return False
 
 
-@transaction_lock()
 def apply_pending_transaction() -> bool:
     """launcher 停止旧 worker 后构建并提交待应用的依赖层
 
@@ -873,10 +933,35 @@ def apply_pending_transaction() -> bool:
     返回:
         bool: 是否已提交并等待启动验证
     """
-    transaction = pending_transaction()
+    import psutil
+
+    with transaction_lock():
+        transaction = pending_transaction()
+        if transaction and transaction.get("parent_operation_id"):
+            from zhenxun.services.migration import state as restore_state
+
+            parent = restore_state.load(transaction["parent_operation_id"]) or {}
+            if parent.get("state") == "preparing":
+                return False
+            if transaction.get("preparation_only"):
+                raise LayerBuildError("migration_candidate_not_authorized")
+        if transaction and transaction.get("state") == "building":
+            raise LayerBuildError("dependency_executor_unconfirmed")
+        if transaction and transaction.get("state") in {
+            "pending_restart",
+            "migration_blocked",
+        }:
+            transaction.update(
+                state="building",
+                executor={
+                    "pid": os.getpid(),
+                    "created_at": psutil.Process().create_time(),
+                },
+            )
+            write_json(PENDING_FILE, transaction)
     if transaction is None:
         return False
-    if transaction.get("state") in {"committed", "cleanup_pending"}:
+    if transaction.get("state") in {"committed", "cleanup_pending", "settling"}:
         finalize_pending_transaction()
         return False
     if transaction.get("state") not in {
@@ -887,9 +972,10 @@ def apply_pending_transaction() -> bool:
         return False
     migrated = False
     try:
-        transaction["state"] = "building"
-        write_json(PENDING_FILE, transaction)
-        build = _staged_build(transaction) or build_generation(transaction)
+        build = _staged_build(transaction)
+        if build is None and transaction.get("prepared_for_migration"):
+            raise LayerBuildError("migration_prepared_candidate_changed")
+        build = build or build_generation(transaction)
         if transaction.get("database_migration_possible"):
             transaction["generation"] = int(build["generation"])
             transaction["generation_digest"] = str(build["digest"])
@@ -898,6 +984,17 @@ def apply_pending_transaction() -> bool:
             )
             write_json(PENDING_FILE, transaction)
             migration_result, diagnostic = _run_orm_migration("apply")
+            with transaction_lock():
+                updated = pending_transaction()
+                if (
+                    not updated
+                    or updated.get("revision") != transaction.get("revision")
+                    or updated.get("parent_operation_id")
+                    != transaction.get("parent_operation_id")
+                    or updated.get("generation") != build["generation"]
+                ):
+                    raise LayerBuildError("dependency_transaction_changed")
+                transaction = updated
             if migration_result:
                 transaction["error"] = diagnostic
                 transaction["state"] = (
@@ -1070,7 +1167,7 @@ def probe_plugin_import(module_name: str, layer: Path) -> dict[str, Any] | None:
     try:
         completed = subprocess.run(
             [sys.executable, "-c", code, module_name, str(layer)],
-            cwd=str(Path.cwd()),
+            cwd=str(INSTANCE_ROOT),
             env={**os.environ, "PYTHONPATH": subprocess_pythonpath()},
             capture_output=True,
             text=True,
@@ -1365,60 +1462,95 @@ def startup_verification() -> tuple[bool, dict[str, Any]]:
     return not status["failures"], status
 
 
-@transaction_lock()
 def finalize_pending_transaction() -> None:
-    """确认依赖层事务验证通过并归档；清理失败只记录，遗留文件由下一次事务结束时清理
+    """持久化验证与提交证据，ORM 清理在文件锁外完成并可重放"""
+    import psutil
 
-    启动验证的告警记入事务的 warnings，加载失败的托管插件记入 manifest 的
-    load_failures，之后的事务不再因这些插件回滚。
-    """
-    transaction = pending_transaction() or {}
-    manifest = load_manifest()
-    manifest["pending_verification"] = False
-    manifest["previous_generation"] = None
-    if transaction.get("revision"):
-        manifest["verified_transaction_revision"] = transaction["revision"]
-    status = read_json(STARTUP_STATUS_FILE, {})
-    if status.get("generation") == manifest.get("active_generation"):
-        manifest["load_failures"] = {
-            str(item["module_name"]): str(item.get("code") or "")
-            for item in status.get("failed") or []
-            if isinstance(item, dict) and item.get("module_name")
+    with transaction_lock():
+        transaction = pending_transaction()
+        if not transaction:
+            return
+        if transaction.get("state") not in {
+            "verification_pending",
+            "settling",
+            "committed",
+            "cleanup_pending",
+        }:
+            raise LayerBuildError("dependency_verification_not_confirmed")
+        if transaction.get("state") == "settling":
+            executor = transaction.get("settlement_executor") or {}
+            try:
+                process = psutil.Process(int(executor["pid"]))
+                if process.create_time() == executor["created_at"]:
+                    raise LayerBuildError("dependency_settlement_in_progress")
+            except psutil.NoSuchProcess:
+                pass
+            except (psutil.Error, KeyError, TypeError, ValueError) as error:
+                raise LayerBuildError("dependency_executor_unconfirmed") from error
+        manifest = load_manifest()
+        manifest["pending_verification"] = False
+        manifest["previous_generation"] = None
+        if transaction.get("revision"):
+            manifest["verified_transaction_revision"] = transaction["revision"]
+        status = read_json(STARTUP_STATUS_FILE, {})
+        if status.get("generation") == manifest.get("active_generation"):
+            manifest["load_failures"] = {
+                str(item["module_name"]): str(item.get("code") or "")
+                for item in status.get("failed") or []
+                if isinstance(item, dict) and item.get("module_name")
+            }
+            if status.get("warnings"):
+                transaction["warnings"] = [
+                    issue_text(item) for item in status["warnings"][:20]
+                ]
+        save_manifest(manifest)
+        transaction.update(state="settling", verification_confirmed=True)
+        transaction.pop("cleanup_error", None)
+        transaction["settlement_executor"] = {
+            "pid": os.getpid(),
+            "created_at": psutil.Process().create_time(),
         }
-        if status.get("warnings"):
-            transaction["warnings"] = [
-                issue_text(item) for item in status["warnings"][:20]
-            ]
-    save_manifest(manifest)
-    transaction.update(state="committed", verification_confirmed=True)
-    transaction.pop("cleanup_error", None)
-    try:
         write_json(PENDING_FILE, transaction)
-        record_manual_operations(transaction, "applied", "completed")
+    cleanup_error = None
+    try:
         finalize_orm_migration()
-        active = manifest.get("active_generation")
-        retained = referenced_generations()
-        if isinstance(active, int):
-            retained.add(active)
-        prune_generations(retained)
-        ROLLBACK_FILE.unlink(missing_ok=True)
     except Exception as error:
-        transaction.update(
-            state="cleanup_pending",
-            cleanup_error={
+        cleanup_error = {
+            "code": getattr(error, "code", type(error).__name__),
+            "diagnostic": safe_process_error(str(error)),
+        }
+    with transaction_lock():
+        current = pending_transaction()
+        if not current or any(
+            current.get(key) != transaction.get(key)
+            for key in ("revision", "record_revision", "generation")
+        ):
+            raise LayerBuildError("dependency_transaction_changed")
+        transaction = current
+        transaction.update(state="committed", verification_confirmed=True)
+        try:
+            write_json(PENDING_FILE, transaction)
+            record_manual_operations(transaction, "applied", "completed")
+            if cleanup_error is None:
+                active = load_manifest().get("active_generation")
+                retained = referenced_generations()
+                if isinstance(active, int):
+                    retained.add(active)
+                prune_generations(retained)
+                ROLLBACK_FILE.unlink(missing_ok=True)
+        except Exception as error:
+            cleanup_error = {
                 "code": getattr(error, "code", type(error).__name__),
                 "diagnostic": safe_process_error(str(error)),
-            },
-        )
-        with contextlib.suppress(OSError):
+            }
+        if cleanup_error:
+            transaction.update(state="cleanup_pending", cleanup_error=cleanup_error)
             write_json(PENDING_FILE, transaction)
-    from .storage import archive_settled
+        from .storage import archive_settled
 
-    with contextlib.suppress(Exception):
         archive_settled()
 
 
-@transaction_lock()
 def rollback_pending_transaction(failed: list[dict[str, Any]] | None = None) -> None:
     """回滚待验证的依赖层事务并记录失败原因
 
@@ -1428,25 +1560,70 @@ def rollback_pending_transaction(failed: list[dict[str, Any]] | None = None) -> 
     参数:
         failed: launcher 记录的失败项
     """
+    from zhenxun.utils.atomic_json import read_json_locked
+
+    with transaction_lock():
+        transaction = pending_transaction()
+        if not transaction:
+            return
+        if transaction.get("state") == "rolling_back":
+            raise LayerBuildError("dependency_rollback_in_progress")
+        rollback = read_json_locked(ROLLBACK_FILE, None, strict=True)
+        if not transaction.get("rollback_confirmed") and not isinstance(rollback, dict):
+            transaction.update(
+                state="recovery_required",
+                error_code="dependency_rollback_receipt_missing",
+            )
+            write_json(PENDING_FILE, transaction)
+            raise LayerBuildError("dependency_rollback_receipt_missing")
+        transaction["state"] = "rolling_back"
+        transaction["rollback_attempt"] = uuid4().hex
+        write_json(PENDING_FILE, transaction)
+    binding = ("revision", "parent_operation_id", "generation", "rollback_attempt")
+    try:
+        code, diagnostic = (
+            (0, "")
+            if transaction.get("rollback_confirmed")
+            else _run_orm_migration("restore")
+        )
+        with transaction_lock():
+            current = pending_transaction()
+            if (
+                not current
+                or any(current.get(key) != transaction.get(key) for key in binding)
+                or current.get("state") != "rolling_back"
+            ):
+                raise LayerBuildError("dependency_transaction_changed")
+            if code:
+                raise LayerBuildError("database_migration_rollback_failed", diagnostic)
+            _finish_rollback(current, rollback, failed)
+    except Exception as error:
+        with transaction_lock():
+            current = pending_transaction()
+            if (
+                current
+                and all(current.get(key) == transaction.get(key) for key in binding)
+                and current.get("state") == "rolling_back"
+                and not current.get("rollback_confirmed")
+            ):
+                current.update(
+                    state="recovery_required",
+                    error_code=getattr(error, "code", type(error).__name__),
+                    rollback_error=safe_process_error(str(error)),
+                )
+                write_json(PENDING_FILE, current)
+                with contextlib.suppress(Exception):
+                    record_manual_operations(
+                        current, "recovery_required", "recovery_required"
+                    )
+        raise
+
+
+def _finish_rollback(transaction: dict, rollback: dict | None, failed: list | None):
+    """核对 ORM 子进程结果后结算依赖回滚与本任务清理"""
     current = load_manifest()
-    transaction = pending_transaction() or {}
     failed_generation = transaction.get("generation", current.get("active_generation"))
     failed_status = read_json(STARTUP_STATUS_FILE, {})
-    rollback = read_json(ROLLBACK_FILE, None)
-    if not transaction.get("rollback_confirmed") and not isinstance(rollback, dict):
-        transaction.update(
-            state="recovery_required", error_code="dependency_rollback_receipt_missing"
-        )
-        write_json(PENDING_FILE, transaction)
-        record_manual_operations(transaction, "recovery_required", "recovery_required")
-        raise LayerBuildError("dependency_rollback_receipt_missing")
-    if not transaction.get("rollback_confirmed") and _run_orm_migration("restore")[0]:
-        transaction.update(
-            state="recovery_required", error_code="database_migration_rollback_failed"
-        )
-        write_json(PENDING_FILE, transaction)
-        record_manual_operations(transaction, "recovery_required", "recovery_required")
-        raise LayerBuildError("database_migration_rollback_failed")
     if isinstance(rollback, dict) and not transaction.get("rollback_confirmed"):
         save_manifest(rollback)
     worker_failed = any(

@@ -2,12 +2,15 @@
 标签服务的核心实现，负责标签的增删改查与动态规则解析。
 """
 
+import asyncio
+from collections import Counter
 from collections.abc import Callable, Coroutine
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, ClassVar
 
-from aiocache import Cache, cached
+from aiocache import cached
 from arclet.alconna import Alconna, Args
 import nonebot
 from nonebot.adapters import Bot
@@ -41,9 +44,13 @@ def invalidate_on_change(func: Callable) -> Callable:
     """装饰器: 在方法成功执行后自动使标签缓存失效。"""
 
     async def wrapper(self: "TagManager", *args, **kwargs):
-        result = await func(self, *args, **kwargs)
-        await self._invalidate_cache()
-        return result
+        async with self._tag_mutation():
+            try:
+                result = await func(self, *args, **kwargs)
+            finally:
+                self._tag_revision += 1
+            await self._invalidate_cache()
+            return result
 
     return wrapper
 
@@ -116,8 +123,9 @@ class TagManager:
 
     async def _invalidate_cache(self):
         """辅助函数，用于清除标签相关的缓存，确保数据一致性。"""
-        cache = Cache(Cache.MEMORY, namespace="tag_service")
-        await cache.clear()
+        self._tag_cache_dirty = True
+        await self._cached_tag_group_ids.cache.clear()
+        self._tag_cache_dirty = False
         logger.debug("已清除所有群组标签缓存。")
 
     @invalidate_on_change
@@ -194,31 +202,250 @@ class TagManager:
             logger.info(f"已从 {deleted_count} 个标签中移除群组 {group_id} 的关联。")
         return deleted_count
 
-    @invalidate_on_change
+    @asynccontextmanager
+    async def _tag_mutation(self):
+        """串行标签写操作，同一任务内允许克隆调用创建等嵌套操作。"""
+        task = asyncio.current_task()
+        if getattr(self, "_tag_owner", None) is task:
+            yield
+            return
+        if getattr(self, "_tag_lock", None) is None:
+            self._tag_lock = asyncio.Lock()
+            self._tag_revision = 0
+        async with self._tag_lock:
+            self._tag_owner = task
+            try:
+                yield
+            finally:
+                self._tag_owner = None
+
     async def prune_stale_group_links(self) -> int:
-        """
-        清理所有静态标签中无效的群组关联。
-        无效指的是机器人已不再任何一个已连接的Bot的群组列表中。
+        """仅删除经完整账号快照与连接代际核验的静态群关联。"""
+        result = await self.prune_stale_group_links_report()
+        return result["deleted"]
 
-        返回：
-            被清理的无效关联的总数。
-        """
-        all_bot_group_ids = set()
-        for bot in nonebot.get_bots().values():
-            groups, _ = await PlatformUtils.get_group_list(bot)
-            all_bot_group_ids.update(g.group_id for g in groups if g.group_id)
+    async def prune_stale_group_links_report(self) -> dict:
+        """返回静态关联核验结果；账号、范围或并发证据不足时保留关联。"""
+        from zhenxun.builtin_plugins.hooks.auth_hook import connection_epochs
+        from zhenxun.models.bot_group_policy import BotGroupMembership
+        from zhenxun.services.plugin_policy import plugin_policy_service
 
-        all_static_links = await GroupTagLink.filter(tag__tag_type="STATIC").all()
+        reasons: Counter = Counter()
+        report = {
+            "status": "completed",
+            "examined": 0,
+            "deleted": 0,
+            "skipped": 0,
+            "reason_counts": {},
+        }
 
-        stale_link_ids = [
-            link.id
-            for link in all_static_links
-            if link.group_id not in all_bot_group_ids
-        ]
+        def finish(reason=None):
+            if reason:
+                reasons[reason] += max(
+                    0, report["examined"] - sum(reasons.values()) - report["deleted"]
+                )
+            report["reason_counts"] = dict(reasons)
+            report["skipped"] = sum(
+                count
+                for reason, count in reasons.items()
+                if reason != "cache_invalidation_pending"
+            )
+            if report["skipped"]:
+                report["status"] = "skipped" if not report["deleted"] else "partial"
+            return report
 
-        if stale_link_ids:
-            return await GroupTagLink.filter(id__in=stale_link_ids).delete()
-        return 0
+        async with self._tag_mutation():
+            revision = self._tag_revision
+            links = await GroupTagLink.filter(tag__tag_type="STATIC").select_related(
+                "tag"
+            )
+            frozen = [
+                (item.id, item.tag_id, str(item.group_id), item.tag.bot_id)
+                for item in links
+            ]
+        report["examined"] = len(frozen)
+        if not frozen:
+            return finish()
+        try:
+            accounts = await plugin_policy_service.list_accounts()
+            memberships = await BotGroupMembership.all().values(
+                "bot_id", "platform_scope", "group_id", "channel_id", "last_seen"
+            )
+        except Exception:
+            return finish("account_evidence_unavailable")
+        known = {str(item["bot_id"]): item for item in accounts}
+        related = {}
+        for item in memberships:
+            related.setdefault(str(item["group_id"]), set()).add(
+                (str(item["bot_id"]), item["platform_scope"], item["channel_id"])
+            )
+        live = {
+            PlatformUtils.get_storage_bot_id(bot): bot
+            for bot in nonebot.get_bots().values()
+        }
+        epochs = {}
+        unavailable = {
+            identity: "account_offline" for identity in known if identity not in live
+        }
+        for identity, bot in live.items():
+            scope = PlatformUtils.get_platform_scope(bot)
+            epoch = connection_epochs.get(bot, scope)
+            if scope == "qq_client" and epoch is not None:
+                epochs[identity] = (bot, scope, epoch.connection_id)
+            else:
+                unavailable[identity] = (
+                    "scope_not_enumerable"
+                    if scope != "qq_client"
+                    else "connection_unconfirmed"
+                )
+
+        def connection_valid():
+            current = {
+                PlatformUtils.get_storage_bot_id(bot): bot
+                for bot in nonebot.get_bots().values()
+            }
+            if current != live:
+                return False
+            for identity, (bot, scope, token) in epochs.items():
+                epoch = connection_epochs.get(bot, scope)
+                if (
+                    current.get(identity) is not bot
+                    or epoch is None
+                    or epoch.connection_id != token
+                ):
+                    return False
+            return True
+
+        async def collect():
+            observed = {}
+            for identity, (bot, scope, token) in epochs.items():
+                try:
+                    groups, platform = await asyncio.wait_for(
+                        PlatformUtils.get_group_list(bot), timeout=30.0
+                    )
+                    ids = {str(group.group_id) for group in groups if group.group_id}
+                    if platform == "qq" and ids and connection_valid():
+                        observed[identity] = ids
+                    else:
+                        unavailable[identity] = (
+                            "empty_group_list" if not ids else "group_scope_unconfirmed"
+                        )
+                except Exception:
+                    unavailable[identity] = "group_list_unavailable"
+                    continue
+            return observed
+
+        first = await collect()
+        if not connection_valid():
+            return finish("connection_changed")
+        second = await collect()
+        if not connection_valid():
+            return finish("connection_changed")
+        candidates = []
+        for link_id, tag_id, group_id, bot_id in frozen:
+            if bot_id:
+                identity = str(bot_id)
+                if identity not in known:
+                    matches = [
+                        key
+                        for key, item in known.items()
+                        if str(item.get("runtime_bot_id")) == identity
+                    ]
+                    if len(matches) != 1:
+                        reasons["account_ambiguous"] += 1
+                        continue
+                    identity = matches[0]
+                owners = {identity}
+            else:
+                origins = related.get(group_id, set())
+                if not origins or any(
+                    scope != "qq_client" or channel for _, scope, channel in origins
+                ):
+                    reasons["global_scope_unconfirmed"] += 1
+                    continue
+                owners = set(known) | {identity for identity, _, _ in origins}
+                if not owners:
+                    reasons["global_scope_unconfirmed"] += 1
+                    continue
+            if any(group_id in values for values in first.values()) or any(
+                group_id in values for values in second.values()
+            ):
+                continue
+            if not owners.issubset(first.keys() & second.keys()):
+                reason = next(
+                    (
+                        unavailable[identity]
+                        for identity in sorted(owners)
+                        if identity in unavailable
+                    ),
+                    "account_snapshot_incomplete",
+                )
+                reasons[reason] += 1
+                continue
+            candidates.append((link_id, tag_id, group_id, bot_id))
+        if not candidates:
+            return finish()
+        async with self._tag_mutation():
+            if self._tag_revision != revision:
+                return finish("tags_changed")
+            try:
+                async with in_transaction() as connection:
+                    current_accounts = await plugin_policy_service.list_accounts()
+                    if {str(item["bot_id"]) for item in current_accounts} != set(known):
+                        raise RuntimeError("accounts_changed")
+                    current_memberships = (
+                        await BotGroupMembership.all()
+                        .using_db(connection)
+                        .values(
+                            "bot_id",
+                            "platform_scope",
+                            "group_id",
+                            "channel_id",
+                            "last_seen",
+                        )
+                    )
+                    if sorted(map(str, current_memberships)) != sorted(
+                        map(str, memberships)
+                    ):
+                        raise RuntimeError("memberships_changed")
+                    if not connection_valid():
+                        raise RuntimeError("connection_changed")
+                    deleted = 0
+                    for link_id, tag_id, group_id, bot_id in candidates:
+                        if (
+                            not await GroupTag.filter(
+                                id=tag_id, tag_type="STATIC", bot_id=bot_id
+                            )
+                            .using_db(connection)
+                            .exists()
+                        ):
+                            raise RuntimeError("tags_changed")
+                        deleted += (
+                            await GroupTagLink.filter(
+                                id=link_id, tag_id=tag_id, group_id=group_id
+                            )
+                            .using_db(connection)
+                            .delete()
+                        )
+                    if not connection_valid():
+                        raise RuntimeError("connection_changed")
+            except RuntimeError as error:
+                return finish(str(error))
+            self._tag_revision += 1
+            report["deleted"] = deleted
+            if deleted:
+                self._tag_cache_dirty = True
+                try:
+                    await self._invalidate_cache()
+                except Exception as error:
+                    report["status"] = "partial"
+                    reasons["cache_invalidation_pending"] += 1
+                    logger.warning(
+                        "静态标签关联已提交，缓存失效待重试；查询将绕过缓存。",
+                        "群组标签管理",
+                        e=error,
+                    )
+        return finish()
 
     @invalidate_on_change
     async def add_groups_to_tag(self, name: str, group_ids: list[str]) -> int:  # type: ignore
@@ -499,9 +726,28 @@ class TagManager:
 
         return final_ids
 
-    @cached(ttl=300, namespace="tag_service")
     async def resolve_tag_to_group_ids(
         self, name: str, bot: Bot | None = None
+    ) -> list[str]:
+        """按当前标签修订解析，缓存失效未确认时直接读取。"""
+        if getattr(self, "_tag_cache_dirty", False):
+            try:
+                await self._invalidate_cache()
+            except Exception:
+                return await self._cached_tag_group_ids(
+                    name,
+                    bot,
+                    getattr(self, "_tag_revision", 0),
+                    cache_read=False,
+                    cache_write=False,
+                )
+        return await self._cached_tag_group_ids(
+            name, bot, getattr(self, "_tag_revision", 0)
+        )
+
+    @cached(ttl=300, namespace="tag_service")
+    async def _cached_tag_group_ids(
+        self, name: str, bot: Bot | None, revision: int
     ) -> list[str]:
         """
         核心解析方法：根据标签名解析出最终的群组ID列表

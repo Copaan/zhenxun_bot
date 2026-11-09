@@ -8,8 +8,9 @@ import sys
 
 import zhenxun
 
-LAYER_ROOT = Path("data") / "runtime" / "nonebot-site-packages"
-STORE_ROOT = Path("data") / "runtime" / "nonebot-store"
+INSTANCE_ROOT = Path(os.environ.get("ZHENXUN_PROJECT_ROOT") or Path.cwd()).resolve()
+LAYER_ROOT = INSTANCE_ROOT / "data/runtime/nonebot-site-packages"
+STORE_ROOT = INSTANCE_ROOT / "data/runtime/nonebot-store"
 
 
 def subprocess_pythonpath() -> str:

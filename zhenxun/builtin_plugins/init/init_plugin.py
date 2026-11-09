@@ -119,7 +119,6 @@ _PLUGIN_REFRESH_FIELDS = [
     "parent",
     "is_show",
     "ignore_prompt",
-    "ignore_statistics",
 ]
 
 

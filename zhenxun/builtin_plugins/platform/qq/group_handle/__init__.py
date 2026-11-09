@@ -102,7 +102,7 @@ async def _(
     session: Uninfo,
     event: GroupIncreaseNoticeEvent,
 ):
-    if session.user.id == bot.self_id:
+    if str(event.user_id) == str(bot.self_id):
         """新成员为bot本身"""
         group, _ = await GroupConsole.get_or_create_root_group(str(event.group_id))
         try:

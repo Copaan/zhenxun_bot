@@ -1,9 +1,12 @@
 import asyncio
 import contextlib
+from hashlib import sha256
+import json
 import os
 from pathlib import Path
 import time
 from typing import Any
+import uuid
 
 from nonebot import get_bots
 from nonebot.adapters import Bot
@@ -55,7 +58,19 @@ def issue_restart_ticket(source: str, *, ttl_seconds: int = 600) -> None:
     logger.info(f"已记录重启授权，来源: {source}", "重启")
 
 
-def mark_restart_pending(source: str, reasons: set[str] | list[str]) -> None:
+def restart_value_digest(value: Any) -> str:
+    """生成配置目标摘要，不在重启记录中保存配置原文。"""
+    return sha256(
+        json.dumps(value, sort_keys=True, ensure_ascii=False, default=str).encode()
+    ).hexdigest()
+
+
+def mark_restart_pending(
+    source: str,
+    reasons: set[str] | list[str],
+    *,
+    evidence: dict[str, Any] | None = None,
+) -> None:
     normalized = sorted(
         {str(reason).strip() for reason in reasons if str(reason).strip()}
     )
@@ -70,6 +85,9 @@ def mark_restart_pending(source: str, reasons: set[str] | list[str]) -> None:
         pending[source] = {
             "reasons": normalized,
             "updated_at": time.time(),
+            "change_id": uuid.uuid4().hex,
+            "boot_id": startup_coordinator.boot_id,
+            **({"evidence": evidence} if evidence is not None else {}),
         }
         state[_PENDING_RESTARTS_KEY] = pending
 
@@ -360,7 +378,6 @@ def _finalize_restart_state_on_startup() -> None:
     result: dict[str, Any] = {}
 
     def finalize(state: dict[str, Any]) -> None:
-        state.pop(_PENDING_RESTARTS_KEY, None)
         clear_restart_tickets(state)
         pending_request = state.get(_PENDING_REQUEST_KEY)
         if not isinstance(pending_request, dict):
@@ -382,7 +399,10 @@ def _finalize_restart_state_on_startup() -> None:
 @PriorityLifecycle.on_startup(priority=0, stage="management", timeout=10)
 async def _cleanup_restart_artifacts() -> None:
     _cleanup_legacy_restart_artifacts()
-    _finalize_restart_state_on_startup()
+    try:
+        _finalize_restart_state_on_startup()
+    except (OSError, ValueError, RuntimeError) as error:
+        logger.warning(f"重启记录待核验: {type(error).__name__}", "重启")
 
 
 @PriorityLifecycle.on_shutdown(priority=99)

@@ -1,5 +1,6 @@
 from collections.abc import Callable
 import copy
+from io import StringIO
 from pathlib import Path
 import sys
 from typing import Any, TypeVar
@@ -588,8 +589,7 @@ class ConfigsManager:
             save_simple_data: 同时保存至config.yaml.
         """
         if save_simple_data:
-            with open(self._simple_file, "w", encoding="utf8") as f:
-                _yaml.dump(self._simple_data, f)
+            self._save_yaml(self._simple_file, self._simple_data)
         path = path or self.file
         save_data = {
             module: {
@@ -598,8 +598,18 @@ class ConfigsManager:
             }
             for module, config_group in self._data.items()
         }
-        with open(path, "w", encoding="utf8") as f:
-            _yaml.dump(save_data, f)
+        self._save_yaml(Path(path), save_data)
+
+    @staticmethod
+    def _save_yaml(path: Path, data: dict) -> None:
+        """保存配置，并为迁移验证阶段的受控写入记录回退证据"""
+        from zhenxun.services.migration.state import write_startup_configuration
+
+        stream = StringIO()
+        _yaml.dump(data, stream)
+        content = stream.getvalue()
+        if not write_startup_configuration(Path(path), content):
+            Path(path).write_text(content, encoding="utf8")
 
     def remove_groups(
         self, modules: set[str], keys: dict[str, set[str]] | None = None

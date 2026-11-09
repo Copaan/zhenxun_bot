@@ -19,16 +19,28 @@ class AtomicJsonLockTimeout(TimeoutError):
     pass
 
 
+class AtomicJsonRecordError(RuntimeError):
+    """持久化记录存在但无法确认内容，调用方不得将其视为空记录"""
+
+    code = "transaction_record_unreadable"
+
+
 def _lock_path(path: Path) -> Path:
     return path.with_name(f".{path.name}.lock")
 
 
-def _read_unlocked(path: Path, default: T, *, quarantine_corrupt: bool) -> T:
-    if not path.exists():
-        return deepcopy(default)
+def _read_unlocked(
+    path: Path, default: T, *, quarantine_corrupt: bool, strict: bool = False
+) -> T:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, TypeError):
+    except FileNotFoundError:
+        return deepcopy(default)
+    except (OSError, ValueError, TypeError) as error:
+        if strict:
+            raise AtomicJsonRecordError(
+                f"{path.name}: {type(error).__name__}"
+            ) from error
         if quarantine_corrupt:
             corrupt = path.with_name(
                 f".{path.name}.corrupt-{os.getpid()}-{uuid.uuid4().hex}"
@@ -83,10 +95,13 @@ def read_json_locked(
     *,
     timeout: float = 5.0,
     quarantine_corrupt: bool = False,
+    strict: bool = False,
 ) -> T:
     try:
         with FileLock(_lock_path(path), timeout=timeout):
-            return _read_unlocked(path, default, quarantine_corrupt=quarantine_corrupt)
+            return _read_unlocked(
+                path, default, quarantine_corrupt=quarantine_corrupt, strict=strict
+            )
     except Timeout as error:
         raise AtomicJsonLockTimeout(str(path)) from error
 
@@ -107,11 +122,14 @@ def mutate_json_locked(
     timeout: float = 5.0,
     quarantine_corrupt: bool = False,
     write_if: Callable[[Any], bool] | None = None,
+    strict: bool = False,
 ) -> Any:
     """Mutate under one lock, optionally persisting only selected results."""
     try:
         with FileLock(_lock_path(path), timeout=timeout):
-            value = _read_unlocked(path, default, quarantine_corrupt=quarantine_corrupt)
+            value = _read_unlocked(
+                path, default, quarantine_corrupt=quarantine_corrupt, strict=strict
+            )
             result = mutator(value)
             if write_if is None or write_if(result):
                 _write_unlocked(path, value)
@@ -122,6 +140,7 @@ def mutate_json_locked(
 
 __all__ = [
     "AtomicJsonLockTimeout",
+    "AtomicJsonRecordError",
     "mutate_json_locked",
     "read_json_locked",
     "write_json_locked",

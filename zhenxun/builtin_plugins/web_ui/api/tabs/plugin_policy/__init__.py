@@ -107,6 +107,7 @@ async def update_account_group(
                 block_tasks=payload.block_tasks,
                 forced_plugins=payload.forced_plugins,
                 forced_tasks=payload.forced_tasks,
+                touched_tasks=payload.touched_tasks,
             ),
             "单群设置",
         )

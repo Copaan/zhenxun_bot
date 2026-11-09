@@ -45,10 +45,17 @@ def install_cors_middleware(app: FastAPI | None = None) -> bool:
                 "/zhenxun/api/system/restart",
                 "/zhenxun/api/system/update",
             )
+            cancel_restore = (
+                request.method == "DELETE"
+                and path == "/zhenxun/api/backup/restore"
+                and bool(request.query_params.get("operation_id"))
+            )
             if (
                 request.method in {"POST", "PUT", "PATCH", "DELETE"}
                 and path.startswith("/zhenxun/api/")
                 and not path.startswith(recovery_prefixes)
+                and not cancel_restore
+                and not (request.method == "POST" and path == "/zhenxun/api/login")
                 and not startup_coordinator.runtime_ready
             ):
                 snapshot = startup_coordinator.snapshot()

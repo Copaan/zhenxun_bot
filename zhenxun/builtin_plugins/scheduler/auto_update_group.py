@@ -14,17 +14,7 @@ from zhenxun.utils.platform import PlatformUtils
     minute=1,
 )
 async def _():
-    if should_pause_db_tasks():
-        return
-    bots = nonebot.get_bots()
-    for bot in bots.values():
-        if PlatformUtils.get_platform_scope(bot) != "qq_client":
-            continue
-        try:
-            await PlatformUtils.update_group(bot)
-        except Exception as e:
-            logger.error(f"Bot: {bot.self_id} 自动更新群组信息", "自动更新群组", e=e)
-    logger.info("自动更新群组成员信息成功...")
+    await _refresh_accounts("group_directory_refresh", PlatformUtils.update_group)
 
 
 # 自动更新好友信息
@@ -34,19 +24,34 @@ async def _():
     minute=1,
 )
 async def _():
-    if should_pause_db_tasks():
-        return
-    bots = nonebot.get_bots()
-    for bot in bots.values():
-        if PlatformUtils.get_platform_scope(bot) != "qq_client":
-            continue
-        try:
-            await PlatformUtils.update_friend(bot)
-        except Exception as e:
-            logger.error(
-                f"Bot: {bot.self_id} 自动更新好友信息错误", "自动更新好友", e=e
-            )
-    logger.info("自动更新好友信息成功...")
+    await _refresh_accounts("friend_directory_refresh", PlatformUtils.update_friend)
+
+
+async def _refresh_accounts(task, refresh):
+    """逐账号更新目录，区分无在线账号、负载暂停和失败。"""
+    from zhenxun.services.scheduler.lifecycle import core_task_run
+
+    async with core_task_run(task) as run:
+        run.update(unit="accounts", failed=0, skipped=0)
+        if should_pause_db_tasks():
+            run.update(status="skipped", reason="db_pressure")
+            return
+        bots = list(nonebot.get_bots().values())
+        if not bots:
+            run.update(status="skipped", reason="no_connected_bot")
+            return
+        for bot in bots:
+            if PlatformUtils.get_platform_scope(bot) != "qq_client":
+                run["skipped"] += 1
+                continue
+            try:
+                await refresh(bot)
+                run["processed"] += 1
+            except Exception as error:
+                run["failed"] += 1
+                logger.error(f"Bot: {bot.self_id} 目录更新失败", task, e=error)
+        if run["skipped"] and not run["processed"] and not run["failed"]:
+            run.update(status="skipped", reason="unsupported_platform")
 
 
 # 自动清理静态标签中的无效群组
@@ -56,11 +61,11 @@ async def _():
     minute=50,
 )
 async def _prune_stale_tags():
-    deleted_count = await tag_manager.prune_stale_group_links()
-    if deleted_count > 0:
-        logger.info(
-            f"定时任务：成功清理了 {deleted_count} 个无效的群组标签" f"关联。",
-            "群组标签管理",
-        )
-    else:
-        logger.debug("定时任务：未发现无效的群组标签关联。", "群组标签管理")
+    from zhenxun.services.scheduler.lifecycle import core_task_run
+
+    async with core_task_run("static_group_tags_cleanup") as run:
+        if should_pause_db_tasks():
+            run.update(status="skipped", reason="db_pressure")
+            return
+        result = await tag_manager.prune_stale_group_links_report()
+        run.update(result, processed=result["deleted"])

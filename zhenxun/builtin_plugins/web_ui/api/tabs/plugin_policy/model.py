@@ -12,6 +12,7 @@ class AccountPolicyUpdate(BaseModel):
 class GroupPolicyUpdate(AccountPolicyUpdate):
     forced_plugins: list[str] | None = None
     forced_tasks: list[str] | None = None
+    touched_tasks: list[str] | None = None
 
 
 class PolicyCreate(BaseModel):

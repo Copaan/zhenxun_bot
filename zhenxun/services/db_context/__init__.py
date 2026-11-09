@@ -8,6 +8,10 @@ from tortoise.connection import connections
 from tortoise.exceptions import ConfigurationError
 
 from zhenxun.configs.config import BotConfig
+from zhenxun.services.lifecycle.deadline import (
+    FINAL_SNAPSHOT_SECONDS,
+    WORKER_SHUTDOWN_SECONDS,
+)
 from zhenxun.services.log import logger
 from zhenxun.utils.manager.priority_manager import PriorityLifecycle
 
@@ -132,20 +136,23 @@ async def init():
                 inspect_database_tls(endpoint, Tortoise.get_connection("default")),
                 DB_TIMEOUT_SECONDS,
             )
-        migrations = await collect_script_migrations()
-        await run_script_migrations(migrations)
-        # Tortoise may emit column comments/index SQL during generate_schemas().
-        # On existing databases with newly added nullable fields, PostgreSQL can
-        # fail before the post-generate SchemaGuard gets a chance to repair drift.
-        await repair_safe_schema_drift()
-        logger.debug("开始生成数据库表结构...")
-        await Tortoise.generate_schemas()
-        await run_script_migrations(migrations)
-        finish_script_migrations(migrations)
-        logger.debug("数据库表结构生成完毕!")
-        await ensure_chat_history_nullable_columns()
-        await ensure_group_plugin_scope_constraint()
-        await repair_safe_schema_drift()
+        from zhenxun.services.migration.restore import prepare_schema
+
+        if not await prepare_schema(Tortoise.get_connection("default")):
+            migrations = await collect_script_migrations()
+            await run_script_migrations(migrations)
+            # Tortoise may emit column comments/index SQL during generate_schemas().
+            # On existing databases with newly added nullable fields, PostgreSQL can
+            # fail before the post-generate SchemaGuard gets a chance to repair drift.
+            await repair_safe_schema_drift()
+            logger.debug("开始生成数据库表结构...")
+            await Tortoise.generate_schemas()
+            await run_script_migrations(migrations)
+            finish_script_migrations(migrations)
+            logger.debug("数据库表结构生成完毕!")
+            await ensure_chat_history_nullable_columns()
+            await ensure_group_plugin_scope_constraint()
+            await repair_safe_schema_drift()
         bind_database_connection(endpoint)
         _database_ready = True
         logger.info("Database loaded successfully!")
@@ -161,22 +168,42 @@ async def init():
 )
 async def import_restore():
     """导入从备份恢复或切换数据库时待写入的数据"""
+    global _database_ready
+
     from zhenxun.services.migration.restore import import_pending
 
-    await import_pending()
+    try:
+        await import_pending()
+    except BaseException:
+        _database_ready = False
+        raise
 
 
-@PriorityLifecycle.on_shutdown(priority=100, component_id="management:database")
+@PriorityLifecycle.on_shutdown(
+    priority=100,
+    timeout=WORKER_SHUTDOWN_SECONDS + FINAL_SNAPSHOT_SECONDS,
+    component_id="management:database",
+)
 async def disconnect():
     global _database_ready
 
     from zhenxun.configs.database import bind_database_connection
+    from zhenxun.services.migration.restore import final_snapshot
 
-    _database_ready = False
-    bind_database_connection(None)
+    snapshot_error = None
+    try:
+        await final_snapshot()
+    except BaseException as error:
+        snapshot_error = error
+    finally:
+        _database_ready = False
+        bind_database_connection(None)
     try:
         await connections.close_all()
     except ConfigurationError:
         logger.debug("数据库连接未初始化，跳过关闭")
     except Exception as e:
         logger.error(f"关闭数据库连接时发生意外错误: {e}")
+
+    if snapshot_error is not None:
+        raise snapshot_error

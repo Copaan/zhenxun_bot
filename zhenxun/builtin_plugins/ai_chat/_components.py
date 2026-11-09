@@ -4,8 +4,12 @@
 """
 
 from dataclasses import dataclass
+from importlib import metadata
 import importlib.util
 from typing import Any
+
+from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
 
 from zhenxun.services.ai.utils.doc_parse import DOC_MODULES, OCR_MODULES
 
@@ -75,6 +79,13 @@ def component_status(*keys: str) -> list[dict[str, Any]]:
     返回:
         list[dict[str, Any]]: 组件信息与是否已安装
     """
+    try:
+        from zhenxun.services.nonebot_store.storage import pending_transaction
+
+        transaction = pending_transaction()
+        known = True
+    except Exception:
+        transaction, known = None, False
     return [
         {
             "key": c.key,
@@ -82,7 +93,85 @@ def component_status(*keys: str) -> list[dict[str, Any]]:
             "description": c.description,
             "packages": list(c.packages),
             "installed": installed(c.key),
+            **_install_status(c, transaction, known=known),
         }
         for c in COMPONENTS.values()
         if not keys or c.key in keys
     ]
+
+
+def _install_status(
+    component: Component, transaction: dict | None, *, known: bool
+) -> dict[str, Any]:
+    """从联合候选事务读取组件变更状态，不把候选包当作当前已安装。"""
+    result = {
+        "install_state": "installed" if installed(component.key) else "not_installed",
+        "install_operation_ids": [],
+        "install_transaction_revision": None,
+    }
+    if not known:
+        return {**result, "install_state": "unknown"}
+    if not transaction:
+        return result
+    try:
+        requirements = [Requirement(value) for value in component.packages]
+        names = {canonicalize_name(value.name) for value in requirements}
+        previous = (transaction.get("base_manifest") or {}).get(
+            "manual_requirements", {}
+        )
+        operations = []
+        for operation in transaction.get("operations", []):
+            target = operation.get("target_manifest") or {}
+            roots = target.get("manual_requirements", previous)
+            touched = {
+                canonicalize_name(name)
+                for name in set(previous) | set(roots)
+                if previous.get(name) != roots.get(name)
+            }
+            for value in operation.get("requested_requirements", []):
+                touched.add(canonicalize_name(Requirement(value).name))
+            if names & touched and operation.get("operation_id"):
+                operations.append(operation["operation_id"])
+            previous = roots
+        if not operations:
+            return result
+        target = transaction.get("target_manifest") or {}
+        packages = target.get("packages", {})
+        base_packages = (transaction.get("base_manifest") or {}).get("packages", {})
+        ready = True
+        for requirement in requirements:
+            name = canonicalize_name(requirement.name)
+            version = (packages.get(name) or {}).get("version")
+            if version is None and name not in base_packages:
+                try:
+                    version = metadata.version(name)
+                except metadata.PackageNotFoundError:
+                    pass
+            if version is None or not requirement.specifier.contains(
+                str(version), prereleases=True
+            ):
+                ready = False
+        state = {
+            "pending_restart": "restart_pending",
+            "building": "preparing",
+            "preparing": "preparing",
+            "verification_pending": "verifying",
+            "committing": "verifying",
+            "settling": "verifying",
+            "migration_blocked": "attention_required",
+            "recovery_required": "recovery_required",
+            "failed": "attention_required",
+            "committed": result["install_state"],
+            "cleanup_pending": result["install_state"],
+        }.get(transaction.get("state"), "unknown")
+        if transaction.get("rollback_confirmed"):
+            state = result["install_state"]
+        return {
+            **result,
+            "install_state": state,
+            "install_operation_ids": list(dict.fromkeys(operations)),
+            "install_transaction_revision": transaction.get("revision"),
+            "install_target_ready": ready,
+        }
+    except (AttributeError, TypeError, ValueError):
+        return {**result, "install_state": "unknown"}

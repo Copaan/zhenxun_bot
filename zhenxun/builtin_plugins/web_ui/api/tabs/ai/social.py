@@ -42,7 +42,22 @@ async def _sticker_item(sticker: Any) -> dict[str, Any]:
     from zhenxun.builtin_plugins.ai_chat._stickers import Stickers
 
     path = Stickers.thumb_path(sticker)
-    thumb = await asyncio.to_thread(path.read_bytes) if path.exists() else b""
+
+    def read_thumb() -> bytes:
+        """读取并验证缩略图，缺失或损坏时返回空内容。"""
+        try:
+            from io import BytesIO
+
+            from PIL import Image
+
+            data = path.read_bytes()
+            with Image.open(BytesIO(data)) as image:
+                image.verify()
+            return data
+        except (OSError, ValueError, SyntaxError, Image.DecompressionBombError):
+            return b""
+
+    thumb = await asyncio.to_thread(read_thumb)
     return {
         "id": sticker.id,
         "remark": sticker.remark,
@@ -65,6 +80,8 @@ async def list_stickers(
     query: str = Query(default="", max_length=64),
     source: Literal["", "ai", "steal", "webui", "qq"] = "",
     sort: Literal["used", "new", "recent"] = "used",
+    page: int | None = Query(default=None, ge=1),
+    page_size: int | None = Query(default=None, ge=1, le=100),
 ) -> Result:
     from zhenxun.builtin_plugins.ai_chat._data_source import MODULE
     from zhenxun.builtin_plugins.ai_chat._stickers import Stickers
@@ -72,10 +89,28 @@ async def list_stickers(
     from zhenxun.models.ai_sticker import AISticker
     from zhenxun.models.ai_sticker_block import AIStickerBlock
 
-    stickers = await Stickers.listing(query, source, sort)
+    if page is None and page_size is None:
+        stickers = await Stickers.listing(query, source, sort)
+        matched_total = len(stickers)
+    else:
+        page, page_size = page or 1, page_size or 30
+        stickers, matched_total = await Stickers.listing_page(
+            query, source, sort, page, page_size
+        )
+    slot = asyncio.Semaphore(4)
+
+    async def item(sticker: Any) -> dict[str, Any]:
+        """在本次请求的并发上限内读取一张缩略图。"""
+        async with slot:
+            return await _sticker_item(sticker)
+
+    items = await asyncio.gather(*(item(sticker) for sticker in stickers))
     return Result.ok(
         {
-            "items": [await _sticker_item(s) for s in stickers],
+            "items": items,
+            "page": page,
+            "page_size": page_size,
+            "matched_total": matched_total,
             "total": await AISticker.all().count(),
             "blocked": await AIStickerBlock.all().count(),
             "limit": int(Config.get_config(MODULE, "STICKER_LIMIT") or 0),

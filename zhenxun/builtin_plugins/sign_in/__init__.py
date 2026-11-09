@@ -23,7 +23,7 @@ from zhenxun.utils.message import MessageUtils
 
 from ._data_source import SignManage
 from .goods_register import Uninfo
-from .utils import clear_sign_data_pic
+from .utils import clear_sign_data_pic_async
 
 __plugin_meta__ = PluginMetadata(
     name="签到",
@@ -182,8 +182,14 @@ async def _(
     minute=10,
 )
 async def _():
-    try:
-        clear_sign_data_pic()
-        logger.info("清理日常签到图片数据数据完成...", "签到")
-    except Exception as e:
-        logger.error("清理日常签到图片数据数据失败...", e=e)
+    from zhenxun.services.scheduler.lifecycle import core_task_run
+
+    async with core_task_run("sign_image_cleanup") as run:
+        result = await clear_sign_data_pic_async()
+        run.update(
+            processed=result["deleted"],
+            errors=result["errors"],
+            reason=result.get("reason", ""),
+        )
+        if result.get("reason") == "shutdown":
+            run["status"] = "cancelled"

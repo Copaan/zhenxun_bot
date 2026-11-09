@@ -1,5 +1,6 @@
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
 from functools import wraps
 import math
 import time
@@ -43,10 +44,20 @@ class ConnectionEpoch:
     bot: weakref.ReferenceType
     connected_second: int
     connection_id: str
+    connected_monotonic: float = field(default_factory=lambda: time.monotonic())
+    groups: dict[tuple[str, str], "GroupActivity"] = field(default_factory=dict)
+
+
+@dataclass
+class GroupActivity:
+    observed_since: float = field(default_factory=lambda: time.monotonic())
+    last_received_at: datetime | None = None
+    last_received_monotonic: float | None = None
+    revision: int = 0
 
 
 class ConnectionEpochs:
-    """按连接记录 Bot 接入时间，用于丢弃接入前积压的旧消息"""
+    """按连接记录接入代际、群消息活动和连续观察时间"""
 
     def __init__(self) -> None:
         self._entries: dict[tuple[str, str], ConnectionEpoch] = {}
@@ -86,6 +97,74 @@ class ConnectionEpochs:
 
     def clear(self) -> None:
         self._entries.clear()
+
+    def observe_group(
+        self, bot, scope: str, group_id: str, channel_id: str | None = None
+    ) -> GroupActivity | None:
+        """为当前连接中的群建立观察基线，连接未知时不创建记录。"""
+        epoch = self.get(bot, scope)
+        if epoch is None:
+            return None
+        key = (str(group_id), str(channel_id or ""))
+        if key not in epoch.groups:
+            epoch.groups[key] = GroupActivity()
+        return epoch.groups[key]
+
+    def reset_group(
+        self, bot, scope: str, group_id: str, channel_id: str | None = None
+    ) -> None:
+        """机器人重新入群时重新建立该群的连续观察基线。"""
+        epoch = self.get(bot, scope)
+        if epoch is not None:
+            epoch.groups[(str(group_id), str(channel_id or ""))] = GroupActivity()
+
+    def message_scene(self, bot, event) -> tuple[str, str, str | None] | None:
+        """识别当前连接中有效的成员群消息，排除机器人和旧积压消息。"""
+        if event.get_type() != "message":
+            return None
+        from zhenxun.utils.platform import PlatformUtils
+
+        scope = PlatformUtils.get_platform_scope(bot)
+        if self.get(bot, scope) is None or self.is_backlog(
+            bot, scope, getattr(event, "time", None)
+        ):
+            return None
+        group_id = resolve_event_group_id(
+            event,
+            getattr(event, "group_openid", None) or getattr(event, "guild_id", None),
+        )
+        if not group_id:
+            return None
+        user_id = getattr(event, "user_id", None)
+        if user_id is None:
+            try:
+                user_id = event.get_user_id()
+            except (AttributeError, ValueError, NotImplementedError):
+                return None
+        if not user_id or str(user_id) == str(bot.self_id):
+            return None
+        for field_name in ("author", "sender"):
+            author = getattr(event, field_name, None)
+            for flag in ("bot", "is_bot"):
+                value = (
+                    author.get(flag)
+                    if isinstance(author, dict)
+                    else getattr(author, flag, None)
+                )
+                if value is True:
+                    return None
+        return scope, group_id, resolve_event_channel_id(event, None)
+
+    def observe_message(self, bot, event, received_at: datetime) -> None:
+        """在排队和异步入库前同步记录成员消息的本地接收时刻。"""
+        scene = self.message_scene(bot, event)
+        if scene is None:
+            return
+        activity = self.observe_group(bot, *scene)
+        if activity is not None:
+            activity.last_received_at = received_at
+            activity.last_received_monotonic = time.monotonic()
+            activity.revision += 1
 
 
 connection_epochs = ConnectionEpochs()
@@ -247,7 +326,7 @@ def _skip_unavailable(function):
 
 @event_preprocessor
 @_skip_unavailable
-async def _drop_message_before_cache_ready(event: Event, bot: Bot):
+async def _drop_message_before_cache_ready(event: Event, bot: Bot, state=None):
     mark_activity()
     if event.get_type() == "message" and not await wait_cache_ready(10):
         raise IgnoredException("cache not ready ignore")
@@ -279,6 +358,28 @@ async def _drop_message_before_cache_ready(event: Event, bot: Bot):
         bot, PlatformUtils.get_platform_scope(bot), getattr(event, "time", None)
     ):
         raise IgnoredException("drop backlog message")
+    if expected := (state or {}).get("_zx_connection_epoch"):
+        current = connection_epochs.get(bot, expected[0])
+        if current is None or current.connection_id != expected[1]:
+            raise IgnoredException("drop previous connection message")
+    if scene := connection_epochs.message_scene(bot, event):
+        from zhenxun.services.bot_group_policy import bot_group_policy_service
+
+        bot_id = PlatformUtils.get_storage_bot_id(bot)
+        try:
+            await bot_group_policy_service.resume_inactive_tasks(bot_id, *scene)
+            await bot_group_policy_service.ensure_fresh(bot_id, *scene)
+        except Exception as error:
+            logger.warning(
+                "群被动恢复尚未确认，消息照常处理，等待后续消息重试",
+                "Chat检测",
+                target=scene[1],
+                e=error,
+            )
+    if expected := (state or {}).get("_zx_connection_epoch"):
+        current = connection_epochs.get(bot, expected[0])
+        if current is None or current.connection_id != expected[1]:
+            raise IgnoredException("drop previous connection message")
 
 
 def _admit_plugin(matcher: Matcher) -> None:

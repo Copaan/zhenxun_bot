@@ -1,3 +1,4 @@
+import asyncio
 from contextlib import suppress
 from datetime import datetime, timedelta
 import os
@@ -17,6 +18,23 @@ from zhenxun.services.db_context.schema_ops import (
 
 if TYPE_CHECKING:
     from nonebot_plugin_alconna import UniMessage
+
+
+class CleanupResult(tuple):
+    """聊天清理计数与本轮批次状态，支持清空数、删除数解包。"""
+
+    pause_reason: str
+    batches: int
+    scanned: int
+
+    def __new__(
+        cls, cleared: int, deleted: int, pause_reason: str, batches: int, scanned: int
+    ):
+        result = super().__new__(cls, (cleared, deleted))
+        result.pause_reason = pause_reason
+        result.batches = batches
+        result.scanned = scanned
+        return result
 
 
 async def ensure_chat_history_nullable_columns() -> None:
@@ -168,28 +186,91 @@ class ChatHistory(Model):
         return segments
 
     @classmethod
-    async def cleanup(cls, segment_days: int, retention_days: int) -> tuple[int, int]:
-        """清空过期的结构化消息段，删除超过保留天数的记录，天数为 0 表示不处理
+    async def cleanup(
+        cls, segment_days: int, retention_days: int, *, progress: dict | None = None
+    ) -> CleanupResult:
+        """按主键分批清理过期记录和消息段，数据库繁忙或关闭时暂停。
 
         参数:
             segment_days: 结构化消息段保留天数
             retention_days: 记录保留天数
+            progress: 每批提交确认后更新的计数映射
 
         返回:
-            tuple[int, int]: 清空消息段的条数, 删除的条数
+            CleanupResult: 清空数、删除数及暂停原因、批次和扫描数
         """
+        from zhenxun.services.lifecycle import lifecycle_kernel
+        from zhenxun.services.message_load import should_pause_db_tasks
+
         now = datetime.now()
-        cleared = deleted = 0
-        if retention_days > 0:
-            deleted = await cls.filter(
-                create_time__lt=now - timedelta(days=retention_days)
-            ).delete()
-        if segment_days > 0:
-            cleared = await cls.filter(
-                create_time__lt=now - timedelta(days=segment_days),
-                segments__isnull=False,
-            ).update(segments=None)
-        return cleared, deleted
+        cleared = deleted = batches = scanned = 0
+        if progress is not None:
+            progress.update(processed=0, cleared=0, deleted=0, batches=0, scanned=0)
+        pause_reason = ""
+        if segment_days <= 0 and retention_days <= 0:
+            return CleanupResult(0, 0, "disabled", 0, 0)
+        if lifecycle_kernel.shutdown_requested:
+            return CleanupResult(0, 0, "shutdown", 0, 0)
+        if should_pause_db_tasks():
+            return CleanupResult(0, 0, "db_pressure", 0, 0)
+        last = await cls.all().order_by("-id").limit(1).values_list("id", flat=True)
+        high_water = last[0] if last else 0
+        cursor = 0
+        delete_cutoff = now - timedelta(days=retention_days)
+        segment_cutoff = now - timedelta(days=segment_days)
+        while cursor < high_water:
+            if lifecycle_kernel.shutdown_requested:
+                pause_reason = "shutdown"
+                break
+            if should_pause_db_tasks():
+                pause_reason = "db_pressure"
+                break
+            ids = (
+                await cls.filter(id__gt=cursor, id__lte=high_water)
+                .order_by("id")
+                .limit(500)
+                .values_list("id", flat=True)
+            )
+            if not ids:
+                break
+            if lifecycle_kernel.shutdown_requested:
+                pause_reason = "shutdown"
+                break
+            if should_pause_db_tasks():
+                pause_reason = "db_pressure"
+                break
+            async with in_transaction(
+                connection_name=cls._meta.default_connection
+            ) as tx:
+                if retention_days > 0:
+                    deleted += (
+                        await cls.filter(id__in=ids, create_time__lt=delete_cutoff)
+                        .using_db(tx)
+                        .delete()
+                    )
+                if segment_days > 0:
+                    cleared += (
+                        await cls.filter(
+                            id__in=ids,
+                            create_time__lt=segment_cutoff,
+                            segments__isnull=False,
+                        )
+                        .using_db(tx)
+                        .update(segments=None)
+                    )
+            cursor = ids[-1]
+            scanned += len(ids)
+            batches += 1
+            if progress is not None:
+                progress.update(
+                    processed=cleared + deleted,
+                    cleared=cleared,
+                    deleted=deleted,
+                    batches=batches,
+                    scanned=scanned,
+                )
+            await asyncio.sleep(0)
+        return CleanupResult(cleared, deleted, pause_reason, batches, scanned)
 
     @classmethod
     def _platform_from_scope(cls, platform_scope: str | None) -> str | None:

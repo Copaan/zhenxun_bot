@@ -29,6 +29,7 @@ from zhenxun.utils.enum import PluginType
 from zhenxun.utils.image_utils import BuildImage, ImageTemplate, RowStyle
 from zhenxun.utils.repo_utils import RepoFileManager
 from zhenxun.utils.repo_utils.models import RepoFileInfo, RepoType
+from zhenxun.utils.repo_utils.utils import redact_git_output
 from zhenxun.utils.utils import is_number, win_on_rm_error
 
 from .config import (
@@ -771,11 +772,33 @@ class StoreManager:
 
     @staticmethod
     def _copy(source: Path, target: Path) -> None:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if source.is_dir():
-            shutil.copytree(source, target)
-        else:
-            shutil.copy2(source, target)
+        if not source.exists():
+            raise PluginStoreException(
+                "plugin_source_missing",
+                code="plugin_source_missing",
+                details={"stage": "source_copy", "file": source.name},
+            )
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if source.is_dir():
+                shutil.copytree(source, target)
+            else:
+                shutil.copy2(source, target)
+        except OSError as error:
+            code = (
+                "plugin_source_missing"
+                if isinstance(error, FileNotFoundError) and not source.exists()
+                else "plugin_file_access_failed"
+            )
+            raise PluginStoreException(
+                code,
+                code=code,
+                details={
+                    "stage": "source_copy",
+                    "file": source.name,
+                    "errno": error.errno,
+                },
+            ) from None
 
     @staticmethod
     def _remove_local(path: Path) -> None:
@@ -793,20 +816,45 @@ class StoreManager:
             candidate: 候选源码
             path: 插件路径
         """
+        if not candidate.exists():
+            raise PluginStoreException(
+                "plugin_candidate_missing",
+                code="plugin_candidate_missing",
+                details={"stage": "candidate_publish", "file": candidate.name},
+            )
         staging = BASE_PATH.parent / "data" / "runtime" / "plugin-store-staging"
-        staging.mkdir(parents=True, exist_ok=True)
-        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            staging.mkdir(parents=True, exist_ok=True)
+            path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            raise PluginStoreException(
+                "plugin_publish_failed",
+                code="plugin_publish_failed",
+                details={
+                    "stage": "publish_directory",
+                    "file": path.name,
+                    "errno": error.errno,
+                },
+            ) from None
         with tempfile.TemporaryDirectory(prefix=f"{path.name}.", dir=staging) as root:
             new, old = Path(root) / "new", Path(root) / "old"
             cls._copy(candidate, new)
-            if path.exists():
-                os.replace(path, old)
             try:
+                if path.exists():
+                    os.replace(path, old)
                 os.replace(new, path)
-            except Exception:
+            except OSError as error:
                 if old.exists() and not path.exists():
                     os.replace(old, path)
-                raise
+                raise PluginStoreException(
+                    "plugin_publish_failed",
+                    code="plugin_publish_failed",
+                    details={
+                        "stage": "candidate_publish",
+                        "file": path.name,
+                        "errno": error.errno,
+                    },
+                ) from None
             cls._remove_local(old)
 
     @classmethod
@@ -848,6 +896,7 @@ class StoreManager:
         """
         source_order = cls._get_source_order(source, cls._aliyun_available(plugin_info))
         errors: list[str] = []
+        source_errors: list[dict[str, Any]] = []
         staged_result: tuple[list[tuple[Path, Path]], list[Path]] | None = None
         selected_source: RepoType | None = None
         for repo_type in source_order:
@@ -862,17 +911,25 @@ class StoreManager:
                 )
                 break
             except Exception as e:
-                errors.append(f"{source_name}: {e}")
+                errors.append(f"{source_name}: {redact_git_output(e)}")
+                source_errors.append(
+                    {
+                        "source": repo_type.value,
+                        "reason": getattr(e, "code", None) or "plugin_download_failed",
+                        "details": getattr(e, "details", None),
+                    }
+                )
                 if repo_type != source_order[-1]:
                     logger.warning(
                         f"插件 {plugin_info.name} 使用{source_name}下载失败，"
                         "尝试 GitHub",
                         LOG_COMMAND,
-                        e=e,
                     )
         if staged_result is None or selected_source is None:
             raise PluginStoreException(
-                f"插件 {plugin_info.name} 下载失败（{'；'.join(errors)}）"
+                f"插件 {plugin_info.name} 下载失败（{'；'.join(errors)}）",
+                code=source_errors[-1]["reason"],
+                details={"stage": "source_download", "sources": source_errors},
             )
 
         deploy_files, requirement_files = staged_result
@@ -896,7 +953,14 @@ class StoreManager:
                     raise PluginStoreException(
                         "source_build_confirmation_required"
                     ) from error
-                raise PluginStoreException(cls._dependency_error(error)) from error
+                raise PluginStoreException(
+                    cls._dependency_error(error),
+                    code=error.code,
+                    details={
+                        "stage": "dependency_preflight",
+                        "diagnostic": error.details,
+                    },
+                ) from None
         result = StoreInstallResult(
             dependency_plan=dependency_plan,
             download_source="ali" if selected_source == RepoType.ALIYUN else "git",
@@ -916,6 +980,12 @@ class StoreManager:
         candidate = root / "candidate" / local_path.name
         for staged_path, destination_path in deploy_files:
             cls._copy(staged_path, candidate / destination_path.relative_to(local_path))
+        if not candidate.exists():
+            raise PluginStoreException(
+                "plugin_candidate_missing",
+                code="plugin_candidate_missing",
+                details={"stage": "candidate_prepare", "file": candidate.name},
+            )
         return candidate, result
 
     @staticmethod
@@ -1115,7 +1185,11 @@ class StoreManager:
 
         for source_path, staged_path in required_download_files:
             if not staged_path.is_file():
-                raise PluginStoreException(f"插件文件下载不完整: {source_path}")
+                raise PluginStoreException(
+                    "plugin_source_missing",
+                    code="plugin_source_missing",
+                    details={"stage": "download_validation", "file": staged_path.name},
+                )
             if (
                 Path(source_path).suffix.lower() in cls._BINARY_EXTENSIONS
                 and staged_path.stat().st_size == 0

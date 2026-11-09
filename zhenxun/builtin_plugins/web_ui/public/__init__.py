@@ -76,6 +76,7 @@ class WebUIResources:
                 self._stamp = stamp
                 await asyncio.to_thread(self._load)
                 self._mount_resources()
+            update_service.record_webui_ready(self.manifest if self.ready else None)
         return self
 
     def _mount_resources(self) -> None:
@@ -102,6 +103,8 @@ class WebUIResources:
         """发布后刷新入口缓存和静态目录映射。"""
         self._stamp = None
         await self.refresh()
+        if not self.ready:
+            raise update_service.UpdateServiceError("webui_refresh_failed")
 
     async def start(self, root: Path) -> None:
         """设置资源目录并读取入口页
@@ -136,6 +139,9 @@ async def index():
         reason = escape(str(status.get("reason") or "正在准备新版管理页面。"))
         retry_at = escape(str(status.get("next_retry_at") or ""))
         phase = {
+            "checking": "核对页面发布版本",
+            "state_unknown": "更新状态暂不可确认",
+            "refresh_pending": "已发布，刷新待重试",
             "queued": "等待更新",
             "preparing": "检查发布版本",
             "downloading": "下载新版资源",

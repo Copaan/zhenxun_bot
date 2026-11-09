@@ -4,18 +4,22 @@
 提供一个统一的、带缓存的头像获取服务，支持多平台和可配置的过期策略。
 """
 
+import asyncio
 from collections import OrderedDict
 from hashlib import sha256
 import os
 from pathlib import Path
+import threading
 import time
 
 from nonebot_plugin_apscheduler import scheduler
 
 from zhenxun.configs.config import Config
 from zhenxun.configs.path_config import DATA_PATH
+from zhenxun.services.lifecycle import lifecycle_kernel
 from zhenxun.services.log import logger
 from zhenxun.utils.http_utils import AsyncHttpx
+from zhenxun.utils.manager.priority_manager import PriorityLifecycle
 from zhenxun.utils.platform import PlatformUtils
 
 Config.add_plugin_config(
@@ -55,6 +59,10 @@ class AvatarService:
         self.cache_path = (DATA_PATH / "cache" / "avatars").resolve()
         self.cache_path.mkdir(parents=True, exist_ok=True)
         self._memory_cache: OrderedDict[str, Path] = OrderedDict()
+        self._cleanup_lock = asyncio.Lock()
+        self._cleanup_stop = threading.Event()
+        self._file_lock = threading.Lock()
+        self._writing: dict[Path, int] = {}
 
     def _get_cache_path(self, platform: str, identifier: str) -> Path:
         """
@@ -81,7 +89,21 @@ class AvatarService:
         if path.exists() and time.time() - path.stat().st_mtime < ttl:
             return path
         path.parent.mkdir(parents=True, exist_ok=True)
-        return path if await AsyncHttpx.download_file(url, path) else None
+        return path if await self._download_avatar(url, path) else None
+
+    async def _download_avatar(self, url: str, path: Path) -> bool:
+        """下载头像期间保护目标文件，避免后台清理删除写入中的文件。"""
+        with self._file_lock:
+            self._writing[path] = self._writing.get(path, 0) + 1
+        try:
+            return await AsyncHttpx.download_file(url, path)
+        finally:
+            with self._file_lock:
+                remaining = self._writing[path] - 1
+                if remaining:
+                    self._writing[path] = remaining
+                else:
+                    self._writing.pop(path)
 
     def clear_memory_cache(self) -> int:
         size = len(self._memory_cache)
@@ -137,7 +159,7 @@ class AvatarService:
 
         local_path.parent.mkdir(parents=True, exist_ok=True)
 
-        if await AsyncHttpx.download_file(avatar_url, local_path):
+        if await self._download_avatar(avatar_url, local_path):
             self._memory_cache[cache_key] = local_path
             self._memory_cache.move_to_end(cache_key)
             while len(self._memory_cache) > self._MEMORY_CACHE_MAX_ITEMS:
@@ -147,47 +169,106 @@ class AvatarService:
             logger.warning(f"下载头像失败: {avatar_url}", "AvatarService")
             return None
 
-    async def _cleanup_cache(self):
-        """后台定时清理过期的缓存文件"""
+    async def _cleanup_cache(self) -> dict:
+        """在线程清理过期文件，取消时等待文件操作结束再释放互斥。"""
         if not Config.get_config("avatar_cache", "ENABLED"):
-            return
-
-        logger.info("开始执行头像缓存清理任务...", "AvatarService")
-        ttl_seconds = Config.get_config("avatar_cache", "TTL_DAYS", 7) * 86400
-        now = time.time()
-        deleted_count = 0
-        for root, _, files in os.walk(self.cache_path):
-            for name in files:
-                file_path = Path(root) / name
-                try:
-                    if now - os.path.getmtime(file_path) > ttl_seconds:
-                        file_path.unlink()
-                        deleted_count += 1
-                except FileNotFoundError:
-                    continue
-
-        if self._memory_cache:
-            stale_keys = []
-            for key, cached_path in self._memory_cache.items():
-                if not cached_path.exists():
-                    stale_keys.append(key)
-                    continue
-                try:
-                    if now - os.path.getmtime(cached_path) > ttl_seconds:
-                        stale_keys.append(key)
-                except OSError:
-                    stale_keys.append(key)
-            for key in stale_keys:
-                self._memory_cache.pop(key, None)
+            return {"deleted": 0, "errors": 0, "reason": "disabled"}
+        async with self._cleanup_lock:
+            if lifecycle_kernel.shutdown_requested:
+                return {"deleted": 0, "errors": 0, "reason": "shutdown"}
+            self._cleanup_stop.clear()
+            snapshot = tuple(self._memory_cache.items())
+            worker = asyncio.create_task(
+                asyncio.to_thread(
+                    self._cleanup_files,
+                    time.time(),
+                    Config.get_config("avatar_cache", "TTL_DAYS", 7) * 86400,
+                    snapshot,
+                )
+            )
+            try:
+                result, stale = await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                self._cleanup_stop.set()
+                while not worker.done():
+                    try:
+                        await asyncio.shield(worker)
+                    except asyncio.CancelledError:
+                        continue
+                worker.result()
+                raise
+            for key, path in stale:
+                if self._memory_cache.get(key) is path:
+                    self._memory_cache.pop(key, None)
             while len(self._memory_cache) > self._MEMORY_CACHE_MAX_ITEMS:
                 self._memory_cache.popitem(last=False)
+            return result
 
-        logger.info(
-            f"头像缓存清理完成，共删除 {deleted_count} 个过期文件。", "AvatarService"
-        )
+    def _cleanup_files(self, now: float, ttl: float, snapshot: tuple) -> tuple:
+        """扫描缓存目录并逐文件隔离异常，内存缓存仅返回待核销快照。"""
+        result = {"deleted": 0, "errors": 0, "reason": ""}
+        stale = []
+
+        def stopping():
+            return self._cleanup_stop.is_set() or lifecycle_kernel.shutdown_requested
+
+        def failed(error):
+            result["errors"] += 1
+            logger.warning(f"头像缓存清理文件失败: {error}", "AvatarService")
+
+        for root, _, files in os.walk(self.cache_path, onerror=failed):
+            for name in files:
+                if stopping():
+                    result["reason"] = (
+                        "shutdown"
+                        if lifecycle_kernel.shutdown_requested
+                        else "cancelled"
+                    )
+                    return result, stale
+                file_path = Path(root) / name
+                try:
+                    with self._file_lock:
+                        if (
+                            file_path not in self._writing
+                            and now - file_path.stat().st_mtime > ttl
+                        ):
+                            file_path.unlink()
+                            result["deleted"] += 1
+                except FileNotFoundError:
+                    continue
+                except OSError as error:
+                    failed(error)
+        for key, cached_path in snapshot:
+            if stopping():
+                result["reason"] = (
+                    "shutdown" if lifecycle_kernel.shutdown_requested else "cancelled"
+                )
+                break
+            try:
+                with self._file_lock:
+                    if cached_path in self._writing:
+                        continue
+                    if now - cached_path.stat().st_mtime > ttl:
+                        stale.append((key, cached_path))
+            except FileNotFoundError:
+                stale.append((key, cached_path))
+            except OSError as error:
+                failed(error)
+        return result, stale
+
+    async def stop_cleanup(self):
+        """请求停止并等待当前清理线程退出。"""
+        self._cleanup_stop.set()
+        async with self._cleanup_lock:
+            pass
 
 
 avatar_service = AvatarService()
+
+
+@PriorityLifecycle.on_shutdown(priority=5)
+async def _stop_avatar_cleanup():
+    await avatar_service.stop_cleanup()
 
 
 @scheduler.scheduled_job(
@@ -196,4 +277,18 @@ avatar_service = AvatarService()
     minute=30,
 )
 async def _run_avatar_cache_cleanup():
-    await avatar_service._cleanup_cache()
+    from zhenxun.services.scheduler.lifecycle import core_task_run
+
+    async with core_task_run("avatar_cleanup") as run:
+        result = await avatar_service._cleanup_cache()
+        run.update(
+            processed=result["deleted"],
+            errors=result["errors"],
+            reason=result.get("reason", ""),
+        )
+        if result.get("reason"):
+            run["status"] = (
+                "cancelled"
+                if result["reason"] in {"shutdown", "cancelled"}
+                else "skipped"
+            )

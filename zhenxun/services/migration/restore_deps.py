@@ -181,9 +181,29 @@ def _root_requirements(root: dict, pin: str | None) -> list[str]:
     """
     plugin = root["plugin"]
     if plugin is not None:
-        if pin == plugin["version"] and plugin.get("resolution_inputs"):
-            return list(plugin["resolution_inputs"])
-        return [f"{plugin['project_link']}=={pin}"]
+        values = []
+        found = False
+        name = canonicalize_name(plugin["project_link"])
+        for raw in plugin.get("resolution_inputs") or []:
+            requirement = Requirement(raw)
+            if canonicalize_name(requirement.name) == name:
+                from zhenxun.services.nonebot_store.dependencies import (
+                    DependencyAnalysisError,
+                )
+
+                found = True
+                if (requirement.specifier and pin not in requirement.specifier) or (
+                    requirement.url and pin != plugin["version"]
+                ):
+                    raise DependencyAnalysisError(
+                        "dependency_explicit_version_conflict"
+                    )
+                if not requirement.url:
+                    requirement.specifier = SpecifierSet(f"=={pin}")
+            values.append(str(requirement))
+        if not found:
+            values.append(f"{plugin['project_link']}=={pin}")
+        return values
     declared = root["requirements"] or [root["name"]]
     if pin is None:
         return list(declared)
@@ -191,6 +211,12 @@ def _root_requirements(root: dict, pin: str | None) -> list[str]:
     for raw in declared:
         requirement = Requirement(raw)
         if canonicalize_name(requirement.name) == root["name"]:
+            if requirement.specifier and pin not in requirement.specifier:
+                from zhenxun.services.nonebot_store.dependencies import (
+                    DependencyAnalysisError,
+                )
+
+                raise DependencyAnalysisError("dependency_explicit_version_conflict")
             requirement.specifier = SpecifierSet(f"=={pin}")
         if str(requirement) not in result:
             result.append(str(requirement))
@@ -241,7 +267,29 @@ async def _plan(roots: dict, pins: dict, preferences: dict) -> dict:
     plan = await preview_manual_dependencies(
         values, "install", manifest=base, restore=True, preferences=preferences
     )
+    from zhenxun.services.nonebot_store.dependencies import DependencyAnalysisError
+    from zhenxun.services.nonebot_store.environment import capture_environment
+    from zhenxun.services.nonebot_store.policy import ORM_PACKAGES
+
+    current = capture_environment().versions
+    changes = [
+        name
+        for name, item in plan["target_manifest"]["packages"].items()
+        if name in ORM_PACKAGES and current.get(name) != str(item["version"])
+    ]
+    if changes:
+        raise DependencyAnalysisError(
+            "orm_dependency_console_required", details=changes
+        )
     plan["target_manifest"]["manual_requirements"] = manual
+    for plugin in plugins.values():
+        name = canonicalize_name(plugin["project_link"])
+        plan["target_manifest"]["packages"][name] = {
+            **plan["target_manifest"]["packages"].get(name, {}),
+            "version": str(plugin["version"]),
+        }
+    if plugins:
+        plan["no_change"] = False
     plan["requirements"] = values
     return plan
 
@@ -276,6 +324,13 @@ async def _nearby(root: dict) -> list[str]:
             version == current
             or version.major != current.major
             or (version.is_prerelease and not current.is_prerelease)
+        ):
+            continue
+        if any(
+            canonicalize_name(Requirement(raw).name) == root["name"]
+            and Requirement(raw).specifier
+            and version not in Requirement(raw).specifier
+            for raw in root["requirements"]
         ):
             continue
         newer = version > current
@@ -320,6 +375,15 @@ def _reason(error: Exception) -> str:
     return detail if len(detail) <= 300 else detail[:300] + "…"
 
 
+def _fallback_or_raise(error) -> None:
+    """仅对已确认的包解析冲突尝试降级方案，环境与网络故障保持失败"""
+    if error.code not in {
+        "dependency_resolution_failed",
+        "registry_version_not_on_pypi",
+    }:
+        raise error
+
+
 async def _choose(
     root: dict, key: str, preferences: dict
 ) -> tuple[str | None, str, dict]:
@@ -348,6 +412,7 @@ async def _choose(
             plan = await _plan({key: root}, {key: pin}, preferences)
             return pin, "", plan["target_manifest"]["packages"]
         except DependencyAnalysisError as error:
+            _fallback_or_raise(error)
             reason = reason or _reason(error)
         if pin is not None and pin == root["version"]:
             unpinned = [None] if root["plugin"] is None else []
@@ -381,8 +446,8 @@ async def _combine(
 
     try:
         return await _plan(roots, pins, preferences)
-    except DependencyAnalysisError:
-        pass
+    except DependencyAnalysisError as error:
+        _fallback_or_raise(error)
     singles = singles or {}
 
     def disagreements(key: str) -> int:
@@ -414,6 +479,7 @@ async def _combine(
                     {**accepted, key: root}, {**pins, key: pin}, preferences
                 )
             except DependencyAnalysisError as error:
+                _fallback_or_raise(error)
                 reason = reason or _reason(error)
                 if len(tried) == 1:
                     candidates = (
@@ -516,15 +582,16 @@ async def _dependents(
         return await dependency_graph(
             [raw for items in values for raw in items], preferences, target
         )
-    except DependencyAnalysisError:
-        pass
+    except DependencyAnalysisError as error:
+        _fallback_or_raise(error)
     semaphore = asyncio.Semaphore(4)
 
     async def single(requirements: list[str]) -> dict[str, set[str]]:
         async with semaphore:
             try:
                 return await dependency_graph(requirements, preferences, target)
-            except DependencyAnalysisError:
+            except DependencyAnalysisError as error:
+                _fallback_or_raise(error)
                 return {}
 
     graph: dict[str, set[str]] = {}
@@ -569,7 +636,11 @@ def _implied(roots: dict, graph: dict[str, set[str]]) -> dict[str, str]:
 
 
 async def stage_restore(
-    saved: dict, skip_failed: bool = False, files: Path | None = None
+    saved: dict,
+    skip_failed: bool = False,
+    files: Path | None = None,
+    *,
+    parent_operation_id: str | None = None,
 ) -> dict:
     """把备份中的依赖解析为当前环境可用的版本，写入待应用的依赖层事务
 
@@ -658,7 +729,7 @@ async def stage_restore(
         for key, owner in _implied(roots, graph).items():
             if roots[key]["kind"] in _IMPLIED_KINDS:
                 report["implied"][key] = owner
-                roots.pop(key)
+                roots[key]["version"] = None
             elif roots[key]["plugin"] is None:
                 roots[key]["version"] = None
     pins = {key: root["version"] for key, root in roots.items()}
@@ -666,7 +737,8 @@ async def stage_restore(
     if roots:
         try:
             plan = await _plan(roots, pins, preferences)
-        except DependencyAnalysisError:
+        except DependencyAnalysisError as error:
+            _fallback_or_raise(error)
             for key, root in list(roots.items()):
                 pins[key], reason, singles[key] = await _choose(root, key, preferences)
                 if reason:
@@ -701,6 +773,9 @@ async def stage_restore(
             await _combine(roots, pins, preferences, skip, singles) if roots else None
         )
     report["restored"] = sorted(roots)
+    report["implied"] = {
+        key: owner for key, owner in report["implied"].items() if owner in roots
+    }
     packages = plan["target_manifest"]["packages"] if plan else {}
     report["nearby"] = {
         key: [
@@ -723,7 +798,12 @@ async def stage_restore(
         for root in roots.values():
             if root["kind"] == "plugin" and root["name"] in declared:
                 target["manual_requirements"].pop(root["name"], None)
-        report["staged"] = stage_plan(plan, plan["requirements"], restore=True)
+        report["staged"] = stage_plan(
+            plan,
+            plan["requirements"],
+            restore=True,
+            parent_operation_id=parent_operation_id,
+        )
     if report["staged"]:
         report["revision"] = (pending_transaction() or {}).get("revision")
     return report
