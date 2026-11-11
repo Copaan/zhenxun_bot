@@ -10,6 +10,7 @@ from zhenxun.models.bot_connect_log import BotConnectLog
 from zhenxun.models.chat_history import ChatHistory
 from zhenxun.models.statistics import Statistics
 from zhenxun.utils.common_utils import SqlUtils
+from zhenxun.utils.time_utils import TimeUtils
 
 from ....base_model import BaseResultModel, QueryModel
 from ....utils import webui_db_call
@@ -31,7 +32,7 @@ class ApiDataSource:
         返回:
             ChatCallMonthCount: 数据内容
         """
-        now = datetime.now()
+        now = TimeUtils.now()
         filter_date = window_starts(now)["month"]
         chat_query = ChatHistory.filter(is_bot=False)
         call_query = Statistics

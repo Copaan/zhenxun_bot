@@ -18,6 +18,7 @@ from zhenxun.models.plugin_info import PluginInfo
 from zhenxun.models.statistics import Statistics
 from zhenxun.services.log import logger
 from zhenxun.utils.platform import PlatformUtils
+from zhenxun.utils.time_utils import TimeUtils
 
 from ....config import AVA_URL, GROUP_AVA_URL, QueryDateType
 from ....utils import webui_db_call, webui_platform
@@ -43,7 +44,7 @@ def window_starts(now: datetime) -> dict[str, datetime]:
     返回:
         dict[str, datetime]: 今日、近7天、近30天、近一年的起始时间
     """
-    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    today = TimeUtils.get_day_start(now)
     return {
         "day": today,
         "week": today - timedelta(days=6),
@@ -66,7 +67,7 @@ async def get_record_counts(
         QueryCount: 总数与今日、近7天、近30天、近一年数量
     """
     query = model.filter(bot_id=bot_id) if bot_id else model
-    starts = window_starts(datetime.now())
+    starts = window_starts(TimeUtils.now())
     result = await webui_db_call(
         query.annotate(
             total_count=Count("id"),
@@ -316,7 +317,7 @@ class ApiDataSource:
             query = query.filter(bot_id=bot_id)
         if date_type:
             query = query.filter(
-                create_time__gte=window_starts(datetime.now())[date_type.value]
+                create_time__gte=window_starts(TimeUtils.now())[date_type.value]
             )
         return query
 
