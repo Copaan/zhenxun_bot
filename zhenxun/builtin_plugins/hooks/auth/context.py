@@ -147,12 +147,12 @@ def resolve_actor_user_id(event: Event, fallback_user_id: str | None) -> str:
 
 
 def resolve_event_group_id(event: Event, fallback_group_id: str | None) -> str | None:
-    """notice 场景 session.group 可能缺失，回退到事件上的 group_id。"""
+    """读取事件群标识，忽略空群号并在缺失时使用会话群标识。"""
     event_group_id = getattr(event, "group_id", None)
-    if event_group_id is None:
-        return fallback_group_id
-    resolved = str(event_group_id)
-    return resolved or fallback_group_id
+    for value in (event_group_id, fallback_group_id):
+        if value is not None and str(value).strip() not in {"", "0"}:
+            return str(value)
+    return None
 
 
 def resolve_event_channel_id(

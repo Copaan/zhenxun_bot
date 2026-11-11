@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+import builtins
 from contextlib import AbstractContextManager
 from pathlib import Path
 from typing import Any, Literal
@@ -261,13 +262,13 @@ class MarkdownData(ContainerComponent):
     """
 
     style_name: str | None = None
-    elements: list[MarkdownElement] = Field(default_factory=list)
+    elements: builtins.list[MarkdownElement] = Field(default_factory=list)
     """Markdown元素列表"""
     width: int = 800
     """渲染区域宽度"""
     css_path: str | None = None
     """自定义CSS文件路径"""
-    _context_stack: list[Any] = PrivateAttr(default_factory=list)
+    _context_stack: builtins.list[Any] = PrivateAttr(default_factory=list)
 
     @property
     def template_name(self) -> str:
@@ -346,9 +347,9 @@ class MarkdownData(ContainerComponent):
 
     def table(
         self,
-        headers: list[str],
-        rows: list[list[str]],
-        alignments: list[Any] | None = None,
+        headers: builtins.list[str],
+        rows: builtins.list[builtins.list[str]],
+        alignments: builtins.list[Any] | None = None,
     ) -> Self:
         return self._append_element(
             TableElement(headers=headers, rows=rows, alignments=alignments)

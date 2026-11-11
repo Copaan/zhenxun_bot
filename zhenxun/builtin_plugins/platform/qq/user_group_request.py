@@ -75,23 +75,50 @@ async def _(
         nickname=uname,
         group_id=str(group_id),
     )
-    results = await PlatformUtils.send_superuser(
-        bot,
-        f"*****一份入群申请*****\n"
-        f"ID：{f.id}\n"
-        f"申请人：{uname}({session.user.id})\n群聊："
-        f"{group_id}\n邀请日期：{datetime.now().replace(microsecond=0)}\n"
-        "注：该请求为手动申请入群",
-    )
+    results = []
+    try:
+        results = await PlatformUtils.send_superuser(
+            bot,
+            f"*****一份入群申请*****\n"
+            f"ID：{f.id}\n"
+            f"申请人：{uname}({session.user.id})\n群聊："
+            f"{group_id}\n邀请日期：{datetime.now().replace(microsecond=0)}\n"
+            "注：该请求为手动申请入群",
+        )
+    except Exception as error:
+        logger.warning(
+            f"请求 ID {f.id}（Bot {bot.self_id}）通知失败："
+            f"{type(error).__name__}；请求仍可在 WebUI 处理",
+            "请求通知",
+        )
     if message_ids := [
         str(r[1].msg_ids[0]["message_id"]) for r in results if r[1] and r[1].msg_ids
     ]:
         f.message_ids = ",".join(message_ids)
-        await f.save(update_fields=["message_ids"])
+        try:
+            await f.save(update_fields=["message_ids"])
+        except Exception as error:
+            logger.warning(
+                f"请求 ID {f.id} 的通知已发送，引用消息记录保存失败："
+                f"{type(error).__name__}；可按请求 ID 处理",
+                "请求通知",
+            )
+    notified = any(result[1] for result in results)
+    if not notified:
+        logger.warning(
+            f"请求 ID {f.id}（Bot {bot.self_id}）未送达任何超级用户，"
+            "请检查超级用户配置及私聊发送错误",
+            "请求通知",
+        )
     await asyncio.sleep(random.randint(1, 5))
     await bot.send_private_msg(
         user_id=int(session.user.id),
-        message=f"已发送申请，请等待管理员审核，ID：{f.id}。",
+        message=(
+            f"申请已记录并通知管理员，请等待审核，ID：{f.id}。"
+            if notified
+            else f"申请已记录，ID：{f.id}，但管理员通知暂未送达。"
+            "请联系管理员在 WebUI 的好友/群组请求中处理。"
+        ),
     )
     logger.info(
         f"用户 {uname}({session.user.id}) 申请入群 {group_id}，ID：{f.id}。",

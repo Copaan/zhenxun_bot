@@ -68,8 +68,9 @@ async def import_transaction(client, *, outcome: dict | None = None):
     """在检查目标之前开始有界写事务，不在已开启的事务中再次 BEGIN"""
     dialect = client.capabilities.dialect
     context = client._in_transaction()
-    wrapper = context.connection
-    original = wrapper.start
+    wrapper = getattr(context, "client", None) or context.connection
+    begin_method = "begin" if hasattr(wrapper, "begin") else "start"
+    original = getattr(wrapper, begin_method)
     sqlite_timeout = None
     if outcome is not None:
         outcome["state"] = "not_started"
@@ -89,7 +90,7 @@ async def import_transaction(client, *, outcome: dict | None = None):
                 )
             await original()
 
-    wrapper.start = start
+    setattr(wrapper, begin_method, start)
     entered = False
     mysql_timeout = None
     try:
@@ -107,8 +108,11 @@ async def import_transaction(client, *, outcome: dict | None = None):
                     await wrapper.rollback()
                 finally:
                     connections.reset(context.token)
-                    if dialect == "sqlite" and context.lock.locked():
-                        context.lock.release()
+                    lock = getattr(context, "_trxlock", None) or getattr(
+                        context, "lock", None
+                    )
+                    if dialect == "sqlite" and lock is not None and lock.locked():
+                        lock.release()
                     elif getattr(wrapper._parent, "_pool", None):
                         await wrapper._parent._pool.release(wrapper._connection)
             raise
@@ -143,7 +147,7 @@ async def import_transaction(client, *, outcome: dict | None = None):
             if outcome is not None:
                 outcome["state"] = "committed"
     finally:
-        wrapper.start = original
+        setattr(wrapper, begin_method, original)
         if entered and dialect == "sqlite" and not wrapper._finalized:
             await wrapper.rollback()
         if sqlite_timeout is not None:
@@ -214,6 +218,65 @@ async def table_names(db) -> set[tuple[str | None, str]]:
         " WHERE TABLE_SCHEMA=DATABASE() AND TABLE_TYPE='BASE TABLE'"
     )
     return {(None, row["name"]) for row in await db.execute_query_dict(query)}
+
+
+async def has_business_rows(db, schema, name) -> bool:
+    """仅豁免结构完整且只含本地身份记录的受管迁移元数据表。"""
+    from hashlib import sha256
+    import json
+    import re
+
+    relation = relation_sql(db, name, schema)
+    if name != "migration_import_records":
+        return bool((await db.execute_query(f"SELECT 1 FROM {relation} LIMIT 1"))[1])
+    rows = await db.execute_query_dict(f"SELECT * FROM {relation} LIMIT 2")
+    if not rows:
+        return False
+    fields = {"id", "source_identity", "table_name", "source_pk", "target_pk"}
+    if len(rows) != 1 or set(rows[0]) != fields:
+        return True
+    row = rows[0]
+    source = row["source_identity"]
+    if (
+        not isinstance(source, str)
+        or not re.fullmatch("[0-9a-f]{32}", source)
+        or row["table_name"] != "__local__"
+        or row["source_pk"] != '"identity"'
+        or row["target_pk"] != '"identity"'
+        or row["id"]
+        not in {
+            sha256(b"zhenxun:migration:local-identity").hexdigest(),
+            sha256(
+                json.dumps(
+                    [source, "__local__", "identity"],
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ).encode()
+            ).hexdigest(),
+        }
+    ):
+        return True
+    dialect = db.capabilities.dialect
+    if dialect == "sqlite":
+        columns = await db.execute_query_dict(f"PRAGMA table_info({relation})")
+        return {item["name"] for item in columns} != fields or [
+            item["name"] for item in columns if item["pk"]
+        ] != ["id"]
+    if dialect == "mysql":
+        primary = await db.execute_query_dict(
+            "SELECT COLUMN_NAME AS name FROM information_schema.KEY_COLUMN_USAGE"
+            " WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=%s"
+            " AND CONSTRAINT_NAME='PRIMARY' ORDER BY ORDINAL_POSITION",
+            [name],
+        )
+    else:
+        primary = await db.execute_query_dict(
+            "SELECT a.attname AS name FROM pg_index i"
+            " JOIN pg_attribute a ON a.attrelid=i.indrelid AND a.attnum=ANY(i.indkey)"
+            " WHERE i.indrelid=$1::regclass AND i.indisprimary ORDER BY a.attnum",
+            [relation],
+        )
+    return [item["name"] for item in primary] != ["id"]
 
 
 async def foreign_keys(db) -> list[dict]:

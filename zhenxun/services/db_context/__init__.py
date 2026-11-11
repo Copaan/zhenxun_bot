@@ -1,10 +1,10 @@
 import asyncio
 from dataclasses import replace
+import inspect
 import os
 from pathlib import Path
 
 from tortoise import Tortoise
-from tortoise.connection import connections
 from tortoise.exceptions import ConfigurationError
 
 from zhenxun.configs.config import BotConfig
@@ -45,6 +45,7 @@ __all__ = [
 ]
 
 _database_ready = False
+_orm_context = None
 
 
 def database_ready() -> bool:
@@ -93,7 +94,7 @@ def get_config(endpoint=None) -> dict:
 )
 async def init():
     """连接数据库，执行模型迁移脚本并生成表结构"""
-    global _database_ready
+    global _database_ready, _orm_context
 
     _database_ready = False
     if not BotConfig.db_url:
@@ -117,11 +118,12 @@ async def init():
         import zhenxun.models.ai_persona
         import zhenxun.models.ai_sticker
         import zhenxun.models.ai_sticker_block
-        import zhenxun.models.ai_token_usage  # noqa: F401
+        import zhenxun.models.ai_token_usage
         from zhenxun.models.chat_history import ensure_chat_history_nullable_columns
         from zhenxun.models.group_plugin_setting import (
             ensure_group_plugin_scope_constraint,
         )
+        import zhenxun.models.migration_import  # noqa: F401
 
         bind_database_connection(None)
         endpoint = replace(
@@ -130,7 +132,17 @@ async def init():
             if any(key.upper() == "DB_URL" for key in os.environ)
             else "configuration_file",
         )
-        await Tortoise.init(config=get_config(endpoint))
+        if _orm_context is not None:
+            await _orm_context.close_connections()
+            _orm_context = None
+        context_options = (
+            {"_enable_global_fallback": True}
+            if "_enable_global_fallback" in inspect.signature(Tortoise.init).parameters
+            else {}
+        )
+        _orm_context = await Tortoise.init(
+            config=get_config(endpoint), **context_options
+        )
         if endpoint.engine == "mysql" and endpoint.tls != "DISABLED":
             await asyncio.wait_for(
                 inspect_database_tls(endpoint, Tortoise.get_connection("default")),
@@ -138,7 +150,8 @@ async def init():
             )
         from zhenxun.services.migration.restore import prepare_schema
 
-        if not await prepare_schema(Tortoise.get_connection("default")):
+        prepared = await prepare_schema(Tortoise.get_connection("default"))
+        if not prepared:
             migrations = await collect_script_migrations()
             await run_script_migrations(migrations)
             # Tortoise may emit column comments/index SQL during generate_schemas().
@@ -154,10 +167,23 @@ async def init():
             await ensure_group_plugin_scope_constraint()
             await repair_safe_schema_drift()
         bind_database_connection(endpoint)
+        from zhenxun.services.migration.merge import ensure_local_identity
+
+        if not prepared:
+            await ensure_local_identity(Tortoise.get_connection("default"))
         _database_ready = True
         logger.info("Database loaded successfully!")
-    except Exception as e:
-        raise DbConnectError(f"数据库连接错误... e:{e}") from e
+    except BaseException as e:
+        try:
+            await asyncio.wait_for(
+                (_orm_context or Tortoise).close_connections(), DB_TIMEOUT_SECONDS
+            )
+        except BaseException as cleanup_error:
+            logger.error("数据库初始化失败后的连接清理未完成", e=cleanup_error)
+        _orm_context = None
+        if isinstance(e, Exception):
+            raise DbConnectError(f"数据库连接错误... e:{e}") from e
+        raise
 
 
 @PriorityLifecycle.on_startup(
@@ -185,7 +211,7 @@ async def import_restore():
     component_id="management:database",
 )
 async def disconnect():
-    global _database_ready
+    global _database_ready, _orm_context
 
     from zhenxun.configs.database import bind_database_connection
     from zhenxun.services.migration.restore import final_snapshot
@@ -199,7 +225,11 @@ async def disconnect():
         _database_ready = False
         bind_database_connection(None)
     try:
-        await connections.close_all()
+        if _orm_context is not None:
+            await _orm_context.close_connections()
+            _orm_context = None
+        else:
+            await Tortoise.close_connections()
     except ConfigurationError:
         logger.debug("数据库连接未初始化，跳过关闭")
     except Exception as e:

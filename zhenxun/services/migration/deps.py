@@ -6,7 +6,9 @@ import hashlib
 import json
 from pathlib import Path
 import platform
+import re
 import sys
+from urllib.parse import urlsplit, urlunsplit
 
 from packaging.requirements import InvalidRequirement, Requirement
 from packaging.utils import canonicalize_name
@@ -109,9 +111,72 @@ def _direct_url(distribution) -> str | None:
         return None
     vcs = data.get("vcs_info") or {}
     if not vcs.get("vcs"):
-        return data["url"]
+        return _safe_url(data["url"])
     commit = f"@{vcs['commit_id']}" if vcs.get("commit_id") else ""
-    return f"{vcs['vcs']}+{data['url']}{commit}"
+    return _safe_url(f"{vcs['vcs']}+{data['url']}{commit}")
+
+
+def _safe_url(value: str) -> str:
+    """保留依赖来源位置，移除 URL 中的认证信息和查询凭据。"""
+    parts = urlsplit(value)
+    if not parts.scheme:
+        return value
+    return urlunsplit(parts._replace(netloc=parts.netloc.rsplit("@", 1)[-1], query=""))
+
+
+def _safe_requirement(value: str) -> str:
+    """序列化保留平台条件且不包含 URL 凭据的依赖声明。"""
+    requirement = Requirement(value)
+    if requirement.url:
+        requirement.url = _safe_url(requirement.url)
+    return str(requirement)
+
+
+def _safe_metadata(value):
+    """递归清理依赖收据与声明中的 URL 凭据。"""
+    if isinstance(value, dict):
+        return {key: _safe_metadata(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_safe_metadata(item) for item in value]
+    if isinstance(value, str) and "://" in value:
+        return re.sub(
+            r"(?:git[+])?(?:https?|ssh|file)://[^\s<>\"']+",
+            lambda match: _safe_url(match.group()),
+            value,
+        )
+    return value
+
+
+def _distributions(environment, items: list[dict], core: set[str]) -> dict:
+    """记录有效环境中全部分发包的静态元数据，不将间接依赖变为安装入口。"""
+    declared = {item["name"]: item for item in items}
+    result = {}
+    for name, distribution in sorted(environment.selected.items()):
+        complete = True
+        requirements = []
+        try:
+            raw_requirements = distribution.requires or []
+        except (OSError, ValueError, TypeError):
+            raw_requirements, complete = [], False
+        for raw in raw_requirements:
+            try:
+                requirements.append(_safe_requirement(raw))
+            except (InvalidRequirement, ValueError, TypeError):
+                complete = False
+        item = declared.get(name)
+        result[name] = {
+            "version": distribution.version,
+            "kind": "core" if name in core else item["kind"] if item else "indirect",
+            "requirements": [_safe_requirement(raw) for raw in item["requirements"]]
+            if item
+            else [],
+            "requires_dist": requirements,
+            "metadata_complete": complete,
+            "source": _direct_url(distribution),
+            "location": "layer" if name in environment.layer else "base",
+            "restore_root": item is not None and name not in core,
+        }
+    return result
 
 
 def _venv_roots(base: dict) -> list[str]:
@@ -276,49 +341,54 @@ def snapshot(items: list[dict] | None = None) -> dict:
     manifest = environment.manifest
     core = set(project_closure())
     version = Path("__version__")
-    return {
-        "format": FORMAT,
-        "bot_version": version.read_text("utf-8").split(":")[-1].strip()
-        if version.is_file()
-        else None,
-        "python": platform.python_version(),
-        "platform": f"{sys.platform}-{platform.machine()}".lower(),
-        "lock_sha256": hashlib.sha256(LOCK_FILE.read_bytes()).hexdigest()
-        if LOCK_FILE.is_file()
-        else None,
-        "plugins": {
-            key: {k: v for k, v in item.items() if k not in _LOCAL_PLUGIN_FIELDS}
-            for key, item in manifest["plugins"].items()
-            if item.get("state") == "managed"
-            and canonicalize_name(str(item.get("project_link") or "")) in selected
-        },
-        "packages": manifest["packages"],
-        "installed": environment.versions,
-        "manual_requirements": {
-            name: values
-            for name, values in manifest["manual_requirements"].items()
-            if canonicalize_name(name) in selected
-        },
-        "extra_requirements": {
-            item["name"]: {
-                "kind": item["kind"],
-                "requirements": item["requirements"],
-                "version": item["version"],
-                **({"url": item["url"]} if item.get("url") else {}),
-            }
-            for item in items
-            if item["kind"] in _EXTRA_KINDS and not item["unsupported"]
-        },
-        "unsupported_requirements": {
-            item["name"]: item["unsupported"] for item in items if item["unsupported"]
-        },
-        "core": {
-            name: {
-                "version": environment.versions.get(name),
-                "unsupported": _unsupported(name, environment.selected),
-            }
-            for name in _venv_roots(environment.base)
-            if name in core
-        },
-        "store_receipts": StoreReceiptStore.load(),
-    }
+    return _safe_metadata(
+        {
+            "format": FORMAT,
+            "bot_version": version.read_text("utf-8").split(":")[-1].strip()
+            if version.is_file()
+            else None,
+            "python": platform.python_version(),
+            "platform": f"{sys.platform}-{platform.machine()}".lower(),
+            "lock_sha256": hashlib.sha256(LOCK_FILE.read_bytes()).hexdigest()
+            if LOCK_FILE.is_file()
+            else None,
+            "plugins": {
+                key: {k: v for k, v in item.items() if k not in _LOCAL_PLUGIN_FIELDS}
+                for key, item in manifest["plugins"].items()
+                if item.get("state") == "managed"
+                and canonicalize_name(str(item.get("project_link") or "")) in selected
+            },
+            "packages": manifest["packages"],
+            "installed": environment.versions,
+            "distributions": _distributions(environment, items, core),
+            "manual_requirements": {
+                name: values
+                for name, values in manifest["manual_requirements"].items()
+                if canonicalize_name(name) in selected
+            },
+            "extra_requirements": {
+                item["name"]: {
+                    "kind": item["kind"],
+                    "requirements": item["requirements"],
+                    "version": item["version"],
+                    **({"url": item["url"]} if item.get("url") else {}),
+                }
+                for item in items
+                if item["kind"] in _EXTRA_KINDS and not item["unsupported"]
+            },
+            "unsupported_requirements": {
+                item["name"]: item["unsupported"]
+                for item in items
+                if item["unsupported"]
+            },
+            "core": {
+                name: {
+                    "version": environment.versions.get(name),
+                    "unsupported": _unsupported(name, environment.selected),
+                }
+                for name in _venv_roots(environment.base)
+                if name in core
+            },
+            "store_receipts": StoreReceiptStore.load(),
+        }
+    )

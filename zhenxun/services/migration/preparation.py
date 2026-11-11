@@ -305,12 +305,16 @@ async def run(
                     "kind": "restore",
                     "db_url": request["previous_db_url"],
                     "snapshot_required": True,
+                    "restore_mode": "replace_tables",
                 }
             )
             if previous["identity"] == checked["identity"]:
                 raise RuntimeError("migration_same_database_identity")
         tasks.save(
-            request, target_identity=checked["identity"], preflight_database=checked
+            request,
+            target_identity=checked["identity"],
+            preflight_database=checked,
+            target_preview=checked.get("preview"),
         )
         file_targets = await blocking(preflight.files_check, request, package)
         if request["kind"] == "restore":

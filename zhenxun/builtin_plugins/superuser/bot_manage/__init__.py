@@ -41,7 +41,7 @@ from .task import *  # noqa: F403
 
 @driver.on_bot_connect
 async def init_bot_console(bot: Bot):
-    """初始化Bot管理
+    """连接后确保当前账号的管理记录与缓存可用
 
     参数:
         bot: Bot
@@ -69,4 +69,4 @@ async def init_bot_console(bot: Bot):
     from zhenxun.services.cache.runtime_cache import BotMemoryCache
 
     await BotMemoryCache.upsert_from_model(bot_data)
-    logger.info("初始化Bot管理完成...")
+    logger.info(f"Bot {storage_bot_id} 管理记录与缓存已就绪")

@@ -67,6 +67,9 @@ class AIModelStat(Model):
             ):
                 columns = ("hour", "model", "task", *COUNTERS)
                 executor = connection.executor_class(model=cls, db=connection)
+                converters = getattr(executor, "column_map", None) or {
+                    key: cls._meta.fields_map[key].to_db_value for key in columns
+                }
                 fields_sql = ",".join(f'"{key}"' for key in columns)
                 values_sql = ",".join("?" for _ in columns)
                 updates_sql = ",".join(
@@ -74,7 +77,7 @@ class AIModelStat(Model):
                 )
                 parameters = [
                     [
-                        executor.column_map[key](value, cls)
+                        converters[key](value, cls)
                         for key, value in zip(
                             columns, (localtime(hour), model, task, *values)
                         )

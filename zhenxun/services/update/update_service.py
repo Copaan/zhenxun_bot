@@ -190,39 +190,153 @@ async def _get_text(url: str) -> str:
         return response.text
 
 
-async def _remote_versions(channel: UpdateChannel) -> dict[str, dict[str, Any]]:
-    if channel == "release":
+async def _from_sources(
+    component: UpdateComponent,
+    aliyun: Callable[[str], Awaitable[Any]],
+    github: Callable[[], Awaitable[Any]],
+    source: UpdateSource = "aliyun",
+) -> Any:
+    """优先从云效镜像查询，云效不可用或未镜像时使用 GitHub
+
+    参数:
+        component: 更新组件
+        aliyun: 以云效仓库名查询的函数
+        github: GitHub 查询函数
+        source: 更新源，github 时只查询 GitHub
+
+    返回:
+        Any: 查询结果
+    """
+    if source == "aliyun" and aliyun_mirrored(component):
+        try:
+            return await aliyun(GITHUB_REPOS[component].split("/", 1)[1])
+        except Exception as exc:
+            logger.warning(
+                "WebUIUpdate: 云效查询失败，改用 GitHub（%s）", exc.__class__.__name__
+            )
+    return await github()
+
+
+async def _branch_commit(
+    component: UpdateComponent, branch: str, source: UpdateSource = "aliyun"
+) -> str:
+    """查询分支最新提交
+
+    参数:
+        component: 更新组件
+        branch: 分支名称
+        source: 更新源
+
+    返回:
+        str: 提交 SHA
+    """
+    from zhenxun.utils.github_utils.models import AliyunFileInfo
+
+    async def github() -> str:
+        result = await _get_json(
+            f"https://api.github.com/repos/{GITHUB_REPOS[component]}/commits/{branch}"
+        )
+        return str(result.get("sha") or "").strip()
+
+    return await _from_sources(
+        component,
+        lambda repo: AliyunFileInfo.get_newest_commit(repo, branch),
+        github,
+        source,
+    )
+
+
+async def _repo_text(
+    component: UpdateComponent, ref: str, path: str, source: UpdateSource = "aliyun"
+) -> str:
+    """读取仓库指定引用下的文本文件
+
+    参数:
+        component: 更新组件
+        ref: 分支、标签或提交
+        path: 文件路径
+        source: 更新源
+
+    返回:
+        str: 文件内容
+    """
+    from zhenxun.utils.github_utils.models import AliyunFileInfo
+
+    return await _from_sources(
+        component,
+        lambda repo: AliyunFileInfo.get_file_content(path, repo, ref),
+        lambda: _get_text(
+            f"https://raw.githubusercontent.com/{GITHUB_REPOS[component]}/{ref}/{path}"
+        ),
+        source,
+    )
+
+
+def _newest_tag(tags: list[str]) -> str:
+    """按版本号选出最新标签，-fixN 视为修订版，无法解析的标签不参与比较
+
+    参数:
+        tags: 标签名
+
+    返回:
+        str: 最新标签
+    """
+    versions = []
+    for tag in tags:
+        value = re.sub(r"-fix(\d+)$", r".post\1", tag.removeprefix("v"))
+        try:
+            versions.append((Version(value), tag))
+        except ValueError:
+            continue
+    if not versions:
+        raise UpdateServiceError("release_not_found")
+    return max(versions)[1]
+
+
+async def _latest_release(source: UpdateSource = "aliyun") -> str:
+    """查询本体最新正式版标签，云效按标签中的最高版本号判断
+
+    参数:
+        source: 更新源
+
+    返回:
+        str: 正式版标签
+    """
+    from zhenxun.utils.github_utils.models import AliyunFileInfo
+
+    async def aliyun(repo: str) -> str:
+        return _newest_tag(await AliyunFileInfo.list_tags(repo))
+
+    async def github() -> str:
         release = await _get_json(
             f"https://api.github.com/repos/{GITHUB_REPOS['bot']}/releases/latest"
         )
-        bot_version = str(release.get("tag_name") or release.get("name") or "unknown")
+        return str(release.get("tag_name") or release.get("name") or "").strip()
+
+    return await _from_sources("bot", aliyun, github, source)
+
+
+async def _remote_versions(channel: UpdateChannel) -> dict[str, dict[str, Any]]:
+    if channel == "release":
+        bot_version = await _latest_release() or "unknown"
         bot_ref = bot_version
     else:
-        text = await _get_text(
-            f"https://raw.githubusercontent.com/{GITHUB_REPOS['bot']}/main/__version__"
-        )
+        text = await _repo_text("bot", "main", "__version__")
         bot_version = text.split(":", 1)[-1].strip() or "unknown"
         bot_ref = "main"
 
-    resource_text, webui_commit = await asyncio.gather(
-        _get_text(
-            f"https://raw.githubusercontent.com/{GITHUB_REPOS['resource']}"
-            "/main/__version__"
-        ),
-        _get_json(f"https://api.github.com/repos/{GITHUB_REPOS['webui']}/commits/dist"),
+    resource_text, webui_sha = await asyncio.gather(
+        _repo_text("resource", "main", "__version__"),
+        _branch_commit("webui", "dist"),
     )
     resource_version = resource_text.split(":", 1)[-1].strip() or "unknown"
-    webui_sha = str(webui_commit.get("sha") or "").strip()
     webui_version = "unknown"
     webui_manifest = False
     webui_api_version: int | None = None
     webui_source_commit: str | None = None
     webui_revision: str | None = None
     try:
-        manifest = await _get_json(
-            f"https://raw.githubusercontent.com/{GITHUB_REPOS['webui']}"
-            f"/{webui_sha}/version.json"
-        )
+        manifest = json.loads(await _repo_text("webui", webui_sha, "version.json"))
         webui_version = str(manifest.get("version") or "unknown")
         webui_manifest = True
         webui_api_version = int(manifest.get("api_version"))
@@ -484,22 +598,20 @@ def _git_dirty() -> bool:
     return result.returncode == 0 and bool(result.stdout.strip())
 
 
-async def _latest_ref(component: UpdateComponent, channel: UpdateChannel) -> str:
+async def _latest_ref(
+    component: UpdateComponent,
+    channel: UpdateChannel,
+    source: UpdateSource = "aliyun",
+) -> str:
     if component in {"webui", "resource"}:
         branch = "dist" if component == "webui" else "main"
-        result = await _get_json(
-            f"https://api.github.com/repos/{GITHUB_REPOS[component]}/commits/{branch}"
-        )
-        ref = str(result.get("sha") or "")
+        ref = await _branch_commit(component, branch, source)
         if not re.fullmatch(r"[0-9a-f]{40}", ref):
             raise UpdateServiceError(f"{component}_ref_invalid")
         return ref
     if component == "resource" or channel == "main":
         return "main"
-    release = await _get_json(
-        f"https://api.github.com/repos/{GITHUB_REPOS['bot']}/releases/latest"
-    )
-    ref = str(release.get("tag_name") or "").strip()
+    ref = await _latest_release(source)
     if not ref:
         raise UpdateServiceError("release_not_found")
     current = _read_version_file(_ROOT / "__version__")
@@ -660,9 +772,7 @@ def record_webui_ready(manifest: dict[str, Any] | None) -> None:
 async def _webui_release() -> dict[str, Any]:
     """从同一不可变发布提交读取 WebUI 版本身份。"""
     ref = await _latest_ref("webui", "main")
-    manifest = await _get_json(
-        f"https://raw.githubusercontent.com/{GITHUB_REPOS['webui']}/{ref}/version.json"
-    )
+    manifest = json.loads(await _repo_text("webui", ref, "version.json"))
     try:
         if not isinstance(manifest, dict):
             raise ValueError
@@ -1558,9 +1668,11 @@ async def _prepare_job(job_id: str) -> None:
         if component == "bot" and _git_dirty() and not job["force"]:
             raise UpdateServiceError("working_tree_dirty")
         ref = (job.get("webui_target") or {}).get("dist_commit") or (
-            await asyncio.wait_for(_latest_ref(component, job["channel"]), 30)
+            await asyncio.wait_for(
+                _latest_ref(component, job["channel"], job["source"]), 30
+            )
             if component in {"webui", "resource"}
-            else await _latest_ref(component, job["channel"])
+            else await _latest_ref(component, job["channel"], job["source"])
         )
         await asyncio.to_thread(_remove_tree, stage)
         stage.mkdir(parents=True, exist_ok=True)
@@ -1747,7 +1859,7 @@ async def create_update_job(
         if source == "aliyun" and method == "download":
             method = "git"
         if component == "bot" and channel == "release":
-            await _latest_ref(component, channel)
+            await _latest_ref(component, channel, source)
         if webui_target and (
             component != "webui"
             or not re.fullmatch(

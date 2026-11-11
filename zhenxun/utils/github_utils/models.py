@@ -1,15 +1,12 @@
 import base64
 import contextlib
-from email.utils import formatdate
-import hashlib
-import hmac
+import os
+import re
 import sys
 from typing import Any, ClassVar, Protocol
 from urllib.parse import quote
-import uuid
 
 from aiocache import cached
-from httpx import Request
 from nonebot.compat import model_dump
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -21,19 +18,15 @@ else:
     from strenum import StrEnum
 
 from .const import (
-    ALIYUN_API_VERSION,
     ALIYUN_ENDPOINT,
     ALIYUN_EXTERNAL_PLUGIN_GROUPS,
-    ALIYUN_ORG_ID,
     ALIYUN_REPO_MAPPING,
     CACHED_API_TTL,
     GIT_API_COMMIT_FORMAT,
     GIT_API_PROXY_COMMIT_FORMAT,
     GIT_API_TREES_FORMAT,
     JSD_PACKAGE_API_FORMAT,
-    Aliyun_AccessKey_ID,
-    Aliyun_Secret_AccessKey_encrypted,
-    RDC_access_token_encrypted,
+    get_aliyun_token,
 )
 from .func import (
     get_fastest_archive_formats,
@@ -324,70 +317,25 @@ class AliyunFileInfo:
 
     @classmethod
     async def _request(cls, pathname: str, **query: str | int) -> Any:
-        """请求云效 Codeup OpenAPI
+        """使用云效令牌读取组织内的 Codeup 资源。"""
+        from zhenxun.utils.repo_utils.config import RepoConfig
 
-        参数:
-            pathname: 接口路径，路径参数需已编码
-            **query: 查询参数
-
-        返回:
-            Any: 响应中的 result
-
-        异常:
-            ValueError: 请求失败
-        """
-        query = {
-            "organizationId": ALIYUN_ORG_ID,
-            "accessToken": base64.b64decode(
-                RDC_access_token_encrypted.encode()
-            ).decode(),
-            **query,
-        }
-        canonical_query = "&".join(
-            f"{key}={query[key]}" if query[key] != "" else key for key in sorted(query)
-        )
-        secret = base64.b64decode(Aliyun_Secret_AccessKey_encrypted.encode())
-
-        def sign(request: Request) -> Request:
-            """每次发送（含重试）都用新的随机数和时间重新签名"""
-            headers = {
-                "date": formatdate(usegmt=True),
-                "accept": "application/json",
-                "x-acs-signature-nonce": uuid.uuid4().hex,
-                "x-acs-signature-method": "HMAC-SHA1",
-                "x-acs-signature-version": "1.0",
-                "x-acs-version": ALIYUN_API_VERSION,
-            }
-            canonical_headers = "".join(
-                f"{key}:{headers[key]}\n"
-                for key in sorted(headers)
-                if key.startswith("x-acs-")
-            )
-            string_to_sign = (
-                f"GET\n{headers['accept']}\n\n\n{headers['date']}\n"
-                f"{canonical_headers}{pathname}?{canonical_query}"
-            )
-            signature = hmac.new(secret, string_to_sign.encode(), hashlib.sha1)
-            headers["authorization"] = (
-                f"acs {Aliyun_AccessKey_ID}:"
-                f"{base64.b64encode(signature.digest()).decode()}"
-            )
-            request.headers.update(headers)
-            return request
-
+        config = RepoConfig.get_instance().aliyun_codeup
+        token = get_aliyun_token(config.rdc_access_token_encrypted)
         response = await AsyncHttpx.get(
-            f"https://{ALIYUN_ENDPOINT}{pathname}",
+            f"https://{ALIYUN_ENDPOINT}/oapi/v1/codeup/organizations/"
+            f"{quote(config.organization_id, safe='')}{pathname}",
             params=query,
-            auth=sign,
-            accept_status_codes=range(400, 600),
+            headers={"x-yunxiao-token": token, "accept": "application/json"},
+            follow_redirects=False,
+            accept_status_codes=range(300, 600),
         )
+        if response.status_code >= 300:
+            raise ValueError(f"云效仓库请求失败（HTTP {response.status_code}）")
         data = response.json()
-        if response.status_code >= 400 or not data.get("success"):
-            raise ValueError(
-                f"阿里云请求失败: {data.get('errorCode') or data.get('Code')} - "
-                f"{data.get('errorMessage') or data.get('Message')}"
-            )
-        return data.get("result")
+        if not isinstance(data, list | dict):
+            raise ValueError("云效仓库响应格式无效")
+        return data
 
     @classmethod
     @cached(ttl=CACHED_API_TTL)
@@ -407,7 +355,7 @@ class AliyunFileInfo:
 
             while True:
                 repos = (
-                    await cls._request("/repository/list", page=page, perPage=per_page)
+                    await cls._request("/repositories", page=page, perPage=per_page)
                     or []
                 )
                 for repo_dict in repos:
@@ -507,11 +455,19 @@ class AliyunFileInfo:
         try:
             repository_id = await cls._get_repository_id_or_raise(repo)
             result = await cls._request(
-                f"/repository/{repository_id}/files/blobs", filePath=file_path, ref=ref
+                f"/repositories/{repository_id}/files/{quote(file_path, safe='')}",
+                ref=ref,
             )
             if not result:
                 raise ValueError("获取阿里云文件内容失败")
-            return result.get("content") or ""
+            content = result.get("content") or ""
+            if result.get("encoding") == "base64":
+                return base64.b64decode("".join(content.split()), validate=True).decode(
+                    "utf-8"
+                )
+            if result.get("encoding") not in (None, "text", "utf-8"):
+                raise ValueError("云效文件编码不受支持")
+            return content
         except Exception as e:
             raise ValueError(f"获取阿里云文件内容失败: {e}")
 
@@ -540,9 +496,9 @@ class AliyunFileInfo:
         try:
             repository_id = await cls._get_repository_id_or_raise(repo)
             result = await cls._request(
-                f"/repository/{repository_id}/files/tree",
+                f"/repositories/{repository_id}/files/tree",
                 path=path,
-                refName=ref,
+                ref=ref,
                 type=search_type,
             )
             return [AliyunTree(**item) for item in result or []]
@@ -550,22 +506,108 @@ class AliyunFileInfo:
             raise ValueError(f"获取仓库树信息失败: {e}")
 
     @classmethod
-    async def get_newest_commit(cls, repo: str, branch: str = "main") -> str:
-        """获取最新提交
+    async def _ls_remote(
+        cls, repo: str, refs: list[str], *, tags: bool = False
+    ) -> dict[str, str]:
+        """用只读 Git 引用查询读取云效仓库的引用
+
         参数:
             repo: 仓库名称
-            branch: sha 分支名称/标签名称/提交版本号
+            refs: 需要读取的引用，为空时读取全部
+            tags: 是否只读取标签
+
         返回:
-            commit: 最新提交信息
+            dict[str, str]: 引用名到提交的映射
         """
-        try:
-            repository_id = await cls._get_repository_id_or_raise(repo)
-            result = await cls._request(
-                f"/repository/{repository_id}/commits/{quote(branch, safe='~')}"
-            )
-            return (result or {}).get("id") or ""
-        except Exception as e:
-            raise ValueError(f"获取仓库commit信息失败: {e}")
+        from zhenxun.utils.repo_utils.utils import (
+            canonicalize_git_url,
+            get_aliyun_group_for_repo,
+            git_auth_environment,
+            prepare_aliyun_url,
+            run_git_command,
+        )
+
+        group = await get_aliyun_group_for_repo(repo)
+        authenticated = prepare_aliyun_url(repo, group)
+        canonical = canonicalize_git_url(authenticated)
+        environment = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.upper().startswith(("GIT_CONFIG", "GIT_TRACE"))
+            and key.upper() != "GIT_CURL_VERBOSE"
+        }
+        environment.update(git_auth_environment(authenticated, canonical) or {})
+        count = int(environment.get("GIT_CONFIG_COUNT", "0"))
+        environment.update(
+            {
+                "GIT_TERMINAL_PROMPT": "0",
+                "GCM_INTERACTIVE": "Never",
+                "GIT_CONFIG_COUNT": str(count + 1),
+                f"GIT_CONFIG_KEY_{count}": "credential.helper",
+                f"GIT_CONFIG_VALUE_{count}": "",
+            }
+        )
+        success, output, _ = await run_git_command(
+            [
+                "-c",
+                "http.followRedirects=false",
+                "ls-remote",
+                *(["--tags"] if tags else []),
+                canonical,
+                *refs,
+            ],
+            timeout_seconds=30,
+            env=environment,
+            isolated_env=True,
+        )
+        if not success:
+            raise ValueError("云效 Git 引用读取失败，请检查网络、Git 和令牌读取权限")
+        resolved = {}
+        for line in output.splitlines():
+            parts = line.split()
+            if len(parts) == 2 and re.fullmatch(r"[0-9a-fA-F]{40}", parts[0]):
+                resolved[parts[1]] = parts[0].lower()
+        return resolved
+
+    @classmethod
+    async def get_newest_commit(cls, repo: str, branch: str = "main") -> str:
+        """使用 Git 只读引用查询取得分支或标签的提交。"""
+        if re.fullmatch(r"[0-9a-fA-F]{40}", branch):
+            return branch.lower()
+        if branch == "HEAD" or branch.startswith("refs/"):
+            refs = [branch, f"{branch}^{{}}"]
+        else:
+            refs = [
+                f"refs/heads/{branch}",
+                f"refs/tags/{branch}^{{}}",
+                f"refs/tags/{branch}",
+            ]
+        resolved = await cls._ls_remote(repo, refs)
+        if branch.startswith("refs/tags/"):
+            refs.reverse()
+        for ref in refs:
+            if ref in resolved:
+                return resolved[ref]
+        raise ValueError("云效仓库中未找到指定分支或标签")
+
+    @classmethod
+    async def list_tags(cls, repo: str) -> list[str]:
+        """列出云效仓库的全部标签名
+
+        参数:
+            repo: 仓库名称
+
+        返回:
+            list[str]: 标签名
+        """
+        resolved = await cls._ls_remote(repo, [], tags=True)
+        return sorted(
+            {
+                name.removeprefix("refs/tags/").removesuffix("^{}")
+                for name in resolved
+                if name.startswith("refs/tags/")
+            }
+        )
 
     def export_files(
         self, tree_list: list[AliyunTree], module_path: str, is_dir: bool

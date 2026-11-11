@@ -1,12 +1,12 @@
 import asyncio
 import secrets
 import time
-from typing import Annotated
+from typing import Annotated, Literal
 from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from zhenxun.configs.webui_tls import WebUITLSConfigError, settings_from_values
 from zhenxun.services.migration import backup, restore
@@ -83,6 +83,8 @@ class ExportPayload(BaseModel):
     """高级模式选择记录的依赖包名，为空时记录全部依赖"""
     password: str | None = None
     """加密密码"""
+    excluded_paths: list[str] = Field(default_factory=list)
+    """不导出的项目内目录"""
 
 
 class UploadPayload(BaseModel):
@@ -102,8 +104,18 @@ class InspectPayload(BaseModel):
 class RestorePayload(InspectPayload):
     operation_id: str | None = None
     """客户端生成并跨重试续用的任务标识"""
-    categories: list[str] = []
-    """恢复的文件分类"""
+    categories: list[str] = Field(default_factory=list)
+    """恢复的文件分类，与数据库导入独立"""
+    restore_mode: (
+        Literal[
+            "empty", "replace_database", "replace_tables", "merge_upsert", "merge_skip"
+        ]
+        | None
+    ) = None
+    """恢复方式，未指定时恢复当前实例按包内表替换，恢复到新数据库须为空库"""
+    backup_before_replace: bool = True
+    included_tables: list[str] | None = Field(default=None, min_length=1)
+    source_binding: str | None = Field(default=None, max_length=128)
     retry: bool = False
     confirmation_digest: str | None = None
     skip_failed: bool = False
@@ -114,9 +126,17 @@ class SwitchPayload(DatabaseConfig):
     operation_id: str | None = None
 
 
+class SetupRestoreAccount(BaseModel):
+    username: str = Field(min_length=1, max_length=128)
+    password: str = Field(min_length=8, max_length=1024, repr=False)
+    confirm_password: str = Field(min_length=8, max_length=1024, repr=False)
+
+
 class SetupRestorePayload(RestorePayload):
     database: DatabaseConfig | None = None
-    """恢复到的数据库，须为空库"""
+    """恢复到的目标数据库"""
+    setup_account: SetupRestoreAccount | None = None
+    """首次配置使用的目标端管理员，仅在停写事务中应用"""
 
 
 def _restored_access(preview: dict | None) -> dict | None:
@@ -153,10 +173,18 @@ class _Restart:
     恢复配置时，重启信息中的访问地址按恢复后生效的配置计算
     """
 
-    def __init__(self, categories: list[str] | None = None, session=None):
+    def __init__(
+        self,
+        categories: list[str] | None = None,
+        session=None,
+        username: str | None = None,
+        operation_id: str | None = None,
+    ):
         self.categories = categories or []
         self.data: dict = {}
         self.session = session
+        self.username = username
+        self.operation_id = operation_id
 
     async def __call__(self) -> tuple[bool, str]:
         prepared = self.data or await self.prepare()
@@ -176,13 +204,20 @@ class _Restart:
 
     async def prepare(self) -> dict:
         """在停写前提供静态交接信息，让现有轮询进入重启续查。"""
+        if self.operation_id and not self.username:
+            from zhenxun.services.migration.state import load
+
+            request = load(self.operation_id) or {}
+            self.username = (request.get("setup_account") or {}).get("username")
         self.data = restart_status_data()
         access = None
         if "configuration" in self.categories:
             access = _restored_access(
                 await asyncio.to_thread(restore.configuration_preview)
             )
-        if access and access["access_urls"]:
+        if self.username:
+            access = {**(access or {}), "username": self.username, "password_set": True}
+        if access and access.get("access_urls"):
             targets = [
                 {"url": url, "scheme": urlsplit(url).scheme}
                 for url in access["access_urls"]
@@ -207,7 +242,10 @@ async def _() -> Result[dict]:
 async def _(payload: ExportPayload) -> Result[dict]:
     try:
         status = backup.ExportTask.start(
-            payload.categories, payload.extras, payload.password or None
+            payload.categories,
+            payload.extras,
+            payload.password or None,
+            excluded_paths=payload.excluded_paths,
         )
     except backup.BackupError as error:
         return Result.fail(str(error), 400)
@@ -339,7 +377,9 @@ async def _(payload: InspectPayload) -> Result[dict]:
         )
     except backup.BackupError as error:
         return Result.fail(str(error), 400)
-    summary["restored_access"] = _restored_access(summary.pop("configuration_preview"))
+    summary["restored_access"] = _restored_access(
+        summary.pop("configuration_preview", None)
+    )
     return Result.ok(summary)
 
 
@@ -353,7 +393,9 @@ async def _(payload: RestorePayload) -> Result[dict]:
                 str(payload.operation_id or ""),
                 password=payload.password,
                 confirmation=payload.confirmation_digest,
-                restart=_Restart(current.get("categories")),
+                restart=_Restart(
+                    current.get("categories"), operation_id=payload.operation_id
+                ),
                 inputs=payload.model_dump(exclude_unset=True),
             )
             return Result.ok({"restore": status}, "已续接原准备任务")
@@ -364,6 +406,10 @@ async def _(payload: RestorePayload) -> Result[dict]:
             payload.skip_failed,
             restart,
             operation_id=payload.operation_id,
+            restore_mode=payload.restore_mode,
+            backup_before_replace=payload.backup_before_replace,
+            included_tables=payload.included_tables,
+            source_binding=payload.source_binding,
         )
     except (backup.BackupError, RuntimeError, OSError) as error:
         return Result.fail(str(error), 400)
@@ -392,25 +438,46 @@ async def _(
                 str(payload.operation_id or ""),
                 password=payload.password,
                 confirmation=payload.confirmation_digest,
-                restart=_Restart(current.get("categories"), session),
+                restart=_Restart(
+                    current.get("categories"),
+                    session,
+                    operation_id=payload.operation_id,
+                ),
                 inputs=inputs,
             )
             return Result.ok({"restore": status}, "已续接原准备任务")
         except (RuntimeError, OSError) as error:
             return Result.fail(str(error), 400)
-    if "configuration" not in payload.categories or payload.database is None:
-        return Result.fail("首次部署恢复必须包含配置分类和目标数据库", 400)
+    if payload.database is None:
+        return Result.fail("首次部署恢复必须选择目标数据库", 400)
     try:
         path = backup.backup_path(payload.name)
         summary = await asyncio.to_thread(
             restore.inspect, path, payload.password or None
         )
-        preview = summary["configuration_preview"] or {}
-        if not (preview.get("username") and preview.get("password_set")):
+        from zhenxun.configs.config import Config
+
+        has_local_account = bool(
+            Config.get_config("web-ui", "username")
+            and Config.get_config("web-ui", "password")
+        )
+        preview = summary.get("configuration_preview") or {}
+        has_source_account = "configuration" in payload.categories and bool(
+            preview.get("username") and preview.get("password_set")
+        )
+        if payload.setup_account is None and not (
+            has_local_account or has_source_account
+        ):
             return Result.fail(
-                "备份中没有 WebUI 管理员账号或密码，无法用于首次部署", 400
+                "请设置目标端管理员账号和密码，或选择包含有效管理员的配置恢复", 400
             )
-        restart = _Restart(payload.categories, session)
+        restart = _Restart(
+            payload.categories,
+            session,
+            payload.setup_account.username
+            if payload.setup_account is not None
+            else None,
+        )
         status = await restore.request_restore(
             path,
             payload.password or None,
@@ -419,6 +486,13 @@ async def _(
             restart,
             db_url=build_database_url(payload.database),
             operation_id=payload.operation_id,
+            restore_mode=payload.restore_mode,
+            backup_before_replace=payload.backup_before_replace,
+            included_tables=payload.included_tables,
+            source_binding=payload.source_binding,
+            setup_account=payload.setup_account.model_dump()
+            if payload.setup_account is not None
+            else None,
         )
     except (backup.BackupError, RuntimeError, ValueError, OSError) as error:
         return Result.fail(str(error), 400)

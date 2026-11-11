@@ -226,7 +226,7 @@ class NotebookData(ContainerComponent):
     """Notebook转图片的数据模型"""
 
     style_name: str | None = None
-    elements: list[NotebookElement]
+    elements: builtins.list[NotebookElement]
 
     @property
     def template_name(self) -> str:
@@ -258,7 +258,7 @@ class NotebookData(ContainerComponent):
         self.elements.append(NotebookElement(type="image", src=src, caption=caption))
         return self
 
-    def quote(self, text: str | list[str]) -> Self:
+    def quote(self, text: str | builtins.list[str]) -> Self:
         if isinstance(text, str):
             self.elements.append(NotebookElement(type="blockquote", text=text))
         elif isinstance(text, list):
@@ -270,7 +270,7 @@ class NotebookData(ContainerComponent):
         self.elements.append(NotebookElement(type="code", code=code, language=language))
         return self
 
-    def list(self, items: list[str], ordered: bool = False) -> Self:
+    def list(self, items: builtins.list[str], ordered: bool = False) -> Self:
         self.elements.append(NotebookElement(type="list", data=items, ordered=ordered))
         return self
 

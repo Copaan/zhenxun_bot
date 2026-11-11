@@ -10,6 +10,7 @@ import re
 import shutil
 import sys
 
+from . import policy
 from . import state as tasks
 
 
@@ -166,6 +167,9 @@ def validate_data(directory: Path, db=None) -> dict:
         if count != table["rows"]:
             raise RuntimeError(f"migration_row_count_mismatch:{name}")
         maxima[name] = maximum
+    from .merge import validate_origins
+
+    validate_origins(directory)
     return {"manifest": manifest, "deferred": deferred, "maxima": maxima}
 
 
@@ -176,6 +180,8 @@ def files_check(request: dict, package: Path) -> dict:
     root = tasks.mutation.INSTANCE_ROOT
     journal = tasks.Files(root, package.parent / "rollback")
     targets = {restore._environment_file(root): 0}
+    if request.get("setup_account"):
+        targets.update({"data/config.yaml": 0, "data/configs/plugins2config.yaml": 0})
     for item in (package / "files").rglob("*"):
         if item.is_file():
             relative = item.relative_to(package / "files").as_posix()
@@ -204,12 +210,14 @@ async def database_check(request: dict, package: Path | None = None) -> dict:
     """只读核验身份、结构及可判定权限，不创建目标库或保存最终回滚点。"""
     from zhenxun.configs.database import DatabaseConnection
 
-    from . import data, target
+    from . import data, native_backup, target
     from . import data_guard as guard
 
     endpoint = DatabaseConnection.parse(
         request["db_url"], root=tasks.mutation.INSTANCE_ROOT
     )
+    if policy.target_backup(request):
+        native_backup.tools_for(endpoint)
     if endpoint.engine == "sqlite" and not Path(endpoint.database).exists():
         return {
             "identity": {
@@ -233,6 +241,7 @@ async def database_check(request: dict, package: Path | None = None) -> dict:
             if validated
             else set((request.get("preflight_database") or {}).get("tables", model_map))
         )
+        tables = policy.selected_tables(request, tables)
         selected = {
             guard.model_key(model_map[name], identity.get("schema"))
             if name in model_map
@@ -243,18 +252,18 @@ async def database_check(request: dict, package: Path | None = None) -> dict:
             )
             for name in tables
         }
-        empty = request["kind"] == "switch" or not request.get("snapshot_required")
+        empty = policy.requires_empty(request)
         if empty:
             for schema, name in sorted(existing, key=str):
-                if (
-                    await client.execute_query(
-                        "SELECT 1 FROM "
-                        + guard.relation_sql(client, name, schema)
-                        + " LIMIT 1"
-                    )
-                )[1]:
+                if await guard.has_business_rows(client, schema, name):
                     raise RuntimeError("migration_target_not_empty:" + name)
         structure, warnings = {}, []
+        replacing_database = policy.mode(request) == "replace_database"
+        preview = await target.database_objects(client) if replacing_database else None
+        if replacing_database:
+            await target.database_permissions(
+                client, backup=policy.target_backup(request)
+            )
         for schema, name in sorted(existing & selected, key=str):
             if client.capabilities.dialect == "sqlite":
                 definition = await client.execute_query_dict(
@@ -291,7 +300,7 @@ async def database_check(request: dict, package: Path | None = None) -> dict:
                 )
                 if not rows[0]["allowed"]:
                     raise RuntimeError(f"migration_schema_create_required:{schema}")
-        for name in tables & model_map.keys():
+        for name in set() if replacing_database else tables & model_map.keys():
             model = model_map[name]
             if guard.model_key(model, identity.get("schema")) not in existing:
                 continue
@@ -307,7 +316,7 @@ async def database_check(request: dict, package: Path | None = None) -> dict:
                     client, model, validated["maxima"].get(name), read_only=True
                 )
         keys = await guard.foreign_keys(client)
-        if validated:
+        if validated and policy.mode(request) == "replace_tables":
             await data._retained_references(
                 client,
                 keys,
@@ -318,8 +327,9 @@ async def database_check(request: dict, package: Path | None = None) -> dict:
             )
         return {
             "identity": identity,
-            "structure": digest([structure, sorted(existing, key=str), keys]),
+            "structure": digest([structure, sorted(existing, key=str), keys, preview]),
             "tables": sorted(tables),
+            "preview": preview,
             "warnings": warnings,
             "deferred": [
                 "停写后复核内容、外键影响、实际写入和锁权限",

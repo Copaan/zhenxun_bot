@@ -175,7 +175,7 @@ async def _(param: HandleRequest) -> Result:
     try:
         bot = nonebot.get_bot(param.bot_id)
         try:
-            await FgRequest.refused(bot, param.id)
+            req = await FgRequest.refused(bot, param.id)
         except ActionFailed:
             await FgRequest.expire(param.id)
             return Result.warning_("请求失败，可能该请求已失效或请求数据错误...")
@@ -183,6 +183,8 @@ async def _(param: HandleRequest) -> Result:
             return Result.warning_("未找到此Id请求...")
         except RequestHandledError:
             return Result.warning_("该请求已被处理或已过期...")
+        if req.blacklisted:
+            return Result.ok(info="已拒绝，多次被拒绝的对象已加入永久黑名单")
         return Result.ok(info="成功处理了请求!")
     except (ValueError, KeyError):
         return Result.warning_("指定Bot未连接...")

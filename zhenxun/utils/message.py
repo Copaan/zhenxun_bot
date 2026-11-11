@@ -90,7 +90,7 @@ class MessageUtils:
 
     @staticmethod
     def _image_to_bytes() -> bool:
-        """图片路径是否转为 bytes 发送，直接读取驱动配置，不重新解析 .env
+        """图片路径是否转为 bytes 发送
 
         返回:
             bool: 是否转为 bytes
@@ -112,6 +112,7 @@ class MessageUtils:
             list[Text | Text]: 构造完成的消息列表
         """
         message_list = []
+        to_bytes: bool | None = None
         for msg in msg_list:
             if isinstance(msg, str):
                 if msg.startswith("base64://"):
@@ -130,7 +131,9 @@ class MessageUtils:
                 message_list.append(Text(str(msg)))
             elif isinstance(msg, Path):
                 if msg.exists():
-                    if cls._image_to_bytes():
+                    if to_bytes is None:
+                        to_bytes = cls._image_to_bytes()
+                    if to_bytes:
                         logger.debug("图片转为bytes发送", "MessageUtils")
                         message_list.append(Image(raw=msg.read_bytes()))
                     else:

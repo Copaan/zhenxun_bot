@@ -2,33 +2,20 @@
 
 from __future__ import annotations
 
-import asyncio
 from collections.abc import Callable
 from pathlib import Path
 import platform
 import re
 import sys
 
-from packaging.requirements import Requirement
+from packaging.requirements import InvalidRequirement, Requirement
 from packaging.specifiers import SpecifierSet
 from packaging.utils import canonicalize_name
 from packaging.version import InvalidVersion, Version
 
-from .deps import KINDS, plugin_requirement_files
+from .deps import KINDS, _safe_url, plugin_requirement_files
 
 _NEARBY_LIMIT = 5
-_PLATFORMS = {
-    "linux-x86_64": "x86_64-unknown-linux-gnu",
-    "linux-amd64": "x86_64-unknown-linux-gnu",
-    "linux-aarch64": "aarch64-unknown-linux-gnu",
-    "linux-arm64": "aarch64-unknown-linux-gnu",
-    "win32-amd64": "x86_64-pc-windows-msvc",
-    "win32-x86_64": "x86_64-pc-windows-msvc",
-    "win32-arm64": "aarch64-pc-windows-msvc",
-    "darwin-arm64": "aarch64-apple-darwin",
-    "darwin-x86_64": "x86_64-apple-darwin",
-}
-"""备份记录的平台 -> uv 解析使用的目标平台"""
 _IMPLIED_KINDS = {"venv", "layer"}
 """自动记录的依赖来源：被其他依赖间接需要时只作为子依赖，无法安装时总是跳过"""
 _UNAVAILABLE = re.compile(
@@ -162,7 +149,7 @@ def _roots(saved: dict) -> dict[str, dict]:
             "name": name,
             "requirements": list(item.get("requirements") or []),
             "version": None if name in shared else item.get("version"),
-            "url": item.get("url"),
+            "url": _safe_url(item["url"]) if item.get("url") else None,
             "plugin": None,
             "unsupported": item.get("unsupported"),
         }
@@ -326,11 +313,20 @@ async def _nearby(root: dict) -> list[str]:
             or (version.is_prerelease and not current.is_prerelease)
         ):
             continue
+        declarations = [
+            *root["requirements"],
+            *((root.get("plugin") or {}).get("resolution_inputs") or []),
+        ]
         if any(
             canonicalize_name(Requirement(raw).name) == root["name"]
-            and Requirement(raw).specifier
-            and version not in Requirement(raw).specifier
-            for raw in root["requirements"]
+            and (
+                Requirement(raw).url
+                or (
+                    Requirement(raw).specifier
+                    and version not in Requirement(raw).specifier
+                )
+            )
+            for raw in declarations
         ):
             continue
         newer = version > current
@@ -534,71 +530,47 @@ def _declared_files(files: Path | None, packages: dict) -> dict[str, list[str]]:
     return result
 
 
-def _source_target(saved: dict) -> tuple[str, str] | None:
-    """备份时的平台与 Python 版本
-
-    参数:
-        saved: 备份中的 dependencies.json
-
-    返回:
-        tuple[str, str] | None: uv 目标平台与 Python 版本，与当前环境相同或无法
-            识别时为 None
-    """
-    current = f"{sys.platform}-{platform.machine()}".lower()
-    source = str(saved.get("platform") or current)
-    python = ".".join(str(saved.get("python") or "").split(".")[:2])
-    running = f"{sys.version_info.major}.{sys.version_info.minor}"
-    if source == current and python in {"", running}:
-        return None
-    target = _PLATFORMS.get(source)
-    return (target, python or running) if target else None
-
-
-async def _dependents(
-    roots: dict, preferences: dict, target: tuple[str, str] | None
-) -> dict[str, set[str]]:
-    """按备份时的平台解析顶层依赖，得到每个包被哪些包直接依赖
-
-    先整体解析，失败时逐个解析顶层依赖再合并，仍无法解析的顶层依赖不计入。
-
-    参数:
-        roots: 顶层依赖
-        preferences: 优先选用的备份时版本
-        target: 备份时的平台与 Python 版本，为 None 时按当前环境解析
-
-    返回:
-        dict[str, set[str]]: 包名 -> 直接依赖它的包名
-    """
-    from zhenxun.services.nonebot_store.dependencies import (
-        DependencyAnalysisError,
-        dependency_graph,
-    )
-
-    values = [
-        _root_requirements(root, root["version"] if root["plugin"] else None)
-        for root in roots.values()
-    ]
-    try:
-        return await dependency_graph(
-            [raw for items in values for raw in items], preferences, target
-        )
-    except DependencyAnalysisError as error:
-        _fallback_or_raise(error)
-    semaphore = asyncio.Semaphore(4)
-
-    async def single(requirements: list[str]) -> dict[str, set[str]]:
-        async with semaphore:
-            try:
-                return await dependency_graph(requirements, preferences, target)
-            except DependencyAnalysisError as error:
-                _fallback_or_raise(error)
-                return {}
-
+def _saved_dependents(saved: dict, roots: dict) -> tuple[dict[str, set[str]], str]:
+    """按目标平台读取包中静态依赖关系，缺失元数据时保留未知状态。"""
+    metadata = saved.get("distributions")
+    if not isinstance(metadata, dict):
+        return {}, "unavailable"
     graph: dict[str, set[str]] = {}
-    for part in await asyncio.gather(*(single(items) for items in values)):
-        for name, owners in part.items():
-            graph.setdefault(name, set()).update(owners)
-    return graph
+    active: dict[str, set[str]] = {}
+    complete = True
+    pending = [
+        (None, raw, frozenset({""}))
+        for root in roots.values()
+        for raw in _root_requirements(root, root["version"] if root["plugin"] else None)
+    ]
+    while pending:
+        owner, raw, contexts = pending.pop()
+        try:
+            requirement = Requirement(raw)
+            if requirement.marker and not any(
+                requirement.marker.evaluate({"extra": extra}) for extra in contexts
+            ):
+                continue
+        except (InvalidRequirement, ValueError, TypeError):
+            complete = False
+            continue
+        name = canonicalize_name(requirement.name)
+        if owner and owner != name:
+            graph.setdefault(name, set()).add(owner)
+        wanted = {""} | {canonicalize_name(extra) for extra in requirement.extras}
+        new = wanted - active.setdefault(name, set())
+        if not new:
+            continue
+        active[name].update(new)
+        item = metadata.get(name)
+        if not isinstance(item, dict) or not isinstance(
+            item.get("requires_dist"), list
+        ):
+            complete = False
+            continue
+        complete = complete and item.get("metadata_complete") is True
+        pending.extend((name, child, frozenset(new)) for child in item["requires_dist"])
+    return graph, "complete" if complete else "partial"
 
 
 def _implied(roots: dict, graph: dict[str, set[str]]) -> dict[str, str]:
@@ -644,19 +616,10 @@ async def stage_restore(
 ) -> dict:
     """把备份中的依赖解析为当前环境可用的版本，写入待应用的依赖层事务
 
-    平台条件不适用于当前环境的依赖声明不参与解析，全部声明都不适用的列入
-    platform_only。再按备份时的平台与 Python 版本解析全部顶层依赖（商店插件、
-    手动依赖、插件声明与虚拟环境中的包），被其他顶层依赖间接需要的虚拟环境包与
-    依赖层包只作为子依赖，由解析器按当前平台决定是否安装；被间接需要的手动依赖
-    与插件声明不再固定备份时的版本。其余顶层依赖优先使用备份时的版本；整体解析
-    失败时逐个检查，备份时的版本不可用的依次改用次版本号相同、主版本号相同的相近
-    版本，商店插件以外的依赖最后放开版本。之后按来源与版本分歧逐个合并，冲突的依赖
-    放开版本或改用相近版本，仍不可用的虚拟环境包与依赖层包直接跳过，其余按
-    skip_failed 决定中止或跳过。子依赖由解析器补齐并优先沿用备份时的版本，允许构建
-    源码包，构建失败的包所属的顶层依赖同样跳过。核心依赖保持当前环境的版本。
-    pip、uv 等安装工具及依赖它们的包只能在控制台安装，列入 unsupported_requirements。
-    恢复插件代码时，恢复后的环境能满足的插件 requirements 文件登记为插件依赖，其中
-    声明的插件目录依赖不再作为手动依赖。
+    平台条件由目标环境判断，依赖关系仅从包内静态元数据读取。元数据缺失时保留
+    未确认状态，目标解析仍继续。显式声明保持约束，历史版本作为偏好；可选组件
+    失败时按 skip_failed 处理，网络及工具故障保持失败。核心和 ORM 依赖保持目标
+    环境约束，源码包通过候选环境的隔离构建处理。
 
     参数:
         saved: 备份中的 dependencies.json
@@ -720,16 +683,23 @@ async def stage_restore(
         report[kind].append(key)
         report["skip_reasons"][key] = reason + (f"；原安装地址 {url}" if url else "")
 
+    for key, root in list(roots.items()):
+        if root.get("url") and not root["requirements"]:
+            skip(
+                key,
+                "原依赖来自直链或本地路径，需在目标环境提供可信来源，未改为同名索引包",
+            )
+            roots.pop(key)
     preferences = {
         **{name: value["version"] for name, value in saved["packages"].items()},
         **(saved.get("installed") or {}),
     }
+    graph, report["metadata_state"] = _saved_dependents(saved, roots)
     if len(roots) > 1:
-        graph = await _dependents(roots, preferences, _source_target(saved))
         for key, owner in _implied(roots, graph).items():
             if roots[key]["kind"] in _IMPLIED_KINDS:
                 report["implied"][key] = owner
-                roots[key]["version"] = None
+                roots.pop(key)
             elif roots[key]["plugin"] is None:
                 roots[key]["version"] = None
     pins = {key: root["version"] for key, root in roots.items()}
@@ -773,6 +743,8 @@ async def stage_restore(
             await _combine(roots, pins, preferences, skip, singles) if roots else None
         )
     report["restored"] = sorted(roots)
+    report["skipped_plugins"].sort()
+    report["skipped_requirements"].sort()
     report["implied"] = {
         key: owner for key, owner in report["implied"].items() if owner in roots
     }

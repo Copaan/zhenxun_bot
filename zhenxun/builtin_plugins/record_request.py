@@ -3,7 +3,7 @@ from datetime import datetime
 import random
 import time
 
-from nonebot import on_message, on_request
+from nonebot import on_request
 from nonebot.adapters.onebot.v11 import (
     ActionFailed,
     FriendRequestEvent,
@@ -17,10 +17,9 @@ from zhenxun.configs.config import BotConfig, Config
 from zhenxun.configs.utils import PluginExtraData, RegisterConfig
 from zhenxun.models.ban_console import BanConsole
 from zhenxun.models.event_log import EventLog
-from zhenxun.models.fg_request import FgRequest
+from zhenxun.models.fg_request import FgRequest, notice_cache
 from zhenxun.models.friend_user import FriendUser
 from zhenxun.models.group_console import GroupConsole
-from zhenxun.services.cache import CacheRoot
 from zhenxun.services.log import logger
 from zhenxun.utils.enum import EventLogType, PluginType, RequestHandleType, RequestType
 from zhenxun.utils.exception import NotFindSuperuser
@@ -70,24 +69,55 @@ __plugin_meta__ = PluginMetadata(
 
 friend_req = on_request(priority=5, block=True)
 group_req = on_request(priority=5, block=True)
-_t = on_message(priority=999, block=False, rule=lambda: False)
 
-
-cache = CacheRoot.cache_dict("FG_REQUEST_CACHE", 0, float)
 _API_TIMEOUT = 5.0
 
 
-def _recently_notified(key: str) -> bool:
-    """是否在 TIP_MESSAGE_LIMIT 分钟内已通知过同一请求
+def _reserve_notice(request: FgRequest) -> bool:
+    """占用 TIP_MESSAGE_LIMIT 分钟的提醒间隔，通知失败时需调用 _release_notice
 
     参数:
-        key: 请求键
+        request: 请求记录
 
     返回:
-        bool: 是否跳过本次通知
+        bool: 是否需要提醒，间隔内已提醒过或刚被拒绝时为 False
     """
+    key = request.notice_key()
+    if key in notice_cache:
+        return False
     limit = (base_config.get("TIP_MESSAGE_LIMIT") or 360) * 60
-    return time.time() - (cache.get(key) or 0) < limit
+    notice_cache.set(key, time.time(), limit)
+    return True
+
+
+async def _create_request(**fields) -> FgRequest:
+    """记录请求，并将同一 Bot、用户与群组下更早的未处理请求设为过期
+
+    参数:
+        fields: 请求字段
+
+    返回:
+        FgRequest: 新请求，并发重复事件下只保留 id 最大的一条未处理请求
+    """
+    request = await FgRequest.create(**fields)
+    await FgRequest.filter(
+        request_type=request.request_type,
+        bot_id=request.bot_id,
+        user_id=request.user_id,
+        group_id=request.group_id,
+        handle_type__isnull=True,
+        id__lt=request.id,
+    ).update(handle_type=RequestHandleType.EXPIRE)
+    return request
+
+
+def _release_notice(request: FgRequest):
+    """释放提醒间隔，下次相同请求重新提醒
+
+    参数:
+        request: 请求记录
+    """
+    notice_cache.pop(request.notice_key(), None)
 
 
 async def _notify_superuser(bot, request: FgRequest, message: str) -> bool:
@@ -105,7 +135,15 @@ async def _notify_superuser(bot, request: FgRequest, message: str) -> bool:
         results = await PlatformUtils.send_superuser(bot, message)
     except NotFindSuperuser:
         logger.warning(
-            "未配置超级用户，无法发送请求通知，请检查 SUPERUSERS / PLATFORM_SUPERUSERS",
+            f"请求 ID {request.id}（Bot {bot.self_id}）没有可用超级用户，"
+            "请检查 SUPERUSERS / PLATFORM_SUPERUSERS；请求仍可在 WebUI 处理",
+            "请求通知",
+        )
+        return False
+    except Exception as error:
+        logger.error(
+            f"请求 ID {request.id}（Bot {bot.self_id}）通知失败，"
+            f"错误类型：{type(error).__name__}；请求仍可在 WebUI 处理",
             "请求通知",
         )
         return False
@@ -113,10 +151,26 @@ async def _notify_superuser(bot, request: FgRequest, message: str) -> bool:
         str(r[1].msg_ids[0]["message_id"]) for r in results if r[1] and r[1].msg_ids
     ]:
         request.message_ids = ",".join(message_ids)
-        await request.save(update_fields=["message_ids"])
+        try:
+            await request.save(update_fields=["message_ids"])
+        except Exception as error:
+            logger.warning(
+                f"请求 ID {request.id}（Bot {bot.self_id}）通知已发送，"
+                f"引用消息记录保存失败：{type(error).__name__}；可按请求 ID 处理",
+                "请求通知",
+            )
     if not any(r[1] for r in results):
-        logger.warning("请求通知未能发送给任何超级用户", "请求通知")
+        logger.warning(
+            f"请求 ID {request.id}（Bot {bot.self_id}）未送达任何超级用户，"
+            "请检查接收账号及私聊发送错误；请求仍可在 WebUI 处理",
+            "请求通知",
+        )
         return False
+    logger.info(
+        f"请求 ID {request.id}（Bot {bot.self_id}）已通知"
+        f" {sum(bool(result[1]) for result in results)} 位超级用户",
+        "请求通知",
+    )
     return True
 
 
@@ -176,32 +230,43 @@ def _format_ban_target(ban_data: BanConsole) -> str:
     return f"群组 {group_id}"
 
 
-async def _build_permanent_ban_tip(
+async def _refuse_blacklisted(
+    bot,
+    event: FriendRequestEvent | GroupRequestEvent,
     *targets: tuple[str | None, str | None],
-) -> str:
-    ban_list: list[BanConsole] = []
-    seen: set[tuple[str, str]] = set()
+) -> bool:
+    """目标在永久黑名单中时直接拒绝请求，不提醒超级用户
+
+    参数:
+        bot: Bot
+        event: 好友或群组请求事件
+        targets: (用户id, 群组id) 检查目标
+
+    返回:
+        bool: 是否已拒绝
+    """
     for user_id, group_id in targets:
         ban_data = await BanConsole.get_ban(user_id=user_id, group_id=group_id)
-        if not ban_data or ban_data.duration != -1:
-            continue
-        key = (ban_data.user_id or "", ban_data.group_id or "")
-        if key in seen:
-            continue
-        seen.add(key)
-        ban_list.append(ban_data)
-    if not ban_list:
-        return ""
-    lines = ["", "永久黑名单提示："]
-    for ban_data in ban_list:
-        lines.extend(
-            [
-                f"- {_format_ban_target(ban_data)} 在黑名单中",
-                f"  操作员ID：{ban_data.operator}",
-                f"  封禁原因：{ban_data.ban_reason or '无'}",
-            ]
-        )
-    return "\n".join(lines)
+        if ban_data and ban_data.duration == -1:
+            break
+    else:
+        return False
+    try:
+        if isinstance(event, FriendRequestEvent):
+            await bot.set_friend_add_request(flag=event.flag, approve=False)
+        else:
+            await bot.set_group_add_request(
+                flag=event.flag, sub_type="invite", approve=False
+            )
+    except Exception as e:
+        logger.warning("拒绝永久黑名单请求失败", "请求处理", e=e)
+    logger.info(
+        f"{_format_ban_target(ban_data)} 在永久黑名单中，已拒绝请求"
+        f"（原因：{ban_data.ban_reason or '无'}）",
+        "请求处理",
+        target=event.user_id,
+    )
+    return True
 
 
 async def _auto_approve_friend(bot, event: FriendRequestEvent, nickname: str) -> bool:
@@ -233,20 +298,14 @@ async def _auto_approve_friend(bot, event: FriendRequestEvent, nickname: str) ->
 async def _(bot: v11Bot, event: FriendRequestEvent, session: EventSession):
     user_id = str(event.user_id)
     logger.debug("收录好友请求...", "好友请求", target=user_id)
+    if await _refuse_blacklisted(bot, event, (user_id, None)):
+        return
     nickname = await _get_nickname(bot, user_id)
-    if base_config.get("AUTO_ADD_FRIEND") and await _auto_approve_friend(
-        bot, event, nickname
-    ):
+    auto_add = base_config.get("AUTO_ADD_FRIEND")
+    if auto_add and await _auto_approve_friend(bot, event, nickname):
         logger.debug("已自动同意好友请求", "好友请求", target=user_id)
         return
-    # 旧请求全部设置为过期
-    await FgRequest.filter(
-        request_type=RequestType.FRIEND,
-        bot_id=bot.self_id,
-        user_id=user_id,
-        handle_type__isnull=True,
-    ).update(handle_type=RequestHandleType.EXPIRE)
-    f = await FgRequest.create(
+    f = await _create_request(
         request_type=RequestType.FRIEND,
         platform=session.platform,
         bot_id=bot.self_id,
@@ -255,27 +314,24 @@ async def _(bot: v11Bot, event: FriendRequestEvent, session: EventSession):
         nickname=nickname,
         comment=event.comment,
     )
-    cache_key = f"friend:{bot.self_id}:{user_id}"
-    if _recently_notified(cache_key):
+    if not _reserve_notice(f):
         logger.debug(
             f"好友请求在提醒间隔内重复，已记录为 ID {f.id}，不再提醒",
             "好友请求",
             target=user_id,
         )
         return
-    ban_tip = await _build_permanent_ban_tip((user_id, None))
-    if await _notify_superuser(
+    if not await _notify_superuser(
         bot,
         f,
         f"*****一份好友申请*****\n"
         f"ID: {f.id}\n"
         f"昵称：{nickname}({user_id})\n"
-        f"自动同意：{'√' if base_config.get('AUTO_ADD_FRIEND') else '×'}\n"
+        f"自动同意：{'失败，需人工处理' if auto_add else '×'}\n"
         f"日期：{datetime.now().replace(microsecond=0)}\n"
-        f"备注：{event.comment}"
-        f"{ban_tip}",
+        f"备注：{event.comment}",
     ):
-        cache[cache_key] = time.time()
+        _release_notice(f)
 
 
 async def _auto_approve_group(bot, event: GroupRequestEvent) -> bool:
@@ -344,9 +400,6 @@ async def _record_auto_approved_group(
         group_id=group_id,
         handle_type=RequestHandleType.APPROVE,
     )
-    ban_tip = await _build_permanent_ban_tip(
-        (user_id, None), (user_id, group_id), (None, group_id)
-    )
     await _notify_superuser(
         bot,
         f,
@@ -354,8 +407,7 @@ async def _record_auto_approved_group(
         f"ID：{f.id}\n"
         f"申请人：{nickname}({user_id})\n群聊："
         f"{group_id}\n邀请日期：{datetime.now().replace(microsecond=0)}\n"
-        "注: 该请求已自动同意"
-        f"{ban_tip}",
+        "注: 该请求已自动同意",
     )
     await asyncio.sleep(random.randint(1, 5))
     await _send_private(
@@ -373,7 +425,11 @@ async def _(bot: v11Bot, event: GroupRequestEvent, session: EventSession):
         return
     user_id = str(event.user_id)
     group_id = str(event.group_id)
-    is_superuser = user_id in bot.config.superusers
+    is_superuser = PlatformUtils.is_superuser(bot, user_id)
+    if not is_superuser and await _refuse_blacklisted(
+        bot, event, (user_id, None), (user_id, group_id), (None, group_id)
+    ):
+        return
     nickname = await _get_nickname(bot, user_id)
     if is_superuser or base_config.get("AUTO_ADD_GROUP"):
         logger.debug(
@@ -391,15 +447,7 @@ async def _(bot: v11Bot, event: GroupRequestEvent, session: EventSession):
         "群聊请求",
         target=group_id,
     )
-    # 旧请求全部设置为过期
-    await FgRequest.filter(
-        request_type=RequestType.GROUP,
-        bot_id=bot.self_id,
-        user_id=user_id,
-        group_id=group_id,
-        handle_type__isnull=True,
-    ).update(handle_type=RequestHandleType.EXPIRE)
-    f = await FgRequest.create(
+    f = await _create_request(
         request_type=RequestType.GROUP,
         platform=session.platform,
         bot_id=bot.self_id,
@@ -408,8 +456,7 @@ async def _(bot: v11Bot, event: GroupRequestEvent, session: EventSession):
         nickname=nickname,
         group_id=group_id,
     )
-    cache_key = f"group:{bot.self_id}:{user_id}:{group_id}"
-    if _recently_notified(cache_key):
+    if not _reserve_notice(f):
         logger.debug(
             f"群聊请求在提醒间隔内重复，已记录为 ID {f.id}，不再提醒",
             "群聊请求",
@@ -424,24 +471,24 @@ async def _(bot: v11Bot, event: GroupRequestEvent, session: EventSession):
         if kick_count
         else ""
     )
-    ban_tip = await _build_permanent_ban_tip(
-        (user_id, None), (user_id, group_id), (None, group_id)
-    )
-    if await _notify_superuser(
+    notified = await _notify_superuser(
         bot,
         f,
         f"*****一份入群申请*****\n"
         f"ID：{f.id}\n"
         f"申请人：{nickname}({user_id})\n群聊："
         f"{group_id}\n邀请日期：{datetime.now().replace(microsecond=0)}"
-        f"{kick_message}"
-        f"{ban_tip}",
-    ):
-        cache[cache_key] = time.time()
+        f"{kick_message}",
+    )
+    if not notified:
+        _release_notice(f)
     await _send_private(
         bot,
         user_id,
-        f"想要邀请我偷偷入群嘛~已经提醒{BotConfig.self_nickname}的管理员大人了\n"
-        "请确保已经群主或群管理沟通过！\n"
-        "等待管理员处理吧！",
+        (
+            f"入群邀请已记录，ID：{f.id}，已提醒管理员，请等待审核。"
+            if notified
+            else f"入群邀请已记录，ID：{f.id}，但管理员通知暂未送达。"
+            "请联系管理员在 WebUI 的好友/群组请求中处理。"
+        ),
     )

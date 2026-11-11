@@ -12,8 +12,14 @@ import inspect
 import time
 from typing import Any
 
-from tortoise.backends.base.client import TransactionContext, TransactionContextPooled
+from tortoise.backends.base.client import (
+    NestedTransactionContext,
+    TransactionContext,
+    TransactionContextPooled,
+)
+from tortoise.backends.sqlite import client as sqlite_client
 from tortoise.connection import connections
+from tortoise.exceptions import TransactionManagementError
 
 from zhenxun.utils.exception import DependencyUnavailable
 
@@ -123,7 +129,10 @@ async def _transaction_failed(batch: WriteBatch | None, committing: bool) -> Non
 
 def _install_transaction_hooks() -> None:
     """在 Tortoise 事务退出后发布缓存效果，并在提交/回滚失败时回收连接"""
-    for context_type in (TransactionContext, TransactionContextPooled):
+    sqlite_context = getattr(
+        sqlite_client, "SqliteTransactionContext", TransactionContext
+    )
+    for context_type in (sqlite_context, TransactionContextPooled):
         pooled = context_type is TransactionContextPooled
         original_enter, original_exit = context_type.__aenter__, context_type.__aexit__
         if getattr(original_exit, "_zx_cache_exit", False):
@@ -132,27 +141,50 @@ def _install_transaction_hooks() -> None:
         def wrap_enter(enter_method, pooled):
             @wraps(enter_method)
             async def enter(context):
+                connection = _transaction_client(context)
+                ensure_connection = context.ensure_connection
+                acquired = False
+
+                async def ensure_locked_connection():
+                    nonlocal acquired
+                    acquired = True
+                    await ensure_connection()
+
+                track_lock = not pooled and hasattr(context, "_trxlock")
+                if track_lock:
+                    context.ensure_connection = ensure_locked_connection
                 try:
                     if getattr(
-                        context.connection._parent,
+                        connection._parent,
                         "_zx_transaction_cleanup_failed",
                         False,
                     ):
                         raise RuntimeError("transaction_connection_quarantined")
                     return await enter_method(context)
                 except BaseException:
-                    if connections.get(context.connection_name) is context.connection:
+                    if connections.get(context.connection_name) is connection:
                         await _recover_transaction_context(context, pooled)
+                    elif acquired:
+                        context._trxlock.release()
                     raise
+                finally:
+                    if track_lock:
+                        context.ensure_connection = ensure_connection
 
             return enter
 
         def wrap_exit(exit_method, pooled):
             @wraps(exit_method)
             async def exit_(context, exc_type, *args):
-                connection = context.connection
+                connection = _transaction_client(context)
                 finalized = connection._finalized
                 try:
+                    if not finalized:
+                        if exc_type:
+                            if exc_type is not TransactionManagementError:
+                                await connection.rollback()
+                        else:
+                            await connection.commit()
                     await exit_method(context, exc_type, *args)
                 except BaseException:
                     # Tortoise doesn't reset the context or release its
@@ -175,13 +207,70 @@ def _install_transaction_hooks() -> None:
 
         setattr(context_type, "__aenter__", wrap_enter(original_enter, pooled))
         setattr(context_type, "__aexit__", wrap_exit(original_exit, pooled))
+    _install_savepoint_hooks()
+
+
+def _install_savepoint_hooks() -> None:
+    """将保存点内的缓存变更合并到外层事务，回滚时丢弃。"""
+    original_enter = NestedTransactionContext.__aenter__
+    original_exit = NestedTransactionContext.__aexit__
+    if getattr(original_exit, "_zx_cache_savepoint_exit", False):
+        return
+
+    @wraps(original_enter)
+    async def enter(context):
+        connection = await original_enter(context)
+        if not hasattr(context, "client"):
+            return connection
+        parent = connections.get(context.connection_name)
+        previous = parent.__dict__.get("_zx_cache_batch")
+        batch = WriteBatch()
+        context._zx_cache_savepoint = (parent, previous, batch)
+        parent.__dict__["_zx_cache_batch"] = batch
+        connection.__dict__["_zx_cache_batch"] = batch
+        return connection
+
+    @wraps(original_exit)
+    async def exit_(context, exc_type, *args):
+        state = getattr(context, "_zx_cache_savepoint", None)
+        if state is None:
+            return await original_exit(context, exc_type, *args)
+        parent, previous, batch = state
+        succeeded = False
+        try:
+            await original_exit(context, exc_type, *args)
+            succeeded = exc_type is None
+        except BaseException:
+            await _transaction_failed(batch, committing=True)
+            raise
+        finally:
+            context.client.__dict__.pop("_zx_cache_batch", None)
+            if previous is None:
+                parent.__dict__.pop("_zx_cache_batch", None)
+            else:
+                parent.__dict__["_zx_cache_batch"] = previous
+            if succeeded:
+                target = previous if previous is not None else WriteBatch()
+                parent.__dict__["_zx_cache_batch"] = target
+                for key, effect in batch.effects.items():
+                    target.add(key, effect)
+
+    setattr(exit_, "_zx_cache_savepoint_exit", True)
+    NestedTransactionContext.__aenter__ = enter
+    NestedTransactionContext.__aexit__ = exit_
+
+
+def _transaction_client(context):
+    """获取事务上下文持有的数据库客户端。"""
+    client = getattr(context, "client", None)
+    return client if client is not None else context.connection
 
 
 async def _recover_transaction_context(context, pooled):
     from zhenxun.services.lifecycle.deadline import remaining_timeout
     from zhenxun.services.log import logger
 
-    connection = context.connection
+    connection = _transaction_client(context)
     raw = connection._connection
     deadline = time.monotonic() + remaining_timeout(15)
 
@@ -216,7 +305,8 @@ async def _recover_transaction_context(context, pooled):
         # ContextVar tokens belong to the calling task, never a cleanup task.
         connections.reset(context.token)
         if not pooled:
-            context.lock.release()
+            lock = getattr(context, "_trxlock", None)
+            (lock if lock is not None else context.lock).release()
 
 
 def _quarantine_connection_parent(parent):

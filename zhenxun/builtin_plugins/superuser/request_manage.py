@@ -184,7 +184,13 @@ async def _(
     logger.info(
         f"处理请求 Id: {req.id if req else ''}", arparma.header_result, session=session
     )
-    await MessageUtils.build_message("成功处理请求!").send(reply_to=True)
+    result = "成功处理请求!"
+    if req and req.id != handle_id:
+        result += f"\n原请求已被新的申请替代，已处理最新请求 ID：{req.id}"
+    if req and req.blacklisted:
+        target = "该用户" if req.request_type == RequestType.FRIEND else "该群组"
+        result += f"\n{target}已多次被拒绝，已加入永久黑名单，之后的请求将自动拒绝"
+    await MessageUtils.build_message(result).send(reply_to=True)
     if (
         req
         and req.request_type == RequestType.GROUP

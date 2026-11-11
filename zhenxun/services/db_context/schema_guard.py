@@ -267,7 +267,7 @@ async def repair_safe_schema_drift() -> SchemaGuardResult:
         logger.debug("SchemaGuard 跳过未知数据库方言", LOG_COMMAND)
         return result
 
-    app = Tortoise.apps.get("models", {})
+    app = Tortoise.apps["models"] if "models" in Tortoise.apps else {}
     for model in app.values():
         meta = getattr(model, "_meta", None)
         table = getattr(meta, "db_table", None) or getattr(meta, "table", None)

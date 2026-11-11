@@ -13,6 +13,7 @@ import time
 from urllib.parse import urlsplit, urlunsplit
 import zipfile
 
+from . import policy
 from . import state as tasks
 
 STATE_DIR = tasks.ROOT
@@ -80,7 +81,12 @@ def _load() -> dict | None:
 
 
 def _save(request: dict, **changes) -> dict:
-    return tasks.save(request, **changes)
+    global _gate_checked
+
+    try:
+        return tasks.save(request, **changes)
+    finally:
+        _gate_checked = 0.0
 
 
 def _mask(url: str | None) -> str | None:
@@ -163,6 +169,13 @@ def status(operation_id: str | None = None) -> dict:
                 "original_modified",
                 "restart_info",
                 "skip_failed",
+                "restore_mode",
+                "backup_before_replace",
+                "included_tables",
+                "source_binding",
+                "target_preview",
+                "target_backup_status",
+                "target_mutation_state",
             }
         },
         "historical_result": request.get("record_version") != 2,
@@ -171,6 +184,8 @@ def status(operation_id: str | None = None) -> dict:
         else False,
         "db_url": _mask(request.get("db_url")),
         "previous_db_url": _mask(request.get("previous_db_url")),
+        "backup_available": bool(request.get("target_native_backup")),
+        "backup_engine": (request.get("target_native_backup") or {}).get("engine"),
     }
 
 
@@ -401,13 +416,37 @@ async def retry_preparation(
     request = tasks.load(operation_id)
     if not request or request["state"] != "preparing":
         raise RestoreError("migration_preparation_not_retryable")
-    for key in ("name", "categories", "skip_failed", "db_url"):
+    for key in (
+        "name",
+        "categories",
+        "skip_failed",
+        "db_url",
+        "restore_mode",
+        "backup_before_replace",
+        "included_tables",
+        "source_binding",
+    ):
         if key in (inputs or {}):
             value = inputs[key]
-            if key == "categories":
+            if key in {"categories", "included_tables"} and value is not None:
                 value = sorted(set(value))
             if value != request.get(key):
                 raise RestoreError("migration_operation_input_changed")
+    if account := (inputs or {}).get("setup_account"):
+        from zhenxun.utils.passwords import verify_password
+
+        saved_account = request.get("setup_account") or {}
+        if (
+            str(account.get("username") or "").strip() != saved_account.get("username")
+            or account.get("password") != account.get("confirm_password")
+            or not saved_account.get("password_hash")
+            or not await asyncio.to_thread(
+                verify_password,
+                str(account.get("password") or ""),
+                saved_account["password_hash"],
+            )
+        ):
+            raise RestoreError("migration_operation_input_changed")
     if operation_id in _tasks:
         return status(operation_id)
     if password is not None and request.get("archive_password_digest") not in {
@@ -458,11 +497,56 @@ async def request_restore(
     db_url: str | None = None,
     *,
     operation_id: str | None = None,
+    restore_mode: str | None = None,
+    backup_before_replace: bool = True,
+    included_tables: list[str] | None = None,
+    source_binding: str | None = None,
+    setup_account: dict | None = None,
 ) -> dict:
     """占位并准备恢复，完成停写后的最终快照才允许 launcher 应用"""
     from . import preparation
 
     current = _current_db_url()
+    policy.mode({"restore_mode": restore_mode})
+    if type(backup_before_replace) is not bool:
+        raise RestoreError("migration_backup_option_invalid")
+    if included_tables is not None:
+        if (
+            not isinstance(included_tables, list)
+            or not included_tables
+            or any(not isinstance(name, str) or not name for name in included_tables)
+        ):
+            raise RestoreError("migration_included_tables_invalid")
+        included_tables = sorted(set(included_tables))
+    account, account_binding = None, None
+    if setup_account is not None:
+        from zhenxun.utils.passwords import hash_password, validate_new_password
+
+        username = str(setup_account.get("username") or "").strip()
+        password_value = str(setup_account.get("password") or "")
+        if (
+            not username
+            or len(username) > 128
+            or any(character in username for character in "\r\n\x00")
+            or password_value != setup_account.get("confirm_password")
+        ):
+            raise RestoreError("migration_setup_account_invalid")
+        if error := validate_new_password(password_value):
+            raise RestoreError(error)
+        account_binding = {
+            "username": username,
+            "password_digest": sha256(password_value.encode()).hexdigest(),
+        }
+        account = {
+            "username": username,
+            "password_hash": await asyncio.to_thread(hash_password, password_value),
+        }
+    options = {
+        "restore_mode": restore_mode,
+        "backup_before_replace": backup_before_replace,
+        "included_tables": included_tables,
+        "source_binding": source_binding,
+    }
     stat = path.stat()
     request, reused = tasks.reserve(
         str(operation_id or ""),
@@ -475,6 +559,8 @@ async def request_restore(
             "categories": sorted(set(categories)),
             "skip_failed": skip_failed,
             "db_url": db_url or current,
+            **options,
+            "setup_account": account_binding,
         },
         {
             "kind": "restore",
@@ -490,6 +576,15 @@ async def request_restore(
             "db_url": db_url or current,
             "previous_db_url": current,
             "snapshot_required": not bool(db_url),
+            "original_snapshot_required": (
+                bool(current)
+                and not bool(db_url)
+                and not (
+                    restore_mode == "replace_database" and not backup_before_replace
+                )
+            ),
+            **options,
+            "setup_account": account,
             "previous_worker": _worker_identity(),
         },
     )
@@ -526,8 +621,7 @@ async def _require_empty(db_url: str, request: dict | None = None) -> dict:
         async with data_guard.import_transaction(client) as db:
             tables = await data_guard.table_names(db)
             for schema, table in sorted(tables, key=str):
-                relation = data_guard.relation_sql(db, table, schema)
-                if (await db.execute_query(f"SELECT 1 FROM {relation} LIMIT 1"))[1]:
+                if await data_guard.has_business_rows(db, schema, table):
                     raise RestoreError(
                         f"目标数据库已有数据（表 {table}），请使用空数据库"
                     )
@@ -587,7 +681,7 @@ def snapshot_pending() -> bool:
     except Exception:
         return False
     return bool(
-        request and request["state"] == "pending" and request.get("snapshot_required")
+        request and request["state"] == "pending" and policy.original_snapshot(request)
     )
 
 
@@ -597,7 +691,7 @@ async def final_snapshot() -> None:
     if (
         not request
         or request["state"] != "pending"
-        or not request.get("snapshot_required")
+        or not policy.original_snapshot(request)
     ):
         return
     from tortoise import Tortoise
@@ -776,6 +870,21 @@ def _write_files(request: dict, root: Path, files: tasks.Files) -> None:
         candidate.touch()
     set_key(candidate, "DB_URL", request["db_url"], quote_mode="always")
     files.write(environment, candidate)
+    if account := request.get("setup_account"):
+        from zhenxun.builtin_plugins.web_ui.api.configure.persistence import (
+            _credential_documents,
+        )
+
+        simple, plugins = _credential_documents(
+            account["username"], account["password_hash"], root=root
+        )
+        for relative, content in (
+            ("data/configs/plugins2config.yaml", plugins),
+            ("data/config.yaml", simple),
+        ):
+            credential = staged / Path(relative).name
+            credential.write_bytes(content)
+            files.write(relative, credential)
 
 
 def _old_worker_exited(request: dict) -> None:
@@ -799,7 +908,7 @@ def _apply(request: dict, root: Path) -> None:
 
         asyncio.run(preparation.cancel(request))
         return
-    if request.get("snapshot_required") and request["state"] != "snapshot_ready":
+    if policy.original_snapshot(request) and request["state"] != "snapshot_ready":
         _save(
             request,
             state="preparing",
@@ -838,7 +947,7 @@ def _apply(request: dict, root: Path) -> None:
             "structure"
         ] != previous.get("structure"):
             raise RestoreError("migration_preflight_database_changed")
-        if request["kind"] == "switch" or not request.get("snapshot_required"):
+        if policy.requires_empty(request):
             identity = asyncio.run(_require_empty(request["db_url"], request))
             _save(request, target_identity=identity)
         files.initialize()
@@ -883,6 +992,21 @@ def _apply(request: dict, root: Path) -> None:
         rollback_after_stop(request)
 
 
+def _orm_scope():
+    """为 launcher 中独立连接的事务提供 ORM 上下文
+
+    返回:
+        已有上下文或旧版 ORM 时为空上下文，否则为临时的 TortoiseContext
+    """
+    from contextlib import nullcontext
+
+    try:
+        from tortoise.context import TortoiseContext, get_current_context
+    except ImportError:
+        return nullcontext()
+    return nullcontext() if get_current_context() else TortoiseContext()
+
+
 def apply_pending(root: Path | None = None) -> bool:
     request = _load()
     if request is None or request["state"] not in {
@@ -894,7 +1018,7 @@ def apply_pending(root: Path | None = None) -> bool:
         "rollback_target",
     }:
         return False
-    with tasks.owned(request):
+    with tasks.owned(request), _orm_scope():
         if request["state"] == "rollback_target":
             asyncio.run(_rollback_target(request))
         elif request["state"] == "committing":
@@ -1028,7 +1152,7 @@ def _original_isolated(request: dict) -> bool:
     components = request.get("rollback_components") or {}
     return bool(
         request.get("kind") == "switch"
-        and request.get("snapshot_required")
+        and policy.original_snapshot(request)
         and request.get("snapshot_identity")
         and request.get("target_identity")
         and request["snapshot_identity"] != request["target_identity"]
@@ -1159,6 +1283,7 @@ def rollback_after_stop(request: dict | None = None) -> None:
             tasks.Files(tasks.mutation.INSTANCE_ROOT, rollback).rollback()
             components["files"] = "confirmed"
             _save(request, rollback_components=components)
+            _require_rollback_evidence(request)
             if (
                 request.get("import_started")
                 and not request.get("report")
@@ -1171,18 +1296,55 @@ def rollback_after_stop(request: dict | None = None) -> None:
             if not database_started:
                 components["target_database"] = "not_applicable"
                 _save(request, rollback_components=components)
+            if (
+                database_started
+                and request.get("target_native_backup")
+                and request["target_native_backup"]["engine"] != "sqlite"
+            ):
+                asyncio.run(_restore_native_target(request))
+                components["target_database"] = "confirmed"
+                _save(request, rollback_components=components)
+                if policy.original_snapshot(request):
+                    _save(
+                        request,
+                        state="rollback_verifying",
+                        import_started=None,
+                        rollback_report={
+                            "database_identity": request["snapshot_identity"],
+                            "content_revision": request["snapshot_revision"],
+                        },
+                    )
+                else:
+                    components["original_instance"] = "not_applicable"
+                    cleanup(request)
+                    tasks.finish(
+                        request,
+                        state="rolled_back",
+                        rollback_confirmed=True,
+                        rollback_components=components,
+                    )
+                return
+            if (
+                database_started
+                and policy.mode(request) == "replace_database"
+                and not request.get("target_native_backup")
+            ):
+                raise RestoreError(
+                    "migration_original_data_unrecoverable_without_backup"
+                )
             if database_started and (snapshot := _target_snapshot(request)):
                 report = request.get("report") or {}
                 expected = (
                     report.get("sqlite_fingerprint")
                     or request.get("preimport_sqlite_fingerprint")
                     or request.get("orm_sqlite_fingerprint")
+                    or request.get("target_last_fingerprint")
                     or snapshot["fingerprint"]
                 )
                 restored_fingerprint = tasks.restore_sqlite(snapshot, expected)
                 components["target_database"] = "confirmed"
                 _save(request, rollback_components=components)
-                if not request.get("snapshot_required"):
+                if not policy.original_snapshot(request):
                     components["original_instance"] = "not_applicable"
                     cleanup(request)
                     tasks.finish(
@@ -1211,10 +1373,10 @@ def rollback_after_stop(request: dict | None = None) -> None:
             if request.get("schema_started"):
                 raise RestoreError("migration_schema_rollback_requires_review")
             if request.get("report"):
-                if request["kind"] == "switch" or not request.get("snapshot_required"):
+                if policy.requires_empty(request):
                     raise RestoreError("migration_target_rollback_requires_review")
                 _save(request, state="rollback_import", import_started=None)
-            elif request.get("snapshot_required"):
+            elif policy.original_snapshot(request):
                 _save(
                     request,
                     state="rollback_verifying",
@@ -1235,26 +1397,104 @@ def rollback_after_stop(request: dict | None = None) -> None:
             )
 
 
+def _require_rollback_evidence(request: dict) -> None:
+    """整库清理后没有原生回滚点时，拒绝把空目标补偿解释为原数据恢复。"""
+    if (
+        policy.mode(request) == "replace_database"
+        and (
+            request.get("target_cleared")
+            or request.get("target_mutation_state") in {"clearing", "cleared"}
+        )
+        and not request.get("target_native_backup")
+    ):
+        raise RestoreError("migration_original_data_unrecoverable_without_backup")
+
+
+async def _restore_native_target(request: dict) -> None:
+    """在 launcher 维护进程中用原生回滚点恢复目标，并核对结构与内容
+
+    参数:
+        request: 恢复任务记录
+
+    异常:
+        RestoreError: 恢复后的结构或内容与备份时不一致
+    """
+    from . import data, data_guard, native_backup, target
+
+    _require_rollback_evidence(request)
+    client = await data.open_client(request["db_url"], "zx_target_native_restore")
+    try:
+        await native_backup.restore(
+            request["db_url"],
+            request["target_native_backup"],
+            root=tasks.mutation.INSTANCE_ROOT,
+            client=client,
+        )
+        if await target.database_objects(client) != request.get(
+            "target_backup_objects"
+        ) or await target.database_content(client) != request.get(
+            "target_backup_content"
+        ):
+            raise RestoreError("migration_native_restore_unverified")
+        identity = await data_guard.identity(client)
+    finally:
+        await client.close()
+    changes = {"target_cleared": False, "target_mutation_state": "restored"}
+    for name in ("target_identity", "snapshot_identity"):
+        previous = request.get(name)
+        if previous and {**previous, "schema_id": None} == {
+            **identity,
+            "schema_id": None,
+        }:
+            changes[name] = identity
+    _save(request, **changes)
+
+
 async def _rollback_target(request: dict) -> None:
     """在 launcher 维护进程中补偿目标，再验证原实例或恢复原库数据。"""
     from . import data, target
 
     client = None
     try:
-        client = await data.open_client(request["db_url"], "zx_target_rollback")
-        if (
-            request.get("import_started")
-            and not request.get("report")
-            and not request.get("import_rollback_confirmed")
-        ):
-            _save(request, report=await target.reconcile(client, request))
-        await target.rollback(client, request, _save)
+        _require_rollback_evidence(request)
+        native = (request.get("target_native_backup") or {}).get("engine")
+        if native in {"mysql", "postgres"}:
+            await _restore_native_target(request)
+        else:
+            client = await data.open_client(request["db_url"], "zx_target_rollback")
+            if (
+                request.get("import_started")
+                and not request.get("report")
+                and not request.get("import_rollback_confirmed")
+            ):
+                _save(request, report=await target.reconcile(client, request))
+            if request.get("target_table_snapshot"):
+                journal = request.get("target_rollback") or {}
+                expected = journal.get("applied") or {
+                    **journal.get("before", {}),
+                    **{
+                        key: item["initial"]
+                        for key, item in journal.get("created", {}).items()
+                        if item.get("initial")
+                    },
+                }
+                await target.restore_tables(
+                    client, request["target_table_snapshot"], expected=expected
+                )
+                _save(request, import_rollback_confirmed=True)
+                await target.rollback(client, request, _save)
+            elif native:
+                await client.close()
+                client = None
+                await _restore_native_target(request)
+            else:
+                await target.rollback(client, request, _save)
         components = {
             **request.get("rollback_components", {}),
             "target_database": "confirmed",
         }
         _save(request, rollback_components=components, schema_started=False)
-        if not request.get("snapshot_required"):
+        if not policy.original_snapshot(request):
             components["original_instance"] = "not_applicable"
             cleanup(request)
             tasks.finish(
@@ -1263,7 +1503,12 @@ async def _rollback_target(request: dict) -> None:
                 rollback_confirmed=True,
                 rollback_components=components,
             )
-        elif request["kind"] == "restore" and request.get("report"):
+        elif (
+            request["kind"] == "restore"
+            and request.get("report")
+            and not request.get("target_native_backup")
+            and not request.get("target_table_snapshot")
+        ):
             components["target_database"] = "pending"
             _save(request, rollback_components=components)
             _save(request, state="rollback_import", import_started=None)
@@ -1417,6 +1662,15 @@ def cleanup(request: dict) -> None:
     try:
         for path in _paths(request):
             if path.exists():
+                if path.name == "rollback" and request.get("target_native_backup"):
+                    for child in path.iterdir():
+                        if child.name == "native":
+                            continue
+                        if child.is_dir():
+                            shutil.rmtree(child)
+                        else:
+                            child.unlink()
+                    continue
                 shutil.rmtree(path)
     except OSError as error:
         _save(request, cleanup_error=_message(error))
@@ -1557,7 +1811,11 @@ async def import_pending() -> None:
             revision = None
             if rollback:
                 revision = request["report"]["content_revision"]
-            elif request.get("snapshot_required") and request["kind"] == "restore":
+            elif (
+                policy.original_snapshot(request)
+                and request["kind"] == "restore"
+                and policy.mode(request) != "replace_database"
+            ):
                 revision = request["snapshot_revision"]
             included = set(request["report"]["tables"]) if rollback else None
             if revision is not None:
@@ -1576,8 +1834,17 @@ async def import_pending() -> None:
                 source,
                 Tortoise.get_connection("default"),
                 replace=bool(
-                    request.get("snapshot_required") and request["kind"] == "restore"
+                    policy.original_snapshot(request) and request["kind"] == "restore"
                 ),
+                restore_mode=(
+                    "replace_tables"
+                    if rollback
+                    else policy.mode(request)
+                    if request.get("restore_mode")
+                    else None
+                ),
+                source_binding=None if rollback else request.get("source_binding"),
+                archive_sha256=None if rollback else request.get("archive_digest"),
                 expected_identity=request.get("snapshot_identity")
                 if rollback
                 else request["target_identity"],
@@ -1586,7 +1853,9 @@ async def import_pending() -> None:
                 excluded_tables=set(request.get("excluded_tables") or [])
                 if not rollback
                 else set(),
-                included_tables=included,
+                included_tables=(
+                    included if rollback else request.get("included_tables")
+                ),
                 expected_sqlite_fingerprint=(
                     request.get("preimport_sqlite_fingerprint")
                     or request.get("orm_sqlite_fingerprint")
@@ -1635,6 +1904,110 @@ async def import_pending() -> None:
             raise RestoreError("migration_import_startup_blocked") from error
 
 
+async def _prepare_target(client, request: dict) -> None:
+    """核验全部待导入模型后生成目标回滚点，再进入整库清理。"""
+    from . import data, data_guard, native_backup, preflight, target
+
+    if not request.get("restore_mode") or policy.requires_empty(request):
+        return
+    if request.get("target_mutation_state") == "clearing":
+        raise RestoreError("migration_target_clear_outcome_unconfirmed")
+    if request.get("target_cleared") or request.get("target_prepared"):
+        return
+    package, rollback = _paths(request)
+    validated = preflight.validate_data(package / "database", client)
+    selected = policy.selected_tables(request, validated["manifest"]["tables"])
+    models = {data._table_key(model): model for model in data._models()}
+    unavailable = selected - models.keys()
+    excluded = selected & set(request.get("excluded_tables") or [])
+    if unavailable or excluded:
+        raise RestoreError(
+            "migration_restore_models_unavailable:"
+            + ",".join(sorted(unavailable | excluded))
+        )
+    if policy.mode(request).startswith("merge_"):
+        from . import merge
+
+        merge.validate_package(package / "database", included_tables=sorted(selected))
+    identity = await data_guard.require_same(client, request["target_identity"])
+    objects = (
+        await target.database_objects(client)
+        if policy.mode(request) == "replace_database"
+        or client.capabilities.dialect == "sqlite"
+        else None
+    )
+    if client.capabilities.dialect == "sqlite" and any(
+        "CREATE VIRTUAL TABLE" in (item.get("sql") or "").upper()
+        for item in objects["objects"]
+    ):
+        raise RestoreError("migration_sqlite_virtual_rollback_requires_review")
+    if policy.target_backup(request) and client.capabilities.dialect == "mysql":
+        if any(
+            item["type"] == "BASE TABLE" and str(item.get("engine")).lower() != "innodb"
+            for item in objects["objects"]
+        ):
+            raise RestoreError("migration_nontransactional_backup_requires_review")
+    if policy.mode(request) == "replace_database":
+        await target.database_permissions(client, backup=policy.target_backup(request))
+    previous = (request.get("preflight_database") or {}).get("preview")
+    if previous is not None and previous != objects:
+        raise RestoreError("migration_target_structure_changed")
+    if policy.target_backup(request) or (
+        policy.mode(request) != "replace_database"
+        and client.capabilities.dialect == "sqlite"
+    ):
+        revision = await target.database_content(client)
+        _save(request, target_backup_status="creating")
+        receipt = await native_backup.create(
+            request["db_url"],
+            rollback / "native",
+            root=tasks.mutation.INSTANCE_ROOT,
+            identity=identity,
+            objects=objects,
+        )
+        if revision != await target.database_content(client):
+            raise RestoreError("migration_target_changed_during_backup")
+        if objects != await target.database_objects(client):
+            raise RestoreError("migration_target_structure_changed")
+        changes = {
+            "target_native_backup": receipt,
+            "target_backup_status": "ready",
+            "target_backup_content": revision,
+            "target_backup_objects": objects,
+        }
+        if receipt["engine"] == "sqlite":
+            from contextlib import closing
+            import sqlite3
+
+            with closing(sqlite3.connect(receipt["path"])) as connection:
+                fingerprint = tasks.sqlite_fingerprint(connection)
+            changes["target_sqlite_snapshot"] = {
+                "file": identity["file"],
+                "backup": receipt["path"],
+                "fingerprint": fingerprint,
+            }
+        _save(request, **changes)
+    elif policy.mode(request) == "replace_database":
+        _save(request, target_backup_status="disabled")
+    else:
+        receipt = await target.snapshot_tables(client, rollback / "tables", selected)
+        _save(request, target_table_snapshot=receipt, target_backup_status="ready")
+    if policy.mode(request) == "replace_database":
+        _save(request, target_mutation_state="clearing", schema_started=True)
+        await target.clear_database(client, expected=objects)
+        identity = await data_guard.identity(client)
+        changes = {
+            "target_cleared": True,
+            "target_identity": identity,
+            "target_mutation_state": "cleared",
+        }
+        if client.capabilities.dialect == "sqlite":
+            changes["target_last_fingerprint"] = await data.sqlite_revision(client)
+        _save(request, **changes)
+        await target.checkpoint(client, request, _save, "cleared")
+    _save(request, target_prepared=True)
+
+
 async def prepare_schema(client) -> bool:
     """恢复窗口只创建缺失表，已有结构须先通过独立升级处理"""
     from contextlib import nullcontext
@@ -1656,6 +2029,8 @@ async def prepare_schema(client) -> bool:
     from . import data, data_guard, target
 
     with tasks.owned(request):
+        if request["state"] == "importing" and not request.get("import_started"):
+            await _prepare_target(client, request)
         if (
             request.get("import_started")
             and request["state"] == "importing"
@@ -1675,11 +2050,14 @@ async def prepare_schema(client) -> bool:
             identity = await data_guard.require_same(db, expected)
             if not sqlite and request["state"] == "importing":
                 package, _ = _paths(request)
-                imported_tables = set(
+                imported_tables = policy.selected_tables(
+                    request,
                     json.loads(
                         (package / "database" / data.MANIFEST).read_text("utf-8")
-                    )["tables"]
+                    )["tables"],
                 )
+                if request.get("restore_mode"):
+                    imported_tables.add("migration_import_records")
                 async with data_guard.import_transaction(client) as protected:
                     present = await data_guard.table_names(protected)
                     models = [
@@ -1697,9 +2075,11 @@ async def prepare_schema(client) -> bool:
                     )
                 await target.create_missing(client, request, _save)
             if sqlite and request["state"] == "importing":
-                fingerprint = request.get("orm_sqlite_fingerprint") or (
-                    _target_snapshot(request) or {}
-                ).get("fingerprint")
+                fingerprint = (
+                    request.get("target_last_fingerprint")
+                    or request.get("orm_sqlite_fingerprint")
+                    or (_target_snapshot(request) or {}).get("fingerprint")
+                )
                 if fingerprint and fingerprint not in {
                     await data.sqlite_revision(db),
                     await data.sqlite_revision(db, legacy=True),
@@ -1740,4 +2120,5 @@ async def prepare_schema(client) -> bool:
                     preimport_sqlite_fingerprint=await data.sqlite_revision(db),
                     schema_completed=True,
                 )
+        await target.checkpoint(client, request, _save, "schema_ready")
         return True

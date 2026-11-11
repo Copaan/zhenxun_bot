@@ -6,9 +6,10 @@ import asyncio
 from collections.abc import Callable
 import contextlib
 from datetime import datetime
+import hashlib
 import json
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
 import secrets
 import shutil
@@ -24,7 +25,7 @@ import pyzipper
 
 from . import data, deps
 
-FORMAT = 1
+FORMAT = 2
 SUFFIX = ".zx"
 MANIFEST = "manifest.json"
 DEPENDENCIES = "dependencies.json"
@@ -53,7 +54,14 @@ _EXCLUDED_DIRS = frozenset(
         "tmp",
     }
 )
-_EXCLUDED_PREFIXES = ("data/runtime/", "data/web_ui/", "data/db/", "resources/temp/")
+_EXCLUDED_PREFIXES = (
+    "data/runtime/",
+    "data/web_ui/",
+    "data/db/",
+    "resources/temp/",
+    "data/test_db_servers/",
+    "data/render_debug/",
+)
 _EXCLUDED_SUFFIXES = (".pyc", ".log", SUFFIX, ".part")
 _WINDOWS_INVALID = re.compile(r'[<>:"|?*\\\x00-\x1f]')
 _WINDOWS_DEVICES = frozenset(
@@ -109,7 +117,11 @@ def _current_db_url() -> str:
 
 
 def collect(
-    root: Path, categories, excluded: set[Path] | None = None
+    root: Path,
+    categories,
+    excluded: set[Path] | None = None,
+    *,
+    excluded_paths: list[str] | None = None,
 ) -> list[tuple[str, int]]:
     """按分类收集需要备份的文件
 
@@ -121,13 +133,22 @@ def collect(
     返回:
         list[tuple[str, int]]: (相对路径, 字节数)
     """
+    root = root.resolve()
     excluded = {path.resolve() for path in excluded or ()}
+    excluded.update(root / name for name in _selection_paths(excluded_paths))
     categories = set(categories)
     result = []
 
     def add(path: Path):
         relative = path.relative_to(root).as_posix()
-        if category_for(relative) in categories and path.resolve() not in excluded:
+        resolved = path.resolve()
+        if (
+            category_for(relative) in categories
+            and resolved.is_relative_to(root)
+            and not any(
+                resolved == item or item in resolved.parents for item in excluded
+            )
+        ):
             try:
                 result.append((relative, path.stat().st_size))
             except OSError:
@@ -147,13 +168,40 @@ def collect(
                 for name in names
                 if name.casefold() not in _EXCLUDED_DIRS
                 and not (current / name).is_symlink()
-                and (current / name).resolve() not in excluded
+                and (current / name).resolve().is_relative_to(root)
+                and not any(
+                    (current / name).resolve() == item
+                    or item in (current / name).resolve().parents
+                    for item in excluded
+                )
+                and not (
+                    (current / name).relative_to(root).as_posix().casefold() + "/"
+                ).startswith(_EXCLUDED_PREFIXES)
             )
             for name in sorted(files):
                 path = current / name
                 if not path.is_symlink():
                     add(path)
     return result
+
+
+def _selection_paths(values: list[str] | None) -> list[str]:
+    """校验用户选择的项目内相对文件或目录。"""
+    result = []
+    for value in values or []:
+        if not isinstance(value, str):
+            raise BackupError("备份路径必须是项目内相对路径")
+        path = PurePosixPath(value.replace(chr(92), "/"))
+        if (
+            not path.parts
+            or path.is_absolute()
+            or PureWindowsPath(value).drive
+            or ".." in path.parts
+            or str(path) == "."
+        ):
+            raise BackupError("备份路径必须是项目内相对路径")
+        result.append(path.as_posix())
+    return sorted(set(result))
 
 
 def scan(root: Path | None = None, db_url: str | None = None) -> dict:
@@ -169,12 +217,32 @@ def scan(root: Path | None = None, db_url: str | None = None) -> dict:
     root = (root or Path.cwd()).resolve()
     excluded = _database_files(db_url or _current_db_url(), root)
     sizes = {name: {"files": 0, "bytes": 0} for name in CATEGORIES}
-    for relative, size in collect(root, CATEGORIES, excluded):
+    files = collect(root, CATEGORIES, excluded)
+    directories = {}
+    for relative, size in files:
         item = sizes[category_for(relative)]  # type: ignore
         item["files"] += 1
         item["bytes"] += size
+        parts = relative.split("/")
+        group = "/".join(
+            parts[:3] if relative.startswith("zhenxun/plugins/") else parts[:2]
+        )
+        entry = directories.setdefault(
+            group,
+            {"path": group, "category": category_for(relative), "files": 0, "bytes": 0},
+        )
+        entry["files"] += 1
+        entry["bytes"] += size
     return {
         "categories": sizes,
+        "directories": sorted(
+            directories.values(), key=lambda item: (-item["bytes"], item["path"])
+        ),
+        "largest_files": [
+            {"path": name, "category": category_for(name), "bytes": size}
+            for name, size in sorted(files, key=lambda item: (-item[1], item[0]))[:30]
+        ],
+        "database_size_pending": True,
         "default_categories": list(DEFAULT_CATEGORIES),
         "dependencies": deps.inventory(root),
     }
@@ -194,6 +262,48 @@ def _open(path: Path, mode: Literal["r", "w"], password: str | None):
     return archive
 
 
+def _archive_category(name: str) -> str:
+    if name.startswith("database/"):
+        return "database"
+    if name.startswith("files/"):
+        return category_for(name[6:]) or "data"
+    return "dependencies" if name == DEPENDENCIES else "metadata"
+
+
+def _archive_summary(archive) -> dict:
+    """读取 ZIP 条目大小，区分内容压缩量与归档文件本身的大小。"""
+    categories = {}
+    largest = []
+    for info in archive.infolist():
+        if info.is_dir():
+            continue
+        category = _archive_category(info.filename)
+        entry = categories.setdefault(
+            category, {"files": 0, "raw_bytes": 0, "compressed_bytes": 0}
+        )
+        entry["files"] += 1
+        entry["raw_bytes"] += info.file_size
+        entry["compressed_bytes"] += info.compress_size
+        largest.append(
+            {
+                "path": info.filename,
+                "category": category,
+                "raw_bytes": info.file_size,
+                "compressed_bytes": info.compress_size,
+            }
+        )
+    return {
+        "raw_bytes": sum(item["raw_bytes"] for item in categories.values()),
+        "compressed_bytes": sum(
+            item["compressed_bytes"] for item in categories.values()
+        ),
+        "categories": categories,
+        "largest_files": sorted(
+            largest, key=lambda item: (-item["raw_bytes"], item["path"])
+        )[:30],
+    }
+
+
 def _write(
     destination: Path,
     root: Path,
@@ -205,20 +315,54 @@ def _write(
     progress: Progress | None,
 ) -> list[str]:
     skipped = []
+    members = {}
     total, done = sum(size for _, size in files), 0
     with _open(destination, "w", password) as archive:
-        for path in sorted(database.iterdir()):
-            archive.write(path, f"database/{path.name}")
-        for relative, size in files:
+
+        def copy_member(path: Path, name: str, *, optional: bool = False):
             try:
-                archive.write(root / relative, f"files/{relative}")
+                source = path.open("rb")
             except OSError:
+                if optional:
+                    return False
+                raise
+            with source:
+                info_type = getattr(archive, "zipinfo_cls", zipfile.ZipInfo)
+                info = info_type.from_file(path, name)
+                info.compress_type = zipfile.ZIP_DEFLATED
+                digest, size = hashlib.sha256(), 0
+                with archive.open(info, "w", force_zip64=True) as output:
+                    while chunk := source.read(1024 * 1024):
+                        output.write(chunk)
+                        digest.update(chunk)
+                        size += len(chunk)
+                members[name] = {"bytes": size, "sha256": digest.hexdigest()}
+            return True
+
+        for path in sorted(database.iterdir()):
+            copy_member(path, f"database/{path.name}")
+        for relative, size in files:
+            path = root / relative
+            if not path.resolve().is_relative_to(root) or path.is_symlink():
+                raise BackupError(f"备份文件越出项目目录: {relative}")
+            if not copy_member(path, f"files/{relative}", optional=True):
                 skipped.append(relative)
             done += size
             if progress:
                 progress("files", done, total, "")
+        payload = json.dumps(dependencies, ensure_ascii=False).encode("utf-8")
+        archive.writestr(DEPENDENCIES, payload)
+        members[DEPENDENCIES] = {
+            "bytes": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        }
         manifest["skipped_files"] = skipped
-        archive.writestr(DEPENDENCIES, json.dumps(dependencies, ensure_ascii=False))
+        manifest["members"] = members
+        manifest["files"] = sum(name.startswith("files/") for name in members)
+        manifest["bytes"] = sum(
+            item["bytes"] for name, item in members.items() if name.startswith("files/")
+        )
+        manifest["content_summary"] = _archive_summary(archive)
         archive.writestr(MANIFEST, json.dumps(manifest, ensure_ascii=False, indent=1))
     return skipped
 
@@ -232,6 +376,7 @@ async def export_backup(
     db_url: str | None = None,
     destination: Path | None = None,
     progress: Progress | None = None,
+    excluded_paths: list[str] | None = None,
 ) -> tuple[Path, dict]:
     """在线导出备份包：数据库快照、所选分类的文件与依赖清单
 
@@ -252,6 +397,7 @@ async def export_backup(
         raise BackupError(f"未知的备份分类: {', '.join(sorted(unknown))}")
     root = (root or Path.cwd()).resolve()
     db_url = db_url or _current_db_url()
+    excluded_paths = _selection_paths(excluded_paths)
     now = datetime.now()
     destination = (
         destination or root / BACKUP_DIR / f"zhenxun-{now:%Y%m%d-%H%M%S}{SUFFIX}"
@@ -277,7 +423,10 @@ async def export_backup(
         finally:
             await client.close()
         files = collect(
-            root, categories, _database_files(db_url, root) | {destination, part, work}
+            root,
+            categories,
+            _database_files(db_url, root) | {destination, part, work},
+            excluded_paths=excluded_paths,
         )
         manifest = {
             "format": FORMAT,
@@ -291,11 +440,16 @@ async def export_backup(
                 "tables": {k: v["rows"] for k, v in tables["tables"].items()},
             },
             "encrypted": bool(password),
+            "excluded_paths": excluded_paths,
+            "source_identity": tables.get("source_identity"),
         }
         await asyncio.to_thread(
             _write, part, root, work, files, manifest, dependencies, password, progress
         )
         part.replace(destination)
+        with _open(destination, "r", password) as archive:
+            manifest["archive_summary"] = _archive_summary(archive)
+            manifest["archive_summary"]["archive_bytes"] = destination.stat().st_size
     finally:
         shutil.rmtree(work, ignore_errors=True)
         part.unlink(missing_ok=True)
@@ -372,8 +526,30 @@ def read_manifest(path: Path, password: str | None = None) -> dict:
         raise BackupError("备份包已加密，需要密码")
     with _open(path, "r", password) as archive:
         manifest = _read_json(archive, MANIFEST)
-        if manifest.get("format") != FORMAT:
+        if manifest.get("format") not in {1, FORMAT}:
             raise BackupError(f"不支持的备份格式: {manifest.get('format')}")
+        if manifest.get("format") == FORMAT:
+            members = manifest.get("members")
+            names = [info.filename for info in archive.infolist() if not info.is_dir()]
+            if len(names) != len(set(names)):
+                raise BackupError("备份包包含重复文件条目")
+            actual = {
+                info.filename: info
+                for info in archive.infolist()
+                if not info.is_dir() and info.filename != MANIFEST
+            }
+            if not isinstance(members, dict) or set(members) != set(actual):
+                raise BackupError("备份包文件清单不完整")
+            for name, info in actual.items():
+                item = members[name]
+                if (
+                    not isinstance(item, dict)
+                    or item.get("bytes") != info.file_size
+                    or not re.fullmatch("[a-f0-9]{64}", str(item.get("sha256", "")))
+                ):
+                    raise BackupError(f"备份包文件摘要无效: {name}")
+        manifest["archive_summary"] = _archive_summary(archive)
+        manifest["archive_summary"]["archive_bytes"] = path.stat().st_size
         manifest["dependencies"] = _read_json(archive, DEPENDENCIES)
         manifest["unrestorable_files"] = _unrestorable(archive.namelist())
     return manifest
@@ -399,15 +575,29 @@ def extract(path: Path, target: Path, password: str | None = None) -> dict:
     with _open(path, "r", password) as archive:
         for info in archive.infolist():
             name = PurePosixPath(info.filename)
-            if info.filename.startswith("/") or ".." in name.parts:
+            if (
+                info.filename.startswith("/")
+                or ".." in name.parts
+                or PureWindowsPath(info.filename).drive
+            ):
                 raise BackupError(f"备份包包含非法路径: {info.filename}")
             if info.is_dir() or info.filename in skipped:
                 continue
             output = target.joinpath(*name.parts)
+            if not output.resolve().is_relative_to(target) or output.is_symlink():
+                raise BackupError(f"备份包包含越界路径: {info.filename}")
             try:
                 output.parent.mkdir(parents=True, exist_ok=True)
                 with archive.open(info) as source, output.open("wb") as file:
-                    shutil.copyfileobj(source, file, 1024 * 1024)
+                    digest = hashlib.sha256()
+                    while chunk := source.read(1024 * 1024):
+                        file.write(chunk)
+                        digest.update(chunk)
+                expected = (manifest.get("members") or {}).get(info.filename)
+                if expected and digest.hexdigest() != expected["sha256"]:
+                    raise BackupError(f"备份包文件校验失败: {info.filename}")
+            except BackupError:
+                raise
             except RuntimeError as error:
                 raise BackupError("备份包密码错误") from error
             except zipfile.BadZipFile as error:
@@ -481,7 +671,12 @@ class ExportTask:
 
     @classmethod
     def start(
-        cls, categories, extras: list[str] | None, password: str | None = None
+        cls,
+        categories,
+        extras: list[str] | None,
+        password: str | None = None,
+        *,
+        excluded_paths: list[str] | None = None,
     ) -> dict:
         """开始导出
 
@@ -497,6 +692,7 @@ class ExportTask:
             raise BackupError("已有导出任务正在进行")
         if unknown := set(categories) - set(CATEGORIES):
             raise BackupError(f"未知的备份分类: {', '.join(sorted(unknown))}")
+        excluded_paths = _selection_paths(excluded_paths)
         cls.status = {
             "state": "running",
             "stage": "database",
@@ -513,7 +709,11 @@ class ExportTask:
 
             try:
                 path, manifest = await export_backup(
-                    categories, extras, password, progress=progress
+                    categories,
+                    extras,
+                    password,
+                    progress=progress,
+                    excluded_paths=excluded_paths,
                 )
                 cls.status = {"state": "done", "name": path.name, "manifest": manifest}
                 logger.info(f"备份导出完成: {path.name}", "备份")

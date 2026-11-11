@@ -6,6 +6,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from zhenxun.configs.path_config import TEMP_PATH
+from zhenxun.utils.github_utils.const import (
+    ALIYUN_ENDPOINT,
+    ALIYUN_GROUP,
+    ALIYUN_ORG_ID,
+    RDC_access_token_encrypted,
+)
 
 LOG_COMMAND = "RepoUtils"
 
@@ -28,23 +34,12 @@ class GithubConfig:
 class AliyunCodeupConfig:
     """阿里云CodeUp配置"""
 
-    # 访问密钥ID
-    access_key_id: str = "LTAI5tNmf7KaTAuhcvRobAQs"
-    # 访问密钥密钥
-    access_key_secret: str = "NmJ3d2VNRU1MREY0T1RtRnBqMlFqdlBxN3pMUk1j"
-    # 组织ID
-    organization_id: str = "67a361cf556e6cdab537117a"
-    # 组织名称
-    organization_name: str = "zhenxun-org"
-    # RDC Access Token
-    rdc_access_token_encrypted: str = (
-        "cHQtYXp0allnQWpub0FYZWpqZm1RWGtneHk0XzBlMmYzZTZmLWQwOWItNDE4Mi1iZWUx"
-        "LTQ1ZTFkYjI0NGRlMg=="
+    organization_id: str = ALIYUN_ORG_ID
+    organization_name: str = ALIYUN_GROUP
+    rdc_access_token_encrypted: str = field(
+        default=RDC_access_token_encrypted, repr=False
     )
-    # 区域
-    region: str = "cn-hangzhou"
-    # 端点
-    endpoint: str = "devops.cn-hangzhou.aliyuncs.com"
+    endpoint: str = ALIYUN_ENDPOINT
     # 下载重试次数
     download_retry: int = 3
 

@@ -12,6 +12,7 @@ from mcp.client.sse import sse_client
 from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.message import SessionMessage
+from mcp.types import PaginatedRequestParams
 from pydantic import ValidationError
 
 from zhenxun.services.ai.core.models import ToolDefinition
@@ -27,6 +28,11 @@ from zhenxun.utils.pydantic_compat import model_dump
 
 _MESSAGE_START_CHARS = {"{", "["}
 _LITERAL_PREFIXES: tuple[str, ...] = ("true", "false", "null")
+
+
+def _protocol_value(value: Any, name: str, alias: str, default: Any = None) -> Any:
+    """读取 MCP 模型字段及其协议别名。"""
+    return getattr(value, name, getattr(value, alias, default))
 
 
 def _should_ignore_exception(exc: Exception) -> bool:
@@ -202,7 +208,7 @@ class MCPRemoteTool(BaseTool):
             )
             return ToolResult(output=f"MCP 错误: {last_error}").as_error()
 
-        if result.isError:
+        if _protocol_value(result, "is_error", "isError", False):
             return ToolResult(output=str(result.content)).as_error()
 
         from zhenxun.services.ai.core.messages import ImagePart, TextPart
@@ -215,7 +221,7 @@ class MCPRemoteTool(BaseTool):
 
             if item_type == "image":
                 b64_data = getattr(item, "data", "")
-                mime_type = getattr(item, "mimeType", "image/png")
+                mime_type = _protocol_value(item, "mime_type", "mimeType", "image/png")
                 if b64_data:
                     try:
                         img_bytes = base64.b64decode(b64_data)
@@ -481,14 +487,18 @@ class MCPToolkit(BaseToolkit):
                         if not self._is_initialized:
                             mcp_tools_res = await client_session.list_tools()
                             tools_list = list(mcp_tools_res.tools)
-                            cursor = getattr(mcp_tools_res, "nextCursor", None)
+                            cursor = _protocol_value(
+                                mcp_tools_res, "next_cursor", "nextCursor"
+                            )
 
                             while cursor:
                                 mcp_tools_res = await client_session.list_tools(
-                                    cursor=cursor
+                                    params=PaginatedRequestParams(cursor=cursor)
                                 )
                                 tools_list.extend(mcp_tools_res.tools)
-                                cursor = getattr(mcp_tools_res, "nextCursor", None)
+                                cursor = _protocol_value(
+                                    mcp_tools_res, "next_cursor", "nextCursor"
+                                )
 
                             for t in tools_list:
                                 t_name = t.name.replace("-", "_")
@@ -502,7 +512,9 @@ class MCPToolkit(BaseToolkit):
                                         name=final_name,
                                         original_tool_name=t.name,
                                         description=t.description or "",
-                                        parameters=t.inputSchema,
+                                        parameters=_protocol_value(
+                                            t, "input_schema", "inputSchema"
+                                        ),
                                         toolkit=self,
                                     )
                                 )

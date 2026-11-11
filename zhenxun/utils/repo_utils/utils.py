@@ -3,7 +3,6 @@
 """
 
 import asyncio
-import base64
 from collections.abc import Mapping
 import contextlib
 import os
@@ -12,11 +11,12 @@ import re
 import shutil
 import tempfile
 from typing import TYPE_CHECKING
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 import psutil
 
 from zhenxun.services.log import logger
+from zhenxun.utils.github_utils.const import get_aliyun_token
 
 from .config import LOG_COMMAND, RepoConfig
 from .exceptions import GitUnavailableError
@@ -503,20 +503,8 @@ def prepare_aliyun_url(repo_url: str, group_name: str | None = None) -> str:
     # https://codeup.aliyun.com/{organization_id}/{group_name}/{repo_name}.git
     url = f"https://codeup.aliyun.com/{config.aliyun_codeup.organization_id}/{group}/{repo_name}.git"
 
-    # 添加访问令牌 - 使用base64解码后的令牌
-    if config.aliyun_codeup.rdc_access_token_encrypted:
-        try:
-            # 解码RDC访问令牌
-            token = base64.b64decode(
-                config.aliyun_codeup.rdc_access_token_encrypted.encode()
-            ).decode()
-            # 阿里云CodeUp使用oauth2:token的格式进行身份验证
-            url = url.replace("https://", f"https://oauth2:{token}@")
-            logger.debug("已为阿里云仓库准备临时RDC认证")
-        except Exception as e:
-            logger.error(f"解码RDC令牌失败: {e}")
-
-    return url
+    token = get_aliyun_token(config.aliyun_codeup.rdc_access_token_encrypted)
+    return url.replace("https://", f"https://oauth2:{quote(token, safe='')}@", 1)
 
 
 async def get_aliyun_group_for_repo(repo_name: str) -> str | None:

@@ -26,6 +26,14 @@ class _InactivePauseCancelled(Exception):
     pass
 
 
+def _valid_group_id(scope, group_id):
+    """检查群关联标识，OneBot 群号必须是大于零的十进制整数。"""
+    value = str(group_id or "").strip()
+    return bool(value) and (
+        scope != "qq_client" or (value.isdecimal() and int(value) > 0)
+    )
+
+
 def group_key(bot_id, platform_scope, group_id, channel_id=None):
     key = str(bot_id), str(platform_scope), str(group_id), str(channel_id or "")
     if any(len(value) > limit for value, limit in zip(key, (191, 32, 191, 191))):
@@ -206,6 +214,8 @@ class BotGroupPolicyService:
         self._accept_row(key, row, clear_stale=marks == self._stale_marks)
 
     async def ensure_fresh(self, bot_id, scope, group_id, channel_id=None):
+        if group_id and not _valid_group_id(scope, group_id):
+            return
         key = group_key(
             bot_id,
             scope if group_id else "private",
@@ -238,7 +248,11 @@ class BotGroupPolicyService:
         await asyncio.shield(task)
 
     def observe(self, bot_id, scope, group_id, channel_id=None):
-        if not group_id or not self.context or not self.context.accepting:
+        if (
+            not _valid_group_id(scope, group_id)
+            or not self.context
+            or not self.context.accepting
+        ):
             return
         key = group_key(bot_id, scope, group_id, channel_id)
         if key in self._memberships or key in self._pending:
@@ -270,6 +284,11 @@ class BotGroupPolicyService:
                     self._queue.task_done()
 
     async def record_memberships(self, entries, *, source):
+        entries = [
+            entry
+            for entry in entries
+            if _valid_group_id(entry["platform_scope"], entry["group_id"])
+        ]
         if not entries:
             return
         keys = set()
@@ -320,6 +339,7 @@ class BotGroupPolicyService:
                 "connected": account["connected"],
             }
             for row in rows
+            if _valid_group_id(row.platform_scope, row.group_id)
         ]
 
     PRIVATE_KEY = "__all__"
@@ -465,6 +485,8 @@ class BotGroupPolicyService:
         }
 
     async def get_group(self, bot_id, scope, group_id, channel_id=""):
+        if not _valid_group_id(scope, group_id):
+            raise PluginPolicyNotFound("群标识无效，无法读取群设置")
         bot_id = await plugin_policy_service._resolve_bot_id(bot_id)
         key = group_key(bot_id, scope, group_id, channel_id)
         membership = await BotGroupMembership.get_or_none(**key_fields(key))

@@ -2,13 +2,13 @@ from typing import Literal
 
 RepoKey = Literal["bot", "resource", "plugin", "webui"]
 
-OFFICIAL_GITHUB_REPOS: dict[RepoKey, str] = {
-    "bot": "zhenxun-org/zhenxun_bot",
-    "resource": "zhenxun-org/zhenxun-bot-resources",
-    "plugin": "zhenxun-org/zhenxun_bot_plugins",
-    "webui": "HibiKier/zhenxun_bot_webui",
+ALIYUN_MIRROR_REPOS: dict[RepoKey, str] = {
+    "bot": "Copaan/zhenxun_bot",
+    "resource": "Copaan/zhenxun-bot-resources",
+    "plugin": "Copaan/zhenxun_bot_plugins",
+    "webui": "Copaan/zhenxun_bot_webui",
 }
-"""官方 GitHub 仓库，阿里云镜像同步自这些仓库"""
+"""阿里云镜像同步自这些 GitHub 仓库"""
 
 GITHUB_REPOS: dict[RepoKey, str] = {
     "bot": "Copaan/zhenxun_bot",
@@ -34,7 +34,7 @@ def github_url(key: RepoKey, branch: str | None = None) -> str:
 
 
 def aliyun_mirrored(key: RepoKey) -> bool:
-    """判断仓库是否可使用阿里云镜像，仅官方仓库同步到阿里云
+    """判断仓库是否可使用阿里云镜像，仅镜像来源仓库同步到阿里云
 
     参数:
         key: 仓库标识
@@ -42,4 +42,4 @@ def aliyun_mirrored(key: RepoKey) -> bool:
     返回:
         bool: 是否可使用阿里云镜像
     """
-    return GITHUB_REPOS[key] == OFFICIAL_GITHUB_REPOS[key]
+    return GITHUB_REPOS[key] == ALIYUN_MIRROR_REPOS[key]

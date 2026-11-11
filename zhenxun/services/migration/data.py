@@ -187,7 +187,9 @@ async def export_data(
     返回:
         dict: 清单，包含每张表的字段与行数
     """
-    models = _models()
+    from .merge import INTERNAL_TABLE, export_origins
+
+    models = [m for m in _models() if m._meta.db_table != INTERNAL_TABLE]
     if (
         models
         and models[0]._meta.db.capabilities.dialect != client.capabilities.dialect
@@ -203,6 +205,7 @@ async def export_data(
     async with context as db:
         if transaction is None and client.capabilities.dialect == "postgres":
             await db.execute_query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        source_identity = await export_origins(db, directory)
         for model in models:
             meta = model._meta
             fields = list(meta.fields_db_projection)
@@ -235,6 +238,8 @@ async def export_data(
             }
     manifest = {"format": FORMAT, "dialect": client.capabilities.dialect}
     manifest["tables"] = tables
+    manifest["source_identity"] = source_identity
+    manifest["origins_file"] = "origins.jsonl"
     (directory / MANIFEST).write_text(
         json.dumps(manifest, ensure_ascii=False, indent=1), encoding="utf-8"
     )
@@ -550,6 +555,9 @@ async def import_data(
     expected_sqlite_fingerprint: str | None = None,
     outcome: dict | None = None,
     before_commit: Callable[..., Awaitable[None]] | None = None,
+    restore_mode: str | None = None,
+    source_binding: str | None = None,
+    archive_sha256: str | None = None,
 ) -> dict:
     """在受保护写事务内替换包内表，保留目标独有表及其外键引用
 
@@ -569,6 +577,31 @@ async def import_data(
         raise DataError("导出清单缺失或已损坏") from error
     if manifest.get("format") != FORMAT or not isinstance(manifest.get("tables"), dict):
         raise DataError("不支持或损坏的数据清单")
+    from .merge import validate_origins
+
+    validate_origins(directory)
+    if restore_mode in {"merge_upsert", "merge_skip"}:
+        from .merge import import_merge
+
+        return await import_merge(
+            directory,
+            client,
+            restore_mode=restore_mode,
+            source_binding=source_binding,
+            archive_sha256=archive_sha256,
+            included_tables=included_tables,
+            excluded_tables=excluded_tables,
+            expected_identity=expected_identity,
+            expected_revision=expected_revision,
+            expected_sqlite_fingerprint=expected_sqlite_fingerprint,
+            outcome=outcome,
+            before_commit=before_commit,
+            progress=progress,
+        )
+    if restore_mode is not None:
+        if restore_mode not in {"empty", "replace_tables", "replace_database"}:
+            raise DataError("migration_invalid_restore_mode")
+        replace = restore_mode in {"replace_tables", "replace_database"}
     exported = manifest["tables"]
     all_models = _models()
     models = [
@@ -701,6 +734,16 @@ async def import_data(
                     raise DataError(
                         "migration_final_row_count_changed:" + _table_key(model)
                     )
+            from .merge import ensure_identity_in_transaction, record_replacement
+
+            await ensure_identity_in_transaction(db)
+            await record_replacement(
+                db,
+                directory,
+                models,
+                source_binding=source_binding,
+                archive_sha256=archive_sha256,
+            )
             if dialect == "sqlite":
                 report["sqlite_fingerprint"] = await sqlite_revision(db)
             report["content_revision"] = await database_revision(

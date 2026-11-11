@@ -1,6 +1,7 @@
 """Managed OneBot ingress; protocol logic follows the locked upstream adapter."""
 
 import asyncio
+from collections import deque
 from collections.abc import Awaitable, Callable
 import contextlib
 import hashlib
@@ -27,6 +28,8 @@ from zhenxun.utils.exception import DependencyUnavailable
 from zhenxun.utils.network import public_client_address
 
 _ADMISSION_TIMEOUT = 30.0
+_ADMISSION_BUFFER_LIMIT = 256
+_ADMISSION_BUFFER_BYTES = 4 * 1024 * 1024
 _INGRESS_PREFIX = "/onebot/"
 _REJECTED_LIMIT = 1024
 _QUEUED_APIS = frozenset(
@@ -43,6 +46,12 @@ _QUEUED_APIS = frozenset(
 _SEND_INTERVAL = 0.05
 _QUEUE_LIMIT = 500
 _DRAIN_TIMEOUT = 3.0
+
+
+async def _close_ws(websocket: WebSocket, code: int = 1000, reason: str = ""):
+    """结束当前连接，允许协议端已断开或握手已被取消。"""
+    with contextlib.suppress(Exception):
+        await websocket.close(code, reason)
 
 
 class SendRejected(DependencyUnavailable):
@@ -183,6 +192,8 @@ class ManagedOneBotAdapter(Adapter):
         return await self._call_api_unqueued(bot, api, **data)
 
     def bot_disconnect(self, bot: BaseBot) -> None:
+        if self.bots.get(bot.self_id) is not bot:
+            return
         SendQueue.forget(bot.self_id)
         super().bot_disconnect(bot)
 
@@ -233,6 +244,53 @@ class ManagedOneBotAdapter(Adapter):
             return True
         log("WARNING", f"Bot {escape_tag(self_id)} 接入超时，等待协议端重连")
         return False
+
+    async def _admit_websocket(
+        self,
+        websocket: WebSocket,
+        self_id: str,
+        timeout: float | None = _ADMISSION_TIMEOUT,
+    ) -> tuple[deque[str | bytes], asyncio.Task[str | bytes]] | None:
+        """等待接入时持续感知断线，按原顺序保留有界的待处理报文。"""
+        receive = asyncio.create_task(websocket.receive())
+        admission = asyncio.create_task(self._admit(self_id, timeout))
+        buffered: deque[str | bytes] = deque()
+        buffered_bytes = 0
+        transferred = False
+        try:
+            while True:
+                done, _ = await asyncio.wait(
+                    (receive, admission), return_when=asyncio.FIRST_COMPLETED
+                )
+                if receive in done:
+                    data = receive.result()
+                    buffered.append(data)
+                    buffered_bytes += len(
+                        data.encode() if isinstance(data, str) else data
+                    )
+                    if (
+                        len(buffered) > _ADMISSION_BUFFER_LIMIT
+                        or buffered_bytes > _ADMISSION_BUFFER_BYTES
+                    ):
+                        log(
+                            "WARNING",
+                            f"Bot {escape_tag(self_id)} 启动等待报文过多，"
+                            "等待协议端重连",
+                        )
+                        return None
+                    receive = asyncio.create_task(websocket.receive())
+                    continue
+                if admission in done:
+                    if not admission.result():
+                        return None
+                    transferred = True
+                    return buffered, receive
+        finally:
+            if not transferred:
+                for task in (admission, receive):
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(admission, receive, return_exceptions=True)
 
     def _public_rejected(self, scope: dict) -> bool:
         """公网来源的接入请求是否因缺少认证被拒绝
@@ -346,39 +404,57 @@ class ManagedOneBotAdapter(Adapter):
         # check self_id
         if not self_id:
             log("WARNING", "Missing X-Self-ID Header")
-            await websocket.close(1008, "Missing X-Self-ID Header")
+            await _close_ws(websocket, 1008, "Missing X-Self-ID Header")
             return
 
         # check access_token
         response = self._check_access_token(websocket.request)
         if response is not None:
             content = cast(str, response.content)
-            await websocket.close(1008, content)
+            await _close_ws(websocket, 1008, content)
             return
 
-        await websocket.accept()
-        if not await self._admit(self_id):
-            await websocket.close(1013, "Runtime starting")
-            return
         if self_id in self.bots:
             log("WARNING", f"There's already a bot {self_id}, ignored")
-            await websocket.close(1008, "Duplicate X-Self-ID")
+            await _close_ws(websocket, 1008, "Duplicate X-Self-ID")
             return
 
-        bot = Bot(self, self_id)
-        self.bot_connect(bot)
-        self.connections[self_id] = websocket
-
-        log("INFO", f"<y>Bot {escape_tag(self_id)}</y> connected")
-
+        bot: Bot | None = None
+        receive: asyncio.Task[str | bytes] | None = None
+        close_code, close_reason = 1000, ""
         try:
+            await websocket.accept()
+            admitted = await self._admit_websocket(websocket, self_id)
+            if admitted is None:
+                close_code, close_reason = 1013, "Runtime starting"
+                return
+            buffered, receive = admitted
+            if self_id in self.bots:
+                log("WARNING", f"There's already a bot {self_id}, ignored")
+                close_code, close_reason = 1008, "Duplicate X-Self-ID"
+                return
+            bot = Bot(self, self_id)
+            self.bot_connect(bot)
+            self.connections[self_id] = websocket
+            log("INFO", f"<y>Bot {escape_tag(self_id)}</y> connected")
             while True:
-                data = await websocket.receive()
+                if buffered:
+                    data = buffered.popleft()
+                elif receive is not None:
+                    data = await receive
+                    receive = None
+                else:
+                    data = await websocket.receive()
                 json_data = json.loads(data)
                 if event := self.json_to_event(json_data):
                     self._offer_event(bot, event)
         except WebSocketClosed:
-            log("WARNING", f"WebSocket for Bot {escape_tag(self_id)} closed by peer")
+            if bot is not None:
+                log(
+                    "WARNING", f"WebSocket for Bot {escape_tag(self_id)} closed by peer"
+                )
+            else:
+                log("DEBUG", f"Bot {escape_tag(self_id)} 在接入前已断开")
         except Exception as e:
             log(
                 "ERROR",
@@ -387,10 +463,13 @@ class ManagedOneBotAdapter(Adapter):
                 e,
             )
         finally:
-            with contextlib.suppress(Exception):
-                await websocket.close()
-            self.connections.pop(self_id, None)
-            self.bot_disconnect(bot)
+            if receive is not None:
+                receive.cancel()
+                await asyncio.gather(receive, return_exceptions=True)
+            await _close_ws(websocket, close_code, close_reason)
+            if bot is not None and self.connections.get(self_id) is websocket:
+                self.connections.pop(self_id, None)
+                self.bot_disconnect(bot)
 
     async def _forward_ws(self, url: URL) -> None:
         headers = {}
@@ -403,6 +482,8 @@ class ManagedOneBotAdapter(Adapter):
         bot: Bot | None = None
 
         while True:
+            receive: asyncio.Task[str | bytes] | None = None
+            buffered: deque[str | bytes] = deque()
             try:
                 async with self.websocket(request) as ws:
                     log(
@@ -411,7 +492,13 @@ class ManagedOneBotAdapter(Adapter):
                     )
                     try:
                         while True:
-                            data = await ws.receive()
+                            if buffered:
+                                data = buffered.popleft()
+                            elif receive is not None:
+                                data = await receive
+                                receive = None
+                            else:
+                                data = await ws.receive()
                             json_data = json.loads(data)
                             event = self.json_to_event(json_data)
                             if not event:
@@ -423,7 +510,18 @@ class ManagedOneBotAdapter(Adapter):
                                 ):
                                     continue
                                 self_id = event.self_id
-                                await self._admit(str(self_id), None)
+                                admitted = await self._admit_websocket(
+                                    ws, str(self_id), None
+                                )
+                                if admitted is None:
+                                    break
+                                buffered, receive = admitted
+                                if str(self_id) in self.bots:
+                                    log(
+                                        "WARNING",
+                                        f"There's already a bot {self_id}, ignored",
+                                    )
+                                    break
                                 bot = Bot(self, str(self_id))
                                 self.bot_connect(bot)
                                 self.connections[str(self_id)] = ws
@@ -450,9 +548,13 @@ class ManagedOneBotAdapter(Adapter):
                             e,
                         )
                     finally:
+                        if receive is not None:
+                            receive.cancel()
+                            await asyncio.gather(receive, return_exceptions=True)
                         if bot:
-                            self.connections.pop(bot.self_id, None)
-                            self.bot_disconnect(bot)
+                            if self.connections.get(bot.self_id) is ws:
+                                self.connections.pop(bot.self_id, None)
+                                self.bot_disconnect(bot)
                             bot = None
 
             except Exception as e:

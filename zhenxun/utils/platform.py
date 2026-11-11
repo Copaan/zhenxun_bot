@@ -135,19 +135,9 @@ class PlatformUtils:
             user_id: 用户id
 
         返回:
-            bool: SUPERUSERS 中的 `适配器:id` 均可匹配；裸 id 只在 QQ 作用域
-                匹配 SUPERUSERS，其余平台匹配 PLATFORM_SUPERUSERS 对应平台
+            bool: 是否在 get_superusers 的结果中
         """
-        if not user_id:
-            return False
-        user_id = str(user_id)
-        superusers = bot.config.superusers
-        if adapter := _adapter_name(bot).split(maxsplit=1):
-            if f"{adapter[0]}:{user_id}" in superusers:
-                return True
-        if cls.get_platform_scope(bot) in ("qq_client", "qq_api"):
-            return user_id in superusers
-        return user_id in BotConfig.get_superuser(cls.get_platform(bot))
+        return bool(user_id) and str(user_id) in cls.get_superusers(bot)
 
     @classmethod
     async def is_group_admin(
@@ -295,23 +285,27 @@ class PlatformUtils:
             )
 
     @classmethod
-    def _config_superusers(cls, bot: Bot) -> list[str]:
-        """从 SUPERUSERS 中取出可用于该 Bot 的超级用户id
+    def get_superusers(cls, bot: Bot) -> list[str]:
+        """获取该 Bot 所在平台的超级用户id
 
         参数:
             bot: Bot
 
         返回:
-            list[str]: `适配器:id` 形式中的 id，QQ 平台另含裸 id
+            list[str]: PLATFORM_SUPERUSERS 对应平台的 id，加上 SUPERUSERS 中
+                `适配器:id` 形式的 id；QQ 平台另含 SUPERUSERS 中的裸 id
         """
+        platform = cls.get_platform(bot)
         adapter = _adapter_name(bot).split(maxsplit=1)
         prefix = f"{adapter[0]}:" if adapter else None
-        bare = cls.get_platform(bot) == "qq"
         result = []
+        for item in BotConfig.get_superuser(platform):
+            if (user_id := str(item).strip()) and user_id not in result:
+                result.append(user_id)
         for item in bot.config.superusers:
             item = str(item).strip()
             if ":" not in item:
-                if not bare:
+                if platform != "qq":
                     continue
                 user_id = item
             elif prefix and item.startswith(prefix):
@@ -350,14 +344,8 @@ class PlatformUtils:
         superuser_ids = []
         if superuser_id:
             superuser_ids.append(superuser_id)
-        elif platform := cls.get_platform(bot):
-            superuser_ids = [
-                uid for uid in BotConfig.get_superuser(platform) if str(uid).strip()
-            ]
-            if not superuser_ids:
-                superuser_ids = cls._config_superusers(bot)
-            if not superuser_ids:
-                raise NotFindSuperuser()
+        elif not (superuser_ids := cls.get_superusers(bot)):
+            raise NotFindSuperuser()
         if isinstance(message, str):
             message = MessageUtils.build_message(message)
         result = []

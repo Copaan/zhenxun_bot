@@ -18,6 +18,13 @@ ALCONNA_SHORTCUT_TOKEN_LIMIT = 16
 
 @dataclass(frozen=True, slots=True)
 class ActivationRuleDescriptor:
+    """matcher 单条 rule 的预筛元数据
+
+    value 按 kind 存放：command / shell_command 为规范化后的命令文本元组，
+    startswith / endswith / fullmatch / keywords 为字符串元组，regex 为正则，
+    is_type 为事件类型。
+    """
+
     kind: str
     value: object | None = None
     flags: int = 0
@@ -59,7 +66,6 @@ class AlconnaDescriptor:
     context_style、会改写输入的扩展、快捷指令无法读取）该 matcher 不参与预筛。
     AlconnaRule 在命令头与快捷指令都未命中时必定返回 False，before/after rule
     不影响这一结论，因此自定义 rule 不阻止预筛。
-    heads 为带前缀的字面命令头，含正则命令头时为空，用于快速排除不可能命中的文本。
     """
 
     command: str = ""
@@ -70,7 +76,6 @@ class AlconnaDescriptor:
     compact: bool = False
     prefilter: bool = False
     reply_merge: bool = False
-    heads: tuple[str, ...] = ()
 
 
 def _alconna_shortcut_signature() -> tuple | None:
@@ -823,23 +828,15 @@ def _build_alconna_descriptor(call: Any, command: Any) -> AlconnaDescriptor | No
         for item in getattr(command, "aliases", ()) or ()
         if str(item).strip() and str(item).strip() != command_text
     )
-    prefixes = tuple(item for item in raw_prefixes if isinstance(item, str))
-    names = (command_text, *aliases)
-    heads = (
-        ()
-        if any(name.startswith("re:") for name in names)
-        else tuple(f"{prefix}{name}" for name in names for prefix in prefixes or ("",))
-    )
     return AlconnaDescriptor(
         command=command_text,
         aliases=aliases,
-        prefixes=prefixes,
+        prefixes=tuple(item for item in raw_prefixes if isinstance(item, str)),
         separators=separators if isinstance(separators, str) and separators else " ",
         shortcuts=shortcuts or (),
         compact=bool(getattr(meta, "compact", False)),
         prefilter=prefilter,
         reply_merge="ReplyMergeExtension" in rewrite_extensions,
-        heads=heads,
     )
 
 
@@ -929,8 +926,7 @@ def matcher_alconna_head_matches(
     saw_unknown = False
     command_heads = (alconna.command, *alconna.aliases)
     for text in candidates:
-        maybe_head = not alconna.heads or text.startswith(alconna.heads)
-        for command in command_heads if maybe_head else ():
+        for command in command_heads:
             if not command:
                 continue
             decision = _alconna_command_head_matches(text, command, alconna)

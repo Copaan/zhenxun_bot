@@ -84,15 +84,18 @@ def _credential_documents(
     username: str,
     password_hash: str,
     secret: str | None = None,
+    *,
+    root: Path | None = None,
 ) -> tuple[bytes, bytes]:
-    simple = _load_yaml(_SIMPLE_CONFIG)
+    root = root or Path.cwd()
+    simple = _load_yaml(root / _SIMPLE_CONFIG)
     simple_group = simple.setdefault("web-ui", {})
     simple_group["USERNAME"] = username
     simple_group["PASSWORD"] = password_hash
     if secret is not None:
         simple_group["SECRET"] = secret
 
-    plugins = _load_yaml(_PLUGIN_CONFIG)
+    plugins = _load_yaml(root / _PLUGIN_CONFIG)
     plugin_group = plugins.setdefault("web-ui", {})
     username_entry = _credential_entry(plugin_group, "USERNAME")
     password_entry = _credential_entry(plugin_group, "PASSWORD")

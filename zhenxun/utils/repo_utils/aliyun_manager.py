@@ -10,6 +10,7 @@ from pathlib import Path
 from aiocache import cached
 
 from zhenxun.services.log import logger
+from zhenxun.utils.github_utils.const import get_aliyun_token
 from zhenxun.utils.github_utils.models import AliyunFileInfo
 from zhenxun.utils.repo_utils.utils import prepare_aliyun_url
 
@@ -339,14 +340,9 @@ class AliyunCodeupManager(BaseRepoManager):
 
     def _check_config(self):
         """检查配置"""
-        if not self.config.aliyun_codeup.access_key_id:
-            raise AuthenticationError("阿里云CodeUp")
-
-        if not self.config.aliyun_codeup.access_key_secret:
-            raise AuthenticationError("阿里云CodeUp")
-
         if not self.config.aliyun_codeup.organization_id:
             raise AuthenticationError("阿里云CodeUp")
+        get_aliyun_token(self.config.aliyun_codeup.rdc_access_token_encrypted)
 
     async def _get_newest_commit(self, repo_name: str, branch: str) -> str:
         """
@@ -446,7 +442,6 @@ class AliyunCodeupManager(BaseRepoManager):
         返回:
             RepoUpdateResult: 更新结果
         """
-        # 调用基类的update_via_git方法
         return await super().update_via_git(
             repo_url=repo_url,
             local_path=local_path,
