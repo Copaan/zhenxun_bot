@@ -24,4 +24,6 @@ jobs:
           git fetch aliyun main --force  # 强制更新本地引用
 
       - name: Force push
-        run: git push --progress --force aliyun HEAD:main
+        run: |
+          git fetch --tags
+          git push --progress --force --tags aliyun HEAD:main
