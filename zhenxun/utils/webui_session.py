@@ -1,12 +1,86 @@
 from __future__ import annotations
 
+import copy
+from io import StringIO
+from pathlib import Path
 import secrets
 import time
+from typing import Any
 
 import jwt
 
 SESSION_VERSION = 2
 SESSION_SECONDS = 6 * 60 * 60
+SIMPLE_CONFIG = Path("data/config.yaml")
+PLUGIN_CONFIG = Path("data/configs/plugins2config.yaml")
+_CREDENTIAL_HELP = {
+    "USERNAME": "前端管理用户名",
+    "PASSWORD": "前端管理密码",
+    "SECRET": "JWT密钥",
+}
+
+
+def credential_documents(
+    username: str,
+    password_hash: str,
+    secret: str | None = None,
+    *,
+    root: Path | None = None,
+    templates: dict[str, dict[str, Any]] | None = None,
+) -> tuple[bytes, bytes]:
+    """生成写入 WebUI 管理员凭据后的两份配置文件内容，不依赖运行中的 Bot
+
+    参数:
+        username: 用户名
+        password_hash: 密码哈希
+        secret: JWT 密钥，为 None 时保持原值
+        root: 实例目录，默认为当前目录
+        templates: 配置项名 -> 已注册配置项的字段，缺少的字段补入插件配置
+
+    返回:
+        tuple[bytes, bytes]: data/config.yaml 与 data/configs/plugins2config.yaml 的内容
+    """
+    from ruamel.yaml import YAML
+
+    def parser() -> YAML:
+        value = YAML()
+        value.preserve_quotes = True
+        value.indent(mapping=2, sequence=2, offset=0)
+        return value
+
+    def load(path: Path) -> Any:
+        if not path.exists():
+            return {}
+        with path.open(encoding="utf-8") as stream:
+            return parser().load(stream) or {}
+
+    def dump(data: Any) -> bytes:
+        stream = StringIO()
+        parser().dump(data, stream)
+        return stream.getvalue().encode("utf-8")
+
+    root = root or Path.cwd()
+    values = {"USERNAME": username, "PASSWORD": password_hash, "SECRET": secret}
+    simple = load(root / SIMPLE_CONFIG)
+    simple_group = simple.setdefault("web-ui", {})
+    plugins = load(root / PLUGIN_CONFIG)
+    plugin_group = plugins.setdefault("web-ui", {})
+    for key, value in values.items():
+        entry = plugin_group.get(key)
+        if not isinstance(entry, dict):
+            entry = plugin_group[key] = {}
+        template = (templates or {}).get(key) or {
+            "value": None,
+            "help": _CREDENTIAL_HELP[key],
+            "default_value": None,
+            "ui": None,
+        }
+        for field, default in template.items():
+            entry.setdefault(field, copy.deepcopy(default))
+        if value is not None:
+            entry["value"] = value
+            simple_group[key] = value
+    return dump(simple), dump(plugins)
 
 
 def compact_token(token: str) -> str:

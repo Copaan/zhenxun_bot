@@ -60,6 +60,9 @@ async def open_client(
         config["credentials"]["init_command"] = (
             "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ"
         )
+    if endpoint.engine == "sqlite" and not read_only:
+        if endpoint.database != ":memory:":
+            Path(endpoint.database).parent.mkdir(parents=True, exist_ok=True)
     module = importlib.import_module(config["engine"])
     client = module.client_class(connection_name=name, **config["credentials"])
     if read_only and endpoint.engine == "sqlite":
@@ -85,6 +88,24 @@ async def open_client(
 def _table_key(model) -> str:
     schema = getattr(model._meta, "schema", None)
     return f"{schema}.{model._meta.db_table}" if schema else model._meta.db_table
+
+
+def column_converters(executor) -> dict:
+    """各列把 Python 值转换为数据库值的函数
+
+    参数:
+        executor: 模型的执行器
+
+    返回:
+        dict: 列名 -> 转换函数，参数为值与模型
+    """
+    converters = getattr(executor, "column_map", None)
+    if converters is None:
+        fields = executor.model._meta.fields_map
+        converters = {
+            name: fields[name].to_db_value for name in executor.regular_columns_all
+        }
+    return converters
 
 
 def _models() -> list[type[Model]]:
@@ -123,10 +144,12 @@ async def create_schema(client: BaseDBAsyncClient, models: list | None = None) -
     base = client.schema_generator
 
     class Generator(base):  # type: ignore
-        def _get_models_to_create(self, models_to_create):
+        def _get_models_to_create(self, models_to_create=None):
+            result = [] if models_to_create is None else models_to_create
             for model in models if models is not None else _models():
                 model._check()
-                models_to_create.append(model)
+                result.append(model)
+            return result
 
     sql = Generator(client).get_create_schema_sql(safe=True)
     if client.capabilities.dialect == "sqlite":
@@ -473,7 +496,7 @@ async def _write_table(
             name: lambda value, decoder=decoder: _strip_nul(decoder(value))
             for name, decoder in decode.items()
         }
-    to_db = executor.column_map
+    to_db = column_converters(executor)
 
     def convert(row: list) -> list:
         return [

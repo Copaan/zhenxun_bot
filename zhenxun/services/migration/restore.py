@@ -871,11 +871,9 @@ def _write_files(request: dict, root: Path, files: tasks.Files) -> None:
     set_key(candidate, "DB_URL", request["db_url"], quote_mode="always")
     files.write(environment, candidate)
     if account := request.get("setup_account"):
-        from zhenxun.builtin_plugins.web_ui.api.configure.persistence import (
-            _credential_documents,
-        )
+        from zhenxun.utils.webui_session import credential_documents
 
-        simple, plugins = _credential_documents(
+        simple, plugins = credential_documents(
             account["username"], account["password_hash"], root=root
         )
         for relative, content in (

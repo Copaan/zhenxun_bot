@@ -273,7 +273,7 @@ async def apply(*, manual_external: bool = False) -> int:
         nonebot.init(_env_file=environment_file())
         migrate_orm_data_dir()
         _load_target_plugins(transaction)
-        import nonebot_plugin_orm as orm
+        orm = nonebot.require("nonebot_plugin_orm")
         from nonebot_plugin_orm import migrate
 
         orm._init_orm()

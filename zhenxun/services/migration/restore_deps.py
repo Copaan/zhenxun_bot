@@ -183,7 +183,8 @@ def _root_requirements(root: dict, pin: str | None) -> list[str]:
                     requirement.url and pin != plugin["version"]
                 ):
                     raise DependencyAnalysisError(
-                        "dependency_explicit_version_conflict"
+                        "dependency_explicit_version_conflict",
+                        details=[f"{name} 的安装声明 {raw} 不包含版本 {pin}"],
                     )
                 if not requirement.url:
                     requirement.specifier = SpecifierSet(f"=={pin}")
@@ -203,7 +204,10 @@ def _root_requirements(root: dict, pin: str | None) -> list[str]:
                     DependencyAnalysisError,
                 )
 
-                raise DependencyAnalysisError("dependency_explicit_version_conflict")
+                raise DependencyAnalysisError(
+                    "dependency_explicit_version_conflict",
+                    details=[f"{root['name']} 的声明 {raw} 不包含版本 {pin}"],
+                )
             requirement.specifier = SpecifierSet(f"=={pin}")
         if str(requirement) not in result:
             result.append(str(requirement))
@@ -260,9 +264,11 @@ async def _plan(roots: dict, pins: dict, preferences: dict) -> dict:
 
     current = capture_environment().versions
     changes = [
-        name
+        f"{name} 已安装 {current[name]}，备份需要 {item['version']}，只能在控制台变更"
         for name, item in plan["target_manifest"]["packages"].items()
-        if name in ORM_PACKAGES and current.get(name) != str(item["version"])
+        if name in ORM_PACKAGES
+        and current.get(name)
+        and current[name] != str(item["version"])
     ]
     if changes:
         raise DependencyAnalysisError(
@@ -372,10 +378,13 @@ def _reason(error: Exception) -> str:
 
 
 def _fallback_or_raise(error) -> None:
-    """仅对已确认的包解析冲突尝试降级方案，环境与网络故障保持失败"""
+    """仅对已确认的包解析冲突、声明与备份版本不一致和已安装 ORM 包的版本变更
+    尝试降级方案，环境与网络故障保持失败"""
     if error.code not in {
         "dependency_resolution_failed",
         "registry_version_not_on_pypi",
+        "orm_dependency_console_required",
+        "dependency_explicit_version_conflict",
     }:
         raise error
 

@@ -123,6 +123,7 @@ def validate_data(directory: Path, db=None) -> dict:
         model = models.get(name)
         executor = db.executor_class(model=model, db=db) if db and model else None
         converters = {}
+        to_db = data.column_converters(executor) if executor else {}
         if executor:
             for field in executor.regular_columns_all:
                 definition = model._meta.fields_map[field]
@@ -148,7 +149,7 @@ def validate_data(directory: Path, db=None) -> dict:
                             value = decode(row[fields.index(field)])
                             if db.capabilities.dialect == "postgres":
                                 value = data._strip_nul(value)
-                            value = executor.column_map[field](value, model)
+                            value = to_db[field](value, model)
                             if field == model._meta.pk_attr:
                                 token = digest(value)
                                 if token in seen:
@@ -350,7 +351,6 @@ async def orm_check(request: dict, package: Path) -> dict:
     import ast
 
     from dotenv import dotenv_values
-    from sqlalchemy.engine import make_url
 
     from zhenxun.services.nonebot_store import storage
 
@@ -386,9 +386,9 @@ async def orm_check(request: dict, package: Path) -> dict:
     raw = values.get("sqlalchemy_database_url")
     if not raw:
         return unknown
-    url = make_url(raw)
-    dialect = url.get_backend_name()
-    if dialect not in {"postgresql", "mysql"}:
+    scheme, separator, location = str(raw).partition("://")
+    dialect = scheme.split("+", 1)[0].lower()
+    if not separator or dialect not in {"postgresql", "mysql"}:
         return {
             "state": "deferred",
             "reason": "SQLite ORM 使用父任务或独立附属库回滚点",
@@ -448,9 +448,7 @@ async def orm_check(request: dict, package: Path) -> dict:
     heads = revisions - parents
     if not heads:
         return unknown
-    connection = url.set(
-        drivername="postgres" if dialect == "postgresql" else "mysql"
-    ).render_as_string(hide_password=False)
+    connection = ("postgres" if dialect == "postgresql" else "mysql") + "://" + location
     client = await data.open_client(connection, "zx_orm_preflight", read_only=True)
     try:
         identity = await guard.identity(client)

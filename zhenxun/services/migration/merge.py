@@ -364,6 +364,7 @@ async def import_merge(
             for parent in set(references.values()):
                 await process(parent)
             executor = db.executor_class(model=model, db=db)
+            to_db = data.column_converters(executor)
             columns = executor.regular_columns_all
             pk = meta.pk_attr
             history = name in HISTORY
@@ -615,8 +616,7 @@ async def import_merge(
                                 f"UPDATE {guard.table_sql(db, model)} SET {sql} "
                                 f"WHERE {guard.quote(db, meta.db_pk_column)}"
                                 f"={params[-1]}",
-                                [executor.column_map[c](row[c], model) for c in update]
-                                + [row[pk]],
+                                [to_db[c](row[c], model) for c in update] + [row[pk]],
                             )
                             index_row(existing, remove=True)
                             if not history:
@@ -636,7 +636,7 @@ async def import_merge(
                             row["uid"] = maximum_uid
                         await db.execute_query(
                             executor.insert_query_all,
-                            [executor.column_map[c](row[c], model) for c in columns],
+                            [to_db[c](row[c], model) for c in columns],
                         )
                         target_row = {pk: row[pk]} if history else row
                         targets.append(target_row)

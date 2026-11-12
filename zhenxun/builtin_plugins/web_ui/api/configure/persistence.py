@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import copy
-from io import StringIO
 import json
 import os
 from pathlib import Path
@@ -11,22 +9,18 @@ from typing import Any
 
 from zhenxun.configs.config import Config
 from zhenxun.configs.environment import environment_file, environment_target
+from zhenxun.utils.webui_session import (
+    PLUGIN_CONFIG,
+    SIMPLE_CONFIG,
+    credential_documents,
+)
 
-from ...config_validation import _yaml_parser
 from ...passwords import hash_password
 from .data_source import build_database_url, resolve_network_host
 from .model import ApplyRequest
 
-_SIMPLE_CONFIG = Path("data/config.yaml")
-_PLUGIN_CONFIG = Path("data/configs/plugins2config.yaml")
 _ENV_CONFIG = Path(".env.dev")
 _ENV_TEMPLATE = Path(".env.example")
-
-_CREDENTIAL_HELP = {
-    "USERNAME": "前端管理用户名",
-    "PASSWORD": "前端管理密码",
-    "SECRET": "JWT密钥",
-}
 
 
 def _set_env_value(env_text: str, key: str, value: str | int) -> str:
@@ -44,42 +38,6 @@ def _quote_env(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
-def _load_yaml(path: Path) -> Any:
-    if not path.exists():
-        return {}
-    parser = _yaml_parser()
-    with path.open(encoding="utf-8") as stream:
-        return parser.load(stream) or {}
-
-
-def _dump_yaml(data: Any) -> bytes:
-    stream = StringIO()
-    _yaml_parser().dump(data, stream)
-    return stream.getvalue().encode("utf-8")
-
-
-def _credential_entry(plugin_group: dict[str, Any], key: str) -> dict[str, Any]:
-    registered_group = Config.get_data().get("web-ui")
-    registered = registered_group.configs.get(key) if registered_group else None
-    template = (
-        registered.to_dict(exclude={"type", "arg_parser"})
-        if registered
-        else {
-            "value": None,
-            "help": _CREDENTIAL_HELP[key],
-            "default_value": None,
-            "ui": None,
-        }
-    )
-    current = plugin_group.get(key)
-    if not isinstance(current, dict):
-        current = {}
-        plugin_group[key] = current
-    for field, value in template.items():
-        current.setdefault(field, copy.deepcopy(value))
-    return current
-
-
 def _credential_documents(
     username: str,
     password_hash: str,
@@ -87,24 +45,15 @@ def _credential_documents(
     *,
     root: Path | None = None,
 ) -> tuple[bytes, bytes]:
-    root = root or Path.cwd()
-    simple = _load_yaml(root / _SIMPLE_CONFIG)
-    simple_group = simple.setdefault("web-ui", {})
-    simple_group["USERNAME"] = username
-    simple_group["PASSWORD"] = password_hash
-    if secret is not None:
-        simple_group["SECRET"] = secret
-
-    plugins = _load_yaml(root / _PLUGIN_CONFIG)
-    plugin_group = plugins.setdefault("web-ui", {})
-    username_entry = _credential_entry(plugin_group, "USERNAME")
-    password_entry = _credential_entry(plugin_group, "PASSWORD")
-    secret_entry = _credential_entry(plugin_group, "SECRET")
-    username_entry["value"] = username
-    password_entry["value"] = password_hash
-    if secret is not None:
-        secret_entry["value"] = secret
-    return _dump_yaml(simple), _dump_yaml(plugins)
+    group = Config.get_data().get("web-ui")
+    templates = {
+        key: registered.to_dict(exclude={"type", "arg_parser"})
+        for key in ("USERNAME", "PASSWORD", "SECRET")
+        if group and (registered := group.configs.get(key))
+    }
+    return credential_documents(
+        username, password_hash, secret, root=root, templates=templates
+    )
 
 
 def _write_transaction(files: list[tuple[Path, bytes]]) -> None:
@@ -158,7 +107,7 @@ def persist_webui_credentials(
         password_hash,
         secret,
     )
-    _write_transaction([(_PLUGIN_CONFIG, plugin_bytes), (_SIMPLE_CONFIG, simple_bytes)])
+    _write_transaction([(PLUGIN_CONFIG, plugin_bytes), (SIMPLE_CONFIG, simple_bytes)])
     Config.set_config("web-ui", "username", username)
     Config.set_config("web-ui", "password", password_hash)
     if secret is not None:
@@ -228,9 +177,9 @@ def apply_configuration(setting: ApplyRequest) -> dict[str, Any]:
     # config.yaml is the commit point and is replaced last.
     _write_transaction(
         [
-            (_PLUGIN_CONFIG, plugin_bytes),
+            (PLUGIN_CONFIG, plugin_bytes),
             (environment_target(source), env_text.encode("utf-8")),
-            (_SIMPLE_CONFIG, simple_bytes),
+            (SIMPLE_CONFIG, simple_bytes),
         ]
     )
     Config.set_config("web-ui", "username", setting.username.strip())

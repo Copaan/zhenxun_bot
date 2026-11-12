@@ -58,6 +58,7 @@ _EXCLUDED_PREFIXES = (
     "data/runtime/",
     "data/web_ui/",
     "data/db/",
+    "data/.restart_state.json",
     "resources/temp/",
     "data/test_db_servers/",
     "data/render_debug/",
