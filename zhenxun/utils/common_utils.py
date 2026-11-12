@@ -150,10 +150,14 @@ class SqlUtils:
     @classmethod
     def random(cls, query, limit: int = 1) -> str:
         db_class_name = BotConfig.get_sql_type()
+        try:
+            sql = query.sql(params_inline=True)
+        except TypeError:
+            sql = query.sql()
         if "postgres" in db_class_name or "sqlite" in db_class_name:
-            query = f"{query.sql()} ORDER BY RANDOM() LIMIT {limit};"
+            query = f"{sql} ORDER BY RANDOM() LIMIT {limit};"
         elif "mysql" in db_class_name:
-            query = f"{query.sql()} ORDER BY RAND() LIMIT {limit};"
+            query = f"{sql} ORDER BY RAND() LIMIT {limit};"
         else:
             logger.warning(
                 f"Unsupported database type: {db_class_name}", query.__module__

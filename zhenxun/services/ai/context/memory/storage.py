@@ -24,6 +24,7 @@ from zhenxun.services.ai.core.messages import (
     VideoPart,
 )
 from zhenxun.utils.pydantic_compat import TypeAdapter, model_copy, model_dump
+from zhenxun.utils.time_utils import TimeUtils
 
 from .models import BaseChatContext
 
@@ -358,7 +359,7 @@ class DatabaseChatContext(BaseChatContext):
             return await self._memory.settle_run(
                 session_id, run_id, revision, delivery, started_at
             )
-        since = datetime.datetime.fromtimestamp(started_at - 1, datetime.timezone.utc)
+        since = datetime.datetime.fromtimestamp(started_at - 1, TimeUtils.zone())
         async with in_transaction() as connection:
             rows = (
                 await self._model()
@@ -427,7 +428,7 @@ class DatabaseChatContext(BaseChatContext):
             if session_id in keep:
                 query = query.filter(id__lte=keep[session_id])
             if retention_days > 0:
-                expire = now() - datetime.timedelta(days=retention_days)
+                expire = TimeUtils.now() - datetime.timedelta(days=retention_days)
                 deleted += await query.filter(created_at__lt=expire).delete()
             if max_messages > 0:
                 boundary = (

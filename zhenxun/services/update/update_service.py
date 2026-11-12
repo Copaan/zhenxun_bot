@@ -15,6 +15,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import threading
 import time
 from typing import Any, Literal
 from uuid import uuid4
@@ -34,7 +35,10 @@ from zhenxun.services.resource_install import (
     resources_ready,
     validate_resources,
 )
-from zhenxun.services.runtime_mutation import runtime_mutation_coordinator
+from zhenxun.services.runtime_mutation import (
+    mutation_owner,
+    runtime_mutation_coordinator,
+)
 from zhenxun.utils.atomic_json import (
     mutate_json_locked,
     read_json_locked,
@@ -59,6 +63,8 @@ _STATUS_CACHE_SECONDS = 300
 _WEBUI_API_VERSION = 1
 _RESOURCE_LEGACY_VERSION = Version("1.1.1")
 _RESOURCE_RETRY_SECONDS = 600
+_QUICK_RETRY_SECONDS = 180
+_QUICK_FAILURE_SECONDS = 30
 _RESOURCE_STARTUP_TASK: asyncio.Task[None] | None = None
 _RESOURCE_ACTIVE_TASK: asyncio.Task[None] | None = None
 _WEBUI_RETRY_SECONDS = 600
@@ -74,6 +80,7 @@ _STATUS_LOCK = asyncio.Lock()
 _JOB_LOCK = asyncio.Lock()
 _STATUS_CACHE: tuple[float, dict[str, Any]] | None = None
 _ACTIVE_TASK: asyncio.Task[None] | None = None
+_ACTIVE_JOB_ID: str | None = None
 _PREPARING_JOB_STATES = {"queued", "preparing", "staged"}
 _RESOURCE_ENTRIES = (
     "font",
@@ -953,6 +960,7 @@ async def _retry_resource_update() -> None:
         return
     while not lifecycle_kernel.shutdown_requested:
         job_id = None
+        started = time.monotonic()
         try:
             if not await _webui_disk(resource_update_required):
                 current = resource_startup_status()
@@ -973,6 +981,9 @@ async def _retry_resource_update() -> None:
                     asyncio.shield(_ACTIVE_TASK), return_exceptions=True
                 )
                 continue
+            owner = await _webui_disk(mutation_owner)
+            if owner and owner.get("kind") == "restore":
+                raise UpdateServiceError("migration_operation_in_progress")
             job = await create_update_job(
                 component="resource",
                 channel="main",
@@ -984,9 +995,14 @@ async def _retry_resource_update() -> None:
             job_id = job["job_id"]
             _RESOURCE_ACTIVE_TASK = _ACTIVE_TASK
             if _RESOURCE_ACTIVE_TASK is not None:
-                await asyncio.shield(_RESOURCE_ACTIVE_TASK)
+                await asyncio.gather(
+                    asyncio.shield(_RESOURCE_ACTIVE_TASK), return_exceptions=True
+                )
             job = read_job(job_id)
             if job["state"] == "recovery_required":
+                return
+            if job["state"] == "cancelled":
+                logger.info("资源自动更新已手动取消，本次运行不再自动重试")
                 return
             if job["state"] != "completed":
                 raise UpdateServiceError(job.get("error") or "resource_update_failed")
@@ -1000,19 +1016,34 @@ async def _retry_resource_update() -> None:
             code = (
                 str(exc) if isinstance(exc, UpdateServiceError) else type(exc).__name__
             )
-            logger.warning("资源自动更新未完成：%s，600 秒后重试", code)
+            delay = _retry_delay(started, _RESOURCE_RETRY_SECONDS)
+            logger.warning("资源自动更新未完成：%s，%s 秒后重试", code, delay)
             if job_id:
                 with suppress(OSError, UpdateServiceError):
                     _update_job(
                         job_id,
                         next_retry_at=datetime.fromtimestamp(
-                            time.time() + _RESOURCE_RETRY_SECONDS, timezone.utc
+                            time.time() + delay, timezone.utc
                         ).isoformat(),
                         runtime_error=code
                         if read_job(job_id)["state"] == "completed"
                         else None,
                     )
-            await asyncio.sleep(_RESOURCE_RETRY_SECONDS)
+            await asyncio.sleep(delay)
+
+
+def _retry_delay(started: float, slow: int) -> int:
+    """按本轮耗时决定重试间隔，很快失败的尽早重试
+
+    参数:
+        started: 本轮开始时的单调时钟读数
+        slow: 长时间下载后失败的重试间隔秒数
+
+    返回:
+        int: 重试间隔秒数
+    """
+    quick = time.monotonic() - started < _QUICK_FAILURE_SECONDS
+    return min(_QUICK_RETRY_SECONDS, slow) if quick else slow
 
 
 def start_resource_update() -> None:
@@ -1104,6 +1135,7 @@ async def _retry_webui_update() -> None:
             )
             if delay > 0:
                 await asyncio.sleep(delay)
+        started = time.monotonic()
         try:
             if _ACTIVE_TASK is not None and not _ACTIVE_TASK.done():
                 await asyncio.gather(
@@ -1154,8 +1186,18 @@ async def _retry_webui_update() -> None:
                         state="queued", job_id=job_id, reason=None, next_retry_at=None
                     )
                     if _ACTIVE_TASK is not None:
-                        await asyncio.shield(_ACTIVE_TASK)
+                        await asyncio.gather(
+                            asyncio.shield(_ACTIVE_TASK), return_exceptions=True
+                        )
                     job = read_job(job_id)
+                    if job["state"] == "cancelled":
+                        logger.info("WebUI 自动更新已手动取消，本次运行不再自动重试")
+                        _WEBUI_STARTUP_STATUS.update(
+                            state="waiting_retry",
+                            reason="更新已手动取消，重启 Bot 后重新检查。",
+                            next_retry_at=None,
+                        )
+                        return
                     if (
                         job["state"] != "completed"
                         or job.get("apply_mode") == "webui_refresh_pending"
@@ -1184,9 +1226,10 @@ async def _retry_webui_update() -> None:
             code = (
                 str(exc) if isinstance(exc, UpdateServiceError) else type(exc).__name__
             )
-            logger.warning("WebUI 自动更新失败：%s，600 秒后重试", code)
+            delay = _retry_delay(started, _WEBUI_RETRY_SECONDS)
+            logger.warning("WebUI 自动更新失败：%s，%s 秒后重试", code, delay)
             retry_at = datetime.fromtimestamp(
-                time.time() + _WEBUI_RETRY_SECONDS, timezone.utc
+                time.time() + delay, timezone.utc
             ).isoformat()
             _WEBUI_STARTUP_STATUS.update(
                 state="refresh_pending"
@@ -1289,11 +1332,61 @@ def _webui_failure_reason(code: str) -> str:
         "pending_update_exists": "另一项更新正在等待重启应用",
         "PermissionError": "资源目录被占用或没有写入权限",
         "TimeoutError": "下载超过本轮时间限制",
+        "TimeoutExpired": "下载超过本轮时间限制",
+        "migration_operation_in_progress": "恢复或切换数据库任务尚未结束",
+        "runtime_mutation_in_progress": "另一项变更正在执行",
     }
     if code in reasons:
-        return reasons[code] + "，十分钟后自动重试。"
+        return reasons[code] + "，稍后自动重试。"
     safe_code = code if re.fullmatch(r"[A-Za-z0-9_]{1,80}", code) else "update_failed"
-    return f"更新未完成（{safe_code}），十分钟后自动重试。"
+    return f"更新未完成（{safe_code}），稍后自动重试。"
+
+
+def _run_git(
+    command: list[str],
+    env: dict[str, str] | None,
+    timeout: float,
+    stop: threading.Event | None,
+) -> tuple[int, str]:
+    """运行 git 命令，收到停止信号或超时时结束整个进程树
+
+    参数:
+        command: 命令
+        env: 环境变量
+        timeout: 超时秒数
+        stop: 停止信号
+
+    返回:
+        tuple[int, str]: 退出码与错误输出
+    """
+    import psutil
+
+    process = subprocess.Popen(
+        command,
+        cwd=_ROOT,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            _, stderr = process.communicate(timeout=0.5)
+            return process.returncode, stderr or ""
+        except subprocess.TimeoutExpired:
+            stopped = stop is not None and stop.is_set()
+            if not stopped and time.monotonic() < deadline:
+                continue
+            with suppress(psutil.Error):
+                for child in psutil.Process(process.pid).children(recursive=True):
+                    with suppress(psutil.Error):
+                        child.kill()
+            process.kill()
+            process.communicate()
+            if stopped:
+                raise UpdateServiceError("update_cancelled") from None
+            raise
 
 
 def _clone_ref(
@@ -1301,6 +1394,7 @@ def _clone_ref(
     ref: str,
     destination: Path,
     source: UpdateSource,
+    stop: threading.Event | None = None,
 ) -> Path:
     repo_url = f"https://github.com/{GITHUB_REPOS[component]}.git"
     authenticated_url = repo_url
@@ -1334,20 +1428,18 @@ def _clone_ref(
             ["git", "-C", str(destination), "fetch", "--depth", "1", repo_url, ref],
             ["git", "-C", str(destination), "checkout", "--detach", "FETCH_HEAD"],
         ]
+    code, stderr = 0, ""
     for command in commands:
-        result = subprocess.run(
+        code, stderr = _run_git(
             command,
-            cwd=_ROOT,
-            capture_output=True,
-            text=True,
-            timeout=_RESOURCE_DOWNLOAD_SECONDS if component == "resource" else 300,
-            check=False,
-            env={**os.environ, **auth_env} if auth_env else None,
+            {**os.environ, **auth_env} if auth_env else None,
+            _RESOURCE_DOWNLOAD_SECONDS if component == "resource" else 300,
+            stop,
         )
-        if result.returncode:
+        if code:
             break
-    if result.returncode != 0:
-        stderr = (result.stderr or "").lower()
+    if code != 0:
+        stderr = stderr.lower()
         transport_markers = (
             "could not resolve host",
             "failed to connect",
@@ -1362,13 +1454,38 @@ def _clone_ref(
             "http 503",
             "http 504",
         )
-        code = (
+        raise UpdateServiceError(
             "git_transport_failed"
             if any(marker in stderr for marker in transport_markers)
             else "official_git_clone_failed"
         )
-        raise UpdateServiceError(code)
     return destination
+
+
+async def _clone(
+    component: UpdateComponent, ref: str, destination: Path, source: UpdateSource
+) -> Path:
+    """在线程中拉取仓库，任务被取消时结束 git 并等线程退出
+
+    参数:
+        component: 更新组件
+        ref: 分支、标签或提交
+        destination: 拉取到的目录
+        source: 更新源
+
+    返回:
+        Path: 拉取到的目录
+    """
+    stop = threading.Event()
+    task = asyncio.create_task(
+        asyncio.to_thread(_clone_ref, component, ref, destination, source, stop)
+    )
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        stop.set()
+        await asyncio.gather(task, return_exceptions=True)
+        raise
 
 
 def _validate_staging(component: UpdateComponent, root: Path) -> None:
@@ -1687,9 +1804,7 @@ async def _prepare_job(job_id: str) -> None:
             source_root = stage / "source"
             logger.info("开始拉取更新 component=%s source=%s", component, job["source"])
             try:
-                cloned = await asyncio.to_thread(
-                    _clone_ref, component, ref, source_root, job["source"]
-                )
+                cloned = await _clone(component, ref, source_root, job["source"])
             except (UpdateServiceError, OSError, subprocess.TimeoutExpired) as exc:
                 if job["source"] != "aliyun" or not (
                     startup or str(exc) == "git_transport_failed"
@@ -1705,9 +1820,7 @@ async def _prepare_job(job_id: str) -> None:
                 effective_source = "github"
                 await asyncio.to_thread(_remove_tree, source_root)
                 if not startup:
-                    cloned = await asyncio.to_thread(
-                        _clone_ref, component, ref, source_root, "github"
-                    )
+                    cloned = await _clone(component, ref, source_root, "github")
             _update_job(
                 job_id,
                 attempted_sources=attempted_sources,
@@ -1760,11 +1873,17 @@ async def _prepare_job(job_id: str) -> None:
             checksum=checksum,
         )
         if component == "webui":
-            async with runtime_mutation_coordinator.operation(
-                "webui_update",
-                operation_id=job_id,
-                owner="webui.update",
-                phase="hot_apply",
+            # 页面目录不在备份与恢复的范围内，恢复任务占用变更归属期间仍可发布
+            owner = await asyncio.to_thread(mutation_owner)
+            async with (
+                nullcontext()
+                if owner and owner.get("kind") == "restore"
+                else runtime_mutation_coordinator.operation(
+                    "webui_update",
+                    operation_id=job_id,
+                    owner="webui.update",
+                    phase="hot_apply",
+                )
             ):
                 async with webui_publication_lock:
                     _publish_webui_job(job_id, job, root)
@@ -1841,6 +1960,8 @@ async def _prepare_job(job_id: str) -> None:
             if isinstance(exc, httpx.HTTPStatusError)
             else exc.__class__.__name__
         )
+        if code == "RuntimeMutationBusyError":
+            code = str(exc) or code
         logger.error("WebUIUpdate: 更新任务失败 component=%s code=%s", component, code)
         recovery_required = component == "resource" and code.startswith(
             "resource_rollback_blocked"
@@ -1870,7 +1991,7 @@ async def create_update_job(
     webui_baseline: dict[str, Any] | None = None,
     webui_check: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    global _ACTIVE_TASK
+    global _ACTIVE_TASK, _ACTIVE_JOB_ID
     async with _JOB_LOCK:
         if _ACTIVE_TASK is not None and not _ACTIVE_TASK.done():
             raise UpdateServiceError("update_in_progress")
@@ -1941,7 +2062,35 @@ async def create_update_job(
             _prepare_job(job_id),
             name=f"update-{component}-{job_id[:8]}",
         )
+        _ACTIVE_JOB_ID = job_id
     return job
+
+
+async def cancel_update(job_id: str) -> dict[str, Any]:
+    """取消更新任务：下载中的任务停止下载并删除暂存文件，等待重启应用的任务撤销应用
+
+    参数:
+        job_id: 更新任务 ID
+
+    返回:
+        dict[str, Any]: 取消后的任务
+    """
+    global _STATUS_CACHE
+    job = read_job(job_id)
+    if job.get("state") == "pending_restart":
+        return await asyncio.to_thread(cancel_pending_update, job_id)
+    task = _ACTIVE_TASK
+    if (
+        job.get("state") not in {"queued", "preparing"}
+        or task is None
+        or task.done()
+        or _ACTIVE_JOB_ID != job_id
+    ):
+        raise UpdateServiceError("update_not_cancellable")
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    _STATUS_CACHE = None
+    return read_job(job_id)
 
 
 async def request_update_apply(job_id: str) -> tuple[bool, str, dict[str, Any]]:
@@ -2273,6 +2422,7 @@ __all__ = [
     "applied_update_pending",
     "apply_pending_update",
     "cancel_pending_update",
+    "cancel_update",
     "check_updates",
     "create_update_job",
     "finalize_applied_update",

@@ -1,11 +1,12 @@
 """Durable evidence for account operations and fee reservations."""
 
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 
 from tortoise import fields
 from tortoise.expressions import Q
 
 from zhenxun.services.db_context import Model
+from zhenxun.utils.time_utils import TimeUtils
 
 
 class AssetOperation(Model):
@@ -34,7 +35,7 @@ class AssetOperation(Model):
         return await cls.filter(
             Q(kind__in=["fee", "daily_sign"]) | Q(event_id__isnull=False),
             state__in=["committed", "released"],
-            update_time__lt=datetime.now(timezone.utc) - timedelta(days=days),
+            update_time__lt=TimeUtils.now() - timedelta(days=days),
         ).delete()
 
     @classmethod

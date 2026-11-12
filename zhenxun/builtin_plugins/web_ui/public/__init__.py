@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime
 from html import escape
 import json
 from pathlib import Path
@@ -10,6 +11,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from zhenxun.services.log import logger
 from zhenxun.services.update import update_service
 from zhenxun.utils.manager.zhenxun_repo_manager import ZhenxunRepoManager
+from zhenxun.utils.time_utils import TimeUtils
 
 from ..security import WebUIStaticFiles
 
@@ -137,7 +139,13 @@ async def index():
     if not resources.ready:
         status = update_service.webui_startup_status()
         reason = escape(str(status.get("reason") or "正在准备新版管理页面。"))
-        retry_at = escape(str(status.get("next_retry_at") or ""))
+        retry_at = ""
+        if status.get("next_retry_at"):
+            retry_at = (
+                datetime.fromisoformat(status["next_retry_at"])
+                .astimezone(TimeUtils.zone())
+                .strftime("%Y-%m-%d %H:%M:%S")
+            )
         phase = {
             "checking": "核对页面发布版本",
             "state_unknown": "更新状态暂不可确认",

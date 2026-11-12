@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 import time
 
 from nonebot.adapters import Event
@@ -16,6 +16,8 @@ from nonebot.adapters.qq.event import (
     GroupMsgReceiveEvent,
     GroupMsgRejectEvent,
 )
+
+from zhenxun.utils.time_utils import TimeUtils
 
 from .context import OfficialReplyUnavailable, digest_identifier
 from .models import QQProactivePermission
@@ -70,7 +72,7 @@ async def proactive_allowed(app_id: str, scene: str, target: str) -> bool | None
     if row.allowed:
         return True
     recent = await QQProactivePermission.filter(
-        id=row.id, updated_at__gte=datetime.now(timezone.utc) - DENIED_RETRY_AFTER
+        id=row.id, updated_at__gte=TimeUtils.now() - DENIED_RETRY_AFTER
     ).exists()
     return False if recent else None
 
