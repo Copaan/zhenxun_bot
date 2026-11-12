@@ -175,6 +175,54 @@ def _foreign_core(saved: dict) -> set[str]:
     return {name for name in saved.get("core") or {} if name in locked}
 
 
+def _implicit_roots(saved: dict, files: Path | None, roots: dict) -> dict:
+    """恢复的插件源码直接导入、备份时由本体间接带入、当前环境已不再提供的包
+
+    按模块名与包名相同的约定匹配（如 pydantic_settings 对应 pydantic-settings），
+    作为虚拟环境中的包恢复，无法安装时跳过。
+
+    参数:
+        saved: 备份中的 dependencies.json
+        files: 备份包解压后的 files 目录，未恢复插件代码时为 None
+        roots: 已确定的顶层依赖
+
+    返回:
+        dict: 键 -> 顶层依赖
+    """
+    from zhenxun.services.nonebot_store.dependencies import (
+        FORBIDDEN_LAYER_PACKAGES,
+        _lock_packages,
+    )
+    from zhenxun.services.nonebot_store.environment import (
+        base_distributions,
+        imported_modules,
+    )
+
+    installed = saved.get("installed") or {}
+    if files is None or not installed:
+        return {}
+    present = set(base_distributions()[0]) | set(_lock_packages()[1])
+    present |= {root["name"] for root in roots.values()} | set(saved["packages"])
+    result = {}
+    for module in imported_modules([files / "zhenxun/plugins"]):
+        name = canonicalize_name(module)
+        if (
+            name in installed
+            and name not in present
+            and name not in FORBIDDEN_LAYER_PACKAGES
+        ):
+            result[name] = {
+                "kind": "venv",
+                "name": name,
+                "requirements": [],
+                "version": str(installed[name]),
+                "url": None,
+                "plugin": None,
+                "unsupported": None,
+            }
+    return result
+
+
 def _root_requirements(root: dict, pin: str | None) -> list[str]:
     """顶层依赖参与解析的依赖声明
 
@@ -671,6 +719,7 @@ async def stage_restore(
     from zhenxun.services.nonebot_store.storage import pending_transaction
 
     roots = _roots(saved)
+    roots.update(_implicit_roots(saved, files, roots))
     tools = {
         key
         for key, root in roots.items()

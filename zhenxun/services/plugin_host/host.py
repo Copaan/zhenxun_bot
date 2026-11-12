@@ -1330,17 +1330,25 @@ class PluginHost:
 
     async def _sync_later(self) -> None:
         self._sync_again = True
+        waited = 0
         while self._sync_again:
             self._sync_again = False
             await asyncio.sleep(_PARK_DELAY)
             try:
                 await self.sync_disabled()
             except Exception as error:
-                if isinstance(error, RuntimeMutationBusyError) and str(error) in {
+                busy = isinstance(error, RuntimeMutationBusyError)
+                if busy and str(error) in {
                     "runtime_mutation_quiescing",
                     "runtime_mutation_closed",
                 }:
                     return
+                if busy and waited < 60:
+                    # 恢复或其他变更收尾期间稍后再试
+                    waited += 1
+                    self._sync_again = True
+                    await asyncio.sleep(5)
+                    continue
                 logger.error("同步插件全局禁用状态失败", _LOG_COMMAND, e=error)
 
     def clear_pending_restart(self, reason: str | None = None) -> None:
