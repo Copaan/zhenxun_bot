@@ -62,8 +62,8 @@ def mutation_scope(operation_id: str | None):
 
 
 @contextmanager
-def mutation_guard(operation_id: str | None = None):
-    """短时间持有跨进程归属锁，校验当前写入属于已登记任务"""
+def mutation_guard_lock():
+    """短时间持有跨进程归属锁，不校验归属"""
     path = OWNER_FILE.with_name(".mutation.lock").resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
     with _owner_locks_guard:
@@ -73,13 +73,43 @@ def mutation_guard(operation_id: str | None = None):
     except Timeout as error:
         raise RuntimeMutationBusyError("runtime_mutation_in_progress") from error
     try:
+        yield
+    finally:
+        lock.release()
+
+
+@contextmanager
+def mutation_guard(operation_id: str | None = None):
+    """短时间持有跨进程归属锁，校验当前写入属于已登记任务"""
+    with mutation_guard_lock():
         owner = mutation_owner()
         identity = operation_id or _ownership.get()
         if owner and owner["operation_id"] != identity:
             raise RuntimeMutationBusyError("migration_operation_in_progress")
         yield owner
-    finally:
-        lock.release()
+
+
+def clear_stale_runtime_owner() -> bool:
+    """清除登记进程已不存在的运行时变更归属，恢复与切换任务的归属保持不动
+
+    返回:
+        bool: 是否清除了记录
+    """
+    import psutil
+
+    with mutation_guard_lock():
+        owner = mutation_owner()
+        if not owner or owner.get("kind") != "runtime":
+            return False
+        executor = owner.get("executor") or {}
+        try:
+            process = psutil.Process(int(executor.get("pid") or 0))
+            if abs(process.create_time() - float(executor.get("created_at") or 0)) < 1:
+                return False
+        except (psutil.Error, ValueError, TypeError):
+            pass
+        write_json_locked(OWNER_FILE, None)
+        return True
 
 
 def release_mutation(operation_id: str) -> None:

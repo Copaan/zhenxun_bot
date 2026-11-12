@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Callable
 from typing import Any
 
 from zhenxun.services.nonebot_store import runtime as nonebot_runtime
@@ -193,6 +195,43 @@ class PluginTransactions:
             self.settle_source_restart_markers()
         if nonebot_storage.archive_settled():
             self.settle_restart_markers(["webui.nonebot-store"])
+
+    async def settle(
+        self, action: Callable[[], None], label: str, *, attempts: int = 60
+    ) -> bool:
+        """执行事务收尾，其他变更占用时等待重试；仍未完成时保留事务并继续运行
+
+        参数:
+            action: 确认或回滚
+            label: 日志中的动作名称
+            attempts: 遇到占用时的尝试次数，每次间隔一秒
+
+        返回:
+            bool: 是否完成
+        """
+        from zhenxun.services.runtime_mutation import (
+            RuntimeMutationBusyError,
+            clear_stale_runtime_owner,
+        )
+
+        error: Exception | None = None
+        for index in range(attempts):
+            try:
+                clear_stale_runtime_owner()
+                action()
+                return True
+            except RuntimeMutationBusyError as busy:
+                error = busy
+                if index + 1 < attempts:
+                    await asyncio.sleep(1)
+            except RuntimeError as failure:
+                error = failure
+                break
+        launcher_log(
+            f"插件事务{label}未完成（{error}），事务已保留，"
+            "可在 WebUI 插件管理中查看并处理"
+        )
+        return False
 
     def finalize(self) -> None:
         """确认已通过验证的事务并清除对应的待重启项"""

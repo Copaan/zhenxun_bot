@@ -115,8 +115,6 @@ async def _dependencies(request: dict, package: Path) -> None:
     from . import backup, restore_deps
 
     phase(request, "dependencies")
-    if (request.get("dependencies") or {}).get("skipped_requirements"):
-        raise RuntimeError("migration_failed_dependency_scope_unknown")
     if not request.get("dependencies"):
         saved = json.loads((package / backup.DEPENDENCIES).read_text("utf-8"))
         report = await restore_deps.stage_restore(
@@ -126,8 +124,6 @@ async def _dependencies(request: dict, package: Path) -> None:
             parent_operation_id=request["operation_id"],
         )
         tasks.save(request, dependencies=report)
-        if report.get("skipped_requirements"):
-            raise RuntimeError("migration_failed_dependency_scope_unknown")
         database = json.loads((package / "database/manifest.json").read_text("utf-8"))
         excluded = []
         for key in report.get("skipped_plugins") or []:
@@ -329,6 +325,8 @@ async def run(
             for name in (
                 "nearby",
                 "skipped_plugins",
+                "skipped_requirements",
+                "skip_reasons",
                 "platform_only",
                 "unsupported_requirements",
             )
@@ -337,7 +335,10 @@ async def run(
         impact["structure"] = checked["structure"]
         impact_digest = preflight.digest(impact)
         previous_impact = request.get("confirmed_impact")
-        changed = bool(report.get("nearby") or report.get("skipped_plugins"))
+        changed = any(
+            report.get(name)
+            for name in ("nearby", "skipped_plugins", "skipped_requirements")
+        )
         if previous_impact and previous_impact != impact_digest:
             changed = True
         if (

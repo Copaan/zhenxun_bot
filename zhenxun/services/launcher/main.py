@@ -152,6 +152,10 @@ class Launcher:
 
     async def prepare_round(self) -> None:
         """应用插件事务并按最新配置调整附属进程"""
+        from zhenxun.services.runtime_mutation import clear_stale_runtime_owner
+
+        if clear_stale_runtime_owner():
+            launcher_log("已清除上次运行遗留的变更归属记录")
         await self.apply_restore()
         from contextlib import nullcontext
 
@@ -381,9 +385,11 @@ class Launcher:
             if failed is not None:
                 await stop_process(worker)
                 self.worker = None
-                self.transactions.rollback(failed)
+                await self.transactions.settle(
+                    lambda: self.transactions.rollback(failed), "回滚", attempts=1
+                )
                 return False
-            self.transactions.finalize()
+            await self.transactions.settle(self.transactions.finalize, "确认")
         if self.pending_bot_verification:
             launcher_log("waiting for updated worker health verification")
             self.pending_bot_verification = False

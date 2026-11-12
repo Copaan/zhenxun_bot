@@ -115,10 +115,11 @@ def _roots(saved: dict) -> dict[str, dict]:
     from zhenxun.services.nonebot_store.dependencies import project_closure
 
     shared = set(project_closure())
+    foreign = _foreign_core(saved)
     dropped = [
         (name, {"kind": "venv", **item})
         for name, item in (saved.get("core") or {}).items()
-        if name not in shared
+        if name not in shared and name not in foreign
     ]
     roots: dict[str, dict] = {}
     for key, plugin in saved["plugins"].items():
@@ -154,6 +155,24 @@ def _roots(saved: dict) -> dict[str, dict]:
             "unsupported": item.get("unsupported"),
         }
     return roots
+
+
+def _foreign_core(saved: dict) -> set[str]:
+    """备份时随本体安装、当前本体仍然声明但不适用于当前平台的包
+
+    参数:
+        saved: 备份中的 dependencies.json
+
+    返回:
+        set[str]: 规范化包名
+    """
+    from zhenxun.services.nonebot_store.dependencies import (
+        _lock_packages,
+        project_closure,
+    )
+
+    locked = set(_lock_packages()[1]) - set(project_closure())
+    return {name for name in saved.get("core") or {} if name in locked}
 
 
 def _root_requirements(root: dict, pin: str | None) -> list[str]:
@@ -672,6 +691,8 @@ async def stage_restore(
     }
     for key in tools:
         roots.pop(key)
+    for name in sorted(_foreign_core(saved)):
+        report["platform_only"][name] = "本体依赖，不适用于当前平台"
     for key, root in list(roots.items()):
         applicable = [raw for raw in root["requirements"] if _applies(raw)]
         if root["requirements"] and not applicable:
