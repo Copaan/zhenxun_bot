@@ -46,6 +46,10 @@ class _Round:
     restart_action: tuple[str, list[str]] | None = None
 
 
+class LauncherReexec(Exception):
+    """本体代码已更新，需要由新的 launcher 进程继续运行"""
+
+
 class Launcher:
     """launcher 进程的主控制器"""
 
@@ -94,7 +98,6 @@ class Launcher:
         from zhenxun.services.migration.state import reconcile_terminal
         from zhenxun.services.update.update_service import (
             applied_update_pending,
-            pending_job,
         )
 
         self.boot_id = launcher_supervisor.initialize()
@@ -104,12 +107,28 @@ class Launcher:
         await asyncio.to_thread(retry_cleanup)
         await self.apply_restore()
         self.pending_bot_verification = applied_update_pending()
-        if pending_job():
-            self.pending_bot_verification = (
-                await run_maintenance("update-apply") or self.pending_bot_verification
-            )
+        self.pending_bot_verification = (
+            await self.apply_update() or self.pending_bot_verification
+        )
         sync_env_missing_items(self.cwd)
         clear_launcher_restart_signal()
+
+    async def apply_update(self) -> bool:
+        """应用等待重启的更新；本体代码更新后由新的 launcher 进程接管
+
+        返回:
+            bool: 是否应用了更新
+        """
+        from zhenxun.services.update.update_service import pending_job
+
+        job = pending_job()
+        if not job:
+            return False
+        applied = bool(await run_maintenance("update-apply"))
+        if applied and job.get("component") == "bot":
+            launcher_log("本体已更新，launcher 将以新代码重新启动")
+            raise LauncherReexec
+        return applied
 
     async def apply_restore(self) -> None:
         """执行待处理的备份恢复或切换数据库步骤"""
@@ -522,7 +541,6 @@ class Launcher:
         参数:
             state: 本轮监管状态
         """
-        from zhenxun.services.update.update_service import pending_job
 
         action = state.restart_action
         if not state.restart_requested:
@@ -534,9 +552,7 @@ class Launcher:
             if action and action[0] == "sync_dependencies_restart":
                 await sync_dependencies(action[1])
             await self.apply_restore()
-            self.pending_bot_verification = (
-                await run_maintenance("update-apply") if pending_job() else False
-            )
+            self.pending_bot_verification = await self.apply_update()
             return
         if self.stopping:
             raise self.stop_exit()

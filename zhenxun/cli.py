@@ -56,12 +56,30 @@ def _run_ingress(args: list[str]) -> None:
     )
 
 
+def _reexec_launcher() -> None:
+    """用更新后的代码重新运行 launcher
+
+    POSIX 下直接替换当前进程，进程号不变；Windows 下替换进程会让终端和上级进程
+    认为程序已退出，改为启动新的 launcher 并等待它结束。
+    """
+    command = [sys.executable, "-m", "zhenxun.cli", "run"]
+    if os.name != "nt":
+        os.execv(sys.executable, command)
+    import signal
+    import subprocess
+
+    for name in ("SIGINT", "SIGTERM", "SIGBREAK"):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), lambda *_: None)
+    sys.exit(subprocess.call(command))
+
+
 def main() -> None:
     args = sys.argv[1:]
 
     if not args or args[0] == "run":
         from zhenxun.services.launcher.lease import InstanceLease, LeaseError
-        from zhenxun.services.launcher.main import run_launcher
+        from zhenxun.services.launcher.main import LauncherReexec, run_launcher
         from zhenxun.services.startup_banner import show_startup_banner
 
         project = _ensure_project_root()
@@ -80,6 +98,8 @@ def main() -> None:
         except LeaseError as error:
             sys.stderr.write(f"错误: {error}\n")
             sys.exit(1)
+        except LauncherReexec:
+            _reexec_launcher()
     elif args[0] == "run-worker":
         from zhenxun.utils.pythonpath import (
             activate_dependency_layer,
