@@ -88,9 +88,9 @@ def _table_key(model) -> str:
 
 
 def _models() -> list[type[Model]]:
-    """所有已注册模型，按外键依赖排序，被引用的表在前"""
+    """所有已注册模型，按外键依赖排序，被引用的表在前；数据库未初始化时为空"""
     tables: dict[str, type[Model]] = {}
-    for app in Tortoise.apps.values():
+    for app in (Tortoise.apps or {}).values():
         for model in app.values():
             if not model._meta.abstract:
                 tables.setdefault(_table_key(model), model)
