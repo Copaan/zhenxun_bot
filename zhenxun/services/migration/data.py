@@ -603,6 +603,9 @@ async def import_data(
     from .merge import validate_origins
 
     validate_origins(directory)
+    if included_tables is not None:
+        included_tables = set(included_tables)
+    excluded_tables = set(excluded_tables or ())
     if restore_mode in {"merge_upsert", "merge_skip"}:
         from .merge import import_merge
 
