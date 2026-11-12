@@ -86,6 +86,8 @@ class RendererService:
         if not path.is_dir():
             raise ValueError(f"提供的路径 '{path}' 不是一个有效的目录。")
         self._plugin_template_paths[namespace] = path
+        if self._template_engine:
+            self._template_engine.add_namespace(namespace, path)
 
     def register_markdown_style(self, name: str, path: Path):
         """

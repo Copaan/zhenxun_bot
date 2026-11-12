@@ -32,6 +32,8 @@ class AIMemory(Model):
     """float32 向量"""
     source = fields.CharField(16, default="auto", description="来源")
     """来源：auto 自动总结，tool AI 记下，webui 手动添加"""
+    author_id = fields.CharField(255, null=True, description="实际写入者")
+    pinned = fields.BooleanField(null=True, description="固定保留；空值沿用历史规则")
     archived = fields.BooleanField(default=False, description="是否归档")
     """归档的记忆不再召回"""
     created_at = fields.DatetimeField(auto_now_add=True, description="创建时间")

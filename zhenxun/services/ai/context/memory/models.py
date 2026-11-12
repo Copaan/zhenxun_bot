@@ -22,6 +22,10 @@ class BaseChatContext(ABC):
         """向会话追加消息"""
         ...
 
+    async def settle_run(self, session_id, run_id, revision, delivery, started_at):
+        """结算支持投递状态的聊天历史。"""
+        raise NotImplementedError("当前历史后端不支持投递结算")
+
     @abstractmethod
     async def clear(self, session_id: str) -> None:
         """清空会话的历史消息"""

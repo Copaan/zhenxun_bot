@@ -18,14 +18,12 @@ from zhenxun.services.ai.core.models import CancellationToken
 from zhenxun.services.ai.flow.agent.agent import Agent
 from zhenxun.services.ai.llm.client import request_timeout
 from zhenxun.services.ai.message_builder import MessageBuilder
-from zhenxun.services.ai.message_segments import is_voice
 from zhenxun.services.ai.run.context import NoneBotDeps, RunContext
 from zhenxun.services.ai.run.session import session_manager
 from zhenxun.services.ai.utils.runtime import ContextUtils
 from zhenxun.services.log import logger
 from zhenxun.utils.enum import GoldHandle
 from zhenxun.utils.exception import InsufficientGold
-from zhenxun.utils.message import MessageUtils
 from zhenxun.utils.platform import PlatformUtils
 
 from ._buffer import AtWaiter, ChatBuffer, sender_name, summarize
@@ -42,7 +40,7 @@ DEFAULT_PROMPT = (
     "把群友当作网上认识的朋友，可以聊音乐、学校、日常和网络上的事，不要把"
     "对方设定成家人、恋人或主人。别人问问题或请你帮忙时，认真给出正确的回答，"
     "用你自己的口吻简单说清楚；确实不知道就直说。\n\n"
-    "说话方式：用自然的中文口语，句子短，不像客服，不使用 Markdown，不要每句话"
+    "说话方式：用自然的中文口语，句子短，不像客服；普通闲聊简短，代码和复杂问题可用必要的结构，不要每句话"
     "都提问。情绪表达简单克制，比如“还行”“挺好”“有点烦”，可以偶尔用网络语，但"
     "不要过度卖萌，不刻意重复口癖，不写动作、心理旁白或括号表演。\n\n"
     "角色边界：始终是安静、略带孩子气、现实向的 12 岁女孩，不使用成熟、说教、"
@@ -71,6 +69,8 @@ PROACTIVE_PROMPT = (
     f"不要说明自己在插话。不适合插话或没有合适的话时只输出 {SILENT}。"
 )
 """主动插话时附在本轮输入后的提醒"""
+REFERENCE_WORDS = ("刚才", "之前", "那个", "这个", "他", "她")
+"""消息含这些指代词时，记忆与知识检索带上附近几条群消息"""
 
 
 def parse_session(session_id: str) -> tuple[str, str | None, str | None]:
@@ -89,6 +89,8 @@ def parse_session(session_id: str) -> tuple[str, str | None, str | None]:
         return bot_id, None, rest[len("private:") :] or None
     if rest.startswith("task:"):
         return bot_id, None, None
+    if ":group:" in rest and not rest.startswith("qq_api:"):
+        return bot_id, rest, None
     parts = rest.split(":")
     size = 4 if rest.startswith("qq_api:") else 1
     return bot_id, ":".join(parts[:size]) or None, ":".join(parts[size:]) or None
@@ -96,7 +98,11 @@ def parse_session(session_id: str) -> tuple[str, str | None, str | None]:
 
 class AIChatManager:
     _agents: ClassVar[dict[tuple, Agent]] = {}
-    _tokens: ClassVar[dict[tuple[str, str], set[int]]] = {}
+    _admitted: ClassVar[set[asyncio.Task]] = set()
+    _requests: ClassVar[dict[str, dict[asyncio.Task, tuple[str, str]]]] = {}
+    """各会话登记中的请求任务及其发起人、来源"""
+    _stopped: ClassVar[set[asyncio.Task]] = set()
+    """被停止指令取消的请求任务，结束时正常返回"""
 
     @classmethod
     async def blocked(cls, bot: Bot, group_id: str, user_id: str | None) -> bool:
@@ -134,8 +140,9 @@ class AIChatManager:
                     scoped_group_id(group_id, scope),
                 )
             )
-        except Exception:
-            return False
+        except Exception as error:
+            logger.warning(f"聊天权限暂不可确认: {type(error).__name__}", MODULE)
+            return True
 
     @classmethod
     async def should_reply(
@@ -184,10 +191,14 @@ class AIChatManager:
         返回:
             str: 会话id
         """
+        from zhenxun.services.platform_identity import scoped_group_id, scoped_user_id
+
         deps = NoneBotDeps(bot=bot, event=event)
+        scope = PlatformUtils.get_platform_scope(bot)
         if group_id := ContextUtils.extract_group_id(deps):
-            return f"{MODULE}:{bot.self_id}:{group_id}"
-        return f"{MODULE}:{bot.self_id}:private:{ContextUtils.extract_user_id(deps)}"
+            return f"{MODULE}:{bot.self_id}:{scoped_group_id(group_id, scope)}"
+        user_id = scoped_user_id(ContextUtils.extract_user_id(deps), scope)
+        return f"{MODULE}:{bot.self_id}:private:{user_id}"
 
     @classmethod
     def build_instruction(cls, persona: AIPersona | None) -> str:
@@ -226,7 +237,7 @@ class AIChatManager:
         """
         from zhenxun.services.ai.tools.providers.builtin.web import WebTools
 
-        from ._agent import AgentCapability, SubagentToolkit
+        from ._agent import AgentCapability, ReplyCapability, SubagentToolkit
         from ._characters import CharacterToolkit
         from ._knowledge import KnowledgeToolkit
         from ._memory_tools import MemoryToolkit
@@ -266,7 +277,7 @@ class AIChatManager:
         tools.append(SkillToolkit(None if skills is None else list(skills)))
         if persona and persona.subagents:
             tools.append(SubagentToolkit([int(i) for i in persona.subagents]))
-        capabilities: list[Any] = []
+        capabilities: list[Any] = [ReplyCapability()]
         if allowed is None or "agent" in allowed:
             capabilities.append(AgentCapability())
         agent = Agent(
@@ -311,7 +322,14 @@ class AIChatManager:
             logger.info(f"人设绑定的知识库已并入全局设置: {merged}", MODULE)
 
     @classmethod
-    async def _check_quota(cls, user_id: str, platform: str | None) -> str | None:
+    async def _check_quota(
+        cls,
+        user_id: str,
+        platform: str | None,
+        *,
+        scope: str | None = None,
+        check_gold: bool = True,
+    ) -> str | None:
         """检查每日 token 额度与金币，不满足时返回提示语
 
         参数:
@@ -321,95 +339,154 @@ class AIChatManager:
         返回:
             str | None: 提示语
         """
+        from zhenxun.services.platform_identity import scoped_user_id
+
+        quota_id = scoped_user_id(user_id, scope) if scope else user_id
         limit = int(Config.get_config(MODULE, "DAILY_TOKEN_LIMIT") or 0)
-        if limit and await AITokenUsage.used_today(user_id) >= limit:
+        if limit and await AITokenUsage.used_today(quota_id) >= limit:
             return "今天的 AI 对话额度已经用完了，明天再来吧。"
         cost = int(Config.get_config(MODULE, "COST_GOLD") or 0)
-        if cost and (await UserConsole.get_user(user_id, platform)).gold < cost:
+        if (
+            check_gold
+            and cost
+            and (await UserConsole.get_user(user_id, platform)).gold < cost
+        ):
             return f"金币不足，每次对话需要 {cost} 金币。"
         return None
 
     @classmethod
     async def chat(
-        cls,
-        bot: Bot,
-        event: Event,
-        message: UniMessage,
-        proactive: str | None = None,
+        cls, bot: Bot, event: Event, message: UniMessage, proactive: str | None = None
     ) -> None:
-        """处理一条唤醒消息：频率限制、安全词与额度检查，按人设运行 Agent
-        （选用 dsh 执行器时由 dsh 回复）、计费并回复。
-        主动插话总是用本地 Agent，不检查用户频率与额度、不计入用户用量，
-        会话正在回复时放弃，失败或命中安全词时不提示，用量计入主动对话预算
+        """处理一条唤醒消息或主动插话：检查输入、额度与频率，在会话锁内按人设生成
+        回复（选用 dsh 执行器时由 dsh 回复）、投递并结算。
+        主动插话总是用本地 Agent，不检查用户额度、不计入用户用量，用量计入主动对话
+        预算；会话正在回复或有定向请求排队时放弃，失败或命中安全词时不提示
 
         参数:
             bot: Bot
             event: 事件
             message: 消息
-            proactive: 主动插话时给 AI 的提示（概率触发时为空字符串），为 None 时
+            proactive: 主动插话时给 AI 的接话原因（概率触发时为空字符串），为 None 时
                 不是主动插话
         """
-        from ._proactive import Proactive
-        from ._reply import parse_silent, quote_reply, send_reply
+        session_id = cls.session_id(bot, event)
+        user_id = ContextUtils.extract_user_id(NoneBotDeps(bot=bot, event=event)) or ""
+        task = asyncio.current_task()
+        if task is None:
+            return
+        requests = cls._requests.setdefault(session_id, {})
+        requests[task] = (user_id, "qq" if proactive is None else "interject")
+        try:
+            await cls._chat(bot, event, message, proactive)
+        except asyncio.CancelledError:
+            if task not in cls._stopped:
+                raise
+        finally:
+            cls._stopped.discard(task)
+            cls._admitted.discard(task)
+            requests.pop(task, None)
+            if not requests:
+                cls._requests.pop(session_id, None)
+
+    @classmethod
+    async def _admit(
+        cls, bot: Bot, event: Event, message: UniMessage, proactive: str | None
+    ) -> tuple[UniMessage, str | None] | None:
+        """空 @ 时等待补问，再检查安全词、额度与频率并占用会话排队名额，
+        不通过时按需提示
+
+        参数:
+            bot: Bot
+            event: 事件
+            message: 消息
+            proactive: 主动插话原因，为 None 时不是主动插话
+
+        返回:
+            tuple[UniMessage, str | None] | None: 最终消息与消息id，不处理时为空
+        """
+        from zhenxun.services.platform_identity import scoped_user_id
+
+        from ._reply import quote_reply
         from ._safety import INPUT_NOTICE, RateLimit, Safety, SessionLimit
 
         deps = NoneBotDeps(bot=bot, event=event)
-        user_id = ContextUtils.extract_user_id(deps)
-        if not user_id:
-            return
+        user_id = ContextUtils.extract_user_id(deps) or ""
         group_id = ContextUtils.extract_group_id(deps)
-        quote = quote_reply(group_id)
-        platform = PlatformUtils.get_platform(bot)
         session_id = cls.session_id(bot, event)
-        unsafe = Safety.check_input(message.extract_plain_text())
-        if proactive is not None:
-            if unsafe or not group_id or session_manager.live_tasks.get(session_id):
-                return
-        else:
-            notice = (
-                None if user_id in bot.config.superusers else RateLimit.take(user_id)
-            )
-            if notice is None and unsafe:
-                logger.info("用户输入命中安全词，不调用 AI", MODULE, session=user_id)
-                notice = INPUT_NOTICE
-            if notice is None:
-                notice = await cls._check_quota(user_id, platform)
-            if notice is not None:
-                if notice:
-                    await MessageUtils.build_message(notice).send(reply_to=quote)
-                return
-            if not await SessionLimit.acquire(session_id):
-                logger.info("会话排队已满，丢弃本条消息", MODULE, session=user_id)
-                return
         message_id = getattr(event, "message_id", None)
         message_id = str(message_id) if message_id is not None else None
         message = strip_slash(message)
-        parts = await MessageBuilder.unimsg_to_llm_parts(message, namespace=MODULE)
-        if not parts and group_id and event.is_tome():
+        if not message and group_id and event.is_tome() and proactive is None:
             if follow := await AtWaiter.wait(bot.self_id, group_id, user_id):
                 message, message_id = strip_slash(follow[0]), follow[1]
-                parts = await MessageBuilder.unimsg_to_llm_parts(
-                    message, namespace=MODULE
-                )
-            parts = parts or [TextPart(text="（@了你，没有说别的）")]
-        if not parts:
-            return
-        from ._agent import record_run, start_run
+        unsafe = Safety.check_input(message.extract_plain_text())
+        if proactive is not None:
+            if unsafe or not group_id or session_manager.live_tasks.get(session_id):
+                return None
+            return message, message_id
+        scope = PlatformUtils.get_platform_scope(bot)
+        notice = (
+            None
+            if user_id in bot.config.superusers
+            else RateLimit.take(scoped_user_id(user_id, scope))
+        )
+        if notice is None and unsafe:
+            notice = INPUT_NOTICE
+        if notice is None:
+            notice = await cls._check_quota(
+                user_id, PlatformUtils.get_platform(bot), scope=scope
+            )
+        if notice is not None:
+            if notice:
+                await UniMessage(Text(notice)).send(reply_to=quote_reply(group_id))
+            return None
+        if not await SessionLimit.acquire(session_id):
+            logger.info("会话排队已满，丢弃本条消息", MODULE, session=user_id)
+            return None
+        return message, message_id
 
-        if group_id:
-            mark = f" #{message_id}" if message_id else ""
-            head = f"{sender_name(event, user_id)}({user_id}){mark}: "
-            if background := ChatBuffer.take(
-                bot.self_id,
-                group_id,
-                message_id,
-                int(Config.get_config(MODULE, "CONTEXT_SIZE") or 0),
-            ):
-                head = f"{background}\n\n{head}"
-            parts = [TextPart(text=head), *parts]
-        setting = await AIChatGroup.get_setting(group_id) if group_id else None
-        persona = await AIPersona.get_for_scene(group_id, user_id)
-        context = RunContext(deps=deps, session_id=session_id)
+    @classmethod
+    def _context(
+        cls,
+        bot: Bot,
+        event: Event,
+        setting: AIChatGroup | None,
+        proactive: str | None,
+        text: str,
+        message_id: str | None,
+    ) -> RunContext:
+        """创建本轮的运行上下文：绑定来源，写入发送者、检索词与本轮提示
+
+        参数:
+            bot: Bot
+            event: 事件
+            setting: 群聊设置
+            proactive: 主动插话原因，为 None 时不是主动插话
+            text: 最终消息的纯文本
+            message_id: 消息id
+
+        返回:
+            RunContext: 运行上下文
+        """
+        from zhenxun.services.platform_identity import scoped_user_id
+
+        from ._agent import bind_source
+
+        deps = NoneBotDeps(bot=bot, event=event)
+        user_id = ContextUtils.extract_user_id(deps) or ""
+        group_id = ContextUtils.extract_group_id(deps)
+        quota_id = scoped_user_id(user_id, PlatformUtils.get_platform_scope(bot))
+        context = RunContext(deps=deps, session_id=cls.session_id(bot, event))
+        bind_source(context, "qq" if proactive is None else "interject")
+        sender = f"{sender_name(event, user_id)}({quota_id})"
+        context.state["_sender_identity"] = sender
+        context.state["_quota_id"] = quota_id
+        query = f"{sender}: {text[:4000]}"
+        if group_id and any(word in text for word in REFERENCE_WORDS):
+            if nearby := ChatBuffer.background(bot.self_id, group_id, message_id, 4):
+                query += "\n有限语境：" + nearby[-800:]
+        context.state["_retrieval_query"] = query
         if setting and setting.model:
             context.run.current_model = setting.model
         if proactive is not None:
@@ -421,109 +498,218 @@ class AIChatManager:
             from zhenxun.services.ai.tools.providers.builtin.web import SEARCH_HINT
 
             context.state[SEARCH_HINT] = hint
-        token = CancellationToken()
-        context.run.cancellation_token = token
-        tokens = cls._tokens.setdefault((session_id, user_id), set())
-        tokens.add(id(token))
-        start_run(context)
-        started = time.monotonic()
-        name = persona.name if persona else None
-        text = summarize(message)
-        source = "qq" if proactive is None else "interject"
-        from ._runner import agent_runner, run_dsh
+        context.run.cancellation_token = CancellationToken()
+        return context
 
+    @classmethod
+    async def _chat(
+        cls, bot: Bot, event: Event, message: UniMessage, proactive: str | None
+    ) -> None:
+        """检查最终输入，组装群聊背景与发送者头，运行 Agent 并结算
+
+        参数:
+            bot: Bot
+            event: 事件
+            message: 消息
+            proactive: 主动插话原因，为 None 时不是主动插话
+        """
+        from ._memory import Memory
+        from ._proactive import Proactive
+        from ._reply import quote_reply, send_reply
+        from ._runner import agent_runner, run_dsh
+        from ._safety import INPUT_NOTICE, Safety
+        from ._turn import FAILED_NOTICE, ChatTurn
+
+        deps = NoneBotDeps(bot=bot, event=event)
+        user_id = ContextUtils.extract_user_id(deps)
+        if not user_id:
+            return
+        group_id = ContextUtils.extract_group_id(deps)
+        session_id = cls.session_id(bot, event)
+        revision = session_manager.revision(session_id)
+        admitted = await cls._admit(bot, event, message, proactive)
+        if admitted is None or revision != session_manager.revision(session_id):
+            return
+        message, message_id = admitted
+        parts = await MessageBuilder.unimsg_to_llm_parts(message, namespace=MODULE)
+        if not parts and group_id and event.is_tome():
+            parts = [TextPart(text="（@了你，没有说别的）")]
+        if not parts:
+            return
+        text = "\n".join(p.text for p in parts if isinstance(p, TextPart))
+        if Safety.check_input(text):
+            if proactive is None:
+                await UniMessage(Text(INPUT_NOTICE)).send(
+                    reply_to=quote_reply(group_id)
+                )
+            return
+        setting = await AIChatGroup.get_setting(group_id) if group_id else None
+        persona = await AIPersona.get_for_scene(group_id, user_id)
+        context = cls._context(bot, event, setting, proactive, text, message_id)
+        sender, quota_id = context.state["_sender_identity"], context.state["_quota_id"]
+        mark = f" #{message_id}" if group_id and message_id else ""
+        head = f"{sender}{mark}: "
+        size = int(Config.get_config(MODULE, "CONTEXT_SIZE") or 0)
+        if group_id and (
+            background := ChatBuffer.take(bot.self_id, group_id, message_id, size)
+        ):
+            head = f"{background}\n\n{head}"
+        parts = [TextPart(text=head), *parts]
+        agent = cls.get_agent(persona)
+        platform = PlatformUtils.get_platform(bot)
+        turn = ChatTurn(
+            context,
+            agent,
+            context.run.source or "qq",
+            persona,
+            summarize(message),
+            sender,
+            usage_id=quota_id if proactive is None else None,
+            revision=revision,
+        )
+        context.run.history_metadata["reply_to_user"] = quota_id
+
+        async def before_run():
+            if not turn.current:
+                raise asyncio.CancelledError("会话已重置")
+            if group_id and await cls.blocked(bot, group_id, user_id):
+                raise asyncio.CancelledError("当前会话已停用")
+            if proactive is None and (
+                notice := await cls._check_quota(
+                    user_id, platform, scope=PlatformUtils.get_platform_scope(bot)
+                )
+            ):
+                context.run.user_notice = notice
+                raise LLMException(notice)
+
+        async def after(report, error):
+            if proactive is not None:
+                Proactive.spend(group_id or "", turn.tokens)
+                if report["text"]:
+                    Proactive.sent(bot.self_id, group_id or "")
+                elif turn.delivery.status not in {"skipped", "pending"} or error:
+                    Proactive.failed(bot.self_id, group_id or "")
+            elif turn.result and not turn.result.stopped and report["text"]:
+                if cost := int(Config.get_config(MODULE, "COST_GOLD") or 0):
+                    try:
+                        await UserConsole.reduce_gold(
+                            user_id, cost, GoldHandle.PLUGIN, MODULE, platform
+                        )
+                    except InsufficientGold:
+                        pass
+            if report["text"] and turn.current:
+                if proactive is None:
+                    await Memory.reinforce(context.state.get("_recalled_memories", []))
+                Memory.after_chat(session_id)
+
+        async def finalize(value, error=None):
+            try:
+                await turn.reply(value, error, message, setting, persona)
+            except BaseException as exc:
+                await turn.settle(exc, after)
+                raise
+            await turn.settle(error, after)
+
+        cls._admitted.add(asyncio.current_task())  # pyright: ignore [reportArgumentType]
         limit = int(Config.get_config(MODULE, "REQUEST_TIMEOUT") or 0)
         timeout_token = request_timeout.set(limit if limit > 0 else None)
         try:
             if proactive is None and agent_runner(setting) == "dsh":
-                result = await run_dsh(context, parts, persona)
+                turn.result = await run_dsh(
+                    context, parts, persona, finalize=finalize, before_run=before_run
+                )
             else:
-                result = await cls.get_agent(persona).run(parts, context=context)
-        except (LLMException, asyncio.CancelledError) as e:
-            await record_run(context, source, name, text, started, error=e)
-            if not isinstance(e, LLMException):
-                raise
-            logger.warning(f"AI 聊天失败: {e}", MODULE, session=user_id)
-            if proactive is not None:
-                return
-            notice = (persona and persona.error_message) or e.user_friendly_message
-            await MessageUtils.build_message(notice).send(reply_to=quote)
-            return
+                turn.result = await agent.run(
+                    parts, context=context, finalize=finalize, before_run=before_run
+                )
+            await turn.settle(None, after)
+        except asyncio.CancelledError as error:
+            turn.delivery.status = "partial" if turn.delivery.parts else "failed"
+            await turn.settle(error, after)
+            raise
+        except Exception as error:
+            logger.warning(
+                f"AI 聊天未完成: {type(error).__name__}", MODULE, session=user_id
+            )
+            delivery = turn.delivery
+            if proactive is None and not (
+                delivery.parts or delivery.uncertain or turn.tool_texts
+            ):
+                notice = (persona and persona.error_message) or FAILED_NOTICE
+                await send_reply(notice, group_id, result=delivery)
+            await turn.settle(error, after)
         finally:
             request_timeout.reset(timeout_token)
-            tokens.discard(id(token))
-            if not tokens:
-                cls._tokens.pop((session_id, user_id), None)
-        await record_run(context, source, name, text, started, result=result)
-        from ._memory import Memory
-
-        Memory.after_chat(session_id)
-        if proactive is not None:
-            Proactive.spend(group_id or "", result.usage.total_tokens)
-        if result.stopped or not str(result.output).strip():
-            return
-        reply = parse_silent(str(result.output))
-        if proactive is None:
-            await AITokenUsage.add_usage(user_id, result.usage.total_tokens)
-            if cost := int(Config.get_config(MODULE, "COST_GOLD") or 0):
-                try:
-                    await UserConsole.reduce_gold(
-                        user_id, cost, GoldHandle.PLUGIN, MODULE, platform
-                    )
-                except InsufficientGold:
-                    pass
-        if reply is None:
-            return
-        from ._stickers import send_marked, split_sticker
-
-        reply, sticker_id = split_sticker(reply)
-        if reply:
-            voice_input = any(is_voice(seg) for seg in message)
-            voice = setting.voice_reply if setting and setting.voice_reply else None
-            await send_reply(reply, group_id, voice_input, voice)
-        if sticker_id is not None:
-            await send_marked(context, sticker_id)
-        if proactive is not None and group_id:
-            Proactive.sent(bot.self_id, group_id)
 
     @classmethod
-    async def stop(cls, session_id: str, user_id: str | None = None) -> int:
-        """中止会话中运行或排队的对话，指定用户时只中止该用户发起的
+    def directed_pending(cls, session_id: str) -> bool:
+        """会话中是否有已通过检查、尚未结束的定向请求
 
         参数:
             session_id: 会话id
-            user_id: 用户id，为空时中止全部
 
         返回:
-            int: 中止的任务数
+            bool: 是否有
         """
-        mine = cls._tokens.get((session_id, user_id), set()) if user_id else None
-        count = 0
-        for token, task in session_manager.live_tasks.get(session_id, []):
-            if mine is not None and id(token) not in mine:
-                continue
-            if not token.is_cancelled():
+        return any(
+            origin == "qq" and task in cls._admitted and not task.done()
+            for task, (_, origin) in cls._requests.get(session_id, {}).items()
+        )
+
+    @classmethod
+    async def stop(cls, session_id: str, user_id: str | None = None) -> int:
+        """取消并等待会话中运行或排队的对话，指定用户时只取消该用户发起的
+
+        参数:
+            session_id: 会话id
+            user_id: 用户id，为空时取消全部（含控制台、任务等其他入口的运行）
+
+        返回:
+            int: 取消的任务数
+        """
+        current = asyncio.current_task()
+        tasks = {
+            task
+            for task, (owner, _) in cls._requests.get(session_id, {}).items()
+            if task is not current
+            and not task.done()
+            and (user_id is None or owner == user_id)
+        }
+        requests, others = len(tasks), 0
+        if user_id is None:
+            for token, task in list(session_manager.live_tasks.get(session_id, ())):
                 token.cancel()
-                count += 1
-            if task and not task.done():
-                task.cancel()
-        return count
+                if task and task is not current and not task.done():
+                    others += task not in tasks
+                    tasks.add(task)
+        cls._stopped.update(tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        cls._stopped.difference_update(tasks)
+        return requests or others
 
     @classmethod
     async def reset(cls, session_id: str) -> None:
-        """清空会话的短期对话记忆与 dsh 会话映射，群聊会话同时不再看到此前的群消息
+        """停止会话中的对话，清空短期对话记忆、整理进度与 dsh 会话映射，群聊会话
+        同时不再看到此前的群消息；已经形成的长期记忆保留
 
         参数:
             session_id: 会话id
         """
         from zhenxun.services.ai.run.dsh import DshSessions
 
+        from ._memory import Memory
+
+        session_manager.invalidate(session_id)
+        await cls.stop(session_id)
+        await Memory.reset(session_id)
         bot_id, group_id, _ = parse_session(session_id)
         DshSessions.reset(session_id)
         if group_id:
             ChatBuffer.reset(bot_id, group_id)
-        agent = cls.get_agent(None)
-        if backend := chat_backend(agent.memory_config):
+        if backend := chat_backend(cls.get_agent(None).memory_config):
             await backend.clear(session_id)
 
 

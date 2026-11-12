@@ -17,6 +17,7 @@ from zhenxun.models.ai_agent_call import AIAgentCall
 from zhenxun.models.ai_agent_run import AIAgentRun
 from zhenxun.models.ai_knowledge_base import AIKnowledgeBase
 from zhenxun.models.ai_token_usage import AITokenUsage
+from zhenxun.services.ai.context.memory.storage import HISTORY_RETAIN
 from zhenxun.services.ai.run.context import NoneBotDeps
 from zhenxun.services.ai.run.dsh import DshRuntime
 from zhenxun.services.ai.utils.runtime import ContextUtils
@@ -153,13 +154,18 @@ async def _(bot: Bot, event: Event, message: UniMsg, state: T_State):
 
 
 @_stop_matcher.handle()
-async def _(bot: Bot, event: Event):
+async def _(bot: Bot, event: Event, session: Uninfo):
     deps = NoneBotDeps(bot=bot, event=event)
+    user_id = ContextUtils.extract_user_id(deps)
+    manage = PlatformUtils.is_superuser(bot, user_id) or (
+        bool(ContextUtils.extract_group_id(deps))
+        and await PlatformUtils.is_group_admin(bot, session)
+    )
     count = await AIChatManager.stop(
-        AIChatManager.session_id(bot, event), ContextUtils.extract_user_id(deps)
+        AIChatManager.session_id(bot, event), None if manage else user_id
     )
     await MessageUtils.build_message(
-        "已停止你发起的对话。" if count else "你当前没有进行中的对话。"
+        "已停止对应的会话任务。" if count else "没有对应的进行中任务。"
     ).finish(reply_to=quote_reply(ContextUtils.extract_group_id(deps)))
 
 
@@ -182,6 +188,8 @@ async def _(bot: Bot, event: Event, session: Uninfo):
 
 
 register_task_job()
+if Memory.cursors not in HISTORY_RETAIN:
+    HISTORY_RETAIN.append(Memory.cursors)
 
 
 @PriorityLifecycle.on_startup(
@@ -207,6 +215,9 @@ async def _():
     priority=60, timeout=15, component_id="runtime:ai_chat_dsh"
 )
 async def _():
+    for session_id in list(AIChatManager._requests):
+        await AIChatManager.stop(session_id)
+    await Memory.stop(shutdown=True)
     await DshRuntime.close()
 
 
@@ -229,3 +240,11 @@ async def _():
             except Exception as error:
                 run["failed"] += 1
                 logger.error(f"AI 定时清理失败: {name}", MODULE, e=error)
+
+
+@scheduler.scheduled_job(
+    "interval", seconds=600, id="ai_chat_memory_retry", max_instances=1
+)
+async def _memory_tick():
+    """补处理空闲尾段和需要重试的记忆区段。"""
+    await Memory.tick()

@@ -1,9 +1,13 @@
 import asyncio
+import json
 from typing import Any
 
 from zhenxun.services.ai.config import get_llm_config
-from zhenxun.services.ai.core.engine.token_counter import parse_usage_info
-from zhenxun.services.ai.core.exceptions import UpstreamServerException
+from zhenxun.services.ai.core.engine.token_counter import (
+    parse_usage_info,
+    token_counter,
+)
+from zhenxun.services.ai.core.exceptions import LLMException, UpstreamServerException
 from zhenxun.services.ai.core.messages import (
     AssistantMessage,
     ChatRequest,
@@ -138,7 +142,7 @@ class AgentExecutor:
             ChatResponse: 模型响应
         """
         run_context = resources.run_context
-        flattened = list(messages)
+        flattened = await self._fit_request(messages, tools, state, resources)
         model_name = run_context.run.current_model
         await run_context.run.emit(
             LLMStartEvent(model_name=model_name or "unknown", messages=flattened)
@@ -152,7 +156,13 @@ class AgentExecutor:
         )
 
         async def handler(ctx: LLMContext[ChatRequest, ChatResponse]) -> ChatResponse:
-            return await invoke("chat", ctx.request, model_name, ctx.cancellation_token)
+            response = await invoke(
+                "chat", ctx.request, model_name, ctx.cancellation_token
+            )
+            known = parse_usage_info(response.usage_info).total_tokens
+            budget = run_context.run.budget
+            budget["tokens"] = budget.get("tokens", 0) + known
+            return response
 
         async def emit_delta(kind: str, text: str) -> None:
             await run_context.run.emit(TextDeltaEvent(kind=kind, text=text))
@@ -180,6 +190,77 @@ class AgentExecutor:
             assistant_message.token_cost = usage.completion_tokens
         run_context.run.messages.append(assistant_message)
         return response
+
+    @staticmethod
+    async def _fit_request(messages, tools, state, resources):
+        """裁剪单次请求视图，保留当前问题及工具配对，不改写持久历史。"""
+        from zhenxun.services.ai.context.memory.compression import (
+            MessageDropper,
+            ToolPrunerReducer,
+        )
+        from zhenxun.utils.pydantic_compat import model_dump
+
+        context = resources.run_context
+        model = context.run.current_model or ""
+        window = resources.model_profile.context_window or 128000
+        threshold = get_llm_config().context_settings.llm_summary.trigger_threshold
+        if resources.memory_context:
+            local = resources.memory_context.memory_config.compression.threshold
+            if local is not None:
+                threshold = local
+        limit = (
+            window
+            if threshold <= 0
+            else int(window * threshold)
+            if threshold <= 1
+            else int(threshold)
+        )
+        reserve = getattr(resources.generation_config, "max_tokens", None) or min(
+            4096, window // 4
+        )
+        limit = max(1, min(limit, window - reserve))
+        overhead = sum(
+            token_counter._count_text(
+                json.dumps(
+                    model_dump(t) if hasattr(t, "model_dump") else t,
+                    ensure_ascii=False,
+                    default=str,
+                )
+            )
+            for t in tools or []
+        )
+
+        def count(values):
+            return token_counter.count_context(values, model, overhead)
+
+        if count(messages) <= limit:
+            return list(messages)
+        head_size = sum(bool(text.strip()) for text in state.static_system_prompt)
+        old_size = next(
+            (i for i, msg in enumerate(context.run.messages) if msg is state._input),
+            max(0, state._origin_msg_len - 1),
+        )
+        head = list(messages[:head_size])
+        old = list(messages[head_size : head_size + old_size])
+        current = list(messages[head_size + old_size :])
+        sentinel = LLMMessage.user("")
+        fixed = count([*head, *current])
+        old, _, _ = await MessageDropper(limit).reduce(
+            [*old, sentinel], count(messages), model, fixed
+        )
+        old = [m for m in old if m is not sentinel]
+        fitted = [*head, *old, *current]
+        if count(fitted) > limit:
+            pruner = ToolPrunerReducer(keep_recent_turns=2, trigger_tokens=0)
+            current, _, _ = await pruner.reduce(
+                current, count(fitted), model, count([*head, *old])
+            )
+            fitted = [*head, *old, *current]
+        if count(fitted) > limit:
+            notice = "当前输入或工具结果超过模型上下文容量，请缩短输入或分步提问。"
+            context.run.user_notice = notice
+            raise LLMException(notice, details={"code": "chat_context_overflow"})
+        return fitted
 
     @staticmethod
     def _build_request(state: AgentState, resources: AgentRunResources) -> None:
@@ -356,18 +437,14 @@ class AgentExecutor:
                 f"超过最大工具调用循环次数 ({max_cycles})。",
             )
         logger.warning(f"达到最大循环次数 ({max_cycles})，触发兜底总结机制。")
-        run_context.run.messages.append(
-            LLMMessage.user(
-                "### 🚨 [系统强制指令]\n"
-                "你的任务执行已达到最大工具调用循环次数上限，当前思考流已被框架强制中断。\n"
-                "请**诚实地**向用户总结：你目前进行到了哪一步？遇到了什么困难导致循环耗尽？还有哪些预期步骤未能完成？\n"
-                "**绝对禁止**对用户撒谎声声称你已经完成了任务。严禁再次尝试调用任何工具！请直接输出纯文本结果。"
-            )
+        hint = LLMMessage.user(
+            "[收尾提示] 工具步骤已用完。请根据已有信息回答，"
+            "如实说明未完成的部分，不再调用工具。"
         )
         response = await self._invoke_and_record(
             state,
             resources,
-            self._request_messages(state, run_context),
+            [*self._request_messages(state, run_context), hint],
             [],
             tool_choice="none",
         )

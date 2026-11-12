@@ -1,8 +1,9 @@
 import asyncio
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 import contextlib
 import copy
 import inspect
+import time
 from typing import Any
 
 from nonebot.utils import is_coroutine_callable
@@ -13,7 +14,7 @@ from zhenxun.services.ai.config import get_llm_config
 from zhenxun.services.ai.context.memory.engine import SessionMemoryContext
 from zhenxun.services.ai.context.memory.models import MemoryConfig
 from zhenxun.services.ai.core.engine.token_counter import token_counter
-from zhenxun.services.ai.core.exceptions import AbortException, ControlFlowExit
+from zhenxun.services.ai.core.exceptions import ControlFlowExit
 from zhenxun.services.ai.core.messages import (
     LLMMessage,
     PromptInput,
@@ -160,7 +161,15 @@ class Agent:
         return func
 
     async def run(
-        self, prompt: PromptInput | None = None, *, context: RunContext | None = None
+        self,
+        prompt: PromptInput | None = None,
+        *,
+        context: RunContext | None = None,
+        finalize: Callable[
+            [AgentRunResult[Any] | None, BaseException | None], Awaitable[None]
+        ]
+        | None = None,
+        before_run: Callable[[], Awaitable[None]] | None = None,
     ) -> AgentRunResult[Any]:
         """运行 Agent 并等待结果
 
@@ -176,16 +185,27 @@ class Agent:
         """
         ctx: RunContext = context or RunContext()
         try:
-            async with self.run_stream(prompt, context=ctx) as stream:
+            async with self.run_stream(
+                prompt, context=ctx, finalize=finalize, before_run=before_run
+            ) as stream:
                 return await stream.get_run_result()
         except ControlFlowExit as e:
             logger.info(f"[{self.name}] 运行中止: {type(e).__name__} - {e}")
-            await show_exit_notice(e, ctx)
+            if not ctx.run.source:
+                await show_exit_notice(e, ctx)
             return AgentRunResult(output="", usage=UsageInfo(), stopped=e)
 
     @contextlib.asynccontextmanager
     async def run_stream(
-        self, prompt: PromptInput | None = None, *, context: RunContext | None = None
+        self,
+        prompt: PromptInput | None = None,
+        *,
+        context: RunContext | None = None,
+        finalize: Callable[
+            [AgentRunResult[Any] | None, BaseException | None], Awaitable[None]
+        ]
+        | None = None,
+        before_run: Callable[[], Awaitable[None]] | None = None,
     ) -> AsyncIterator[StreamedRunResult[Any]]:
         """流式运行 Agent，负责会话并发控制与事件总线挂载
 
@@ -203,6 +223,7 @@ class Agent:
             if ctx.get_bot() and ctx.get_event():
                 DefaultUISubscriber(ctx).attach(bus)
         text = _prompt_text(prompt)
+        revision = session_manager.revision(ctx.session_id or "default_session")
 
         async def execution() -> None:
             cancel_token = ctx.run.cancellation_token or CancellationToken()
@@ -212,15 +233,57 @@ class Agent:
                     ctx.session_id or "default_session",
                     cancel_token,
                     exclusive=not self.stateless,
-                    follow_up=prompt if self.config.follow_up else None,
-                    sender=ctx.get_user_id(),
+                    follow_up=prompt
+                    if self.config.follow_up and ctx.run.follow_up
+                    else None,
+                    sender=ctx.get_user_id() if ctx.run.follow_up else None,
+                    revision=revision,
                 ):
-                    await bus.emit(AgentRunStart(agent_name=self.name))
-                    result = await self._execute(prompt, text, ctx, cancel_token)
-                    await bus.emit(AgentRunEnd(result=result))
+                    budget = ctx.run.budget
+                    if ctx.run.timeout:
+                        budget.setdefault(
+                            "deadline", time.monotonic() + float(ctx.run.timeout)
+                        )
+                    deadline = budget.get("deadline")
+
+                    async def turn():
+                        try:
+                            if before_run:
+                                await before_run()
+                            await bus.emit(AgentRunStart(agent_name=self.name))
+                            result = await self._execute(
+                                prompt, text, ctx, cancel_token
+                            )
+                            cancel_token.raise_if_cancelled()
+                            if revision != session_manager.revision(
+                                ctx.session_id or "default_session"
+                            ):
+                                raise asyncio.CancelledError("会话已重置")
+                        except BaseException as error:
+                            if (
+                                isinstance(error, asyncio.CancelledError)
+                                and deadline
+                                and time.monotonic() >= deadline
+                                and not cancel_token.is_cancelled()
+                            ):
+                                error = asyncio.TimeoutError("本轮执行超时")
+                            if finalize:
+                                await finalize(None, error)
+                            raise
+                        if finalize:
+                            await finalize(result, None)
+                        await bus.emit(AgentRunEnd(result=result))
+
+                    if deadline:
+                        remaining = max(0.001, deadline - time.monotonic())
+                        await asyncio.wait_for(turn(), remaining)
+                    else:
+                        await turn()
             except asyncio.CancelledError:
                 logger.debug(f"[{self.name}] 执行被取消。")
-                await bus.emit(AgentRunError(error=AbortException("任务已被中止")))
+                await bus.emit(
+                    AgentRunError(error=asyncio.CancelledError("任务已被中止"))
+                )
             except (ControlFlowExit, Exception) as e:
                 await bus.emit(AgentRunError(error=e))
             finally:
@@ -233,6 +296,7 @@ class Agent:
         finally:
             if not task.done():
                 task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
     def _effective_config(self) -> AgentConfig:
         """未显式设置的循环相关字段取全局 agent_settings
@@ -350,6 +414,8 @@ class Agent:
         if prompt is not None and (
             msgs := await MessageBuilder.normalize_to_llm_messages(prompt)
         ):
+            if history := context.run.history_metadata:
+                msgs[-1].metadata = {**(msgs[-1].metadata or {}), **history}
             messages.append(msgs[-1])
             state._input = msgs[-1]
             if memory:
@@ -421,6 +487,15 @@ class Agent:
             context.capabilities = original_capabilities
 
         new_msgs = result.messages[state._origin_msg_len :]
+        if history := context.run.history_metadata:
+            for msg in new_msgs:
+                msg.metadata = {**(msg.metadata or {}), **history}
+                if msg.role == "assistant":
+                    msg.metadata["chat_final"] = msg is new_msgs[-1]
+            if history.get("chat_revision", 0) != session_manager.revision(
+                context.session_id or "default_session"
+            ):
+                raise asyncio.CancelledError("会话已重置")
         if memory:
             await memory.write([*pending, *drop_tool_media(new_msgs)])
         output = result.output or (

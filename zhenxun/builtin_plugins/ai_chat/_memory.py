@@ -6,28 +6,28 @@
 
 import asyncio
 from collections.abc import Iterable
-from datetime import datetime
 import json
+import math
 import re
 import time
 from typing import Any, ClassVar, Literal
-import uuid
 
 import numpy as np
-from tortoise.expressions import F
+from tortoise.expressions import F, Q
 from tortoise.timezone import now
+from tortoise.transactions import in_transaction
 
-from zhenxun.configs.config import BotConfig, Config
-from zhenxun.models.ai_agent_run import AIAgentRun
+from zhenxun.configs.config import Config
 from zhenxun.models.ai_chat_message import AIChatMessage
 from zhenxun.models.ai_memory import AIMemory
 from zhenxun.models.ai_memory_cursor import AIMemoryCursor
-from zhenxun.services.ai.core.templates import wrap_untrusted
 from zhenxun.services.ai.run.context import RunContext
 from zhenxun.services.log import logger
+from zhenxun.services.platform_identity import scoped_group_id, scoped_user_id
+from zhenxun.utils.platform import PlatformUtils
 from zhenxun.utils.time_utils import TimeUtils
 
-from ._data_source import MODULE, SILENT, parse_session
+from ._data_source import MODULE, parse_session
 from ._kb_index import _Index, to_blob, tokenize
 
 Scope = tuple[str | None, str | None]
@@ -137,9 +137,10 @@ def context_scope(context: RunContext | None) -> Scope | None:
     """
     if context is None or context.get_bot() is None:
         return None
+    platform = PlatformUtils.get_platform_scope(context.get_bot())
     if group_id := context.get_group_id():
-        return group_id, None
-    user_id = context.get_user_id()
+        return scoped_group_id(group_id, platform), None
+    user_id = scoped_user_id(context.get_user_id(), platform)
     return (None, user_id) if user_id else None
 
 
@@ -159,33 +160,48 @@ def scope_filter(scope: Scope) -> dict[str, Any]:
 
 
 def _message_text(role: str, content: Any) -> str:
-    """短期记忆消息的可读文本，略去思考过程、工具调用与沉默令牌"""
+    """提取正文；群背景只保留末尾，思考与工具调度不作为对话。"""
+    from ._reply import clean_output, parse_silent
+
     if isinstance(content, str):
         text = content
     else:
-        text = "".join(
-            str(part.get("text", ""))
-            if part.get("type") == "text"
-            else f"[{part.get('type')}]"
-            for part in content or ()
-            if isinstance(part, dict) and part.get("type") != "thought"
-        )
-    text = text.strip()
-    if role == "assistant" and (
-        text == SILENT or text.startswith("[仅包含思维链或工具调度")
-    ):
-        return ""
-    return text[:2000]
+        parts = [
+            str(p.get("text", "")) if p.get("type") == "text" else f"[{p.get('type')}]"
+            for p in content or ()
+            if isinstance(p, dict)
+            and p.get("type") not in {"thought", "tool-call", "tool-return"}
+        ]
+        if role == "user" and len(parts) > 1:
+            parts[0] = parts[0][-400:]
+        text = "".join(parts)
+    if role == "assistant":
+        return parse_silent(text) or ""
+    return clean_output(text).strip()
 
 
 def _parse_json(text: str) -> dict:
-    """取模型输出中的 JSON 对象"""
-    match = re.search(r"\{.*\}", text, re.S)
-    try:
-        result = json.loads(match.group(0)) if match else {}
-    except ValueError:
-        return {}
-    return result if isinstance(result, dict) else {}
+    """逐个解码摘要对象，格式错误与有效空摘要分别处理。"""
+    text = re.sub(r"<(think|thinking)>.*?(?:</\1>|$)", "", text, flags=re.S | re.I)
+    decoder = json.JSONDecoder()
+    for found in re.finditer(r"\{", text):
+        try:
+            value, _ = decoder.raw_decode(text[found.start() :])
+        except ValueError:
+            continue
+        if isinstance(value, dict) and isinstance(value.get("summary"), str):
+            importance = value.get("importance")
+            try:
+                importance = (
+                    float(importance) if not isinstance(importance, bool) else 0.5
+                )
+                if not math.isfinite(importance):
+                    importance = 0.5
+            except (TypeError, ValueError):
+                importance = 0.5
+            value["importance"] = min(1.0, max(0.0, importance))
+            return value
+    raise ValueError("整理响应不是有效摘要 JSON")
 
 
 def _strings(value: Any, limit: int) -> list[str]:
@@ -238,6 +254,11 @@ class Memory:
     _failed: ClassVar[dict[str, float]] = {}
     """整理失败的会话与失败时间"""
     _tasks: ClassVar[set[asyncio.Task]] = set()
+    _session_tasks: ClassVar[dict[str, asyncio.Task]] = {}
+    _summary_tasks: ClassVar[dict[str, asyncio.Task]] = {}
+    _locks: ClassVar[dict[str, asyncio.Lock]] = {}
+    _slots: ClassVar[asyncio.Semaphore] = asyncio.Semaphore(2)
+    rebuild_result: ClassVar[dict[str, Any]] = {}
     rebuilding: ClassVar[bool] = False
     """是否正在重算向量"""
 
@@ -318,66 +339,47 @@ class Memory:
         cls,
         scope: Scope,
         content: str,
-        topics: list[str] | None = None,
-        facts: list[str] | None = None,
-        participants: list[str] | None = None,
+        topics=None,
+        facts=None,
+        participants=None,
         importance: float = 0.5,
         source: str = "auto",
-        created_at: datetime | None = None,
+        created_at=None,
+        *,
+        author_id: str | None = None,
+        pinned: bool | None = False,
+        vector: bytes | None = None,
+        embedded: bool = False,
+        using_db=None,
     ) -> tuple[AIMemory, bool]:
-        """保存一条记忆；与范围内已有记忆几乎相同时并入已有记忆：
-        话题、要点与参与者取并集，重要度取较大值
-
-        参数:
-            scope: 记忆范围
-            content: 内容
-            topics: 话题
-            facts: 关键事实
-            participants: 参与者
-            importance: 重要度
-            source: 来源
-            created_at: 记忆发生的时间，为空时为现在
-
-        返回:
-            tuple[AIMemory, bool]: 记忆, 是否新建
-        """
-        content = content.strip()
-        topics, facts, participants = topics or [], facts or [], participants or []
-        importance = min(1.0, max(0.0, float(importance)))
-        vector = (await cls._embed([content]))[0]
-        if vector is not None:
-            index = await cls.index(scope)
-            query = np.frombuffer(vector, dtype=np.float32)
-            try:
-                cosine = index.scores(query, [])[0]
-            except ValueError:
-                cosine = np.zeros(0)
-            if len(cosine) and float(cosine.max()) >= MERGE_SIMILARITY:
-                same = await AIMemory.get_or_none(id=index.ids[int(cosine.argmax())])
-                if same is not None:
-                    same.topics = list(dict.fromkeys([*same.topics, *topics]))[:10]
-                    same.facts = list(dict.fromkeys([*same.facts, *facts]))[:20]
-                    same.participants = list(
-                        dict.fromkeys([*same.participants, *participants])
-                    )[:20]
-                    same.importance = max(same.importance, importance)
-                    same.tokens = _tokens(same.content, same.topics, same.facts)
-                    await same.save()
-                    cls.invalidate(scope)
-                    return same, False
-        group_id, user_id = scope
-        extra: dict[str, Any] = {"created_at": created_at} if created_at else {}
+        """保存记忆；仅完全相同正文去重，固定保留由调用方核验权限。"""
+        content = " ".join(content.split())
+        if not embedded:
+            vector = (await cls._embed([content]))[0]
+        query = AIMemory.filter(**scope_filter(scope), content=content, archived=False)
+        if using_db:
+            query = query.using_db(using_db)
+        same = await query.first()
+        if same:
+            if pinned is True and same.pinned is not True:
+                same.pinned = True
+                await same.save(using_db=using_db, update_fields=["pinned"])
+            return same, False
+        extra = {"created_at": created_at} if created_at else {}
         memory = await AIMemory.create(
-            group_id=group_id,
-            user_id=None if group_id else user_id,
+            group_id=scope[0],
+            user_id=None if scope[0] else scope[1],
             content=content,
-            topics=topics,
-            facts=facts,
-            participants=participants,
-            importance=importance,
-            tokens=_tokens(content, topics, facts),
+            topics=topics or [],
+            facts=facts or [],
+            participants=participants or [],
+            importance=min(1.0, max(0.0, float(importance))),
+            tokens=_tokens(content, topics or [], facts or []),
             vector=vector,
             source=source,
+            author_id=author_id,
+            pinned=pinned,
+            using_db=using_db,
             **extra,
         )
         cls.invalidate(scope)
@@ -420,7 +422,7 @@ class Memory:
         scope: Scope,
         query: str,
         top_k: int | None = None,
-        reinforce: bool = True,
+        reinforce: bool = False,
     ) -> list[tuple[AIMemory, float]]:
         """召回记忆：相关度为向量相似度与关键词覆盖度（按 idf 加权的查询词命中比例）
         的混合分，没有向量时只用覆盖度；最终分再计入重要度与时间，
@@ -450,7 +452,8 @@ class Memory:
         if vector is not None:
             try:
                 cosine = (await asyncio.to_thread(index.scores, vector, []))[0]
-                relevance = 0.8 * cosine + 0.2 * keyword
+                has_vector = np.linalg.norm(index.vectors, axis=1) > 0
+                relevance = np.where(has_vector, 0.8 * cosine + 0.2 * keyword, keyword)
             except ValueError:
                 logger.warning(
                     "长期记忆向量维度与当前模型不一致，请在 WebUI 重算", MODULE
@@ -484,187 +487,171 @@ class Memory:
             candidates.remove(best)
             chosen.append(best)
         if reinforce and chosen:
-            ids = [m.id for _, m, _ in chosen]
-            await AIMemory.filter(id__in=ids).update(
-                access_count=F("access_count") + 1, last_access_at=now()
-            )
-            await AIMemory.filter(id__in=ids, importance__gt=1 - REINFORCE).update(
-                importance=1.0
-            )
-            await AIMemory.filter(id__in=ids, importance__lte=1 - REINFORCE).update(
-                importance=F("importance") + REINFORCE
-            )
+            await cls.reinforce([m.id for _, m, _ in chosen])
         return [(memory, score) for _, memory, score in chosen]
 
     @classmethod
+    async def reinforce(cls, ids: list[int]) -> None:
+        """有效回复后每天最多强化一次召回记忆。"""
+        if not ids or memory_mode() == "off":
+            return
+        async with in_transaction() as connection:
+            rows = (
+                await AIMemory.filter(id__in=set(ids), archived=False)
+                .using_db(connection)
+                .select_for_update()
+            )
+            timestamp = now()
+            for row in rows:
+                if (
+                    row.last_access_at
+                    and row.last_access_at.astimezone(TimeUtils.zone()).date()
+                    == timestamp.astimezone(TimeUtils.zone()).date()
+                ):
+                    continue
+                row.importance = min(1.0, row.importance + REINFORCE)
+                row.access_count += 1
+                row.last_access_at = timestamp
+                await row.save(
+                    using_db=connection,
+                    update_fields=["importance", "access_count", "last_access_at"],
+                )
+
+    @classmethod
     def after_chat(cls, session_id: str) -> asyncio.Task | None:
-        """一轮对话结束后检查会话，新的用户消息攒够 MEMORY_TURNS 条时在后台整理
-
-        参数:
-            session_id: 会话id
-
-        返回:
-            asyncio.Task | None: 后台检查任务
-        """
+        """在后台整理已结算轮次，同一会话只保留一个检查任务。"""
         if memory_mode() == "off" or session_scope(session_id) is None:
             return None
-        if session_id in cls._running:
-            return None
-        if time.time() - cls._failed.get(session_id, 0) < RETRY_AFTER:
-            return None
-        cls._running.add(session_id)
-        return cls._spawn(cls._check(session_id))
+        old = cls._session_tasks.get(session_id)
+        if old and not old.done():
+            return old
+        task = cls._spawn(cls._check(session_id))
+        cls._session_tasks[session_id] = task
+
+        def done(finished):
+            if cls._session_tasks.get(session_id) is finished:
+                cls._session_tasks.pop(session_id, None)
+
+        task.add_done_callback(done)
+        return task
 
     @classmethod
     async def _check(cls, session_id: str) -> AIMemory | None:
-        """新的用户消息攒够时整理会话，积压多段时最多连续整理 MAX_SEGMENTS 段"""
+        """按轮次或空闲时长整理，失败区段等待有界重试。"""
+        memory = None
         try:
-            turns = max(1, int(_cfg("MEMORY_TURNS", 10)))
-            start = await cls.start_of(session_id)
-            memory = None
             for _ in range(MAX_SEGMENTS):
-                count = await AIChatMessage.filter(
-                    session_id=session_id, is_summary=False, role="user", id__gt=start
-                ).count()
-                if count < turns:
-                    break
-                memory = await cls.summarize(session_id, start) or memory
+                start = await cls.start_of(session_id)
+                rows = AIChatMessage.filter(
+                    session_id=session_id, is_summary=False, id__gt=start
+                )
+                count = await rows.filter(role="user").count()
+                last = await rows.order_by("-id").first()
+                idle = bool(
+                    last and time.time() - last.created_at.timestamp() >= SPLIT_GAP
+                )
                 cursor = await AIMemoryCursor.get_or_none(session_id=session_id)
-                if cursor is None or cursor.message_id <= start:
+                state = (cursor.state or {}) if cursor else {}
+                if (
+                    not idle
+                    and count < max(1, int(_cfg("MEMORY_TURNS", 10)))
+                    and not state.get("partial_id")
+                    and not state.get("attempts")
+                ):
                     break
-                start = cursor.message_id
-            return memory
-        except Exception as e:
-            cls._failed[session_id] = time.time()
-            logger.warning(f"整理长期记忆失败: {e}", MODULE, session=session_id)
-            return None
-        finally:
-            cls._running.discard(session_id)
+                before = (start, state.get("offset", 0))
+                memory = await cls.summarize(session_id) or memory
+                cursor = await AIMemoryCursor.get_or_none(session_id=session_id)
+                if not cursor or before == (
+                    cursor.message_id,
+                    (cursor.state or {}).get("offset", 0),
+                ):
+                    break
+        except Exception as error:
+            logger.warning(
+                f"检查长期记忆失败: {type(error).__name__}", MODULE, session=session_id
+            )
+        return memory
 
     @classmethod
     async def start_of(cls, session_id: str) -> int:
-        """会话已整理到的消息id；从没整理过时跳过最近 MAX_ROWS 条之前的旧消息
-
-        参数:
-            session_id: 会话id
-
-        返回:
-            int: 从这条消息之后开始整理
-        """
-        if cursor := await AIMemoryCursor.get_or_none(session_id=session_id):
-            return cursor.message_id
-        older = (
-            await AIChatMessage.filter(session_id=session_id, is_summary=False)
-            .order_by("-id")
-            .offset(MAX_ROWS)
-            .limit(1)
-            .values_list("id", flat=True)
-        )
-        return int(str(older[0])) if older else 0
+        """取得最后完整整理的消息锚点。"""
+        cursor = await AIMemoryCursor.get_or_none(session_id=session_id)
+        return cursor.message_id if cursor else 0
 
     @classmethod
-    async def summarize(cls, session_id: str, start: int = 0) -> AIMemory | None:
-        """把会话中 start 之后最早的一段对话整理为一条记忆：跨天或相邻消息间隔
-        超过 SPLIT_GAP 时只整理前一段。结果记为 memory 运行记录，整理成功后
-        推进整理进度，没有值得记的内容时不保存
+    async def stop(cls, *, shutdown: bool = False) -> None:
+        """等待整理任务中止；关闭进程时同时收尾向量重算任务。"""
+        tasks = set(cls._session_tasks.values()) | set(cls._summary_tasks.values())
+        if shutdown:
+            tasks.update(cls._tasks)
+        tasks = {t for t in tasks if t is not asyncio.current_task() and not t.done()}
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
-        参数:
-            session_id: 会话id
-            start: 从这条短期记忆消息之后开始
+    @classmethod
+    async def reset(cls, session_id: str) -> None:
+        """取消整理并使持久化游标修订失效，保留已有长期记忆。"""
+        current = asyncio.current_task()
+        tasks = {
+            t
+            for t in (
+                cls._session_tasks.get(session_id),
+                cls._summary_tasks.get(session_id),
+            )
+            if t and t is not current and not t.done()
+        }
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        async with cls._locks.setdefault(session_id, asyncio.Lock()):
+            cursor, _ = await AIMemoryCursor.get_or_create(session_id=session_id)
+            await AIMemoryCursor.filter(id=cursor.id).update(
+                revision=F("revision") + 1, message_id=0, state={}, updated_at=now()
+            )
+        cls._failed.pop(session_id, None)
+
+    @classmethod
+    async def cursors(cls) -> dict[str, int]:
+        """开启长期记忆时各聊天会话已整理到的消息id，其后的消息尚未整理
 
         返回:
-            AIMemory | None: 保存或并入的记忆
+            dict[str, int]: 会话id 到消息id
         """
-        from zhenxun.services.ai.core.engine.token_counter import parse_usage_info
-        from zhenxun.services.ai.llm.api import chat
-        from zhenxun.services.ai.llm.manager import get_default_model
+        if memory_mode() == "off":
+            return {}
+        sessions = (
+            await AIChatMessage.all().distinct().values_list("session_id", flat=True)
+        )
+        marks = {c.session_id: c.message_id for c in await AIMemoryCursor.all()}
+        return {
+            session_id: marks.get(session_id, 0)
+            for session_id in map(str, sessions)
+            if session_scope(session_id) is not None
+        }
 
-        scope = session_scope(session_id)
-        rows = await (
-            AIChatMessage.filter(session_id=session_id, is_summary=False, id__gt=start)
-            .order_by("id")
-            .limit(MAX_ROWS)
+    @classmethod
+    async def tick(cls) -> None:
+        """补处理空闲尾段和到期重试，不占用聊天请求。"""
+        if memory_mode() == "off":
+            return
+        sessions = (
+            await AIChatMessage.all().distinct().values_list("session_id", flat=True)
         )
-        if scope is None or not rows:
-            return None
-        name = BotConfig.self_nickname or "Bot"
-        zone = TimeUtils.zone()
-        for i in range(1, len(rows)):
-            prev, cur = rows[i - 1].created_at, rows[i].created_at
-            if (cur - prev).total_seconds() > SPLIT_GAP or (
-                cur.astimezone(zone).date() != prev.astimezone(zone).date()
-            ):
-                rows = rows[:i]
-                break
-        lines = []
-        for row in rows:
-            if row.role not in ("user", "assistant"):
-                continue
-            if text := _message_text(row.role, row.content):
-                at = row.created_at.astimezone(zone).strftime("%m-%d %H:%M")
-                lines.append(
-                    f"[{at}] {'你：' if row.role == 'assistant' else ''}{text}"
-                )
-        chat_text = "\n".join(lines)[-MAX_CHAT_CHARS:]
-        prompt = SUMMARY_PROMPT.format(
-            name=name,
-            scene=f"群 {scope[0]}" if scope[0] else "和对方的私聊",
-            start=rows[0].created_at.astimezone(zone).strftime("%Y-%m-%d %H:%M"),
-            end=rows[-1].created_at.astimezone(zone).strftime("%Y-%m-%d %H:%M"),
-            chat=wrap_untrusted(chat_text, "chat_log"),
-        )
-        model = str(_cfg("MEMORY_MODEL", "")).strip() or None
-        bot_id = parse_session(session_id)[0]
-        started = time.monotonic()
-        status, output, error, tokens = "silent", "", "", 0
-        memory = None
-        try:
-            if chat_text:
-                response = await chat(prompt, model=model, timeout=120)
-                output = response.text
-                tokens = parse_usage_info(response.usage_info).total_tokens
-                result = _parse_json(output)
-                summary = str(result.get("summary") or "").strip()
-                try:
-                    importance = float(result.get("importance") or 0)
-                except (TypeError, ValueError):
-                    importance = 0.0
-                if summary and importance >= MIN_IMPORTANCE:
-                    memory, _ = await cls.add(
-                        scope,
-                        summary[:2000],
-                        _strings(result.get("topics"), 5),
-                        _strings(result.get("key_facts"), 8),
-                        _strings(result.get("participants"), 20),
-                        importance,
-                        created_at=rows[-1].created_at,
-                    )
-                    status = "ok"
-            await AIMemoryCursor.update_or_create(
-                defaults={"message_id": rows[-1].id}, session_id=session_id
-            )
-        except Exception as e:
-            status, error = "error", f"{type(e).__name__}: {e}"
-            cls._failed[session_id] = time.time()
-            logger.warning(f"整理长期记忆失败: {e}", MODULE, session=session_id)
-        try:
-            await AIAgentRun.create(
-                run_id=uuid.uuid4().hex,
-                source="memory",
-                session_id=session_id,
-                user_id=bot_id,
-                group_id=scope[0],
-                model=model or get_default_model("chat"),
-                input=f"整理 {len(rows)} 条对话",
-                output=output[:4000],
-                tokens=tokens,
-                status=status,
-                error=error[:2000],
-                duration=int((time.monotonic() - started) * 1000),
-            )
-        except Exception as e:
-            logger.warning(f"保存记忆整理记录失败: {e}", MODULE)
-        return memory
+        for session_id in sessions:
+            cls.after_chat(session_id)
+
+    @classmethod
+    async def summarize(
+        cls, session_id: str, start: int = 0, *, retry: bool = False
+    ) -> AIMemory | None:
+        """整理一个有界区段，按修订原子提交结果。"""
+        from ._memory_summary import summarize
+
+        return await summarize(cls, session_id, start, retry=retry)
 
     @classmethod
     async def decay(cls) -> int:
@@ -673,10 +660,14 @@ class Memory:
         返回:
             int: 归档的条数
         """
+        if memory_mode() == "off":
+            return 0
         step = float(_cfg("MEMORY_DECAY", 0.01))
         if step <= 0:
             return 0
-        query = AIMemory.filter(source="auto", archived=False)
+        query = AIMemory.filter(
+            Q(pinned=False) | Q(pinned__isnull=True, source="auto"), archived=False
+        )
         await query.filter(importance__gt=0).update(importance=F("importance") - step)
         archived = await query.filter(importance__lt=ARCHIVE_BELOW).update(
             archived=True
@@ -694,6 +685,7 @@ class Memory:
         """
         if cls.rebuilding:
             return False
+        cls.rebuild_result = {"succeeded": 0, "failed": 0, "error": ""}
         cls.rebuilding = True
         cls._spawn(cls._rebuild())
         return True
@@ -705,11 +697,26 @@ class Memory:
             last = 0
             while rows := await AIMemory.filter(id__gt=last).order_by("id").limit(64):
                 vectors = await cls._embed([m.content for m in rows])
-                for memory, vector in zip(rows, vectors):
-                    await AIMemory.filter(id=memory.id).update(vector=vector)
-                last = rows[-1].id
+                for index, memory in enumerate(rows):
+                    vector = vectors[index] if index < len(vectors) else None
+                    if vector is None:
+                        cls.rebuild_result["failed"] += 1
+                        cls.rebuild_result["error"] = "部分向量未能生成，原向量保持不变"
+                        last = memory.id
+                        continue
+                    changed = await AIMemory.filter(
+                        id=memory.id, updated_at=memory.updated_at
+                    ).update(vector=vector)
+                    cls.rebuild_result["succeeded" if changed else "failed"] += 1
+                    last = memory.id
             cls.invalidate()
+        except asyncio.CancelledError:
+            cls.rebuild_result["error"] = "重算已中止，未处理条目保留原向量"
+            cls.rebuild_result["failed"] += await AIMemory.filter(id__gt=last).count()
+            raise
         except Exception as e:
-            logger.warning(f"重算长期记忆向量失败: {e}", MODULE)
+            cls.rebuild_result["error"] = f"重算未完成（{type(e).__name__}）"
+            cls.rebuild_result["failed"] += await AIMemory.filter(id__gt=last).count()
+            logger.warning(f"重算长期记忆向量失败: {type(e).__name__}", MODULE)
         finally:
             cls.rebuilding = False

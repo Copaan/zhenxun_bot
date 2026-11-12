@@ -43,51 +43,26 @@ def split_text(text: str, size: int, overlap: int) -> list[str]:
     返回:
         list[str]: 分块
     """
+    if size <= 0:
+        raise ValueError("分块大小必须大于零")
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
-    if not text:
-        return []
     overlap = max(0, min(overlap, size // 2))
-
-    def merge(parts: list[str], sep: str) -> list[str]:
-        chunks, current, length = [], [], 0
-        for part in parts:
-            extra = len(sep) if current else 0
-            if current and length + extra + len(part) > size:
-                chunks.append(sep.join(current))
-                while current and (length > overlap or length + len(part) > size):
-                    length -= len(current.pop(0)) + (len(sep) if current else 0)
-                extra = len(sep) if current else 0
-            current.append(part)
-            length += extra + len(part)
-        if current:
-            chunks.append(sep.join(current))
-        return chunks
-
-    def split(value: str, seps: list[str]) -> list[str]:
-        sep = next((s for s in seps if s == "" or s in value), "")
-        rest = seps[seps.index(sep) + 1 :] if sep else []
-        parts = value.split(sep) if sep else list(value)
-        out, good = [], []
-        for part in parts:
-            if not part:
-                continue
-            if len(part) <= size:
-                good.append(part)
-                continue
-            if good:
-                out += merge(good, sep)
-                good = []
-            if rest:
-                out += split(part, rest)
-            else:
-                out += [part[i : i + size] for i in range(0, len(part), size)]
-        if good:
-            out += merge(good, sep)
-        return out
-
-    if len(text) <= size:
-        return [text]
-    return [c.strip() for c in split(text, SEPARATORS) if c.strip()]
+    chunks, start = [], 0
+    while start < len(text):
+        end = min(start + size, len(text))
+        if end < len(text):
+            for separator in SEPARATORS[:-1]:
+                split = text.rfind(separator, start + max(overlap + 1, size // 2), end)
+                if split >= 0:
+                    end = split + len(separator)
+                    break
+        chunk = text[start:end]
+        if chunk.strip():
+            chunks.append(chunk)
+        if end == len(text):
+            break
+        start = max(start + 1, end - overlap)
+    return chunks
 
 
 def to_blob(vector: np.ndarray) -> bytes:

@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-import hashlib
 import json
 from typing import Any, ClassVar, cast
 
 from zhenxun.services.ai.config import get_llm_config
 from zhenxun.services.ai.core.exceptions import (
     AbortException,
-    ControlFlowExit,
     LLMException,
     ModelRetry,
     ResponseParseException,
@@ -19,7 +17,6 @@ from zhenxun.services.ai.core.messages import (
     ChatRequest,
     ChatResponse,
     LLMMessage,
-    ToolCallPart,
 )
 from zhenxun.services.ai.core.models import LLMContext
 from zhenxun.services.ai.run.context import RunContext
@@ -43,76 +40,32 @@ def _get_tool_meta(tool: Any, key: str, default: Any = None) -> Any:
 
 
 class StuckDetectionCapability(AbstractCapability):
-    """死循环检测：使用前置请求拦截防止 LLM 陷入无限重试"""
+    """相同工具参数连续重复时分级提醒，超过五次不再执行。"""
 
-    async def wrap_model_request(
-        self,
-        context: RunContext,
-        llm_context: LLMContext[ChatRequest, ChatResponse],
-        handler: WrapModelRequestHandler,
-    ) -> ChatResponse:
-        max_repeated_errors = 3
-        action_hashes = []
-        messages = list(llm_context.request.messages)
-        idx = len(messages) - 1
+    async def wrap_tool_execute(self, context, tool_name, arguments, handler):
+        from zhenxun.services.ai.tools.models import ToolResult
 
-        while idx >= 0:
-            msg = messages[idx]
-            if msg.role == "tool":
-                batch_tool_contents = []
-                while idx >= 0 and messages[idx].role == "tool":
-                    for tr in messages[idx].tool_returns:
-                        batch_tool_contents.append(f"{tr.tool_name}:{tr.output}")
-                    idx -= 1
-
-                if (
-                    idx >= 0
-                    and messages[idx].role == "assistant"
-                    and messages[idx].tool_calls
-                ):
-                    assistant_msg = messages[idx]
-                    batch_tool_calls = []
-                    for tc in assistant_msg.tool_calls:
-                        if isinstance(tc, ToolCallPart):
-                            args_str = (
-                                tc.args
-                                if isinstance(tc.args, str)
-                                else json.dumps(tc.args, ensure_ascii=False)
-                            )
-                            batch_tool_calls.append(f"{tc.tool_name}:{args_str}")
-
-                    batch_tool_calls.sort()
-                    batch_tool_contents.sort()
-
-                    state_str = (
-                        "|".join(batch_tool_calls)
-                        + "||"
-                        + "|".join(batch_tool_contents)
-                    )
-                    state_hash = hashlib.md5(state_str.encode("utf-8")).hexdigest()
-                    action_hashes.append(state_hash)
-                    idx -= 1
-                else:
-                    break
-            elif msg.role == "assistant":
-                idx -= 1
-            else:
-                break
-
-        if len(action_hashes) >= max_repeated_errors:
-            recent_hashes = action_hashes[:max_repeated_errors]
-            if len(set(recent_hashes)) == 1:
-                logger.warning(
-                    "[StuckDetection] 拦截到死循环：连续 "
-                    f"{max_repeated_errors} 次产生完全相同的状态哈希碰撞。"
+        signature = json.dumps(
+            arguments, sort_keys=True, ensure_ascii=False, default=str
+        )
+        history = context.state.setdefault("_tool_repetitions", {})
+        previous, count = history.get(tool_name, (None, 0))
+        count = count + 1 if signature == previous else 1
+        history[tool_name] = (signature, count)
+        if count >= 5:
+            context.state.setdefault("_disabled_tools", set()).add(tool_name)
+            return ToolResult(
+                output=(
+                    "这个工具的相同调用已重复多次，本轮停止调用，" "请用已有信息回答。"
                 )
-                raise ToolFatalError(
-                    "Agent 触发终极防呆机制：连续 "
-                    f"{max_repeated_errors} 次产生完全相同的"
-                    "无效工具调用状态，已物理阻断以节省 Token。"
-                )
-
-        return await handler(llm_context)
+            ).as_error(False)
+        result = await handler(arguments)
+        if count >= 3 and isinstance(result, ToolResult):
+            result.output = (
+                f"{result.output}\n[提醒] 相同调用已重复 {count} 次，"
+                "请停止重复并总结现有结果。"
+            )
+        return result
 
 
 class GlobalCycleLimitCapability(AbstractCapability):
@@ -174,42 +127,39 @@ class PermissionCapability(AbstractCapability):
 
 
 class ToolRetryAndReflectionCapability(AbstractCapability):
-    """
-    重试与自愈反思中间件。
-    接管原执行器中的重试计数与致命异常熔断。
-    将 Python 异常优雅地转化为大模型的反思 Prompt。
-    """
+    """连续失败回填模型；不可重试或结果未知的写工具本轮禁用。"""
 
-    async def wrap_tool_execute(
-        self,
-        context: RunContext,
-        tool_name: str,
-        arguments: dict[str, Any],
-        handler: WrapToolExecuteHandler,
-    ) -> Any:
+    async def wrap_tool_execute(self, context, tool_name, arguments, handler):
+        from zhenxun.services.ai.tools.models import ToolResult
+
+        disabled = context.state.setdefault("_disabled_tools", set())
+        if tool_name in disabled:
+            return ToolResult(
+                output="该工具本轮已停用，请根据已有信息回答，不要换参数重试。"
+            ).as_error(False)
         try:
-            return await handler(arguments)
-        except Exception as e:
-            from zhenxun.services.ai.tools.models import ToolResult
-
-            if isinstance(e, ControlFlowExit):
-                raise e
-
-            retries = context.run.tool_retries.get(tool_name, 0)
-            retries += 1
-            context.run.tool_retries[tool_name] = retries
-
-            if isinstance(e, ToolFatalError):
-                display_msg = getattr(e, "display_content", f"❌ 系统致命错误: {e}")
-                raise AbortException(reason=str(e), display=display_msg)
-
-            if retries > context.run.tool_max_retries:
-                raise AbortException(
-                    reason=f"工具 '{tool_name}' 连续出错达 {retries} 次，超出上限。",
-                    display=f"🚨 工具 '{tool_name}' 已达最大重试次数，执行阻断。",
-                )
-
-            return ToolResult(output=f"执行发生异常: {e}").as_error()
+            result = await handler(arguments)
+        except Exception as error:
+            readonly = bool(
+                _get_tool_meta(context.call.current_tool, "read_only", False)
+            ) and not isinstance(error, PermissionError)
+            result = ToolResult(
+                output=f"工具执行失败（{type(error).__name__}），未确认完成。"
+            ).as_error(readonly)
+            logger.warning(f"工具 {tool_name} 失败: {type(error).__name__}")
+        if not isinstance(result, ToolResult) or not result.is_error:
+            context.run.tool_retries.pop(tool_name, None)
+            return result
+        failures = context.run.tool_retries.get(tool_name, 0) + 1
+        context.run.tool_retries[tool_name] = failures
+        if not result.is_retryable or failures > context.run.tool_max_retries:
+            disabled.add(tool_name)
+            result.output = (
+                f"{result.output}\n该工具本轮停用。不要再次执行，"
+                "请用已有信息回答并说明未完成部分。"
+            )
+            result.is_retryable = False
+        return result
 
 
 class ReflexionCapability(AbstractCapability):

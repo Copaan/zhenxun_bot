@@ -455,7 +455,12 @@ class Stickers:
 
     @classmethod
     async def send(
-        cls, scene: Scene, sticker_id: int, reply_to: str = ""
+        cls,
+        scene: Scene,
+        sticker_id: int,
+        reply_to: str = "",
+        *,
+        expected_md5: str | None = None,
     ) -> str | None:
         """向当前会话发送表情库中的一个表情，计入发送配额并记录使用
 
@@ -474,6 +479,11 @@ class Stickers:
         if reason := SendQuota.take(scene.key):
             return reason
         data = await asyncio.to_thread(path.read_bytes)
+        if (expected_md5 and sticker.md5 != expected_md5) or hashlib.md5(
+            data
+        ).hexdigest() != sticker.md5:
+            SendQuota.refund(scene.key, 1)
+            return "表情文件已经变化，请重新检索。"
         segments: list[Segment] = [Reply(reply_to)] if reply_to else []
         segments.append(Image(raw=data))
         if not await PlatformUtils.send_message(
@@ -603,22 +613,38 @@ def split_sticker(text: str) -> tuple[str, int | None]:
     返回:
         tuple[str, int | None]: 去掉标记后的文字, 表情 id
     """
-    match = MARKER.search(text)
-    if match is None:
-        return text, None
-    return MARKER.sub("", text).strip(), int(match.group(1))
+    from ._reply import _INLINE_CODE, _segments
+
+    result, sticker_id = [], None
+    for code, block in _segments(text):
+        if code:
+            result.append(block)
+            continue
+        for i, part in enumerate(_INLINE_CODE.split(block)):
+            if not i % 2:
+                match = MARKER.search(part)
+                if match and sticker_id is None:
+                    sticker_id = int(match.group(1))
+                part = MARKER.sub("", part)
+            result.append(part)
+    return "".join(result).strip(), sticker_id
 
 
-async def send_marked(context: RunContext, sticker_id: int) -> None:
+async def send_marked(context: RunContext, sticker_id: int) -> bool:
     """回复文字发完后发送回复中标记的表情，关闭发送工具、表情不存在或配额用完时放弃
 
     参数:
         context: 运行上下文
         sticker_id: 表情 id
     """
-    if not Config.get_config(MODULE, "SEND_TOOLS", True):
-        return
-    if (scene := Scene.of(context)) and (
-        reason := await Stickers.send(scene, sticker_id)
-    ):
+    expected = context.state.get("_sticker_candidates", {}).get(sticker_id)
+    if expected is None or not Config.get_config(MODULE, "SEND_TOOLS", True):
+        return False
+    scene = Scene.of(context)
+    if scene is None:
+        return False
+    reason = await Stickers.send(scene, sticker_id, expected_md5=expected)
+    if reason:
         logger.debug(f"未发送标记的表情 #{sticker_id}: {reason}", MODULE)
+        return False
+    return True

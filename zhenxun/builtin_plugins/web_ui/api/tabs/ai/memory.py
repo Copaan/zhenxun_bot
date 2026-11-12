@@ -34,6 +34,7 @@ class MemoryUpdate(BaseModel):
     topics: list[str] = Field(default_factory=list, max_length=10)
     facts: list[str] = Field(default_factory=list, max_length=20)
     importance: float = Field(default=0.6, ge=0, le=1)
+    pinned: bool | None = None
 
 
 class MemoryCreate(ScopePayload, MemoryUpdate):
@@ -74,6 +75,8 @@ def _item(memory: Any) -> dict[str, Any]:
         "access_count": memory.access_count,
         "last_access_at": memory.last_access_at,
         "source": memory.source,
+        "author_id": memory.author_id,
+        "pinned": memory.pinned,
         "archived": memory.archived,
         "has_vector": bool(memory.vector),
         "created_at": memory.created_at,
@@ -111,11 +114,21 @@ async def memory_status() -> Result:
         .group_by("group_id", "user_id")
         .values("group_id", "user_id", "n")
     )
+    from zhenxun.models.ai_memory_cursor import AIMemoryCursor
+
+    cursors = await AIMemoryCursor.all().order_by("-updated_at").limit(100)
     enabled = Config.get_config(MODULE, "MEMORY_EMBEDDING")
     return Result.ok(
         {
             "mode": memory_mode(),
             "rebuilding": Memory.rebuilding,
+            "rebuild_result": Memory.rebuild_result,
+            "local_agent_only": True,
+            "summaries": [
+                {"session_id": c.session_id, "revision": c.revision, **(c.state or {})}
+                for c in cursors
+                if (c.state or {}).get("status") in {"running", "retry_wait", "pending"}
+            ],
             "embedding_enabled": enabled is None or bool(enabled),
             "embedding_model": embedding_model(),
             "scopes": sorted(
@@ -166,6 +179,7 @@ async def list_memories(
 @router.post("/memory/items", dependencies=[authentication()], response_model=Result)
 async def create_memory(payload: MemoryCreate) -> Result:
     from zhenxun.builtin_plugins.ai_chat._memory import Memory
+    from zhenxun.configs.config import Config
 
     memory, created = await Memory.add(
         payload.scope,
@@ -174,8 +188,15 @@ async def create_memory(payload: MemoryCreate) -> Result:
         _clean(payload.facts),
         importance=payload.importance,
         source="webui",
+        author_id="webui:"
+        + str(Config.get_config("web-ui", "username") or "administrator"),
+        pinned=True if payload.pinned is None else payload.pinned,
     )
-    info = "已添加记忆。" if created else f"与记忆 #{memory.id} 几乎相同，已并入。"
+    info = (
+        "已添加记忆。"
+        if created
+        else f"已有完全相同的记忆 #{memory.id}，未覆盖其他内容。"
+    )
     return Result.ok(_item(memory), info=info)
 
 
@@ -194,6 +215,7 @@ async def update_memory(memory_id: int, payload: MemoryEdit) -> Result:
         facts=_clean(payload.facts),
         importance=payload.importance,
         archived=payload.archived,
+        **({"pinned": payload.pinned} if payload.pinned is not None else {}),
     )
     return Result.ok(_item(memory), info="已保存。")
 
@@ -226,15 +248,29 @@ async def recall(payload: RecallPayload) -> Result:
     "/memory/summarize", dependencies=[authentication()], response_model=Result
 )
 async def summarize(payload: SummarizePayload) -> Result:
-    from zhenxun.builtin_plugins.ai_chat._memory import Memory, session_scope
+    from zhenxun.builtin_plugins.ai_chat._memory import (
+        Memory,
+        memory_mode,
+        session_scope,
+    )
 
     if session_scope(payload.session_id) is None:
         raise HTTPException(422, detail="这个会话没有长期记忆")
+    if memory_mode() == "off":
+        return Result.fail("长期记忆已关闭，请先开启后再整理。")
     memory = await Memory.summarize(
-        payload.session_id, await Memory.start_of(payload.session_id)
+        payload.session_id, await Memory.start_of(payload.session_id), retry=True
     )
     if memory is None:
-        return Result.ok(None, info="没有整理出值得记的内容，详情见运行记录。")
+        from zhenxun.models.ai_memory_cursor import AIMemoryCursor
+
+        cursor = await AIMemoryCursor.get_or_none(session_id=payload.session_id)
+        state = (cursor.state or {}) if cursor else {}
+        if payload.session_id in Memory._running:
+            return Result.fail("该会话正在整理，请稍后查看结果。")
+        if state.get("status") in {"pending", "retry_wait"}:
+            return Result.fail(state.get("error") or "整理未完成，原进度已保留。")
+        return Result.ok(None, info="没有新的可整理内容，或本段无需形成长期记忆。")
     return Result.ok(_item(memory), info=f"已整理为记忆 #{memory.id}。")
 
 
@@ -250,11 +286,14 @@ async def rebuild() -> Result:
 @router.put("/memory/mode", dependencies=[authentication()], response_model=Result)
 async def update_mode(payload: ModePayload) -> Result:
     from zhenxun.builtin_plugins.ai_chat._data_source import MODULE
+    from zhenxun.builtin_plugins.ai_chat._memory import Memory
     from zhenxun.configs.config import Config
     from zhenxun.services.log import logger
 
     Config.set_config(MODULE, "MEMORY_MODE", payload.mode)
     Config.save(save_simple_data=True)
+    if payload.mode == "off":
+        await Memory.stop()
     logger.info(f"WebUI 修改了长期记忆模式: {payload.mode}", "WebUi")
     names = {"off": "已关闭长期记忆。", "inject": "已切换为自动召回。"}
     return Result.ok(info=names.get(payload.mode, "已切换为按需召回。"))

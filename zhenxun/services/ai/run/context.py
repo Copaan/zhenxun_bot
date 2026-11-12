@@ -109,6 +109,18 @@ class AgentRunContext(Generic[AgentDepsT]):
     """全局级联取消令牌，用于跨 Agent 的协程挂起中断。"""
     event_bus: EventBus | None = None
     """底层的事件流发射器 (EventBus)，由执行引擎在运行时挂载。"""
+    source: str | None = None
+    """运行来源，由入口设置；设置后中止原因由入口自行提示。"""
+    follow_up: bool = True
+    """是否接受同一发送者在工具执行期间追加的输入。"""
+    timeout: float | None = None
+    """整轮时限（秒），从进入会话锁开始计算。"""
+    budget: dict[str, float] = dataclasses.field(default_factory=dict)
+    """整轮预算：tokens 为已知模型用量，deadline 为截止时间；子代理共享同一对象。"""
+    history_metadata: dict[str, Any] = dataclasses.field(default_factory=dict)
+    """写入短期记忆时附加到本轮消息上的元数据。"""
+    user_notice: str | None = None
+    """可直接展示给用户的失败原因。"""
 
     dynamic_prompts: dict[str, str] = dataclasses.field(default_factory=dict)
     """动态提示词字典（保持插入顺序并去重）。

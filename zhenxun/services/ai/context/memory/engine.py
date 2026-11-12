@@ -91,6 +91,9 @@ class SessionMemoryContext:
         """
         key = f"{id(backend)}:{self.session_id}"
         session_id = self.session_id
+        from zhenxun.services.ai.run.session import session_manager
+
+        revision = session_manager.revision(session_id)
 
         def submit(produce: Callable[[], Awaitable[LLMMessage | None]]) -> None:
             if key in _summarizing:
@@ -100,6 +103,8 @@ class SessionMemoryContext:
             async def job() -> None:
                 try:
                     if summary := await produce():
+                        if session_manager.revision(session_id) != revision:
+                            return
                         await backend.add_messages(session_id, [summary])
                         logger.info(f"💾 [SessionMemory] 已保存会话 {key} 的摘要")
                 except Exception as e:

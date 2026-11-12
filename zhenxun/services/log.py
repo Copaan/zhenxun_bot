@@ -4,6 +4,7 @@ import asyncio
 import atexit
 import contextlib
 from datetime import timedelta
+import logging
 import queue
 import sys
 import threading
@@ -12,7 +13,7 @@ from typing import TYPE_CHECKING, Any, TextIO, cast, overload
 from loguru import logger as logger_
 import nonebot
 from nonebot import _log_patcher as _nonebot_log_patcher
-from nonebot.log import default_filter, default_format
+from nonebot.log import LoguruHandler, default_filter, default_format
 from nonebot.log import logger_id as nonebot_logger_id
 
 if TYPE_CHECKING:
@@ -173,6 +174,12 @@ _ERROR_LOG_SINK_ID = logger_.add(
     filter=default_filter,
     retention=timedelta(days=30),
 )
+
+# 更新服务同时运行在 launcher 中，使用标准日志；这里把它接入真寻日志
+_update_logger = logging.getLogger("zhenxun.services.update")
+_update_logger.addHandler(LoguruHandler())
+_update_logger.setLevel(logging.INFO)
+_update_logger.propagate = False
 
 _DEBUG_LEVEL = logger_.level("DEBUG")
 _INFO_LEVEL_NO = logger_.level("INFO").no

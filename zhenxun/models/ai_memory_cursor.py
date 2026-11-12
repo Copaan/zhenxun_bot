@@ -10,6 +10,8 @@ class AIMemoryCursor(Model):
     """聊天会话id"""
     message_id = fields.BigIntField(default=0, description="已整理到的消息")
     """已整理成长期记忆的最后一条短期记忆消息id"""
+    revision = fields.IntField(default=0, description="整理修订")
+    state = fields.JSONField(null=True, default=dict, description="区段进度与重试状态")
     updated_at = fields.DatetimeField(auto_now=True, description="修改时间")
     """修改时间"""
 

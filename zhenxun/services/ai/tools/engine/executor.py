@@ -316,7 +316,10 @@ class ToolExecutor:
             try:
                 return await asyncio.wait_for(call, timeout)
             except asyncio.TimeoutError:
-                return ToolResult(output=f"工具执行超时（{timeout} 秒）").as_error()
+                metadata = getattr(executable, "metadata", None) or {}
+                return ToolResult(
+                    output=f"工具执行超时（{timeout} 秒），执行结果未确认。"
+                ).as_error(bool(metadata.get("read_only")))
 
         async with self._tool_stream_scope(event_bus, tool_name, arguments) as box:
             with set_run_context(safe_context):
@@ -329,8 +332,13 @@ class ToolExecutor:
                 except BaseException as e:
                     if isinstance(e, ControlFlowExit | asyncio.CancelledError):
                         raise e
-                    logger.error(f"洋葱模型异常穿透: {e}")
-                    result = ToolResult(output=f"System Fatal Error: {e}").as_error()
+                    safe_context.state.setdefault("_disabled_tools", set()).add(
+                        tool_name
+                    )
+                    logger.error(f"工具执行链未完成: {type(e).__name__}")
+                    result = ToolResult(
+                        output="工具执行结果无法确认，本轮不要重试，请用已有信息回答。"
+                    ).as_error(False)
             box["result"] = result
 
         return validated.call, box["result"]

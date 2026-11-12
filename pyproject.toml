@@ -1,6 +1,6 @@
 [project]
 name = "zhenxun-bot"
-version = "0.2.6"
+version = "0.2.7"
 description = "基于 Nonebot2 和 go-cqhttp 开发，以 postgresql 作为数据库，非常可爱的绪山真寻bot"
 authors = [{ name = "HibiKier", email = "775757368@qq.com" }]
 license = { text = "AGPL-3.0" }
@@ -27,7 +27,8 @@ dependencies = [
     "pymdown-extensions>=10",
     "pypinyin>=0.51.0",
     "psutil>=5.9.8",
-    "numpy>=1.26",
+    "numpy>=1.26,<2.4; python_version < \"3.11\"",
+    "numpy>=2.3,<2.4; python_version >= \"3.11\"",
     "pyjwt>=2.8.0",
     "cryptography>=42.0.0",
     "python-multipart>=0.0.9",

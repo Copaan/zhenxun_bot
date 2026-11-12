@@ -243,7 +243,15 @@ class ToolPrunerReducer(BaseMemoryReducer):
 
             if part_changed:
                 new_msg = model_copy(
-                    msg, update={"content": new_content, "token_cost": None}
+                    msg,
+                    update={
+                        "content": new_content,
+                        "metadata": {
+                            k: v
+                            for k, v in (msg.metadata or {}).items()
+                            if k != "token_cost"
+                        },
+                    },
                 )
                 new_messages.append(new_msg)
             else:
@@ -503,7 +511,7 @@ class CondenserPipeline:
                         summarization_prompt=config.llm_summary.summarization_prompt,
                     )
                 )
-                pipeline_reducers.append(MessageDropper(trigger_tokens=limit))
+            pipeline_reducers.append(MessageDropper(trigger_tokens=limit))
 
         return cls(pipeline_reducers)
 

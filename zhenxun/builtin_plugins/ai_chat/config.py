@@ -74,6 +74,16 @@ def _config(
 
 CONFIGS = [
     _config(
+        "请求",
+        "TURN_TIMEOUT",
+        300,
+        int,
+        "整轮时限",
+        "取得执行权后，模型、工具与投递的总时限",
+        unit="秒",
+        min=1,
+    ),
+    _config(
         "唤醒",
         "WAKE_WORDS",
         [],

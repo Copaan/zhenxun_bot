@@ -291,6 +291,7 @@ def _run_item(run: Any) -> dict[str, Any]:
         "status": run.status,
         "error": run.error,
         "duration": run.duration,
+        "details": run.details or {},
         "created_at": run.created_at.isoformat(),
     }
 

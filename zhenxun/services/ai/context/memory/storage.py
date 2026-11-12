@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import base64
+from collections.abc import Awaitable, Callable
 import datetime
 from pathlib import Path
 import time
 from typing import Any, cast
 
-from tortoise.functions import Count
 from tortoise.timezone import now
 
 from zhenxun.services.ai.core.messages import (
@@ -169,6 +170,68 @@ class DBMessageSerializer:
         return []
 
 
+def visible_messages(messages: list[LLMMessage]) -> list[LLMMessage]:
+    """读取已结算对话，只把平台确认的正文作为最终回复。"""
+    out = []
+    for msg in messages:
+        meta = msg.metadata or {}
+        if meta.get("chat_run"):
+            if not meta.get("chat_settled") or not meta.get("chat_visible"):
+                continue
+            if msg.role == "assistant" and not meta.get("chat_final"):
+                msg = model_copy(
+                    msg,
+                    update={
+                        "content": [
+                            p for p in msg.content if getattr(p, "type", "") != "text"
+                        ]
+                    },
+                )
+                if not msg.content:
+                    continue
+        out.append(msg)
+    return out
+
+
+def _settled_message(msg: LLMMessage, run_id: str, revision: int, delivery: dict):
+    meta = msg.metadata or {}
+    if meta.get("chat_run") != run_id or meta.get("chat_revision") != revision:
+        return None
+    meta = {
+        **meta,
+        "chat_settled": True,
+        "chat_visible": bool(delivery.get("text")),
+        "delivery": delivery.get("status", "unknown"),
+    }
+    content = msg.content
+    if meta.get("chat_final"):
+        content = [TextPart(text=delivery.get("text", ""))]
+        meta.pop("token_cost", None)
+    return model_copy(msg, update={"metadata": meta, "content": content})
+
+
+def _delivered_fallback(messages, run_id, revision, delivery):
+    """生成失败后若兜底已经送达，为该轮补入确认正文。"""
+    related = [m for m in messages if (m.metadata or {}).get("chat_run") == run_id]
+    if (
+        not delivery.get("text")
+        or not related
+        or any((m.metadata or {}).get("chat_final") for m in related)
+    ):
+        return None
+    return AssistantMessage(
+        content=[TextPart(text=delivery["text"])],
+        metadata={
+            **(related[0].metadata or {}),
+            "chat_final": True,
+            "chat_settled": True,
+            "chat_visible": True,
+            "chat_revision": revision,
+            "delivery": delivery.get("status", "unknown"),
+        },
+    )
+
+
 class InMemoryChatContext(BaseChatContext):
     """基于内存的聊天上下文存储后端"""
 
@@ -178,7 +241,7 @@ class InMemoryChatContext(BaseChatContext):
 
     async def get_messages(self, session_id: str) -> list[LLMMessage]:
         """获取指定会话的所有短期历史消息"""
-        return list(self._messages.get(session_id, []))
+        return visible_messages(list(self._messages.get(session_id, [])))
 
     async def add_messages(self, session_id: str, messages: list[LLMMessage]) -> None:
         """向指定会话中追加历史消息，消息时间保持严格递增"""
@@ -190,9 +253,29 @@ class InMemoryChatContext(BaseChatContext):
                 )
             stored.append(message)
 
+    async def settle_run(self, session_id, run_id, revision, delivery, started_at):
+        """按运行身份结算内存中的对话。"""
+        from zhenxun.services.ai.run.session import session_manager
+
+        if revision != session_manager.revision(session_id):
+            return
+        self._messages[session_id] = [
+            _settled_message(m, run_id, revision, delivery) or m
+            for m in self._messages.get(session_id, [])
+        ]
+        if fallback := _delivered_fallback(
+            self._messages[session_id], run_id, revision, delivery
+        ):
+            await self.add_messages(session_id, [fallback])
+
     async def clear(self, session_id: str) -> None:
         """清空指定会话的全部历史消息"""
         self._messages.pop(session_id, None)
+
+
+HISTORY_RETAIN: list[Callable[[], Awaitable[dict[str, int]]]] = []
+"""返回各会话已处理到的消息id的回调，清理历史时保留其后的消息；由需要继续读取
+历史的插件注册"""
 
 
 class DatabaseChatContext(BaseChatContext):
@@ -232,11 +315,11 @@ class DatabaseChatContext(BaseChatContext):
                 gap = summary.created_at.timestamp() - until
                 bound = summary.created_at - datetime.timedelta(seconds=gap + 1)
                 query = query.filter(created_at__gte=bound)
-        rows = await query.order_by("id")
+        rows = list(reversed(await query.order_by("-id").limit(1000)))
         messages = [_row_to_message(row) for row in rows]
         if summary:
             messages.insert(0, _row_to_message(summary))
-        return after_latest_summary(messages)
+        return after_latest_summary(_drop_partial_tools(visible_messages(messages)))
 
     async def add_messages(self, session_id: str, messages: list[LLMMessage]) -> None:
         """逐条追加消息"""
@@ -263,6 +346,57 @@ class DatabaseChatContext(BaseChatContext):
             ]
         )
 
+    async def settle_run(self, session_id, run_id, revision, delivery, started_at):
+        """定向结算本轮记录，旧会话修订不能改写新历史。"""
+        from tortoise.transactions import in_transaction
+
+        from zhenxun.services.ai.run.session import session_manager
+
+        if revision != session_manager.revision(session_id):
+            return
+        if not self._ready():
+            return await self._memory.settle_run(
+                session_id, run_id, revision, delivery, started_at
+            )
+        since = datetime.datetime.fromtimestamp(started_at - 1, datetime.timezone.utc)
+        async with in_transaction() as connection:
+            rows = (
+                await self._model()
+                .filter(session_id=session_id, created_at__gte=since)
+                .using_db(connection)
+            )
+            for row in rows:
+                if revision != session_manager.revision(session_id):
+                    raise asyncio.CancelledError("会话已重置")
+                if msg := _settled_message(
+                    _row_to_message(row), run_id, revision, delivery
+                ):
+                    row.content = DBMessageSerializer.serialize_content(msg.content)
+                    row.metadata = msg.metadata
+                    await row.save(
+                        using_db=connection, update_fields=["content", "metadata"]
+                    )
+
+            fallback = _delivered_fallback(
+                [_row_to_message(row) for row in rows], run_id, revision, delivery
+            )
+            if fallback and revision == session_manager.revision(session_id):
+                await self._model().bulk_create(
+                    [
+                        self._model()(
+                            session_id=session_id,
+                            role="assistant",
+                            content=DBMessageSerializer.serialize_content(
+                                fallback.content
+                            ),
+                            metadata=fallback.metadata,
+                            is_summary=False,
+                            created_at=now(),
+                        )
+                    ],
+                    using_db=connection,
+                )
+
     async def clear(self, session_id: str) -> None:
         """删除会话的全部消息"""
         await self._memory.clear(session_id)
@@ -284,17 +418,18 @@ class DatabaseChatContext(BaseChatContext):
             return 0
         model = cls._model()
         deleted = 0
-        if retention_days > 0:
-            expire = now() - datetime.timedelta(days=retention_days)
-            deleted += await model.filter(created_at__lt=expire).delete()
-        if max_messages > 0:
-            sessions = (
-                await model.annotate(count=Count("id"))
-                .group_by("session_id")
-                .filter(count__gt=max_messages)
-                .values_list("session_id", flat=True)
-            )
-            for session_id in sessions:
+        keep: dict[str, int] = {}
+        for retain in HISTORY_RETAIN:
+            keep.update(await retain())
+        sessions = await model.all().distinct().values_list("session_id", flat=True)
+        for session_id in sessions:
+            query = model.filter(session_id=session_id)
+            if session_id in keep:
+                query = query.filter(id__lte=keep[session_id])
+            if retention_days > 0:
+                expire = now() - datetime.timedelta(days=retention_days)
+                deleted += await query.filter(created_at__lt=expire).delete()
+            if max_messages > 0:
                 boundary = (
                     await model.filter(session_id=session_id)
                     .order_by("-id")
@@ -303,9 +438,7 @@ class DatabaseChatContext(BaseChatContext):
                     .values_list("id", flat=True)
                 )
                 if boundary:
-                    deleted += await model.filter(
-                        session_id=session_id, id__lte=boundary[0]
-                    ).delete()
+                    deleted += await query.filter(id__lte=boundary[0]).delete()
         return deleted
 
 

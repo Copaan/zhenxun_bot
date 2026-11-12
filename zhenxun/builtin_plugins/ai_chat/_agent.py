@@ -9,9 +9,11 @@ from zhenxun.models.ai_agent_call import AIAgentCall
 from zhenxun.models.ai_agent_run import AIAgentRun
 from zhenxun.services.ai.capabilities.base import (
     AbstractCapability,
+    WrapModelRequestHandler,
     WrapToolExecuteHandler,
 )
 from zhenxun.services.ai.core.exceptions import ControlFlowExit, LLMException
+from zhenxun.services.ai.core.messages import TextPart
 from zhenxun.services.ai.llm import get_default_model
 from zhenxun.services.ai.run.context import RunContext
 from zhenxun.services.ai.sandbox.manager import SandboxManager
@@ -37,6 +39,89 @@ AGENT_ACTIVE_KEY = "_agent_active"
 """运行上下文 state 中缓存的 Agent 是否生效"""
 AGENT_TOOLS_KEY = "_agent_tools"
 """运行上下文 state 中本次运行提供的 Agent 工具名"""
+
+
+SOURCES = {
+    "qq": {"privileged": True, "follow_up": True},
+    "webui": {"privileged": True, "follow_up": True},
+    "task": {"privileged": True, "follow_up": False},
+    "interject": {"privileged": False, "follow_up": False},
+}
+"""聊天来源及其策略：privileged 为可用管理与持久化修改类工具，
+follow_up 为接受同一发送者追加的输入"""
+INTERJECT_TOOLS = {
+    "web_search",
+    "search_web",
+    "search_knowledge",
+    "recall_memory",
+    "find_stickers",
+    "send_sticker",
+    "send_message",
+}
+"""自动插话可用的工具"""
+
+
+def source_policy(context: RunContext) -> dict[str, bool]:
+    """运行来源的策略，未绑定来源时按 QQ 消息处理
+
+    参数:
+        context: 运行上下文
+
+    返回:
+        dict[str, bool]: 来源策略
+    """
+    return SOURCES.get(context.run.source or "qq", SOURCES["qq"])
+
+
+def bind_source(context: RunContext, source: str) -> None:
+    """为运行绑定聊天来源，设置是否接受追加输入与整轮时限，
+    无特权的来源不启用 Agent
+
+    参数:
+        context: 运行上下文
+        source: 来源：qq、webui、task 或 interject
+    """
+    if source not in SOURCES:
+        raise ValueError(f"未知聊天来源: {source}")
+    context.run.source = source
+    context.run.follow_up = SOURCES[source]["follow_up"]
+    context.run.timeout = max(1, int(Config.get_config(MODULE, "TURN_TIMEOUT") or 300))
+    if not SOURCES[source]["privileged"]:
+        context.state[AGENT_ACTIVE_KEY] = False
+
+
+class ReplyCapability(AbstractCapability):
+    """无特权来源只提供插话工具；模型输出写入历史前先清理并过滤"""
+
+    async def prepare_tools(self, context, tool_defs):
+        if not source_policy(context)["privileged"]:
+            return [t for t in tool_defs if t.name in INTERJECT_TOOLS]
+        return tool_defs
+
+    async def wrap_tool_execute(self, context, tool_name, arguments, handler):
+        if (
+            not source_policy(context)["privileged"]
+            and tool_name not in INTERJECT_TOOLS
+        ):
+            return ToolResult(output="自动插话不能执行管理或持久化修改。").as_error(
+                False
+            )
+        return await handler(arguments)
+
+    async def wrap_model_request(
+        self, context, llm_context, handler: WrapModelRequestHandler
+    ):
+        from ._reply import clean_output
+        from ._safety import Safety
+
+        response = await handler(llm_context)
+        parts = response.content_parts
+        text = "".join(p.text for p in parts if isinstance(p, TextPart))
+        safe, _ = Safety.filter_output(clean_output(text))
+        response.content_parts = ([TextPart(text=safe)] if safe else []) + [
+            p for p in parts if not isinstance(p, TextPart)
+        ]
+        return response
 
 
 def agent_enabled() -> bool:
@@ -75,8 +160,7 @@ async def record_run(
     result: Any = None,
     error: BaseException | None = None,
 ) -> None:
-    """保存一次运行的记录：聊天与控制台只在 Agent 生效时记录，主动发言总是记录，
-    主动发言放弃发言时状态为 silent
+    """保存所有来源的生成、投递及已知用量，主动未发言时状态为 silent
 
     参数:
         context: 运行上下文
@@ -89,7 +173,7 @@ async def record_run(
     """
     run_id = context.state.get(RUN_ID_KEY)
     proactive = source in PROACTIVE_SOURCES
-    if not run_id or not (proactive or context.state.get(AGENT_ACTIVE_KEY)):
+    if not run_id:
         return
     status, message = "ok", ""
     if error is not None:
@@ -104,21 +188,33 @@ async def record_run(
     elif proactive and result is not None and parse_silent(str(result.output)) is None:
         status = "silent"
     try:
-        await AIAgentRun.create(
+        from ._safety import Safety
+
+        delivery = context.state.get("_delivery", {})
+        if delivery.get("status") in {"failed", "partial", "unknown"}:
+            status = delivery["status"]
+        await AIAgentRun.update_or_create(
+            defaults={
+                "source": source,
+                "session_id": context.session_id or "",
+                "user_id": context.get_user_id() or context.state.get(USER_KEY) or "",
+                "group_id": context.get_group_id(),
+                "persona": persona,
+                "model": context.run.current_model or get_default_model("chat"),
+                "input": _shorten(text, 2000),
+                "output": _shorten(
+                    Safety.filter_output(str(result.output) if result else "")[0], 4000
+                ),
+                "tools": await AIAgentCall.filter(run_id=run_id).count(),
+                "tokens": context.run.budget.get(
+                    "tokens", result.usage.total_tokens if result else 0
+                ),
+                "status": status,
+                "error": _shorten(Safety.filter_output(message)[0], 2000),
+                "details": {"delivery": delivery},
+                "duration": int((time.monotonic() - started) * 1000),
+            },
             run_id=run_id,
-            source=source,
-            session_id=context.session_id or "",
-            user_id=context.get_user_id() or context.state.get(USER_KEY) or "",
-            group_id=context.get_group_id(),
-            persona=persona,
-            model=context.run.current_model or get_default_model("chat"),
-            input=_shorten(text, 2000),
-            output=_shorten(str(result.output) if result else "", 4000),
-            tools=await AIAgentCall.filter(run_id=run_id).count(),
-            tokens=result.usage.total_tokens if result else 0,
-            status=status,
-            error=_shorten(message, 2000),
-            duration=int((time.monotonic() - started) * 1000),
         )
     except Exception as e:
         logger.warning(f"保存 Agent 运行记录失败: {e}", MODULE)
@@ -288,7 +384,6 @@ def _transfer(persona_id: int):
             task: 交给子代理的任务，写清背景与要求
         """
         from zhenxun.models.ai_persona import AIPersona
-        from zhenxun.models.ai_token_usage import AITokenUsage
         from zhenxun.services.ai.context.memory.engine import chat_backend
 
         from ._data_source import AIChatManager
@@ -298,8 +393,13 @@ def _transfer(persona_id: int):
             return ToolResult(output="这个子代理已不存在。").as_error(False)
         agent = AIChatManager.get_agent(persona)
         child = RunContext(
-            deps=context.deps, session_id=f"{context.session_id}:sub:{uuid.uuid4().hex}"
+            deps=context.deps,
+            session_id=f"{context.session_id}:sub:{uuid.uuid4().hex}",
+            shared_state=context.shared_state,
         )
+        bind_source(child, context.run.source or "qq")
+        child.run.budget = context.run.budget
+        child.run.follow_up = False
         child.state[SUBAGENT_DEPTH_KEY] = 1
         child.run.cancellation_token = context.run.cancellation_token
         try:
@@ -311,8 +411,9 @@ def _transfer(persona_id: int):
         finally:
             if backend := chat_backend(agent.memory_config):
                 await backend.clear(child.session_id or "")
-        if user_id := context.get_user_id():
-            await AITokenUsage.add_usage(user_id, result.usage.total_tokens)
-        return ToolResult(output=str(result.output).strip() or "子代理没有给出结果。")
+        return ToolResult(
+            output=str(result.output).strip() or "子代理没有给出结果。",
+            usage=result.usage,
+        )
 
     return transfer

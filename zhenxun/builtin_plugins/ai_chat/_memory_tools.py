@@ -36,6 +36,10 @@ def can_forget(context: RunContext) -> bool:
     返回:
         bool: 是否可以
     """
+    from ._agent import source_policy
+
+    if not source_policy(context)["privileged"]:
+        return False
     bot = context.get_bot()
     if bot and PlatformUtils.is_superuser(bot, context.get_user_id()):
         return True
@@ -54,15 +58,23 @@ class MemoryToolkit(BaseToolkit):
         payload = await super().resolve(context)
         prompt = TOOL_PROMPT.format(scene="群" if scope[0] else "用户")
         if mode == "inject":
-            payload.tools = [t for t in payload.tools if t.name != "recall_memory"]
-            event = context.get_event() if context else None
-            text = event.get_plaintext().strip() if event else ""
-            if text and (hits := await Memory.recall(scope, text)):
-                payload.reminders.append(
-                    INJECT_HEADER + wrap_untrusted(format_memories(hits), "memory")
-                )
-        else:
-            prompt += RECALL_PROMPT
+            from zhenxun.services.log import logger
+
+            text = context.state.get("_retrieval_query", "") if context else ""
+            if text:
+                try:
+                    hits = await Memory.recall(scope, text, reinforce=False)
+                except Exception as error:
+                    logger.warning(f"本轮记忆召回不可用: {type(error).__name__}")
+                    hits = []
+                if hits:
+                    context.state.setdefault("_recalled_memories", []).extend(
+                        m.id for m, _ in hits
+                    )
+                    payload.reminders.append(
+                        INJECT_HEADER + wrap_untrusted(format_memories(hits), "memory")
+                    )
+        prompt += RECALL_PROMPT
         payload.injected_prompts.append(prompt)
         return payload
 
@@ -74,7 +86,8 @@ class MemoryToolkit(BaseToolkit):
         scope = context_scope(context)
         if scope is None:
             return ToolResult(output="当前不在会话中。").as_error(False)
-        hits = await Memory.recall(scope, query)
+        hits = await Memory.recall(scope, query, reinforce=False)
+        context.state.setdefault("_recalled_memories", []).extend(m.id for m, _ in hits)
         if not hits:
             return ToolResult(output="没有相关的记忆。")
         return ToolResult(output=wrap_untrusted(format_memories(hits), "memory"))
@@ -87,7 +100,11 @@ class MemoryToolkit(BaseToolkit):
         ),
     )
     async def memorize(
-        self, context: RunContext, content: str, importance: float = 0.6
+        self,
+        context: RunContext,
+        content: str,
+        importance: float = 0.6,
+        pinned: bool = False,
     ) -> ToolResult:
         scope = context_scope(context)
         if scope is None:
@@ -95,12 +112,36 @@ class MemoryToolkit(BaseToolkit):
         content = content.strip()
         if not content:
             return ToolResult(output="记忆内容不能为空。").as_error()
-        memory, created = await Memory.add(
-            scope, content[:500], importance=importance, source="tool"
+        from zhenxun.services.platform_identity import scoped_user_id
+
+        from ._agent import source_policy
+
+        if not source_policy(context)["privileged"]:
+            return ToolResult(output="自动插话不能写入长期记忆。").as_error(False)
+        if pinned and scope[0] and not can_forget(context):
+            return ToolResult(
+                output="只有群管理员可以固定群记忆；普通记忆无需固定。"
+            ).as_error(False)
+        author = scoped_user_id(
+            context.get_user_id(), PlatformUtils.get_platform_scope(context.get_bot())
         )
+        memory, created = await Memory.add(
+            scope,
+            content[:500],
+            importance=importance,
+            source="tool",
+            author_id=author,
+            pinned=pinned,
+        )
+
         if not created:
-            return ToolResult(output=f"已有相同的记忆 #{memory.id}，已加强。")
-        return ToolResult(output=f"已记下 #{memory.id}。")
+            return ToolResult(
+                output=f"已有完全相同的记忆 #{memory.id}，未覆盖其他内容。"
+            )
+        related = await Memory.recall(scope, content[:500], top_k=3, reinforce=False)
+        older = [f"#{m.id}：{m.content[:120]}" for m, _ in related if m.id != memory.id]
+        detail = "相关旧记忆仍保留：" + "；".join(older) if older else ""
+        return ToolResult(output=f"已记下 #{memory.id}。{detail}")
 
     @tool(
         name="forget",

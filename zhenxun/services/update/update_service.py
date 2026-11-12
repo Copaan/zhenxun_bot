@@ -63,6 +63,7 @@ _RESOURCE_STARTUP_TASK: asyncio.Task[None] | None = None
 _RESOURCE_ACTIVE_TASK: asyncio.Task[None] | None = None
 _WEBUI_RETRY_SECONDS = 600
 _WEBUI_DOWNLOAD_SECONDS = 180
+_RESOURCE_DOWNLOAD_SECONDS = 1800
 _WEBUI_STARTUP_TASK: asyncio.Task[None] | None = None
 _WEBUI_REFRESH: Callable[[], Awaitable[Any]] | None = None
 _WEBUI_READY_MANIFEST: dict[str, Any] | None = None
@@ -976,7 +977,7 @@ async def _retry_resource_update() -> None:
                 component="resource",
                 channel="main",
                 method="download",
-                source="github",
+                source="aliyun",
                 force=True,
                 startup_resource=True,
             )
@@ -991,6 +992,7 @@ async def _retry_resource_update() -> None:
                 raise UpdateServiceError(job.get("error") or "resource_update_failed")
             await _recover_resource_components()
             _update_job(job_id, runtime_ready=True, next_retry_at=None)
+            logger.info("资源自动更新完成")
             return
         except asyncio.CancelledError:
             raise
@@ -1138,7 +1140,7 @@ async def _retry_webui_update() -> None:
                         component="webui",
                         channel="main",
                         method="download",
-                        source="github",
+                        source="aliyun",
                         force=False,
                         startup_webui=True,
                         webui_target=target,
@@ -1338,7 +1340,7 @@ def _clone_ref(
             cwd=_ROOT,
             capture_output=True,
             text=True,
-            timeout=300,
+            timeout=_RESOURCE_DOWNLOAD_SECONDS if component == "resource" else 300,
             check=False,
             env={**os.environ, **auth_env} if auth_env else None,
         )
@@ -1677,38 +1679,58 @@ async def _prepare_job(job_id: str) -> None:
         await asyncio.to_thread(_remove_tree, stage)
         stage.mkdir(parents=True, exist_ok=True)
         checksum: str | None = None
+        cloned: Path | None = None
+        attempted_sources = [job["source"]]
         if job["method"] == "git":
-            attempted_sources = [job["source"]]
+            startup = job.get("startup_resource") or job.get("startup_webui")
             effective_source = job["source"]
+            source_root = stage / "source"
+            logger.info("开始拉取更新 component=%s source=%s", component, job["source"])
             try:
-                root = await asyncio.to_thread(
-                    _clone_ref, component, ref, stage / "source", job["source"]
+                cloned = await asyncio.to_thread(
+                    _clone_ref, component, ref, source_root, job["source"]
                 )
-            except UpdateServiceError as exc:
-                if str(exc) != "git_transport_failed" or job["source"] != "aliyun":
+            except (UpdateServiceError, OSError, subprocess.TimeoutExpired) as exc:
+                if job["source"] != "aliyun" or not (
+                    startup or str(exc) == "git_transport_failed"
+                ):
                     raise
+                logger.warning(
+                    "阿里云镜像拉取失败，改用 GitHub（%s）",
+                    str(exc)
+                    if isinstance(exc, UpdateServiceError)
+                    else type(exc).__name__,
+                )
                 attempted_sources.append("github")
                 effective_source = "github"
-                source_root = stage / "source"
-                if source_root.exists():
-                    shutil.rmtree(source_root)
-                root = await asyncio.to_thread(
-                    _clone_ref, component, ref, source_root, "github"
-                )
+                await asyncio.to_thread(_remove_tree, source_root)
+                if not startup:
+                    cloned = await asyncio.to_thread(
+                        _clone_ref, component, ref, source_root, "github"
+                    )
             _update_job(
                 job_id,
                 attempted_sources=attempted_sources,
                 effective_source=effective_source,
             )
+        if cloned is not None:
+            root = cloned
         else:
             archive = stage / "package.zip"
             _update_job(job_id, state="preparing", phase="downloading", ref=ref)
             download = _download_archive(component, ref, archive)
+            logger.info("开始下载更新包 component=%s ref=%s", component, ref)
             checksum = (
-                await asyncio.wait_for(download, _WEBUI_DOWNLOAD_SECONDS)
+                await asyncio.wait_for(
+                    download,
+                    _RESOURCE_DOWNLOAD_SECONDS
+                    if component == "resource"
+                    else _WEBUI_DOWNLOAD_SECONDS,
+                )
                 if component in {"webui", "resource"}
                 else await download
             )
+            logger.info("更新包下载完成 component=%s", component)
             disk = (
                 _webui_disk if component in {"webui", "resource"} else asyncio.to_thread
             )
@@ -1716,7 +1738,11 @@ async def _prepare_job(job_id: str) -> None:
                 extract_resources_zip if component == "resource" else _safe_extract
             )
             root = await disk(extract, archive, stage / "content")
-            _update_job(job_id, effective_source="github", attempted_sources=["github"])
+            _update_job(
+                job_id,
+                effective_source="github",
+                attempted_sources=list(dict.fromkeys([*attempted_sources, "github"])),
+            )
         _update_job(job_id, phase="validating")
         _validate_staging(component, root)
         if job.get("webui_target") and not _same_webui(

@@ -39,6 +39,8 @@ class AIAgentRun(Model):
     """错误信息"""
     duration = fields.IntField(default=0, description="耗时（毫秒）")
     """耗时（毫秒）"""
+    details = fields.JSONField(null=True, description="投递与结算详情")
+
     created_at = fields.DatetimeField(auto_now_add=True, description="开始时间")
     """开始时间"""
 

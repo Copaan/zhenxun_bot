@@ -75,7 +75,7 @@ class JinjaTemplateEngine:
 
     def _create_jinja_env(self) -> Environment:
         """创建并配置 Jinja2 渲染环境"""
-        prefix_loader = PrefixLoader(
+        prefix_loader = self._prefix_loader = PrefixLoader(
             {
                 namespace: FileSystemLoader(str(path.absolute()))
                 for namespace, path in self._plugin_template_paths.items()
@@ -93,6 +93,17 @@ class JinjaTemplateEngine:
             auto_reload=self._auto_reload,
         )
         return env
+
+    def add_namespace(self, namespace: str, path: Path):
+        """为已创建的渲染环境加入插件模板命名空间
+
+        参数:
+            namespace: 命名空间
+            path: 模板目录
+        """
+        self._prefix_loader.mapping[namespace] = FileSystemLoader(str(path.absolute()))
+        if self.env.cache:
+            self.env.cache.clear()
 
     def update_theme_loaders(self, theme_dir: Path):
         """更新 Loader 以支持多主题"""

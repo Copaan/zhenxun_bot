@@ -288,6 +288,11 @@ class Proactive:
             cls._states[key].unanswered = 0
 
     @classmethod
+    def failed(cls, bot_id: str, group_id: str) -> None:
+        """投递失败进入冷却，不计为已发送或无人回应。"""
+        cls.state(bot_id, group_id).last_proactive_at = time.time()
+
+    @classmethod
     def sent(cls, bot_id: str, group_id: str) -> None:
         """记录一次主动插话，用于冷却、每日次数与连续没人理的次数
 

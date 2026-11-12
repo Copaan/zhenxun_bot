@@ -18,7 +18,7 @@ from ._send import Scene, SendQuota
 from ._stickers import STICKER_MAX_BYTES, Stickers
 from ._tools import GroupHistory, image_source, locate_images, pick_images
 
-MANAGE_TOOLS = {"delete_stickers", "merge_stickers"}
+MANAGE_TOOLS = {"delete_stickers", "merge_stickers", "update_sticker"}
 """只在超级用户的对话中提供的表情整理工具"""
 
 
@@ -34,7 +34,7 @@ class StickerNote(BaseModel):
 
 
 class StickerToolkit(BaseToolkit):
-    """AI 聊天的表情包工具：收藏、搜索、修改说明、发送，超级用户还能删除与合并"""
+    """AI 聊天的表情包工具：收藏、搜索、发送，超级用户还能修改说明、删除与合并"""
 
     default_instructions = (
         "## 表情包\n"
@@ -43,12 +43,12 @@ class StickerToolkit(BaseToolkit):
         "想用表情时在回复末尾写 `[表情:#id]`"
         "（最多一个，只发表情时回复只写这个标记），文字发出后会接着发这个表情，"
         "按当前表情发送倾向自然使用。提醒里列出了部分表情，找别的用 `find_stickers`；"
-        "要引用某条消息发表情时用 `send_sticker`。表情说明不准时用 "
-        "`update_sticker` 修改。"
+        "要引用某条消息发表情时用 `send_sticker`。"
     )
     manage_instructions = (
-        "当前对话者是超级用户，可以整理表情库：重复的用 `merge_stickers` 合并，"
-        "不好用的用 `delete_stickers` 删除，删除前先用 `find_stickers` 确认 id。"
+        "当前对话者是超级用户，可以整理表情库：说明不准的用 `update_sticker` 修改，"
+        "重复的用 `merge_stickers` 合并，不好用的用 `delete_stickers` 删除，"
+        "删除前先用 `find_stickers` 确认 id。"
     )
 
     async def resolve(self, context: RunContext | None = None) -> ResolvedToolPayload:
@@ -65,6 +65,10 @@ class StickerToolkit(BaseToolkit):
         if not manage:
             hidden |= MANAGE_TOOLS
         top = await Stickers.candidates()
+        if context:
+            context.state.setdefault("_sticker_candidates", {}).update(
+                {s.id: s.md5 for s in top}
+            )
         if not top and "collect_sticker" in hidden:
             return ResolvedToolPayload()
         frequency = Config.get_config(MODULE, "STICKER_FREQUENCY", "balanced")
@@ -74,19 +78,19 @@ class StickerToolkit(BaseToolkit):
                 "但不要机械地每次都发。"
             ),
             "balanced": (
-                "自然穿插表情；通常用文字即可，表情能增添表达时再发，" "不要每次都用。"
+                "自然穿插表情；通常用文字即可，表情能增添表达时再发，不要每次都用。"
             ),
             "low": "大多数回复只用文字；仅在表情特别贴切或用户明确要求时发送。",
         }
-        payload.reminders.append(
-            "表情发送倾向（同时适用于回复中的 [表情:#id] 和 send_sticker 工具）："
-            + hints.get(frequency, hints["balanced"])
-        )
         payload.tools = [t for t in payload.tools if t.name not in hidden]
         if top and "send_sticker" not in hidden:
             payload.reminders.append(
                 "可用表情（在回复末尾写 [表情:#id] 发送）："
                 + "；".join(Stickers.describe(s) for s in top)
+            )
+            payload.reminders.append(
+                "表情发送倾向（同时适用于回复中的 [表情:#id] 和 send_sticker 工具）："
+                + hints.get(frequency, hints["balanced"])
             )
         if manage:
             payload.reminders.append(self.manage_instructions)
@@ -200,6 +204,9 @@ class StickerToolkit(BaseToolkit):
     )
     async def find_stickers(self, context: RunContext, query: str = "") -> ToolResult:
         stickers = await Stickers.search(query)
+        context.state.setdefault("_sticker_candidates", {}).update(
+            {s.id: s.md5 for s in stickers}
+        )
         if not stickers:
             return ToolResult(output="没有找到合适的表情。")
         return ToolResult(output="\n".join(Stickers.describe(s) for s in stickers))
@@ -216,6 +223,10 @@ class StickerToolkit(BaseToolkit):
         tags: list[str] | None = None,
         usage: str | None = None,
     ) -> ToolResult:
+        if not await self._manager(context):
+            return ToolResult(output="只有超级用户可以修改全局表情说明。").as_error(
+                False
+            )
         sticker = await Stickers.update(sticker_id, remark, tags, usage)
         if sticker is None:
             return ToolResult(output="没有这个表情。").as_error()
@@ -240,7 +251,12 @@ class StickerToolkit(BaseToolkit):
             or await GroupHistory.message(scene.bot, scene.group_id, reply_to) is None
         ):
             return ToolResult(output="只能引用当前群里的消息。").as_error()
-        if reason := await Stickers.send(scene, sticker_id, reply_to):
+        expected = context.state.get("_sticker_candidates", {}).get(sticker_id)
+        if expected is None:
+            return ToolResult(output="请先检索本轮可用的表情。").as_error(False)
+        if reason := await Stickers.send(
+            scene, sticker_id, reply_to, expected_md5=expected
+        ):
             return ToolResult(output=reason).as_error(reason == "没有这个表情。")
         return ToolResult(output="已发送。")
 
@@ -289,4 +305,10 @@ class StickerToolkit(BaseToolkit):
             bool: 是否为超级用户
         """
         bot = context.get_bot()
-        return bool(bot and PlatformUtils.is_superuser(bot, context.get_user_id()))
+        from ._agent import source_policy
+
+        return bool(
+            source_policy(context)["privileged"]
+            and bot
+            and PlatformUtils.is_superuser(bot, context.get_user_id())
+        )

@@ -1,13 +1,15 @@
 """回复的发送：清理模型输出、Markdown 清理、语音、长回复转图或合并转发、分段发送"""
 
 import asyncio
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from functools import lru_cache
 import random
 import re
 import time
 
 from nonebot.adapters import Bot
-from nonebot.matcher import current_bot
+from nonebot.matcher import current_bot, current_event
 from nonebot_plugin_alconna import Image, Reference, Reply, Text, UniMessage, Voice
 
 from zhenxun.configs.config import BotConfig, Config
@@ -18,7 +20,7 @@ from zhenxun.services.log import logger
 from zhenxun.utils.message import MessageUtils
 from zhenxun.utils.platform import PlatformUtils
 
-from ._buffer import ChatBuffer, ChatLine
+from ._buffer import AI_SEND, ChatBuffer, ChatLine
 from ._data_source import MODULE
 from ._safety import Safety
 
@@ -29,6 +31,8 @@ VOICE_MAX_CHARS = 200
 """超过该长度的回复不转语音"""
 _SILENT = re.compile(r"[\[【]\s*silent\s*[\]】]", re.IGNORECASE)
 _THINK = re.compile(r"<(think|thinking)>.*?</\1>\s*", re.S | re.I)
+_OPEN_THINK = re.compile(r"<(?:think|thinking)>", re.I)
+_CLOSE_THINK = re.compile(r"</(?:think|thinking)>", re.I)
 _TOOL_MARKUP = re.compile(
     r"<tool_call>.*?(?:</tool_call>|$)"
     r"|<function_calls>.*?(?:</function_calls>|$)"
@@ -38,12 +42,29 @@ _TOOL_MARKUP = re.compile(
     re.S,
 )
 """模型以文本形式输出的工具调用（中转未解析时）"""
-_ECHO_LABEL = re.compile(
-    r"^[ \t]*(?:\[(?:\d{2}-\d{2} )?\d{1,2}:\d{2}\][ \t]*[^\n:：]{0,40}?"
-    r"|你\(\d+\)(?:[ \t]*#\S+)?)[ \t]*[:：][ \t]*",
-    re.M,
-)
-"""模型模仿群聊背景格式输出的“[时间] 发言人:”或“你(id):”前缀"""
+_LABEL_TIME = r"\[(?:\d{2}-\d{2} )?\d{1,2}:\d{2}\][ \t]*"
+_LABEL_ID = r"\(\d+\)(?:[ \t]*#\S+)?"
+
+
+@lru_cache(maxsize=4)
+def _echo_label(nickname: str) -> re.Pattern[str]:
+    """模型模仿群聊背景格式输出的发言人前缀：“[时间] 名字(id) #消息id:”、
+    “[时间] 自己的昵称:”或“你(id):”
+
+    参数:
+        nickname: Bot 昵称
+
+    返回:
+        re.Pattern[str]: 正则
+    """
+    own = "|".join(re.escape(name) for name in ("你", nickname) if name)
+    return re.compile(
+        rf"^[ \t]*(?:{_LABEL_TIME}(?:[^\n:：]{{0,40}}?{_LABEL_ID}|(?:{own}))"
+        rf"|你(?:（其他功能）)?{_LABEL_ID})[ \t]*[:：][ \t]*",
+        re.M,
+    )
+
+
 _SENTENCE_END = re.compile(r"[。！？!?…~]")
 _FENCE = re.compile(r"^\s*(```|~~~)")
 _INLINE_CODE = re.compile(r"(`[^`\n]+`)")
@@ -266,6 +287,7 @@ def note_forward(bot_id: str, group_id: str | None, text: str) -> None:
             f"[合并转发] {summary}",
             time.time(),
             is_bot=True,
+            is_ai=True,
         ),
     )
 
@@ -308,7 +330,7 @@ async def long_message(bot: Bot | None, text: str) -> UniMessage | None:
     if mode == "forward" and bot and PlatformUtils.get_platform_scope(bot) != "qq_api":
         nodes = [clean_markdown(p) for p in _paragraphs(text)]
         return MessageUtils.alc_forward_msg(
-            [[node] for node in nodes if node],
+            [[Text(node)] for node in nodes if node],
             bot.self_id,
             BotConfig.self_nickname or "Bot",
         )
@@ -349,6 +371,115 @@ def text_parts(text: str) -> list[str]:
     )
 
 
+@dataclass
+class DeliveryResult:
+    """平台确认的投递结果与已发送正文，不代表用户已经阅读。"""
+
+    status: str = "pending"
+    parts: list[str] = field(default_factory=list)
+    error: str = ""
+    uncertain: bool = False
+
+    def __bool__(self) -> bool:
+        return self.status == "sent"
+
+    def as_dict(self) -> dict:
+        return {
+            "status": self.status,
+            "text": "\n".join(self.parts),
+            "error": self.error,
+            "uncertain": self.uncertain,
+        }
+
+
+_delivery_queues: dict[tuple, tuple[asyncio.Lock, int]] = {}
+
+
+async def _deliver(
+    text, bot, send, voice_input=False, voice_mode=None, result=None, *, target=None
+):
+    """同一投递目标的分段回复依次发送，等待结束后释放队列。"""
+    key = target or (getattr(bot, "self_id", ""), "current")
+    lock, users = _delivery_queues.get(key, (asyncio.Lock(), 0))
+    _delivery_queues[key] = (lock, users + 1)
+    try:
+        async with lock:
+            return await _deliver_unlocked(
+                text, bot, send, voice_input, voice_mode, result
+            )
+    finally:
+        remaining = _delivery_queues[key][1] - 1
+        if remaining:
+            _delivery_queues[key] = (lock, remaining)
+        else:
+            _delivery_queues.pop(key, None)
+
+
+async def _deliver_unlocked(
+    text: str,
+    bot: Bot | None,
+    send: Callable[[UniMessage, bool], Awaitable[bool]],
+    voice_input: bool = False,
+    voice_mode: str | None = None,
+    result: DeliveryResult | None = None,
+) -> DeliveryResult:
+    """按相同规则发送语音、长消息或文字，逐段保存平台确认结果。"""
+    result = result if result is not None else DeliveryResult()
+    text, _ = Safety.filter_output(clean_output(text))
+    if not text.strip():
+        result.status = "skipped"
+        return result
+    sending = False
+    try:
+        voice = await voice_segment(clean_markdown(text), voice_input, voice_mode, bot)
+        long = None if voice else await long_message(bot, text)
+        chunks = (
+            [(UniMessage(voice), text)]
+            if voice
+            else (
+                [(long, text)]
+                if long is not None
+                else [
+                    (UniMessage(Text(part)), part) for part in text_parts(text) if part
+                ]
+            )
+        )
+        for index, (message, visible) in enumerate(chunks):
+            if index and (delay := split_delay()):
+                await asyncio.sleep(delay)
+            sending = True
+            send_token = AI_SEND.set(True)
+            try:
+                confirmed = await send(
+                    message, index == 0 and not message.has(Reference)
+                )
+            finally:
+                AI_SEND.reset(send_token)
+            if not confirmed:
+                result.status = "partial" if result.parts else "unknown"
+                result.uncertain = True
+                result.error = "平台未确认发送结果，不自动重发"
+                return result
+            sending = False
+            result.parts.append(visible)
+        result.status = "sent" if result.parts else "skipped"
+    except asyncio.CancelledError:
+        result.status = (
+            "partial" if result.parts else ("unknown" if sending else "failed")
+        )
+        result.uncertain = sending
+        result.error = "投递已取消"
+        raise
+    except Exception as exc:
+        result.status = (
+            "partial" if result.parts else ("unknown" if sending else "failed")
+        )
+        result.uncertain = sending
+        result.error = f"投递未完成（{type(exc).__name__}）"
+        logger.warning(result.error, MODULE)
+    return result
+
+
 async def deliver(
     bot: Bot,
     group_id: str | None,
@@ -356,48 +487,23 @@ async def deliver(
     text: str,
     reply_to: str | None = None,
     voice_mode: str | None = None,
-) -> bool:
-    """不依赖事件向群或私聊发送回复：语音回复设为 always 时发语音，长回复转图或
-    合并转发，其余清理 Markdown 后分段发送，开启 REPLY_QUOTE 时第一段引用消息
+    result: DeliveryResult | None = None,
+) -> DeliveryResult:
+    """向指定会话发送回复并返回逐段投递结果。"""
 
-    参数:
-        bot: Bot
-        group_id: 群号，私聊为空
-        user_id: 私聊对象
-        text: 文字
-        reply_to: 引用的消息id，未开启 REPLY_QUOTE 时忽略
-        voice_mode: 语音回复方式，为空使用全局配置
-
-    返回:
-        bool: 是否全部发送成功
-    """
-    if not quote_reply(group_id):
-        reply_to = None
-    text, _ = Safety.filter_output(text)
-    voice = await voice_segment(clean_markdown(text), False, voice_mode, bot)
-    if voice:
-        return bool(
-            await PlatformUtils.send_message(bot, user_id, group_id, UniMessage(voice))
-        )
-    if message := await long_message(bot, text):
-        if reply_to and not message.has(Reference):
+    async def send(message: UniMessage, first: bool) -> bool:
+        if first and reply_to and quote_reply(group_id):
             message = UniMessage(Reply(reply_to)) + message
-        if not await PlatformUtils.send_message(bot, user_id, group_id, message):
-            return False
-        if message.has(Reference):
-            note_forward(bot.self_id, group_id, text)
-        return True
-    for index, part in enumerate(text_parts(text)):
-        if delay := split_delay():
-            await asyncio.sleep(delay)
-        message = (
-            UniMessage([Reply(reply_to), Text(part)])
-            if reply_to and not index
-            else UniMessage(Text(part))
-        )
-        if not await PlatformUtils.send_message(bot, user_id, group_id, message):
-            return False
-    return True
+        return bool(await PlatformUtils.send_message(bot, user_id, group_id, message))
+
+    return await _deliver(
+        text,
+        bot,
+        send,
+        voice_mode=voice_mode,
+        result=result,
+        target=(bot.self_id, "group" if group_id else "user", group_id or user_id),
+    )
 
 
 def clean_output(text: str) -> str:
@@ -410,28 +516,52 @@ def clean_output(text: str) -> str:
     返回:
         str: 清理后的文本
     """
-    text = _THINK.sub("", text)
-    head, sep, tail = text.partition("</think>")
-    if sep and "<think" not in head.lower():
-        text = tail
-    text = _TOOL_MARKUP.sub("", text)
-    return _ECHO_LABEL.sub("", text).strip()
+    output: list[str] = []
+    hidden = False
+    for code, block in _segments(text):
+        if hidden:
+            close = _CLOSE_THINK.search(block) if not code else None
+            if close is None:
+                continue
+            block, hidden = block[close.end() :], False
+        if code:
+            output.append(block)
+            continue
+        parts = _INLINE_CODE.split(block)
+        for index, part in enumerate(parts):
+            if hidden:
+                close = _CLOSE_THINK.search(part) if not index % 2 else None
+                if close is None:
+                    continue
+                part, hidden = part[close.end() :], False
+            if index % 2:
+                output.append(part)
+                continue
+            part = _THINK.sub("", part)
+            if match := _OPEN_THINK.search(part):
+                part, hidden = part[: match.start()], True
+            if close := _CLOSE_THINK.search(part):
+                part = part[close.end() :]
+            label = _echo_label(BotConfig.self_nickname or "真寻")
+            output.append(label.sub("", _TOOL_MARKUP.sub("", part)))
+    return "".join(output).strip()
 
 
 def parse_silent(text: str) -> str | None:
-    """解析模型回复：先去掉不该发出的内容，为空、以沉默令牌开头或只有令牌时
-    视为沉默，其余情况去掉令牌后返回
-
-    参数:
-        text: 模型回复
-
-    返回:
-        str | None: 要发送的文本，沉默时为空
-    """
+    """解析正文中的沉默令牌，代码示例中的令牌保持原样。"""
     text = clean_output(text)
-    if not text or _SILENT.match(text) or text.upper() == "SILENT":
+    if not text or text.upper() == "SILENT" or _SILENT.match(text):
         return None
-    return _SILENT.sub("", text).strip() or None
+    pieces = []
+    for code, block in _segments(text):
+        if code:
+            pieces.append(block)
+        else:
+            pieces.extend(
+                part if i % 2 else _SILENT.sub("", part)
+                for i, part in enumerate(_INLINE_CODE.split(block))
+            )
+    return "".join(pieces).strip() or None
 
 
 async def voice_segment(
@@ -482,30 +612,24 @@ async def send_reply(
     group_id: str | None,
     voice_input: bool = False,
     voice_mode: str | None = None,
-) -> None:
-    """按配置用语音、长回复（图片或合并转发）或分段文字发送回复，
-    群聊按 REPLY_QUOTE 在第一段引用原消息
+    result: DeliveryResult | None = None,
+) -> DeliveryResult:
+    """向当前事件发送回复并返回逐段投递结果。"""
 
-    参数:
-        text: 回复文本
-        group_id: 群号，私聊为空
-        voice_input: 用户是否发送了语音
-        voice_mode: 语音回复方式，为空使用全局配置
-    """
-    quote = quote_reply(group_id)
-    text, _ = Safety.filter_output(text)
-    voice = await voice_segment(clean_markdown(text), voice_input, voice_mode)
-    if voice:
-        await MessageUtils.build_message(voice).send()
-        return
-    bot = current_bot.get(None)
-    if message := await long_message(bot, text):
-        forward = message.has(Reference)
-        await message.send(reply_to=quote and not forward)
-        if forward and bot:
+    async def send(message: UniMessage, first: bool) -> bool:
+        await message.send(reply_to=first and quote_reply(group_id))
+        bot = current_bot.get(None)
+        if bot and message.has(Reference):
             note_forward(bot.self_id, group_id, text)
-        return
-    for index, part in enumerate(text_parts(text)):
-        if delay := split_delay():
-            await asyncio.sleep(delay)
-        await MessageUtils.build_message(part).send(reply_to=quote and not index)
+        return True
+
+    bot = current_bot.get(None)
+    event = current_event.get(None)
+    target = (
+        getattr(bot, "self_id", ""),
+        "group" if group_id else "user",
+        group_id or (event.get_user_id() if event else ""),
+    )
+    return await _deliver(
+        text, bot, send, voice_input, voice_mode, result, target=target
+    )

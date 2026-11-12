@@ -4,6 +4,7 @@ import time
 from typing import Any, ClassVar
 
 from nonebot.adapters import Bot
+from nonebot.exception import ActionFailed, ApiNotAvailable
 from nonebot_plugin_alconna import At, Reply, Segment, Text, UniMessage
 
 from zhenxun.configs.config import BotConfig, Config
@@ -14,7 +15,7 @@ from zhenxun.services.ai.tools.models import ResolvedToolPayload, ToolResult
 from zhenxun.services.log import logger
 from zhenxun.utils.platform import PlatformUtils
 
-from ._buffer import ChatBuffer, ChatLine
+from ._buffer import AI_SEND, ChatBuffer, ChatLine
 from ._data_source import MODULE
 from ._reply import clean_markdown
 from ._safety import Safety, prune
@@ -252,11 +253,19 @@ class QQSendToolkit(BaseToolkit):
             if not index and at:
                 segments += [At("user", at), Text(" ")]
             segments.append(Text(text))
-            if not await PlatformUtils.send_message(
-                scene.bot, scene.user_id, scene.group_id, UniMessage(segments)
-            ):
+            send_token = AI_SEND.set(True)
+            try:
+                delivered = await PlatformUtils.send_message(
+                    scene.bot, scene.user_id, scene.group_id, UniMessage(segments)
+                )
+            finally:
+                AI_SEND.reset(send_token)
+            if not delivered:
                 SendQuota.refund(scene.key, len(texts) - index)
-                return ToolResult(output=f"第 {index + 1} 条发送失败。").as_error()
+                return ToolResult(
+                    output=f"第 {index + 1} 条未确认送达，不要重发。"
+                ).as_error(False)
+            context.state.setdefault("_sent_texts", []).append(text.strip())
         return ToolResult(output=f"已发送 {len(texts)} 条。")
 
     @tool(
@@ -289,9 +298,14 @@ class QQSendToolkit(BaseToolkit):
         for api, keys in methods:
             try:
                 await scene.bot.call_api(api, **{k: values[k] for k in keys})
-            except Exception as e:
-                logger.debug(f"戳一戳接口 {api} 不可用: {e}", MODULE)
+            except (ActionFailed, ApiNotAvailable, NotImplementedError) as exc:
+                logger.debug(f"戳一戳接口 {api} 不可用: {type(exc).__name__}", MODULE)
                 continue
+            except Exception as exc:
+                logger.debug(f"戳一戳结果未知: {type(exc).__name__}", MODULE)
+                return ToolResult(
+                    output="戳一戳未确认完成，本轮不要再次执行。"
+                ).as_error(False)
             self._poke_methods[(scene.bot.self_id, kind)] = api
             scene.note(f"[戳了戳 {target}]")
             return ToolResult(output="已戳了一下。")

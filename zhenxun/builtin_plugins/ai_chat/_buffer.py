@@ -2,6 +2,7 @@
 
 import asyncio
 from collections import deque
+from contextvars import ContextVar
 from dataclasses import dataclass
 import time
 from typing import Any, ClassVar
@@ -11,6 +12,8 @@ from nonebot_plugin_alconna import At, Other, Reply, Text, UniMessage
 
 from zhenxun.configs.config import BotConfig
 from zhenxun.services.ai.core.templates import wrap_untrusted
+
+AI_SEND: ContextVar[bool] = ContextVar("ai_chat_send", default=False)
 
 _PLACEHOLDERS = {
     "image": "图片",
@@ -35,10 +38,13 @@ class ChatLine:
     text: str
     at: float
     is_bot: bool = False
+    is_ai: bool = False
+    sequence: int = 0
 
 
 def sender_name(event: Event, user_id: str) -> str:
-    """消息发送者的群名片或昵称，取不到时用用户id
+    """消息发送者的群名片或昵称，取不到时用用户id；去掉换行、半角括号与 #，
+    最长 32 字，避免伪造发送者头
 
     参数:
         event: 事件
@@ -48,7 +54,12 @@ def sender_name(event: Event, user_id: str) -> str:
         str: 名称
     """
     sender = getattr(event, "sender", None)
-    return getattr(sender, "card", None) or getattr(sender, "nickname", None) or user_id
+    name = getattr(sender, "card", None) or getattr(sender, "nickname", None) or ""
+    name = " ".join(str(name).split()).translate(_NAME_TABLE)[:32].strip()
+    return name or user_id
+
+
+_NAME_TABLE = str.maketrans({"(": "（", ")": "）", "#": "＃", ":": "："})
 
 
 def summarize(message: UniMessage) -> str:
@@ -80,7 +91,8 @@ class ChatBuffer:
     """每个群最近消息的内存环形缓冲（含 Bot 自己的发言）"""
 
     _lines: ClassVar[dict[tuple[str, str], deque[ChatLine]]] = {}
-    _cursors: ClassVar[dict[tuple[str, str], float]] = {}
+    _cursors: ClassVar[dict[tuple[str, str], int]] = {}
+    _sequence: ClassVar[int] = 0
     MAX_LINES = 50
 
     @classmethod
@@ -97,6 +109,8 @@ class ChatBuffer:
         key = (bot_id, group_id)
         if key not in cls._lines:
             cls._lines[key] = deque(maxlen=cls.MAX_LINES)
+        cls._sequence += 1
+        line.sequence = cls._sequence
         cls._lines[key].append(line)
 
     @classmethod
@@ -139,6 +153,7 @@ class ChatBuffer:
                 text.strip(),
                 time.time(),
                 is_bot=True,
+                is_ai=AI_SEND.get(),
             ),
         )
 
@@ -150,7 +165,7 @@ class ChatBuffer:
             bot_id: Bot id
             group_id: 群号
         """
-        cls._cursors[(bot_id, group_id)] = time.time()
+        cls._cursors[(bot_id, group_id)] = cls._sequence
 
     @staticmethod
     def _format(lines: list[ChatLine]) -> str:
@@ -169,9 +184,16 @@ class ChatBuffer:
             same_day = time.strftime("%Y%m%d", local) == today
             return time.strftime("%H:%M" if same_day else "%m-%d %H:%M", local)
 
+        def speaker(line):
+            return (
+                ("你（其他功能）" if not line.is_ai else "你")
+                if line.is_bot
+                else line.name
+            )
+
         return "\n".join(
             f"[{stamp(line.at)}] "
-            f"{'你' if line.is_bot else line.name}({line.user_id})"
+            f"{speaker(line)}({line.user_id})"
             f"{f' #{line.message_id}' if line.message_id else ''}: {line.text}"
             for line in lines
         )
@@ -207,13 +229,13 @@ class ChatBuffer:
     def take(
         cls, bot_id: str, group_id: str, exclude_id: str | None, size: int
     ) -> str | None:
-        """取出群聊会话游标之后、当前消息之前的群消息（不含 Bot 的发言，最多 size 条），
-        并把游标推进到当前消息；重启后游标丢失时取最近 size 条。聊天内容按不可信内容包裹
+        """取出游标之后、当前消息之前的群消息，排除已入历史的 AI 发言。
+        最多取 size 条并推进游标；重启后取最近 size 条，内容按不可信信息包裹。
 
         参数:
             bot_id: Bot id
             group_id: 群号
-            exclude_id: 当前消息id，为空或不在缓冲区时取到最新
+            exclude_id: 当前消息id；为空时最后一条视为当前消息，不在缓冲区时取到最新
             size: 条数
 
         返回:
@@ -226,16 +248,17 @@ class ChatBuffer:
             (
                 i
                 for i, line in enumerate(buffered)
-                if exclude_id and line.message_id == exclude_id
+                if (exclude_id and line.message_id == exclude_id)
+                or (not exclude_id and i == len(buffered) - 1)
             ),
             None,
         )
-        until = buffered[index].at if index is not None else time.time()
+        until = buffered[index].sequence if index is not None else cls._sequence
         cls._cursors[key] = max(since, until)
         lines = [
             line
             for line in buffered[:index]
-            if not line.is_bot and since < line.at <= until
+            if not line.is_ai and since < line.sequence <= until
         ][-size:]
         if size <= 0 or not lines:
             return None
