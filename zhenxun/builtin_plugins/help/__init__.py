@@ -1,4 +1,6 @@
-from nonebot.adapters import Bot
+from nonebot import on_notice
+from nonebot.adapters import Bot, Event
+from nonebot.adapters.qq.event import FriendAddEvent, GroupAddRobotEvent
 from nonebot.plugin import PluginMetadata
 from nonebot.rule import to_me
 from nonebot_plugin_alconna import (
@@ -13,6 +15,7 @@ from nonebot_plugin_alconna import (
 )
 from nonebot_plugin_uninfo import Uninfo
 
+from zhenxun.adapters.qq_official.presentation import send_configured_card
 from zhenxun.configs.config import Config
 from zhenxun.configs.utils import PluginExtraData, RegisterConfig
 from zhenxun.services.log import logger
@@ -96,10 +99,14 @@ _matcher.shortcut(
 @_matcher.handle()
 async def _(
     bot: Bot,
+    event: Event,
     name: Match[str],
     session: Uninfo,
     is_detail: Query[bool] = AlconnaQuery("detail.value", False),
 ):
+    if not name.available and not is_detail.result:
+        if await send_configured_card(bot, event, "help"):
+            return
     _is_superuser = PlatformUtils.is_superuser(bot, session.user.id)
 
     if name.available:
@@ -133,3 +140,17 @@ async def _(
     else:
         image_bytes = await create_help_img(session, None, is_detail.result)
         await MessageUtils.build_message(image_bytes).finish()
+
+
+_qq_welcome = on_notice(
+    rule=lambda event: isinstance(event, FriendAddEvent | GroupAddRobotEvent),
+    priority=10,
+    block=False,
+)
+
+
+@_qq_welcome.handle()
+async def _send_qq_welcome(bot: Bot, event: Event):
+    """按账号设置回复加好友或机器人入群事件。"""
+    kind = "welcome_friend" if isinstance(event, FriendAddEvent) else "welcome_group"
+    await send_configured_card(bot, event, kind)

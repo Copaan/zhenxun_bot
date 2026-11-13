@@ -212,6 +212,8 @@ class Message(BaseModel):
     消息
     """
 
+    message_id: str | None = None
+    """平台消息标识，用于与已存历史去重"""
     bot_id: str
     """接收消息的 bot 运行时 id"""
     object_id: str

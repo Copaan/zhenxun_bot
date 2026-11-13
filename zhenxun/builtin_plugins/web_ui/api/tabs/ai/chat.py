@@ -374,13 +374,16 @@ async def list_chat_groups() -> Result:
     settings = {row.group_id: row for row in await AIChatGroup.all()}
     personas = {
         group_id: persona
-        for persona in await AIPersona.filter(enabled=True).order_by("-id")
+        for persona in await AIPersona.filter(enabled=True)
+        .only("id", "name", "group_ids")
+        .order_by("-id")
         for group_id in persona.group_ids or []
     }
-    groups = {
-        group.group_id: group.group_name
-        for group in await GroupConsole.filter(channel_id__isnull=True)
-    }
+    groups = dict(
+        await GroupConsole.filter(channel_id__isnull=True).values_list(
+            "group_id", "group_name"
+        )
+    )
     items = []
     for group_id in sorted(set(groups) | set(settings)):
         setting = settings.get(group_id)

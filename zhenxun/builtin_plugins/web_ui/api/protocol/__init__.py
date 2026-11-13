@@ -19,11 +19,15 @@ from .model import (
     ProtocolQQError,
     ProtocolStatus,
 )
+from .presentation import drain_presentation_tasks
+from .presentation import router as presentation_router
 from .qq_registration import router as qq_registration_router
 
 router = APIRouter(prefix="/protocol")
 router.include_router(configuration_router)
 router.include_router(qq_registration_router)
+router.include_router(presentation_router)
+nonebot.get_driver().on_shutdown(drain_presentation_tasks)
 
 
 def build_protocol_status() -> ProtocolStatus:

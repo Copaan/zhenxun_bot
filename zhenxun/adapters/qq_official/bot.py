@@ -85,6 +85,7 @@ class ZhenxunQQBot(QQBot):
         message: str | Message | MessageSegment,
         **kwargs: Any,
     ) -> Any:
+        passive_only = bool(kwargs.pop("passive_only", False))
         context = event_official_context(event)
         if (
             context is not None
@@ -96,7 +97,7 @@ class ZhenxunQQBot(QQBot):
                 return await self._send_to_scene(
                     context, message, event_id=context.source_id
                 )
-            if not _proactive_fallback_enabled():
+            if passive_only or not _proactive_fallback_enabled():
                 raise OfficialReplyExpired("QQ passive reply window expired")
             return await self._send_to_scene(context, message)
         if context is None or not isinstance(
@@ -107,6 +108,8 @@ class ZhenxunQQBot(QQBot):
         # 与上游一致，忽略 reply_message、at_sender 等通用发送参数
         reserved = await reserve_passive_reply(context)
         if reserved is None:
+            if passive_only:
+                raise OfficialReplyExpired("QQ passive reply window unavailable")
             return await self._send_to_scene(context, message)
         state, sequence = reserved
         successful = False

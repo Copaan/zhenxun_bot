@@ -22,13 +22,13 @@ from zhenxun.services.ai.run.context import RunContext
 from zhenxun.services.ai.tools.core.decorators import tool
 from zhenxun.services.ai.tools.core.toolkit import BaseToolkit
 from zhenxun.services.ai.tools.models import ResolvedToolPayload, ToolResult
-from zhenxun.services.ai.utils.utils import MediaFetchError, fetch_media
+from zhenxun.services.ai.utils.utils import MediaFetchError
 from zhenxun.services.log import logger
 from zhenxun.utils.http_utils import get_async_client
 
 from ._char_local import TAGGERS, Candidate, LocalModels, normalize
 from ._data_source import MODULE
-from ._tools import image_source, locate_images, pick_images
+from ._tools import fetch_image, locate_images, pick_images
 
 TIERS = ("off", "cloud", "lite", "full")
 """识别档位"""
@@ -515,7 +515,7 @@ class CharacterToolkit(BaseToolkit):
 
         async def run(segment) -> tuple[str, bool]:
             async with semaphore:
-                return await self._recognize_one(segment)
+                return await self._recognize_one(segment, context.get_bot())
 
         results = await asyncio.gather(*(run(segment) for _, segment in picked))
         lines = [
@@ -526,26 +526,21 @@ class CharacterToolkit(BaseToolkit):
         return result if any(ok for _, ok in results) else result.as_error(False)
 
     @staticmethod
-    async def _recognize_one(segment) -> tuple[str, bool]:
+    async def _recognize_one(segment, bot=None) -> tuple[str, bool]:
         """识别一张图片
 
         参数:
             segment: 图片消息段
+            bot: Bot，图片地址无效时用于向协议端查询
 
         返回:
             tuple[str, bool]: 识别说明或失败原因、是否完成识别
         """
-        raw, url, _ = image_source(segment)
-        if raw is None:
-            if not url:
-                return "读取不到这张图片。", False
-            try:
-                raw = await fetch_media(
-                    url, max_bytes=IMAGE_MAX_BYTES, allow_private=True
-                )
-            except MediaFetchError as e:
-                logger.debug(f"下载识别图片失败: {e}", "AI角色识别")
-                return ("图片太大。" if e.too_large else "图片下载失败。"), False
+        try:
+            raw = await fetch_image(bot, segment, IMAGE_MAX_BYTES)
+        except MediaFetchError as e:
+            logger.debug(f"下载识别图片失败: {e}", "AI角色识别")
+            return ("图片太大。" if e.too_large else "图片下载失败。"), False
         if not _large(raw):
             return "图片太小，无法识别。", False
         result = await CharacterRecognizer.recognize(raw)

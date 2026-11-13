@@ -1,9 +1,14 @@
+from urllib.parse import urlsplit
+
 import nonebot
+from tortoise import timezone
+from tortoise.expressions import Q
 
 from zhenxun.models.ban_console import BanConsole
 from zhenxun.models.chat_history import ChatHistory
 from zhenxun.models.fg_request import FgRequest
 from zhenxun.models.group_console import GroupConsole
+from zhenxun.models.group_member_info import GroupInfoUser
 from zhenxun.models.statistics import Statistics
 from zhenxun.services.bot_group_policy import bot_group_policy_service
 from zhenxun.services.plugin_policy import (
@@ -28,6 +33,118 @@ from .model import (
 
 
 class ApiDataSource:
+    @classmethod
+    async def recent_messages(cls, bot_id: str, group_id: str, limit: int) -> dict:
+        """读取指定 OneBot 账号与群的最近已存消息，不触发协议端补拉。"""
+        from zhenxun.configs.config import Config
+
+        bot = nonebot.get_bot(bot_id)
+        scope = PlatformUtils.get_platform_scope(bot)
+        if scope != "qq_client" or not group_id.isdecimal() or int(group_id) <= 0:
+            raise ValueError("当前历史消息入口仅支持 OneBot 的有效群号。")
+        rows = await webui_db_call(
+            ChatHistory.scoped_query(
+                platform_scope=scope,
+                bot_id=PlatformUtils.get_storage_bot_id(bot),
+                group_id=group_id,
+            )
+            .order_by("-create_time", "-id")
+            .limit(limit + 1),
+            "Manage.recent_messages",
+        )
+        has_more = len(rows) > limit
+        rows = list(reversed(rows[:limit]))
+        user_ids = {row.user_id for row in rows}
+        names = (
+            dict(
+                await webui_db_call(
+                    GroupInfoUser.filter(
+                        Q(platform="qq") | Q(platform__isnull=True) | Q(platform=""),
+                        group_id=group_id,
+                        user_id__in=user_ids,
+                    ).values_list("user_id", "user_name"),
+                    "Manage.recent_message_names",
+                )
+            )
+            if user_ids
+            else {}
+        )
+        items = []
+        for row in rows:
+            created = row.create_time
+            if timezone.is_naive(created):
+                created = timezone.make_aware(created)
+            stamp = created.isoformat()
+            parts = []
+            for segment in row.segments if isinstance(row.segments, list) else []:
+                if not isinstance(segment, dict):
+                    continue
+                data = segment.get("data", segment)
+                if not isinstance(data, dict):
+                    continue
+                kind = str(segment.get("type", "")).lower()
+                if kind == "text" and isinstance(data.get("text"), str):
+                    parts.append({"type": "text", "msg": data["text"], "time": stamp})
+                elif kind == "image":
+                    url = data.get("url")
+                    try:
+                        parsed = urlsplit(url) if isinstance(url, str) else None
+                        valid = (
+                            parsed
+                            and parsed.scheme in {"http", "https"}
+                            and parsed.hostname
+                            and not parsed.username
+                            and not parsed.password
+                        )
+                    except ValueError:
+                        valid = False
+                    parts.append(
+                        {
+                            "type": "img" if valid else "text",
+                            "msg": url if valid else "[图片暂不可用]",
+                            "time": stamp,
+                        }
+                    )
+                elif kind == "at":
+                    parts.append(
+                        {
+                            "type": "text",
+                            "msg": "@" + str(data.get("target", "成员")),
+                            "time": stamp,
+                        }
+                    )
+                elif kind:
+                    parts.append({"type": "text", "msg": "[其他消息]", "time": stamp})
+            if not parts:
+                parts = [
+                    {
+                        "type": "text",
+                        "msg": row.plain_text or row.text or "[无可显示内容]",
+                        "time": stamp,
+                    }
+                ]
+            items.append(
+                {
+                    "history_id": row.id,
+                    "message_id": row.message_id,
+                    "bot_id": str(bot.self_id),
+                    "object_id": group_id,
+                    "group_id": group_id,
+                    "user_id": row.user_id,
+                    "name": names.get(row.user_id) or row.user_id,
+                    "ava_url": AVA_URL.format(row.user_id),
+                    "message": parts,
+                    "isSelf": row.is_bot or row.user_id == str(bot.self_id),
+                }
+            )
+        return {
+            "items": items,
+            "limit": limit,
+            "has_more": has_more,
+            "source": "stored_history",
+            "recording_enabled": bool(Config.get_config("chat_history", "FLAG", True)),
+        }
+
     @staticmethod
     async def _group_policy(group_id: str, bot_id: str | None):
         from zhenxun.models.bot_group_policy import BotGroupMembership

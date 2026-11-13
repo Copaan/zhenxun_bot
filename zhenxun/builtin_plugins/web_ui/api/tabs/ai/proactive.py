@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 from typing import Any, Literal
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 import nonebot
 from pydantic import BaseModel, Field
 
@@ -43,27 +43,37 @@ def _state_item(bot_id: str, group_id: str, st: Any, cooldown: int) -> dict[str,
 
 
 @router.get("/chat/proactive", dependencies=[authentication()], response_model=Result)
-async def proactive_state() -> Result:
+async def proactive_state(
+    group_ids: list[str] | None = Query(default=None, max_length=50),
+) -> Result:
     from zhenxun.builtin_plugins.ai_chat._proactive import Proactive
     from zhenxun.builtin_plugins.ai_chat._steal import Steal
 
+    selected = set(group_ids) if group_ids is not None else None
+    _, total = await Proactive.used_tokens("")
+    _, judges = await Steal.today("")
     states = []
+    summaries = {}
     for (bot_id, group_id), st in list(Proactive._states.items()):
-        cfg = await Proactive.settings(group_id)
-        group_used, _ = await Proactive.used_tokens(group_id)
+        if selected is not None and group_id not in selected:
+            continue
+        if group_id not in summaries:
+            cfg = await Proactive.settings(group_id)
+            group_used, _ = await Proactive.used_tokens(group_id)
+            stolen, _ = await Steal.today(group_id)
+            count = await Proactive.count_today(group_id)
+            summaries[group_id] = cfg, group_used, stolen, count
+        cfg, group_used, stolen, count = summaries[group_id]
         item = _state_item(bot_id, group_id, st, cfg.cooldown if cfg else 0)
-        stolen, _ = await Steal.today(group_id)
         states.append(
             {
                 **item,
                 "mode": cfg.mode if cfg else "off",
                 "used_tokens": group_used,
-                "count": await Proactive.count_today(group_id),
+                "count": count,
                 "stolen": stolen,
             }
         )
-    _, total = await Proactive.used_tokens("")
-    _, judges = await Steal.today("")
     return Result.ok({"used_tokens": total, "steal_judges": judges, "groups": states})
 
 

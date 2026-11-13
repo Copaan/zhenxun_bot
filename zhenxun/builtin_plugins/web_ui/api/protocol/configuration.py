@@ -319,30 +319,31 @@ def _resolve_bots(
     return result
 
 
+async def _credential_headers(
+    client: httpx.AsyncClient, app_id: str, secret: str
+) -> dict[str, str]:
+    """使用已保存的账号凭据获取 QQ 接口请求头。"""
+    auth = await client.post(_AUTH_URL, json={"appId": app_id, "clientSecret": secret})
+    auth.raise_for_status()
+    payload = auth.json()
+    access_token = (
+        str(payload.get("access_token") or "") if isinstance(payload, dict) else ""
+    )
+    if not access_token:
+        raise httpx.HTTPStatusError(
+            "QQ authorization response did not include an access token",
+            request=auth.request,
+            response=auth,
+        )
+    return {"Authorization": f"QQBot {access_token}", "X-Union-Appid": app_id}
+
+
 async def _probe_credential(app_id: str, secret: str) -> dict[str, str]:
     started_at = time.perf_counter()
     try:
         async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=True) as client:
-            auth = await client.post(
-                _AUTH_URL,
-                json={"appId": app_id, "clientSecret": secret},
-            )
-            auth.raise_for_status()
-            auth_data = auth.json()
-            access_token = str(auth_data.get("access_token") or "")
-            if not access_token:
-                raise httpx.HTTPStatusError(
-                    "QQ authorization response did not include an access token",
-                    request=auth.request,
-                    response=auth,
-                )
-            me = await client.get(
-                _ME_URL,
-                headers={
-                    "Authorization": f"QQBot {access_token}",
-                    "X-Union-Appid": app_id,
-                },
-            )
+            headers = await _credential_headers(client, app_id, secret)
+            me = await client.get(_ME_URL, headers=headers)
             me.raise_for_status()
             data = me.json()
     except Exception as exc:

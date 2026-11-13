@@ -1,4 +1,6 @@
-from fastapi import APIRouter
+from datetime import datetime, timezone
+
+from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import JSONResponse
 import nonebot
 from nonebot.adapters.onebot.v11 import ActionFailed
@@ -30,6 +32,24 @@ from .model import (
 )
 
 router = APIRouter(prefix="/manage")
+
+
+@router.get("/chat/history", dependencies=[authentication()], response_model=Result)
+async def recent_messages(
+    bot_id: str, group_id: str, limit: int = Query(default=50, ge=1, le=50)
+) -> Result:
+    """按账号、平台和群读取有限的已存聊天历史。"""
+    try:
+        return Result.ok(await ApiDataSource.recent_messages(bot_id, group_id, limit))
+    except KeyError as error:
+        raise HTTPException(409, "指定 Bot 当前未连接，请重新选择账号。") from error
+    except ValueError as error:
+        raise HTTPException(422, str(error)) from error
+    except Exception as error:
+        logger.warning("群消息历史读取失败", "WebUi", e=error)
+        raise HTTPException(
+            503, "历史消息暂不可用，可稍后重试；实时消息仍会显示。"
+        ) from error
 
 
 @router.get(
@@ -351,10 +371,30 @@ async def _(group_id: str, bot_id: str | None = None) -> Result[GroupDetail]:
 async def _(param: SendMessageParam) -> Result:
     try:
         bot = nonebot.get_bot(param.bot_id)
-        await PlatformUtils.send_message(
+        receipt = await PlatformUtils.send_message(
             bot, param.user_id, param.group_id, param.message
         )
-        return Result.ok(info="发送成功!")
+        if receipt is None:
+            return Result.warning_("未取得发送回执，请核对会话，不要重复发送。")
+        if isinstance(receipt, dict):
+            message_id = receipt.get("message_id") or receipt.get("id")
+        else:
+            try:
+                reply = receipt.get_reply(0)
+                message_id = reply.id if reply else None
+            except Exception as error:
+                logger.warning(
+                    f"消息已发送但回执标识无法解析: {type(error).__name__}", "WebUi"
+                )
+                message_id = None
+        return Result.ok(
+            data={
+                "message_id": str(message_id) if message_id is not None else None,
+                "bot_id": str(bot.self_id),
+                "sent_at": datetime.now(timezone.utc).isoformat(),
+            },
+            info="发送成功!",
+        )
     except (ValueError, KeyError):
         return Result.warning_("指定Bot未连接...")
     except Exception as e:

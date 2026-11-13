@@ -8,7 +8,7 @@ from zhenxun.services.ai.run.context import RunContext
 from zhenxun.services.ai.tools.core.decorators import tool
 from zhenxun.services.ai.tools.core.toolkit import BaseToolkit
 from zhenxun.services.ai.tools.models import ResolvedToolPayload, ToolResult
-from zhenxun.services.ai.utils.utils import MediaFetchError, fetch_media
+from zhenxun.services.ai.utils.utils import MediaFetchError
 from zhenxun.services.log import logger
 from zhenxun.utils.platform import PlatformUtils
 from zhenxun.utils.pydantic_compat import model_validate
@@ -16,7 +16,13 @@ from zhenxun.utils.pydantic_compat import model_validate
 from ._data_source import MODULE
 from ._send import Scene, SendQuota
 from ._stickers import STICKER_MAX_BYTES, Stickers
-from ._tools import GroupHistory, image_source, locate_images, pick_images
+from ._tools import (
+    GroupHistory,
+    fetch_image,
+    image_source,
+    locate_images,
+    pick_images,
+)
 
 MANAGE_TOOLS = {"delete_stickers", "merge_stickers", "update_sticker"}
 """只在超级用户的对话中提供的表情整理工具"""
@@ -172,9 +178,7 @@ class StickerToolkit(BaseToolkit):
             return "", False, f"剩下的图片没有收藏：{reason}" if many else reason
         if raw is None:
             try:
-                raw = await fetch_media(
-                    url or "", max_bytes=STICKER_MAX_BYTES, allow_private=True
-                )
+                raw = await fetch_image(scene.bot, segment, STICKER_MAX_BYTES)
             except MediaFetchError as e:
                 SendQuota.refund(key, 1)
                 logger.debug(f"下载表情失败: {e}", MODULE)

@@ -1,5 +1,5 @@
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 
 from fastapi import APIRouter
 import nonebot
@@ -81,7 +81,7 @@ async def message_handle(
     message: UniMsg,
     group_id: str | None,
 ):
-    time = str(datetime.now().replace(microsecond=0))
+    time = datetime.now(timezone.utc).isoformat(timespec="seconds")
     messages = []
     for m in message:
         if isinstance(m, Text | str):
@@ -121,7 +121,7 @@ async def _(
 ):
     global ID2NAME, ID_LIST
     if _CHAT_CONNECTIONS:
-        msg_id = event.message_id
+        msg_id = (str(bot.self_id), str(event.message_id))
         if msg_id in ID_LIST:
             return
         ID_LIST.append(msg_id)
@@ -130,6 +130,7 @@ async def _(
         gid = session.group.id if session.group else None
         messages = await message_handle(message, gid)
         data = Message(
+            message_id=str(event.message_id),
             bot_id=str(bot.self_id),
             object_id=gid or session.user.id,
             user_id=session.user.id,

@@ -20,14 +20,14 @@ from tortoise.timezone import localtime
 from zhenxun.configs.config import Config
 from zhenxun.models.ai_agent_run import AIAgentRun
 from zhenxun.models.ai_sticker import AISticker
-from zhenxun.services.ai.utils.utils import MediaFetchError, fetch_media
+from zhenxun.services.ai.utils.utils import MediaFetchError
 from zhenxun.services.log import logger
 from zhenxun.utils.time_utils import TimeUtils
 
 from ._data_source import MODULE
 from ._proactive import group_config
 from ._stickers import STICKER_MAX_BYTES, Stickers
-from ._tools import image_source
+from ._tools import fetch_image
 
 MIN_CONFIDENCE = 0.7
 """视觉模型确认表情属性与收藏价值的最低置信度"""
@@ -236,17 +236,11 @@ class Steal:
         day, judged = reservation_day or cls._day, False
         try:
             async with cls._slot:
-                raw, url, _summary = image_source(segment)
-                if raw is None:
-                    if not url:
-                        return False
-                    try:
-                        raw = await fetch_media(
-                            url, max_bytes=STICKER_MAX_BYTES, allow_private=True
-                        )
-                    except MediaFetchError as e:
-                        logger.debug(f"偷表情下载失败: {e}", MODULE)
-                        return False
+                try:
+                    raw = await fetch_image(bot, segment, STICKER_MAX_BYTES)
+                except MediaFetchError as e:
+                    logger.debug(f"偷表情下载失败: {e}", MODULE)
+                    return False
                 digest = hashlib.md5(raw).hexdigest()
                 if (
                     cls.rejected(digest)

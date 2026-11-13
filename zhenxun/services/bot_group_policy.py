@@ -322,18 +322,44 @@ class BotGroupPolicyService:
             self._memberships.update(keys)
 
     async def list_groups(self, bot_id):
+        from zhenxun.models.group_console import GroupConsole
+
         bot_id = await plugin_policy_service._resolve_bot_id(bot_id)
         account = await plugin_policy_service.get_account(bot_id)
         rows = await BotGroupMembership.filter(bot_id=bot_id).order_by(
             "group_name", "group_id"
         )
+        missing = {
+            row.group_id
+            for row in rows
+            if row.platform_scope == "qq_client"
+            and not row.channel_id
+            and (not row.group_name or row.group_name == row.group_id)
+        }
+        names = {}
+        if missing:
+            for group in await GroupConsole.filter(
+                group_id__in=missing, channel_id__isnull=True
+            ).values("group_id", "group_name", "platform"):
+                if (
+                    group["platform"] in _LEGACY_PLATFORMS
+                    and group["group_name"]
+                    and group["group_name"] != group["group_id"]
+                ):
+                    names[group["group_id"]] = group["group_name"]
         return [
             {
                 "bot_id": bot_id,
                 "platform_scope": row.platform_scope,
                 "group_id": row.group_id,
                 "channel_id": row.channel_id,
-                "group_name": row.group_name or row.group_id,
+                "group_name": (
+                    row.group_name
+                    if row.group_name and row.group_name != row.group_id
+                    else names.get(row.group_id, "")
+                    if row.platform_scope == "qq_client" and not row.channel_id
+                    else ""
+                ),
                 "last_seen": row.last_seen.isoformat(),
                 "source": row.source,
                 "connected": account["connected"],

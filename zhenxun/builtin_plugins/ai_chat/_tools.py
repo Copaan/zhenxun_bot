@@ -1,6 +1,9 @@
 import asyncio
+import base64
+import binascii
 import time
 from typing import Any
+from urllib.parse import urlsplit
 
 from nonebot.adapters import Bot
 from nonebot_plugin_alconna import Image, Other, Reply, Segment, UniMessage
@@ -14,6 +17,7 @@ from zhenxun.services.ai.run.context import RunContext
 from zhenxun.services.ai.tools.core.decorators import tool
 from zhenxun.services.ai.tools.core.toolkit import BaseToolkit
 from zhenxun.services.ai.tools.models import ToolResult
+from zhenxun.services.ai.utils.utils import MediaFetchError, fetch_media
 from zhenxun.services.hot_query_cache import get_member_names
 from zhenxun.services.log import logger
 from zhenxun.utils.message import MessageUtils
@@ -389,6 +393,62 @@ def image_source(segment: Segment) -> tuple[bytes | None, str | None, str]:
     origin = getattr(segment, "origin", None)
     data = getattr(origin, "data", None) or {}
     return None, data.get("url"), str(data.get("summary") or "").strip("[]")
+
+
+def _http_url(url: Any) -> bool:
+    """是否为带主机名的 http/https 地址"""
+    if not isinstance(url, str):
+        return False
+    parts = urlsplit(url)
+    return parts.scheme in ("http", "https") and bool(parts.hostname)
+
+
+async def fetch_image(bot: Bot | None, segment: Segment, max_bytes: int) -> bytes:
+    """读取图片或商城表情消息段的内容
+
+    协议端给出的地址不是完整的 http/https 地址时，用图片的 file 标识向 OneBot V11
+    协议端查询可用地址或内容。
+
+    参数:
+        bot: Bot，用于向协议端查询
+        segment: 图片或商城表情消息段
+        max_bytes: 允许的最大字节数
+
+    返回:
+        bytes: 图片内容
+
+    异常:
+        MediaFetchError: 没有可用地址、下载失败或超过大小上限
+    """
+    raw, url, _ = image_source(segment)
+    if raw is not None:
+        return raw
+    data = getattr(getattr(segment, "origin", None), "data", None) or {}
+    if data:
+        url = data.get("url")
+    if _http_url(url):
+        return await fetch_media(str(url), max_bytes=max_bytes, allow_private=True)
+    file = data.get("file")
+    if bot is None or not file or bot.adapter.get_name() != "OneBot V11":
+        raise MediaFetchError(f"图片地址无效: {str(url)[:80]}")
+    try:
+        found = await bot.call_api("get_image", file=str(file))
+    except Exception as error:
+        raise MediaFetchError(f"协议端查询图片失败: {error}") from error
+    found = found if isinstance(found, dict) else {}
+    if _http_url(found.get("url")):
+        return await fetch_media(found["url"], max_bytes=max_bytes, allow_private=True)
+    if encoded := found.get("base64"):
+        if len(encoded) > max_bytes * 4 // 3 + 4:
+            raise MediaFetchError("图片超过大小上限", too_large=True)
+        try:
+            content = base64.b64decode(str(encoded).removeprefix("base64://"))
+        except (binascii.Error, ValueError) as error:
+            raise MediaFetchError("协议端返回的图片内容无效") from error
+        if len(content) > max_bytes:
+            raise MediaFetchError("图片超过大小上限", too_large=True)
+        return content
+    raise MediaFetchError(f"协议端没有提供可用的图片地址: {str(url)[:80]}")
 
 
 def _find_images(message: UniMessage) -> list[Segment]:
