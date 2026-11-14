@@ -25,6 +25,92 @@ from zhenxun.utils.atomic_json import (
 CARD_PATH = DATA_PATH / "qq_official" / "presentation.json"
 CARD_KINDS = ("help", "welcome_friend", "welcome_group")
 _welcome_attempts: dict[tuple[str, str, str], float] = {}
+_editor_contacts: dict[tuple[str, str, str], dict] = {}
+
+
+def remember_editor_contact(bot, event) -> None:
+    """暂存当前账号收到的 QQ 联系人及短期私聊回复上下文。"""
+    from .context import event_official_context
+
+    context = event_official_context(event)
+    if (
+        not context
+        or context.app_id != str(bot.self_id)
+        or context.scene not in {"c2c", "group"}
+    ):
+        return
+    target = context.actor_openid if context.scene == "c2c" else context.group_openid
+    if not target:
+        return
+    now = datetime.now(timezone.utc)
+    for key, value in list(_editor_contacts.items()):
+        if now.timestamp() - value["seen_at"] > 86400:
+            _editor_contacts.pop(key, None)
+        elif value["deadline"] <= now:
+            value.pop("event", None)
+    key = (context.app_id, context.scene, target)
+    previous = _editor_contacts.pop(key, {})
+    label = (
+        getattr(getattr(event, "author", None), "username", None)
+        if context.scene == "c2c"
+        else getattr(event, "group_name", None)
+    )
+    record = {
+        "openid": target,
+        "label": str(
+            label
+            or previous.get("name")
+            or ("用户" if context.scene == "c2c" else "群")
+        )[:80]
+        + " · "
+        + target[-6:],
+        "name": str(label or previous.get("name") or "")[:80],
+        "seen_at": now.timestamp(),
+        "deadline": context.reply_deadline,
+    }
+    if (
+        context.scene == "c2c"
+        and context.source_kind == "msg_id"
+        and now < context.reply_deadline
+    ):
+        record["event"] = event
+    _editor_contacts[key] = record
+    while len(_editor_contacts) > 300:
+        _editor_contacts.pop(next(iter(_editor_contacts)))
+
+
+def editor_contacts(app_id: str, scene: str) -> list[dict]:
+    """列出本次运行见到的联系人，不导出事件内容或反推身份摘要。"""
+    now = datetime.now(timezone.utc)
+    items = []
+    for (owner, scope, _), record in reversed(_editor_contacts.items()):
+        if record["deadline"] <= now:
+            record.pop("event", None)
+        if (
+            owner == app_id
+            and scope == scene
+            and now.timestamp() - record["seen_at"] <= 86400
+        ):
+            items.append(
+                {
+                    "openid": record["openid"],
+                    "label": record["label"],
+                    "can_test": bool(record.get("event")),
+                }
+            )
+    return items[:100]
+
+
+def editor_test_event(app_id: str, openid: str):
+    """取得当前账号已确认归属且回复窗口有效的私聊事件。"""
+    record = _editor_contacts.get((app_id, "c2c", openid))
+    if (
+        not record
+        or not record.get("event")
+        or record["deadline"] <= datetime.now(timezone.utc)
+    ):
+        raise ValueError("请接收人先私聊当前机器人一条消息，再刷新接收人。")
+    return record["event"]
 
 
 def digest(value: Any) -> str:

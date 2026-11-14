@@ -1,3 +1,4 @@
+import re
 from urllib.parse import quote
 
 from fastapi import Query
@@ -43,6 +44,81 @@ def _loaded_metadata(runtime_module: str, module: str) -> tuple[str, str | None]
         str(getattr(metadata, "usage", "") or ""),
         str(getattr(metadata, "homepage", "") or "") or None,
     )
+
+
+def _loaded_commands(runtime_module: str, module: str) -> list[str]:
+    """读取插件已注册的字面量指令，主指令在前，别名与快捷指令在后
+
+    正则指令与带正则的快捷指令不列出；同一指令只保留一种指令前缀，
+    允许不带前缀时取不带前缀的写法。
+
+    参数:
+        runtime_module: 插件的完整模块路径
+        module: 插件模块名
+
+    返回:
+        list[str]: 指令，最多 100 个
+    """
+    from nonebot.rule import CommandRule, FullmatchRule, ShellCommandRule
+    from nonebot_plugin_alconna.matcher import AlconnaMatcher
+
+    def prefix(values) -> str:
+        texts = [value for value in values or [""] if isinstance(value, str)]
+        return "" if "" in texts or not texts else sorted(texts)[0]
+
+    config = nonebot.get_driver().config
+    start = prefix(config.command_start)
+    separator = prefix(config.command_sep) or "."
+    names = {runtime_module} if "." in runtime_module else {runtime_module, module}
+    primary: list[str] = []
+    extra: list[str] = []
+    for plugin in nonebot.get_loaded_plugins():
+        name = str(getattr(plugin, "module_name", ""))
+        if name not in names and not (
+            "." not in runtime_module and name.endswith(f".{module}")
+        ):
+            continue
+        matchers = sorted(
+            plugin.matcher,
+            key=lambda item: (
+                item.priority,
+                getattr(getattr(item, "_source", None), "lineno", None) or 0,
+            ),
+        )
+        for matcher in matchers:
+            if issubclass(matcher, AlconnaMatcher):
+                command = matcher.command()
+                head = command.command
+                if isinstance(head, str) and not head.startswith("re:"):
+                    primary.append(prefix(command.prefixes) + head)
+                try:
+                    shortcuts = command.get_shortcuts()
+                except Exception:
+                    shortcuts = []
+                for raw in shortcuts:
+                    key = re.sub(r"^\[[^\]]*\]", "", str(raw)).split(" ", 1)[0]
+                    if key and not re.search(r"[\\()\[\]{}|^$*+?]", key):
+                        extra.append(key)
+            for checker in matcher.rule.checkers:
+                rule = checker.call
+                if isinstance(rule, CommandRule | ShellCommandRule):
+                    for index, cmd in enumerate(rule.cmds):
+                        (extra if index else primary).append(
+                            start + separator.join(cmd)
+                        )
+                elif isinstance(rule, FullmatchRule):
+                    primary.extend(rule.msg)
+    result = []
+    for value in [*primary, *extra]:
+        if (
+            isinstance(value, str)
+            and value.strip()
+            and len(value) <= 1000
+            and value not in result
+            and not any(ord(c) < 32 for c in value)
+        ):
+            result.append(value)
+    return result[:100]
 
 
 class ApiDataSource:
@@ -154,6 +230,7 @@ class ApiDataSource:
                     else "该插件不由插件商店管理，请手动维护插件文件"
                 ),
                 usage=usage,
+                commands=_loaded_commands(runtime_module, plugin.module),
                 homepage=homepage,
                 management_source=management_source,
                 management_route=management_route,

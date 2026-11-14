@@ -208,11 +208,12 @@ def _record(
             raise ValueError("操作 ID 已绑定其他输入，请重新分析。")
         if reserve and old:
             return old
-        if reserve:
+        if reserve and record.get("action") != "card_test":
             for other_key, pending in records.items():
                 if (
                     other_key.startswith(app_id + ":")
                     and pending.get("state") == "running"
+                    and pending.get("action") != "card_test"
                 ):
                     raise HTTPException(
                         409,
@@ -258,6 +259,8 @@ def _targets(payload: dict, scope: str) -> dict:
 
 def _validate(action: str, payload: dict, before: dict) -> dict:
     value = deepcopy(payload)
+    if action == "card_test":
+        return value
     if action == "menu":
         return {"menu": validate_menu(value.get("menu", {}))}
     if action in {"create", "update"}:
@@ -337,12 +340,15 @@ async def _execute(
                 }
             return prior
         read_path = path.removesuffix("/target")
-        before = (
-            await _panel_list(app_id, request.payload.get("scope", ""))
-            if action == "create"
-            else await _call(app_id, "GET", read_path)
-        )
-        if digest(before) != request.expected_revision:
+        if action == "card_test":
+            before = {}
+        else:
+            before = (
+                await _panel_list(app_id, request.payload.get("scope", ""))
+                if action == "create"
+                else await _call(app_id, "GET", read_path)
+            )
+        if action != "card_test" and digest(before) != request.expected_revision:
             raise HTTPException(
                 409,
                 {
@@ -352,6 +358,10 @@ async def _execute(
             )
         try:
             payload = _validate(action, request.payload, before)
+            if action == "card_test":
+                from .presentation_editor import prepare_test
+
+                prepared = prepare_test(app_id, payload)
         except (TypeError, ValueError) as error:
             raise HTTPException(422, str(error)) from error
         record = {
@@ -372,6 +382,12 @@ async def _execute(
             raise HTTPException(409, str(error)) from error
         if previous:
             return previous
+        if action == "card_test":
+            from .presentation_editor import deliver_test
+
+            record.update(await deliver_test(prepared), updated_at=time.time())
+            await asyncio.to_thread(_record, app_id, request.operation_id, record)
+            return record
         method = {"create": "POST", "delete": "DELETE"}.get(action, "PUT")
         try:
             result = await _call(

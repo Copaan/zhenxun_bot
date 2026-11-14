@@ -64,6 +64,7 @@ class PluginInfo(BaseModel):
     uninstall_supported: bool = False
     uninstall_reason: str | None = None
     usage: str = ""
+    commands: list[str] = Field(default_factory=list)
     homepage: str | None = None
     management_source: str = "manual"
     management_route: str | None = None

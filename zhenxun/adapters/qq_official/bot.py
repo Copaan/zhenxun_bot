@@ -213,6 +213,12 @@ class ZhenxunQQBot(QQBot):
         参数:
             event: Event
         """
+        from .presentation import remember_editor_contact
+
+        try:
+            remember_editor_contact(self, event)
+        except Exception:
+            logger.warning("QQ 编辑器联系人暂存失败", "QQOfficial", target=self.self_id)
         try:
             await record_switch_event(self.self_id, event)
         except Exception as exc:
