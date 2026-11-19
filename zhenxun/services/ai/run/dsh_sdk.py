@@ -349,8 +349,11 @@ class SdkClient:
         home = str(cls.home_for(settings))
         if binding.get("sdk_home") not in {None, home}:
             raise DshUnavailable("SDK home 已变化，请显式选择此后端的会话。")
+        search = context.state.get("_dsh_chat_search") is True
         if not binding.get("native") and (
-            binding.get("inflight") or binding.get("quarantined")
+            binding.get("inflight")
+            or binding.get("quarantined")
+            or (binding.get("created") and bool(binding.get("chat_search")) != search)
         ):
             records.rotate_remote(binding)
         client = await cls.ensure(settings, binding["mode"])
@@ -368,6 +371,7 @@ class SdkClient:
         records.update(
             binding,
             sdk_home=home,
+            chat_search=search,
             inflight={
                 "boot": BOOT_ID,
                 "run_id": context.run.run_id,
@@ -388,6 +392,7 @@ class SdkClient:
                 "run_id": self.run_id,
                 "session_id": turn.binding["remote_id"],
                 "inherited": turn.binding["created"],
+                "chat_search": turn.binding.get("chat_search") is True,
                 "content": content,
                 "model": turn.binding.get("model")
                 if not turn.binding.get("created") and not turn.binding.get("inherited")

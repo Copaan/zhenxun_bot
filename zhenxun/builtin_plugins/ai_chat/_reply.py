@@ -741,6 +741,11 @@ def clean_output(text: str) -> str:
     return "\n".join(output).strip()
 
 
+def empty_reply_reason(raw: str) -> str:
+    """区分清理后的空回复是否仅含文本工具标记，不解释其参数。"""
+    return "tool_markup_only" if _DSML_TAG.search(raw) else "empty_reply"
+
+
 def _strip_dsml(text: str) -> str:
     """移除正文中的 DSML 调用及参数，不解析执行，保留独立代码示例。"""
     hidden = ""

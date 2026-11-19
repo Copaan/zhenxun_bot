@@ -38,7 +38,7 @@ from ._data_source import (
     SILENT,
     AIChatManager,
 )
-from ._reply import deliver, parse_silent
+from ._reply import deliver, delivery_target
 
 TASK_PLUGIN = "ai_chat"
 """主动任务在定时任务服务中的插件名"""
@@ -513,6 +513,7 @@ class AITasks:
         )
         context.run.history_metadata.update(schedule_id=task_id, creator=quota_id)
         delivery = turn.delivery
+        turn.target = delivery_target(bot, group_id, user_id)
 
         async def prepare_run():
             nonlocal setting, persona, agent
@@ -554,11 +555,7 @@ class AITasks:
         async def finalize(result, error=None, turn=turn, delivery=delivery):
             turn.result = result
             try:
-                reply = (
-                    parse_silent(str(result.output))
-                    if result and not result.stopped
-                    else None
-                )
+                reply = turn.resolve_reply(result, error)
                 sticker_id = None
                 if reply:
                     reply, sticker_id = split_sticker(reply)
@@ -578,7 +575,9 @@ class AITasks:
                     "sent",
                     "skipped",
                 }:
-                    await send_marked(context, sticker_id)
+                    if await send_marked(context, sticker_id):
+                        context.state["_chat_sticker_sent"] = True
+                        delivery.status = "sent"
             except BaseException as exc:
                 await turn.settle(exc)
                 raise

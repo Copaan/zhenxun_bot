@@ -31,6 +31,8 @@ export async function apply(ctx, config) {
   const restored = new WeakMap()
   const retries = new WeakMap()
   const expected = new Map()
+  const pendingSearch = new Set()
+  const searchAgents = new WeakSet()
   const endpoint = path.join(config.root, 'control.json')
   ctx.on('session/created', session => {
     const previous = selection(session.snapshotEvents())
@@ -39,7 +41,11 @@ export async function apply(ctx, config) {
   ctx.on('agent/created', async ({ agent }) => {
     if (agent.session.header.agentPreset && !['zhenxun-chat', 'sdk-native'].includes(agent.session.header.agentPreset)) throw new Error('Cannot preserve this SDK session preset')
     if (typeof agent.cancel !== 'function' || typeof agent.whenIdle !== 'function' || !agent.inbox?.remove || !agent.model?.select) throw new Error('Unsupported SDK Agent contract')
-    if (config.mode === 'chat') agent.ctx.tools.restrict({ allow: [] })
+    if (config.mode === 'chat') {
+      const search = pendingSearch.delete(agent.id)
+      agent.ctx.tools.restrict({ allow: search ? ['web_search'] : [] })
+      if (search) searchAgents.add(agent)
+    }
     const previous = restored.get(agent.session)
     if (previous) agent.model.select(previous)
     const target = expected.get(agent.id)
@@ -47,11 +53,19 @@ export async function apply(ctx, config) {
     if (!previous && !target && agent.model.current()) agent.model.select(agent.model.current())
   })
   if (config.mode === 'chat') {
-    ctx.tools.guard(() => 'Zhenxun ordinary chat cannot execute tools')
-    ctx.on('tools/execute', async () => { throw new Error('Zhenxun ordinary chat cannot execute tools') }, { prepend: true })
+    const allowed = exec => exec.name === 'web_search' && searchAgents.has(exec.agent)
+    ctx.tools.guard(exec => allowed(exec) ? undefined : 'Tool unavailable in Zhenxun chat')
+    ctx.on('tools/execute', async (exec, next) => {
+      if (!allowed(exec)) throw new Error('Tool unavailable in Zhenxun chat')
+      return next()
+    }, { prepend: true })
   }
   ctx.on('agent/pre-step', async (payload, next) => {
-    if (config.mode === 'chat' && ctx.tools.definitions(payload.agent).length) throw new Error('Unexpected chat tool exposure')
+    if (config.mode === 'chat') {
+      const defs = ctx.tools.definitions(payload.agent)
+      const search = searchAgents.has(payload.agent)
+      if (defs.length !== Number(search) || defs.some(d => d.name !== 'web_search')) throw new Error('Unexpected chat tool exposure')
+    }
     const active = payload.agent.model.current()
     if (active) Object.assign(payload.modelSelection, active)
     return next()
@@ -99,6 +113,13 @@ export async function apply(ctx, config) {
     if (!/^[a-zA-Z0-9_-]{1,128}$/.test(args.sessionId || '')) throw new Error('Invalid session identity')
     if (method === 'describe') return describe(args.sessionId)
     const agent = ctx.agents.get(args.sessionId)
+    if (method === 'chatSearch' && config.mode === 'chat') {
+      const enabled = args.enabled === true
+      if (agent && searchAgents.has(agent) !== enabled) throw new Error('Chat search policy changed; new session required')
+      if (enabled && !agent) pendingSearch.add(args.sessionId)
+      else pendingSearch.delete(args.sessionId)
+      return { enabled }
+    }
     if (method === 'prepare') {
       if (!args.model?.provider || !args.model?.model) throw new Error('Missing model selection')
       if (agent?.status === 'running') throw new Error('Session is running')

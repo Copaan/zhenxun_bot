@@ -108,13 +108,18 @@ class ReplyCapability(AbstractCapability):
     async def wrap_model_request(
         self, context, llm_context, handler: WrapModelRequestHandler
     ):
-        from ._reply import clean_output
+        from ._reply import clean_output, empty_reply_reason
         from ._safety import Safety
 
         response = await handler(llm_context)
         parts = response.content_parts
         text = "".join(p.text for p in parts if isinstance(p, TextPart))
-        safe, _ = Safety.filter_output(clean_output(text))
+        safe, blocked = Safety.filter_output(clean_output(text))
+        context.state.pop("_chat_reply_issue", None)
+        if blocked:
+            context.state["_chat_reply_issue"] = "output_blocked"
+        elif text and not safe:
+            context.state["_chat_reply_issue"] = empty_reply_reason(text)
         response.content_parts = ([TextPart(text=safe)] if safe else []) + [
             p for p in parts if not isinstance(p, TextPart)
         ]
@@ -182,13 +187,23 @@ async def record_run(
         )
     elif result is not None and result.stopped:
         status, message = "stopped", str(result.stopped)
-    elif proactive and result is not None and parse_silent(str(result.output)) is None:
+    elif context.state.get("_delivery", {}).get("reply_kind") == "silent" or (
+        "reply_kind" not in context.state.get("_delivery", {})
+        and proactive
+        and result is not None
+        and parse_silent(str(result.output)) is None
+    ):
         status = "silent"
     from zhenxun.services.ai.run.session import session_manager
 
     if context.run.outcome and context.run.outcome != "completed":
         # failed 只表示投递失败，执行失败记为 error
         status = "error" if context.run.outcome == "failed" else context.run.outcome
+        if (
+            not message
+            and context.state.get("_delivery", {}).get("reply_kind") == "failure"
+        ):
+            message = context.run.user_notice or "模型没有返回有效正文。"
     try:
         from ._safety import Safety
 

@@ -10,6 +10,7 @@ from typing import Any
 from zhenxun.configs.config import Config
 from zhenxun.models.ai_chat_group import AIChatGroup
 from zhenxun.models.ai_persona import AIPersona
+from zhenxun.services.ai.config import get_llm_config
 from zhenxun.services.ai.core.exceptions import LLMException, ToolFatalError
 from zhenxun.services.ai.core.messages import TextPart
 from zhenxun.services.ai.core.models import CancellationToken
@@ -59,6 +60,20 @@ def dsh_settings() -> DshSettings:
         DshSettings: dsh 执行器设置
     """
     return DshSettings(**(Config.get_config(MODULE, "DSH") or {}))
+
+
+def chat_search_hint(enabled: bool) -> str:
+    """说明普通 DSH 会话本轮实际可用的搜索和回复方式。"""
+    search = (
+        "遇到陌生的具体事物、时效性问题或需要核实的事实，先用实际注册的 "
+        "web_search 搜索，再依据查到的资料回答。普通闲聊不必搜索。"
+        if enabled
+        else "本轮没有联网工具；无法核实的内容要说明，不要假称已查询。"
+    )
+    return (
+        search
+        + "只用实际提供的工具接口，不把调用写进正文。直接用文字回复，无需调用发送工具。"
+    )
 
 
 async def dsh_mode(context: RunContext, persona: AIPersona | None) -> str:
@@ -130,7 +145,7 @@ async def _run_dsh(
     from zhenxun.services.ai.run.hitl import HITLController
 
     from ._attachments import collect_export, export_instruction, export_slot
-    from ._reply import clean_output
+    from ._reply import clean_output, empty_reply_reason
     from ._safety import Safety
 
     session_id = context.session_id or ""
@@ -221,6 +236,17 @@ async def _run_dsh(
                 if before_run:
                     await before_run()
                 settings = dsh_settings()
+                search = (
+                    settings.transport == "sdk"
+                    and binding["mode"] == "chat"
+                    and get_llm_config().web_search.mode in {"auto", "native"}
+                    and (
+                        not selected
+                        or selected.tools is None
+                        or "web_search" in selected.tools
+                    )
+                )
+                context.state["_dsh_chat_search"] = search
                 persona_key = (
                     f"{selected.id}:{selected.updated_at.isoformat()}"
                     if selected
@@ -309,6 +335,11 @@ async def _run_dsh(
                     blocks.append({"type": "text", "text": _time_prompt(context)})
                     if hint := context.run.dynamic_prompts.get("proactive"):
                         blocks.append({"type": "text", "text": hint})
+                    if binding["mode"] == "chat":
+                        guidance = chat_search_hint(search)
+                        if context.run.source in {"qq", "webui"}:
+                            guidance += "本轮是直接向你提问，不是邀请你判断是否插话。"
+                        blocks.append({"type": "text", "text": guidance})
                 blocks += await content_blocks(
                     prepared, native=bool(binding.get("native"))
                 )
@@ -326,7 +357,11 @@ async def _run_dsh(
                         )
                     raw, usage, reason = await DshRuntime.prompt(remote, blocks)
                     settling = True
+                    diagnostics = context.run.operations.setdefault("dsh", {})
+                    diagnostics["end_reason"] = reason
                     text, blocked = Safety.filter_output(clean_output(raw))
+                    diagnostics["raw_chars"] = len(raw)
+                    diagnostics["filtered_chars"] = len(text)
                     if slot and not blocked:
                         text = collect_export(context, slot, text)
                 if backend:
@@ -336,6 +371,10 @@ async def _run_dsh(
                         "chat_final": True,
                     }
                     await backend.add_messages(session_id, [assistant])
+                if blocked:
+                    context.state["_chat_reply_issue"] = "output_blocked"
+                elif not text and raw:
+                    context.state["_chat_reply_issue"] = empty_reply_reason(raw)
                 result = AgentRunResult(output=text, usage=usage)
             except BaseException as error:
                 from zhenxun.services.ai.run.dsh_desktop import DshUnavailable
@@ -381,13 +420,14 @@ async def _run_dsh(
                         await DshRuntime.release(remote)
                 raise
             try:
-                context.run.outcome = "completed"
+                context.run.outcome = result.outcome
                 if finalize:
                     await finalize(result, None)
                 delivery = context.state.get("_delivery", {})
                 attachment = delivery.get("attachment")
                 clean = (
                     delivery.get("status") == "sent"
+                    and result.outcome == "completed"
                     and not delivery.get("uncertain")
                     and (
                         attachment.get("status") == "sent"

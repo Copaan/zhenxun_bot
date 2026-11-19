@@ -207,7 +207,6 @@ async def _run(
         bind_source,
     )
     from zhenxun.builtin_plugins.ai_chat._data_source import AIChatManager
-    from zhenxun.builtin_plugins.ai_chat._reply import parse_silent
     from zhenxun.builtin_plugins.ai_chat._runner import (
         agent_runner,
         run_dsh,
@@ -320,10 +319,11 @@ async def _run(
         if finalized:
             return
         finalized = True
-        turn.result = result
-        output = parse_silent(str(result.output)) if result else None
-        if not output and not isinstance(
-            error, asyncio.CancelledError | ControlFlowExit
+        output = turn.resolve_reply(result, error)
+        if (
+            turn.reply_kind == "failure"
+            and not turn.tool_texts
+            and not turn.report(error)["uncertain"]
         ):
             output = (
                 context.run.user_notice
@@ -363,6 +363,7 @@ async def _run(
             "type": "done",
             "run_id": turn.run_id,
             "outcome": context.run.outcome,
+            "reply_kind": turn.reply_kind,
             "phase": context.run.phase,
             "duration": int((time.monotonic() - turn.started) * 1000),
             "output": output,

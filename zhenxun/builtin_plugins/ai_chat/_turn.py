@@ -18,7 +18,7 @@ from zhenxun.services.log import logger
 
 from ._agent import record_run, start_run
 from ._data_source import MODULE
-from ._reply import DeliveryResult
+from ._reply import DeliveryResult, delivery_target, parse_silent
 
 FAILED_NOTICE = "这次回复没有完成，请稍后再试。"
 """回复失败且人设没有设置失败提示时的提示语"""
@@ -71,6 +71,10 @@ class ChatTurn:
         self.started, self.started_at = time.monotonic(), time.time()
         self.result: Any = None
         self.delivery = DeliveryResult()
+        self.reply_kind = "skipped"
+        self.target = delivery_target(
+            context.get_bot(), context.get_group_id(), context.get_user_id()
+        )
         self._task: asyncio.Task | None = None
         context.run.history_metadata = {
             "chat_run": self.run_id,
@@ -103,10 +107,56 @@ class ChatTurn:
         """本轮通过发送工具发出的文本"""
         return [
             entry["text"]
-            for record in self.context.run.operations.get("deliveries", {}).values()
-            for entry in record["entries"]
+            for entry in self.context.run.operations.get("deliveries", {})
+            .get(self.target, {})
+            .get("entries", [])
             if entry["origin"] == "tool"
         ]
+
+    def resolve_reply(self, result, error: BaseException | None = None) -> str | None:
+        """按运行结果和当前目标的发送收据判定回复，不在这里执行投递。"""
+        from zhenxun.services.ai.core.exceptions import ControlFlowExit
+
+        self.result = result
+        run = self.context.run
+        if isinstance(error, asyncio.CancelledError | ControlFlowExit) or (
+            result and result.stopped
+        ):
+            self.reply_kind = "skipped"
+            return None
+        if error is not None or result is None:
+            self.reply_kind = "failure"
+            return None
+        text = str(result.output or "")
+        issue = self.context.state.get("_chat_reply_issue")
+        if (reply := parse_silent(text)) and issue != "output_blocked":
+            self.reply_kind = "answer"
+            return reply
+        if self.tool_texts:
+            self.reply_kind = "tool_reply"
+            return None
+        issue = result.reason or issue
+        if not issue and (
+            self.source == "interject" or (self.source == "task" and text.strip())
+        ):
+            self.reply_kind = "silent"
+            return None
+        self.reply_kind = "failure"
+        if run.outcome in {None, "completed"} and result.outcome == "completed":
+            run.outcome = result.outcome = "failed"
+            result.reason = issue or "empty_reply"
+            if "dsh" in run.operations:
+                run.operations["dsh"]["reply_issue"] = result.reason
+            run.user_notice = (
+                run.user_notice
+                or (text if issue == "output_blocked" else None)
+                or (
+                    "这次模型只返回了文本形式的工具调用，没有可发送的回答。"
+                    if issue == "tool_markup_only"
+                    else "这次模型没有返回可发送的正文。"
+                )
+            )
+        return None
 
     def report(self, error: BaseException | None = None) -> dict:
         """汇总投递结果：本轮回复（含失败提示）确认送达时为已送达，出错前只由发送工具
@@ -122,7 +172,8 @@ class ChatTurn:
         operations = self.context.run.operations
         if attachment := operations.get("attachment"):
             report["attachment"] = dict(attachment)
-        records = list(operations.get("deliveries", {}).values())
+        record = operations.get("deliveries", {}).get(self.target)
+        records = [record] if record else []
         entries = [entry for record in records for entry in record["entries"]]
         report["text"] = "\n".join(
             [entry["text"] for entry in entries] if entries else self.delivery.parts
@@ -159,16 +210,33 @@ class ChatTurn:
         report["contributors"] = sorted(
             {entry["agent"] for entry in entries if entry["agent"]}
         )
-        from ._reply import parse_silent
-
+        report["reply_kind"] = (
+            "tool_reply"
+            if self.tool_texts
+            and self.reply_kind == "answer"
+            and not self.delivery.parts
+            and report["deduplicated"]
+            else self.reply_kind
+        )
+        if self.reply_kind == "failure" and self.result:
+            report["reply_issue"] = self.result.reason
         report["effective_reply"] = bool(
             self.tool_texts
             or (
-                self.delivery.parts
-                and self.result
-                and not self.result.stopped
-                and parse_silent(str(self.result.output))
+                self.reply_kind == "answer"
+                and (
+                    self.delivery.parts or self.context.state.get("_chat_sticker_sent")
+                )
             )
+            or (attachment and attachment.get("status") == "sent")
+        )
+        report["chargeable_reply"] = (
+            self.source == "qq"
+            and not error
+            and self.context.run.outcome == "completed"
+            and report["effective_reply"]
+            and report["status"] == "sent"
+            and not report["uncertain"]
         )
         return report
 
@@ -198,7 +266,7 @@ class ChatTurn:
         )
 
         from ._data_source import AIChatManager
-        from ._reply import clean_output, parse_silent, send_reply
+        from ._reply import send_reply
         from ._stickers import send_marked, split_sticker
 
         self.result = value
@@ -207,6 +275,7 @@ class ChatTurn:
         directed = self.source != "interject"
         custom = persona.error_message if persona else None
         if error is not None:
+            self.resolve_reply(value, error)
             if isinstance(error, RunInterrupted):
                 if not self.report(error).get(
                     "uncertain"
@@ -243,6 +312,7 @@ class ChatTurn:
             from ._attachments import send_export
 
             await send_export(context, payload, delivery)
+            self.reply_kind = "answer" if delivery.status == "sent" else "failure"
             if delivery.status == "failed":
                 await send_reply(
                     "附件未发送：" + (delivery.error or "平台拒绝了上传"),
@@ -253,10 +323,13 @@ class ChatTurn:
             return
         if context.run.operations.get("attachment", {}).get("name"):
             return
-        reply = parse_silent(str(value.output))
-        empty = not clean_output(str(value.output)).strip()
-        if empty and directed and not self.tool_texts:
-            reply = custom or "这次没能整理出有效回复，请再试一次。"
+        reply = self.resolve_reply(value)
+        if self.reply_kind == "failure" and directed and not self.report()["uncertain"]:
+            reply = (
+                context.run.user_notice
+                or custom
+                or "这次没能整理出有效回复，请再试一次。"
+            )
         sticker_id = None
         if reply:
             reply, sticker_id = split_sticker(reply)
@@ -269,7 +342,9 @@ class ChatTurn:
         else:
             delivery.status = "skipped"
         if sticker_id is not None and delivery.status in {"sent", "skipped"}:
-            await send_marked(context, sticker_id)
+            if await send_marked(context, sticker_id):
+                context.state["_chat_sticker_sent"] = True
+                delivery.status = "sent"
 
     async def settle(
         self, error: BaseException | None = None, after: AfterSettle | None = None

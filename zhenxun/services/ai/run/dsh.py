@@ -1076,13 +1076,18 @@ class DshRuntime:
         if kind == "assistant/message":
             message = data.get("message") or {}
             message_id = message.get("id")
-            if not message_id or message_id in turn.responses:
+            if not message_id:
                 return None
-            turn.responses[message_id] = "".join(
+            text = "".join(
                 str(p.get("text") or "")
                 for p in message.get("content") or []
                 if p.get("type") == "text"
             )
+            if message_id in turn.responses:
+                if not turn.responses[message_id].strip() and text.strip():
+                    turn.responses[message_id] = text
+                return None
+            turn.responses[message_id] = text
             counts = data.get("usage") or {}
             cached = int(counts.get("cacheReadTokens") or 0)
             prompt = int(counts.get("inputTokens") or 0) + cached

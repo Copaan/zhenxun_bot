@@ -836,11 +836,15 @@ class AIChatManager:
         async def after(report, error):
             if proactive is not None:
                 Proactive.spend(group_id or "", turn.tokens)
-                if report["text"]:
+                if report["effective_reply"]:
                     Proactive.sent(bot.self_id, group_id or "")
-                elif turn.delivery.status not in {"skipped", "pending"} or error:
+                elif (
+                    turn.reply_kind == "failure"
+                    or turn.delivery.status not in {"skipped", "pending"}
+                    or error
+                ):
                     Proactive.failed(bot.self_id, group_id or "")
-            elif turn.result and not turn.result.stopped and report["text"]:
+            elif report["chargeable_reply"]:
                 if cost := int(Config.get_config(MODULE, "COST_GOLD") or 0):
                     try:
                         await UserConsole.reduce_gold(

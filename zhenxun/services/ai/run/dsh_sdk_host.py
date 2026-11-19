@@ -21,7 +21,7 @@ import yaml
 
 LIMIT = 8 * 1024 * 1024
 SDK_API_BASE = "https://api.deepseek.com/anthropic"
-SDK_CONNECTION_REVISION = 2
+SDK_CONNECTION_REVISION = 3
 SHELL_TIMEOUT = {"timeoutMs": 300_000, "maxTimeoutMs": 1_800_000}
 
 
@@ -389,7 +389,7 @@ class Worker:
                 json.dumps(
                     {
                         key: params.get(key)
-                        for key in ("session_id", "content", "model")
+                        for key in ("session_id", "content", "model", "chat_search")
                     },
                     sort_keys=True,
                 ).encode()
@@ -402,6 +402,14 @@ class Worker:
             state = await self.control("state", {"sessionId": session_id})
             if state.get("running") or state.get("queue"):
                 raise ValueError("SDK 会话仍有任务；不会追加或重放输入。")
+            if self.mode == "chat":
+                await self.control(
+                    "chatSearch",
+                    {
+                        "sessionId": session_id,
+                        "enabled": params.get("chat_search") is True,
+                    },
+                )
             if params.get("inherited") and session_id not in self.loaded:
                 await self.rpc("session/resume", {"sessionId": session_id})
                 self.loaded.add(session_id)
