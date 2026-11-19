@@ -32,17 +32,24 @@ export async function apply(ctx, config) {
   const retries = new WeakMap()
   const expected = new Map()
   const pendingSearch = new Set()
-  const searchAgents = new WeakSet()
+  const searchAgents = new WeakMap()
   const restrictions = new WeakMap()
   function restrictChat(agent, search) {
-    search = search && ctx.tools.definitions().some(d=>d.name==='web_search')
-    const next = agent.ctx.tools.restrict({allow:search ? ['web_search'] : []})
+    const native = search ? ctx.tools.get('web_search') : undefined
+    if (restrictions.has(agent) && searchAgents.get(agent) === native) return
+    const next = agent.ctx.tools.restrict({allow:native ? ['web_search'] : []})
     restrictions.get(agent)?.()
     restrictions.set(agent,next)
-    if (search) searchAgents.add(agent); else searchAgents.delete(agent)
+    if (native) searchAgents.set(agent,native); else searchAgents.delete(agent)
   }
   const bridge = chatTools(ctx)
   const armed = new Map()
+  ctx.on('agent/inbox/claimed', ({agent, message, turn}) => {
+    const lease = armed.get(agent.id)?.lease
+    if (lease && message.source?.kind === 'user') {
+      agent.session.append('zhenxun/input-claimed', {turn, messageId:message.id, runId:lease.runId, requestId:lease.requestId})
+    }
+  })
   const endpoint = path.join(config.root, 'control.json')
   ctx.on('session/created', session => {
     const previous = selection(session.snapshotEvents())
@@ -64,7 +71,7 @@ export async function apply(ctx, config) {
     if (!previous && !target && agent.model.current()) agent.model.select(agent.model.current())
   })
   if (config.mode === 'chat') {
-    const allowed = exec => bridge.has(exec.agent,exec.name) || (exec.name === 'web_search' && searchAgents.has(exec.agent))
+    const allowed = exec => bridge.has(exec.agent,exec.name) || (exec.name === 'web_search' && searchAgents.has(exec.agent) && ctx.tools.get(exec.name,exec.agent) === searchAgents.get(exec.agent))
     ctx.tools.guard(exec => allowed(exec) ? undefined : 'Tool unavailable in Zhenxun chat')
     ctx.on('tools/execute', async (exec, next) => {
       if (!allowed(exec)) throw new Error('Tool unavailable in Zhenxun chat')
@@ -84,9 +91,9 @@ export async function apply(ctx, config) {
     }
     bridge.bind(payload.agent,payload.turn,lease)
     if (config.mode === 'chat') {
-      const defs = ctx.tools.definitions(payload.agent).filter(d=>!bridge.has(payload.agent,d.name))
       const search = searchAgents.has(payload.agent)
-      if (defs.length !== Number(search) || defs.some(d => d.name !== 'web_search')) throw new Error('Unexpected chat tool exposure')
+      const conflict = search && ctx.tools.get('web_search',payload.agent) !== searchAgents.get(payload.agent) ? ['web_search'] : []
+      bridge.verify(payload.agent, search ? ['web_search'] : [], conflict)
     }
     const active = payload.agent.model.current()
     if (active) Object.assign(payload.modelSelection, active)
@@ -150,7 +157,7 @@ export async function apply(ctx, config) {
     if (method === 'chatSearch' && config.mode === 'chat') {
       const enabled = args.enabled === true
       if (agent?.status==='running') throw new Error('Session not idle')
-      if (agent && searchAgents.has(agent) !== enabled) restrictChat(agent,enabled)
+      if (agent) restrictChat(agent,enabled)
       if (enabled && !agent) pendingSearch.add(args.sessionId)
       else pendingSearch.delete(args.sessionId)
       return { enabled }

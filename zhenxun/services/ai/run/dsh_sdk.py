@@ -360,7 +360,6 @@ class SdkClient:
         home = str(cls.home_for(settings))
         if binding.get("sdk_home") not in {None, home}:
             raise DshUnavailable("SDK home 已变化，请显式选择此后端的会话。")
-        search = context.state.get("_dsh_chat_search") is True
         if not binding.get("native") and (
             binding.get("inflight") or binding.get("quarantined")
         ):
@@ -380,7 +379,6 @@ class SdkClient:
         records.update(
             binding,
             sdk_home=home,
-            chat_search=search,
             inflight={
                 "boot": BOOT_ID,
                 "run_id": context.run.run_id,
@@ -402,7 +400,6 @@ class SdkClient:
                 "run_id": self.run_id,
                 "session_id": turn.binding["remote_id"],
                 "inherited": turn.binding["created"],
-                "chat_search": turn.binding.get("chat_search") is True,
                 "content": content,
                 "bridge": bridge_lease(turn),
                 "model": turn.binding.get("model")
@@ -439,13 +436,7 @@ class SdkClient:
                 ):
                     continue
                 event = params.get("event") or {}
-                data = event.get("data") or {}
-                if (
-                    event.get("type") == "user/message"
-                    and (data.get("message") or data).get("id") == self.message_id
-                ):
-                    turn.admitted = True
-                outcome = DshRuntime.consume(turn, event)
+                outcome = DshRuntime.consume(turn, event, message_id=self.message_id)
                 if outcome is not None:
                     if outcome != "completed":
                         raise RunInterrupted("SDK 本轮未完成")

@@ -410,6 +410,7 @@ class _Turn:
     responses: dict[str, str] = field(default_factory=dict)
     remote_turn: int | None = None
     admitted: bool = False
+    terminal_received: bool = False
     stop_confirmation: str = "not_requested"
     revoked: bool = False
     pending: set = field(default_factory=set)
@@ -602,9 +603,9 @@ class DshRuntime:
         if name == "web_search" and execution_mode == "chat":
             from zhenxun.services.ai.config import get_llm_config
 
-            if not context.state.get(
-                "_dsh_search_allowed"
-            ) or get_llm_config().web_search.mode not in {"native", "auto"}:
+            if context.state.get("_dsh_search_source") != "native" or (
+                get_llm_config().web_search.mode not in {"native", "auto"}
+            ):
                 raise DshUnavailable("本轮未授权桌面原生搜索")
         elif name and name not in TOOLS[execution_mode]:
             raise DshUnavailable("工具未授权")
@@ -1020,20 +1021,43 @@ class DshRuntime:
             DshSessions.for_binding(turn.binding).update(turn.binding, model=selected)
 
     @staticmethod
-    def consume(turn: _Turn, event: dict) -> str | None:
+    def consume(
+        turn: _Turn, event: dict, *, message_id: str | None = None
+    ) -> str | None:
         seq = event.get("seq")
-        if not isinstance(seq, int) or seq in turn.seen:
+        if turn.terminal_received or not isinstance(seq, int) or seq in turn.seen:
             return None
         turn.seen.add(seq)
         data, kind = event.get("data") or {}, event.get("type")
+        if kind == "turn/start":
+            if not turn.admitted:
+                turn.remote_turn = data.get("turn")
+            return None
+        if kind == "zhenxun/input-claimed":
+            if (
+                data.get("runId") == turn.context.run.run_id
+                and data.get("requestId") == turn.request_id
+                and type(data.get("turn")) is int
+                and data["turn"] == turn.remote_turn
+                and (message_id is None or data.get("messageId") == message_id)
+            ):
+                turn.admitted = True
+            return None
         if (
             kind == "user/message"
-            and (data.get("source") or {}).get("rpcId") == turn.request_id
+            and message_id is None
+            and turn.remote_turn is not None
         ):
-            turn.admitted = True
-        if kind == "turn/start":
-            turn.remote_turn = data.get("turn")
+            message = data.get("message") or data
+            if (message.get("source") or {}).get("rpcId") == turn.request_id:
+                turn.admitted = True
         if not turn.admitted or data.get("turn") not in {None, turn.remote_turn}:
+            return None
+        if kind in {"zhenxun/tool-mismatch", "zhenxun/tool-shadowed"}:
+            turn.context.run.operations.setdefault("dsh", {})[kind.split("/")[1]] = {
+                key: [n[:120] for n in data.get(key, []) if isinstance(n, str)][:64]
+                for key in ("missing", "extra", "conflict")
+            }
             return None
         if kind == "request/header":
             header = data.get("header") or {}
@@ -1124,7 +1148,15 @@ class DshRuntime:
             turn.usage.total_tokens += int(counts.get("totalTokens") or prompt + output)
             turn.context.run.budget["tokens"] = turn.usage.total_tokens
         if kind == "turn/end":
-            return (data.get("reason") or {}).get("kind", "unknown")
+            if data.get("turn") is None or data["turn"] != turn.remote_turn:
+                return None
+            turn.terminal_received = True
+            reason = data.get("reason") or {}
+            if (reason.get("error") or {}).get(
+                "message"
+            ) == "Zhenxun tool manifest mismatch":
+                raise DshUnavailable("本轮工具配置不一致，未生成回复。")
+            return reason.get("kind", "unknown")
         return None
 
     @classmethod
@@ -1190,7 +1222,11 @@ class DshRuntime:
             and turn.context.run.cancellation_token.reason == "cancelled"
         )
         try:
-            if native and not explicit:
+            if turn.terminal_received:
+                turn.stop_confirmation = (
+                    "foreground_confirmed" if native else "confirmed"
+                )
+            elif native and not explicit:
                 state = await asyncio.wait_for(
                     turn.client.rpc(
                         "session/state", {"sessionId": turn.binding["remote_id"]}

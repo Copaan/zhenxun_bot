@@ -9,7 +9,6 @@ from nonebot import get_driver
 
 from zhenxun.services.ai.capabilities.base import CombinedCapability
 from zhenxun.services.ai.capabilities.builtin import default_capabilities
-from zhenxun.services.ai.config import get_llm_config
 from zhenxun.services.ai.core.messages import ImagePart, TextPart, ToolCallPart
 from zhenxun.services.ai.run.context import set_run_context
 from zhenxun.services.ai.tools.engine.executor import ToolExecutor
@@ -23,6 +22,14 @@ IMAGE_LIMIT = 8 * 1024 * 1024
 """单次工具结果中图片的总大小上限"""
 RESULT_LIMIT = 16 * 1024 * 1024
 """一轮内桥接工具结果的总大小上限"""
+EXECUTOR_TOOL_NAMES = {
+    "run_code",
+    "ask_user_question",
+    "zx_list",
+    "zx_read",
+    "zx_write",
+}
+"""执行端保留或自带的工具名，同名工具不桥接"""
 
 
 class ChatToolBridge:
@@ -54,9 +61,11 @@ class ChatToolBridge:
         返回:
             bool: 是否桥接
         """
-        if getattr(tool, "execution_side", None) != "client" or (
-            tool.metadata or {}
-        ).get("delegates"):
+        if (
+            getattr(tool, "execution_side", None) != "client"
+            or (tool.metadata or {}).get("delegates")
+            or tool.name in EXECUTOR_TOOL_NAMES
+        ):
             return False
         if tool.name not in self.context.state.get(AGENT_TOOLS_KEY, ()):
             return True
@@ -230,9 +239,7 @@ def bridge_lease(turn) -> dict | None:
         "runId": turn.context.run.run_id,
         "token": turn.token,
         "definitions": bridge.definitions,
-        "searchMode": get_llm_config().web_search.mode
-        if bridge.context.state.get("_dsh_search_allowed", True)
-        else "off",
+        "searchMode": bridge.context.state.get("_dsh_search_source", "off"),
     }
 
 

@@ -21,7 +21,7 @@ import yaml
 
 LIMIT = 8 * 1024 * 1024
 SDK_API_BASE = "https://api.deepseek.com/anthropic"
-SDK_CONNECTION_REVISION = 4
+SDK_CONNECTION_REVISION = 6
 SHELL_TIMEOUT = {"timeoutMs": 300_000, "maxTimeoutMs": 1_800_000}
 
 
@@ -385,11 +385,14 @@ class Worker:
     async def prompt(self, params):
         async with self.lock:
             run_id = params["run_id"]
+            bridge = params.get("bridge") or {}
             signature = hashlib.sha256(
                 json.dumps(
                     {
-                        key: params.get(key)
-                        for key in ("session_id", "content", "model", "chat_search")
+                        "search": bridge.get("searchMode", "off"),
+                        "session_id": params["session_id"],
+                        "content": params["content"],
+                        "model": params.get("model"),
                     },
                     sort_keys=True,
                 ).encode()
@@ -407,7 +410,7 @@ class Worker:
                     "chatSearch",
                     {
                         "sessionId": session_id,
-                        "enabled": params.get("chat_search") is True,
+                        "enabled": bridge.get("searchMode") == "native",
                     },
                 )
             if params.get("inherited") and session_id not in self.loaded:
@@ -437,7 +440,7 @@ class Worker:
             }
             self.runs[run_id] = run
             self.save_receipts()
-            if bridge := params.get("bridge"):
+            if bridge:
                 await self.control(
                     "bridgeArm", {"sessionId": session_id, "lease": bridge}
                 )

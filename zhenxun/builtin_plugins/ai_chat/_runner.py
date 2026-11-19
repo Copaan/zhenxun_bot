@@ -10,7 +10,6 @@ from typing import Any
 from zhenxun.configs.config import Config
 from zhenxun.models.ai_chat_group import AIChatGroup
 from zhenxun.models.ai_persona import AIPersona
-from zhenxun.services.ai.config import get_llm_config
 from zhenxun.services.ai.core.exceptions import LLMException, ToolFatalError
 from zhenxun.services.ai.core.messages import TextPart, UsageInfo
 from zhenxun.services.ai.core.models import CancellationToken
@@ -242,17 +241,12 @@ async def _run_dsh(
                     or selected.tools is None
                     or "web_search" in selected.tools
                 )
-                native_search = search_allowed and get_llm_config().web_search.mode in {
-                    "auto",
-                    "native",
-                }
-                search = (
-                    settings.transport == "sdk"
-                    and binding["mode"] == "chat"
-                    and native_search
+                from zhenxun.services.ai.tools.providers.builtin.web import (
+                    dsh_search_source,
                 )
-                context.state["_dsh_chat_search"] = search
-                context.state["_dsh_search_allowed"] = search_allowed
+
+                source = dsh_search_source(search_allowed, binding["mode"])
+                context.state["_dsh_search_source"] = source
                 persona_key = (
                     f"{selected.id}:{selected.updated_at.isoformat()}"
                     if selected
@@ -299,6 +293,9 @@ async def _run_dsh(
                 bridge = ChatToolBridge(AIChatManager.get_agent(selected), context)
                 context.state["_dsh_chat_tools"] = bridge
                 await bridge.prepare()
+                if source == "api" and "web_search" not in bridge.identities:
+                    source = context.state["_dsh_search_source"] = "off"
+                context.run.operations.setdefault("dsh", {})["search_source"] = source
                 media_usage = UsageInfo()
 
                 def record_media_usage(usage):
@@ -336,9 +333,12 @@ async def _run_dsh(
                 blocks = []
                 persona_text = AIChatManager.build_instruction(selected)
                 stamp = hashlib.sha256(
-                    (binding["remote_id"] + "\0" + persona_text).encode()
+                    "\0".join(
+                        (binding["remote_id"], persona_text, bridge.instructions)
+                    ).encode()
                 ).hexdigest()
-                if new or binding.get("applied_persona") != stamp:
+                refresh = new or binding.get("applied_persona") != stamp
+                if refresh:
                     blocks.append(
                         {
                             "type": "text",
@@ -368,14 +368,14 @@ async def _run_dsh(
                     if hint := context.run.dynamic_prompts.get("proactive"):
                         blocks.append({"type": "text", "text": hint})
                     if binding["mode"] == "chat":
-                        guidance = chat_search_hint(
-                            native_search or "web_search" in bridge.identities
-                        )
+                        guidance = chat_search_hint(source != "off")
+                        if source != "off" and "web_fetch" not in bridge.identities:
+                            guidance += "搜索摘要不等于网页正文，不要声称已读取原文。"
                         if context.run.source in {"qq", "webui"}:
                             guidance += "本轮是直接向你提问，不是邀请你判断是否插话。"
                         blocks.append({"type": "text", "text": guidance})
                 blocks += input_blocks
-                if bridge.instructions:
+                if bridge.instructions and (refresh or not binding.get("native")):
                     blocks.insert(
                         0,
                         {
@@ -448,7 +448,7 @@ async def _run_dsh(
                 if isinstance(error, asyncio.TimeoutError):
                     context.run.outcome = "timeout"
                     context.run.user_notice = (
-                        f"DSH 本轮执行超过 {int(timeout)} 秒，已停止。"
+                        f"DSH 本轮执行超过 {int(timeout)} 秒，已结束本地等待。"
                         "等待确认的时间不计入，可在 DSH 连接设置中调整单轮超时。"
                     )
                 elif (

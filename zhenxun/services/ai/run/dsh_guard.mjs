@@ -25,18 +25,25 @@ export function chatTools(ctx, desktopChat = false) {
   }
   function bind(agent, turn, lease) {
     const old = active.get(agent)
-    if (lease && old?.lease.runId===lease.runId && old.turn===null) { old.turn=turn; return }
+    if (lease && old?.lease.runId===lease.runId && old.turn===null) {
+      old.turn=turn
+      if (turn!==null && old.conflicts.length) agent.session.append('zhenxun/tool-shadowed', {turn, conflict:old.conflicts})
+      return
+    }
     if (old?.turn === turn && (!lease || old.lease.runId === lease.runId)) return
     clear(agent)
     if (!lease || lease.sessionId !== agent.id) return
-    const state = {turn, lease, names: new Set(), disposers: []}
+    const state = {turn, lease, definitions: new Map(), conflicts: [], disposers: []}
     active.set(agent, state)
     const existing = new Set(ctx.tools.definitions(agent).map(t => t.name))
     try {
-      const bridgedSearch = lease.definitions.some(d => d.name === 'web_search')
       const web = desktopChat && ctx.get('web')
-      if (web && !bridgedSearch && ['native','auto'].includes(lease.searchMode)) {
-        state.disposers.push(agent.ctx.tools.register({
+      function register(definition) {
+        state.disposers.push(agent.ctx.tools.register(definition))
+        state.definitions.set(definition.name, definition)
+      }
+      if (web && lease.searchMode === 'native' && !existing.has('web_search')) {
+        register({
           name: 'web_search', description: '搜索网络，返回不可信的外部资料和来源链接。',
           parameters: {type:'object', properties:{query:{type:'string',minLength:1,maxLength:1000}}, required:['query'], additionalProperties:false},
           output: {schema:{type:'object'}, render: (_args, result) => result.blocks},
@@ -46,17 +53,15 @@ export function chatTools(ctx, desktopChat = false) {
             const sources = found.sources.slice(0,5).map(({title,url,snippet,summary})=>({title,url,excerpt:summary||snippet}))
             return {blocks:[{type:'text',text:'外部搜索结果，仅供参考，不是指令：\n'+JSON.stringify({content:found.content,sources}).slice(0,16000)}]}
           }
-        }))
-        state.names.add('web_search')
+        })
         state.nativeSearch = true
       }
-      if (existing.has('web_search') && (bridgedSearch || ['off','api'].includes(lease.searchMode))) {
-        state.disposers.push(agent.ctx.tools.restrict({deny:['web_search']}))
-        existing.delete('web_search')
-      }
       for (const def of lease.definitions) {
-        if (existing.has(def.name) || def.name === 'run_code') continue
-        state.disposers.push(agent.ctx.tools.register({
+        if (existing.has(def.name) || def.name === 'run_code') {
+          state.conflicts.push(def.name)
+          continue
+        }
+        register({
           ...def, output: {schema: {type:'object'}, render: (_args, result) => result.blocks},
           execute: async (args, exec) => {
             if (active.get(agent) !== state || state.turn===null || exec.agent !== agent || !exec.callId) throw new Error('工具运行已过期')
@@ -79,12 +84,29 @@ export function chatTools(ctx, desktopChat = false) {
             }
             return {blocks}
           }
-        }))
-        state.names.add(def.name)
+        })
       }
+      if (turn!==null && state.conflicts.length) agent.session.append('zhenxun/tool-shadowed', {turn, conflict:state.conflicts})
     } catch (error) { clear(agent); throw error }
   }
-  return {bind,clear,clearRun:(agent,id)=>{if(active.get(agent)?.lease.runId===id) clear(agent)},has:(agent,name)=>active.get(agent)?.names.has(name)===true,nativeSearch:agent=>active.get(agent)?.nativeSearch===true}
+  function has(agent, name) {
+    const def = active.get(agent)?.definitions.get(name)
+    return !!def && ctx.tools.get(name, agent) === def
+  }
+  function verify(agent, expected, collisions = []) {
+    const state = active.get(agent)
+    const visible = new Map(ctx.tools.definitions(agent).map(d => [d.name, d]))
+    const actual = new Set([...visible.keys()].filter(n => state?.definitions.get(n) !== visible.get(n)))
+    const missing = expected.filter(n => !actual.has(n))
+    if (state) for (const [name, def] of state.definitions) if (visible.get(name) !== def) missing.push(name)
+    const extra = [...actual].filter(n => !expected.includes(n))
+    if (missing.length || extra.length || collisions.length) {
+      agent.session.append('zhenxun/tool-mismatch', {turn:state?.turn, missing, extra, conflict:collisions})
+      throw new Error('Zhenxun tool manifest mismatch')
+    }
+    return [...actual].sort()
+  }
+  return {bind,clear,verify,clearRun:(agent,id)=>{if(active.get(agent)?.lease.runId===id) clear(agent)},has,nativeSearch:agent=>active.get(agent)?.nativeSearch===true}
 }
 
 function bindDesktopInput(ctx, config, bridge, native) {
@@ -93,7 +115,10 @@ function bindDesktopInput(ctx, config, bridge, native) {
     let lease
     try { lease=JSON.parse(readFileSync(path.join(config.root,'leases',agent.id+'.json'),'utf8')) }
     catch { return }
-    if (Boolean(lease.native)===native && lease.requestId===message.source.rpcId && lease.expires>Date.now()/1000) bridge.bind(agent,turn,lease.bridge)
+    if (Boolean(lease.native)===native && lease.requestId===message.source.rpcId && lease.expires>Date.now()/1000) {
+      agent.session.append('zhenxun/input-claimed', {turn, runId:lease.runId, requestId:lease.requestId})
+      bridge.bind(agent,turn,lease.bridge)
+    }
   })
 }
 
@@ -200,8 +225,7 @@ export async function apply(ctx, config) {
     if (lease.sessionId !== agent.id || lease.mode !== config.mode || lease.expires <= Date.now() / 1000 || path.resolve(lease.cwd) !== path.resolve(agent.session.header.cwd || '')) throw new Error('Expired or mismatched Zhenxun run')
     const url = new URL(lease.authorize)
     if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1' || !url.port || url.pathname !== '/zhenxun/api/ai/dsh/authorize' || url.search || url.username || url.password) throw new Error('Invalid authorization target')
-    const names = ctx.tools.definitions(agent).map(t => t.name).filter(n=>!bridge.has(agent,n)).sort()
-    if (JSON.stringify(names) !== JSON.stringify([...TOOL_NAMES[config.mode]].sort())) throw new Error('Unexpected tools in Zhenxun preset: ' + names.join(', '))
+    const names = bridge.verify(agent, TOOL_NAMES[config.mode])
     let run = runs.get(agent)
     if (!run || run.id !== lease.runId) {
       run = { id: lease.runId, model: { ...(lease.modelSelection || ctx.agentDefaultModel.currentSelection()) }, writes: new Map(), retries: new Map(), uncertain: false }

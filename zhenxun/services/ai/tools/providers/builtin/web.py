@@ -361,6 +361,26 @@ def web_tools(model: str | None = None) -> list[Any]:
     return []
 
 
+def dsh_search_source(allowed: bool, execution_mode: str) -> str:
+    """为本轮 DSH 对话选择唯一的联网实现
+
+    参数:
+        allowed: 人设是否允许联网
+        execution_mode: DSH 执行模式，原生搜索只在 chat 模式接入
+
+    返回:
+        str: api 为真寻搜索服务，native 为执行端原生搜索，off 为不联网
+    """
+    mode = get_llm_config().web_search.mode
+    if not allowed or mode == "off":
+        return "off"
+    if mode in {"api", "auto"} and _search_service() is not None:
+        return "api"
+    if execution_mode == "chat" and mode in {"auto", "native"}:
+        return "native"
+    return "off"
+
+
 class WebTools:
     """每次运行时按当前 AI.web_search 配置提供联网工具，修改配置后立即生效"""
 
@@ -380,9 +400,10 @@ class WebTools:
 
         model = context.run.current_model if context else None
         if context and context.state.get("_dsh_binding"):
-            mode = get_llm_config().web_search.mode
-            use_api = mode == "api" or (
-                mode == "auto" and _search_service() is not None
+            use_api = (
+                context.state.get("_dsh_search_source") == "api"
+                and get_llm_config().web_search.mode in {"api", "auto"}
+                and _search_service() is not None
             )
             tools = [WebSearchToolkit()] if use_api else []
         else:
