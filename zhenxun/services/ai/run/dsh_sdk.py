@@ -106,27 +106,30 @@ class SdkClient:
             ) from exc
 
     async def call(self, method, params=None, timeout=40):
+        from .dsh_sdk_host import LIMIT
+
         writer = None
         try:
 
             async def request():
                 nonlocal writer
+                frame = (
+                    json.dumps(
+                        {
+                            "token": self.endpoint["token"],
+                            "method": method,
+                            "params": {"mode": self.mode, **(params or {})},
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                ).encode()
+                if len(frame) > LIMIT:
+                    raise DshUnavailable("SDK 请求过大，未提交；请缩小图片或减少附件。")
                 reader, writer = await asyncio.open_connection(
-                    "127.0.0.1", int(self.endpoint["port"]), limit=8 * 1024 * 1024
+                    "127.0.0.1", int(self.endpoint["port"]), limit=LIMIT
                 )
-                writer.write(
-                    (
-                        json.dumps(
-                            {
-                                "token": self.endpoint["token"],
-                                "method": method,
-                                "params": {"mode": self.mode, **(params or {})},
-                            },
-                            ensure_ascii=False,
-                        )
-                        + "\n"
-                    ).encode()
-                )
+                writer.write(frame)
                 await writer.drain()
                 result = json.loads(await reader.readline())
                 if result.get("boot") != self.endpoint["boot"]:
@@ -235,6 +238,9 @@ class SdkClient:
 
     @classmethod
     async def status(cls, settings):
+        from zhenxun.services.ai.llm.api import text_media_capabilities
+
+        media = text_media_capabilities()
         result = {
             "transport": "sdk",
             "connected": False,
@@ -245,10 +251,12 @@ class SdkClient:
             "mapping_trusted": True,
             "login_state": "api-key",
             "capabilities": {
-                "memory": False,
-                "knowledge": False,
+                "memory": True,
+                "knowledge": True,
                 "native_agent": True,
-                "images": False,
+                "images": True,
+                "image_input": "native",
+                "media_to_text": media,
             },
             "retry_policy": {"max_attempts": 5, "delays": [2, 5, 10, 20]},
             "restart_required": False,
@@ -260,6 +268,9 @@ class SdkClient:
             data = await client.call("status")
             workers = data["workers"]
             restart_required = cls.needs_restart(data)
+            result["capabilities"]["chat_tool_bridge"] = (
+                "restart_required" if restart_required else "per_turn"
+            )
             result.update(
                 connected=True,
                 host_boot=data["boot"],
@@ -351,9 +362,7 @@ class SdkClient:
             raise DshUnavailable("SDK home 已变化，请显式选择此后端的会话。")
         search = context.state.get("_dsh_chat_search") is True
         if not binding.get("native") and (
-            binding.get("inflight")
-            or binding.get("quarantined")
-            or (binding.get("created") and bool(binding.get("chat_search")) != search)
+            binding.get("inflight") or binding.get("quarantined")
         ):
             records.rotate_remote(binding)
         client = await cls.ensure(settings, binding["mode"])
@@ -383,9 +392,10 @@ class SdkClient:
 
     async def prompt(self, turn, content):
         from .dsh import DshRuntime, DshSessions
+        from .dsh_tools import bridge_lease
 
-        if any(block.get("type") != "text" for block in content):
-            raise DshUnavailable("SDK 图片契约尚未通过本接入验证，请改发文字。")
+        if any(block.get("type") not in {"text", "image"} for block in content):
+            raise DshUnavailable("SDK 不支持本次输入的附件类型。")
         receipt = await self.call(
             "prompt",
             {
@@ -394,6 +404,7 @@ class SdkClient:
                 "inherited": turn.binding["created"],
                 "chat_search": turn.binding.get("chat_search") is True,
                 "content": content,
+                "bridge": bridge_lease(turn),
                 "model": turn.binding.get("model")
                 if not turn.binding.get("created") and not turn.binding.get("inherited")
                 else None,

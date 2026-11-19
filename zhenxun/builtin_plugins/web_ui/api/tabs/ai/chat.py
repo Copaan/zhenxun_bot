@@ -39,6 +39,9 @@ async def chat_switch_state() -> Result:
 
 @router.put("/chat/switch", dependencies=[authentication()], response_model=Result)
 async def update_chat_switch(payload: ChatSwitchRequest) -> Result:
+    import asyncio
+
+    from zhenxun.services.ai.run.session import session_manager
     from zhenxun.services.plugin_policy import (
         PluginPolicyConflict,
         plugin_policy_service,
@@ -54,6 +57,14 @@ async def update_chat_switch(payload: ChatSwitchRequest) -> Result:
         raise HTTPException(
             409, detail={"code": error.code, **error.details}
         ) from error
+    if not payload.enabled:
+        ids = [
+            run_id
+            for run_id, (context, _) in list(session_manager.runs.items())
+            if context.run.source in {"qq", "interject", "task"}
+            and not context.run.parent_run_id
+        ]
+        await asyncio.gather(*(session_manager.stop(run_id) for run_id in ids))
     logger.info(f"WebUI {'启用' if payload.enabled else '停用'}了内置 AI 聊天", "WebUi")
     return Result.ok(
         {

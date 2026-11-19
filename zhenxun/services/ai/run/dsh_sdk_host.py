@@ -21,7 +21,7 @@ import yaml
 
 LIMIT = 8 * 1024 * 1024
 SDK_API_BASE = "https://api.deepseek.com/anthropic"
-SDK_CONNECTION_REVISION = 3
+SDK_CONNECTION_REVISION = 4
 SHELL_TIMEOUT = {"timeoutMs": 300_000, "maxTimeoutMs": 1_800_000}
 
 
@@ -437,6 +437,10 @@ class Worker:
             }
             self.runs[run_id] = run
             self.save_receipts()
+            if bridge := params.get("bridge"):
+                await self.control(
+                    "bridgeArm", {"sessionId": session_id, "lease": bridge}
+                )
             receipt = await self.rpc(
                 "session/prompt",
                 {"sessionId": session_id, "contentBlocks": params["content"]},
@@ -445,6 +449,15 @@ class Worker:
                 raise ValueError("SDK 输入收据缺失，禁止自动重发。")
             run["message_id"] = receipt["messageId"]
             self.save_receipts()
+            if bridge:
+                await self.control(
+                    "bridgeReceipt",
+                    {
+                        "sessionId": session_id,
+                        "runId": run_id,
+                        "messageId": run["message_id"],
+                    },
+                )
             return dict(run)
 
     def save_receipts(self):
@@ -620,6 +633,10 @@ class Host:
             return {"accepted": True}
         if method == "detach":
             if run := worker.runs.get(params["run_id"]):
+                await worker.control(
+                    "bridgeClear",
+                    {"sessionId": run["session_id"], "runId": run["run_id"]},
+                )
                 run["attached"] = False
                 run["outcome"] = params.get("outcome", "detached")
                 worker.save_receipts()

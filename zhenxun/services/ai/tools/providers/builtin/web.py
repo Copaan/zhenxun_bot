@@ -379,7 +379,14 @@ class WebTools:
         from zhenxun.services.ai.tools.engine.registry import resolve_tools
 
         model = context.run.current_model if context else None
-        tools = web_tools(model or self.model)
+        if context and context.state.get("_dsh_binding"):
+            mode = get_llm_config().web_search.mode
+            use_api = mode == "api" or (
+                mode == "auto" and _search_service() is not None
+            )
+            tools = [WebSearchToolkit()] if use_api else []
+        else:
+            tools = web_tools(model or self.model)
         payload = await resolve_tools(tools, context)
         if tools and not isinstance(tools[0], WebSearchToolkit):
             required = frozenset(t.name for t in tools)

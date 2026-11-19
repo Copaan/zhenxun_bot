@@ -392,3 +392,37 @@ async def authorize_desktop(payload: DshAuthorization, request: Request) -> dict
         return await DshRuntime.authorize(header[7:], payload.model_dump())
     except (Exception, asyncio.CancelledError) as exc:
         raise HTTPException(403, detail={"code": "dsh_execution_denied"}) from exc
+
+
+class DshToolCall(BaseModel):
+    sessionId: str = Field(min_length=1, max_length=128)
+    runId: str = Field(min_length=1, max_length=64)
+    requestId: str = Field(min_length=1, max_length=64)
+    callId: str = Field(min_length=1, max_length=180)
+    name: str = Field(min_length=1, max_length=128)
+    arguments: dict
+
+
+@router.post("/dsh/tool")
+async def dsh_tool(payload: DshToolCall, request: Request) -> dict:
+    """仅接受本机执行器持本轮凭据发起的工具调用。"""
+    from zhenxun.services.ai.run.dsh_tools import invoke_bridge
+
+    header = request.headers.get("Authorization", "")
+    if (
+        not request.client
+        or request.client.host not in {"127.0.0.1", "::1"}
+        or not header.startswith("Bearer ")
+        or not header.isascii()
+        or len(header) > 100
+    ):
+        raise HTTPException(403, detail="dsh_tool_denied")
+    try:
+        return await invoke_bridge(header[7:], payload)
+    except asyncio.CancelledError as exc:
+        raise HTTPException(409, detail="dsh_tool_cancelled") from exc
+    except PermissionError as exc:
+        raise HTTPException(403, detail="dsh_tool_denied") from exc
+    except Exception as exc:
+        logger.warning(f"DSH 工具调用未完成: {type(exc).__name__}", "WebUi")
+        raise HTTPException(409, detail="dsh_tool_failed") from exc

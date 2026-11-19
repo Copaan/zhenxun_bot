@@ -817,7 +817,11 @@ class KnowledgeToolkit(BaseToolkit):
         )
         text = context.state.get("_retrieval_query", "") if context else ""
         mode = Config.get_config(MODULE, "KNOWLEDGE_MODE", "inject")
-        automatic = mode == "inject" and bool(text)
+        automatic = (
+            mode == "inject"
+            and bool(text)
+            and not (context and context.state.get("_dsh_binding"))
+        )
         if automatic:
             hits = (
                 await KnowledgeManage.search(

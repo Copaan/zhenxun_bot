@@ -12,7 +12,7 @@ from zhenxun.models.ai_chat_group import AIChatGroup
 from zhenxun.models.ai_persona import AIPersona
 from zhenxun.services.ai.config import get_llm_config
 from zhenxun.services.ai.core.exceptions import LLMException, ToolFatalError
-from zhenxun.services.ai.core.messages import TextPart
+from zhenxun.services.ai.core.messages import TextPart, UsageInfo
 from zhenxun.services.ai.core.models import CancellationToken
 from zhenxun.services.ai.run.context import RunContext, set_run_context
 from zhenxun.services.ai.run.dsh import (
@@ -65,14 +65,15 @@ def dsh_settings() -> DshSettings:
 def chat_search_hint(enabled: bool) -> str:
     """说明普通 DSH 会话本轮实际可用的搜索和回复方式。"""
     search = (
-        "遇到陌生的具体事物、时效性问题或需要核实的事实，先用实际注册的 "
-        "web_search 搜索，再依据查到的资料回答。普通闲聊不必搜索。"
+        "遇到陌生的具体事物、时效性问题或需要核实的事实，先用 web_search "
+        "搜索，再依据查到的资料回答，普通闲聊不必搜索；工具列表里没有 "
+        "web_search 时，无法核实的内容要说明，不要假称已查询。"
         if enabled
         else "本轮没有联网工具；无法核实的内容要说明，不要假称已查询。"
     )
     return (
-        search
-        + "只用实际提供的工具接口，不把调用写进正文。直接用文字回复，无需调用发送工具。"
+        search + "只用实际提供的工具接口，不把调用写进正文。普通回复直接写文字；"
+        "已用工具发出的内容不用再说一遍。"
     )
 
 
@@ -236,17 +237,22 @@ async def _run_dsh(
                 if before_run:
                     await before_run()
                 settings = dsh_settings()
+                search_allowed = (
+                    not selected
+                    or selected.tools is None
+                    or "web_search" in selected.tools
+                )
+                native_search = search_allowed and get_llm_config().web_search.mode in {
+                    "auto",
+                    "native",
+                }
                 search = (
                     settings.transport == "sdk"
                     and binding["mode"] == "chat"
-                    and get_llm_config().web_search.mode in {"auto", "native"}
-                    and (
-                        not selected
-                        or selected.tools is None
-                        or "web_search" in selected.tools
-                    )
+                    and native_search
                 )
                 context.state["_dsh_chat_search"] = search
+                context.state["_dsh_search_allowed"] = search_allowed
                 persona_key = (
                     f"{selected.id}:{selected.updated_at.isoformat()}"
                     if selected
@@ -288,6 +294,31 @@ async def _run_dsh(
                     return await dsh_mode(context, current)
 
                 context.state["_dsh_authorization_check"] = authorization_check
+                from zhenxun.services.ai.run.dsh_tools import ChatToolBridge
+
+                bridge = ChatToolBridge(AIChatManager.get_agent(selected), context)
+                context.state["_dsh_chat_tools"] = bridge
+                await bridge.prepare()
+                media_usage = UsageInfo()
+
+                def record_media_usage(usage):
+                    nonlocal media_usage
+                    media_usage += usage
+                    context.run.budget["tokens"] = media_usage.total_tokens
+
+                input_blocks = await content_blocks(
+                    prepared,
+                    transport=settings.transport,
+                    token=token,
+                    record_usage=record_media_usage,
+                    check_input=Safety.check_input,
+                )
+                token.raise_if_cancelled()
+                if any(not isinstance(p, TextPart) for p in prepared) and (
+                    await authorization_check() != binding["mode"]
+                    or dsh_settings() != settings
+                ):
+                    raise LLMException("处理附件期间会话或权限已变化，请重新提问。")
                 DshSessions.for_binding(binding).update(binding, persona=persona_key)
                 backend = chat_backend(AIChatManager.get_agent(selected).memory_config)
                 history = await backend.get_messages(session_id) if backend else []
@@ -300,6 +331,7 @@ async def _run_dsh(
                 remote = await DshRuntime.start(
                     context, binding, settings, approve, ask
                 )
+                remote.usage += media_usage
                 new = new or remote_id != binding["remote_id"]
                 blocks = []
                 persona_text = AIChatManager.build_instruction(selected)
@@ -336,13 +368,22 @@ async def _run_dsh(
                     if hint := context.run.dynamic_prompts.get("proactive"):
                         blocks.append({"type": "text", "text": hint})
                     if binding["mode"] == "chat":
-                        guidance = chat_search_hint(search)
+                        guidance = chat_search_hint(
+                            native_search or "web_search" in bridge.identities
+                        )
                         if context.run.source in {"qq", "webui"}:
                             guidance += "本轮是直接向你提问，不是邀请你判断是否插话。"
                         blocks.append({"type": "text", "text": guidance})
-                blocks += await content_blocks(
-                    prepared, native=bool(binding.get("native"))
-                )
+                blocks += input_blocks
+                if bridge.instructions:
+                    blocks.insert(
+                        0,
+                        {
+                            "type": "text",
+                            "text": "本轮工具说明（以实际工具列表为准）：\n"
+                            + bridge.instructions,
+                        },
+                    )
                 if backend:
                     user_message = LLMMessage.user(prepared)
                     user_message.metadata = {
@@ -356,8 +397,11 @@ async def _run_dsh(
                             {"type": "text", "text": export_instruction(slot[1])}
                         )
                     raw, usage, reason = await DshRuntime.prompt(remote, blocks)
+                    remote.revoked = True
                     settling = True
                     diagnostics = context.run.operations.setdefault("dsh", {})
+                    diagnostics["bridge_offered"] = sorted(bridge.identities)
+                    diagnostics["bridge_calls"] = len(bridge.receipts)
                     diagnostics["end_reason"] = reason
                     text, blocked = Safety.filter_output(clean_output(raw))
                     diagnostics["raw_chars"] = len(raw)

@@ -476,14 +476,15 @@ class Agent:
         context.state["_prompt_sources"] = sources
         return static, reminders
 
-    async def _build_tools(
-        self, context: RunContext, capability: CombinedCapability
+    async def resolve_run_tools(
+        self, context: RunContext, capability: CombinedCapability, *, include=None
     ) -> tuple[ToolCollection, ResolvedToolPayload]:
         """解析工具来源，经能力组件筛选后生成本次可用的工具集合
 
         参数:
             context: 运行上下文
             capability: 组合能力
+            include: 工具筛选函数，返回 False 的工具不提供
 
         返回:
             tuple[ToolCollection, ResolvedToolPayload]: 工具集合与解析载荷
@@ -495,6 +496,8 @@ class Agent:
         candidates = {}
         conflicts = set()
         for tool in payload.tools:
+            if include is not None and not include(tool):
+                continue
             if not hasattr(tool, "get_definition"):
                 continue
             definition = await tool.get_definition(context)
@@ -558,7 +561,7 @@ class Agent:
             AgentState: 初始运行状态
         """
         static, reminders = await self._build_prompts(context, resources.capability)
-        tools, payload = await self._build_tools(context, resources.capability)
+        tools, payload = await self.resolve_run_tools(context, resources.capability)
         static.extend(payload.injected_prompts)
         reminders.extend(payload.reminders)
         static = list(dict.fromkeys(static))

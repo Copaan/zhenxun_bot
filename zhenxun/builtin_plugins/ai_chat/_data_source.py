@@ -819,6 +819,33 @@ class AIChatManager:
             context.state["_dsh_input_metadata"] = prepared.metadata or {}
             return prepared.content, persona
 
+        async def check_delivery():
+            try:
+                if group_id:
+                    blocked = await cls.blocked(bot, group_id, user_id)
+                else:
+                    from zhenxun.services.scheduler.engine import _plugin_blocked
+
+                    blocked = await _plugin_blocked(
+                        PLUGIN_MODULE, bot, SimpleNamespace(user_id=user_id)
+                    )
+                if persona and not blocked:
+                    blocked = not await AIPersona.filter(
+                        id=persona.id, enabled=True
+                    ).exists()
+                if not blocked and (
+                    check := context.state.get("_dsh_authorization_check")
+                ):
+                    blocked = await check() != context.state["_dsh_binding"]["mode"]
+            except Exception as exc:
+                logger.warning(f"无法复核聊天投递权限：{type(exc).__name__}", MODULE)
+                blocked = True
+            if blocked:
+                context.run.outcome = "cancelled"
+                raise asyncio.CancelledError("聊天已停用或本轮授权已变更")
+
+        context.state["_chat_delivery_check"] = check_delivery
+
         async def before_run():
             await Conversations.check(snapshot)
             if not turn.current:
@@ -889,6 +916,10 @@ class AIChatManager:
                 )
             await turn.settle(None, after)
         except asyncio.CancelledError as error:
+            if proactive is None and group_id and message_id:
+                ChatBuffer.discard_input(
+                    bot.self_id, group_id, message_id, context.state["_input_anchor"]
+                )
             turn.delivery.status = "partial" if turn.delivery.parts else "failed"
             await turn.settle(error, after)
             raise

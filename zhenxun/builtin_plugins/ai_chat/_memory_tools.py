@@ -52,7 +52,9 @@ class MemoryToolkit(BaseToolkit):
         if mode == "off" or scope is None:
             return ResolvedToolPayload()
         payload = await super().resolve(context)
-        if mode == "inject":
+        if scope[0] and not await can_forget(context):
+            payload.tools = [t for t in payload.tools if t.name != "forget"]
+        if mode == "inject" and context and not context.state.get("_dsh_binding"):
             from zhenxun.services.log import logger
 
             text = context.state.get("_retrieval_query", "") if context else ""
@@ -84,7 +86,7 @@ class MemoryToolkit(BaseToolkit):
         if "memorize" in names:
             lines.append("明确要求记住或有长期价值的信息，可以用 `memorize` 记录。")
         if "forget" in names:
-            lines.append("需要删除记忆时使用 `forget`，执行仍需当前管理权限。")
+            lines.append("记忆有误或对方要求忘掉时，用 `forget` 删除。")
         return (
             [f"## 长期记忆\n本{scene}的可用记忆操作：\n" + "\n".join(lines)]
             if lines

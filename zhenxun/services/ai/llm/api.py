@@ -4,6 +4,7 @@ LLM 服务的高级 API 接口 - 便捷函数入口 (无状态)
 
 import asyncio
 from collections import OrderedDict
+from collections.abc import Callable
 import hashlib
 from pathlib import Path
 from typing import Any, Literal, TypeVar, overload
@@ -11,6 +12,7 @@ from typing import Any, Literal, TypeVar, overload
 from pydantic import BaseModel
 
 from zhenxun.services.ai.config import get_llm_config
+from zhenxun.services.ai.core.engine.token_counter import parse_usage_info
 from zhenxun.services.ai.core.exceptions import (
     ControlFlowExit,
     LLMException,
@@ -109,7 +111,10 @@ async def _video_request(part: VideoPart) -> ChatRequest | str | None:
 
 
 async def _media_to_text(
-    part: MediaPart, model: str | None, token: CancellationToken | None
+    part: MediaPart,
+    model: str | None,
+    token: CancellationToken | None,
+    record_usage: Callable[[UsageInfo], None] | None = None,
 ) -> str | None:
     """用视觉模型描述图片或视频截帧，或用语音识别模型转写语音，结果按地址或内容缓存
 
@@ -128,28 +133,39 @@ async def _media_to_text(
     if key in _media_text_cache:
         _media_text_cache.move_to_end(key)
         return _media_text_cache[key]
+    response = None
+    text = ""
     try:
         if isinstance(part, VideoPart):
             request = await _video_request(part)
             if not isinstance(request, ChatRequest):
                 return request
-            text = (await invoke("chat", request, model, token)).text
+            response = await invoke("chat", request, model, token)
         elif is_image and model is None:
             from .deepseek_tools import ocr_file, ocr_text
 
             result = await ocr_file(
                 await part.get_raw_bytes(), "image.png", token=token
             )
+            if record_usage and isinstance(result.get("usage"), dict):
+                record_usage(parse_usage_info(result["usage"]))
             text = ocr_text(result)
         elif is_image:
             request = ChatRequest(
                 messages=[UserMessage(content=[TextPart(text=_CAPTION_PROMPT), part])],
                 timeout=120,
             )
-            text = (await invoke("chat", request, model, token)).text
+            response = await invoke("chat", request, model, token)
         else:
             request = TranscriptionRequest(audio=part, timeout=120)
-            text = (await invoke("stt", request, model, token)).text
+            response = await invoke("stt", request, model, token)
+        if response is not None:
+            if record_usage:
+                if isinstance(response, ChatResponse):
+                    record_usage(parse_usage_info(response.usage_info))
+                else:
+                    record_usage(response.usage)
+            text = response.text
     except LLMException as e:
         label = {"image": "图片", "video": "视频", "audio": "语音"}[kind]
         logger.warning(f"模型 {model} 转换{label}失败: {e}")
@@ -163,7 +179,7 @@ async def _media_to_text(
 
 
 def _converter(
-    modality: str, routes: list[Route]
+    modality: str, routes: list[Route], *, text_only: bool = False
 ) -> tuple[type[MediaPart], str | None, str] | None:
     """取对话线路不支持的媒体所对应的转换模型
 
@@ -187,7 +203,20 @@ def _converter(
     context = get_current_run_context()
     scene = context.state.get("_scene_configuration", {}) if context else {}
     model = scene.get("effective", {}).get("stt") if task == "stt" else None
-    if not (model := model or get_default_model(task)):
+    model = model or get_default_model(task)
+    if text_only and not model and task == "vision":
+        try:
+            model = next(
+                (
+                    r.name
+                    for r in resolve_routes(None, "chat")
+                    if not unmet_needs(r, {"image"})
+                ),
+                None,
+            )
+        except LLMException:
+            pass
+    if not model:
         settings = get_llm_config().deepseek_tools
         if modality == "audio" and settings.asr_enabled:
             return part_type, None, label
@@ -206,6 +235,32 @@ def _converter(
         logger.warning(f"视觉模型 {model} 不支持图片输入，已跳过{label}")
         return None
     return part_type, model, label
+
+
+def text_media_capabilities() -> dict[str, bool]:
+    """文本执行器可通过当前模型配置识别的媒体类型。"""
+    return {
+        kind: _converter(kind, [], text_only=True) is not None
+        for kind in ("audio", "video")
+    }
+
+
+async def describe_text_input(part: MediaPart, token, record_usage=None) -> str:
+    """使用聊天媒体转换器为文本执行器生成标记来源的媒体描述。"""
+    converter = _converter(part.type, [], text_only=True)
+    if not converter:
+        raise LLMException(
+            {
+                "image": "未配置可识图的模型，请在 AI 配置中选择视觉模型。",
+                "video": "未配置可识别视频画面的视觉模型。",
+                "audio": "未配置语音识别模型或 ASR 服务。",
+            }[part.type]
+        )
+    _, model, label = converter
+    text = await _media_to_text(part, model, token, record_usage)
+    if not text:
+        raise LLMException(f"{label}没有取得有效结果，未提交本轮对话。")
+    return wrap_untrusted(text, label)
 
 
 async def _describe_media(

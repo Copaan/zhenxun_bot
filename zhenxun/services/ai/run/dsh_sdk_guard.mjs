@@ -2,7 +2,7 @@ import http from 'node:http'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import { timingSafeEqual } from 'node:crypto'
-import { retryModelRequest } from './dsh_guard.mjs'
+import { chatTools, retryModelRequest } from './dsh_guard.mjs'
 
 export const name = 'zhenxun-sdk-control'
 export const inject = ['agents', 'tools', 'sessionPersistence', 'workingDirectory', 'llm']
@@ -33,6 +33,16 @@ export async function apply(ctx, config) {
   const expected = new Map()
   const pendingSearch = new Set()
   const searchAgents = new WeakSet()
+  const restrictions = new WeakMap()
+  function restrictChat(agent, search) {
+    search = search && ctx.tools.definitions().some(d=>d.name==='web_search')
+    const next = agent.ctx.tools.restrict({allow:search ? ['web_search'] : []})
+    restrictions.get(agent)?.()
+    restrictions.set(agent,next)
+    if (search) searchAgents.add(agent); else searchAgents.delete(agent)
+  }
+  const bridge = chatTools(ctx)
+  const armed = new Map()
   const endpoint = path.join(config.root, 'control.json')
   ctx.on('session/created', session => {
     const previous = selection(session.snapshotEvents())
@@ -43,9 +53,10 @@ export async function apply(ctx, config) {
     if (typeof agent.cancel !== 'function' || typeof agent.whenIdle !== 'function' || !agent.inbox?.remove || !agent.model?.select) throw new Error('Unsupported SDK Agent contract')
     if (config.mode === 'chat') {
       const search = pendingSearch.delete(agent.id)
-      agent.ctx.tools.restrict({ allow: search ? ['web_search'] : [] })
-      if (search) searchAgents.add(agent)
+      restrictChat(agent, search)
     }
+    const arm = armed.get(agent.id)
+    if (arm) bridge.bind(agent,null,arm.lease)
     const previous = restored.get(agent.session)
     if (previous) agent.model.select(previous)
     const target = expected.get(agent.id)
@@ -53,7 +64,7 @@ export async function apply(ctx, config) {
     if (!previous && !target && agent.model.current()) agent.model.select(agent.model.current())
   })
   if (config.mode === 'chat') {
-    const allowed = exec => exec.name === 'web_search' && searchAgents.has(exec.agent)
+    const allowed = exec => bridge.has(exec.agent,exec.name) || (exec.name === 'web_search' && searchAgents.has(exec.agent))
     ctx.tools.guard(exec => allowed(exec) ? undefined : 'Tool unavailable in Zhenxun chat')
     ctx.on('tools/execute', async (exec, next) => {
       if (!allowed(exec)) throw new Error('Tool unavailable in Zhenxun chat')
@@ -61,8 +72,19 @@ export async function apply(ctx, config) {
     }, { prepend: true })
   }
   ctx.on('agent/pre-step', async (payload, next) => {
+    const arm = armed.get(payload.agent.id)
+    let lease
+    if (arm && payload.messages.length) {
+      let timer
+      try {
+        const id=await Promise.race([arm.ready,new Promise(resolve=>{timer=setTimeout(()=>resolve(null),5000)})])
+        if (!id || !payload.messages.some(m=>m.id===id)) { bridge.clear(payload.agent); throw new Error('SDK 本轮消息收据不匹配') }
+        lease=arm.lease
+      } finally { clearTimeout(timer); if (armed.get(payload.agent.id)===arm) armed.delete(payload.agent.id) }
+    }
+    bridge.bind(payload.agent,payload.turn,lease)
     if (config.mode === 'chat') {
-      const defs = ctx.tools.definitions(payload.agent)
+      const defs = ctx.tools.definitions(payload.agent).filter(d=>!bridge.has(payload.agent,d.name))
       const search = searchAgents.has(payload.agent)
       if (defs.length !== Number(search) || defs.some(d => d.name !== 'web_search')) throw new Error('Unexpected chat tool exposure')
     }
@@ -113,9 +135,22 @@ export async function apply(ctx, config) {
     if (!/^[a-zA-Z0-9_-]{1,128}$/.test(args.sessionId || '')) throw new Error('Invalid session identity')
     if (method === 'describe') return describe(args.sessionId)
     const agent = ctx.agents.get(args.sessionId)
+    if (method==='bridgeArm') {
+      if(agent?.status==='running' || args.lease.sessionId!==args.sessionId) throw new Error('Session not idle')
+      let resolve; const ready=new Promise(r=>{resolve=r});armed.set(args.sessionId,{lease:args.lease,resolve,ready});if(agent) bridge.bind(agent,null,args.lease);return {ok:true}
+    }
+    if (method==='bridgeReceipt') {
+      const arm=armed.get(args.sessionId);if(!arm || arm.lease.runId!==args.runId) throw new Error('Unknown bridge run')
+      arm.resolve(args.messageId);return {ok:true}
+    }
+    if (method==='bridgeClear') {
+      const arm=armed.get(args.sessionId);if(arm?.lease.runId===args.runId){arm.resolve(null);armed.delete(args.sessionId)}
+      if(agent) bridge.clearRun(agent,args.runId);return {ok:true}
+    }
     if (method === 'chatSearch' && config.mode === 'chat') {
       const enabled = args.enabled === true
-      if (agent && searchAgents.has(agent) !== enabled) throw new Error('Chat search policy changed; new session required')
+      if (agent?.status==='running') throw new Error('Session not idle')
+      if (agent && searchAgents.has(agent) !== enabled) restrictChat(agent,enabled)
       if (enabled && !agent) pendingSearch.add(args.sessionId)
       else pendingSearch.delete(args.sessionId)
       return { enabled }

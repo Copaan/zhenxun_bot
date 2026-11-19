@@ -41,6 +41,7 @@ class ChatLine:
     is_bot: bool = False
     is_ai: bool = False
     sequence: int = 0
+    cancelled_input: bool = False
 
 
 @dataclass(frozen=True)
@@ -247,6 +248,7 @@ class ChatBuffer:
             line
             for line in cls._lines.get((bot_id, group_id), ())
             if (not exclude_id or line.message_id != exclude_id)
+            and not line.cancelled_input
             and (anchor is None or line.sequence < anchor)
         ][-size:]
         if size <= 0 or not lines:
@@ -271,6 +273,21 @@ class ChatBuffer:
         return fallback if fallback is not None else cls._sequence
 
     @classmethod
+    def discard_input(cls, bot_id: str, group_id: str, message_id: str, anchor: int):
+        """标记已取消的定向请求，保留群记录但不再放进之后的对话背景
+
+        参数:
+            bot_id: Bot id
+            group_id: 群号
+            message_id: 请求消息 id
+            anchor: 请求消息的序号
+        """
+        for line in reversed(cls._lines.get((bot_id, group_id), ())):
+            if line.sequence == anchor and line.message_id == message_id:
+                line.cancelled_input = True
+                break
+
+    @classmethod
     def snapshot(
         cls,
         bot_id: str,
@@ -290,6 +307,7 @@ class ChatBuffer:
             line
             for line in buffered
             if not line.is_ai
+            and not line.cancelled_input
             and since < line.sequence < anchor
             and line.sequence not in confirmed
             and line.sequence not in excluded
@@ -330,7 +348,11 @@ class ChatBuffer:
         for line in lines:
             if line.sequence <= cursor:
                 continue
-            if not line.is_ai and line.sequence not in confirmed:
+            if (
+                not line.is_ai
+                and not line.cancelled_input
+                and line.sequence not in confirmed
+            ):
                 break
             cursor = line.sequence
         cls._cursors[key] = cursor

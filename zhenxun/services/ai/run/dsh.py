@@ -20,8 +20,14 @@ from pydantic import BaseModel, Field, model_validator
 import yaml
 
 from zhenxun.configs.path_config import DATA_PATH
-from zhenxun.services.ai.core.exceptions import RunInterrupted
-from zhenxun.services.ai.core.messages import ImagePart, TextPart, UsageInfo
+from zhenxun.services.ai.core.exceptions import LLMException, RunInterrupted
+from zhenxun.services.ai.core.messages import (
+    AudioPart,
+    ImagePart,
+    TextPart,
+    UsageInfo,
+    VideoPart,
+)
 from zhenxun.services.ai.run.dsh_desktop import DesktopClient, DshUnavailable
 from zhenxun.services.ai.utils.runtime import PermissionUtils
 from zhenxun.services.log import logger
@@ -38,10 +44,6 @@ BOOT_ID = uuid.uuid4().hex
 INTEGRATION = Path(__file__).with_name("dsh_guard.mjs")
 PRESETS = {"chat": "zhenxun-chat", "agent": "zhenxun-agent"}
 TOOLS = {"chat": [], "agent": ["zx_list", "zx_read", "zx_write", "ask_user_question"]}
-IMAGE_UNAVAILABLE = (
-    "当前 DSH 桌面的图片上传会在内部降级或重发，无法计入统一五次尝试上限；"
-    "本接入暂不接受图片，请改发文字。"
-)
 Approver = Callable[[str, str], Awaitable[bool]]
 Asker = Callable[[str], Awaitable[str]]
 
@@ -102,7 +104,7 @@ class DshSessions:
         return SdkSessions if binding.get("transport") == "sdk" else DshSessions
 
     @classmethod
-    def _read(cls):
+    def _read(cls) -> dict:
         if not cls.FILE.exists():
             return {"version": 1, "owners": {}, "archives": []}
         value = read_json_locked(cls.FILE, None, strict=True)
@@ -411,6 +413,7 @@ class _Turn:
     stop_confirmation: str = "not_requested"
     revoked: bool = False
     pending: set = field(default_factory=set)
+    bridge_tasks: set = field(default_factory=set)
     event_ids: set[str] = field(default_factory=set)
 
 
@@ -482,6 +485,9 @@ class DshRuntime:
             from .dsh_sdk import SdkClient
 
             return await SdkClient.status(settings)
+        from zhenxun.services.ai.llm.api import text_media_capabilities
+
+        media = text_media_capabilities()
         result = {
             "transport": "desktop",
             "connected": False,
@@ -496,10 +502,12 @@ class DshRuntime:
                 "shell": False,
                 "subagents": False,
                 "workspace_tools": True,
-                "images": False,
+                "chat_tool_bridge": "requires_verified_preset",
+                "images": True,
+                "image_input": "native",
+                "media_to_text": media,
                 "native_agent": True,
             },
-            "image_limitation": IMAGE_UNAVAILABLE,
             "retry_policy": {"max_attempts": 5, "delays_seconds": [2, 5, 10, 20]},
             "migration_required": settings.migration_required,
         }
@@ -591,10 +599,21 @@ class DshRuntime:
         if check is None or await check() != binding["mode"]:
             raise DshUnavailable("DSH 模式或当前授权已变化")
         name = payload.get("tool")
-        if name and name not in TOOLS[execution_mode]:
+        if name == "web_search" and execution_mode == "chat":
+            from zhenxun.services.ai.config import get_llm_config
+
+            if not context.state.get(
+                "_dsh_search_allowed"
+            ) or get_llm_config().web_search.mode not in {"native", "auto"}:
+                raise DshUnavailable("本轮未授权桌面原生搜索")
+        elif name and name not in TOOLS[execution_mode]:
             raise DshUnavailable("工具未授权")
         model = payload.get("model") or {}
-        if model.get("provider") not in {"deepseek", "deepseek-account"}:
+        if model.get("provider") not in {
+            "deepseek",
+            "deepseek-official",
+            "deepseek-account",
+        }:
             raise DshUnavailable("当前桌面模型提供方的中断契约未核验，已阻止执行。")
         turn.proof = {
             "mode": binding["mode"],
@@ -617,6 +636,8 @@ class DshRuntime:
 
     @classmethod
     async def start(cls, context, binding, settings, approve, ask) -> _Turn:
+        from .dsh_tools import bridge_lease
+
         if settings.transport != binding.get("transport", "desktop"):
             raise DshUnavailable("执行器传输已变化，请重新选择会话。")
         if settings.transport == "sdk":
@@ -700,6 +721,7 @@ class DshRuntime:
                     "cwd": str(workspace.resolve()),
                     "expires": time.time() + settings.timeout,
                     "authorize": f"http://127.0.0.1:{port}/zhenxun/api/ai/dsh/authorize",
+                    "bridge": bridge_lease(turn),
                 },
             )
             if not binding["created"]:
@@ -764,6 +786,7 @@ class DshRuntime:
         from nonebot import get_driver
 
         from .dsh_control import DshControl
+        from .dsh_tools import bridge_lease
 
         binding, client, context = turn.binding, turn.client, turn.context
         marker = read_json_locked(DSH_PATH / "forwarding-ready.json", None, strict=True)
@@ -816,6 +839,7 @@ class DshRuntime:
                 "requestId": turn.request_id,
                 "native": True,
                 "token": turn.token,
+                "bridge": bridge_lease(turn),
                 "expires": time.time() + settings.timeout,
                 "authorize": f"http://127.0.0.1:{int(get_driver().config.port)}/zhenxun/api/ai/dsh/authorize",
             },
@@ -856,10 +880,8 @@ class DshRuntime:
             return await turn.client.prompt(turn, content)
         from websockets.exceptions import WebSocketException
 
-        if not (turn and turn.binding.get("native")) and any(
-            block.get("type") != "text" for block in content
-        ):
-            raise DshUnavailable(IMAGE_UNAVAILABLE)
+        if any(block.get("type") not in {"text", "image"} for block in content):
+            raise DshUnavailable("DSH 不支持本次输入的附件类型。")
 
         async def collect():
             await turn.client.verify_process()
@@ -1154,6 +1176,8 @@ class DshRuntime:
     @classmethod
     async def interrupt(cls, turn):
         turn.revoked = True
+        for task in tuple(turn.bridge_tasks):
+            task.cancel()
         for entry in turn.context.run.operations.get("dsh_tools", {}).values():
             if entry["status"] == "running":
                 entry["status"] = "unknown"
@@ -1246,6 +1270,11 @@ class DshRuntime:
     @classmethod
     async def release(cls, turn):
         turn.revoked = True
+        tasks = tuple(turn.bridge_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         for task in turn.pending:
             task.cancel()
         if turn.pending:
@@ -1277,10 +1306,37 @@ class DshRuntime:
         )
 
 
+def _image_block(raw: bytes, transport: Literal["sdk", "desktop"]) -> dict[str, str]:
+    """校验图片并编码为当前 DSH 传输的原生内容块。"""
+    from PIL import Image
+
+    try:
+        with Image.open(BytesIO(raw)) as image:
+            mime = Image.MIME.get(image.format or "")
+            if mime in {"image/png", "image/jpeg", "image/gif", "image/webp"}:
+                image.verify()
+            else:
+                output = BytesIO()
+                image.convert("RGBA").save(output, "PNG")
+                raw, mime = output.getvalue(), "image/png"
+    except (OSError, ValueError, SyntaxError, Image.DecompressionBombError) as exc:
+        raise DshUnavailable("图片损坏或过大，未提交到 DSH。") from exc
+    return {
+        "type": "image",
+        "data": base64.b64encode(raw).decode("ascii"),
+        "mimeType" if transport == "sdk" else "mediaType": mime,
+    }
+
+
 async def content_blocks(
-    parts: list[Any], *, native: bool = False
+    parts: list[Any],
+    *,
+    transport: Literal["sdk", "desktop"],
+    token=None,
+    record_usage=None,
+    check_input=None,
 ) -> list[dict[str, Any]]:
-    """把文字转换为桌面内容块；不支持可靠中断的图片输入明确拒绝
+    """图片随本轮提示原生提交到 DSH，音视频转为文字，保留片段顺序
 
     参数:
         parts: 消息片段
@@ -1290,42 +1346,45 @@ async def content_blocks(
     """
     blocks: list[dict[str, Any]] = []
     for part in parts:
+        if token:
+            token.raise_if_cancelled()
         if isinstance(part, TextPart):
             if part.text:
                 blocks.append({"type": "text", "text": part.text})
             continue
+        if isinstance(part, AudioPart | VideoPart):
+            from zhenxun.services.ai.llm.api import describe_text_input
+
+            try:
+                text = await describe_text_input(part, token, record_usage)
+            except LLMException as exc:
+                raise DshUnavailable(str(exc)) from exc
+            if check_input and check_input(text):
+                raise DshUnavailable("这个话题我不方便聊，换个话题吧。")
+            part.metadata = {**(part.metadata or {}), "text": text}
+            blocks.append({"type": "text", "text": text})
+            continue
         if isinstance(part, ImagePart):
-            if not native:
-                raise DshUnavailable(IMAGE_UNAVAILABLE)
-            from PIL import Image
-
-            from zhenxun.services.ai.utils.utils import fetch_media
-
-            raw = part.raw
-            if raw is None and part.path is not None:
-                raw = await asyncio.to_thread(part.path.read_bytes)
-            if raw is None and part.url:
-                raw = await fetch_media(part.url)
+            if part.url:
+                try:
+                    parsed = urlsplit(part.url)
+                    valid = parsed.scheme in {"http", "https"} and bool(parsed.hostname)
+                    valid = (
+                        valid and not parsed.netloc.endswith(":") and parsed.port != 0
+                    )
+                except ValueError:
+                    valid = False
+                if not valid:
+                    raise DshUnavailable(
+                        "图片地址不是可访问的 HTTP(S) 地址，请直接发送图片。"
+                    )
+            try:
+                raw = await part.get_raw_bytes()
+            except (OSError, ValueError) as exc:
+                raise DshUnavailable("图片内容不可读取，未提交到 DSH。") from exc
             if not raw:
-                raise DshUnavailable("图片内容不可读取，未发送桌面请求。")
-            with Image.open(BytesIO(raw)) as image:
-                mime = {
-                    "PNG": "image/png",
-                    "JPEG": "image/jpeg",
-                    "GIF": "image/gif",
-                    "WEBP": "image/webp",
-                }.get(image.format or "")
-                if not mime:
-                    output = BytesIO()
-                    image.save(output, "PNG")
-                    raw, mime = output.getvalue(), "image/png"
-            blocks.append(
-                {
-                    "type": "image",
-                    "data": base64.b64encode(raw).decode(),
-                    "mediaType": mime,
-                }
-            )
+                raise DshUnavailable("图片内容不可读取，未提交到 DSH。")
+            blocks.append(await asyncio.to_thread(_image_block, raw, transport))
             continue
         kind = getattr(part, "type", "")
         blocks.append({"type": "text", "text": f"[{kind or '附件'}]"})

@@ -275,9 +275,11 @@ class QQSendToolkit(BaseToolkit):
         finally:
             SendQuota.refund(scene.key, max(0, len(texts) - result.attempted))
         if result.status != "sent":
-            return ToolResult(output=result.error or "消息未全部送达。").as_error(
-                False, uncertain=result.uncertain
+            notice = (
+                f"共 {len(texts)} 条，已确认 {len(result.parts)} 条。"
+                "其余未确认，勿重发。"
             )
+            return ToolResult(output=notice).as_error(False, uncertain=result.uncertain)
         return ToolResult(
             output=f"已发送 {len(result.parts)} 条。", reused=result.reused
         )

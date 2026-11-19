@@ -274,6 +274,21 @@ class ChatTurn:
         group_id = context.get_group_id()
         directed = self.source != "interject"
         custom = persona.error_message if persona else None
+        if not isinstance(error, asyncio.CancelledError):
+            if check := context.state.get("_chat_delivery_check"):
+                await check()
+        record = context.run.operations.get("deliveries", {}).get(self.target, {})
+        if record.get("tool_delivery_failure") and not isinstance(
+            error, asyncio.CancelledError
+        ):
+            self.reply_kind = "tool_reply" if self.tool_texts else "failure"
+            await send_reply(
+                record["tool_delivery_failure"],
+                group_id,
+                result=delivery,
+                context=context,
+            )
+            return
         if error is not None:
             self.resolve_reply(value, error)
             if isinstance(error, RunInterrupted):
@@ -342,6 +357,8 @@ class ChatTurn:
         else:
             delivery.status = "skipped"
         if sticker_id is not None and delivery.status in {"sent", "skipped"}:
+            if check := context.state.get("_chat_delivery_check"):
+                await check()
             if await send_marked(context, sticker_id):
                 context.state["_chat_sticker_sent"] = True
                 delivery.status = "sent"

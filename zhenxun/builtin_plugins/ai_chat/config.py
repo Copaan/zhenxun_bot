@@ -609,9 +609,9 @@ CONFIGS = [
         "local",
         str,
         "回复执行器",
-        "DeepSeek Harness 可选择已登录的桌面版或独立 SDK；普通聊天无宿主工具。"
-        "SDK 普通聊天在人设允许联网且联网模式为 auto/native 时可用原生搜索，"
-        "不桥接长期记忆、知识库及本地 Agent 工具；"
+        "DeepSeek Harness 可选择已登录的桌面版或独立 SDK；与本地 Agent 一样按人设"
+        "和当前权限接入聊天工具，超管 Agent 另有 MCP 与 REST API；SDK 在联网模式为"
+        " auto/native 时使用自带搜索；长期记忆与知识库改为按需检索；"
         "账号场景设置优先于按群和全局设置；"
         "可用 /ai runner dsh 切换当前场景，/ai status 查看实际执行器",
         options=_options(local="本地 Agent", dsh="DeepSeek Harness"),

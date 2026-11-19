@@ -515,6 +515,18 @@ async def _deliver(
                     result.uncertain = True
                     result.error = "本轮该目标的投递结果未确认，不自动补发"
                     return result
+                if failure := record.get("tool_delivery_failure"):
+                    if (
+                        chunks is not None
+                        or origin != "final"
+                        or record.get("failure_notice_attempted")
+                    ):
+                        result.status = "skipped"
+                        result.error = failure
+                        return result
+                    record["failure_notice_attempted"] = True
+                    text = failure
+                    chunks = [(UniMessage(Text(failure)), failure)]
                 if request_key is not None and request_key in record["requests"]:
                     previous = record["requests"][request_key]
                     record["deduplicated"] += len(previous.parts)
@@ -556,6 +568,11 @@ async def _deliver(
                     )
                     record["uncertain"] |= result.uncertain
                     record["failed"] |= result.status in {"failed", "partial"}
+                    if origin == "tool" and result.status in {"failed", "partial"}:
+                        record["tool_delivery_failure"] = (
+                            f"这次共 {len(chunks)} 条，"
+                            f"平台已确认 {len(result.parts)} 条，其余未确认送达。"
+                        )
                     if request_key is not None and result.status == "sent":
                         record["requests"][request_key] = result
     finally:
@@ -617,6 +634,8 @@ async def _deliver_unlocked(
                 from zhenxun.services.ai.utils.runtime import PermissionUtils
 
                 PermissionUtils.ensure_current(context)
+                if check := context.state.get("_chat_delivery_check"):
+                    await check()
             sending = True
             result.attempted += 1
             send_token = AI_SEND.set(True)
