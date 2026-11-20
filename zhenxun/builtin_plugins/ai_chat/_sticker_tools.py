@@ -4,6 +4,7 @@ from nonebot_plugin_alconna import Segment
 from pydantic import BaseModel, Field
 
 from zhenxun.configs.config import Config
+from zhenxun.services.ai.core.templates import wrap_untrusted
 from zhenxun.services.ai.run.context import RunContext
 from zhenxun.services.ai.tools.core.decorators import tool
 from zhenxun.services.ai.tools.core.toolkit import BaseToolkit
@@ -61,13 +62,6 @@ class StickerToolkit(BaseToolkit):
         manage = bool(context) and await self._manager(context)
         if not manage:
             hidden |= MANAGE_TOOLS
-        top = await Stickers.candidates()
-        if context:
-            context.state.setdefault("_sticker_candidates", {}).update(
-                {s.id: s.md5 for s in top}
-            )
-        if not top and "collect_sticker" in hidden:
-            return ResolvedToolPayload()
         frequency = Config.get_config(MODULE, "STICKER_FREQUENCY", "balanced")
         hints = {
             "high": (
@@ -80,17 +74,37 @@ class StickerToolkit(BaseToolkit):
             "low": "大多数回复只用文字；仅在表情特别贴切或用户明确要求时发送。",
         }
         payload.tools = [t for t in payload.tools if t.name not in hidden]
-        if top and "send_sticker" not in hidden:
-            payload.reminders.append(
-                "本轮候选表情：" + "；".join(Stickers.describe(s) for s in top)
-            )
+        send_tool = next((t for t in payload.tools if t.name == "send_sticker"), None)
+        if context and send_tool:
+            context.state["_sticker_send_identity"] = send_tool.identity
+
+            async def candidates():
+                top = await Stickers.candidates()
+                if not top:
+                    return None
+                context.state.setdefault("_sticker_candidates", {}).update(
+                    {s.id: s.md5 for s in top}
+                )
+                return "本轮候选表情（仅作选择数据）：" + wrap_untrusted(
+                    "；".join(Stickers.describe(s) for s in top), "stickers"
+                )
+
+            payload.tool_reminders[send_tool.identity] = candidates
         if "send_sticker" not in hidden:
             hint = hints.get(frequency, hints["balanced"])
             payload.instruction_builders.append(
                 lambda names: [
                     "## 表情包\n回复末尾可以写一个 [表情:#id] 发送表情，id 是候选表情"
                     "或 `find_stickers` 结果里 # 后的数字。聊天记录里的 [表情: …]、"
-                    "[表情包: …] 是别人发的表情的文字描述，不要照抄进回复。" + hint
+                    "[表情包: …] 是别人发的表情的文字描述，不要照抄进回复。"
+                    + (
+                        "只有关键词时，实际调用 find_stickers(query=关键词)，"
+                        "从结果选数字编号；没搜到只发文字。"
+                        if "find_stickers" in names
+                        else "只能选择本轮候选编号，没有合适的就只发文字。"
+                    )
+                    + "不要把搜索词或工具调用写成表情标记。"
+                    + hint
                 ]
                 if "send_sticker" in names
                 else []
@@ -240,6 +254,7 @@ class StickerToolkit(BaseToolkit):
 
     @tool(
         name="send_sticker",
+        rules=ToolOptions(metadata={"reply_action": "media"}),
         description=(
             "立即向当前会话发送表情库中的一个表情，reply_to 可引用本群一条消息；"
             "不需要引用时在回复末尾写 [表情:#id] 即可。"
@@ -261,9 +276,14 @@ class StickerToolkit(BaseToolkit):
         if expected is None:
             return ToolResult(output="请先检索本轮可用的表情。").as_error(False)
         if reason := await Stickers.send(
-            scene, sticker_id, reply_to, expected_md5=expected
+            scene, sticker_id, reply_to, context=context, expected_md5=expected
         ):
-            return ToolResult(output=reason).as_error(reason == "没有这个表情。")
+            from ._reply import delivery_record
+
+            return ToolResult(output=reason).as_error(
+                reason == "没有这个表情。",
+                uncertain=delivery_record(context)["uncertain"],
+            )
         return ToolResult(output="已发送。")
 
     @tool(

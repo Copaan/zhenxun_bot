@@ -30,6 +30,60 @@ class Conversations:
     _changing: ClassVar[set[str]] = set()
 
     @staticmethod
+    def personal_scene(owner) -> str:
+        """按平台、Bot 和经验证的超管确定个人对话归属。"""
+        from zhenxun.services.ai.run.dsh import DshSessions
+
+        return (
+            f"ai_chat:{owner.bot_id}:personal:{DshSessions.owner_key(owner, 'agent')}"
+        )
+
+    @classmethod
+    async def personal(cls, context, entry: str, enabled: bool | None = None):
+        """读取或更新本人在指定入口的开关，不改变普通会话的执行修订。"""
+        from zhenxun.services.ai.utils.runtime import PermissionUtils
+
+        caller = context.run.caller
+        if (
+            not caller
+            or caller.source != "qq"
+            or not await PermissionUtils.check_superuser(context)
+        ):
+            if enabled is not None:
+                raise ValueError("只有当前超级用户可修改本人的入口。")
+            return None
+        return await cls.owner_entry(caller, entry, enabled)
+
+    @classmethod
+    async def owner_entry(cls, owner, entry, enabled=None):
+        """读写可信所有者的入口设置，不变更当前对话。"""
+        scene = cls.personal_scene(owner)
+        async with cls.locked(entry):
+            if entry.startswith("webui_entry:"):
+                row = await AIChatScene.get_or_none(scene_id=entry)
+                if not row and enabled:
+                    row, _ = await AIChatScene.get_or_create(
+                        scene_id=entry, defaults={"settings": {}, "current_id": None}
+                    )
+            else:
+                row, _ = await cls._current(
+                    entry, create=enabled is True, activate=False
+                )
+            settings = dict(row.settings or {}) if row else {}
+            owners = set(settings.get("_personal_entries", []))
+            if enabled is not None and (scene in owners) != enabled:
+                if enabled:
+                    owners.add(scene)
+                else:
+                    owners.discard(scene)
+                settings["_personal_entries"] = sorted(owners)
+                if not await AIChatScene.filter(
+                    id=row.id, revision=row.revision
+                ).update(settings=settings, revision=row.revision + 1):
+                    raise ConversationConflict("入口设置已变化，请重新读取。")
+        return scene if scene in owners else None
+
+    @staticmethod
     async def disabled(scene: str, setting=None) -> bool:
         """场景是否停用 AI，不加锁；场景未覆盖时继承群设置
 
@@ -54,16 +108,17 @@ class Conversations:
         return bool(setting and setting.disabled)
 
     @staticmethod
-    async def base(scene: str) -> tuple[dict, dict]:
+    async def base(scene: str, owner=None) -> tuple[dict, dict]:
         """读取群、用户绑定及全局默认，不修改共享配置。"""
-        from zhenxun.configs.config import Config
         from zhenxun.models.ai_chat_group import AIChatGroup
         from zhenxun.services.ai.llm.manager import get_default_model
 
-        from ._data_source import MODULE, parse_session
+        from ._data_source import parse_session
         from ._runner import agent_runner
 
         _, group, user = parse_session(scene)
+        if owner is not None and scene == Conversations.personal_scene(owner):
+            user = owner.user_id
         setting = await AIChatGroup.get_setting(group) if group else None
         persona = await AIPersona.get_for_scene(group, user)
         values = {
@@ -74,15 +129,13 @@ class Conversations:
             "tts": get_default_model("tts"),
             "stt": get_default_model("stt"),
             "disabled": bool(setting and setting.disabled),
-            "runner": agent_runner(setting),
-            "agent": bool(Config.get_config(MODULE, "AGENT_ENABLED")),
+            "runner": agent_runner(),
         }
         legacy = {}
         if setting:
             for key, value in {
                 "model": setting.model,
                 "disabled": setting.disabled,
-                "runner": setting.agent_runner,
             }.items():
                 if value is not None:
                     legacy[key] = value
@@ -95,15 +148,20 @@ class Conversations:
 
     @classmethod
     async def resolve(
-        cls, scene: str, snapshot: dict | None = None, *, inspect_policy: bool = False
+        cls,
+        scene: str,
+        snapshot: dict | None = None,
+        *,
+        inspect_policy: bool = False,
+        owner=None,
     ) -> dict:
         """返回覆盖、继承和有效值；停用保护由入口另行核验。"""
         snapshot = snapshot or await cls.snapshot(scene, create=False)
-        inherited, legacy = await cls.base(scene)
+        inherited, legacy = await cls.base(scene, owner)
         overrides = {
             key: value
             for key, value in snapshot["settings"].items()
-            if key in inherited
+            if key in inherited and key != "runner"
         }
         if "persona_id" in overrides and "model" not in legacy:
             from zhenxun.services.ai.llm.manager import get_default_model
@@ -158,13 +216,13 @@ class Conversations:
         """按实际任务能力校验场景设置，空值恢复继承。"""
         from zhenxun.services.ai.llm.manager import resolve_routes
 
-        allowed = {"model", "persona_id", "tts", "stt", "disabled", "runner", "agent"}
+        allowed = {"model", "persona_id", "tts", "stt", "disabled"}
         if set(settings) - allowed:
             raise ValueError("不支持的场景配置字段。")
         for key, value in settings.items():
             if value is None:
                 continue
-            if key in {"disabled", "agent"}:
+            if key == "disabled":
                 if type(value) is not bool:
                     raise ValueError("开关须为布尔值。")
             elif key == "persona_id":
@@ -173,9 +231,6 @@ class Conversations:
                     or not await AIPersona.filter(id=value, enabled=True).exists()
                 ):
                     raise ValueError("人设不存在或未启用。")
-            elif key == "runner":
-                if not isinstance(value, str) or value not in {"local", "dsh"}:
-                    raise ValueError("未知的执行器。")
             else:
                 if not isinstance(value, str) or not value.strip():
                     raise ValueError("模型或路由组名称不能为空。")

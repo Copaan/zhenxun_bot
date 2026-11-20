@@ -366,12 +366,20 @@ class ToolExecutor:
                 ).encode()
             ).hexdigest()
         )
+        if metadata.get("reply_action") and safe_context.run.reply_control:
+            signature += (
+                f":caller:{safe_context.run.run_id}"
+                f":input:{safe_context.run.reply_control.epoch}"
+            )
 
         async def inner_handler(args_inner: dict) -> Any:
             nonlocal started
             from zhenxun.services.ai.utils.runtime import PermissionUtils
 
             PermissionUtils.ensure_current(safe_context)
+            restricted = await PermissionUtils.tool_restrictions(safe_context)
+            if restricted is None or identity in restricted:
+                return ToolResult(output="当前身份无权使用此工具。").as_error(False)
             completed = operations.setdefault("completed_operations", {})
             if mutating and signature in completed:
                 operations["reused_operations"] = (
@@ -452,9 +460,23 @@ class ToolExecutor:
                 结果，出错的调用对应异常对象；遇到中止或取消后不再执行后续调用
         """
         size = len(validated_calls)
+        control = context.run.reply_control if context else None
+        terminal = [
+            i
+            for i, call in enumerate(validated_calls)
+            if control and not context.run.parent_run_id and control.terminal(call)
+        ]
+        if len(terminal) > 1:
+            for i in terminal:
+                validated_calls[i].args_valid = False
+                validated_calls[i].validation_error = ValueError(
+                    "同一批只能请求一次答复结束，请合并最终消息。"
+                )
+        order = [i for i in range(size) if i not in terminal] + terminal
         chunks: list[list[int]] = []
         reads: list[int] = []
-        for index, validated in enumerate(validated_calls):
+        for index in order:
+            validated = validated_calls[index]
             metadata = getattr(validated.tool, "metadata", None) or {}
             if parallel and (
                 metadata.get("read_only") is True or metadata.get("delegates") is True
@@ -467,8 +489,19 @@ class ToolExecutor:
             chunks.append([index])
         if reads:
             chunks.append(reads)
-        results: list[tuple[ToolCallPart, ToolResult] | BaseException] = []
+        results: dict[int, tuple[ToolCallPart, ToolResult] | BaseException] = {}
         for chunk in chunks:
+            if any(i in terminal for i in chunk) and any(
+                isinstance(value, BaseException)
+                or value[1].is_error
+                or value[1].uncertain
+                for value in results.values()
+            ):
+                for i in chunk:
+                    validated_calls[i].args_valid = False
+                    validated_calls[i].validation_error = ValueError(
+                        "本批工具尚未全部成功，未执行最终发送或结束。"
+                    )
             tasks = [
                 asyncio.create_task(
                     self.execute_tool_call(validated_calls[i], context, event_bus)
@@ -491,7 +524,7 @@ class ToolExecutor:
                     if not task.done():
                         task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
-            results.extend(chunk_results)
+            results.update(zip(chunk, chunk_results))
             stop = next(
                 (
                     r
@@ -501,9 +534,9 @@ class ToolExecutor:
                 None,
             )
             if stop is not None:
-                results.extend([stop] * (size - len(results)))
+                results.update({i: stop for i in range(size) if i not in results})
                 break
-        return results
+        return [results[i] for i in range(size)]
 
     async def execute_batch(
         self,

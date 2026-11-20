@@ -45,8 +45,8 @@ COMMANDS = (
     ),
     ("persona", "/persona list|view <名称>|<名称>|unset", "admin", True),
     ("llm", "/llm status|on|off|default", "admin", True),
-    ("runner", "/ai runner status|local|dsh|default", "admin", False),
-    ("agent", "/ai agent status|on|off|default", "admin", False),
+    ("runner", "/ai runner status（全局切换在 WebUI）", "admin", False),
+    ("agent", "/ai agent status|on|off", "admin", False),
     (
         "memory",
         "/ai memory list|search <词>|add <内容>|del <ID>|organize",
@@ -94,9 +94,10 @@ async def command_help(context: RunContext, runner: str) -> str:
         [
             "AI 控制（独立简写冲突时可使用 /ai 前缀）",
             *lines,
-            f"当前执行器：{runner}。设置属于场景，切换历史不换设置。",
+            f"当前执行器：{runner}。执行器全局生效，切换历史不更换执行器。",
             "/new 从新背景边界开始，旧历史和长期记忆保留。",
-            "停止默认只针对本人运行；群管理员和超管可停止当前群范围。",
+            "群内会话命令始终管理本群普通对话；个人 Agent 请在私聊或控制台管理。",
+            "停止只针对本人从当前入口发起的运行。",
             "DSH 原生选择不被本地模型覆盖；不支持的远端操作会明确拒绝。"
             if runner == "dsh"
             else "模型、人设与执行器修改限超管。",
@@ -212,44 +213,30 @@ async def stop(context: RunContext, run_id: str = "") -> str:
     from zhenxun.services.ai.run.dsh_control import DshControl
     from zhenxun.services.ai.run.session import session_manager
 
-    from ._runner import dsh_settings, scene_session
+    from ._runner import dsh_settings
 
-    manage = await PermissionUtils.check_superuser(context) or (
-        bool(context.get_group_id())
-        and await PermissionUtils.check_admin_level(context, 1)
-    )
-    if run_id:
-        entry = session_manager.runs.get(run_id)
-        other = entry[0].run.caller if entry else None
-        caller = context.run.caller
-        same = (
+    caller = context.run.caller
+
+    def within(active):
+        other = active.run.caller
+        return (
             other
-            and caller
+            and other.source == "qq"
             and (other.platform, other.bot_id, other.group_id)
             == (caller.platform, caller.bot_id, caller.group_id)
+            and other.user_id == caller.user_id
         )
-        if entry and (
-            not same
-            or (not manage and other.user_id != caller.user_id)
-            or (not caller.group_id and other.user_id != caller.user_id)
-        ):
-            raise ValueError("不能停止不属于当前范围的运行。")
-        if entry:
-            done = await session_manager.stop(run_id)
-            remote = entry[0].run.operations.get("dsh", {}).get("stop")
-            if entry[0].state.get("_dsh_binding"):
-                return stop_message([remote or "unknown"], done)
-            return stop_message([], done)
-    target = await scene_session(context.get_bot(), context.get_event())
+
     captured = [
         (ident, active)
         for ident, (active, task) in list(session_manager.runs.items())
-        if not run_id
-        and active.session_id == target
+        if (not run_id or ident == run_id)
         and task
         and not task.done()
-        and (manage or active.get_user_id() == context.get_user_id())
+        and within(active)
     ]
+    if run_id in session_manager.runs and not captured:
+        raise ValueError("不能停止不属于当前入口的运行。")
     completed = [await session_manager.stop(ident) for ident, _ in captured]
     states = [
         active.run.operations.get("dsh", {}).get("stop", "unknown")
@@ -272,12 +259,16 @@ async def stop(context: RunContext, run_id: str = "") -> str:
             continue
         if run_id and flight.get("run_id") != run_id:
             continue
-        if item["mode"] == "chat" and context.get_group_id() and not manage:
-            from zhenxun.models.ai_agent_run import AIAgentRun
+        from zhenxun.models.ai_agent_run import AIAgentRun
 
-            row = await AIAgentRun.get_or_none(run_id=flight.get("run_id"))
-            if not row or str(row.user_id) != context.get_user_id():
-                continue
+        row = await AIAgentRun.get_or_none(run_id=flight.get("run_id"))
+        if (
+            not row
+            or row.source != "qq"
+            or row.group_id != caller.group_id
+            or str(row.user_id) != caller.user_id
+        ):
+            continue
         result = await DshControl.stop_owned(settings, dict(item), flight.get("run_id"))
         states.append(result["state"])
     if captured or states:
@@ -317,11 +308,32 @@ async def execute(bot, event, text: str) -> str:
         raise ValueError("此操作只针对当前对话，不接受额外目标参数。")
     if command == "stop":
         return await stop(context, argument)
+    if command == "agent":
+        await require_admin(context)
+        if argument not in {"", "status", "on", "off"}:
+            raise ValueError("用法：/ai agent on|off|status")
+        personal = await Conversations.personal(
+            context, scene, {"on": True, "off": False}.get(argument)
+        )
+        return "本人在当前入口的个人 Agent：" + ("开启" if personal else "关闭")
+    personal = await Conversations.personal(context, scene)
+    group = context.get_group_id()
+    scope = (
+        "本群普通对话" if group else "本人个人 Agent" if personal else "本人普通私聊"
+    )
+    destination = "本人个人 Agent" if personal else scope
+    routing = f"下一条定向消息：{destination}；会话命令：{scope}。"
+    if personal and not group:
+        context.state["_personal_scene"] = personal
+        scene = personal
     snapshot = await Conversations.snapshot(scene, create=False)
     context.session_id = snapshot["session_id"]
     context.state["_conversation"] = snapshot
     resolved = context.state["_scene_configuration"] = await Conversations.resolve(
-        scene, snapshot, inspect_policy=command in {"sid", "status", "llm"}
+        scene,
+        snapshot,
+        inspect_policy=command in {"sid", "status", "llm"},
+        owner=context.run.caller if personal and not group else None,
     )
     group, user = context.get_group_id(), context.get_user_id()
     setting = await AIChatGroup.get_setting(group) if group else None
@@ -330,12 +342,12 @@ async def execute(bot, event, text: str) -> str:
     runner = resolved["effective"]["runner"]
     key = (context.run.caller.platform, str(bot.self_id), user, scene)
     if command in {"help", ""}:
-        return await command_help(context, runner)
+        return routing + "\n" + await command_help(context, runner)
     if command in {"sid", "status"}:
         persona = await Conversations.persona(snapshot, group, user)
         AIChatManager.configuration(context, setting, persona, runner)
         active = (
-            await scene_session(bot, event)
+            scene_session(context, snapshot, runner)
             if runner == "dsh" or snapshot["session_id"]
             else "无，请新建或选择已有对话"
         )
@@ -343,9 +355,9 @@ async def execute(bot, event, text: str) -> str:
         if runner == "dsh":
             from zhenxun.services.ai.run.dsh import DshSessions
 
-            from ._runner import dsh_mode, dsh_settings
+            from ._runner import dsh_settings
 
-            mode = await dsh_mode(context, persona)
+            mode = "agent" if not group and personal else "chat"
             records = DshSessions.for_settings(dsh_settings())
             item = records._read()["owners"].get(records.owner(context, mode), {})
             model = item.get("model")
@@ -354,7 +366,7 @@ async def execute(bot, event, text: str) -> str:
                 f"\n原生选择（上次确认）：{model or '尚未确认，请查询 DSH 状态'}"
             )
         return (
-            f"场景：{scene}\n当前对话：{active}\n"
+            f"{routing}\n场景：{scene}\n当前对话：{active}\n"
             f"执行器：{runner}\n模型：{context.state['_configuration']['model']}\n"
             f"人设：{persona.name if persona else '内置默认'}\n"
             + (
@@ -376,6 +388,8 @@ async def execute(bot, event, text: str) -> str:
         from zhenxun.services.ai.run.hitl import HITLController
 
         return await HITLController.command(context, command, argument)
+    if command == "dsh" and runner != "dsh":
+        return "全局执行器为内置，未操作 DSH 会话。"
     if command == "dsh":
         await require_admin(context)
         from ._runner import dsh_command
@@ -386,8 +400,14 @@ async def execute(bot, event, text: str) -> str:
             await require_scene(context, reset=command == "reset")
         from ._runner import dsh_command
 
-        return await dsh_command(
-            context, command + (" " + argument if argument else ""), current_mode=True
+        return (
+            scope
+            + "：\n"
+            + await dsh_command(
+                context,
+                command + (" " + argument if argument else ""),
+                current_mode=True,
+            )
         )
     if runner == "dsh" and command in {
         "del",
@@ -407,7 +427,11 @@ async def execute(bot, event, text: str) -> str:
         listing = select_number((*key, "sessions", archived), pairs, None)
         listing = listing.splitlines()
         start = (int(page) - 1) * 10
-        return "\n".join(listing[start : start + 10]) or "本页没有对话。"
+        return (
+            scope
+            + "：\n"
+            + ("\n".join(listing[start : start + 10]) or "本页没有对话。")
+        )
     if command in {"new", "switch", "rename", "archive", "unarchive", "del", "reset"}:
         await require_scene(context, reset=command == "reset")
         target = None
@@ -422,23 +446,21 @@ async def execute(bot, event, text: str) -> str:
             name=argument or None,
             expected_revision=snapshot["revision"],
         )
+        if command == "new":
+            return f"已新建{scope}。旧对话和长期记忆保留。"
         current = result["current_id"] or "无，下次聊天新建"
-        return f"已完成 {command}；当前对话：{current}。长期记忆保留。"
+        return f"{scope}已完成 {command}；当前对话：{current}。长期记忆保留。"
     if command == "history":
         if runner == "local" and snapshot["session_id"] is None:
             return "当前没有活跃对话；请用 /ls 查看并选择已有对话。"
-        if runner == "dsh" and group:
-            from ._runner import dsh_mode
-
-            persona = await Conversations.persona(snapshot, group, user)
-            if await dsh_mode(context, persona) == "agent":
-                raise ValueError(AGENT_PRIVATE)
         from zhenxun.models.ai_chat_message import AIChatMessage
 
         if argument and (not argument.isdigit() or int(argument) < 1):
             raise ValueError("页码须为正整数。")
         rows = (
-            await AIChatMessage.filter(session_id=await scene_session(bot, event))
+            await AIChatMessage.filter(
+                session_id=scene_session(context, snapshot, runner)
+            )
             .order_by("-id")
             .offset((int(argument or 1) - 1) * 10)
             .limit(10)
@@ -462,7 +484,7 @@ async def execute(bot, event, text: str) -> str:
             )
             if value:
                 lines.append(f"{row.role}: {value[:800]}")
-        return "\n".join(lines) or "本页没有可显示的已结算消息。"
+        return scope + "：\n" + ("\n".join(lines) or "本页没有可显示的已结算消息。")
     if command == "stats":
         from zhenxun.models.ai_agent_run import AIAgentRun
         from zhenxun.models.ai_token_usage import AITokenUsage
@@ -472,7 +494,9 @@ async def execute(bot, event, text: str) -> str:
         usage = []
         if runner == "dsh" or snapshot["session_id"]:
             usage = (
-                await AIAgentRun.filter(session_id=await scene_session(bot, event))
+                await AIAgentRun.filter(
+                    session_id=scene_session(context, snapshot, runner)
+                )
                 .annotate(total=Sum("tokens"))
                 .values("total")
             )
@@ -481,11 +505,11 @@ async def execute(bot, event, text: str) -> str:
         )
         total = (usage[0]["total"] or 0) if usage else 0
         return (
-            f"当前对话已记录总 token：{total}\n"
+            f"{scope}已记录总 token：{total}\n"
             f"本人今日（{date.today()}）额度用量：{used}\n"
             "历史输入/输出分项未记录时不可推算。"
         )
-    if command in {"provider", "model", "persona", "llm", "runner", "agent"}:
+    if command in {"provider", "model", "persona", "llm", "runner"}:
         await require_admin(context)
         return await configure(context, snapshot, command, argument, key)
     if command == "memory":
@@ -516,11 +540,13 @@ async def configure(context, snapshot, command, argument, key) -> str:
 
     settings = {}
     resolved = context.state["_scene_configuration"]
-    if command in {"llm", "runner", "agent"}:
-        name = {"llm": "disabled", "runner": "runner", "agent": "agent"}[command]
+    if command == "runner":
+        return f"全局执行器：{resolved['effective']['runner']}。仅可在 WebUI 切换。"
+    if command == "llm":
+        name = "disabled"
         if argument in {"", "status"}:
             value = resolved["effective"][name]
-            label = ("关闭" if value else "开启") if command == "llm" else str(value)
+            label = "关闭" if value else "开启"
             return (
                 f"{command} 有效值：{label}；来源：{resolved['sources'][name]}。"
                 f"范围：{resolved['scope']}。插件启停、封禁和账号权限仍独立生效。"
@@ -530,16 +556,9 @@ async def configure(context, snapshot, command, argument, key) -> str:
                     else ""
                 )
             )
-        allowed = {"local", "dsh"} if command == "runner" else {"on", "off"}
-        if argument not in allowed | {"default"}:
-            raise ValueError("有效值：" + " / ".join(sorted(allowed | {"default"})))
-        settings[name] = (
-            None
-            if argument == "default"
-            else argument
-            if command == "runner"
-            else argument == ("off" if command == "llm" else "on")
-        )
+        if argument not in {"on", "off", "default"}:
+            raise ValueError("有效值：on / off / default")
+        settings[name] = None if argument == "default" else argument == "off"
     elif command == "persona":
         people = await AIPersona.filter(enabled=True).order_by("id")
         pairs = [(str(p.id), p.name) for p in people]
@@ -562,6 +581,8 @@ async def configure(context, snapshot, command, argument, key) -> str:
             argument = rest.strip()
         else:
             task = "chat"
+        if resolved["effective"]["runner"] == "dsh" and task == "chat":
+            return "当前使用 DSH 原生模型，请使用 /ai dsh model。"
         field = "model" if task == "chat" else task
         choices = Conversations.models(task)
         pairs = (

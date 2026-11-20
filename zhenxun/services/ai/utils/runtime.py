@@ -141,6 +141,25 @@ class PermissionUtils:
         return False
 
     @staticmethod
+    async def tool_restrictions(context) -> set[str] | None:
+        """读取当前聊天主体不可使用的工具标识，无法确认配置时拒绝执行。"""
+        if not context.run.caller:
+            return set() if not context.run.source else None
+        from zhenxun.configs.config import Config
+
+        try:
+            values = Config.get_config("ai_chat", "SUPERUSER_TOOLS", [])
+            if not isinstance(values, list) or any(
+                not isinstance(v, str) for v in values
+            ):
+                return None
+            if not values or await PermissionUtils.check_superuser(context):
+                return set()
+            return set(values)
+        except Exception:
+            return None
+
+    @staticmethod
     async def check_superuser(context: Any) -> bool:
         """按可信来源和当前授权校验超管，不复用旧事件角色。"""
         caller = context.run.caller

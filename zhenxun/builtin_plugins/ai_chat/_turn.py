@@ -65,6 +65,9 @@ class ChatTurn:
             session_manager.revision(session_id) if revision is None else revision
         )
         self.run_id = start_run(context)
+        from ._send import reply_completion
+
+        reply_completion(context)
         session_manager.register(context)
         context.run.root_session_id = session_id
         context.run.root_revision = self.revision
@@ -111,6 +114,12 @@ class ChatTurn:
             .get(self.target, {})
             .get("entries", [])
             if entry["origin"] == "tool"
+            and entry.get("reply_epoch", 0)
+            == (
+                self.context.run.reply_control.epoch
+                if self.context.run.reply_control
+                else 0
+            )
         ]
 
     def resolve_reply(self, result, error: BaseException | None = None) -> str | None:
@@ -129,6 +138,9 @@ class ChatTurn:
             return None
         text = str(result.output or "")
         issue = self.context.state.get("_chat_reply_issue")
+        if self.context.run.reply_control and self.context.run.reply_control.closed:
+            self.reply_kind = "tool_reply"
+            return None
         if (reply := parse_silent(text)) and issue != "output_blocked":
             self.reply_kind = "answer"
             return reply
@@ -218,6 +230,11 @@ class ChatTurn:
             and report["deduplicated"]
             else self.reply_kind
         )
+        if control := self.context.run.reply_control:
+            report["reply_completion"] = {
+                "closed": control.closed,
+                "input_segment": control.epoch,
+            }
         if self.reply_kind == "failure" and self.result:
             report["reply_issue"] = self.result.reason
         report["effective_reply"] = bool(
@@ -278,6 +295,19 @@ class ChatTurn:
             if check := context.state.get("_chat_delivery_check"):
                 await check()
         record = context.run.operations.get("deliveries", {}).get(self.target, {})
+        if context.run.reply_control and context.run.reply_control.closed:
+            self.reply_kind = "tool_reply"
+            delivery.status = "skipped"
+            return
+        if not directed and (
+            error is not None
+            or record.get("tool_delivery_failure")
+            or record.get("uncertain")
+            or (value and value.outcome not in {None, "completed"})
+        ):
+            self.reply_kind = "failure"
+            delivery.status = "failed" if record.get("failed") else "skipped"
+            return
         if record.get("tool_delivery_failure") and not isinstance(
             error, asyncio.CancelledError
         ):

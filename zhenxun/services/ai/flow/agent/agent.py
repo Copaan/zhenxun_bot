@@ -312,6 +312,9 @@ class Agent:
                     sender=ctx.get_user_id() if ctx.run.follow_up else None,
                     revision=revision,
                     admission=admission,
+                    owner_scope=ctx.state.get("_personal_scene")
+                    if not ctx.run.parent_run_id
+                    else None,
                 ):
                     await session_manager.phase(ctx, "running")
                     budget = ctx.run.budget
@@ -495,6 +498,9 @@ class Agent:
         )
         candidates = {}
         conflicts = set()
+        from zhenxun.services.ai.utils.runtime import PermissionUtils
+
+        restricted = await PermissionUtils.tool_restrictions(context)
         for tool in payload.tools:
             if include is not None and not include(tool):
                 continue
@@ -505,6 +511,8 @@ class Agent:
                 continue
             name = definition.name.lower()
             identity = tool.identity
+            if restricted is None or identity in restricted:
+                continue
             if (
                 context.run.tool_ceiling is not None
                 and identity not in context.run.tool_ceiling
@@ -529,6 +537,12 @@ class Agent:
                 tools.append(tool)
         context.run.available_tools = frozenset(tool.identity for tool in tools)
         context.run.bound_tools = {tool.identity: tool for tool in tools}
+        if context.prepare_chat_reminders:
+            for identity, build_reminder in payload.tool_reminders.items():
+                if identity in context.run.bound_tools and (
+                    reminder := await build_reminder()
+                ):
+                    payload.reminders.append(reminder)
         context.state["_available_tool_names"] = {tool.name for tool in tools}
         names = frozenset(tool.name for tool in tools)
         for build in payload.instruction_builders:

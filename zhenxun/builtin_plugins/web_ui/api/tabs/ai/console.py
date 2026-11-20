@@ -25,11 +25,16 @@ CONSOLE_PREFIX = "webui_console:"
 _tasks: dict[str, asyncio.Task] = {}
 
 
-class ConsoleRequest(BaseModel):
+class ConsoleEntry(BaseModel):
+    owner: str | None = Field(default=None, max_length=64)
+    agent: bool = False
+
+
+class ConsoleRequest(ConsoleEntry):
     message: str = Field(min_length=1, max_length=8000)
     persona_id: int | None = None
-    agent: bool = False
     session_id: str | None = Field(default=None, max_length=255)
+    executor: str | None = Field(default=None, max_length=16)
 
 
 class ConsoleStopRequest(BaseModel):
@@ -81,26 +86,92 @@ def management_subject(request: Request) -> str:
     return str(principal["sub"])
 
 
+def personal_targets():
+    """列出在线 Bot 当前配置的超管，映射历史不能作为身份依据。"""
+    import nonebot
+
+    from zhenxun.services.ai.run.context import CallerIdentity
+    from zhenxun.services.ai.run.dsh import DshSessions
+    from zhenxun.utils.platform import PlatformUtils
+
+    result = {}
+    for bot in nonebot.get_bots().values():
+        for user in PlatformUtils.get_superusers(bot):
+            owner = CallerIdentity(
+                "qq",
+                PlatformUtils.get_platform_scope(bot),
+                str(bot.self_id),
+                user,
+                None,
+            )
+            result[DshSessions.owner_key(owner, "agent")] = owner
+    return result
+
+
+def console_entry(subject):
+    return "webui_entry:" + hashlib.sha256(subject.encode()).hexdigest()
+
+
+@router.put("/console/entry", dependencies=[authentication()], response_model=Result)
+async def set_console_entry(payload: ConsoleEntry, request: Request) -> Result:
+    from zhenxun.builtin_plugins.ai_chat._sessions import Conversations
+
+    owner = personal_targets().get(payload.owner)
+    if owner is None:
+        raise HTTPException(409, detail={"message": "请选择当前 Bot 的有效超管。"})
+    await Conversations.owner_entry(
+        owner, console_entry(management_subject(request)), payload.agent
+    )
+    return Result.ok(info="已保存本人控制台入口。")
+
+
 @router.get("/console/session", dependencies=[authentication()], response_model=Result)
 async def resolve_console_session(
-    request: Request, persona_id: int | None = None, agent: bool = False
+    request: Request, persona_id: int | None = None, owner: str | None = None
 ) -> Result:
     from zhenxun.builtin_plugins.ai_chat._agent import AGENT_ACTIVE_KEY, bind_source
     from zhenxun.builtin_plugins.ai_chat._runner import (
         agent_runner,
-        dsh_mode,
         dsh_settings,
     )
-    from zhenxun.models.ai_persona import AIPersona
+    from zhenxun.builtin_plugins.ai_chat._sessions import Conversations
     from zhenxun.services.ai.run.context import RunContext, ScheduledDeps
     from zhenxun.services.ai.run.dsh import DshSessions
 
     from ....security import validate_access_token
 
     subject = management_subject(request)
-    if agent_runner(None) != "dsh":
+    targets = personal_targets()
+    if owner is None and len(targets) == 1:
+        owner = next(iter(targets))
+    if owner and owner not in targets:
+        raise HTTPException(409, detail={"message": "所选超管已失效。"})
+    selected = targets.get(owner)
+    personal = (
+        await Conversations.owner_entry(selected, console_entry(subject))
+        if selected
+        else None
+    )
+    choices = [
+        {"id": k, "label": f"{v.user_id} · Bot {v.bot_id} ({v.platform})"}
+        for k, v in targets.items()
+    ]
+    data = {
+        "owners": choices,
+        "owner": owner,
+        "agent": bool(personal),
+        "executor": agent_runner(),
+    }
+    if data["executor"] == "local":
+        snapshot = await Conversations.snapshot(personal) if personal else None
         return Result.ok(
-            {"session_id": console_session(persona_id), "executor": "local"}
+            {
+                **data,
+                "session_id": snapshot["session_id"]
+                if snapshot
+                else console_session(persona_id),
+                "revision": snapshot["revision"] if snapshot else None,
+            }
         )
     context = RunContext(
         deps=ScheduledDeps(user_id=f"webui:{subject}", platform="webui")
@@ -109,15 +180,16 @@ async def resolve_console_session(
     bind_source(
         context, "webui", management_check=lambda: validate_access_token(credential)
     )
-    context.state[AGENT_ACTIVE_KEY] = agent
-    persona = await AIPersona.get_or_none(id=persona_id) if persona_id else None
-    mode = await dsh_mode(context, persona)
+    context.state[AGENT_ACTIVE_KEY] = bool(personal)
+    context.state["_personal_scene"] = personal
+    context.state["_personal_owner"] = selected
+    mode = "agent" if personal else "chat"
     records = DshSessions.for_settings(dsh_settings())
     item = records._read()["owners"].get(records.owner(context, mode))
     return Result.ok(
         {
             "session_id": item["local_id"] if item else None,
-            "executor": "dsh",
+            **data,
             "mode": mode,
             "revision": item["revision"] if item else None,
         }
@@ -192,8 +264,28 @@ async def _run(
     management_check=None,
     subject: str = "",
 ) -> None:
+    """确保控制台生产者在初始化失败或退出时结束事件流。"""
+    if receipt is None:
+        receipt = {"event": asyncio.Event()}
+    try:
+        await _run_console(payload, persona, queue, receipt, management_check, subject)
+    except Exception as error:
+        logger.warning(f"控制台运行未完成: {type(error).__name__}", "WebUi")
+        if not receipt.get("done_emitted"):
+            queue.put_nowait(
+                {
+                    "type": "done",
+                    "outcome": "failed",
+                    "error": "控制台未能完成本轮，请检查执行器配置和运行记录。",
+                }
+            )
+    finally:
+        queue.put_nowait(None)
+
+
+async def _run_console(payload, persona, queue, receipt, management_check, subject):
     """在会话锁内运行一次控制台对话：工具事件实时推送，回复正文随结束事件推送，
-    等待前端收到结束事件后按实际送达的内容结算历史与运行记录，最后写入 None
+    等待前端收到结束事件后按实际送达的内容结算历史与运行记录
 
     参数:
         payload: 请求
@@ -212,7 +304,7 @@ async def _run(
         run_dsh,
         select_dsh_session,
     )
-    from zhenxun.builtin_plugins.ai_chat._safety import Safety
+    from zhenxun.builtin_plugins.ai_chat._safety import Safety, SessionLimit
     from zhenxun.builtin_plugins.ai_chat._turn import FAILED_NOTICE, ChatTurn
     from zhenxun.services.ai.core.exceptions import ControlFlowExit
     from zhenxun.services.ai.run.context import RunContext, ScheduledDeps
@@ -226,7 +318,20 @@ async def _run(
         context.run.run_id = receipt["run_id"]
     bind_source(context, "webui", management_check=management_check)
     context.state[AGENT_ACTIVE_KEY] = payload.agent
-    context.state[USER_KEY] = "WebUI"
+    from zhenxun.builtin_plugins.ai_chat._sessions import Conversations
+
+    async def verify_entry():
+        owner = personal_targets().get(payload.owner) if payload.owner else None
+        personal = (
+            await Conversations.owner_entry(owner, console_entry(subject))
+            if owner
+            else None
+        )
+        if bool(personal) != payload.agent or (payload.owner and not owner):
+            raise ValueError("控制台入口已变化，请刷新后重新发送。")
+        return owner, personal
+
+    context.state[USER_KEY] = f"webui:{subject}"
     context.state["_dsh_event"] = queue.put_nowait
 
     async def ask_dsh(question, approval=False):
@@ -251,24 +356,55 @@ async def _run(
                 future.cancel()
 
     context.state["_dsh_ask"] = ask_dsh
-    runner = agent_runner(None)
-    if runner == "dsh":
-        try:
-            await select_dsh_session(context, persona)
-            if payload.session_id and payload.session_id != context.session_id:
-                raise ValueError("DSH 会话已变化，请刷新后重新发送")
-        except Exception:
-            await queue.put(
-                {
-                    "type": "done",
-                    "error": "DSH 会话未能确认，请刷新状态后重试。",
-                    "outcome": "failed",
-                }
+    runner = agent_runner()
+    try:
+        if payload.executor and payload.executor != runner:
+            raise ValueError("执行器已变化")
+        owner, personal = await verify_entry()
+        context.state["_personal_owner"] = owner
+        context.state["_personal_scene"] = personal
+        if personal:
+            context.run.follow_up = False
+            snapshot = await Conversations.snapshot(personal)
+            context.state["_conversation"] = snapshot
+            context.state["_entry_scene"] = console_entry(subject)
+            context.state["_scene_configuration"] = await Conversations.resolve(
+                personal, snapshot, owner=owner
             )
-            await queue.put(None)
-            return
+            if context.state["_scene_configuration"]["effective"]["disabled"]:
+                raise ValueError("个人会话已停用")
+            if payload.persona_id is None:
+                persona = await Conversations.persona(snapshot, None, owner.user_id)
+            context.session_id = context.session.session_id = snapshot["session_id"]
+            context.run.management_check = lambda: bool(
+                management_check
+                and management_check()
+                and personal_targets().get(payload.owner) == owner
+            )
+        if runner == "dsh":
+            await select_dsh_session(context, persona)
+        if payload.session_id and payload.session_id != context.session_id:
+            raise ValueError("会话已变化")
+    except Exception:
+        await queue.put(
+            {
+                "type": "done",
+                "error": "会话或权限已变化，请刷新后重试。",
+                "outcome": "failed",
+            }
+        )
+        return
     AIChatManager.prepare_input(context, payload.message)
     agent = AIChatManager.get_agent(persona)
+    if SessionLimit.personal_full(personal):
+        queue.put_nowait(
+            {
+                "type": "done",
+                "outcome": "skipped",
+                "error": "个人 Agent 队列已满，请稍后再试。",
+            }
+        )
+        return
     turn = ChatTurn(
         context,
         agent,
@@ -288,7 +424,6 @@ async def _run(
             "phase": "queued",
         }
     )
-    receipt = receipt if receipt is not None else {"event": asyncio.Event()}
     finalized = False
 
     async def prepare_run():
@@ -296,7 +431,10 @@ async def _run(
         from zhenxun.models.ai_persona import AIPersona
         from zhenxun.services.ai.core.exceptions import LLMException
 
-        if agent_runner(None) != runner:
+        await verify_entry()
+        if personal:
+            await Conversations.check(snapshot)
+        if agent_runner() != runner:
             raise LLMException("排队期间执行器已切换，请重新发送。")
 
         if payload.persona_id is not None:
@@ -333,15 +471,10 @@ async def _run(
         output = Safety.filter_output(output or "")[0]
         from zhenxun.builtin_plugins.ai_chat._agent import (
             AGENT_TOOLS_KEY,
-            agent_enabled,
         )
         from zhenxun.services.ai.utils.runtime import PermissionUtils
 
-        allowed = (
-            payload.agent
-            and agent_enabled()
-            and await PermissionUtils.check_superuser(context)
-        )
+        allowed = payload.agent and await PermissionUtils.check_superuser(context)
         actual = context.state.get("_available_tool_names", set()) & context.state.get(
             AGENT_TOOLS_KEY, set()
         )
@@ -352,12 +485,8 @@ async def _run(
             )
         reason = ""
         if payload.agent and not available:
-            reason = (
-                "Agent 开关未开启"
-                if not agent_enabled()
-                else context.state.get(
-                    "_permission_reason", "当前人设没有可用的敏感工具"
-                )
+            reason = context.state.get(
+                "_permission_reason", "当前人设没有可用的敏感工具"
             )
         done = {
             "type": "done",
@@ -391,6 +520,7 @@ async def _run(
             )
         try:
             await queue.put(done)
+            receipt["done_emitted"] = True
             if not isinstance(error, asyncio.CancelledError):
                 await asyncio.wait_for(receipt["event"].wait(), 5)
         except asyncio.TimeoutError:
@@ -453,7 +583,6 @@ async def _run(
                 "details": session_manager.details(context),
             }
         )
-        await queue.put(None)
 
 
 @router.post("/console/run", dependencies=[authentication()])
@@ -571,16 +700,18 @@ async def console_stop(payload: ConsoleStopRequest, request: Request) -> Result:
     records = DshSessions.for_settings(settings)
     captured_ids = {run_id for run_id, _ in captured}
     for item in records._read()["owners"].values():
-        identity = item.get("identity") or {}
         flight = item.get("inflight") or {}
         run_id = flight.get("run_id")
-        if (
-            identity.get("source") != "webui"
-            or identity.get("user_id") != f"webui:{subject}"
-            or not run_id
-            or run_id in captured_ids
-            or (payload.run_id and run_id != payload.run_id)
-        ):
+        if not run_id or run_id in captured_ids or payload.run_id != run_id:
+            continue
+        from zhenxun.models.ai_agent_run import AIAgentRun
+
+        if not await AIAgentRun.filter(
+            run_id=run_id,
+            source="webui",
+            user_id=f"webui:{subject}",
+            session_id=item["local_id"],
+        ).exists():
             continue
         result = await DshControl.stop_owned(settings, dict(item), run_id)
         states.append(result["state"])

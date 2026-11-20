@@ -201,7 +201,7 @@ class SessionLimit:
     """每个会话最多排队的消息数（含等待会话锁的运行）"""
 
     @classmethod
-    async def acquire(cls, session_id: str) -> bool:
+    async def acquire(cls, session_id: str, *, check_queue: bool = True) -> bool:
         """占用一次 SESSION_RATE_LIMIT 名额，名额用完时按到达顺序等到有空位；
         每分钟最多清理一次超过一分钟没有对话且无人排队的会话
 
@@ -215,7 +215,7 @@ class SessionLimit:
 
         waiting = cls._waiting.get(session_id, 0)
         running = len(session_manager.live_tasks.get(session_id, ()))
-        if waiting + running > cls.QUEUE:
+        if check_queue and waiting + running > cls.QUEUE:
             return False
         limit = int(Config.get_config(MODULE, "SESSION_RATE_LIMIT") or 0)
         if limit <= 0:
@@ -240,3 +240,19 @@ class SessionLimit:
             if not cls._waiting[session_id]:
                 cls._waiting.pop(session_id, None)
                 cls._queues.pop(session_id, None)
+
+    @classmethod
+    def personal_full(cls, scene: str | None) -> bool:
+        """按个人归属检查一个执行名额和等待名额；通过后在同一事件循环步内登记。"""
+        if not scene:
+            return False
+        from zhenxun.services.ai.run.session import session_manager
+
+        return (
+            sum(
+                not context.run.parent_run_id
+                and context.state.get("_personal_scene") == scene
+                for context, _ in session_manager.runs.values()
+            )
+            >= cls.QUEUE + 1
+        )

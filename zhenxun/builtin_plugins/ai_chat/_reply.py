@@ -68,6 +68,11 @@ def _echo_label(nickname: str) -> re.Pattern[str]:
 _SENTENCE_END = re.compile(r"[。！？!?…~]")
 _FENCE = re.compile(r"^\s*(```|~~~)")
 _INLINE_CODE = re.compile(r"(`[^`\n]+`)")
+_STICKER_QUERY_TAIL = re.compile(
+    r"(?:^|\n)[ \t]*[\[【]表情[:：][ \t]*#[ \t]*(?:search|find_stickers)"
+    r"(?=[ \t(])[^\n\]】]*[\]】][ \t]*\Z",
+    re.IGNORECASE,
+)
 _DSML_TAG = re.compile(
     r"\\?<(?P<close>/?)\s*[｜|]{2}DSML[｜|]{2}\s*"
     r"(?P<name>tool_calls|calls|invoke|parameter)\b[^>]*(?:>|$)",
@@ -505,6 +510,11 @@ async def _deliver(
         async with lock:
             result = result if result is not None else DeliveryResult()
             record = delivery_record(context, key) if context else None
+            control = context.run.reply_control if context else None
+            epoch = control.epoch if control else 0
+            if control and control.closed and control.target == key:
+                result.status = "skipped"
+                return result
             if context:
                 from zhenxun.services.ai.utils.runtime import PermissionUtils
 
@@ -517,7 +527,8 @@ async def _deliver(
                     return result
                 if failure := record.get("tool_delivery_failure"):
                     if (
-                        chunks is not None
+                        context.run.source == "interject"
+                        or chunks is not None
                         or origin != "final"
                         or record.get("failure_notice_attempted")
                     ):
@@ -538,7 +549,12 @@ async def _deliver(
                     )
                 if origin == "final":
                     text, count = deduplicate_reply(
-                        text, [entry["text"] for entry in record["entries"]]
+                        text,
+                        [
+                            entry["text"]
+                            for entry in record["entries"]
+                            if entry.get("reply_epoch", 0) == epoch
+                        ],
                     )
                     record["deduplicated"] += count
             start = len(result.parts)
@@ -559,6 +575,7 @@ async def _deliver(
                         {
                             "text": part,
                             "origin": origin,
+                            "reply_epoch": epoch,
                             "agent": context.run.agent_name,
                             "receipt": result.receipts[index]
                             if index < len(result.receipts)
@@ -728,7 +745,8 @@ def clean_output(text: str) -> str:
         text = _strip_dsml(text)
     output: list[str] = []
     hidden = False
-    for code, block in _segments(text):
+    segments = _segments(text)
+    for position, (code, block) in enumerate(segments):
         if hidden:
             close = _CLOSE_THINK.search(block) if not code else None
             if close is None:
@@ -737,6 +755,8 @@ def clean_output(text: str) -> str:
         if code:
             output.append(block)
             continue
+        if position == len(segments) - 1:
+            block = _STICKER_QUERY_TAIL.sub("", block.rstrip())
         parts = _INLINE_CODE.split(block)
         cleaned = []
         for index, part in enumerate(parts):

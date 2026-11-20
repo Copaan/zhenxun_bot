@@ -94,6 +94,9 @@ class AgentExecutor:
                 finally:
                     session_manager.set_tools_running(session_id, False)
                 await self._add_follow_ups(state, resources)
+                control = run.reply_control
+                if control and control.closed and not run.parent_run_id:
+                    self._finish(state, resources, "")
             else:
                 self._finish(state, resources, state.current_response.text)
             if state.is_finished:
@@ -142,6 +145,8 @@ class AgentExecutor:
                 if not msgs or receipt.done():
                     continue
                 context.run.messages.append(msgs[-1])
+                if context.run.reply_control:
+                    context.run.reply_control.new_input()
                 receipt.set_result(True)
                 if injections := context.state.get("_injections"):
                     injections["sources"].append(

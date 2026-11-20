@@ -144,6 +144,7 @@ export async function apply(ctx, config) {
     const agent = ctx.agents.get(args.sessionId)
     if (method==='bridgeArm') {
       if(agent?.status==='running' || args.lease.sessionId!==args.sessionId) throw new Error('Session not idle')
+      if (Object.keys(args.lease.replyActions || {}).length && args.lease.replyProtocol !== 1) throw new Error('请重新加载真寻发送协议')
       let resolve; const ready=new Promise(r=>{resolve=r});armed.set(args.sessionId,{lease:args.lease,resolve,ready});if(agent) bridge.bind(agent,null,args.lease);return {ok:true}
     }
     if (method==='bridgeReceipt') {

@@ -103,6 +103,8 @@ def parse_session(session_id: str) -> tuple[str, str | None, str | None]:
     _, bot_id, rest = [*scene_key(session_id).split(":", 2), "", ""][:3]
     if rest.startswith("private:"):
         return bot_id, None, rest[len("private:") :] or None
+    if rest.startswith("personal:"):
+        return bot_id, None, rest
     if rest.startswith("task:"):
         return bot_id, None, None
     if ":group:" in rest and not rest.startswith("qq_api:"):
@@ -394,13 +396,9 @@ class AIChatManager:
             proactive: 主动插话时给 AI 的接话原因（概率触发时为空字符串），为 None 时
                 不是主动插话
         """
-        session_id = cls.session_id(bot, event)
-        user_id = ContextUtils.extract_user_id(NoneBotDeps(bot=bot, event=event)) or ""
         task = asyncio.current_task()
         if task is None:
             return
-        requests = cls._requests.setdefault(session_id, {})
-        requests[task] = (user_id, "qq" if proactive is None else "interject")
         try:
             await cls._chat(bot, event, message, proactive, input_anchor=input_anchor)
         except asyncio.CancelledError:
@@ -409,13 +407,16 @@ class AIChatManager:
         finally:
             cls._stopped.discard(task)
             cls._admitted.discard(task)
-            requests.pop(task, None)
-            if not requests:
-                cls._requests.pop(session_id, None)
 
     @classmethod
     async def _admit(
-        cls, bot: Bot, event: Event, message: UniMessage, proactive: str | None
+        cls,
+        bot: Bot,
+        event: Event,
+        message: UniMessage,
+        proactive: str | None,
+        *,
+        personal: bool = False,
     ) -> tuple[UniMessage, str | None] | None:
         """空 @ 时等待补问，再检查安全词、额度与频率并占用会话排队名额，
         不通过时按需提示
@@ -465,7 +466,7 @@ class AIChatManager:
             if notice:
                 await UniMessage(Text(notice)).send(reply_to=quote_reply(group_id))
             return None
-        if not await SessionLimit.acquire(session_id):
+        if not await SessionLimit.acquire(session_id, check_queue=not personal):
             logger.info("会话排队已满，丢弃本条消息", MODULE, session=user_id)
             return None
         return message, message_id
@@ -507,15 +508,19 @@ class AIChatManager:
         if isinstance(native_model, dict):
             native_model = native_model.get("model")
 
+        config = context.state.get("_scene_configuration", {})
+        model = (
+            config.get("overrides", {}).get("model")
+            if context.state.get("_personal_scene")
+            else config.get("effective", {}).get("model")
+        )
         selected = {
             "persona_id": persona.id if persona else None,
             "persona_revision": version(persona),
             "group_revision": version(setting),
             "model": native_model or "DSH 原生选择（待查询）"
             if runner == "dsh"
-            else context.state.get("_scene_configuration", {})
-            .get("effective", {})
-            .get("model")
+            else model
             or (setting.model if setting else None)
             or (persona.model if persona else None)
             or get_default_model("chat"),
@@ -532,7 +537,7 @@ class AIChatManager:
                 for key in (
                     "MEMORY_MODE",
                     "KNOWLEDGE_BASES",
-                    "AGENT_ENABLED",
+                    "SUPERUSER_TOOLS",
                     "CONTEXT_SIZE",
                     "SEARCH_HINT",
                 )
@@ -548,6 +553,8 @@ class AIChatManager:
     async def prepare_background(cls, context: RunContext, prompt: Any):
         """在本轮消费输入时附加锚点之前的背景，结算后再确认。"""
         bot, group_id = context.get_bot(), context.get_group_id()
+        if context.state.get("_personal_scene"):
+            return prompt
         if not bot or not group_id or not isinstance(prompt, LLMMessage):
             return prompt
         anchor = (prompt.metadata or {}).get("chat_input_anchor")
@@ -623,7 +630,11 @@ class AIChatManager:
         bind_source(context, "qq" if proactive is None else "interject")
         context.state["_quota_id"] = quota_id
         nearby = None
-        if group_id and any(word in text for word in REFERENCE_WORDS):
+        if (
+            not context.state.get("_personal_scene")
+            and group_id
+            and any(word in text for word in REFERENCE_WORDS)
+        ):
             nearby = ChatBuffer.background(
                 bot.self_id,
                 group_id,
@@ -662,17 +673,26 @@ class AIChatManager:
         from zhenxun.services.ai.core.exceptions import RunInterrupted
         from zhenxun.services.ai.run.context import set_run_context
 
+        from ._agent import bind_source
         from ._sessions import Conversations
 
-        snapshot = await Conversations.snapshot(cls.session_id(bot, event))
-        effective = await Conversations.resolve(snapshot["scene_id"], snapshot)
+        entry = cls.session_id(bot, event)
+        context = RunContext(deps=NoneBotDeps(bot=bot, event=event))
+        bind_source(context, "qq" if proactive is None else "interject")
+        personal = await Conversations.personal(context, entry)
+        snapshot = await Conversations.snapshot(personal or entry)
+        owner = context.run.caller if personal else None
+        effective = await Conversations.resolve(
+            snapshot["scene_id"], snapshot, owner=owner
+        )
         if effective["effective"]["disabled"]:
             return
-
-        context = RunContext(
-            deps=NoneBotDeps(bot=bot, event=event),
-            session_id=snapshot["session_id"],
-        )
+        if personal and await Conversations.disabled(entry):
+            return
+        context.session_id = context.session.session_id = snapshot["session_id"]
+        context.state["_entry_scene"] = entry
+        context.state["_personal_scene"] = personal
+        context.state["_personal_owner"] = owner
         context.state["_conversation"] = snapshot
         context.state["_scene_configuration"] = effective
         if group_id := context.get_group_id():
@@ -686,7 +706,16 @@ class AIChatManager:
         context = cls._context(
             bot, event, None, proactive, summarize(message), None, context
         )
+        from ._safety import SessionLimit
+
+        if SessionLimit.personal_full(personal):
+            await UniMessage.text("个人 Agent 队列已满，请稍后再试。").send()
+            return
         session_manager.register(context)
+        scene = snapshot["scene_id"]
+        requests = cls._requests.setdefault(scene, {})
+        task = asyncio.current_task()
+        requests[task] = (context.get_user_id() or "", context.run.source)
         with set_run_context(context):
             try:
                 await session_manager.accept(context)
@@ -701,7 +730,12 @@ class AIChatManager:
                 context.run.outcome = context.run.outcome or "failed"
                 raise
             finally:
-                await session_manager.finish(context)
+                try:
+                    await session_manager.finish(context)
+                finally:
+                    requests.pop(task, None)
+                    if not requests:
+                        cls._requests.pop(scene, None)
 
     @classmethod
     async def _chat_body(
@@ -723,7 +757,7 @@ class AIChatManager:
         from ._memory import Memory
         from ._proactive import Proactive
         from ._reply import quote_reply, send_reply
-        from ._runner import agent_runner, run_dsh, select_dsh_session
+        from ._runner import run_dsh, select_dsh_session
         from ._safety import INPUT_NOTICE, Safety
         from ._sessions import Conversations
         from ._turn import FAILED_NOTICE, ChatTurn
@@ -737,13 +771,26 @@ class AIChatManager:
         await Conversations.check(snapshot)
         session_id = snapshot["session_id"]
         revision = session_manager.revision(session_id)
-        admitted = await cls._admit(bot, event, message, proactive)
+        admitted = await cls._admit(
+            bot,
+            event,
+            message,
+            proactive,
+            personal=bool(context.state.get("_personal_scene")),
+        )
         if admitted is None or revision != session_manager.revision(session_id):
             return
         message, message_id = admitted
         if group_id:
             context.state["_input_anchor"] = ChatBuffer.anchor(
                 bot.self_id, group_id, message_id, context.state.get("_input_anchor")
+            )
+        personal = context.state.get("_personal_scene")
+        if personal:
+            from nonebot_plugin_alconna import Reply
+
+            message = UniMessage(
+                [part for part in message if not isinstance(part, Reply)]
             )
         parts = await MessageBuilder.unimsg_to_llm_parts(message, namespace=MODULE)
         if not parts and group_id and event.is_tome():
@@ -757,8 +804,9 @@ class AIChatManager:
                     reply_to=quote_reply(group_id)
                 )
             return
-        setting = await AIChatGroup.get_setting(group_id) if group_id else None
-        persona = await Conversations.persona(snapshot, group_id, user_id)
+        policy_group = None if personal else group_id
+        setting = await AIChatGroup.get_setting(policy_group) if policy_group else None
+        persona = await Conversations.persona(snapshot, policy_group, user_id)
         context = cls._context(
             bot, event, setting, proactive, text, message_id, context
         )
@@ -769,9 +817,17 @@ class AIChatManager:
         prompt = LLMMessage.user(parts)
         prompt.metadata = {"chat_input_anchor": context.state.get("_input_anchor")}
         agent = cls.get_agent(persona)
-        accepted_runner = snapshot["settings"].get("runner") or agent_runner(setting)
+        accepted_runner = context.state["_scene_configuration"]["effective"]["runner"]
         if accepted_runner == "dsh":
-            await select_dsh_session(context, persona)
+            try:
+                await select_dsh_session(context, persona)
+            except LLMException as exc:
+                context.run.outcome = "failed"
+                if proactive is None:
+                    await UniMessage.text(exc.user_friendly_message).send(
+                        reply_to=quote_reply(group_id)
+                    )
+                return
             session_id = context.session_id or ""
             revision = session_manager.revision(session_id)
         cls.configuration(context, setting, persona, accepted_runner)
@@ -794,15 +850,24 @@ class AIChatManager:
         async def prepare_run():
             nonlocal setting, persona, agent
             await Conversations.check(snapshot)
-            setting = await AIChatGroup.get_setting(group_id) if group_id else None
+            if (
+                await Conversations.personal(context, context.state["_entry_scene"])
+                != personal
+            ):
+                raise LLMException("排队期间个人入口已变化，请重新发送。")
+            setting = (
+                await AIChatGroup.get_setting(policy_group) if policy_group else None
+            )
             context.state["_scene_configuration"] = await Conversations.resolve(
-                snapshot["scene_id"], snapshot
+                snapshot["scene_id"],
+                snapshot,
+                owner=context.state.get("_personal_owner"),
             )
             runner = context.state["_scene_configuration"]["effective"]["runner"]
             if runner != accepted_runner:
                 context.run.user_notice = "排队期间执行器已切换，请重新发送问题。"
                 raise LLMException(context.run.user_notice)
-            persona = await Conversations.persona(snapshot, group_id, user_id)
+            persona = await Conversations.persona(snapshot, policy_group, user_id)
             agent = cls.get_agent(persona)
             turn.select_agent(agent, persona)
             cls.configuration(context, setting, persona, runner)
@@ -817,6 +882,9 @@ class AIChatManager:
         async def prepare_dsh():
             _, prepared = await prepare_run()
             context.state["_dsh_input_metadata"] = prepared.metadata or {}
+            binding = context.state["_dsh_binding"]
+            if binding.get("native") and binding.get("inherited"):
+                return parts[1:], persona
             return prepared.content, persona
 
         async def check_delivery():
@@ -829,6 +897,10 @@ class AIChatManager:
                     blocked = await _plugin_blocked(
                         PLUGIN_MODULE, bot, SimpleNamespace(user_id=user_id)
                     )
+                if personal and not blocked:
+                    from zhenxun.services.ai.utils.runtime import PermissionUtils
+
+                    blocked = not await PermissionUtils.check_superuser(context)
                 if persona and not blocked:
                     blocked = not await AIPersona.filter(
                         id=persona.id, enabled=True

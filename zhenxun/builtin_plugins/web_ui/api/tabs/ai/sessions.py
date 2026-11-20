@@ -55,7 +55,12 @@ async def scene_settings(scene_id: str) -> Result:
     from zhenxun.builtin_plugins.ai_chat._sessions import Conversations
 
     _require_scene(scene_id)
-    state = await Conversations.resolve(scene_id, inspect_policy=True)
+    owner = None
+    if scene_id.split(":", 2)[-1].startswith("personal:"):
+        from .console import personal_targets
+
+        owner = personal_targets().get(scene_id.rsplit(":", 1)[1])
+    state = await Conversations.resolve(scene_id, inspect_policy=True, owner=owner)
     state["models"] = {
         task: Conversations.models(task) for task in ("chat", "tts", "stt")
     }
@@ -173,7 +178,7 @@ async def list_sessions(
     from zhenxun.models.ai_chat_message import AIChatMessage
     from zhenxun.models.ai_chat_scene import AIChatScene
 
-    metadata = AIChatConversation.all()
+    metadata = AIChatConversation.exclude(scene_id__startswith="webui_entry:")
     term = keyword.strip()
     if term:
         metadata = metadata.filter(
@@ -360,6 +365,8 @@ async def reset_session(
             expected_revision is not None and item["revision"] != expected_revision
         ):
             raise HTTPException(409, detail={"code": "dsh_session_changed"})
+        if item.get("mode") == "agent" and expected_revision is None:
+            raise HTTPException(409, detail={"message": "请先刷新个人 Agent 会话。"})
         if item.get("transport") == "sdk":
             from zhenxun.services.ai.run.dsh_control import DshControl
             from zhenxun.services.ai.run.dsh_desktop import DshUnavailable
@@ -418,6 +425,11 @@ async def reset_session(
     else:
         from zhenxun.builtin_plugins.ai_chat._sessions import Conversations, scene_key
 
+        if (
+            scene_key(session_id).split(":", 2)[-1].startswith("personal:")
+            and expected_revision is None
+        ):
+            raise HTTPException(409, detail={"message": "请先刷新个人 Agent 会话。"})
         try:
             await Conversations.change(
                 scene_key(session_id),

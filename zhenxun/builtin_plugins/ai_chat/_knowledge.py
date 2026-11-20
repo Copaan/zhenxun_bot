@@ -820,7 +820,8 @@ class KnowledgeToolkit(BaseToolkit):
         automatic = (
             mode == "inject"
             and bool(text)
-            and not (context and context.state.get("_dsh_binding"))
+            and context
+            and context.prepare_chat_reminders
         )
         if automatic:
             hits = (
@@ -863,6 +864,7 @@ class KnowledgeToolkit(BaseToolkit):
 
     @tool(
         name="send_knowledge_image",
+        rules=ToolOptions(metadata={"reply_action": "media"}),
         description=(
             "把检索结果中的一张知识库图片发到当前会话，" "chunk_id 为结果中标出的编号。"
         ),
@@ -873,9 +875,7 @@ class KnowledgeToolkit(BaseToolkit):
         from nonebot_plugin_alconna import Image as ImageSegment
         from nonebot_plugin_alconna import UniMessage
 
-        from zhenxun.utils.platform import PlatformUtils
-
-        from ._send import Scene, SendQuota
+        from ._send import Scene, SendQuota, deliver_tool_message
 
         scene = Scene.of(context)
         if scene is None:
@@ -890,13 +890,14 @@ class KnowledgeToolkit(BaseToolkit):
             return ToolResult(output="没有这张图片。").as_error()
         if reason := SendQuota.take(scene.key):
             return ToolResult(output=reason).as_error(False)
-        if not await PlatformUtils.send_message(
-            scene.bot,
-            scene.user_id,
-            scene.group_id,
-            UniMessage(ImageSegment(path=path)),
-        ):
-            SendQuota.refund(scene.key, 1)
-            return ToolResult(output="发送结果未确认，本轮不要重发。").as_error(False)
+        result = await deliver_tool_message(
+            context, UniMessage(ImageSegment(path=path)), f"[知识库图片 #{chunk.id}]"
+        )
+        if result.status != "sent":
+            if not result.attempted:
+                SendQuota.refund(scene.key, 1)
+            return ToolResult(
+                output=result.error or "图片未确认发送，本轮不要重发。"
+            ).as_error(False, uncertain=result.uncertain)
         scene.note(f"[发了知识库图片 #{chunk.id}]")
         return ToolResult(output="已发送。")

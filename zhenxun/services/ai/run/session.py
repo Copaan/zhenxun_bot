@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 import time
 from typing import Any
 import uuid
+import weakref
 
 from zhenxun.services.ai.core.exceptions import (
     InterventionHandledException,
@@ -24,7 +25,9 @@ class AgentSessionManager:
             str, list[tuple[CancellationToken, asyncio.Task | None]]
         ] = {}
         self._revisions: dict[str, int] = {}
-        self._locks: dict[str, asyncio.Lock] = {}
+        self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+            weakref.WeakValueDictionary()
+        )
         self._follow_ups: dict[str, list[Any]] = {}
         self._owners: dict[str, str | None] = {}
         self._admissions: dict[str, Any] = {}
@@ -136,11 +139,14 @@ class AgentSessionManager:
         """返回不含凭据的生命周期证据。"""
         return {
             "boot_id": self.boot_id,
+            "entry_scene": context.state.get("_entry_scene"),
+            "personal_scene": context.state.get("_personal_scene"),
             "phase": context.run.phase,
             "parent_run_id": context.run.parent_run_id,
             "connection_id": context.run.connection_id,
             "outcome": context.run.outcome,
             "interruption": context.run.operations.get("interruption"),
+            "interruption_detail": context.run.operations.get("interruption_detail"),
             "stop_reason": context.run.cancellation_token.reason
             if context.run.cancellation_token
             else None,
@@ -357,6 +363,7 @@ class AgentSessionManager:
         sender: str | None = None,
         revision: int | None = None,
         admission: Any = None,
+        owner_scope: str | None = None,
     ):
         """登记一次运行；独占运行时同一会话依次执行。会话正在执行工具，且新输入
         与当前运行来自同一发送者时，把输入并入当前运行，否则排队等待
@@ -379,7 +386,8 @@ class AgentSessionManager:
             if not exclusive:
                 yield
                 return
-            lock = self._locks.setdefault(session_id, asyncio.Lock())
+            lock_id = owner_scope or session_id
+            lock = self._locks.setdefault(lock_id, asyncio.Lock())
             if lock.locked():
                 if (
                     follow_up is not None
@@ -419,7 +427,6 @@ class AgentSessionManager:
             tasks.remove(entry)
             if not tasks:
                 self.live_tasks.pop(session_id, None)
-                self._locks.pop(session_id, None)
 
 
 session_manager = AgentSessionManager()

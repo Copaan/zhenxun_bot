@@ -47,7 +47,11 @@ def export_slot(context, binding):
         return
     try:
         with os.fdopen(fd, "rb") as stream:
-            yield stream, path
+            context.state["_attachment_export_stream"] = stream
+            try:
+                yield stream, path
+            finally:
+                context.state.pop("_attachment_export_stream", None)
     finally:
         try:
             Path(path).unlink(missing_ok=True)
@@ -62,6 +66,8 @@ def export_instruction(path):
         f"{path}（原地写入，不要重命名替换，最多 8 MiB）。成功后最终回复最后一行仅写 "
         '{"qq_attachment":"展示文件名.扩展名"}；由机器人实际投递。'
         "不要输出临时路径、不要声称已经发送。无附件时照常回答。"
+        "有附件时不要调用 finish_reply 或发送 purpose=final 的消息提前结束；"
+        "先提交上述附件声明，由机器人核对实际交付。"
     )
 
 
@@ -94,6 +100,11 @@ def collect_export(context, slot, text):
         context.run.operations["attachment"] = {"status": "invalid"}
         return "附件未发送：请导出一个不超过 8 MiB 的非空文件，并提供有效文件名。"
     context.state["_qq_attachment"] = (name, data)
+    if context.run.reply_control and context.run.reply_control.closed:
+        context.run.reply_control.closed = False
+        context.run.operations.setdefault("dsh", {})["reply_completion_reopened"] = (
+            "pending_attachment"
+        )
     return f"[附件：{name}]"
 
 

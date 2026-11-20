@@ -46,6 +46,8 @@ class ChatToolBridge:
         self.identities = {}
         self.definitions = []
         self.instructions = ""
+        self.reminders = []
+        self.reply_actions = {}
         self.result_bytes = 0
 
     def allowed(self, tool) -> bool:
@@ -87,6 +89,11 @@ class ChatToolBridge:
             self.context, self.capability, include=self.allowed
         )
         self.identities = {t.name: t.identity for t in tools}
+        self.reply_actions = {
+            t.name: t.metadata["reply_action"]
+            for t in tools
+            if (t.metadata or {}).get("reply_action")
+        }
         self.definitions = [
             (await t.get_definition(self.context)).model_dump(
                 include={"name", "description", "parameters"}
@@ -94,6 +101,9 @@ class ChatToolBridge:
             for t in tools
         ]
         self.instructions = "\n".join(payload.injected_prompts)
+        binding = self.context.state["_dsh_binding"]
+        if not (binding.get("native") and binding.get("inherited")):
+            self.reminders = list(dict.fromkeys(payload.reminders))
 
     async def call(self, turn, call_id: str, name: str, arguments: dict) -> dict:
         """复核本轮授权后执行一次桥接工具调用，同一调用编号只执行一次
@@ -128,9 +138,13 @@ class ChatToolBridge:
             ):
                 raise PermissionError
             with set_run_context(context):
-                tools, _ = await self.agent.resolve_run_tools(
-                    context, self.capability, include=self.allowed
-                )
+                context.state["_tool_recheck"] = True
+                try:
+                    tools, _ = await self.agent.resolve_run_tools(
+                        context, self.capability, include=self.allowed
+                    )
+                finally:
+                    context.state.pop("_tool_recheck", None)
                 tool = tools.get(name)
                 if turn.revoked or not tool or tool.identity != self.identities[name]:
                     raise PermissionError
@@ -240,6 +254,8 @@ def bridge_lease(turn) -> dict | None:
         "token": turn.token,
         "definitions": bridge.definitions,
         "searchMode": bridge.context.state.get("_dsh_search_source", "off"),
+        "replyProtocol": 1,
+        "replyActions": bridge.reply_actions,
     }
 
 
@@ -270,6 +286,8 @@ async def invoke_bridge(token: str, payload) -> dict:
     bridge = turn.context.state.get("_dsh_chat_tools")
     if not bridge:
         raise PermissionError
+    if bridge.reply_actions and getattr(payload, "replyProtocol", None) != 1:
+        raise PermissionError("DSH 发送协议已变化，请重新加载真寻工具集。")
     task = asyncio.current_task()
     turn.bridge_tasks.add(task)
     try:

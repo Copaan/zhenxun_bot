@@ -8,7 +8,6 @@ import time
 from typing import Any
 
 from zhenxun.configs.config import Config
-from zhenxun.models.ai_chat_group import AIChatGroup
 from zhenxun.models.ai_persona import AIPersona
 from zhenxun.services.ai.core.exceptions import LLMException, ToolFatalError
 from zhenxun.services.ai.core.messages import TextPart, UsageInfo
@@ -37,19 +36,12 @@ APPROVE_HINT = "允许：仅本次；全部允许：本轮；停止：结束本�
 """聊天中批准请求的回复说明"""
 
 
-def agent_runner(setting: AIChatGroup | None) -> str:
-    """会话使用的执行器：群设置优先，其次为全局 AGENT_RUNNER
-
-    参数:
-        setting: 群设置，私聊为空
-
-    返回:
-        str: 执行器名称
-    """
-    runner = (setting.agent_runner if setting else None) or Config.get_config(
-        MODULE, "AGENT_RUNNER", "local"
-    )
-    return runner if runner in RUNNERS else "local"
+def agent_runner() -> str:
+    """读取所有入口共用的执行器。"""
+    runner = Config.get_config(MODULE, "AGENT_RUNNER", "local")
+    if runner not in RUNNERS:
+        raise LLMException("全局执行器设置无效，请在 WebUI 中重新选择。")
+    return runner
 
 
 def dsh_settings() -> DshSettings:
@@ -89,35 +81,20 @@ async def dsh_mode(context: RunContext, persona: AIPersona | None) -> str:
 async def select_dsh_session(context: RunContext, persona: AIPersona | None) -> dict:
     """在排队前绑定所有者与模式，回复位置仍由本轮上下文持有。"""
     mode = await dsh_mode(context, persona)
+    if context.state.get("_personal_scene") and mode != "agent":
+        raise LLMException("当前 DSH 权限或人设不允许个人 Agent，未进入普通聊天。")
     key = f"{persona.id}:{persona.updated_at.isoformat()}" if persona else ""
     return DshSessions.for_settings(dsh_settings()).route(context, mode, key)
 
 
-async def scene_session(bot, event) -> str:
-    """读取当前场景的有效桌面映射，不为停止或重置新建会话。"""
-    from zhenxun.services.ai.run.context import NoneBotDeps
-
-    from ._agent import bind_source
-    from ._sessions import Conversations
-
-    context = RunContext(deps=NoneBotDeps(bot=bot, event=event))
-    scene = AIChatManager.session_id(bot, event)
-    snapshot = await Conversations.snapshot(scene, create=False)
-    preferences = snapshot["settings"]
-    context.state["_conversation"] = snapshot
-    group = context.get_group_id()
-    setting = await AIChatGroup.get_setting(group) if group else None
-    if (preferences.get("runner") or agent_runner(setting)) == "dsh":
-        bind_source(context, "qq")
-        persona = await Conversations.persona(
-            context.state["_conversation"], group, context.get_user_id()
-        )
+def scene_session(context: RunContext, snapshot: dict, runner: str) -> str:
+    """读取命令已绑定的历史，不创建映射或改用另一个执行器的历史。"""
+    if runner == "dsh":
         records = DshSessions.for_settings(dsh_settings())
-        owner = records.owner(context, await dsh_mode(context, persona))
-        item = records._read()["owners"].get(owner)
-        if item:
-            return item["local_id"]
-    return snapshot["session_id"] or scene
+        mode = "agent" if context.state.get("_personal_scene") else "chat"
+        item = records._read()["owners"].get(records.owner(context, mode))
+        return item["local_id"] if item else ""
+    return snapshot["session_id"] or ""
 
 
 async def _run_dsh(
@@ -217,7 +194,11 @@ async def _run_dsh(
     context.run.cancellation_token = token
     revision = session_manager.revision(session_id)
     async with session_manager.run_scope(
-        session_id, token, exclusive=True, revision=revision
+        session_id,
+        token,
+        exclusive=True,
+        revision=revision,
+        owner_scope=context.state.get("_personal_scene"),
     ):
         await session_manager.phase(context, "running")
         deadline = time.monotonic() + timeout
@@ -236,6 +217,8 @@ async def _run_dsh(
                 if before_run:
                     await before_run()
                 settings = dsh_settings()
+                if settings.transport != binding.get("transport", "desktop"):
+                    raise LLMException("排队期间 DSH 后端已切换，请重新发送。")
                 search_allowed = (
                     not selected
                     or selected.tools is None
@@ -271,20 +254,11 @@ async def _run_dsh(
                         or current.updated_at != selected.updated_at
                     ):
                         return "denied"
-                    group = context.get_group_id()
-                    current_setting = (
-                        await AIChatGroup.get_setting(group) if group else None
-                    )
                     snapshot = context.state.get("_conversation")
                     if snapshot:
                         from ._sessions import Conversations
 
                         await Conversations.check(snapshot)
-                    if (
-                        (snapshot or {}).get("settings", {}).get("runner")
-                        or agent_runner(current_setting)
-                    ) != "dsh":
-                        return "denied"
                     return await dsh_mode(context, current)
 
                 context.state["_dsh_authorization_check"] = authorization_check
@@ -331,6 +305,17 @@ async def _run_dsh(
                 remote.usage += media_usage
                 new = new or remote_id != binding["remote_id"]
                 blocks = []
+                if binding.get("native") and (receipt := binding.get("delivery_note")):
+                    blocks.append(
+                        {
+                            "type": "text",
+                            "text": "<投递记录>上一轮最终答复已由工具发送，"
+                            "随后生成的收尾文本没有转发给 QQ 用户，"
+                            "不要当成已经对用户说过的话。已确认发送内容：\n"
+                            + receipt
+                            + "\n</投递记录>",
+                        }
+                    )
                 persona_text = AIChatManager.build_instruction(selected)
                 stamp = hashlib.sha256(
                     "\0".join(
@@ -338,7 +323,7 @@ async def _run_dsh(
                     ).encode()
                 ).hexdigest()
                 refresh = new or binding.get("applied_persona") != stamp
-                if refresh:
+                if refresh and not (binding.get("native") and binding.get("inherited")):
                     blocks.append(
                         {
                             "type": "text",
@@ -375,6 +360,9 @@ async def _run_dsh(
                             guidance += "本轮是直接向你提问，不是邀请你判断是否插话。"
                         blocks.append({"type": "text", "text": guidance})
                 blocks += input_blocks
+                blocks.extend(
+                    {"type": "text", "text": text} for text in bridge.reminders
+                )
                 if bridge.instructions and (refresh or not binding.get("native")):
                     blocks.insert(
                         0,
@@ -469,10 +457,19 @@ async def _run_dsh(
                     await finalize(result, None)
                 delivery = context.state.get("_delivery", {})
                 attachment = delivery.get("attachment")
+                from ._reply import parse_silent
+
+                suppressed = bool(
+                    context.run.reply_control
+                    and context.run.reply_control.closed
+                    and parse_silent(text)
+                )
+                context.run.operations["dsh"]["final_text_suppressed"] = suppressed
                 clean = (
                     delivery.get("status") == "sent"
                     and result.outcome == "completed"
                     and not delivery.get("uncertain")
+                    and not suppressed
                     and (
                         attachment.get("status") == "sent"
                         if attachment
@@ -485,7 +482,11 @@ async def _run_dsh(
                     quarantined=None
                     if clean or binding.get("native")
                     else "delivery_or_filter_changed",
-                    delivery_uncertain=not clean,
+                    delivery_uncertain=bool(delivery.get("uncertain"))
+                    or delivery.get("status") != "sent",
+                    delivery_note=(delivery.get("text") or "")[:8000]
+                    if suppressed and binding.get("native")
+                    else None,
                     applied_persona=stamp,
                 )
                 return result
@@ -550,7 +551,7 @@ async def dsh_command(context, argument: str, *, current_mode: bool = False) -> 
     参数:
         context: 运行上下文
         argument: 子命令与参数
-        current_mode: 按当前场景的 DSH 模式执行，否则为 Agent 模式
+        current_mode: 普通会话命令使用群共享或私聊当前模式，否则管理个人 Agent
 
     返回:
         str: 执行结果
@@ -558,21 +559,18 @@ async def dsh_command(context, argument: str, *, current_mode: bool = False) -> 
     from zhenxun.services.ai.run.dsh_control import DshControl
 
     from ._commands import AGENT_PRIVATE, require_admin
-    from ._sessions import Conversations
 
     action, _, value = argument.strip().partition(" ")
     settings = dsh_settings()
     records = DshSessions.for_settings(settings)
-    persona = await Conversations.persona(
-        context.state["_conversation"], context.get_group_id(), context.get_user_id()
+    group = context.get_group_id()
+    if group and not current_mode and action not in {"", "status"}:
+        raise ValueError(AGENT_PRIVATE)
+    mode = (
+        "agent"
+        if not current_mode or (not group and context.state.get("_personal_scene"))
+        else "chat"
     )
-    mode = await dsh_mode(context, persona) if current_mode else "agent"
-    if context.get_group_id() and mode == "agent":
-        # 群内重置针对本群共用的聊天会话；跨场景共用的 Agent 会话只在私聊管理
-        if current_mode and action == "reset":
-            mode = "chat"
-        elif action in {"ls", "new", "switch", "archive"}:
-            raise ValueError(AGENT_PRIVATE)
     if mode == "agent":
         await require_admin(context)
     owner = records.owner(context, mode)
@@ -610,6 +608,8 @@ async def dsh_command(context, argument: str, *, current_mode: bool = False) -> 
             from ._buffer import ChatBuffer
 
             ChatBuffer.reset(context.get_bot().self_id, context.get_group_id())
+        if action == "new" and group and current_mode:
+            return "已新建本群共享对话。旧对话和长期记忆保留。"
         return (
             f"已选择 {selected['remote_id']}；"
             "回复到每次触发位置，原会话历史和设置保留。"

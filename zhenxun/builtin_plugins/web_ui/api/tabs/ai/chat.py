@@ -285,7 +285,7 @@ async def list_chat_tools() -> Result:
 
 
 class AgentSettingsPayload(BaseModel):
-    enabled: bool
+    restricted: list[str]
 
 
 def _run_item(run: Any) -> dict[str, Any]:
@@ -315,7 +315,8 @@ async def agent_state(
     source: str | None = Query(None, max_length=16),
     status: str | None = Query(None, max_length=16),
 ) -> Result:
-    from zhenxun.builtin_plugins.ai_chat._agent import agent_enabled
+    from zhenxun.builtin_plugins.ai_chat._data_source import MODULE
+    from zhenxun.configs.config import Config
     from zhenxun.models.ai_agent_run import AIAgentRun
     from zhenxun.services.ai.sandbox.manager import SandboxManager
 
@@ -328,7 +329,7 @@ async def agent_state(
     sandbox_ready, sandbox_reason = await SandboxManager.ready()
     return Result.ok(
         {
-            "enabled": agent_enabled(),
+            "restricted": Config.get_config(MODULE, "SUPERUSER_TOOLS", []),
             "sandbox": {"ready": sandbox_ready, "reason": sandbox_reason},
             "runs": [_run_item(run) for run in runs],
         }
@@ -372,9 +373,15 @@ async def update_agent_settings(payload: AgentSettingsPayload) -> Result:
     from zhenxun.builtin_plugins.ai_chat._data_source import MODULE
     from zhenxun.configs.config import Config
 
-    Config.set_config(MODULE, "AGENT_ENABLED", payload.enabled)
+    if len(payload.restricted) > 512 or any(
+        not item.strip() or len(item) > 512 for item in payload.restricted
+    ):
+        raise HTTPException(422, detail={"message": "无效的工具标识。"})
+    Config.set_config(
+        MODULE, "SUPERUSER_TOOLS", sorted({item.strip() for item in payload.restricted})
+    )
     Config.save(save_simple_data=True)
-    logger.info(f"WebUI 修改了 Agent 设置: 开启={payload.enabled}", "WebUi")
+    logger.info("WebUI 修改了聊天工具的权限限制", "WebUi")
     return Result.ok(info="Agent 设置已保存。")
 
 
@@ -444,7 +451,6 @@ async def list_chat_groups() -> Result:
                 "wake_words": setting.wake_words if setting else None,
                 "model": setting.model if setting else None,
                 "voice_reply": setting.voice_reply if setting else None,
-                "agent_runner": setting.agent_runner if setting else None,
                 "knowledge_bases": setting.knowledge_bases if setting else None,
                 "persona_id": persona.id if persona else None,
                 "persona": persona.name if persona else None,
@@ -459,6 +465,8 @@ async def list_chat_groups() -> Result:
     "/chat/groups/{group_id}", dependencies=[authentication()], response_model=Result
 )
 async def update_chat_group(group_id: str, payload: GroupSettingPayload) -> Result:
+    if "agent_runner" in payload.model_fields_set:
+        raise HTTPException(422, detail={"message": "执行器只能在全局 AI 设置中修改。"})
     from zhenxun.models.ai_chat_group import AIChatGroup
     from zhenxun.models.ai_knowledge_base import AIKnowledgeBase
     from zhenxun.models.ai_persona import AIPersona
@@ -479,7 +487,6 @@ async def update_chat_group(group_id: str, payload: GroupSettingPayload) -> Resu
         wake_words=words,
         model=(payload.model or "").strip() or None,
         voice_reply=payload.voice_reply,
-        agent_runner=payload.agent_runner,
         knowledge_bases=bases,
         disabled=None if payload.enabled else True,
     )

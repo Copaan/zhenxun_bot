@@ -2,7 +2,7 @@
 工具系统域类型定义
 """
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -109,12 +109,16 @@ class ResolvedToolPayload:
     """根据最终可用工具生成操作说明，不持久化回调。"""
     injection_sources: list[dict[str, Any]] = field(default_factory=list)
     """来源、长度与生命周期摘要，不包含注入正文。"""
+    tool_reminders: dict[str, Callable[[], Awaitable[str | None]]] = field(
+        default_factory=dict
+    )
 
     def merge(self, other: "ResolvedToolPayload") -> "ResolvedToolPayload":
         """将另一个解析载荷合并到当前载荷中"""
         self.tools.extend(other.tools)
         self.injected_prompts.extend(other.injected_prompts)
         self.reminders.extend(other.reminders)
+        self.tool_reminders.update(other.tool_reminders)
         self.instruction_builders.extend(other.instruction_builders)
         self.injection_sources.extend(other.injection_sources)
         return self

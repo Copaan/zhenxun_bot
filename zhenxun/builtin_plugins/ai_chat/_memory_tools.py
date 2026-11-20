@@ -54,7 +54,7 @@ class MemoryToolkit(BaseToolkit):
         payload = await super().resolve(context)
         if scope[0] and not await can_forget(context):
             payload.tools = [t for t in payload.tools if t.name != "forget"]
-        if mode == "inject" and context and not context.state.get("_dsh_binding"):
+        if mode == "inject" and context and context.prepare_chat_reminders:
             from zhenxun.services.log import logger
 
             text = context.state.get("_retrieval_query", "") if context else ""

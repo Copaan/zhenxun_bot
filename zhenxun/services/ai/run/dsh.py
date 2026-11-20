@@ -153,6 +153,8 @@ class DshSessions:
     def mapping_caller(context, mode: str):
         """普通定时聊天按目标归属历史，授权与用量仍取真实创建者。"""
         caller = context.run.caller
+        if mode == "agent" and caller and caller.source == "webui":
+            return context.state.get("_personal_owner", caller)
         if mode == "chat" and caller and caller.source == "task":
             return context.state.get("_dsh_chat_target", caller)
         return caller

@@ -596,12 +596,11 @@ CONFIGS = [
     ),
     _config(
         "Agent 与执行器",
-        "AGENT_ENABLED",
-        False,
-        bool,
-        "超级用户 Agent",
-        "为超级用户提供 HTTP 请求、沙箱、MCP 等工具，调用记录在 Agent 页；"
-        "普通用户不会获得这些工具",
+        "SUPERUSER_TOOLS",
+        [],
+        list,
+        "仅超管可用的聊天工具",
+        "填写完整工具标识，仅收紧现有授权。",
     ),
     _config(
         "Agent 与执行器",
@@ -609,11 +608,7 @@ CONFIGS = [
         "local",
         str,
         "回复执行器",
-        "DeepSeek Harness 可选择已登录的桌面版或独立 SDK；与本地 Agent 一样按人设"
-        "和当前权限接入聊天工具，超管 Agent 另有 MCP 与 REST API；SDK 在联网模式为"
-        " auto/native 时使用自带搜索；长期记忆与知识库改为按需检索；"
-        "账号场景设置优先于按群和全局设置；"
-        "可用 /ai runner dsh 切换当前场景，/ai status 查看实际执行器",
+        "所有聊天和计划共用此执行器。切换不会开启个人 Agent 或迁移历史。",
         options=_options(local="本地 Agent", dsh="DeepSeek Harness"),
     ),
     _config(

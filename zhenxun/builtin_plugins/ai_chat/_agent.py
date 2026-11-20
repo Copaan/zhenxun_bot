@@ -49,6 +49,7 @@ INTERJECT_TOOLS = {
     "find_stickers",
     "send_sticker",
     "send_message",
+    "finish_reply",
 }
 """自动插话可用的工具"""
 
@@ -81,7 +82,9 @@ def bind_source(context: RunContext, source: str, *, management_check=None) -> N
     context.run.fail_fast = True
     if bot := context.get_bot():
         context.run.connection_id = vars(bot).get("_zhenxun_connection_id")
-    context.run.follow_up = SOURCES[source]["follow_up"]
+    context.run.follow_up = SOURCES[source]["follow_up"] and not context.state.get(
+        "_personal_scene"
+    )
     context.run.timeout = max(1, int(Config.get_config(MODULE, "TURN_TIMEOUT") or 300))
     if not SOURCES[source]["privileged"]:
         context.state[AGENT_ACTIVE_KEY] = False
@@ -124,15 +127,6 @@ class ReplyCapability(AbstractCapability):
             p for p in parts if not isinstance(p, TextPart)
         ]
         return response
-
-
-def agent_enabled() -> bool:
-    """是否为超级用户开启 Agent
-
-    返回:
-        bool: 是否开启
-    """
-    return bool(Config.get_config(MODULE, "AGENT_ENABLED"))
 
 
 USER_KEY = "_agent_user"
@@ -290,10 +284,7 @@ class AgentCapability(AbstractCapability):
         返回:
             bool: 已开启 Agent 且对话者是超级用户时为 True
         """
-        enabled = (
-            context.state.get("_conversation", {}).get("settings", {}).get("agent")
-        )
-        if not (agent_enabled() if enabled is None else enabled):
+        if not context.state.get("_personal_scene"):
             return False
         if context.state.get(AGENT_ACTIVE_KEY) is False:
             return False
@@ -452,6 +443,9 @@ def _transfer(persona_id: int):
             shared_state=context.shared_state,
         )
         child.run.caller = context.run.caller
+        for key in ("_personal_scene", "_personal_owner", "_entry_scene"):
+            if key in context.state:
+                child.state[key] = context.state[key]
         child.run.management_check = context.run.management_check
         child.run.tool_ceiling = context.run.available_tools
         child.run.delegated_agent_tools = [
@@ -460,6 +454,7 @@ def _transfer(persona_id: int):
             if tool.name in context.state.get(AGENT_TOOLS_KEY, ())
         ]
         child.run.operations = context.run.operations
+        child.run.reply_control = context.run.reply_control
         child.state[RUN_ID_KEY] = child.run.run_id
         child.run.parent_run_id = context.run.run_id
         child.state["_parent_event_bus"] = context.run.event_bus

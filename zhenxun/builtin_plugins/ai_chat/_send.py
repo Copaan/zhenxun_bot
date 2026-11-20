@@ -1,6 +1,7 @@
 from collections import deque
+import os
 import time
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 
 from nonebot.adapters import Bot
 from nonebot.exception import ActionFailed, ApiNotAvailable
@@ -10,7 +11,11 @@ from zhenxun.configs.config import BotConfig, Config
 from zhenxun.services.ai.run.context import RunContext
 from zhenxun.services.ai.tools.core.decorators import tool
 from zhenxun.services.ai.tools.core.toolkit import BaseToolkit
-from zhenxun.services.ai.tools.models import ResolvedToolPayload, ToolResult
+from zhenxun.services.ai.tools.models import (
+    ResolvedToolPayload,
+    ToolOptions,
+    ToolResult,
+)
 from zhenxun.services.log import logger
 from zhenxun.utils.platform import PlatformUtils
 
@@ -184,6 +189,125 @@ class SendQuota:
             del cls._times[key]
 
 
+class ReplyCompletion:
+    """按根运行、收件目标与输入段确认答复结束，不判断自然语言含义。"""
+
+    def __init__(self, context: RunContext):
+        from ._reply import delivery_target
+
+        self.run_id = context.run.run_id
+        self.target = delivery_target(
+            context.get_bot(), context.get_group_id(), context.get_user_id()
+        )
+        self.epoch = 0
+        self.closed = False
+
+    def new_input(self) -> None:
+        """已消费的新用户输入拥有独立的答复段。"""
+        self.epoch += 1
+        self.closed = False
+
+    @staticmethod
+    def terminal(call) -> bool:
+        """由可信工具元数据和已校验参数识别结束动作。"""
+        action = (getattr(call.tool, "metadata", None) or {}).get("reply_action")
+        return action == "finish" or (
+            action == "send" and (call.validated_args or {}).get("purpose") == "final"
+        )
+
+    def check(self, context: RunContext) -> str | None:
+        """核对目标、根归属、当前收据及在途子任务。"""
+        from zhenxun.services.ai.run.session import session_manager
+
+        from ._reply import delivery_record, delivery_target
+
+        if context.run.run_id != self.run_id or context.run.parent_run_id:
+            return "子代理只能提交中途内容，由父任务确认答复结束。"
+        if self.target != delivery_target(
+            context.get_bot(), context.get_group_id(), context.get_user_id()
+        ):
+            return "答复目标与当前运行不一致。"
+        record = delivery_record(context, self.target)
+        if record["uncertain"] or record["failed"]:
+            return "本轮有未完整确认的发送，不能声明答复已完成。"
+        stream = context.state.get("_attachment_export_stream")
+        try:
+            pending_export = (
+                stream is not None and os.fstat(stream.fileno()).st_size > 0
+            )
+        except (OSError, ValueError):
+            return "无法复核附件导出状态，不能提前结束答复。"
+        if pending_export or context.state.get("_qq_attachment"):
+            return "附件尚未交付，请在最终回复中提交附件声明，不要提前结束答复。"
+        if any(
+            child.run.parent_run_id == self.run_id
+            for child, _ in session_manager.runs.values()
+        ):
+            return "子任务尚未结束，请等待结果后再结束答复。"
+        return None
+
+    def finish(self, context: RunContext) -> ToolResult:
+        """仅依据当前输入段的成功投递记录关闭自动转发。"""
+        from ._reply import delivery_record
+
+        if reason := self.check(context):
+            return ToolResult(output=reason).as_error(False)
+        entries = [
+            entry
+            for entry in delivery_record(context, self.target)["entries"]
+            if entry.get("reply_epoch", 0) == self.epoch
+        ]
+        if not entries or any(
+            not e.get("receipt", {}).get("accepted") for e in entries
+        ):
+            return ToolResult(
+                output="当前输入段没有完整确认的回复，不能结束。请先正常回答或发送最终答复。"
+            ).as_error()
+        reused = self.closed
+        self.closed = True
+        return ToolResult(
+            output={
+                "delivery_status": "accepted",
+                "reply_state": "closed",
+                "accepted_count": len(entries),
+            },
+            reused=reused,
+        )
+
+
+def reply_completion(context: RunContext) -> ReplyCompletion:
+    """取得当前根运行共享的答复结束控制。"""
+    if context.run.reply_control is None:
+        context.run.reply_control = ReplyCompletion(context)
+    return context.run.reply_control
+
+
+async def deliver_tool_message(context: RunContext, message: UniMessage, label: str):
+    """媒体工具使用同一投递队列和收据账本，不发送说明文字。"""
+    from ._reply import DeliveryResult, _deliver, delivery_target
+
+    control = reply_completion(context)
+    scene = Scene.of(context)
+    if scene is None:
+        return DeliveryResult(status="failed", error="当前不在会话中。")
+
+    async def send(payload, first):
+        return await PlatformUtils.send_message(
+            scene.bot, scene.user_id, scene.group_id, payload
+        )
+
+    return await _deliver(
+        label,
+        scene.bot,
+        send,
+        context=context,
+        origin="tool",
+        chunks=[(message, label)],
+        target=delivery_target(scene.bot, scene.group_id, scene.user_id),
+        request_key=(control.epoch, "media", label),
+    )
+
+
 class QQSendToolkit(BaseToolkit):
     """AI 聊天的发送工具：运行中发言、戳一戳，只能发到当前会话"""
 
@@ -194,8 +318,10 @@ class QQSendToolkit(BaseToolkit):
         "需要先说一句（比如“我查一下”）或想连发几条时用 `send_message`，"
         "第一条可以引用消息（reply_to）或 @ 一位本群成员（at）；"
         "`poke` 戳一戳某人。发送只会到当前会话，次数有限，不要刷屏。"
-        "用 `send_message` 说过的话不要在最终回复里重复；要说的都已经用 "
-        "`send_message` 发完时，最终回复只输出 [SILENT]。"
+        "send_message 必须选择 purpose：progress 是中途发言，final 是完整最终答复。"
+        "最终答复可一次分多条发送；final 确认成功后不要再发消息或总结。"
+        "其他发送工具已经交付全部答案时调用 finish_reply，不要回复已回复或已发送。"
+        "子代理只能中途发送，由父任务收尾；未确认成功时不要声称完成。"
         "戳一戳、收藏表情等操作本身不算回复，做完仍要正常回一句。"
     )
 
@@ -210,18 +336,32 @@ class QQSendToolkit(BaseToolkit):
             "立刻向当前会话发送 1 到 5 条文字消息（每条最多 500 字），"
             "按长度间隔发送。reply_to：第一条引用的消息 id（仅群聊）；"
             "at：第一条 @ 的本群成员 QQ 号。"
+            "purpose 必填：progress 为中途发言，final 为完整最终答复。"
         ),
+        rules=ToolOptions(metadata={"reply_action": "send"}),
     )
     async def send_message(
         self,
         context: RunContext,
         messages: list[str],
+        purpose: Literal["progress", "final"],
         reply_to: str = "",
         at: str = "",
     ) -> ToolResult:
         scene = Scene.of(context)
         if scene is None:
             return ToolResult(output="当前不在会话中。").as_error()
+        control = reply_completion(context)
+        if purpose not in {"progress", "final"}:
+            return ToolResult(output="purpose 必须为 progress 或 final。").as_error()
+        if control.closed:
+            return ToolResult(output={"reply_state": "closed", "sent": False}).as_error(
+                False
+            )
+        if context.run.parent_run_id:
+            purpose = "progress"
+        if purpose == "final" and (reason := control.check(context)):
+            return ToolResult(output=reason).as_error(False)
         texts = [
             text
             for m in messages
@@ -270,7 +410,7 @@ class QQSendToolkit(BaseToolkit):
                 origin="tool",
                 chunks=[(UniMessage(Text(text)), text) for text in texts],
                 target=delivery_target(scene.bot, scene.group_id, scene.user_id),
-                request_key=(tuple(texts), reply_to, at),
+                request_key=(control.epoch, tuple(texts), reply_to, at),
             )
         finally:
             SendQuota.refund(scene.key, max(0, len(texts) - result.attempted))
@@ -280,9 +420,25 @@ class QQSendToolkit(BaseToolkit):
                 "其余未确认，勿重发。"
             )
             return ToolResult(output=notice).as_error(False, uncertain=result.uncertain)
+        if purpose == "final":
+            return control.finish(context)
         return ToolResult(
-            output=f"已发送 {len(result.parts)} 条。", reused=result.reused
+            output={
+                "delivery_status": "accepted",
+                "reply_state": "open",
+                "accepted_count": len(result.parts),
+            },
+            reused=result.reused,
         )
+
+    @tool(
+        name="finish_reply",
+        description="全部答案已通过工具发送成功时结束本轮答复，不发送消息；没有收据、发送未知或子任务未结束时不能使用。",
+        rules=ToolOptions(metadata={"reply_action": "finish"}),
+    )
+    async def finish_reply(self, context: RunContext) -> ToolResult:
+        """核对发送收据后结束当前输入段的答复。"""
+        return reply_completion(context).finish(context)
 
     @tool(
         name="poke",

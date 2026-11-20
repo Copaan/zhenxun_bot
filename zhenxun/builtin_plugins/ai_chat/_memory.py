@@ -137,6 +137,8 @@ def context_scope(context: RunContext | None) -> Scope | None:
     返回:
         Scope | None: 记忆范围
     """
+    if context and (personal := context.state.get("_personal_scene")):
+        return None, personal.split(":", 2)[2]
     if context is None or context.get_bot() is None:
         return None
     platform = PlatformUtils.get_platform_scope(context.get_bot())

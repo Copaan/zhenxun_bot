@@ -152,6 +152,8 @@ class AgentRunContext(Generic[AgentDepsT]):
     on_accept: Any = None
     prepare_follow_up: Any = None
     """由当前运行在追加输入消费边界准备背景，不重新执行整套检索。"""
+    reply_control: Any = None
+    """聊天入口提供的答复结束控制，与执行终态相互独立。"""
 
     dynamic_prompts: dict[str, str] = dataclasses.field(default_factory=dict)
     """动态提示词字典（保持插入顺序并去重）。
@@ -252,6 +254,14 @@ class RunContext(Generic[AgentDepsT]):
         """安全提取当前连接的适配器平台标识"""
         return ContextUtils.extract_platform(self.deps)
 
+    @property
+    def prepare_chat_reminders(self) -> bool:
+        """是否为本轮输入准备自动召回数据。"""
+        binding = self.state.get("_dsh_binding") or {}
+        return not self.state.get("_tool_recheck") and not (
+            binding.get("inherited") and binding.get("native")
+        )
+
     def __post_init__(self):
         if self.deps is None:
             self.deps = cast(AgentDepsT, NoneBotDeps.get_current())
@@ -321,6 +331,13 @@ def interrupt_network(stage: str, error: BaseException | None = None) -> None:
     if context is None or not context.run.fail_fast:
         return
     context.run.operations["interruption"] = stage
+    if error is not None:
+        detail: dict[str, str | int] = {"type": type(error).__name__}
+        metadata = getattr(error, "details", None)
+        status = metadata.get("status_code") if isinstance(metadata, dict) else None
+        if isinstance(status, int) and 100 <= status <= 599:
+            detail["http_status"] = status
+        context.run.operations["interruption_detail"] = detail
     context.run.outcome = "interrupted"
     session_manager.interrupt_siblings(context, "network")
     raise RunInterrupted(stage) from error

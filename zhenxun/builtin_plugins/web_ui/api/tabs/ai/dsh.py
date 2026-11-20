@@ -133,38 +133,13 @@ def _agent_targets(request) -> list[dict]:
     返回:
         list[dict]: 归属，含 owner、label 与 caller
     """
-    import nonebot
-
-    from zhenxun.services.ai.run.context import CallerIdentity
-    from zhenxun.utils.platform import PlatformUtils
+    from .console import personal_targets
 
     callers = [("当前 WebUI 账号", _management_context(request).run.caller)]
-    for bot in nonebot.get_bots().values():
-        platform = PlatformUtils.get_platform_scope(bot)
-        for user_id in PlatformUtils.get_superusers(bot):
-            callers.append(
-                (
-                    f"QQ 超管 {user_id} · Bot {bot.self_id}",
-                    CallerIdentity("qq", platform, str(bot.self_id), user_id, None),
-                )
-            )
-    from zhenxun.builtin_plugins.ai_chat._runner import dsh_settings
-
-    for item in DshSessions.for_settings(dsh_settings())._read()["owners"].values():
-        who = item.get("identity") or {}
-        if item["mode"] == "agent" and who.get("source") not in (None, "webui"):
-            callers.append(
-                (
-                    f"QQ 超管 {who.get('user_id')} · Bot {who.get('bot_id')}",
-                    CallerIdentity(
-                        who["source"],
-                        who.get("platform", ""),
-                        str(who.get("bot_id", "")),
-                        who.get("user_id"),
-                        None,
-                    ),
-                )
-            )
+    callers.extend(
+        (f"QQ 超管 {caller.user_id} · Bot {caller.bot_id}", caller)
+        for caller in personal_targets().values()
+    )
     targets: dict[str, dict] = {}
     for label, caller in callers:
         owner = DshSessions.owner_key(caller, "agent")
@@ -401,6 +376,7 @@ class DshToolCall(BaseModel):
     callId: str = Field(min_length=1, max_length=180)
     name: str = Field(min_length=1, max_length=128)
     arguments: dict
+    replyProtocol: int = Field(default=0, ge=0, le=1)
 
 
 @router.post("/dsh/tool")

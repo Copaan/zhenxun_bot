@@ -21,7 +21,7 @@ import yaml
 
 LIMIT = 8 * 1024 * 1024
 SDK_API_BASE = "https://api.deepseek.com/anthropic"
-SDK_CONNECTION_REVISION = 6
+SDK_CONNECTION_REVISION = 7
 SHELL_TIMEOUT = {"timeoutMs": 300_000, "maxTimeoutMs": 1_800_000}
 
 

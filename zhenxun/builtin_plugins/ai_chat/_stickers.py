@@ -460,14 +460,16 @@ class Stickers:
         sticker_id: int,
         reply_to: str = "",
         *,
+        context: RunContext,
         expected_md5: str | None = None,
     ) -> str | None:
-        """向当前会话发送表情库中的一个表情，计入发送配额并记录使用
+        """向当前会话发送表情，登记投递收据、发送配额与使用记录
 
         参数:
             scene: 会话
             sticker_id: 表情 id
             reply_to: 引用的消息 id
+            context: 本轮调用上下文
 
         返回:
             str | None: 发送失败的原因，成功时为空
@@ -486,11 +488,15 @@ class Stickers:
             return "表情文件已经变化，请重新检索。"
         segments: list[Segment] = [Reply(reply_to)] if reply_to else []
         segments.append(Image(raw=data))
-        if not await PlatformUtils.send_message(
-            scene.bot, scene.user_id, scene.group_id, UniMessage(segments)
-        ):
-            SendQuota.refund(scene.key, 1)
-            return "发送失败。"
+        from ._send import deliver_tool_message
+
+        result = await deliver_tool_message(
+            context, UniMessage(segments), f"[表情 #{sticker.id} {sticker.remark}]"
+        )
+        if result.status != "sent":
+            if not result.attempted:
+                SendQuota.refund(scene.key, 1)
+            return result.error or "表情未确认发送，不能重发。"
         await cls.mark_used(sticker)
         scene.note(f"[发了表情 #{sticker.id} {sticker.remark}]")
         return None
@@ -640,10 +646,21 @@ async def send_marked(context: RunContext, sticker_id: int) -> bool:
     expected = context.state.get("_sticker_candidates", {}).get(sticker_id)
     if expected is None or not Config.get_config(MODULE, "SEND_TOOLS", True):
         return False
+    from zhenxun.services.ai.utils.runtime import PermissionUtils
+
+    identity = context.state.get("_sticker_send_identity")
+    if not identity or identity not in context.run.bound_tools:
+        return False
+    PermissionUtils.ensure_current(context)
+    restricted = await PermissionUtils.tool_restrictions(context)
+    if restricted is None or identity in restricted:
+        return False
     scene = Scene.of(context)
     if scene is None:
         return False
-    reason = await Stickers.send(scene, sticker_id, expected_md5=expected)
+    reason = await Stickers.send(
+        scene, sticker_id, context=context, expected_md5=expected
+    )
     if reason:
         logger.debug(f"未发送标记的表情 #{sticker_id}: {reason}", MODULE)
         return False

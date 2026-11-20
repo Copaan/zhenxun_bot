@@ -17,6 +17,25 @@ const RETRY_CODES = new Set(['EMPTY_RESPONSE', 'RATE_LIMIT', 'SERVER', 'TIMEOUT'
 /** 桥接工具只在匹配的 Agent、运行和轮次内有效。 */
 export function chatTools(ctx, desktopChat = false) {
   const active = new WeakMap()
+  /** 结束动作只接受本批唯一请求，并核对其他调用的真实结果。 */
+  function checkFinal(agent, state, name, args, callId) {
+    const terminal = (name, args) => {
+      if (typeof args === 'string') {
+        try { args = JSON.parse(args) } catch { args = undefined }
+      }
+      return state.lease.replyActions?.[name] === 'finish' ||
+        (state.lease.replyActions?.[name] === 'send' && args?.purpose === 'final')
+    }
+    if (!terminal(name, args)) return
+    if (state.lease.replyProtocol !== 1 || !agent.session.snapshotEvents) throw new Error('请重新加载真寻发送协议')
+    const events = agent.session.snapshotEvents()
+    const at = events.findLastIndex(e => e.type === 'assistant/message' && e.data.turn === state.turn)
+    const calls = (events[at]?.data.message?.content || []).filter(b => b.type === 'tool-call')
+    if (new Set(calls.map(c=>c.id)).size !== calls.length) throw new Error('工具调用编号重复，不能确认本批答复结束')
+    if (!calls.some(c => c.id === callId) || calls.filter(c => terminal(c.name,c.arguments)).length !== 1) throw new Error('同批只能有一个答复结束动作，请合并消息后单独提交')
+    const results = new Map(events.slice(at + 1).filter(e => e.type === 'tool/result' && e.data.turn === state.turn && e.data.step === events[at].data.step).map(e => [e.data.message?.source?.callId,e.data.message]))
+    if (calls.some(c => c.id !== callId && (!results.has(c.id) || results.get(c.id).isError))) throw new Error('本批其他工具尚未全部成功，请等待结果后单独提交最终答复')
+  }
   ctx.on('agent/turn-stopping',({agent})=>clear(agent))
   function clear(agent) {
     const old = active.get(agent)
@@ -65,10 +84,11 @@ export function chatTools(ctx, desktopChat = false) {
           ...def, output: {schema: {type:'object'}, render: (_args, result) => result.blocks},
           execute: async (args, exec) => {
             if (active.get(agent) !== state || state.turn===null || exec.agent !== agent || !exec.callId) throw new Error('工具运行已过期')
+            checkFinal(agent,state,def.name,args,exec.callId)
             const response = await fetch(`http://127.0.0.1:${Number(lease.port)}/zhenxun/api/ai/dsh/tool`, {
               method:'POST', redirect:'error', signal:exec.signal,
               headers:{Authorization:'Bearer '+lease.token,'Content-Type':'application/json'},
-              body:JSON.stringify({sessionId:agent.id,runId:lease.runId,requestId:lease.requestId,callId:exec.callId,name:def.name,arguments:args})
+              body:JSON.stringify({sessionId:agent.id,runId:lease.runId,requestId:lease.requestId,callId:exec.callId,name:def.name,arguments:args,replyProtocol:1})
             })
             if (!response.ok) throw new Error('真寻未确认本次工具调用；不要重放。')
             const value=await response.json()
