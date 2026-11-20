@@ -15,8 +15,15 @@ const RETRY_DELAYS = [2000, 5000, 10000, 20000]
 const RETRY_CODES = new Set(['EMPTY_RESPONSE', 'RATE_LIMIT', 'SERVER', 'TIMEOUT', 'TRANSPORT'])
 
 /** 桥接工具只在匹配的 Agent、运行和轮次内有效。 */
-export function chatTools(ctx, desktopChat = false) {
+export function chatTools(ctx, desktopChat = false, recordWarning) {
   const active = new WeakMap()
+  function warnTools(kind, turn, groups) {
+    const names = Object.fromEntries(Object.entries(groups).map(([key, values]) =>
+      [key, values.filter(name => typeof name === 'string').slice(0,64).map(name => name.slice(0,120))]))
+    const warning = 'Zhenxun tool ' + kind + ': ' + JSON.stringify({turn, ...names})
+    ctx.logger.warn(warning)
+    recordWarning?.(warning)
+  }
   /** 结束动作只接受本批唯一请求，并核对其他调用的真实结果。 */
   function checkFinal(agent, state, name, args, callId) {
     const terminal = (name, args) => {
@@ -46,7 +53,7 @@ export function chatTools(ctx, desktopChat = false) {
     const old = active.get(agent)
     if (lease && old?.lease.runId===lease.runId && old.turn===null) {
       old.turn=turn
-      if (turn!==null && old.conflicts.length) agent.session.append('zhenxun/tool-shadowed', {turn, conflict:old.conflicts})
+      if (turn!==null && old.conflicts.length) warnTools('shadowed', turn, {conflict:old.conflicts})
       return
     }
     if (old?.turn === turn && (!lease || old.lease.runId === lease.runId)) return
@@ -106,7 +113,7 @@ export function chatTools(ctx, desktopChat = false) {
           }
         })
       }
-      if (turn!==null && state.conflicts.length) agent.session.append('zhenxun/tool-shadowed', {turn, conflict:state.conflicts})
+      if (turn!==null && state.conflicts.length) warnTools('shadowed', turn, {conflict:state.conflicts})
     } catch (error) { clear(agent); throw error }
   }
   function has(agent, name) {
@@ -121,7 +128,7 @@ export function chatTools(ctx, desktopChat = false) {
     if (state) for (const [name, def] of state.definitions) if (visible.get(name) !== def) missing.push(name)
     const extra = [...actual].filter(n => !expected.includes(n))
     if (missing.length || extra.length || collisions.length) {
-      agent.session.append('zhenxun/tool-mismatch', {turn:state?.turn, missing, extra, conflict:collisions})
+      warnTools('mismatch', state?.turn, {missing, extra, conflict:collisions})
       throw new Error('Zhenxun tool manifest mismatch')
     }
     return [...actual].sort()
@@ -136,7 +143,6 @@ function bindDesktopInput(ctx, config, bridge, native) {
     try { lease=JSON.parse(readFileSync(path.join(config.root,'leases',agent.id+'.json'),'utf8')) }
     catch { return }
     if (Boolean(lease.native)===native && lease.requestId===message.source.rpcId && lease.expires>Date.now()/1000) {
-      agent.session.append('zhenxun/input-claimed', {turn, runId:lease.runId, requestId:lease.requestId})
       bridge.bind(agent,turn,lease.bridge)
     }
   })

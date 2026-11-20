@@ -1035,31 +1035,14 @@ class DshRuntime:
             if not turn.admitted:
                 turn.remote_turn = data.get("turn")
             return None
-        if kind == "zhenxun/input-claimed":
-            if (
-                data.get("runId") == turn.context.run.run_id
-                and data.get("requestId") == turn.request_id
-                and type(data.get("turn")) is int
-                and data["turn"] == turn.remote_turn
-                and (message_id is None or data.get("messageId") == message_id)
-            ):
-                turn.admitted = True
-            return None
-        if (
-            kind == "user/message"
-            and message_id is None
-            and turn.remote_turn is not None
-        ):
+        if kind == "user/message" and turn.remote_turn is not None:
             message = data.get("message") or data
-            if (message.get("source") or {}).get("rpcId") == turn.request_id:
+            if message_id is not None:
+                if message.get("id") == message_id:
+                    turn.admitted = True
+            elif (message.get("source") or {}).get("rpcId") == turn.request_id:
                 turn.admitted = True
         if not turn.admitted or data.get("turn") not in {None, turn.remote_turn}:
-            return None
-        if kind in {"zhenxun/tool-mismatch", "zhenxun/tool-shadowed"}:
-            turn.context.run.operations.setdefault("dsh", {})[kind.split("/")[1]] = {
-                key: [n[:120] for n in data.get(key, []) if isinstance(n, str)][:64]
-                for key in ("missing", "extra", "conflict")
-            }
             return None
         if kind == "request/header":
             header = data.get("header") or {}

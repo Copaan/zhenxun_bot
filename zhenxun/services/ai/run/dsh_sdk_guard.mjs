@@ -1,7 +1,8 @@
 import http from 'node:http'
+import { renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import fs from 'node:fs/promises'
 import path from 'node:path'
-import { timingSafeEqual } from 'node:crypto'
+import { randomUUID, timingSafeEqual } from 'node:crypto'
 import { chatTools, retryModelRequest } from './dsh_guard.mjs'
 
 export const name = 'zhenxun-sdk-control'
@@ -42,14 +43,19 @@ export async function apply(ctx, config) {
     restrictions.set(agent,next)
     if (native) searchAgents.set(agent,native); else searchAgents.delete(agent)
   }
-  const bridge = chatTools(ctx)
-  const armed = new Map()
-  ctx.on('agent/inbox/claimed', ({agent, message, turn}) => {
-    const lease = armed.get(agent.id)?.lease
-    if (lease && message.source?.kind === 'user') {
-      agent.session.append('zhenxun/input-claimed', {turn, messageId:message.id, runId:lease.runId, requestId:lease.requestId})
+  // SDK 的 stderr 不持久化，只保留守卫生成的最近一条工具诊断。
+  const lastWarning = path.join(config.root, 'last-tool-warning.log')
+  const bridge = chatTools(ctx, false, warning => {
+    const temporary = lastWarning + '.' + randomUUID() + '.tmp'
+    try {
+      writeFileSync(temporary, warning + '\n', {flag:'wx', mode:0o600})
+      renameSync(temporary, lastWarning)
+    } catch {
+      try { unlinkSync(temporary) } catch {}
+      ctx.logger.warn('Cannot save Zhenxun tool warning')
     }
   })
+  const armed = new Map()
   const endpoint = path.join(config.root, 'control.json')
   ctx.on('session/created', session => {
     const previous = selection(session.snapshotEvents())
