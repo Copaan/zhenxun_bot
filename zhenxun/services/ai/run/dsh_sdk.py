@@ -178,14 +178,12 @@ class SdkClient:
         }
 
     @classmethod
-    async def ensure(cls, settings, mode, *, allow_start=True):
+    async def ensure(cls, settings, mode):
         async with cls._starting:
             parameters = cls.credentials(settings)
             try:
                 client = await cls.open(settings, mode)
             except DshUnavailable:
-                if not allow_start:
-                    raise
                 home = cls.home_for(settings)
                 home.mkdir(parents=True, exist_ok=True)
                 options = (
@@ -226,6 +224,19 @@ class SdkClient:
                 )
             await client.call("start", parameters, timeout=65)
             return client
+
+    @classmethod
+    async def shutdown(cls, settings):
+        """随 Bot 关闭请求宿主退出，宿主仍有后台任务时会拒绝
+
+        参数:
+            settings: dsh 执行器设置
+        """
+        if settings.transport != "sdk":
+            return
+        with contextlib.suppress(DshUnavailable, RunInterrupted):
+            client = await cls.open(settings)
+            await client.call("shutdown", timeout=5)
 
     @staticmethod
     def needs_restart(status):
@@ -363,11 +374,7 @@ class SdkClient:
         home = str(cls.home_for(settings))
         if binding.get("sdk_home") not in {None, home}:
             raise DshUnavailable("SDK home 已变化，请显式选择此后端的会话。")
-        client = await cls.ensure(
-            settings,
-            binding["mode"],
-            allow_start=not (binding["created"] or binding.get("inflight")),
-        )
+        client = await cls.ensure(settings, binding["mode"])
         DshControl.verify_home(binding, client)
         turn = _Turn(context, binding, client, approve, ask)
         turn.proof = {"transport": "sdk", "contract": 1}

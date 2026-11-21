@@ -105,6 +105,23 @@ class Worker:
         self.defaults = None
         self.api_base = None
 
+    def outdated(self, params, permission):
+        """权限、运行文件或凭据变化后，工具组合需要重新启动
+
+        参数:
+            params: 本次启动参数
+            permission: 本次权限模式
+
+        返回:
+            bool: 是否需要重新启动
+        """
+        return (
+            (self.mode == "agent" and self.permission != permission)
+            or self.runtime_identity not in {None, str(Path(params["bin"]).resolve())}
+            or self.credential_hash
+            not in {None, hashlib.sha256(params["api_key"].encode()).hexdigest()}
+        )
+
     async def control(self, method, args=None):
         if self.process is None or self.process.returncode is not None:
             raise ValueError("SDK 进程已退出；不会重放原输入。")
@@ -134,15 +151,6 @@ class Worker:
         if self.process and self.process.returncode is None:
             if self.transport_closed:
                 raise ValueError("SDK 通道已关闭，请核验后显式停止宿主。")
-            if self.runtime_identity != str(executable):
-                raise ValueError("运行文件已变化，请显式停止宿主后重新启动。")
-            if (
-                self.credential_hash
-                != hashlib.sha256(params["api_key"].encode()).hexdigest()
-            ):
-                raise ValueError(
-                    "SDK 凭据已变化，请显式停止宿主后重新启动；原任务未被修改。"
-                )
             if self.defaults != (params["model"], params.get("thinking") or ""):
                 await self.initialize(params)
             return
@@ -572,7 +580,7 @@ class Host:
         if method == "start":
             permission = params.get("permission") or "sandbox"
             worker = self.workers.get(mode)
-            if worker and mode == "agent" and worker.permission != permission:
+            if worker and worker.outdated(params, permission):
                 async with worker.lock:
                     if worker.process and worker.process.returncode is None:
                         if any(r.get("attached") for r in worker.runs.values()) or any(
@@ -580,7 +588,7 @@ class Host:
                             for row in (await worker.control("list"))["items"]
                         ):
                             raise ValueError(
-                                "Agent 权限已修改，但 SDK 仍有任务在运行；"
+                                "SDK 权限、运行文件或凭据已修改，但仍有任务在运行；"
                                 "请等待任务结束后再试。"
                             )
                         await worker.close()

@@ -412,11 +412,25 @@ class DshSessions:
         item.update(updated)
         return updated
 
+    @staticmethod
+    def managed(item: dict) -> bool:
+        """判断会话是否由真寻创建，只有这类会话可以自动更换
+
+        参数:
+            item: 会话记录
+
+        返回:
+            bool: 是否由真寻创建
+        """
+        if item.get("origin"):
+            return item["origin"] == "managed"
+        return not item.get("inherited")
+
     @classmethod
     def rotate_remote(cls, item: dict, reason: str) -> None:
         def edit(data):
             current = data["owners"].get(item["owner"])
-            if current != item or current.get("origin") != "managed":
+            if current != item or not cls.managed(current):
                 raise DshUnavailable("会话已变化")
             data["archives"].append(
                 {

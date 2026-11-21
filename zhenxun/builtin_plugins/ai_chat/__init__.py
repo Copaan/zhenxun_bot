@@ -264,11 +264,15 @@ async def _():
     priority=60, timeout=15, component_id="runtime:ai_chat_dsh"
 )
 async def _():
+    from zhenxun.services.ai.run.dsh_sdk import SdkClient
     from zhenxun.services.ai.run.session import session_manager
+
+    from ._runner import dsh_settings
 
     await session_manager.shutdown()
     await Memory.stop(shutdown=True)
     await DshRuntime.close()
+    await SdkClient.shutdown(dsh_settings())
 
 
 @scheduler.scheduled_job("cron", hour=4, minute=50, id="ai_chat_token_cleanup")

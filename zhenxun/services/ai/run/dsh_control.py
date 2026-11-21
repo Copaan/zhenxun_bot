@@ -162,8 +162,7 @@ class DshControl:
         flight = binding.get("inflight") or {}
         info = context.run.operations.setdefault("dsh", {})
         if (
-            binding.get("origin") != "managed"
-            or not binding.get("home_identity")
+            not records.managed(binding)
             or binding["owner"] != records.owner(context, binding["mode"])
             or flight.get("run_id") == context.run.run_id
             or info.get("submission") != "not_submitted"

@@ -44,6 +44,38 @@ def agent_runner() -> str:
     return runner
 
 
+def dsh_reusable(
+    outcome: str, delivery: dict, text: str, raw: str, suppressed: bool
+) -> bool:
+    """判断 DSH 会话记录与实际送达是否一致，一致时下一轮沿用原会话
+
+    参数:
+        outcome: 本轮执行结果
+        delivery: 投递结果
+        text: 过滤后的最终文本
+        raw: 执行端返回的原始文本
+        suppressed: 答复已由工具发出，收尾文本未转发
+
+    返回:
+        bool: 是否沿用原会话
+    """
+    from ._reply import parse_silent
+
+    status, attachment = delivery.get("status"), delivery.get("attachment")
+    if suppressed or (status == "skipped" and not attachment):
+        if delivery.get("uncertain") or delivery.get("operation_uncertain"):
+            return False
+        if suppressed:
+            return status == "sent"
+        return outcome == "completed" and parse_silent(raw) is None
+    return (
+        status == "sent"
+        and outcome == "completed"
+        and not delivery.get("uncertain")
+        and (attachment.get("status") == "sent" if attachment else text == raw)
+    )
+
+
 def dsh_settings() -> DshSettings:
     """读取聊天设置中的 DSH
 
@@ -306,7 +338,7 @@ async def _run_dsh(
                 remote.usage += media_usage
                 new = new or remote_id != binding["remote_id"]
                 blocks = []
-                if binding.get("native") and (receipt := binding.get("delivery_note")):
+                if receipt := binding.get("delivery_note"):
                     blocks.append(
                         {
                             "type": "text",
@@ -457,7 +489,6 @@ async def _run_dsh(
                 if finalize:
                     await finalize(result, None)
                 delivery = context.state.get("_delivery", {})
-                attachment = delivery.get("attachment")
                 from ._reply import parse_silent
 
                 suppressed = bool(
@@ -466,34 +497,16 @@ async def _run_dsh(
                     and parse_silent(text)
                 )
                 context.run.operations["dsh"]["final_text_suppressed"] = suppressed
-                clean = (
-                    delivery.get("status") == "sent"
-                    and result.outcome == "completed"
-                    and not delivery.get("uncertain")
-                    and not suppressed
-                    and (
-                        attachment.get("status") == "sent"
-                        if attachment
-                        else text == raw
-                    )
-                )
                 DshSessions.for_binding(binding).update(
                     binding,
                     inflight=None,
                     quarantined=None
-                    if clean
-                    or (
-                        binding.get("native")
-                        and suppressed
-                        and delivery.get("status") == "sent"
-                        and not delivery.get("uncertain")
-                        and not delivery.get("operation_uncertain")
-                    )
+                    if dsh_reusable(result.outcome, delivery, text, raw, suppressed)
                     else "delivery_or_filter_changed",
                     delivery_uncertain=bool(delivery.get("uncertain"))
                     or delivery.get("status") != "sent",
                     delivery_note=(delivery.get("text") or "")[:8000]
-                    if suppressed and binding.get("native")
+                    if suppressed
                     else None,
                     applied_persona=stamp,
                     persona=persona_key,
