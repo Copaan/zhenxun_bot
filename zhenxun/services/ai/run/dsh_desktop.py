@@ -25,6 +25,10 @@ class DshUnavailable(LLMException):
     """桌面连接或专用能力尚未就绪。"""
 
 
+class DesktopSessionMissing(DshUnavailable):
+    """桌面已明确拒绝读取不存在的会话。"""
+
+
 def loopback_url(value: str) -> str:
     """校验仅包含回环 IP 与显式端口的桌面 HTTP 地址。"""
     try:
@@ -228,7 +232,15 @@ class DesktopClient:
             result = envelope["result"]
             if result.get("ok") is not True:
                 code = str((result.get("error") or {}).get("code", "unknown"))
+                if (
+                    result.get("ok") is False
+                    and method == "session/state"
+                    and code == "session/not-found"
+                ):
+                    raise DesktopSessionMissing("桌面会话不存在。")
                 raise DshUnavailable(f"桌面拒绝操作（{code}）。")
+            if method == "session/projections" and "value" not in result:
+                raise ValueError
             return result.get("value")
         except (httpx.TransportError, asyncio.TimeoutError) as exc:
             raise RunInterrupted("DSH 桌面通信中断，操作结果待核验。") from exc
@@ -270,7 +282,10 @@ class DesktopClient:
         """移除精确待执行输入；缺少当前执行的原子归属条件时不取消整会话。"""
 
         async def drain():
+            from .dsh_control import Foreground
+
             snapshot = await self.rpc("session/state", {"sessionId": session_id})
+            Foreground.read("desktop", snapshot)
             for item in snapshot.get("queue") or []:
                 if item.get("rpcId") == request_id:
                     await self.rpc(
@@ -286,11 +301,7 @@ class DesktopClient:
                 return "unknown"
             while True:
                 state = await self.rpc("session/state", {"sessionId": session_id})
-                if (
-                    state.get("running") is False
-                    and not state.get("queue")
-                    and not state.get("pendingInput")
-                ):
+                if Foreground.read("desktop", state) is Foreground.IDLE:
                     return "confirmed"
                 await asyncio.sleep(0.2)
 

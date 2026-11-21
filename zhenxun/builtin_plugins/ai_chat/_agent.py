@@ -202,6 +202,8 @@ async def record_run(
         from ._safety import Safety
 
         delivery = context.state.get("_delivery", {})
+        if delivery.get("uncertain") or delivery.get("operation_uncertain"):
+            status = "unknown"
         if status in {"ok", "silent"} and delivery.get("status") in {
             "failed",
             "partial",

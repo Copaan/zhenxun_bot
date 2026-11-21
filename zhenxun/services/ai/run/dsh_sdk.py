@@ -178,12 +178,14 @@ class SdkClient:
         }
 
     @classmethod
-    async def ensure(cls, settings, mode):
+    async def ensure(cls, settings, mode, *, allow_start=True):
         async with cls._starting:
             parameters = cls.credentials(settings)
             try:
                 client = await cls.open(settings, mode)
             except DshUnavailable:
+                if not allow_start:
+                    raise
                 home = cls.home_for(settings)
                 home.mkdir(parents=True, exist_ok=True)
                 options = (
@@ -355,36 +357,65 @@ class SdkClient:
     @classmethod
     async def start_turn(cls, context, binding, settings, approve, ask):
         from .dsh import BOOT_ID, DshRuntime, DshSessions, _Turn
+        from .dsh_control import DshControl, Foreground
 
         records = DshSessions.for_binding(binding)
         home = str(cls.home_for(settings))
         if binding.get("sdk_home") not in {None, home}:
             raise DshUnavailable("SDK home 已变化，请显式选择此后端的会话。")
-        if not binding.get("native") and (
-            binding.get("inflight") or binding.get("quarantined")
-        ):
-            records.rotate_remote(binding)
-        client = await cls.ensure(settings, binding["mode"])
-        client.context = context
-        client.run_id = context.run.run_id
+        client = await cls.ensure(
+            settings,
+            binding["mode"],
+            allow_start=not (binding["created"] or binding.get("inflight")),
+        )
+        DshControl.verify_home(binding, client)
         turn = _Turn(context, binding, client, approve, ask)
         turn.proof = {"transport": "sdk", "contract": 1}
+        info = context.run.operations.setdefault("dsh", {})
+        info["submission"] = "not_submitted"
         state = await client.rpc("session/state", {"sessionId": binding["remote_id"]})
-        if binding.get("inflight") and not state.get("loaded"):
-            raise DshUnavailable(
-                "原 SDK 执行结果待核验；可显式新建会话，不会重放旧输入。"
-            )
-        if state.get("running") or state.get("queue"):
+        activity = Foreground.read("sdk", state)
+        if activity is Foreground.BUSY:
             raise DshUnavailable("此 SDK 会话仍在运行，请等待或显式停止。")
+        reason = binding.get("quarantined") or (
+            "previous_run_unknown" if binding.get("inflight") else None
+        )
+        if not reason and binding["created"]:
+            receipt = await client.call(
+                "resume",
+                {
+                    "session_id": binding["remote_id"],
+                    "search": context.state.get("_dsh_search_source") == "native",
+                },
+            )
+            if (
+                not isinstance(receipt, dict)
+                or receipt.get("session_id") != binding["remote_id"]
+            ):
+                raise DshUnavailable("SDK 会话恢复收据不符。")
+            history = receipt.get("history")
+            if history in ("missing", "unreadable"):
+                reason = history
+            elif history != "ready":
+                raise DshUnavailable("SDK 未确认恢复会话。")
+        if reason:
+            if binding.get("sdk_home") != home:
+                raise DshUnavailable("无法确认原 SDK 数据目录，未更换会话。")
+            await DshControl.recover(context, binding, client, reason)
         records.update(
             binding,
             sdk_home=home,
+            home_identity=DshControl.home_identity(client),
             inflight={
                 "boot": BOOT_ID,
                 "run_id": context.run.run_id,
                 "request_id": turn.request_id,
+                "submission": "not_submitted",
+                "input_id": context.state.get("_dsh_input_id"),
             },
         )
+        client.context = context
+        client.run_id = context.run.run_id
         DshRuntime._turns[context.run.run_id] = turn
         return turn
 
@@ -394,6 +425,7 @@ class SdkClient:
 
         if any(block.get("type") not in {"text", "image"} for block in content):
             raise DshUnavailable("SDK 不支持本次输入的附件类型。")
+        turn.mark_submission("unknown")
         receipt = await self.call(
             "prompt",
             {
@@ -407,9 +439,16 @@ class SdkClient:
                 else None,
             },
         )
-        self.message_id = receipt["message_id"]
-        if not self.message_id:
+        if (
+            not isinstance(receipt, dict)
+            or receipt.get("session_id") != turn.binding["remote_id"]
+            or receipt.get("run_id") != self.run_id
+            or not isinstance(receipt.get("message_id"), str)
+            or not receipt["message_id"]
+        ):
             raise RunInterrupted("SDK 输入收据未知，未重发")
+        self.message_id = receipt["message_id"]
+        turn.mark_submission("accepted")
         DshSessions.for_binding(turn.binding).update(turn.binding, created=True)
         cursor = receipt["cursor"]
         answered = set()
@@ -476,7 +515,7 @@ class SdkClient:
                 "args": {"sessionId": session_id, "messageId": self.message_id},
             },
         )
-        if not state.get("confirmed"):
+        if state.get("confirmed") is not True:
             return "unknown"
         return (
             "target_removed"

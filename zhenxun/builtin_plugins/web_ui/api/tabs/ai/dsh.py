@@ -184,26 +184,23 @@ async def desktop_sessions(request: Request, owner: str | None = None) -> Result
     from zhenxun.services.ai.run.dsh_desktop import DshUnavailable
 
     target, targets = _target(request, owner)
+    settings = dsh_settings()
+    list_error = None
     try:
-        items = await DshControl.list(dsh_settings(), target["owner"])
-    except (DshUnavailable, RunInterrupted) as exc:
-        raise HTTPException(
-            409,
-            detail={
-                "code": "dsh_unavailable",
-                "message": str(exc)
-                if isinstance(exc, DshUnavailable)
-                else "桌面连接失败，请确认 DSH 桌面已启动。",
-            },
-        ) from exc
-    current = (
-        DshSessions.for_settings(dsh_settings())._read()["owners"].get(target["owner"])
-    )
+        items = await DshControl.list(settings, target["owner"])
+    except (DshUnavailable, RunInterrupted):
+        items = []
+        list_error = "已有会话列表暂不可读；新建会话将单独核验。"
+    current = DshSessions.for_settings(settings)._read()["owners"].get(target["owner"])
+    reason, _, actions = await DshControl.inspect(settings, current, "agent")
     return Result.ok(
         {
             "targets": [{"owner": t["owner"], "label": t["label"]} for t in targets],
             "owner": target["owner"],
             "items": items,
+            "list_error": list_error,
+            "reason_code": reason,
+            "allowed_actions": [a for a in actions if a != "select" or not list_error],
             "current_id": current["remote_id"] if current else None,
             "revision": current["revision"] if current else 0,
         }
@@ -214,6 +211,7 @@ async def desktop_sessions(request: Request, owner: str | None = None) -> Result
 async def choose_desktop_session(payload: DshSessionChoice, request: Request) -> Result:
     """为指定归属显式选择原会话或准备新会话，后续发送仍按发起人身份准入。"""
     from zhenxun.builtin_plugins.ai_chat._runner import dsh_settings
+    from zhenxun.services.ai.core.exceptions import RunInterrupted
     from zhenxun.services.ai.run.dsh_control import DshControl
     from zhenxun.services.ai.run.dsh_desktop import DshUnavailable
 
@@ -225,9 +223,15 @@ async def choose_desktop_session(payload: DshSessionChoice, request: Request) ->
             payload.remote_id,
             payload.expected_revision,
         )
-    except DshUnavailable as exc:
+    except (DshUnavailable, RunInterrupted) as exc:
         raise HTTPException(
-            409, detail={"code": "dsh_selection_conflict", "message": str(exc)}
+            409,
+            detail={
+                "code": "dsh_selection_conflict",
+                "message": str(exc)
+                if isinstance(exc, DshUnavailable)
+                else "无法确认 DSH 会话状态，请刷新后再选择。",
+            },
         ) from exc
     if target is not targets[0]:
         logger.info(
@@ -239,7 +243,7 @@ async def choose_desktop_session(payload: DshSessionChoice, request: Request) ->
         selected,
         info="已选择原会话，保留桌面模型、思考等级和模式。"
         if payload.remote_id
-        else "已准备新标准会话，首次发送时建立。",
+        else "已选择新会话；旧历史保留，旧任务不会重跑。",
     )
 
 
@@ -257,42 +261,37 @@ class DshAuthorization(BaseModel):
 @router.get("/dsh/status", dependencies=[authentication()], response_model=Result)
 async def desktop_status() -> Result:
     from zhenxun.builtin_plugins.ai_chat._runner import dsh_settings
+    from zhenxun.services.ai.run.dsh_control import DshControl
 
-    status = await DshRuntime.status(dsh_settings())
+    settings = dsh_settings()
+    status = await DshRuntime.status(settings)
+    clients = {}
     try:
         status["sessions"] = list(
-            DshSessions.for_settings(dsh_settings())._read()["owners"].values()
+            DshSessions.for_settings(settings)._read()["owners"].values()
         )
         from zhenxun.services.ai.run.session import session_manager
 
         for item in status["sessions"]:
+            reason, label, actions = (
+                await DshControl.inspect(settings, item, item["mode"], clients=clients)
+                if status.get("connected")
+                else ("offline", "宿主不可达，请先连接", [])
+            )
+            item.update(reason_code=reason, allowed_actions=actions)
             run_id = (item.get("inflight") or {}).get("run_id")
             active = session_manager.runs.get(run_id)
             item["local_running"] = bool(active and not active[1].done())
-            item["stop_state_label"] = (
-                "本地转发中"
-                if item["local_running"]
-                else "远端前台结果待核验"
-                if item.get("inflight")
-                else "前台已停止或已移除（后台另行管理）"
-                if item.get("stop")
-                in {
-                    "confirmed",
-                    "foreground_confirmed",
-                    "foreground_idle",
-                    "target_removed",
-                }
-                else "下次对话将重建会话"
-                if item.get("quarantined")
-                else "停止结果待核验"
-                if item.get("stop")
-                else "无登记运行（非远端状态）"
-            )
+            item["stop_state_label"] = label
         status["mapping_trusted"] = True
     except Exception:
         status["sessions"] = []
         status["mapping_trusted"] = False
         status["reason"] = "会话映射损坏或不可读取，已阻止新运行。"
+    finally:
+        for client in clients.values():
+            if client:
+                await client.close()
     return Result.ok(status)
 
 

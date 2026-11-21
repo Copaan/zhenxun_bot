@@ -147,6 +147,18 @@ export async function apply(ctx, config) {
     }
     if (!/^[a-zA-Z0-9_-]{1,128}$/.test(args.sessionId || '')) throw new Error('Invalid session identity')
     if (method === 'describe') return describe(args.sessionId)
+    if (method === 'historyState') {
+      let handle
+      try {
+        handle = await ctx.sessionPersistence.open(args.sessionId, 'read')
+        await handle.read()
+        return { history: 'readable' }
+      } catch (error) {
+        if (error.name === 'SessionPersistenceNotFoundError') return { history: 'missing' }
+        if (['SessionFormatUnsupportedError', 'SessionPersistenceCorruptionError'].includes(error.name)) return { history: 'unreadable' }
+        throw error
+      } finally { if (handle) await handle.close() }
+    }
     const agent = ctx.agents.get(args.sessionId)
     if (method==='bridgeArm') {
       if(agent?.status==='running' || args.lease.sessionId!==args.sessionId) throw new Error('Session not idle')

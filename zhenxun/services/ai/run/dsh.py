@@ -125,7 +125,7 @@ class DshSessions:
                 not isinstance(item, dict)
                 or item.get("owner") != key
                 or item.get("mode") not in PRESETS
-                or not isinstance(item.get("revision"), int)
+                or type(item.get("revision")) is not int
                 or not re.fullmatch(
                     r"[a-zA-Z0-9_-]{1,128}", str(item.get("remote_id", ""))
                 )
@@ -193,6 +193,14 @@ class DshSessions:
 
         def edit(data):
             item = data["owners"].get(owner)
+            input_id = context.state.get("_dsh_input_id")
+            if input_id and any(
+                (row.get("unresolved_run") or row.get("inflight") or {}).get("input_id")
+                == input_id
+                for row in [*data["archives"], item or {}]
+                if row.get("owner") == owner
+            ):
+                raise DshUnavailable("这条输入已有运行收据，未重复提交。")
             if (
                 item
                 and item.get("inflight")
@@ -203,12 +211,21 @@ class DshSessions:
                 remote = "zx-" + uuid.uuid4().hex
                 item = {
                     "transport": cls.TRANSPORT,
+                    "origin": "managed",
                     "owner": owner,
                     "mode": mode,
                     "persona": persona_key,
                     "remote_id": remote,
                     "local_id": f"ai_chat:dsh:{owner}:{uuid.uuid4().hex}",
-                    "revision": 1,
+                    "revision": 1
+                    + max(
+                        (
+                            row["revision"]
+                            for row in data["archives"]
+                            if row["owner"] == owner
+                        ),
+                        default=0,
+                    ),
                     "created": False,
                     "inflight": None,
                     "quarantined": None,
@@ -237,17 +254,30 @@ class DshSessions:
 
     @classmethod
     def switch(
-        cls, caller, selected: dict | None, expected_revision: int, mode: str = "agent"
+        cls,
+        caller,
+        selected: dict | None,
+        expected_revision: int,
+        mode: str,
+        *,
+        previous: dict | None,
     ) -> dict:
         """按可信所有者和模式切换映射，普通聊天只复用自身记录。"""
         if mode not in PRESETS:
             raise DshUnavailable("未知的 DSH 模式。")
-        owner = cls.owner_key(caller, mode)
+        owner = (
+            previous["owner"]
+            if previous and caller is None
+            else cls.owner_key(caller, mode)
+        )
         remote_id = selected["remote_id"] if selected else "zx-" + uuid.uuid4().hex
 
         def edit(data):
             current = data["owners"].get(owner)
-            if (current["revision"] if current else 0) != expected_revision:
+            if (
+                current != previous
+                or (current["revision"] if current else 0) != expected_revision
+            ):
                 raise DshUnavailable("会话映射已变化，请重新选择。")
             for item in [*data["archives"], *data["owners"].values()]:
                 if item["remote_id"] == remote_id and item["owner"] != owner:
@@ -273,12 +303,23 @@ class DshSessions:
                 )
             ):
                 raise DshUnavailable("不能接入无可信归属或结果待核验的普通聊天。")
-            if current and current.get("inflight"):
-                raise DshUnavailable("会话仍在执行，不能切换。")
+            if selected and any(
+                row["remote_id"] == remote_id and row.get("unresolved_run")
+                for row in data["archives"]
+            ):
+                raise DshUnavailable("目标会话仍有待核验的旧运行，请新建会话。")
             if current:
-                data["archives"].append(
-                    {**current, "archive_reason": "selection_changed"}
-                )
+                archived = {
+                    **current,
+                    "archive_reason": "selection_changed",
+                    "inflight": None,
+                }
+                if current.get("inflight"):
+                    archived.update(
+                        unresolved_run=current["inflight"],
+                        quarantined="previous_run_unknown",
+                    )
+                data["archives"].append(archived)
             item = {
                 "transport": cls.TRANSPORT,
                 "owner": owner,
@@ -288,7 +329,18 @@ class DshSessions:
                 "local_id": owned["local_id"]
                 if owned and mode == "chat"
                 else f"ai_chat:dsh:{owner}:{uuid.uuid4().hex}",
-                "revision": expected_revision + 1,
+                "revision": 1
+                + max(
+                    expected_revision,
+                    max(
+                        (
+                            row["revision"]
+                            for row in data["archives"]
+                            if row["owner"] == owner
+                        ),
+                        default=0,
+                    ),
+                ),
                 "created": selected.get("created", True) if selected else False,
                 "inflight": None,
                 "quarantined": None,
@@ -303,11 +355,14 @@ class DshSessions:
                 if selected
                 else True,
                 "inherited": bool(selected),
+                "origin": "selected" if selected else "managed",
                 "cwd": selected["cwd"] if selected else None,
                 "model": selected["model"] if selected else None,
                 "plan": selected["plan"] if selected else None,
                 "title": selected["title"] if selected else "新建桌面会话",
-                "identity": {
+                "identity": previous["identity"]
+                if previous and caller is None
+                else {
                     "source": caller.source,
                     "platform": caller.platform,
                     "bot_id": caller.bot_id,
@@ -327,22 +382,28 @@ class DshSessions:
         return cls._mutate(edit)
 
     @classmethod
-    def refresh(cls, item: dict) -> None:
+    def refresh(cls, item: dict, *, input_id=None) -> None:
         """取得执行权后读取前一轮结算，不接受已解除的会话映射。"""
-        current = cls._read()["owners"].get(item["owner"])
-        if not current or current["local_id"] != item["local_id"]:
+        data = cls._read()
+        current = data["owners"].get(item["owner"])
+        if not current or any(
+            current[key] != item[key] for key in ("local_id", "remote_id", "revision")
+        ):
             raise DshUnavailable("会话已新开或重置，请重新提问。")
+        if input_id and any(
+            (row.get("inflight") or row.get("unresolved_run") or {}).get("input_id")
+            == input_id
+            for row in [current, *data["archives"]]
+            if row.get("owner") == item["owner"]
+        ):
+            raise DshUnavailable("这条输入已有运行收据，未重复提交。")
         item.update(current)
 
     @classmethod
     def update(cls, item: dict, **changes) -> dict:
         def edit(data):
             current = data["owners"].get(item["owner"])
-            if (
-                current is None
-                or current["local_id"] != item["local_id"]
-                or current["revision"] != item["revision"]
-            ):
+            if current != item:
                 raise DshUnavailable("DSH 会话已变化，本次操作已放弃。")
             current.update(changes)
             return dict(current)
@@ -352,17 +413,18 @@ class DshSessions:
         return updated
 
     @classmethod
-    def rotate_remote(cls, item: dict) -> None:
+    def rotate_remote(cls, item: dict, reason: str) -> None:
         def edit(data):
             current = data["owners"].get(item["owner"])
-            if (
-                not current
-                or current["local_id"] != item["local_id"]
-                or current["revision"] != item["revision"]
-            ):
+            if current != item or current.get("origin") != "managed":
                 raise DshUnavailable("会话已变化")
             data["archives"].append(
-                {**current, "archive_reason": current.get("quarantined") or "new"}
+                {
+                    **current,
+                    "archive_reason": reason,
+                    "unresolved_run": current.get("inflight"),
+                    "inflight": None,
+                }
             )
             current.update(
                 remote_id="zx-" + uuid.uuid4().hex,
@@ -370,13 +432,18 @@ class DshSessions:
                 created=False,
                 inflight=None,
                 quarantined=None,
+                delivery_note=None,
+                applied_persona=None,
+                model=None,
+                cwd=None,
+                plan=None,
             )
             return dict(current)
 
         item.update(cls._mutate(edit))
 
     @classmethod
-    def reset(cls, session_id: str) -> None:
+    def reset(cls, session_id: str, *, previous: dict | None = None) -> None:
         """解除当前映射并保留归属记录；调用方须先等待运行停止。"""
         if not session_id.startswith("ai_chat:dsh:"):
             return
@@ -384,6 +451,8 @@ class DshSessions:
         def edit(data):
             for owner, item in list(data["owners"].items()):
                 if item["local_id"] == session_id:
+                    if previous is not None and item != previous:
+                        raise DshUnavailable("会话记录已变化，未解除关联。")
                     if item.get("inflight"):
                         raise DshUnavailable("运行停止尚未确认，不能重置会话。")
                     data["archives"].append({**item, "archive_reason": "unmapped"})
@@ -418,6 +487,16 @@ class _Turn:
     pending: set = field(default_factory=set)
     bridge_tasks: set = field(default_factory=set)
     event_ids: set[str] = field(default_factory=set)
+
+    def mark_submission(self, phase: Literal["unknown", "accepted"]):
+        """在发送边界持久化本轮提交状态，通信中断时不覆盖旧收据。"""
+        flight = self.binding.get("inflight") or {}
+        if flight.get("run_id") != self.context.run.run_id:
+            raise DshUnavailable("运行归属已变化，未提交输入。")
+        DshSessions.for_binding(self.binding).update(
+            self.binding, inflight={**flight, "submission": phase}
+        )
+        self.context.run.operations.setdefault("dsh", {})["submission"] = phase
 
 
 class DshRuntime:
@@ -639,6 +718,7 @@ class DshRuntime:
 
     @classmethod
     async def start(cls, context, binding, settings, approve, ask) -> _Turn:
+        from .dsh_control import DshControl, Foreground
         from .dsh_tools import bridge_lease
 
         if settings.transport != binding.get("transport", "desktop"):
@@ -651,10 +731,6 @@ class DshRuntime:
             raise DshUnavailable(
                 "旧 SDK 配置不能连接桌面，请更新 desktop_url 与 home。"
             )
-        if not binding.get("native") and (
-            binding.get("inflight") or binding.get("quarantined")
-        ):
-            DshSessions.rotate_remote(binding)
         client = await DesktopClient.open(settings.desktop_url, settings.home)
         turn = _Turn(context, binding, client, approve, ask)
         cls._turns[context.run.run_id] = turn
@@ -662,6 +738,26 @@ class DshRuntime:
             if client.version != "0.2.2-rc.3":
                 raise DshUnavailable("当前桌面版本不在已核验协议范围内，已阻止执行。")
             guard_revision = hashlib.sha256(INTEGRATION.read_bytes()).hexdigest()
+            context.run.operations.setdefault("dsh", {})["submission"] = "not_submitted"
+            DshControl.verify_home(binding, client)
+            if binding.get("desktop_home") not in {None, str(client.home)}:
+                raise DshUnavailable("桌面数据目录已变化，未切换。")
+
+            async def recover(reason):
+                if binding.get("desktop_home") != str(client.home):
+                    raise DshUnavailable("无法确认原桌面数据目录，未自动更换。")
+                await DshControl.recover(context, binding, client, reason)
+
+            if binding.get("inflight") or binding.get("quarantined"):
+                await recover(binding.get("quarantined") or "previous_run_unknown")
+            elif binding.get("created"):
+                activity = await Foreground.observe(
+                    client, "desktop", binding["remote_id"]
+                )
+                if activity is Foreground.MISSING:
+                    await recover("missing")
+                elif activity is Foreground.BUSY:
+                    raise DshUnavailable("当前会话正在执行或等待输入。")
             if binding.get("native"):
                 await cls._start_native(turn, settings, guard_revision)
                 return turn
@@ -673,7 +769,7 @@ class DshRuntime:
                     or binding.get("guard_revision") != guard_revision
                 )
             ):
-                DshSessions.rotate_remote(binding)
+                await recover("guard_changed")
             presets = await client.rpc("agentPresets/list", args={})
             entries = (
                 presets if isinstance(presets, list) else presets.get("presets", [])
@@ -690,7 +786,7 @@ class DshRuntime:
                 and not binding.get("inherited")
                 and binding.get("preset_revision") != preset_revision
             ):
-                DshSessions.rotate_remote(binding)
+                await recover("preset_changed")
             from nonebot import get_driver
 
             port = int(get_driver().config.port)
@@ -701,12 +797,10 @@ class DshRuntime:
             )
             group = None
             if binding["mode"] == "chat" and not binding.get("inherited"):
-                from .dsh_control import DshControl
-
                 group = await DshControl.chat_workspace(client)
                 workspace = Path(group["path"])
                 if binding["created"] and binding.get("cwd") != str(workspace):
-                    DshSessions.rotate_remote(binding)
+                    raise DshUnavailable("普通聊天工作区已变化，未自动更换。")
             workspace.mkdir(parents=True, exist_ok=True)
             leases = DSH_PATH / "leases"
             leases.mkdir(parents=True, exist_ok=True)
@@ -746,6 +840,8 @@ class DshRuntime:
                     binding,
                     created=True,
                     desktop_identity=list(client.identity),
+                    desktop_home=str(client.home),
+                    home_identity=DshControl.home_identity(client),
                     guard_revision=guard_revision,
                     preset_revision=preset_revision,
                     cwd=str(workspace),
@@ -754,11 +850,8 @@ class DshRuntime:
                 "session/state", {"sessionId": binding["remote_id"]}
             )
             if (
-                (not state.get("active") and not binding.get("inherited"))
-                or state.get("running")
-                or state.get("pendingInput")
-                or state.get("queue")
-            ):
+                state.get("active") is not True and not binding.get("inherited")
+            ) or Foreground.read("desktop", state) is not Foreground.IDLE:
                 raise DshUnavailable("该 DSH 会话仍有未结束的执行，未提交新输入。")
             DshSessions.update(
                 binding,
@@ -766,21 +859,13 @@ class DshRuntime:
                     "boot": BOOT_ID,
                     "run_id": context.run.run_id,
                     "request_id": turn.request_id,
+                    "submission": "not_submitted",
+                    "input_id": context.state.get("_dsh_input_id"),
                 },
             )
             return turn
         except BaseException:
-            try:
-                DshSessions.update(binding, quarantined="initialization_unconfirmed")
-            except Exception as exc:
-                context.run.operations.setdefault("dsh", {})["mapping_error"] = type(
-                    exc
-                ).__name__
-                logger.warning(
-                    "DSH 初始化结果未能写入映射，保留原记录等待核验。", LOG_NAME
-                )
-            finally:
-                await cls.release(turn)
+            await cls.release(turn)
             raise
 
     @classmethod
@@ -788,7 +873,7 @@ class DshRuntime:
         """接入原生 Agent，保留其模型、思考等级、计划模式及执行权限。"""
         from nonebot import get_driver
 
-        from .dsh_control import DshControl
+        from .dsh_control import DshControl, Foreground
         from .dsh_tools import bridge_lease
 
         binding, client, context = turn.binding, turn.client, turn.context
@@ -812,7 +897,13 @@ class DshRuntime:
             )
             if created.get("sessionId") != binding["remote_id"]:
                 raise DshUnavailable("桌面返回了不同会话，未提交问题。")
-            DshSessions.update(binding, created=True, cwd=str(workspace.resolve()))
+            DshSessions.update(
+                binding,
+                created=True,
+                desktop_home=str(client.home),
+                home_identity=DshControl.home_identity(client),
+                cwd=str(workspace.resolve()),
+            )
         observed = await client.rpc(
             "session/projections", {"sessionId": binding["remote_id"]}
         )
@@ -828,7 +919,7 @@ class DshRuntime:
         if info["subagent"]:
             raise DshUnavailable("子代理会话不能作为独立 QQ 会话接入。")
         state = await client.rpc("session/state", {"sessionId": binding["remote_id"]})
-        if state.get("running") or state.get("queue") or state.get("pendingInput"):
+        if Foreground.read("desktop", state) is not Foreground.IDLE:
             raise DshUnavailable("桌面会话仍有任务或等待输入，未抢占原任务。")
         await client.rpc(
             "workspace/unarchiveSession", {"sessionId": binding["remote_id"]}
@@ -858,6 +949,8 @@ class DshRuntime:
                 "boot": BOOT_ID,
                 "run_id": context.run.run_id,
                 "request_id": turn.request_id,
+                "submission": "not_submitted",
+                "input_id": context.state.get("_dsh_input_id"),
             },
         )
         turn.proof = {
@@ -866,6 +959,7 @@ class DshRuntime:
             "preset": info["preset"],
         }
         context.run.operations["dsh"] = {
+            **context.run.operations.get("dsh", {}),
             "session_id": binding["remote_id"],
             "mode": "native",
             "guard": "desktop_permissions",
@@ -970,6 +1064,7 @@ class DshRuntime:
                             task.result()
                     if ready and client_id and not submitted:
                         submitted = True
+                        turn.mark_submission("unknown")
                         receipt = await turn.client.rpc(
                             "session/prompt",
                             {
@@ -981,6 +1076,7 @@ class DshRuntime:
                         )
                         if not receipt or receipt.get("accepted") is not True:
                             raise RunInterrupted("DSH 输入接收")
+                        turn.mark_submission("accepted")
 
         try:
             return await collect()
@@ -1192,6 +1288,8 @@ class DshRuntime:
 
     @classmethod
     async def interrupt(cls, turn):
+        from .dsh_control import Foreground
+
         turn.revoked = True
         for task in tuple(turn.bridge_tasks):
             task.cancel()
@@ -1218,13 +1316,14 @@ class DshRuntime:
                     ),
                     max(0.001, remaining),
                 )
+                activity = Foreground.read(
+                    turn.binding.get("transport", "desktop"), state
+                )
                 turn.stop_confirmation = (
                     "unknown"
-                    if not state.get("loaded", turn.binding.get("transport") != "sdk")
+                    if activity is Foreground.UNLOADED
                     else "foreground_idle"
-                    if not state.get("running")
-                    and not state.get("queue")
-                    and not state.get("pendingInput")
+                    if activity is Foreground.IDLE
                     else "desktop_continues"
                 )
             else:
@@ -1239,23 +1338,24 @@ class DshRuntime:
         turn.context.run.operations.setdefault("dsh", {})["stop"] = (
             turn.stop_confirmation
         )
+        info = turn.context.run.operations["dsh"]
+        info["result_uncertain"] = info.get("submission") == "unknown" or (
+            info.get("submission") == "accepted" and not turn.terminal_received
+        )
         try:
             DshSessions.for_binding(turn.binding).update(
                 turn.binding,
                 quarantined="interrupted",
                 inflight=None
-                if turn.stop_confirmation
+                if not info["result_uncertain"]
+                and turn.stop_confirmation
                 in {
                     "confirmed",
                     "foreground_confirmed",
                     "foreground_idle",
                     "target_removed",
                 }
-                else {
-                    "boot": BOOT_ID,
-                    "run_id": turn.context.run.run_id,
-                    "request_id": turn.request_id,
-                },
+                else turn.binding.get("inflight"),
             )
         except Exception as exc:
             turn.context.run.operations["dsh"]["mapping_error"] = type(exc).__name__
@@ -1305,9 +1405,16 @@ class DshRuntime:
             await turn.client.close()
             return
         try:
-            (DSH_PATH / "leases" / (turn.binding["remote_id"] + ".json")).unlink(
-                missing_ok=True
-            )
+            path = DSH_PATH / "leases" / (turn.binding["remote_id"] + ".json")
+            if path.exists():
+
+                def clear_owned(lease):
+                    if lease.get("runId") == turn.context.run.run_id:
+                        path.unlink(missing_ok=True)
+
+                mutate_json_locked(
+                    path, {}, clear_owned, write_if=lambda _: False, strict=True
+                )
         except OSError:
             turn.context.run.operations.setdefault("dsh", {})["cleanup_pending"] = True
             logger.warning("DSH 运行已撤权，授权文件清理待重试。", LOG_NAME)

@@ -210,7 +210,9 @@ async def _run_dsh(
             if binding is None:
                 raise LLMException("DSH 会话没有在准入时绑定。")
             try:
-                DshSessions.for_binding(binding).refresh(binding)
+                DshSessions.for_binding(binding).refresh(
+                    binding, input_id=context.state.get("_dsh_input_id")
+                )
                 prepared, selected = parts, persona
                 if prepare_run:
                     prepared, selected = await prepare_run()
@@ -290,7 +292,6 @@ async def _run_dsh(
                     or dsh_settings() != settings
                 ):
                     raise LLMException("处理附件期间会话或权限已变化，请重新提问。")
-                DshSessions.for_binding(binding).update(binding, persona=persona_key)
                 backend = chat_backend(AIChatManager.get_agent(selected).memory_config)
                 history = await backend.get_messages(session_id) if backend else []
                 remote_id = binding["remote_id"]
@@ -480,7 +481,14 @@ async def _run_dsh(
                     binding,
                     inflight=None,
                     quarantined=None
-                    if clean or binding.get("native")
+                    if clean
+                    or (
+                        binding.get("native")
+                        and suppressed
+                        and delivery.get("status") == "sent"
+                        and not delivery.get("uncertain")
+                        and not delivery.get("operation_uncertain")
+                    )
                     else "delivery_or_filter_changed",
                     delivery_uncertain=bool(delivery.get("uncertain"))
                     or delivery.get("status") != "sent",
@@ -488,6 +496,7 @@ async def _run_dsh(
                     if suppressed and binding.get("native")
                     else None,
                     applied_persona=stamp,
+                    persona=persona_key,
                 )
                 return result
             except BaseException:

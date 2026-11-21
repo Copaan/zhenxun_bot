@@ -20,8 +20,8 @@ from ._agent import record_run, start_run
 from ._data_source import MODULE
 from ._reply import DeliveryResult, delivery_target, parse_silent
 
-FAILED_NOTICE = "这次回复没有完成，请稍后再试。"
-"""回复失败且人设没有设置失败提示时的提示语"""
+FAILED_NOTICE = "本轮没有可交付的回复，请查看运行详情。"
+"""无具体失败原因时在管理端投递报告中显示的摘要。"""
 AfterSettle = Callable[[dict, BaseException | None], Awaitable[None]]
 """结算时在写运行记录前执行的附加步骤，参数为投递报告与异常"""
 
@@ -136,6 +136,13 @@ class ChatTurn:
         if error is not None or result is None:
             self.reply_kind = "failure"
             return None
+        if result.outcome not in {None, "completed"}:
+            self.reply_kind = "failure"
+            return None
+        record = run.operations.get("deliveries", {}).get(self.target, {})
+        if record.get("uncertain") or record.get("tool_delivery_failure"):
+            self.reply_kind = "failure"
+            return None
         text = str(result.output or "")
         issue = self.context.state.get("_chat_reply_issue")
         if self.context.run.reply_control and self.context.run.reply_control.closed:
@@ -217,6 +224,8 @@ class ChatTurn:
                 for item in operations.get("dsh_tools", {}).values()
             )
             or operations.get("dsh", {}).get("stop") == "unknown"
+            or operations.get("dsh", {}).get("submission") == "unknown"
+            or operations.get("dsh", {}).get("result_uncertain") is True
         )
         report["tool_conflicts"] = self.context.state.get("_tool_conflicts", [])
         report["contributors"] = sorted(
@@ -235,8 +244,12 @@ class ChatTurn:
                 "closed": control.closed,
                 "input_segment": control.epoch,
             }
-        if self.reply_kind == "failure" and self.result:
-            report["reply_issue"] = self.result.reason
+        if self.reply_kind == "failure":
+            report["reply_issue"] = (
+                (self.result.reason if self.result else None)
+                or self.context.run.user_notice
+                or FAILED_NOTICE
+            )
         report["effective_reply"] = bool(
             self.tool_texts
             or (
@@ -254,6 +267,7 @@ class ChatTurn:
             and report["effective_reply"]
             and report["status"] == "sent"
             and not report["uncertain"]
+            and not report["operation_uncertain"]
         )
         return report
 
@@ -265,9 +279,7 @@ class ChatTurn:
         setting: AIChatGroup | None,
         persona: AIPersona | None,
     ) -> None:
-        """投递本轮回复：失败时提示用户；主动插话遇到排队中的定向请求时放弃；
-        定向回复为空（不含模型选择沉默）时给出兜底文本；已由发送工具发出的内容不重复
-        发送
+        """投递正常回复与业务拒绝；系统故障只进入运行记录。
 
         参数:
             value: 运行结果，失败时为空
@@ -276,11 +288,7 @@ class ChatTurn:
             setting: 群聊设置
             persona: 人设
         """
-        from zhenxun.services.ai.core.exceptions import (
-            InterventionHandledException,
-            LLMException,
-            RunInterrupted,
-        )
+        from zhenxun.services.ai.core.exceptions import LLMException
 
         from ._data_source import AIChatManager
         from ._reply import send_reply
@@ -290,7 +298,6 @@ class ChatTurn:
         context, delivery = self.context, self.delivery
         group_id = context.get_group_id()
         directed = self.source != "interject"
-        custom = persona.error_message if persona else None
         if not isinstance(error, asyncio.CancelledError):
             if check := context.state.get("_chat_delivery_check"):
                 await check()
@@ -299,53 +306,26 @@ class ChatTurn:
             self.reply_kind = "tool_reply"
             delivery.status = "skipped"
             return
-        if not directed and (
-            error is not None
-            or record.get("tool_delivery_failure")
-            or record.get("uncertain")
-            or (value and value.outcome not in {None, "completed"})
-        ):
-            self.reply_kind = "failure"
-            delivery.status = "failed" if record.get("failed") else "skipped"
-            return
-        if record.get("tool_delivery_failure") and not isinstance(
-            error, asyncio.CancelledError
-        ):
-            self.reply_kind = "tool_reply" if self.tool_texts else "failure"
-            await send_reply(
-                record["tool_delivery_failure"],
-                group_id,
-                result=delivery,
-                context=context,
-            )
-            return
         if error is not None:
             self.resolve_reply(value, error)
-            if isinstance(error, RunInterrupted):
-                if not self.report(error).get(
-                    "uncertain"
-                ) and not context.run.operations.get("notice_sent"):
-                    context.run.operations["notice_sent"] = True
-                    await send_reply(
-                        "本次执行因通信异常中断，未自动重试。",
-                        group_id,
-                        result=delivery,
-                        context=context,
-                    )
-                return
-            interrupted = isinstance(
-                error, asyncio.CancelledError | InterventionHandledException
-            )
-            if not interrupted and directed and not self.tool_texts:
-                notice = context.run.user_notice or custom or FAILED_NOTICE
-                if (
-                    isinstance(error, LLMException)
-                    and (error.details or {}).get("code") == "follow_up_unconsumed"
-                ):
-                    notice = "上一轮已结束，追加消息未被处理，请重新发送。"
-                await send_reply(notice, group_id, result=delivery, context=context)
-            elif delivery.status == "pending":
-                delivery.status = "skipped" if interrupted else "failed"
+            if (
+                directed
+                and isinstance(error, LLMException)
+                and (error.details or {}).get("code") == "quota_denied"
+            ):
+                await send_reply(
+                    error.message, group_id, result=delivery, context=context
+                )
+            else:
+                delivery.status = "failed"
+            return
+        if (
+            record.get("tool_delivery_failure")
+            or record.get("uncertain")
+            or value is None
+        ):
+            self.reply_kind = "failure"
+            delivery.status = "failed"
             return
         if value.stopped:
             delivery.status = "skipped"
@@ -358,23 +338,13 @@ class ChatTurn:
 
             await send_export(context, payload, delivery)
             self.reply_kind = "answer" if delivery.status == "sent" else "failure"
-            if delivery.status == "failed":
-                await send_reply(
-                    "附件未发送：" + (delivery.error or "平台拒绝了上传"),
-                    group_id,
-                    result=delivery,
-                    context=context,
-                )
             return
         if context.run.operations.get("attachment", {}).get("name"):
             return
         reply = self.resolve_reply(value)
-        if self.reply_kind == "failure" and directed and not self.report()["uncertain"]:
-            reply = (
-                context.run.user_notice
-                or custom
-                or "这次没能整理出有效回复，请再试一次。"
-            )
+        if self.reply_kind == "failure":
+            delivery.status = "failed"
+            return
         sticker_id = None
         if reply:
             reply, sticker_id = split_sticker(reply)

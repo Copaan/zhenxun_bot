@@ -349,8 +349,6 @@ async def reset_session(
         from zhenxun.builtin_plugins.ai_chat._runner import dsh_settings
         from zhenxun.services.ai.core.exceptions import RunInterrupted
         from zhenxun.services.ai.run.dsh import DshSessions, SdkSessions
-        from zhenxun.services.ai.run.dsh_desktop import DesktopClient
-        from zhenxun.services.ai.run.session import session_manager
 
         item = next(
             (
@@ -367,56 +365,40 @@ async def reset_session(
             raise HTTPException(409, detail={"code": "dsh_session_changed"})
         if item.get("mode") == "agent" and expected_revision is None:
             raise HTTPException(409, detail={"message": "请先刷新个人 Agent 会话。"})
-        if item.get("transport") == "sdk":
-            from zhenxun.services.ai.run.dsh_control import DshControl
-            from zhenxun.services.ai.run.dsh_desktop import DshUnavailable
+        from zhenxun.services.ai.run.dsh_control import DshControl
+        from zhenxun.services.ai.run.dsh_desktop import DshUnavailable
 
-            settings = dsh_settings()
-            if settings.transport != "sdk":
-                raise HTTPException(
-                    409, detail={"message": "请先选择 SDK 模式再操作此会话。"}
-                )
-            try:
-                await DshControl.release(settings, item, archive=action == "archive")
-                if action == "reset":
-                    await AIChatManager.reset(session_id)
-            except DshUnavailable as error:
-                raise HTTPException(409, detail={"message": str(error)}) from error
-            return Result.ok(
-                {"archived": False, "history_deleted": False},
-                info="已解除 SDK 关联；远端历史保留，未执行远端归档或删除。",
-            )
-        session_manager.invalidate(session_id)
-        await AIChatManager.stop(session_id)
-        DshSessions.refresh(item)
-        if item.get("inflight"):
-            raise HTTPException(409, detail={"code": "dsh_stop_unconfirmed"})
-        archived = False
-        client = None
+        settings = dsh_settings()
+        if settings.transport != item.get("transport", "desktop"):
+            raise HTTPException(409, detail={"message": "执行端已切换，请刷新会话。"})
         try:
-            settings = dsh_settings()
-            client = await DesktopClient.open(settings.desktop_url, settings.home)
-            if item["created"] and (not item.get("native") or action == "archive"):
-                await client.rpc(
-                    "workspace/archiveSession", {"sessionId": item["remote_id"]}
+            if action == "new":
+                await DshControl.choose(
+                    None,
+                    settings,
+                    None,
+                    item["revision"],
+                    mode=item["mode"],
+                    previous=item,
                 )
-                archived = True
-        except (Exception, RunInterrupted):
-            pass
-        finally:
-            if client:
-                await client.close()
-        if action == "reset":
-            await AIChatManager.reset(session_id)
-        else:
-            DshSessions.reset(session_id)
+                return Result.ok(
+                    {"archived": False, "history_deleted": False},
+                    info="已选择新会话；旧历史保留，旧任务不会重跑。",
+                )
+            archive = settings.transport == "desktop" and (
+                action == "archive" or not item.get("native")
+            )
+            await DshControl.release(settings, item, archive=archive)
+            if action == "reset":
+                await AIChatManager.reset(session_id)
+        except (DshUnavailable, RunInterrupted) as exc:
+            raise HTTPException(409, detail={"message": str(exc)}) from exc
         return Result.ok(
-            {"archived": archived, "history_deleted": False},
-            info="已解除关联；原生 DSH 会话、历史和设置均保留。"
-            if item.get("native") and action != "archive"
-            else "已解除会话映射；桌面历史已归档但未删除。"
-            if archived
-            else "已解除会话映射；桌面归档暂未确认，原历史仍保留。",
+            {
+                "archived": bool(archive and item.get("created")),
+                "history_deleted": False,
+            },
+            info="已解除关联；原会话的远端历史保留。",
         )
     if session_id.startswith(CONSOLE_PREFIX):
         if action != "reset":

@@ -1,11 +1,197 @@
 """DSH 会话选择与工作区展示；不替换桌面 Agent 的模型或执行权限。"""
 
+from enum import Enum
 import re
 
-from zhenxun.services.ai.run.dsh_desktop import DesktopClient, DshUnavailable
+from zhenxun.services.ai.run.dsh_desktop import (
+    DesktopClient,
+    DesktopSessionMissing,
+    DshUnavailable,
+)
+
+
+class Foreground(Enum):
+    IDLE = "idle"
+    UNLOADED = "unloaded"
+    MISSING = "missing"
+    BUSY = "busy"
+
+    @classmethod
+    def read(cls, transport: str, data: dict):
+        """按执行端协议核验前台活动；未加载不代表旧操作已停止。"""
+        if not isinstance(data, dict) or type(data.get("running")) is not bool:
+            raise DshUnavailable("无法确认会话状态，请刷新后重试。")
+        if transport == "sdk":
+            if type(data.get("loaded")) is not bool:
+                raise DshUnavailable("无法确认 SDK 会话是否已加载。")
+            if not data["loaded"]:
+                if (
+                    data["running"]
+                    or data.get("confirmed") is not False
+                    or data.get("queue", []) != []
+                    or data.get("pendingInput", []) != []
+                ):
+                    raise DshUnavailable("SDK 前台状态不一致。")
+                return cls.UNLOADED
+            fields = ("queue", "pendingInput") if "pendingInput" in data else ("queue",)
+        elif transport == "desktop":
+            fields = ("queue", "pendingInput")
+        else:
+            raise DshUnavailable("未知的会话执行端。")
+        if any(not isinstance(data.get(key), list) for key in fields):
+            raise DshUnavailable("执行端未提供完整的队列状态。")
+        if data["running"] or any(data[key] for key in fields):
+            return cls.BUSY
+        return cls.IDLE
+
+    @classmethod
+    async def observe(cls, client, transport, remote_id):
+        args = {"sessionId": remote_id}
+        try:
+            return cls.read(transport, await client.rpc("session/state", args))
+        except DesktopSessionMissing:
+            if (
+                transport == "desktop"
+                and await client.rpc("session/projections", args) is None
+            ):
+                return cls.MISSING
+            raise
 
 
 class DshControl:
+    @classmethod
+    async def actions(cls, settings, item, client):
+        """按本地登记和远端前台状态给出管理操作，写入时仍需复核。"""
+        if client is None:
+            return "offline", "宿主不可达，请先连接", []
+        if not item:
+            return "new", "尚未建立会话", ["new", "select"]
+        flight = item.get("inflight")
+        stop = ["stop"] if flight else []
+        try:
+            cls.check_local(item)
+        except DshUnavailable:
+            return "local_active", "有运行或排队输入", stop
+        cls.verify_home(item, client)
+        if item.get("created") or flight:
+            activity = await Foreground.observe(
+                client, settings.transport, item["remote_id"]
+            )
+            if activity is Foreground.BUSY:
+                return "remote_busy", "正在执行或等待输入", stop
+            if flight:
+                return "previous_unknown", "旧结果待核验，可新建", ["new", *stop]
+            if activity is Foreground.MISSING:
+                return (
+                    "missing",
+                    "原会话不存在，可新建或选择其他会话",
+                    ["new", "select"],
+                )
+        return (
+            "idle",
+            "可切换会话" if item.get("quarantined") else "空闲",
+            ["new", "select", "reset", "archive"],
+        )
+
+    @classmethod
+    async def inspect(cls, settings, item, mode, *, clients=None):
+        from zhenxun.services.ai.core.exceptions import RunInterrupted
+
+        client = None
+        try:
+            key = mode if settings.transport == "sdk" else "desktop"
+            if clients is not None and key in clients:
+                client = clients[key]
+            else:
+                if clients is not None:
+                    clients[key] = None
+                client = await cls.client(settings, mode)
+                if clients is not None:
+                    clients[key] = client
+            return await cls.actions(settings, item, client)
+        except (
+            RunInterrupted,
+            DshUnavailable,
+            OSError,
+            ValueError,
+            TypeError,
+            KeyError,
+        ):
+            return "unverified", "状态未确认，请检查连接", []
+        finally:
+            if client and clients is None:
+                await client.close()
+
+    @staticmethod
+    def check_local(item, context=None):
+        """切换前检查会话中其他运行，包括已准入的排队请求。"""
+        from .session import session_manager
+
+        if item and any(
+            active is not context
+            and active.session_id == item["local_id"]
+            and task
+            and not task.done()
+            for active, task in session_manager.runs.values()
+        ):
+            raise DshUnavailable("当前会话仍有运行，请先停止或等待完成后切换。")
+
+    @staticmethod
+    def verify_home(item, client):
+        key = "sdk_home" if item.get("transport") == "sdk" else "desktop_home"
+        if item.get(key) and item[key] != str(client.home):
+            raise DshUnavailable("数据目录已变化，未操作原会话。")
+        if item.get("home_identity") and item[
+            "home_identity"
+        ] != DshControl.home_identity(client):
+            raise DshUnavailable("原会话数据目录身份不符，未操作。")
+
+    @staticmethod
+    def home_identity(client):
+        """识别当前宿主数据目录，不以相同路径代替目录身份。"""
+        stat = client.home.stat()
+        return [stat.st_dev, stat.st_ino] if stat.st_ino else None
+
+    @classmethod
+    async def recover(cls, context, binding, client, reason):
+        """仅在本轮提交之前轮换托管会话，旧运行的收据原样归档。"""
+        from .dsh import DshSessions
+
+        records = DshSessions.for_binding(binding)
+        cls.verify_home(binding, client)
+        flight = binding.get("inflight") or {}
+        info = context.run.operations.setdefault("dsh", {})
+        if (
+            binding.get("origin") != "managed"
+            or not binding.get("home_identity")
+            or binding["owner"] != records.owner(context, binding["mode"])
+            or flight.get("run_id") == context.run.run_id
+            or info.get("submission") != "not_submitted"
+            or info.get("recovered")
+            or (
+                context.run.operations.get("deliveries")
+                or context.run.operations.get("dsh_tools")
+            )
+        ):
+            raise DshUnavailable("无法自动更换当前会话，请在管理页处理。")
+        cls.check_local(binding, context)
+        activity = await Foreground.observe(
+            client, binding["transport"], binding["remote_id"]
+        )
+        if activity is Foreground.BUSY or (
+            reason == "missing"
+            and binding["transport"] == "desktop"
+            and activity is not Foreground.MISSING
+        ):
+            raise DshUnavailable("旧会话仍在运行或等待输入，未切换。")
+        check = context.state["_dsh_authorization_check"]
+        if await check() != binding["mode"]:
+            raise DshUnavailable("本轮权限已变化，未切换。")
+        context.run.cancellation_token.raise_if_cancelled()
+        cls.check_local(binding, context)
+        records.rotate_remote(binding, reason)
+        info["recovered"] = reason
+
     @staticmethod
     async def client(settings, mode="agent"):
         if settings.transport == "sdk":
@@ -104,48 +290,30 @@ class DshControl:
         expected_revision: int | None,
         *,
         mode: str = "agent",
+        previous: dict | None = None,
     ):
         """为指定超管显式新开或接入原会话；不复制历史、不更改原模型、模式或目录。"""
         from .dsh import DshSessions
         from .session import session_manager
 
         records = DshSessions.for_settings(settings)
-        owner = records.owner_key(caller, mode)
+        owner = (
+            previous["owner"]
+            if caller is None and previous
+            else records.owner_key(caller, mode)
+        )
         before = records._read()["owners"].get(owner)
-        if before and any(
-            active.session_id == before["local_id"] and task and not task.done()
-            for active, task in session_manager.runs.values()
-        ):
-            raise DshUnavailable("当前会话仍有运行，请先停止或等待完成后切换。")
-        if before and before.get("inflight"):
-            client = await cls.client(settings, mode)
-            try:
-                state = await client.rpc(
-                    "session/state", {"sessionId": before["remote_id"]}
-                )
-                if (
-                    state.get("running")
-                    or state.get("queue")
-                    or state.get("pendingInput")
-                ):
-                    raise DshUnavailable("原会话仍有桌面任务，未切换或中断原任务。")
-                if settings.transport == "sdk" and not state.get("loaded"):
-                    if remote_id is not None:
-                        raise DshUnavailable(
-                            "SDK 原运行停止不可确认；请先显式新建会话，"
-                            "旧结果保留待核验。"
-                        )
-                    records.update(
-                        before,
-                        unresolved_run=before["inflight"],
-                        quarantined="previous_run_unknown",
-                    )
-                records.update(before, inflight=None)
-            finally:
-                await client.close()
+        if previous is not None and before != previous:
+            raise DshUnavailable("会话归属或运行收据已变化，请刷新。")
         revision = before["revision"] if before else 0
         if expected_revision is not None and revision != expected_revision:
             raise DshUnavailable("当前会话已变化，请刷新后重新选择。")
+
+        cls.check_local(before)
+        action = "select" if remote_id else "new"
+        _, label, allowed = await cls.inspect(settings, before, mode)
+        if action not in allowed:
+            raise DshUnavailable(label)
         selected = None
         if remote_id:
             matches = [
@@ -158,15 +326,11 @@ class DshControl:
             selected = matches[0]
             if selected["running"] or selected.get("quarantined"):
                 raise DshUnavailable("目标会话正在执行，未接管或中断桌面任务。")
-            if mode == "chat" and selected.get("created"):
+            if mode == "agent" or selected.get("created"):
                 client = await cls.client(settings, mode)
                 try:
                     state = await client.rpc("session/state", {"sessionId": remote_id})
-                    if (
-                        state.get("running")
-                        or state.get("queue")
-                        or state.get("pendingInput")
-                    ):
+                    if Foreground.read(settings.transport, state) is Foreground.BUSY:
                         raise DshUnavailable("目标聊天仍有执行，不能切换。")
                 finally:
                     await client.close()
@@ -174,45 +338,45 @@ class DshControl:
                 selected["native"] = False
             else:
                 selected["native"] = True
-        item = records.switch(caller, selected, revision, mode)
+        if remote_id:
+            _, label, allowed = await cls.inspect(settings, before, mode)
+            if action not in allowed:
+                raise DshUnavailable(label)
+        cls.check_local(before)
+        item = records.switch(caller, selected, revision, mode, previous=before)
         if before:
             session_manager.invalidate(before["local_id"])
         return item
 
     @classmethod
     async def release(cls, settings, item, *, archive=False):
-        """停止前台后解除关联，远端归档与永久删除明确区分。"""
-        from zhenxun.builtin_plugins.ai_chat._data_source import AIChatManager
-
+        """核验前台空闲后解除关联，不取消已有任务。"""
         from .dsh import DshSessions
         from .session import session_manager
 
         records = DshSessions.for_binding(item)
-        session_manager.invalidate(item["local_id"])
-        await AIChatManager.stop(item["local_id"])
-        records.refresh(item)
+        if records._read()["owners"].get(item["owner"]) != item:
+            raise DshUnavailable("会话或运行已变化，未解除关联。")
+        cls.check_local(item)
         if not item.get("created") and not item.get("inflight"):
-            records.reset(item["local_id"])
+            records.reset(item["local_id"], previous=item)
+            session_manager.invalidate(item["local_id"])
             return
         client = await cls.client(settings, item["mode"])
         try:
+            cls.verify_home(item, client)
             state = await client.rpc("session/state", {"sessionId": item["remote_id"]})
-            if (
-                state.get("running")
-                or state.get("queue")
-                or state.get("pendingInput")
-                or (
-                    item.get("inflight")
-                    and not state.get("loaded", settings.transport == "desktop")
-                )
-            ):
+            activity = Foreground.read(settings.transport, state)
+            if activity is Foreground.BUSY or item.get("inflight"):
                 raise DshUnavailable("远端运行尚未确认停止，未解除关联。")
+            cls.check_local(item)
             if archive and settings.transport == "desktop":
                 await client.rpc(
                     "workspace/archiveSession", {"sessionId": item["remote_id"]}
                 )
-            records.update(item, inflight=None)
-            records.reset(item["local_id"])
+            cls.check_local(item)
+            records.reset(item["local_id"], previous=item)
+            session_manager.invalidate(item["local_id"])
         finally:
             await client.close()
 
@@ -248,6 +412,7 @@ class DshControl:
             if run_id and inflight.get("run_id") != run_id:
                 return {**result, "reason": "运行已变化，未停止后续任务"}
             client = await cls.client(settings, item["mode"])
+            cls.verify_home(item, client)
             records.refresh(item)
             if receipt(item) != expected:
                 return {**result, "reason": "连接期间运行已变化，未执行停止"}
@@ -255,16 +420,13 @@ class DshControl:
                 state = await client.rpc(
                     "session/state", {"sessionId": item["remote_id"]}
                 )
-                if (
-                    state.get("running")
-                    or state.get("queue")
-                    or state.get("pendingInput")
-                ):
+                activity = Foreground.read(settings.transport, state)
+                if activity is Foreground.BUSY:
                     return {**result, "reason": "存在非本次转发的原生活动，未中断"}
                 return {
                     **result,
                     "state": "foreground_idle"
-                    if state.get("loaded", settings.transport == "desktop")
+                    if activity is Foreground.IDLE
                     else "unknown",
                 }
             if settings.transport == "sdk":
@@ -287,7 +449,13 @@ class DshControl:
             }:
                 records.refresh(item)
                 if receipt(item) == expected:
-                    records.update(item, inflight=None, stop=result["state"])
+                    records.update(
+                        item,
+                        inflight=inflight
+                        if inflight.get("submission") == "unknown"
+                        else None,
+                        stop=result["state"],
+                    )
             return result
         except asyncio.CancelledError:
             raise

@@ -21,7 +21,13 @@ import yaml
 
 LIMIT = 8 * 1024 * 1024
 SDK_API_BASE = "https://api.deepseek.com/anthropic"
-SDK_CONNECTION_REVISION = 9
+SDK_CONNECTION_REVISION = 10
+
+
+class RpcRejected(ValueError):
+    """SDK 对匹配的 JSON-RPC 请求返回了明确错误。"""
+
+
 SHELL_TIMEOUT = {"timeoutMs": 300_000, "maxTimeoutMs": 1_800_000}
 
 
@@ -295,7 +301,7 @@ class Worker:
                         if "error" in value:
                             self.last_error = value["error"]
                             future.set_exception(
-                                ValueError("SDK 拒绝请求；未自动重复提交。")
+                                RpcRejected("SDK 拒绝请求；未自动重复提交。")
                             )
                         else:
                             future.set_result(value.get("result") or {})
@@ -414,8 +420,7 @@ class Worker:
                     },
                 )
             if params.get("inherited") and session_id not in self.loaded:
-                await self.rpc("session/resume", {"sessionId": session_id})
-                self.loaded.add(session_id)
+                raise ValueError("会话尚未完成恢复，未提交输入。")
             if params.get("model"):
                 await self.control(
                     "prepare", {"sessionId": session_id, "model": params["model"]}
@@ -590,6 +595,25 @@ class Host:
             raise ValueError("此 SDK 工具组合尚未启动。")
         if method == "prompt":
             return await worker.prompt(params)
+        if method == "resume":
+            async with worker.lock:
+                ident = params["session_id"]
+                args = {"sessionId": ident}
+                if ident not in worker.loaded:
+                    if mode == "chat":
+                        await worker.control(
+                            "chatSearch",
+                            {**args, "enabled": params.get("search") is True},
+                        )
+                    try:
+                        await worker.rpc("session/resume", args)
+                    except RpcRejected:
+                        state = await worker.control("historyState", args)
+                        if state.get("history") not in {"missing", "unreadable"}:
+                            raise
+                        return {"session_id": ident, "history": state["history"]}
+                    worker.loaded.add(ident)
+                return {"session_id": ident, "history": "ready"}
         if method == "poll":
             return await worker.poll(params)
         if method in {"run_status", "stop_run"}:
@@ -604,7 +628,7 @@ class Host:
             state = await worker.control("inspect", args)
             if method == "run_status":
                 return state
-            if not state.get("known"):
+            if state.get("known") is not True:
                 return {"state": "unknown", "reason": "无法在当前执行端确认原输入"}
             stopped = await worker.control("cancel", args)
             outcome = (
@@ -613,7 +637,7 @@ class Host:
                     if stopped.get("reason") == "another_activity"
                     else "foreground_confirmed"
                 )
-                if stopped.get("confirmed")
+                if stopped.get("confirmed") is True
                 else "unknown"
             )
             return {

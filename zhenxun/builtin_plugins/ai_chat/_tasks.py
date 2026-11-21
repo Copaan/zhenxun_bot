@@ -14,7 +14,11 @@ from pydantic import BaseModel
 from zhenxun.configs.config import Config
 from zhenxun.models.ai_chat_group import AIChatGroup
 from zhenxun.models.scheduled_job import ScheduledJob
-from zhenxun.services.ai.core.exceptions import LLMException
+from zhenxun.services.ai.core.exceptions import (
+    ControlFlowExit,
+    LLMException,
+    RunInterrupted,
+)
 from zhenxun.services.ai.run.context import CallerIdentity, RunContext, ScheduledDeps
 from zhenxun.services.ai.tools.core.decorators import tool
 from zhenxun.services.ai.tools.core.toolkit import BaseToolkit
@@ -607,33 +611,40 @@ class AITasks:
                     before_run=before_run,
                     prepare_run=prepare_run,
                 )
-            report = turn.report()
-            if report.get("uncertain") or report.get("operation_uncertain"):
-                return TaskOutcome(status="UNKNOWN")
-            outcome = context.run.outcome
-            if outcome and outcome != "completed":
-                return TaskOutcome(
-                    status={
-                        "interrupted": "INTERRUPTED",
-                        "cancelled": "CANCELLED",
-                        "timeout": "TIMEOUT",
-                        "exhausted": "EXHAUSTED",
-                        "failed": "FAILURE",
-                    }.get(outcome, "UNKNOWN")
-                )
-            return TaskOutcome(
-                status="FAILURE"
-                if report["status"] in {"failed", "partial"}
-                else "SKIPPED"
-                if report["status"] == "skipped"
-                else "SUCCESS"
-            )
-        except asyncio.CancelledError as error:
+        except (Exception, asyncio.CancelledError, ControlFlowExit) as error:
             await turn.settle(error)
-            raise
-        except Exception as error:
-            await turn.settle(error)
-            return TaskOutcome(status="FAILURE")
+            return task_result(context, turn.report(error), error)
+        return task_result(context, turn.report())
+
+
+def task_result(context, report, error=None) -> TaskOutcome:
+    """由运行终态和已确认投递收据结算单个 AI 任务目标。"""
+    if (
+        report["uncertain"]
+        or report["operation_uncertain"]
+        or context.run.outcome == "unknown"
+    ):
+        return TaskOutcome(status="UNKNOWN")
+    if context.run.outcome == "timeout" or isinstance(error, asyncio.TimeoutError):
+        return TaskOutcome(status="TIMEOUT")
+    if context.run.outcome == "interrupted" or isinstance(error, RunInterrupted):
+        return TaskOutcome(status="INTERRUPTED")
+    if context.run.outcome == "cancelled" or isinstance(error, asyncio.CancelledError):
+        return TaskOutcome(status="CANCELLED")
+    if context.run.outcome == "exhausted":
+        return TaskOutcome(status="EXHAUSTED")
+    if (
+        error
+        or context.run.outcome == "failed"
+        or report["reply_kind"] == "failure"
+        or report["status"] in {"partial", "failed"}
+    ):
+        return TaskOutcome(status="FAILURE")
+    if context.run.outcome not in {None, "completed"}:
+        return TaskOutcome(status="UNKNOWN")
+    if report["status"] == "sent" and report["effective_reply"]:
+        return TaskOutcome(status="SUCCESS")
+    return TaskOutcome(status="SKIPPED" if report["status"] == "skipped" else "UNKNOWN")
 
 
 async def _run_task(bot: Bot, context: ScheduleContext, params: TaskParams):

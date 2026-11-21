@@ -756,11 +756,11 @@ class AIChatManager:
         """
         from ._memory import Memory
         from ._proactive import Proactive
-        from ._reply import quote_reply, send_reply
+        from ._reply import quote_reply
         from ._runner import run_dsh, select_dsh_session
         from ._safety import INPUT_NOTICE, Safety
         from ._sessions import Conversations
-        from ._turn import FAILED_NOTICE, ChatTurn
+        from ._turn import ChatTurn
 
         deps = NoneBotDeps(bot=bot, event=event)
         user_id = ContextUtils.extract_user_id(deps)
@@ -819,14 +819,25 @@ class AIChatManager:
         agent = cls.get_agent(persona)
         accepted_runner = context.state["_scene_configuration"]["effective"]["runner"]
         if accepted_runner == "dsh":
+            context.state["_dsh_input_id"] = (
+                [group_id, user_id, str(message_id)] if message_id is not None else None
+            )
             try:
                 await select_dsh_session(context, persona)
-            except LLMException as exc:
+            except Exception as exc:
+                from ._agent import record_run, start_run
+
+                start_run(context)
                 context.run.outcome = "failed"
-                if proactive is None:
-                    await UniMessage.text(exc.user_friendly_message).send(
-                        reply_to=quote_reply(group_id)
-                    )
+                context.run.user_notice = "会话准入失败，请检查执行器和会话映射。"
+                await record_run(
+                    context,
+                    context.run.source or "qq",
+                    persona.name if persona else None,
+                    summarize(message),
+                    time.monotonic(),
+                    error=exc,
+                )
                 return
             session_id = context.session_id or ""
             revision = session_manager.revision(session_id)
@@ -930,7 +941,7 @@ class AIChatManager:
                 )
             ):
                 context.run.user_notice = notice
-                raise LLMException(notice)
+                raise LLMException(notice, details={"code": "quota_denied"})
 
         async def after(report, error):
             if proactive is not None:
@@ -999,12 +1010,6 @@ class AIChatManager:
             logger.warning(
                 f"AI 聊天未完成: {type(error).__name__}", MODULE, session=user_id
             )
-            delivery = turn.delivery
-            if proactive is None and not (
-                delivery.parts or turn.report(error)["uncertain"] or turn.tool_texts
-            ):
-                notice = (persona and persona.error_message) or FAILED_NOTICE
-                await send_reply(notice, group_id, result=delivery, context=context)
             await turn.settle(error, after)
         finally:
             request_timeout.reset(timeout_token)
