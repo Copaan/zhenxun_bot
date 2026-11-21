@@ -786,12 +786,6 @@ class AIChatManager:
                 bot.self_id, group_id, message_id, context.state.get("_input_anchor")
             )
         personal = context.state.get("_personal_scene")
-        if personal:
-            from nonebot_plugin_alconna import Reply
-
-            message = UniMessage(
-                [part for part in message if not isinstance(part, Reply)]
-            )
         parts = await MessageBuilder.unimsg_to_llm_parts(message, namespace=MODULE)
         if not parts and group_id and event.is_tome():
             parts = [TextPart(text="（@了你，没有说别的）")]
