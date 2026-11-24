@@ -14,19 +14,48 @@ _LUNAR_START = date(1990, 1, 27)
 _LUNAR_YEARS = [
     int(value, 16)
     for value in (
-        "04af5 04970 064b0 074a3 0ea50 06b58 05ac0 0ab60 096e5 092e0 0c960 0d954 0d4a0 "
-        "0da50 07552 056a0 0abb7 025d0 092d0 0cab5 0a950 0b4a0 0bca4 0ad50 055d9 04ba0 "
-        "0a5b0 15176 05270 0a930 07954 06aa0 0ad50 05b52 04b60 0a6e6 0a4f0 05260 0ea65 "
-        "0d520 0daa0 076a3 096d0 04afb 04ad0 0a4d0 1d0b6 0d250 0d520 0dd45 0b5a0 056d0 "
+        "04af5 04970 064b0 074a3 0ea50 06b58 05ac0 0ab60 096d5 092e0 0c960 0d954 0d4a0 "
+        "0da50 07552 056a0 0abb7 025d0 092d0 0cab5 0a950 0b4a0 0baa4 0ad50 055d9 04ba0 "
+        "0a5b0 15176 052b0 0a930 07954 06aa0 0ad50 05b52 04b60 0a6e6 0a4e0 0d260 0ea65 "
+        "0d530 05aa0 076a3 096d0 04afb 04ad0 0a4d0 1d0b6 0d250 0d520 0dd45 0b5a0 056d0 "
         "055b2 049b0 0a577 0a4b0 0aa50 1b255 06d20 0ada0 14b63 09370 049f8 04970 064b0 "
-        "168a6 0ea50 06b20 1a6c4 0aae0 092e0 0d2e3 0c960 0d557 0d4a0 0da50 05d55 056a0 "
-        "0a6d0 055d4 092d0 0a9b8 0a950 0b4a0 0b6a6 0ad50 055a0 0aba4 0a5b0 052b0 0b273 "
+        "168a6 0ea50 06aa0 1a6c4 0aae0 092e0 0d2e3 0c960 0d557 0d4a0 0da50 05d55 056a0 "
+        "0a6d0 055d4 052d0 0a9b8 0a950 0b4a0 0b6a6 0ad50 055a0 0aba4 0a5b0 052b0 0b273 "
         "06930 07337 06aa0 0ad50 14b55 04b60 0a570 054e4 0d160 0e968 0d520 0daa0 16aa6 "
         "056d0 04ae0 0a9d4 0a2d0 0d150 0f252 0d520"
     ).split()
 ]
 """农历 1990-2100 年的月份数据：低 4 位为闰月，4-15 位为一至十二月是否大月，
 第 16 位为闰月是否大月"""
+_LUNAR_FESTIVALS = {
+    (1, 1): "春节",
+    (1, 15): "元宵",
+    (2, 2): "龙抬头",
+    (5, 5): "端午",
+    (7, 7): "七夕",
+    (7, 15): "中元",
+    (8, 15): "中秋",
+    (9, 9): "重阳",
+    (12, 8): "腊八",
+    (12, 23): "小年",
+}
+"""农历节日（月, 日）"""
+_SOLAR_FESTIVALS = {
+    (1, 1): "元旦",
+    (2, 14): "情人节",
+    (3, 8): "妇女节",
+    (3, 12): "植树节",
+    (5, 1): "劳动节",
+    (5, 4): "青年节",
+    (6, 1): "儿童节",
+    (7, 1): "建党节",
+    (8, 1): "建军节",
+    (9, 10): "教师节",
+    (10, 1): "国庆",
+    (12, 24): "平安夜",
+    (12, 25): "圣诞",
+}
+"""公历节日（月, 日）"""
 
 
 def check_timezone(name: str) -> str | None:
@@ -202,14 +231,15 @@ class TimeUtils:
         return f"{hours}小时{rem_minutes}分钟"
 
     @staticmethod
-    def lunar_date(day: date) -> str | None:
-        """公历日期转为农历日期文本
+    def lunar(day: date) -> tuple[int, int, bool, int] | None:
+        """公历日期转为农历年月日
 
         参数:
             day: 公历日期
 
         返回:
-            str | None: 如 "农历丙午年 九月廿六"，超出数据范围时为 None
+            tuple[int, int, bool, int] | None: 农历年、月、是否闰月、日，
+                超出数据范围时为 None
         """
         offset = (day - _LUNAR_START).days
         if offset < 0:
@@ -221,16 +251,57 @@ class TimeUtils:
                 months.insert(leap, (leap, True, 29 + (info >> 16 & 1)))
             for month, is_leap, length in months:
                 if offset < length:
-                    year = _LUNAR_START.year + index
-                    stem = "甲乙丙丁戊己庚辛壬癸"[(year - 4) % 10]
-                    branch = "子丑寅卯辰巳午未申酉戌亥"[(year - 4) % 12]
-                    name = ("闰" if is_leap else "") + "正二三四五六七八九十冬腊"[
-                        month - 1
-                    ]
-                    number = offset + 1
-                    day_name = {10: "初十", 20: "二十", 30: "三十"}.get(number) or (
-                        "初十廿"[number // 10] + "一二三四五六七八九"[number % 10 - 1]
-                    )
-                    return f"农历{stem}{branch}年 {name}月{day_name}"
+                    return _LUNAR_START.year + index, month, is_leap, offset + 1
                 offset -= length
         return None
+
+    @classmethod
+    def lunar_date(cls, day: date) -> str | None:
+        """公历日期转为农历日期文本
+
+        参数:
+            day: 公历日期
+
+        返回:
+            str | None: 如 "农历丙午年 九月廿六"，超出数据范围时为 None
+        """
+        if not (lunar := cls.lunar(day)):
+            return None
+        year, month, is_leap, number = lunar
+        stem = "甲乙丙丁戊己庚辛壬癸"[(year - 4) % 10]
+        branch = "子丑寅卯辰巳午未申酉戌亥"[(year - 4) % 12]
+        name = ("闰" if is_leap else "") + "正二三四五六七八九十冬腊"[month - 1]
+        day_name = {10: "初十", 20: "二十", 30: "三十"}.get(number) or (
+            "初十廿"[number // 10] + "一二三四五六七八九"[number % 10 - 1]
+        )
+        return f"农历{stem}{branch}年 {name}月{day_name}"
+
+    @classmethod
+    def festival(cls, day: date) -> str | None:
+        """日期对应的节日简称，农历节日优先
+
+        参数:
+            day: 公历日期
+
+        返回:
+            str | None: 如 "中秋"、"国庆"，不是节日时为 None
+        """
+        lunar = cls.lunar(day)
+        if lunar and not lunar[2]:
+            if name := _LUNAR_FESTIVALS.get((lunar[1], lunar[3])):
+                return name
+            tomorrow = cls.lunar(day + timedelta(days=1))
+            if tomorrow and tomorrow[1:] == (1, False, 1):
+                return "除夕"
+        if day.month in (4, 12):
+            # 清明、冬至按 21 世纪节气通式计算，2021 年冬至为例外
+            y = day.year % 100
+            base = 4.81 if day.month == 4 else 21.94
+            term = int(y * 0.2422 + base) - y // 4
+            if (day.year, day.month) == (2021, 12):
+                term -= 1
+            if day.day == term:
+                return "清明" if day.month == 4 else "冬至"
+        if day.weekday() == 6 and (day.month, (day.day - 1) // 7) in ((5, 1), (6, 2)):
+            return "母亲节" if day.month == 5 else "父亲节"
+        return _SOLAR_FESTIVALS.get((day.month, day.day))

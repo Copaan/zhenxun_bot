@@ -11,10 +11,13 @@ from typing import Any, ClassVar
 
 import ujson as json
 
+from zhenxun import ui
 from zhenxun.builtin_plugins.plugin_store.models import StorePluginInfo
+from zhenxun.configs.config import BotConfig
 from zhenxun.configs.repo_config import aliyun_mirrored
 from zhenxun.models.plugin_info import PluginInfo
 from zhenxun.services.cache.bounded_ttl import BoundedTTLCache
+from zhenxun.services.help_service import is_night_mode
 from zhenxun.services.log import logger
 from zhenxun.services.network_proxy import core_network_operation
 from zhenxun.services.plugin_init import PluginInitManager
@@ -27,7 +30,6 @@ from zhenxun.services.runtime_mutation import (
     coordinated_store_operation,
 )
 from zhenxun.utils.enum import PluginType
-from zhenxun.utils.image_utils import BuildImage, ImageTemplate, RowStyle
 from zhenxun.utils.repo_utils import RepoFileManager
 from zhenxun.utils.repo_utils.models import RepoFileInfo, RepoType
 from zhenxun.utils.repo_utils.utils import redact_git_output
@@ -86,22 +88,6 @@ class StoreInstallResult:
             }
         )
         return result
-
-
-def row_style(column: str, text: str) -> RowStyle:
-    """被动技能文本风格
-
-    参数:
-        column: 表头
-        text: 文本内容
-
-    返回:
-        RowStyle: RowStyle
-    """
-    style = RowStyle()
-    if column == "-" and text == "已安装":
-        style.font_color = "#67C23A"
-    return style
 
 
 class StoreManager:
@@ -345,24 +331,6 @@ class StoreManager:
         return result
 
     @classmethod
-    def version_check(cls, plugin_info: StorePluginInfo, suc_plugin: dict[str, str]):
-        """版本检查
-
-        参数:
-            plugin_info: StorePluginInfo
-            suc_plugin: 模块名: 版本号
-
-        返回:
-            str: 版本号
-        """
-        module = plugin_info.module
-        if suc_plugin.get(module) and not cls.check_version_is_new(
-            plugin_info, suc_plugin
-        ):
-            return f"{suc_plugin[module]} (有更新->{plugin_info.version})"
-        return plugin_info.version
-
-    @classmethod
     def check_version_is_new(
         cls, plugin_info: StorePluginInfo, suc_plugin: dict[str, str]
     ):
@@ -390,61 +358,90 @@ class StoreManager:
         )
         return {p[0]: (p[1] or "0.1") for p in db_plugin_list}
 
+    @staticmethod
+    def plugin_card(
+        index: int, plugin_info: StorePluginInfo, suc_plugin: dict[str, str]
+    ) -> dict[str, Any]:
+        """插件商店卡片数据
+
+        参数:
+            index: 插件 ID
+            plugin_info: StorePluginInfo
+            suc_plugin: 模块名: 版本号
+
+        返回:
+            dict[str, Any]: 卡片数据
+        """
+        version = suc_plugin.get(plugin_info.module)
+        return {
+            "id": index,
+            "name": plugin_info.name,
+            "description": plugin_info.description,
+            "author": plugin_info.author,
+            "version": version or plugin_info.version,
+            "new_version": (
+                plugin_info.version
+                if version and version != plugin_info.version
+                else None
+            ),
+            "type": plugin_info.plugin_type.value,
+            "type_name": plugin_info.plugin_type_name,
+            "installed": plugin_info.module in suc_plugin,
+        }
+
+    @staticmethod
+    async def render_store(
+        title: str, sections: list[tuple[str, list[dict[str, Any]]]]
+    ) -> bytes:
+        """渲染插件商店图片
+
+        参数:
+            title: 页面标题
+            sections: (分组名, 卡片数据列表) 列表
+
+        返回:
+            bytes: 插件商店图片
+        """
+        cards = [card for _, items in sections for card in items]
+        data = {
+            "title": title,
+            "bot_nickname": BotConfig.self_nickname,
+            "night": is_night_mode(),
+            "total": len(cards),
+            "installed": sum(card["installed"] for card in cards),
+            "updates": sum(bool(card["new_version"]) for card in cards),
+            "sections": [
+                {"title": name, "items": items} for name, items in sections if items
+            ],
+        }
+        return await ui.render_template(
+            "pages/builtin/plugin_store",
+            data=data,
+            clip_selector=".page",
+            clip_padding=0,
+            disable_animations=True,
+        )
+
     @classmethod
-    async def get_plugins_info(cls) -> list[BuildImage] | str:
+    async def get_plugins_info(cls) -> bytes:
         """插件列表
 
         返回:
-            BuildImage | str: 返回消息
+            bytes: 插件列表图片
         """
         plugin_list, extra_plugin_list = await cls.get_data()
-        column_name = ["-", "ID", "名称", "简介", "作者", "版本", "类型"]
         suc_plugin = await cls.get_installed_plugins()
-        index = 0
-        data_list = []
-        extra_data_list = []
-        for plugin_info in plugin_list:
-            data_list.append(
-                [
-                    "已安装" if plugin_info.module in suc_plugin else "",
-                    index,
-                    plugin_info.name,
-                    plugin_info.description,
-                    plugin_info.author,
-                    cls.version_check(plugin_info, suc_plugin),
-                    plugin_info.plugin_type_name,
-                ]
-            )
-            index += 1
-        for plugin_info in extra_plugin_list:
-            extra_data_list.append(
-                [
-                    "已安装" if plugin_info.module in suc_plugin else "",
-                    index,
-                    plugin_info.name,
-                    plugin_info.description,
-                    plugin_info.author,
-                    cls.version_check(plugin_info, suc_plugin),
-                    plugin_info.plugin_type_name,
-                ]
-            )
-            index += 1
-        return [
-            await ImageTemplate.table_page(
-                "原生插件列表",
-                "通过添加/移除插件 ID 来管理插件",
-                column_name,
-                data_list,
-                text_style=row_style,
-            ),
-            await ImageTemplate.table_page(
-                "第三方插件列表",
-                "通过添加/移除插件 ID 来管理插件",
-                column_name,
-                extra_data_list,
-                text_style=row_style,
-            ),
+        cards = [
+            cls.plugin_card(index, plugin_info, suc_plugin)
+            for index, plugin_info in enumerate(plugin_list + extra_plugin_list)
         ]
+        return await cls.render_store(
+            "插件商店",
+            [
+                ("原生插件", cards[: len(plugin_list)]),
+                ("第三方插件", cards[len(plugin_list) :]),
+            ],
+        )
 
     @classmethod
     async def get_plugin_by_value(
@@ -1350,46 +1347,28 @@ class StoreManager:
         return operation
 
     @classmethod
-    async def search_plugin(cls, plugin_name_or_author: str) -> BuildImage | str:
+    async def search_plugin(cls, plugin_name_or_author: str) -> bytes | str:
         """搜索插件
 
         参数:
             plugin_name_or_author: 插件名称或作者
 
         返回:
-            BuildImage | str: 返回消息
+            bytes | str: 搜索结果图片或提示
         """
         plugin_list, extra_plugin_list = await cls.get_data()
-        all_plugin_list = plugin_list + extra_plugin_list
         suc_plugin = await cls.get_installed_plugins()
-        filtered_data = [
-            (id, plugin_info)
-            for id, plugin_info in enumerate(all_plugin_list)
-            if plugin_name_or_author.lower() in plugin_info.name.lower()
-            or plugin_name_or_author.lower() in plugin_info.author.lower()
+        keyword = plugin_name_or_author.lower()
+        cards = [
+            cls.plugin_card(index, plugin_info, suc_plugin)
+            for index, plugin_info in enumerate(plugin_list + extra_plugin_list)
+            if keyword in plugin_info.name.lower()
+            or keyword in plugin_info.author.lower()
         ]
-
-        data_list = [
-            [
-                "已安装" if plugin_info.module in suc_plugin else "",
-                id,
-                plugin_info.name,
-                plugin_info.description,
-                plugin_info.author,
-                cls.version_check(plugin_info, suc_plugin),
-                plugin_info.plugin_type_name,
-            ]
-            for id, plugin_info in filtered_data
-        ]
-        if not data_list:
+        if not cards:
             return "未找到相关插件..."
-        column_name = ["-", "ID", "名称", "简介", "作者", "版本", "类型"]
-        return await ImageTemplate.table_page(
-            "商店插件列表",
-            "通过添加/移除插件 ID 来管理插件",
-            column_name,
-            data_list,
-            text_style=row_style,
+        return await cls.render_store(
+            f"搜索：{plugin_name_or_author}", [("搜索结果", cards)]
         )
 
     @classmethod

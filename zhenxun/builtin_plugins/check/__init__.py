@@ -26,7 +26,7 @@ __plugin_meta__ = PluginMetadata(
     """.strip(),
     extra=PluginExtraData(
         author="HibiKier",
-        version="0.2",
+        version="0.3",
         plugin_type=PluginType.SUPERUSER,
         configs=[
             RegisterConfig(
@@ -71,6 +71,9 @@ async def handle_self_check():
         image_bytes = await ui.render_template(
             "pages/builtin/check",
             data=data_dict,
+            clip_selector=".wrapper",
+            clip_padding=0,
+            disable_animations=True,
         )
 
         await MessageUtils.build_message(image_bytes).send()

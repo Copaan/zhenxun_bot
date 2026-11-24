@@ -33,7 +33,7 @@ __plugin_meta__ = PluginMetadata(
     usage="",
     extra=PluginExtraData(
         author="HibiKier",
-        version="0.1",
+        version="0.2",
         plugin_type=PluginType.HIDDEN,
         configs=[
             RegisterConfig(
@@ -71,6 +71,10 @@ friend_req = on_request(priority=5, block=True)
 group_req = on_request(priority=5, block=True)
 
 _API_TIMEOUT = 5.0
+_INVITE_DEDUP_SECONDS = 120
+"""同一群组邀请在该时间内重复上报时忽略"""
+_handled_invites: dict[tuple[str, str], float] = {}
+"""正在同意或已同意的群组邀请 (Bot id, 群号) 及时间"""
 
 
 def _reserve_notice(request: FgRequest) -> bool:
@@ -334,7 +338,67 @@ async def _(bot: v11Bot, event: FriendRequestEvent, session: EventSession):
         _release_notice(f)
 
 
-async def _auto_approve_group(bot, event: GroupRequestEvent) -> bool:
+async def _resolve_inviter(bot, event: GroupRequestEvent) -> str:
+    """获取群组邀请的邀请人id
+
+    协议端从群通知上报邀请时 user_id 可能为 Bot 自身或 0，此时按 flag 从群系统消息中
+    查找邀请人
+
+    参数:
+        bot: Bot
+        event: 群组请求事件
+
+    返回:
+        str: 邀请人id，查找失败时为事件中的 user_id
+    """
+    user_id = str(event.user_id)
+    if user_id not in ("0", str(bot.self_id)):
+        return user_id
+    try:
+        data = await asyncio.wait_for(
+            bot.get_group_system_msg(count=50), timeout=_API_TIMEOUT
+        )
+    except Exception as e:
+        logger.warning("获取群系统消息失败", "群聊请求", target=event.group_id, e=e)
+        return user_id
+    invites = (data or {}).get("invited_requests") or []
+    group_invites = [
+        item
+        for item in invites
+        if str(item.get("group_id")) == str(event.group_id) and not item.get("checked")
+    ]
+    for item in invites:
+        if str(item.get("request_id")) == str(event.flag):
+            group_invites = [item]
+            break
+    if len(group_invites) == 1 and (inviter := group_invites[0].get("invitor_uin")):
+        return str(inviter)
+    logger.warning("未能从群系统消息中找到邀请人", "群聊请求", target=event.group_id)
+    return user_id
+
+
+def _claim_invite(bot, group_id: str) -> bool:
+    """占用群组邀请的处理权，用于忽略同一邀请的重复上报
+
+    参数:
+        bot: Bot
+        group_id: 群号
+
+    返回:
+        bool: 是否占用成功，该群邀请近期已在处理或已同意时为 False
+    """
+    now = time.time()
+    for key, claimed in list(_handled_invites.items()):
+        if now - claimed >= _INVITE_DEDUP_SECONDS:
+            del _handled_invites[key]
+    key = (str(bot.self_id), group_id)
+    if key in _handled_invites:
+        return False
+    _handled_invites[key] = now
+    return True
+
+
+async def _auto_approve_group(bot, event: GroupRequestEvent) -> GroupConsole | None:
     """自动同意群组邀请并写入群认证
 
     参数:
@@ -342,7 +406,7 @@ async def _auto_approve_group(bot, event: GroupRequestEvent) -> bool:
         event: 群组请求事件
 
     返回:
-        bool: 是否同意成功
+        GroupConsole | None: 同意成功时为群组记录
     """
     try:
         await bot.set_group_add_request(
@@ -356,7 +420,7 @@ async def _auto_approve_group(bot, event: GroupRequestEvent) -> bool:
             target=event.group_id,
             e=e,
         )
-        return False
+        return None
     group, _ = await GroupConsole.get_or_create_root_group(
         group_id=str(event.group_id),
         defaults={
@@ -374,11 +438,15 @@ async def _auto_approve_group(bot, event: GroupRequestEvent) -> bool:
         await group.save(
             update_fields=["group_name", "max_member_count", "member_count"]
         )
-    return True
+    return group
 
 
 async def _record_auto_approved_group(
-    bot, event: GroupRequestEvent, session: EventSession, nickname: str
+    bot,
+    event: GroupRequestEvent,
+    session: EventSession,
+    user_id: str,
+    nickname: str,
 ):
     """记录非超级用户的自动同意入群，并通知超级用户与邀请人
 
@@ -386,9 +454,9 @@ async def _record_auto_approved_group(
         bot: Bot
         event: 群组请求事件
         session: EventSession
+        user_id: 邀请人id
         nickname: 邀请人昵称
     """
-    user_id = str(event.user_id)
     group_id = str(event.group_id)
     f = await FgRequest.create(
         request_type=RequestType.GROUP,
@@ -423,8 +491,12 @@ async def _record_auto_approved_group(
 async def _(bot: v11Bot, event: GroupRequestEvent, session: EventSession):
     if event.sub_type != "invite":
         return
-    user_id = str(event.user_id)
     group_id = str(event.group_id)
+    key = (str(bot.self_id), group_id)
+    if time.time() - _handled_invites.get(key, 0) < _INVITE_DEDUP_SECONDS:
+        logger.debug("群组邀请重复上报，已忽略", "群聊请求", target=group_id)
+        return
+    user_id = await _resolve_inviter(bot, event)
     is_superuser = PlatformUtils.is_superuser(bot, user_id)
     if not is_superuser and await _refuse_blacklisted(
         bot, event, (user_id, None), (user_id, group_id), (None, group_id)
@@ -438,10 +510,24 @@ async def _(bot: v11Bot, event: GroupRequestEvent, session: EventSession):
             session=user_id,
             target=group_id,
         )
-        if await _auto_approve_group(bot, event):
-            if not is_superuser:
-                await _record_auto_approved_group(bot, event, session, nickname)
+        if not _claim_invite(bot, group_id):
             return
+        if group := await _auto_approve_group(bot, event):
+            if is_superuser:
+                name = (
+                    f"{group.group_name}({group_id})" if group.group_name else group_id
+                )
+                await _send_private(
+                    bot,
+                    user_id,
+                    f"已同意你的入群邀请，群聊：{name}",
+                )
+            else:
+                await _record_auto_approved_group(
+                    bot, event, session, user_id, nickname
+                )
+            return
+        _handled_invites.pop(key, None)
     logger.debug(
         f"收录 用户[{user_id}] 群聊[{group_id}] 群聊请求",
         "群聊请求",

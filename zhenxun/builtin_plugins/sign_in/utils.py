@@ -1,10 +1,12 @@
 import asyncio
 from datetime import date, datetime, timedelta
 from hashlib import sha256
+import json
 import os
 from pathlib import Path
 import random
 import threading
+import time
 
 import aiofiles
 import nonebot
@@ -18,12 +20,18 @@ from zhenxun.models.sign_log import SignLog
 from zhenxun.models.sign_user import SignUser
 from zhenxun.models.user_console import UserConsole
 from zhenxun.services.avatar_service import avatar_service
+from zhenxun.services.help_service import is_night_mode
 from zhenxun.services.lifecycle import lifecycle_kernel
 from zhenxun.services.log import logger
+from zhenxun.utils.http_utils import AsyncHttpx
 from zhenxun.utils.manager.priority_manager import PriorityLifecycle
 from zhenxun.utils.time_utils import TimeUtils
 
 from .config import (
+    SIGN_DOUBLE_GREETING,
+    SIGN_GREETINGS,
+    SIGN_HOLIDAY_PATH,
+    SIGN_HOLIDAY_URLS,
     SIGN_TODAY_CARD_PATH,
     level2attitude,
     lik2level,
@@ -45,19 +53,27 @@ _card_file_lock = threading.Lock()
 _writing_cards: dict[Path, int] = {}
 
 
-MORNING_MESSAGE = [
-    "早上好，希望今天是美好的一天！",
-    "醒了吗，今天也要元气满满哦！",
-    "早上好呀，今天也要开心哦！",
-    "早安，愿你拥有美好的一天！",
-]
+def bot_greeting(hour: int, is_double: bool, night: bool = False) -> tuple[str, str]:
+    """按时段随机选择签到卡片上的真寻立绘和寄语
 
-LG_MESSAGE = [
-    "今天要早点休息哦~",
-    "可不要熬夜到太晚呀",
-    "请尽早休息吧！",
-    "不要熬夜啦！",
-]
+    参数:
+        hour: 当前小时
+        is_double: 本次签到好感是否双倍
+        night: 是否使用夜间配色，双倍时据此选择白天或夜间立绘
+
+    返回:
+        tuple[str, str]: 寄语, 立绘在主题 `ui/mahiro` 目录下的相对路径
+    """
+    figures, lines = next(
+        (figures, lines)
+        for start, end, figures, lines in SIGN_GREETINGS
+        if start <= hour < end
+    )
+    if is_double:
+        day_figures, night_figures, lines = SIGN_DOUBLE_GREETING
+        figures = night_figures if night else day_figures
+    line = random.choice(lines).format(name=BotConfig.self_nickname)
+    return line, random.choice(figures)
 
 
 def _now() -> datetime:
@@ -196,8 +212,9 @@ async def get_card(
                 reward=(add_impression, gold or 0, gift, is_double),
             )
     rank = await SignUser.impression_rank(user.impression)
+    night = is_night_mode(_now())
     digest = sha256(
-        f"{user.impression}:{user.sign_count}:{gold}:{rank}".encode()
+        f"{user.impression}:{user.sign_count}:{gold}:{rank}:{night}".encode()
     ).hexdigest()[:12]
     card_file = SIGN_TODAY_CARD_PATH / f"{key}_view_{date}_{digest}.png"
     if _cached(card_file):
@@ -238,16 +255,53 @@ def get_level_and_next_impression(impression: float) -> tuple[int, int | float, 
     return level_int, next_impression, previous_impression
 
 
-async def sign_history(user_id: str, today: date) -> dict:
+_holiday_retry: dict[int, float] = {}
+
+
+async def holiday_days(year: int) -> dict[date, bool]:
+    """法定节假日安排，数据来自 holiday-cn，按年缓存并每周刷新
+
+    参数:
+        year: 公历年份
+
+    返回:
+        dict[date, bool]: 日期: 是否放假，False 为调休上班，获取不到数据时为空
+    """
+    file = SIGN_HOLIDAY_PATH / f"{year}.json"
+    expired = not file.exists() or time.time() - file.stat().st_mtime > 7 * 86400
+    if expired and time.time() >= _holiday_retry.get(year, 0):
+        _holiday_retry[year] = time.time() + 3600
+        try:
+            response = await AsyncHttpx.get(
+                [url.format(year=year) for url in SIGN_HOLIDAY_URLS],
+                check_status_code=200,
+                timeout=5,
+            )
+            if response.json().get("year") == year:
+                file.parent.mkdir(parents=True, exist_ok=True)
+                file.write_text(response.text, encoding="utf8")
+        except Exception as e:
+            logger.debug(f"获取 {year} 年节假日安排失败", "签到", e=e)
+    try:
+        days = json.loads(file.read_text(encoding="utf8"))["days"]
+        return {date.fromisoformat(d["date"]): bool(d["isOffDay"]) for d in days}
+    except (OSError, ValueError, KeyError, TypeError):
+        return {}
+
+
+async def sign_history(
+    user_id: str, today: date, holidays: dict[date, bool] | None = None
+) -> dict:
     """本月签到日历与连续签到天数，今天未签到时从昨天开始计算连续天数
 
     参数:
         user_id: 用户id
         today: Bot 时区的今天
+        holidays: 法定节假日安排，日期: 是否放假
 
     返回:
-        dict: offset 本月1日前的空格数，days 本月每天的状态（signed/empty/future），
-            streak 连续签到天数，month_count 本月签到天数
+        dict: offset 本月1日前的空格数，days 本月每天的状态（signed/empty/future）、
+            节日名与放假/调休标记，streak 连续签到天数，month_count 本月签到天数
     """
     first = today.replace(day=1)
     zone = TimeUtils.zone()
@@ -281,7 +335,15 @@ async def sign_history(user_id: str, today: date) -> dict:
     for n in range((following - first).days):
         day = first + timedelta(days=n)
         state = "future" if day > today else "signed" if day in signed else "empty"
-        days.append({"day": day.day, "state": state, "today": day == today})
+        days.append(
+            {
+                "day": day.day,
+                "state": state,
+                "today": day == today,
+                "festival": TimeUtils.festival(day),
+                "rest": (holidays or {}).get(day),
+            }
+        )
     return {
         "offset": first.isoweekday() - 1,
         "days": days,
@@ -407,13 +469,8 @@ async def _generate_html_card(
         else min(100.0, ((impression - previous_impression) / denominator) * 100)
     )
 
-    hour = now.hour
-    if 6 < hour < 10:
-        message = random.choice(MORNING_MESSAGE)
-    elif 0 <= hour < 6:
-        message = random.choice(LG_MESSAGE)
-    else:
-        message = f"{BotConfig.self_nickname}希望你开心！"
+    night = is_night_mode(now)
+    message, bot_figure = bot_greeting(now.hour, bool(reward and reward[3]), night)
     bot_message = f"{BotConfig.self_nickname}说: {message}"
 
     avatar_path = await avatar_service.get_session_avatar_path(session)
@@ -460,12 +517,16 @@ async def _generate_html_card(
         "reward": reward_info,
         "page": page_info,
         "bot_message": bot_message,
+        "bot_figure": bot_figure,
         "attitude": attitude,
         "interpolation": interpolation,
         "progress": progress,
         "rank": rank,
         "total_gold": total_gold,
-        "history": await sign_history(user.user_id, now.date()),
+        "history": await sign_history(
+            user.user_id, now.date(), await holiday_days(now.year)
+        ),
+        "night": night,
     }
 
     image_bytes = await ui.render_template(

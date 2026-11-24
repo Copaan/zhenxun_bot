@@ -42,6 +42,8 @@ class PluginHelpPageData(RenderableComponent):
     """页面主标题"""
     categories: list[HelpCategory]
     """帮助分类列表"""
+    night: bool = False
+    """是否使用夜间配色"""
 
     @property
     def template_name(self) -> str:

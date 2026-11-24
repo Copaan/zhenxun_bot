@@ -1,4 +1,6 @@
 from collections import defaultdict
+import contextlib
+from datetime import datetime
 
 import nonebot
 from nonebot.plugin import PluginMetadata
@@ -25,6 +27,27 @@ class PluginData(BaseModel):
     metadata: PluginMetadata
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
+
+
+def is_night_mode(now: datetime | None = None) -> bool:
+    """判断帮助、插件商店等图片是否使用夜间配色
+
+    参数:
+        now: 判断用的时间，默认为当前时间
+
+    返回:
+        bool: 开启了自动切换且处于夜间时段时为 True
+    """
+    if not Config.get_config("help", "AUTO_NIGHT_MODE", True):
+        return False
+    start, end = 19, 7
+    hours = str(Config.get_config("help", "NIGHT_HOURS", "19-7"))
+    with contextlib.suppress(ValueError):
+        start, end = (int(value) % 24 for value in hours.split("-"))
+    hour = (now or datetime.now()).hour
+    if start > end:
+        return hour >= start or hour < end
+    return start <= hour < end
 
 
 async def _get_plugins_by_types(plugin_types: list[PluginType]) -> list[PluginData]:
@@ -119,6 +142,7 @@ async def create_plugin_help_image(
         bot_nickname=BotConfig.self_nickname,
         page_title=page_title,
         categories=categories,
+        night=is_night_mode(),
     )
 
     cache_payload = {
@@ -134,8 +158,8 @@ async def create_plugin_help_image(
     image_bytes = await ui.render(
         page_data,
         use_cache=True,
-        clip_selector=".container",
-        clip_padding=20,
+        clip_selector=".page",
+        clip_padding=0,
         disable_animations=True,
     )
     await _PLUGIN_HELP_IMAGE_CACHE.set(cache_key, image_bytes)

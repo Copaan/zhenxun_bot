@@ -24,7 +24,7 @@ from zhenxun.utils.enum import PluginType
 from zhenxun.utils.message import MessageUtils
 from zhenxun.utils.platform import PlatformUtils
 
-from .data_source import create_help_img, get_llm_help, get_plugin_help
+from .data_source import create_help_img, get_plugin_help
 
 __plugin_meta__ = PluginMetadata(
     name="帮助",
@@ -32,43 +32,29 @@ __plugin_meta__ = PluginMetadata(
     usage="",
     extra=PluginExtraData(
         author="HibiKier",
-        version="0.1",
+        version="0.2",
         plugin_type=PluginType.DEPENDANT,
         is_show=False,
         configs=[
-            RegisterConfig(
-                key="ENABLE_LLM_HELPER",
-                value=False,
-                help="是否开启LLM智能帮助功能",
-                default_value=False,
-                type=bool,
-            ),
-            RegisterConfig(
-                key="DEFAULT_LLM_MODEL",
-                value="Gemini/gemini-2.5-flash-lite-preview-06-17",
-                help="智能帮助功能使用的默认LLM模型",
-                default_value="Gemini/gemini-2.5-flash-lite-preview-06-17",
-                type=str,
-            ),
-            RegisterConfig(
-                key="LLM_HELPER_STYLE",
-                value="绪山真寻",
-                help="设置智能帮助功能的回复口吻或风格",
-                default_value="绪山真寻",
-                type=str,
-            ),
-            RegisterConfig(
-                key="LLM_HELPER_REPLY_AS_IMAGE_THRESHOLD",
-                value=100,
-                help="AI帮助回复超过多少字时转为图片发送",
-                default_value=100,
-                type=int,
-            ),
             RegisterConfig(
                 key="HELP_STYLE",
                 value="default",
                 help="帮助页面的显示样式 (可选值: 'default', 'simple')",
                 default_value="default",
+                type=str,
+            ),
+            RegisterConfig(
+                key="AUTO_NIGHT_MODE",
+                value=True,
+                help="帮助图片是否按时间自动切换日间/夜间配色",
+                default_value=True,
+                type=bool,
+            ),
+            RegisterConfig(
+                key="NIGHT_HOURS",
+                value="19-7",
+                help="夜间配色时段，格式为 开始时-结束时，例如 19-7",
+                default_value="19-7",
                 type=str,
             ),
         ],
@@ -141,10 +127,6 @@ async def _(
                 reply_to=True
             )
             logger.info(f"查看帮助详情: {name.result}", "帮助", session=session)
-        elif Config.get_config("help", "ENABLE_LLM_HELPER"):
-            logger.info(f"智能帮助处理问题: {name.result}", "帮助", session=session)
-            llm_answer = await get_llm_help(name.result, is_admin, _is_superuser)
-            await MessageUtils.build_message(llm_answer).send(reply_to=True)
         else:
             await MessageUtils.build_message("没有查找到这个功能噢...").send(
                 reply_to=True

@@ -145,7 +145,7 @@ class GroupManager:
         """
         if (
             base_config.get("flag")
-            and operator_id not in bot.config.superusers
+            and not PlatformUtils.is_superuser(bot, operator_id)
             and group.group_flag != 1
         ):
             """退出群组"""

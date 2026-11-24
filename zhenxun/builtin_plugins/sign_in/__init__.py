@@ -40,7 +40,7 @@ __plugin_meta__ = PluginMetadata(
     """.strip(),
     extra=PluginExtraData(
         author="HibiKier",
-        version="0.1",
+        version="0.2",
         required_platform_capabilities={"business_identity"},
         commands=[
             Command(command="签到"),

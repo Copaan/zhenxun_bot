@@ -6,15 +6,13 @@ from zhenxun.configs.config import BotConfig, Config
 from zhenxun.configs.utils import PluginExtraData
 from zhenxun.models.plugin_info import PluginInfo
 from zhenxun.models.statistics import Statistics
-from zhenxun.services.ai.core.exceptions import LLMException
 from zhenxun.services.db_context import with_db_timeout
-from zhenxun.services.log import logger
+from zhenxun.services.help_service import is_night_mode
 from zhenxun.services.message_load import is_db_unhealthy
 from zhenxun.services.renderer.result_cache import RenderResultMemoryCache
 from zhenxun.services.startup_load import startup_load_planner
 from zhenxun.ui.models import PluginMenuCategory, PluginMenuData
 from zhenxun.utils.common_utils import format_usage_for_markdown
-from zhenxun.utils.enum import PluginType
 
 from .utils import classify_plugin
 
@@ -119,6 +117,7 @@ async def create_help_img(
         plugin_count=plugin_count,
         active_count=active_count,
         categories=categories_objects,
+        night=is_night_mode(),
     )
 
     cache_payload = {
@@ -253,6 +252,7 @@ async def get_plugin_help(
                 "title": _plugin.metadata.name,
                 "metadata": metadata_items,
                 "sections": sections,
+                "night": is_night_mode(),
             }
 
             component = ui.template("pages/builtin/help", data=page_data)
@@ -263,103 +263,3 @@ async def get_plugin_help(
             )
         return None
     return None
-
-
-async def get_llm_help(
-    question: str, is_admin: bool, is_superuser: bool
-) -> str | list[bytes]:
-    """
-    使用LLM来回答用户的自然语言求助。
-
-    参数:
-        question: 用户的问题。
-        is_admin: 是否为当前群的群主或管理员。
-        is_superuser: 是否为超级用户。
-
-    返回:
-        str | list[bytes]: LLM生成的回答或错误提示，较长的回答为图片。
-    """
-
-    try:
-        try:
-            allowed_types = get_user_allow_help(is_admin, is_superuser)
-            plugins = await _read_db(
-                lambda: PluginInfo.get_plugins(
-                    load_status=True,
-                    filter_parent=False,
-                    is_show=True,
-                    plugin_type__in=allowed_types,
-                ),
-                "Help.llm_plugin_list",
-            )
-        except _DbBusyError:
-            return _DB_BUSY_MESSAGE
-
-        knowledge_base_parts = []
-        for p in plugins:
-            if not startup_load_planner.plugin_available(p.module_path):
-                continue
-            meta = nonebot.get_plugin_by_module_name(p.module_path)
-            if not meta or not meta.metadata:
-                continue
-            usage = meta.metadata.usage.strip() or "无"
-            desc = meta.metadata.description.strip() or "无"
-            part = f"功能名称: {p.name}\n功能描述: {desc}\n用法示例:\n{usage}"
-            knowledge_base_parts.append(part)
-
-        if not knowledge_base_parts:
-            return "抱歉，根据您的权限，当前没有可供查询的功能信息。"
-
-        knowledge_base = "\n\n---\n\n".join(knowledge_base_parts)
-
-        user_role = "普通用户"
-        if PluginType.SUPERUSER in allowed_types:
-            user_role = "超级管理员"
-        elif PluginType.ADMIN in allowed_types:
-            user_role = "管理员"
-
-        base_system_prompt = (
-            f"你是一个精通机器人功能的AI助手。当前向你提问的用户是一位「{user_role}」。\n"
-            "你的任务是根据下面提供的功能列表和详细说明，来回答用户关于如何使用机器人的问题。\n"
-            "请仔细阅读每个功能的描述和用法，然后用简洁、清晰的语言告诉用户应该使用哪个或哪些命令来解决他们的问题。\n"
-            "如果找不到完全匹配的功能，可以推荐最相关的一个或几个。直接给出操作指令和简要解释即可。"
-        )
-
-        if (
-            Config.get_config("help", "LLM_HELPER_STYLE")
-            and Config.get_config("help", "LLM_HELPER_STYLE").strip()
-        ):
-            style = Config.get_config("help", "LLM_HELPER_STYLE")
-            style_instruction = f"请务必使用「{style}」的风格和口吻来回答。"
-            system_prompt = f"{base_system_prompt}\n{style_instruction}"
-        else:
-            system_prompt = base_system_prompt
-
-        full_instruction = (
-            f"{system_prompt}\n\n=== 功能列表和说明 ===\n{knowledge_base}"
-        )
-
-        from zhenxun.services.ai.llm.api import chat
-
-        response = await chat(
-            message=question,
-            instruction=full_instruction,
-            model=Config.get_config("help", "DEFAULT_LLM_MODEL"),
-        )
-
-        reply_text = response.text if response else "抱歉，我暂时无法回答这个问题。"
-        threshold = Config.get_config("help", "LLM_HELPER_REPLY_AS_IMAGE_THRESHOLD", 50)
-
-        if len(reply_text) > threshold:
-            notebook = ui.notebook()
-            notebook.text(reply_text)
-            return await ui.render_pages(notebook)
-
-        return reply_text
-
-    except LLMException as e:
-        logger.error(f"LLM智能帮助出错: {e}", "帮助", e=e)
-        return "抱歉，智能帮助功能当前不可用，请稍后再试或联系管理员。"
-    except Exception as e:
-        logger.error(f"构建LLM帮助时发生未知错误: {e}", "帮助", e=e)
-        return "抱歉，智能帮助功能遇到了一点小问题，正在紧急处理中！"

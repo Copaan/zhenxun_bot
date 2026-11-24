@@ -52,6 +52,8 @@ class PluginMenuData(RenderableComponent):
     """已启用插件数量"""
     categories: list[PluginMenuCategory]
     """插件分类列表"""
+    night: bool = False
+    """是否使用夜间配色"""
 
     @property
     def template_name(self) -> str:

@@ -28,7 +28,7 @@ __plugin_meta__ = PluginMetadata(
     usage="",
     extra=PluginExtraData(
         author="HibiKier",
-        version="0.1",
+        version="0.2",
         plugin_type=PluginType.HIDDEN,
         configs=[
             RegisterConfig(

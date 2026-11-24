@@ -12,6 +12,7 @@ import psutil
 from pydantic import BaseModel
 
 from zhenxun.configs.config import BotConfig
+from zhenxun.services.help_service import is_night_mode
 from zhenxun.services.log import logger
 from zhenxun.utils.http_utils import AsyncHttpx
 
@@ -21,49 +22,91 @@ GOOGLE_URL = "https://www.google.com/"
 VERSION_FILE = Path() / "__version__"
 
 
-def get_arm_cpu_freq_safe():
-    """获取ARM设备CPU频率（仅限 Linux/macOS）"""
-    if platform.system().lower() == "windows":
-        return 0
+def _sysfs_cpu_freq() -> float:
+    """读取 Linux sysfs 中所有核心的最高频率
 
-    # 方法1: 优先从系统频率文件读取（Linux sysfs）
-    freq_files = [
-        "/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq",
-        "/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq",
-        "/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_cur_freq",
-        "/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq",
-    ]
+    返回:
+        float: 频率（MHz），无法获取时为 0
+    """
+    best = 0
+    for cpu in Path("/sys/devices/system/cpu").glob("cpu[0-9]*"):
+        for name in ("cpuinfo_max_freq", "scaling_max_freq", "scaling_cur_freq"):
+            with contextlib.suppress(OSError, ValueError):
+                best = max(best, int((cpu / "cpufreq" / name).read_text().strip()))
+                break
+    return best / 1000
 
-    for freq_file in freq_files:
-        try:
-            with open(freq_file, encoding="utf-8") as f:
-                frequency = int(f.read().strip())
-                return round(frequency / 1000000, 2)  # 转换为GHz
-        except (OSError, ValueError):
-            continue
 
-    # 方法2: 解析/proc/cpuinfo（Linux）
-    with contextlib.suppress(OSError, FileNotFoundError, ValueError, PermissionError):
-        with open("/proc/cpuinfo", encoding="utf-8") as f:
-            for line in f:
-                if "CPU MHz" in line:
-                    freq = float(line.split(":")[1].strip())
-                    return round(freq / 1000, 2)  # 转换为GHz
+def _cpuinfo_freq() -> float:
+    """读取 /proc/cpuinfo 中的 cpu MHz
 
-    # 方法3: 使用lscpu命令（Linux）
+    返回:
+        float: 频率（MHz），无法获取时为 0
+    """
+    best = 0.0
+    with contextlib.suppress(OSError, UnicodeDecodeError):
+        for line in Path("/proc/cpuinfo").read_text(encoding="utf-8").splitlines():
+            key, _, value = line.partition(":")
+            if key.strip().lower() == "cpu mhz":
+                with contextlib.suppress(ValueError):
+                    best = max(best, float(value))
+    return best
+
+
+def _command_freq(args: list[str], keys: tuple[str, ...], scale: float) -> float:
+    """执行命令并按优先级读取频率字段
+
+    参数:
+        args: 命令参数
+        keys: 依次尝试的字段名，为空时把整段输出当作数值
+        scale: 换算为 MHz 的除数
+
+    返回:
+        float: 频率（MHz），无法获取时为 0
+    """
     with contextlib.suppress(OSError, subprocess.SubprocessError, ValueError):
-        env = os.environ.copy()
-        env["LC_ALL"] = "C"
+        env = {**os.environ, "LC_ALL": "C"}
         result = subprocess.run(
-            ["lscpu"], capture_output=True, text=True, env=env, timeout=10
+            args, capture_output=True, text=True, env=env, timeout=5
         )
+        if result.returncode != 0:
+            return 0
+        if not keys:
+            return float(result.stdout.strip()) / scale
+        fields = {}
+        for line in result.stdout.splitlines():
+            key, _, value = line.partition(":")
+            fields[key.strip()] = value.strip()
+        for key in keys:
+            if fields.get(key):
+                return float(fields[key].replace(",", ".")) / scale
+    return 0
 
-        if result.returncode == 0:
-            for line in result.stdout.split("\n"):
-                if "CPU max MHz" in line or "CPU MHz" in line:
-                    freq = float(line.split(":")[1].strip())
-                    return round(freq / 1000, 2)  # 转换为GHz
-    return 0  # 如果所有方法都失败，返回0
+
+def get_cpu_freq() -> float:
+    """获取 CPU 频率，psutil 获取不到时依次读取 sysfs、/proc/cpuinfo、lscpu 与 sysctl
+
+    返回:
+        float: 频率（GHz），无法获取时为 0
+    """
+    with contextlib.suppress(Exception):
+        if freq := psutil.cpu_freq():
+            if mhz := freq.current or freq.max:
+                return round(mhz / 1000, 2)
+    system = platform.system()
+    if system == "Linux":
+        mhz = (
+            _sysfs_cpu_freq()
+            or _cpuinfo_freq()
+            or _command_freq(["lscpu"], ("CPU max MHz", "CPU MHz"), 1)
+        )
+    elif system == "Darwin":
+        mhz = _command_freq(
+            ["sysctl", "-n", "hw.cpufrequency_max"], (), 1_000_000
+        ) or _command_freq(["sysctl", "-n", "hw.cpufrequency"], (), 1_000_000)
+    else:
+        mhz = 0
+    return round(mhz / 1000, 2)
 
 
 @cache
@@ -128,13 +171,9 @@ class CPUInfo:
 
     @classmethod
     def get_cpu_info(cls):
-        cpu_core = psutil.cpu_count(logical=False)
+        cpu_core = psutil.cpu_count(logical=False) or psutil.cpu_count()
         cpu_usage = psutil.cpu_percent(interval=0.1)
-        if _cpu_freq := psutil.cpu_freq():
-            cpu_freq = round(_cpu_freq.current / 1000, 2)
-        else:
-            cpu_freq = get_arm_cpu_freq_safe()
-        return CPUInfo(core=cpu_core, usage=cpu_usage, freq=cpu_freq)
+        return CPUInfo(core=cpu_core, usage=cpu_usage, freq=get_cpu_freq())
 
 
 @dataclass
@@ -203,8 +242,14 @@ class SystemInfo(BaseModel):
 
     def get_system_info(self):
         return {
-            "cpu_info": f"{self.cpu.usage}% - {self.cpu.freq}Ghz "
-            f"[{self.cpu.core} core]",
+            "cpu_info": " · ".join(
+                part
+                for part in (
+                    f"{self.cpu.core} 核" if self.cpu.core else "",
+                    f"{self.cpu.freq} GHz" if self.cpu.freq else "",
+                )
+                if part
+            ),
             "cpu_process": self.cpu.usage,
             "ram_info": f"{self.ram.usage} / {self.ram.total} GB",
             "ram_process": (
@@ -258,18 +303,19 @@ def __get_version() -> str | None:
 
 
 async def get_status_info() -> dict:
-    """获取信息"""
+    """获取自检页面数据"""
     data = await __build_status()
 
     system = platform.uname()
     data = data.get_system_info()
     data["brand_raw"] = await run_sync(get_cpu_brand)()
     baidu, google = await __get_network_info()
-    data["baidu"] = "#8CC265" if baidu else "red"
-    data["google"] = "#8CC265" if google else "red"
+    data["baidu"] = baidu
+    data["google"] = google
 
     data["system"] = f"{system.system} {system.release}"
     data["version"] = __get_version()
     data["plugin_count"] = len(nonebot.get_loaded_plugins())
     data["nickname"] = BotConfig.self_nickname
+    data["night"] = is_night_mode()
     return data
