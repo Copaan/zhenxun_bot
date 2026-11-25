@@ -56,6 +56,7 @@ class ProviderSettingsUpdate(BaseModel):
     headers: dict[str, str] | None = None
     params: dict[str, Any] | None = None
     api_keys: list[str] | None = None
+    auto_break_keys: list[str] | None = None
     models: list[dict[str, Any]] | None = None
 
 
@@ -214,15 +215,16 @@ async def get_configuration() -> Result:
     return Result.ok(configuration_view(config, config_revision(content)))
 
 
-def _provider_fields(payload: ProviderSettingsUpdate, keys: Any) -> dict[str, Any]:
+def _provider_fields(payload: ProviderSettingsUpdate) -> dict[str, Any]:
     """生成要写入的服务商字段，与预设默认值相同的协议和地址记为 None
 
     参数:
         payload: 提交的服务商设置
-        keys: 要保存的 API Key
 
     返回:
-        dict[str, Any]: 服务商字段，值为 None 的字段会从配置中移除
+        dict[str, Any]: 服务商字段，值为 None 的字段会从配置中移除；
+            未提交 API Key 时不包含密钥字段，开启自动熔断的密钥写成
+            {key, auto_break} 条目
     """
     preset = payload.preset or None
     default_protocol = PRESETS.get(preset or "", {}).get("protocol", "openai_chat")
@@ -233,9 +235,14 @@ def _provider_fields(payload: ProviderSettingsUpdate, keys: Any) -> dict[str, An
         "preset": preset,
         "protocol": None if protocol == default_protocol else protocol,
         "base_url": None if base_url == preset_base_url(preset, protocol) else base_url,
-        "api_keys": clean_keys(keys),
         "timeout": payload.timeout,
     }
+    if payload.api_keys is not None:
+        breakers = set(clean_keys(payload.auto_break_keys))
+        fields["api_keys"] = [
+            {"key": key, "auto_break": True} if key in breakers else key
+            for key in clean_keys(payload.api_keys)
+        ]
     for key in ("headers", "params"):
         value = getattr(payload, key)
         if value is not None:
@@ -275,7 +282,7 @@ async def create_provider(payload: ProviderSettingsUpdate) -> Result:
             providers = []
             ai_set(ai, "PROVIDERS", providers)
         provider: dict[str, Any] = {}
-        _set_fields(provider, _provider_fields(payload, payload.api_keys))
+        _set_fields(provider, _provider_fields(payload))
         provider["models"] = deepcopy(payload.models or [])
         providers.append(provider)
 
@@ -298,10 +305,7 @@ async def update_provider(
     def mutate(ai: dict[str, Any]) -> None:
         index, provider = find_provider(ai, provider_name)
         _check_provider_name(ai, payload.name, index)
-        fields = _provider_fields(
-            payload,
-            provider.get("api_keys") if payload.api_keys is None else payload.api_keys,
-        )
+        fields = _provider_fields(payload)
         _rename_provider_references(ai, str(provider.get("name", "")), fields["name"])
         _set_fields(provider, fields)
         if payload.models is not None:

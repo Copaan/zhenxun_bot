@@ -510,7 +510,7 @@ async def _read_stream(
 
 def _no_key_error(route: Route) -> LLMException:
     provider = route.provider
-    recovery = health_manager.key_recovery_time(provider.name, provider.api_keys)
+    recovery = health_manager.key_recovery_time(provider)
     if recovery is None:
         return AuthenticationException(f"[{route.name}] 没有可用的 API 密钥")
     wait = max(int(recovery - time.time()), 1)
@@ -557,9 +557,7 @@ async def call_route(
     affinity = None
     if isinstance(context, RunContext) and context.run.source:
         affinity = context.run.root_session_id or context.session_id
-    api_key = health_manager.pick_key(
-        provider.name, provider.api_keys, tried, affinity=affinity
-    )
+    api_key = health_manager.pick_key(provider, tried, affinity=affinity)
     if api_key is None:
         raise _no_key_error(route)
     attempt = 0
@@ -583,9 +581,7 @@ async def call_route(
                 route = adapted
                 call = await _build(build, route, task, request)
                 continue
-            others = health_manager.available_keys(
-                provider.name, provider.api_keys, tried | {key_id(api_key)}
-            )
+            others = health_manager.available_keys(provider, tried | {key_id(api_key)})
             if (
                 e.is_retryable
                 and attempt < settings.max_retries
@@ -598,12 +594,10 @@ async def call_route(
                 logger.debug(f"{route.name} 第 {attempt} 次重试，{delay:.1f} 秒后: {e}")
                 await asyncio.sleep(min(float(delay), 30.0))
                 continue
-            health_manager.record_key_failure(provider.name, api_key, e, cooldowns)
+            health_manager.record_key_failure(provider, api_key, e, cooldowns)
             if e.should_rotate_key:
                 tried.add(key_id(api_key))
-                api_key = health_manager.pick_key(
-                    provider.name, provider.api_keys, tried
-                )
+                api_key = health_manager.pick_key(provider, tried)
                 if api_key is not None:
                     logger.info(f"{route.name} 切换密钥后重试: {e}")
                     continue

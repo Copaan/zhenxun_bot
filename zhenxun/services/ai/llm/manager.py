@@ -237,7 +237,7 @@ async def get_key_usage_stats() -> dict[str, Any]:
     return {
         provider.name: {
             "total_keys": len(provider.api_keys),
-            "key_stats": health_manager.key_stats(provider.name, provider.api_keys),
+            "key_stats": health_manager.key_stats(provider),
         }
         for provider in get_configured_providers()
     }

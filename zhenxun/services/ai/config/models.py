@@ -154,7 +154,11 @@ class ProviderConfig(BaseModel):
     base_url: str = ""
     """接口地址，与对应协议官方 SDK 的 base_url 一致"""
     api_keys: list[str] = Field(default_factory=list)
-    """API 密钥列表，多个密钥轮询使用"""
+    """API 密钥列表，多个密钥轮询使用；条目写成 {key, auto_break: true} 时
+    开启该密钥的自动熔断"""
+    auto_break_keys: list[str] = Field(default_factory=list)
+    """开启自动熔断的密钥：认证失败后停用，限流或额度不足时暂停一段时间；
+    未开启的密钥失败后只记录，不影响后续调用"""
     headers: dict[str, str] = Field(default_factory=dict)
     """附加请求头"""
     params: dict[str, Any] = Field(default_factory=dict)
@@ -164,7 +168,27 @@ class ProviderConfig(BaseModel):
     models: list[ModelConfig] = Field(default_factory=list)
     """提供的模型列表"""
 
-    @field_validator("api_keys", mode="before")
+    @model_validator(mode="before")
+    @classmethod
+    def _split_key_options(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        keys = data.get("api_keys")
+        keys = [keys] if isinstance(keys, str | dict) else keys
+        if not isinstance(keys, list):
+            return data
+        plain: list[Any] = []
+        breakers = list(data.get("auto_break_keys") or [])
+        for item in keys:
+            if isinstance(item, dict):
+                key = str(item.get("key") or "").strip()
+                if item.get("auto_break") and key:
+                    breakers.append(key)
+                item = key
+            plain.append(item)
+        return {**data, "api_keys": plain, "auto_break_keys": breakers}
+
+    @field_validator("api_keys", "auto_break_keys", mode="before")
     @classmethod
     def _keys_as_list(cls, value: Any) -> Any:
         if isinstance(value, str):

@@ -219,7 +219,7 @@ async def _probe_target(
     api_key: str | None,
     expected_revision: str | None,
     timeout: int | None = None,
-) -> tuple[ProviderConfig, list[str], str | None]:
+) -> tuple[ProviderConfig, list[str], ProviderConfig | None]:
     """确定探测使用的服务商与候选密钥
 
     已保存的密钥只会发往该服务商保存的协议和地址；使用已保存密钥时
@@ -236,8 +236,8 @@ async def _probe_target(
         timeout: 请求超时
 
     返回:
-        tuple[ProviderConfig, list[str], str | None]: 服务商、候选密钥，
-            以及使用已保存密钥时用于记录健康状态的服务商名称
+        tuple[ProviderConfig, list[str], ProviderConfig | None]: 服务商、候选密钥，
+            以及使用已保存密钥时用于记录健康状态的已保存服务商
     """
     saved = _saved_provider(saved_provider_name or provider_name, expected_revision)
     if preset is None and saved is not None:
@@ -281,21 +281,21 @@ async def _probe_target(
         )
     if saved is None or selected_key not in saved_keys:
         return provider, [selected_key], None
-    available = health_manager.available_keys(saved.name, saved_keys, set())
+    available = health_manager.available_keys(saved, set())
     keys = [*available, *(key for key in saved_keys if key not in available)]
     if temporary_key:
         keys = [temporary_key, *(key for key in keys if key != temporary_key)]
-    return provider, keys, saved.name
+    return provider, keys, saved
 
 
 async def _try_keys(
-    keys: list[str], health_name: str | None, call: Any
+    keys: list[str], health: ProviderConfig | None, call: Any
 ) -> tuple[str, Any]:
     """依次用候选密钥发起请求，凭据被拒绝时换下一个
 
     参数:
         keys: 候选密钥
-        health_name: 记录密钥健康状态的服务商名称，为空时不记录
+        health: 记录密钥健康状态的已保存服务商，为空时不记录
         call: 接收密钥并发起请求的协程函数
 
     返回:
@@ -308,8 +308,8 @@ async def _try_keys(
         try:
             return key, await call(key)
         except LLMException as error:
-            if health_name:
-                health_manager.record_key_failure(health_name, key, error, cooldowns)
+            if health:
+                health_manager.record_key_failure(health, key, error, cooldowns)
             if not isinstance(error, AuthenticationException):
                 raise
             rejected = error
@@ -352,14 +352,15 @@ def _draft_route(
 
 async def _model_target(
     payload: ModelTestRequest,
-) -> tuple[Route, list[str], str | None]:
+) -> tuple[Route, list[str], ProviderConfig | None]:
     """校验付费确认与模型名称，确定测试使用的线路与候选密钥
 
     参数:
         payload: 模型测试请求
 
     返回:
-        tuple[Route, list[str], str | None]: 线路、候选密钥与记录健康状态的服务商名称
+        tuple[Route, list[str], ProviderConfig | None]: 线路、候选密钥与
+            记录健康状态的已保存服务商
     """
     if not payload.confirmed_paid_request:
         raise HTTPException(
@@ -378,7 +379,7 @@ async def _model_target(
             },
         )
     model_provider_name, model_name = payload.model.split("/", 1)
-    provider, keys, health_name = await _probe_target(
+    provider, keys, health = await _probe_target(
         provider_name=payload.provider_name or model_provider_name,
         saved_provider_name=payload.saved_provider_name,
         preset=payload.preset,
@@ -389,7 +390,7 @@ async def _model_target(
         timeout=min(payload.timeout or _TEST_TIMEOUT, _TEST_TIMEOUT),
     )
     route = _draft_route(provider, model_name, payload.model_settings, payload.task)
-    return route, keys, health_name
+    return route, keys, health
 
 
 async def _run_model_probe(
@@ -405,11 +406,11 @@ async def _run_model_probe(
     返回:
         tuple[Route, Any, float]: 线路、请求结果与耗时 (毫秒)
     """
-    route, keys, health_name = await _model_target(payload)
-    route_name = f"{health_name}/{route.model.name}"
+    route, keys, health = await _model_target(payload)
+    route_name = f"{health.name if health else None}/{route.model.name}"
     started = time.monotonic()
     try:
-        key, result = await _try_keys(keys, health_name, lambda key: call(route, key))
+        key, result = await _try_keys(keys, health, lambda key: call(route, key))
     except HTTPException:
         raise
     except Exception as error:
@@ -418,14 +419,14 @@ async def _run_model_probe(
             f"error={error.__class__.__name__}",
             "WebUi",
         )
-        if health_name and isinstance(error, LLMException | httpx.HTTPError):
+        if health and isinstance(error, LLMException | httpx.HTTPError):
             health_manager.record_route_failure(
                 route_name, error, get_llm_config().client_settings.route_cooldown
             )
         raise _map_probe_error(error) from error
     latency_ms = (time.monotonic() - started) * 1000
-    if health_name:
-        health_manager.record_key_success(health_name, key)
+    if health:
+        health_manager.record_key_success(health.name, key)
         health_manager.record_route_success(route_name)
     return route, result, latency_ms
 
@@ -437,7 +438,7 @@ async def _run_model_probe(
     response_class=JSONResponse,
 )
 async def discover_models(payload: ProviderDiscoveryRequest) -> Result:
-    provider, keys, health_name = await _probe_target(
+    provider, keys, health = await _probe_target(
         provider_name=payload.provider_name,
         saved_provider_name=payload.saved_provider_name,
         preset=payload.preset,
@@ -449,7 +450,7 @@ async def discover_models(payload: ProviderDiscoveryRequest) -> Result:
     started = time.monotonic()
     try:
         key, models = await _try_keys(
-            keys, health_name, lambda key: fetch_models(provider, key)
+            keys, health, lambda key: fetch_models(provider, key)
         )
     except HTTPException:
         raise
@@ -461,8 +462,8 @@ async def discover_models(payload: ProviderDiscoveryRequest) -> Result:
         )
         raise _map_probe_error(error) from error
     latency = round((time.monotonic() - started) * 1000)
-    if health_name:
-        health_manager.record_key_success(health_name, key)
+    if health:
+        health_manager.record_key_success(health.name, key)
     saved = _saved_provider(payload.saved_provider_name or payload.provider_name, None)
     if saved is None or (saved.protocol, saved.base_url) == (
         provider.protocol,

@@ -816,9 +816,7 @@ async def check_unverified_models() -> None:
     logger.info(f"发现 {len(pending)} 个未核验的模型，开始核验能力: {names}")
     for route in pending:
         provider = route.provider
-        available = health_manager.available_keys(
-            provider.name, provider.api_keys, set()
-        )
+        available = health_manager.available_keys(provider, set())
         keys = [*available, *(k for k in provider.api_keys if k not in available)]
         error: Exception | None = None
         for key in keys:

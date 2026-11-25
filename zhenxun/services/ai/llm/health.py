@@ -10,7 +10,7 @@ import hashlib
 import json
 import os
 import time
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -23,6 +23,9 @@ from zhenxun.services.ai.core.exceptions import (
 from zhenxun.services.ai.utils.logger import log_llm as logger
 from zhenxun.services.lifecycle.deadline import current_budget
 from zhenxun.utils.pydantic_compat import model_dump, parse_as
+
+if TYPE_CHECKING:
+    from zhenxun.services.ai.config.models import ProviderConfig
 
 HEALTH_FILE = DATA_PATH / "ai" / "api_key.json"
 
@@ -165,14 +168,17 @@ class HealthManager:
             key_id(api_key), KeyState()
         )
 
+    @staticmethod
+    def _breaks(provider: "ProviderConfig", api_key: str) -> bool:
+        return api_key in provider.auto_break_keys
+
     def available_keys(
-        self, provider: str, api_keys: list[str], exclude: set[str]
+        self, provider: "ProviderConfig", exclude: set[str]
     ) -> list[str]:
-        """获取未失效、未冷却且不在排除集合中的密钥
+        """获取可用且不在排除集合中的密钥，只有开启自动熔断的密钥会被停用或冷却
 
         参数:
-            provider: 提供商名称
-            api_keys: 提供商的全部密钥
+            provider: 提供商配置
             exclude: 本次调用已经失败的密钥标识
 
         返回:
@@ -181,42 +187,48 @@ class HealthManager:
         now = time.time()
         return [
             api_key
-            for api_key in api_keys
+            for api_key in provider.api_keys
             if key_id(api_key) not in exclude
-            and (state := self._key_state(provider, api_key)).status != "invalid"
-            and state.cooldown_until <= now
+            and (
+                not self._breaks(provider, api_key)
+                or (
+                    (state := self._key_state(provider.name, api_key)).status
+                    != "invalid"
+                    and state.cooldown_until <= now
+                )
+            )
         ]
 
     def pick_key(
         self,
-        provider: str,
-        api_keys: list[str],
+        provider: "ProviderConfig",
         exclude: set[str],
         *,
         affinity: str | None = None,
     ) -> str | None:
         """同一会话优先使用相同的健康密钥；无会话请求轮询。"""
-        available = self.available_keys(provider, api_keys, exclude)
+        available = self.available_keys(provider, exclude)
         if not available:
             return None
         if affinity:
             return max(
                 available,
                 key=lambda key: hashlib.sha256(
-                    f"{provider}\0{affinity}\0{key_id(key)}".encode()
+                    f"{provider.name}\0{affinity}\0{key_id(key)}".encode()
                 ).digest(),
             )
-        cursor = self._cursor.get(provider, 0)
-        self._cursor[provider] = cursor + 1
+        cursor = self._cursor.get(provider.name, 0)
+        self._cursor[provider.name] = cursor + 1
         return available[cursor % len(available)]
 
-    def key_recovery_time(self, provider: str, api_keys: list[str]) -> float | None:
-        """获取最早恢复可用的冷却密钥时间戳，全部失效时为 None"""
-        times = [
-            state.cooldown_until
-            for api_key in api_keys
-            if (state := self._key_state(provider, api_key)).status != "invalid"
-        ]
+    def key_recovery_time(self, provider: "ProviderConfig") -> float | None:
+        """获取最早恢复可用的密钥时间戳，全部失效或没有密钥时为 None"""
+        times: list[float] = []
+        for api_key in provider.api_keys:
+            if not self._breaks(provider, api_key):
+                times.append(0.0)
+            elif (state := self._key_state(provider.name, api_key)).status != "invalid":
+                times.append(state.cooldown_until)
         return min(times) if times else None
 
     def record_key_success(self, provider: str, api_key: str) -> None:
@@ -230,40 +242,50 @@ class HealthManager:
 
     def record_key_failure(
         self,
-        provider: str,
+        provider: "ProviderConfig",
         api_key: str,
         error: Exception,
         cooldowns: dict[str, int],
     ) -> None:
-        """记录密钥调用失败，并按错误类型设置冷却或失效
+        """记录密钥调用失败；开启自动熔断的密钥按错误类型设置冷却或失效
 
         参数:
-            provider: 提供商名称
+            provider: 提供商配置
             api_key: 失败的密钥
             error: 失败原因
             cooldowns: rate_limit / quota 两类冷却秒数
         """
-        state = self._key_state(provider, api_key)
+        state = self._key_state(provider.name, api_key)
         state.failures += 1
         state.last_error = str(error)[:256]
+        self._dirty = True
+        logger.debug(f"密钥 {mask_key(api_key)} 调用失败: {error}")
+        if not self._breaks(provider, api_key):
+            return
         retry_after = getattr(error, "details", {}).get("retry_after")
         if isinstance(error, AuthenticationException):
             state.status = "invalid"
+            logger.warning(
+                f"密钥 {mask_key(api_key)} 认证失败，已自动熔断，"
+                f"测试通过或关闭自动熔断后恢复: {error}"
+            )
         elif isinstance(error, QuotaExceededException | RateLimitException):
             kind = "quota" if isinstance(error, QuotaExceededException) else "rate"
             seconds = retry_after or cooldowns[kind]
             if seconds:
                 state.status = "cooldown"
                 state.cooldown_until = time.time() + float(seconds)
-        self._dirty = True
-        logger.debug(f"密钥 {mask_key(api_key)} 调用失败: {error}")
 
-    def key_stats(self, provider: str, api_keys: list[str]) -> dict[str, Any]:
-        """获取提供商的密钥统计，以脱敏密钥为键"""
-        return {
-            mask_key(api_key): model_dump(self._key_state(provider, api_key))
-            for api_key in api_keys
-        }
+    def key_stats(self, provider: "ProviderConfig") -> dict[str, Any]:
+        """获取提供商的密钥统计，以脱敏密钥为键；未开启自动熔断的密钥始终可用"""
+        stats: dict[str, Any] = {}
+        for api_key in provider.api_keys:
+            data = model_dump(self._key_state(provider.name, api_key))
+            data["auto_break"] = self._breaks(provider, api_key)
+            if not data["auto_break"]:
+                data.update(status="healthy", cooldown_until=0.0)
+            stats[mask_key(api_key)] = data
+        return stats
 
     def route_available(self, route: str) -> bool:
         """判断线路是否可用，熔断冷却结束后放行一次探测"""
