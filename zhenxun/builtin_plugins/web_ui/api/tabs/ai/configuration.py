@@ -58,11 +58,13 @@ class ProviderSettingsUpdate(BaseModel):
     api_keys: list[str] | None = None
     auto_break_keys: list[str] | None = None
     models: list[dict[str, Any]] | None = None
+    model_renames: dict[str, str] | None = None
 
 
 class ProviderModelsUpdate(BaseModel):
     expected_revision: str = Field(min_length=64, max_length=64)
     models: list[dict[str, Any]]
+    model_renames: dict[str, str] | None = None
 
 
 class SectionUpdate(BaseModel):
@@ -86,38 +88,82 @@ class ReferenceRepairRequest(BaseModel):
     expected_revision: str = Field(min_length=64, max_length=64)
 
 
-def _rename_provider_references(ai: dict[str, Any], old: str, new: str) -> None:
-    if old == new:
+def _rename_references(
+    ai: dict[str, Any],
+    provider: str,
+    new_provider: str,
+    model_renames: dict[str, str] | None = None,
+) -> None:
+    """把默认模型与路由组中指向该服务商的引用改为新的服务商名和模型名
+
+    参数:
+        ai: AI 配置
+        provider: 原服务商名称
+        new_provider: 新服务商名称
+        model_renames: 原模型名到新模型名的映射
+    """
+    renames = model_renames or {}
+    if provider == new_provider and not renames:
         return
-    old_prefix = f"{old}/"
-    new_prefix = f"{new}/"
+    prefix = f"{provider}/"
+
+    def rename(target: Any) -> Any:
+        if not isinstance(target, str) or not target.startswith(prefix):
+            return target
+        model = target[len(prefix) :]
+        return f"{new_provider}/{renames.get(model, model)}"
 
     defaults = ai_get(ai, "default_models", {})
     if isinstance(defaults, dict):
         for task, target in defaults.items():
-            if isinstance(target, str) and target.startswith(old_prefix):
-                defaults[task] = new_prefix + target[len(old_prefix) :]
+            defaults[task] = rename(target)
 
     groups = ai_get(ai, "MODEL_GROUPS", {})
     if isinstance(groups, dict):
         for group, targets in groups.items():
             if isinstance(targets, list):
-                groups[group] = [
-                    new_prefix + target[len(old_prefix) :]
-                    if isinstance(target, str) and target.startswith(old_prefix)
-                    else target
-                    for target in targets
-                ]
+                groups[group] = [rename(target) for target in targets]
 
 
-def _merge_models(
-    provider: dict[str, Any], models: list[dict[str, Any]]
-) -> list[dict[str, Any]]:
-    """用提交的模型列表覆盖服务商模型，保留同名模型中未提交的字段
+def _model_renames(
+    provider: dict[str, Any],
+    models: list[dict[str, Any]],
+    renames: dict[str, str] | None,
+) -> dict[str, str]:
+    """筛选有效的模型改名：原名已保存且不再提交，新名在提交的模型列表中
 
     参数:
         provider: 原始服务商配置
         models: 提交的模型列表
+        renames: 提交的原模型名到新模型名的映射
+
+    返回:
+        dict[str, str]: 有效的改名映射
+    """
+    saved = {
+        str(item.get("name"))
+        for item in provider.get("models") or []
+        if isinstance(item, dict) and item.get("name")
+    }
+    submitted = {str(model.get("name", "")) for model in models}
+    return {
+        old: new
+        for old, new in (renames or {}).items()
+        if old != new and old in saved and old not in submitted and new in submitted
+    }
+
+
+def _merge_models(
+    provider: dict[str, Any],
+    models: list[dict[str, Any]],
+    renames: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    """用提交的模型列表覆盖服务商模型，保留同名或改名前模型中未提交的字段
+
+    参数:
+        provider: 原始服务商配置
+        models: 提交的模型列表
+        renames: 原模型名到新模型名的映射
 
     返回:
         list[dict[str, Any]]: 合并后的模型列表
@@ -127,10 +173,13 @@ def _merge_models(
         for item in provider.get("models") or []
         if isinstance(item, dict) and item.get("name")
     }
-    return [
-        {**deepcopy(existing.get(str(model.get("name", "")), {})), **model}
-        for model in models
-    ]
+    origin = {new: old for old, new in (renames or {}).items()}
+    result = []
+    for model in models:
+        name = str(model.get("name", ""))
+        saved = existing.get(origin.get(name, name), {})
+        result.append({**deepcopy(saved), **model})
+    return result
 
 
 def _normalize_model_groups(value: Any) -> dict[str, list[str]]:
@@ -306,10 +355,15 @@ async def update_provider(
         index, provider = find_provider(ai, provider_name)
         _check_provider_name(ai, payload.name, index)
         fields = _provider_fields(payload)
-        _rename_provider_references(ai, str(provider.get("name", "")), fields["name"])
+        renames = (
+            {}
+            if payload.models is None
+            else _model_renames(provider, payload.models, payload.model_renames)
+        )
+        _rename_references(ai, str(provider.get("name", "")), fields["name"], renames)
         _set_fields(provider, fields)
         if payload.models is not None:
-            provider["models"] = _merge_models(provider, payload.models)
+            provider["models"] = _merge_models(provider, payload.models, renames)
 
     revision, config, operation = await persist(payload.expected_revision, mutate)
     return Result.ok(
@@ -345,7 +399,10 @@ async def delete_provider(provider_name: str, expected_revision: str) -> Result:
 async def update_models(provider_name: str, payload: ProviderModelsUpdate) -> Result:
     def mutate(ai: dict[str, Any]) -> None:
         _, provider = find_provider(ai, provider_name)
-        provider["models"] = _merge_models(provider, payload.models)
+        renames = _model_renames(provider, payload.models, payload.model_renames)
+        name = str(provider.get("name", ""))
+        _rename_references(ai, name, name, renames)
+        provider["models"] = _merge_models(provider, payload.models, renames)
 
     revision, config, operation = await persist(payload.expected_revision, mutate)
     return Result.ok(

@@ -796,42 +796,42 @@ def format_results(results: list[dict[str, Any]]) -> str:
 
 
 async def check_unverified_models() -> None:
-    """核验配置文件中从未核验过的已启用对话模型，失败的模型下次启动时重试"""
-    from zhenxun.services.ai.core.exceptions import AuthenticationException
+    """核验尚未核验的默认对话模型，默认值为路由组时只核验首选模型，失败时下次启动重试"""
+    from zhenxun.services.ai.core.exceptions import (
+        AuthenticationException,
+        ConfigurationException,
+    )
 
     from .health import health_manager
-    from .manager import get_configured_providers, get_profile
+    from .manager import resolve_routes
 
-    pending = [
-        Route(provider, model, get_profile(provider, model))
-        for provider in get_configured_providers()
-        if provider.base_url and provider.api_keys
-        for model in provider.models
-        if model.enabled and get_observation(provider, model) is None
-    ]
-    pending = [route for route in pending if route.profile.supports_task("chat")]
-    if not pending:
+    try:
+        route = resolve_routes(None, "chat")[0]
+    except ConfigurationException:
         return
-    names = "、".join(route.name for route in pending)
-    logger.info(f"发现 {len(pending)} 个未核验的模型，开始核验能力: {names}")
-    for route in pending:
-        provider = route.provider
-        available = health_manager.available_keys(provider, set())
-        keys = [*available, *(k for k in provider.api_keys if k not in available)]
-        error: Exception | None = None
-        for key in keys:
-            try:
-                results = await run_check(route, key)
-            except AuthenticationException as e:
-                error = e
-                continue
-            except Exception as e:
-                error = e
-                break
-            logger.info(f"模型 {route.name} 核验完成: {format_results(results)}")
-            error = None
+    provider = route.provider
+    if (
+        not provider.base_url
+        or not provider.api_keys
+        or get_observation(provider, route.model) is not None
+    ):
+        return
+    logger.info(f"默认对话模型 {route.name} 尚未核验，开始核验能力")
+    available = health_manager.available_keys(provider, set())
+    keys = [*available, *(k for k in provider.api_keys if k not in available)]
+    error: Exception | None = None
+    for key in keys:
+        try:
+            results = await run_check(route, key)
+        except AuthenticationException as e:
+            error = e
+            continue
+        except Exception as e:
+            error = e
             break
-        if error is not None:
-            logger.warning(
-                f"模型 {route.name} 核验失败，下次启动时重试: {_error_text(error)}"
-            )
+        logger.info(f"模型 {route.name} 核验完成: {format_results(results)}")
+        return
+    if error is not None:
+        logger.warning(
+            f"模型 {route.name} 核验失败，下次启动时重试: {_error_text(error)}"
+        )

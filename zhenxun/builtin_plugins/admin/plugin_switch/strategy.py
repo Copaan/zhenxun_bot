@@ -1,6 +1,8 @@
 from abc import ABC, abstractmethod
 from typing import Any, cast
 
+from tortoise.expressions import Q
+
 from zhenxun.models.group_console import GroupConsole
 from zhenxun.models.plugin_info import PluginInfo
 from zhenxun.models.task_info import TaskInfo
@@ -68,10 +70,17 @@ class PluginStrategy(SwitchStrategy):
         return "功能"
 
     async def get_entity(self, name: str) -> Any:
-        if name.isdigit():
-            return await PluginInfo.get_or_none(id=int(name))
+        """按名称或功能列表中的 ID 查找已加载的插件
+
+        参数:
+            name: 插件名称或 ID
+
+        返回:
+            Any: 插件信息，未找到时为 None
+        """
+        query = Q(id=int(name)) if name.isdigit() else Q(name=name)
         return await PluginInfo.get_or_none(
-            name=name, load_status=True, plugin_type__not=PluginType.PARENT
+            query, load_status=True, plugin_type__not=PluginType.PARENT
         )
 
     async def check_block_status(self, group_id: str, module: str) -> tuple[bool, bool]:

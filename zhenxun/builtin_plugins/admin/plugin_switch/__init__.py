@@ -232,6 +232,7 @@ async def _handle_switch_command(
         await MessageUtils.build_message("请选择一个目标群组").finish(reply_to=True)
 
     messages = []
+    batch_names: list[str] = []
     for name in names:
         name_str = str(name)
         if is_superuser and default_status.result:
@@ -284,24 +285,29 @@ async def _handle_switch_command(
             messages.append(f"{name_str}: 请选择一个目标群组")
             continue
 
-        msg = await PluginManager.batch_update_status(
-            name_str,
-            targets,
-            status=status,
-            is_task=task.result,
-            is_superuser=is_superuser,
-            is_whitelist_mode=only_flag_value,
-            use_su_field=use_su_field_final,
-            bot=bot,
-            channel_id=getattr(getattr(session, "channel", None), "id", None),
+        batch_names.append(name_str)
+
+    if batch_names:
+        messages.append(
+            await PluginManager.batch_update_status(
+                batch_names,
+                targets,
+                status=status,
+                is_task=task.result,
+                is_superuser=is_superuser,
+                is_whitelist_mode=only_flag_value,
+                use_su_field=use_su_field_final,
+                bot=bot,
+                channel_id=getattr(getattr(session, "channel", None), "id", None),
+                current_group=not is_remote,
+            )
         )
         action_name = "开启" if status else "关闭"
         logger.info(
-            f"{action_name}操作: {name_str}, targets={targets}",
+            f"{action_name}操作: {'、'.join(batch_names)}, targets={targets}",
             arparma.header_result,
             session=session,
         )
-        messages.append(msg)
 
     await MessageUtils.build_message("\n".join(messages)).finish(reply_to=True)
 

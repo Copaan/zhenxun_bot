@@ -101,8 +101,29 @@ def receipt_dependency_inputs(
     return result
 
 
+def _version_text(node: ast.expr, constants: dict[str, str]) -> str | None:
+    """解析版本表达式，支持字符串字面量与模块级字符串常量
+
+    参数:
+        node: 版本表达式
+        constants: 模块级字符串常量
+
+    返回:
+        str | None: 版本文本
+    """
+    if isinstance(node, ast.Name):
+        return constants.get(node.id)
+    try:
+        value = ast.literal_eval(node)
+    except (ValueError, TypeError, SyntaxError):
+        return None
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
 def artifact_version(path: Path) -> str | None:
     """从插件元数据中静态读取插件版本
+
+    支持 PluginExtraData(version=...) 与 PluginMetadata(extra={"version": ...})。
 
     参数:
         path: 插件源码路径
@@ -115,13 +136,15 @@ def artifact_version(path: Path) -> str | None:
         tree = ast.parse(entrypoint.read_text(encoding="utf-8"))
     except (OSError, SyntaxError, UnicodeError):
         return None
+    constants: dict[str, str] = {}
     metadata_values = []
     for node in tree.body:
-        if isinstance(node, ast.Assign) and any(
-            isinstance(target, ast.Name) and target.id == "__plugin_meta__"
-            for target in node.targets
-        ):
-            metadata_values.append(node.value)
+        if isinstance(node, ast.Assign):
+            names = [t.id for t in node.targets if isinstance(t, ast.Name)]
+            if "__plugin_meta__" in names:
+                metadata_values.append(node.value)
+            elif text := _version_text(node.value, {}):
+                constants.update(dict.fromkeys(names, text))
         elif (
             isinstance(node, ast.AnnAssign)
             and isinstance(node.target, ast.Name)
@@ -140,19 +163,22 @@ def artifact_version(path: Path) -> str | None:
                 if isinstance(node.func, ast.Attribute)
                 else ""
             )
-            if name != "PluginExtraData":
+            keywords = {item.arg: item.value for item in node.keywords}
+            if name == "PluginExtraData" and "version" in keywords:
+                candidates = [keywords["version"]]
+            elif name == "PluginMetadata" and isinstance(
+                extra := keywords.get("extra"), ast.Dict
+            ):
+                candidates = [
+                    value
+                    for key, value in zip(extra.keys, extra.values)
+                    if isinstance(key, ast.Constant) and key.value == "version"
+                ]
+            else:
                 continue
-            keyword = next(
-                (item for item in node.keywords if item.arg == "version"), None
-            )
-            if keyword is None:
-                continue
-            try:
-                value = ast.literal_eval(keyword.value)
-            except (ValueError, TypeError):
-                continue
-            if isinstance(value, str) and value.strip():
-                return value.strip()
+            for candidate in candidates:
+                if version := _version_text(candidate, constants):
+                    return version
     return None
 
 

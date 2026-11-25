@@ -102,7 +102,7 @@ class PluginManager:
     @classmethod
     async def batch_update_status(
         cls,
-        name: str,
+        names: list[str],
         target_groups: set[str],
         status: bool,
         is_task: bool = False,
@@ -111,11 +111,12 @@ class PluginManager:
         bot: Bot | None = None,
         use_su_field: bool = False,
         channel_id: str | None = None,
+        current_group: bool = False,
     ) -> str:
-        """批量开关多个群中的功能，超级用户开启时同时解除本群禁用与超管锁定
+        """批量开关多个群中的多个功能，超级用户开启时同时解除本群禁用与超管锁定
 
         参数:
-            name: 功能名称
+            names: 功能名称或 ID
             target_groups: 目标群
             status: 开启或关闭
             is_task: 是否为被动技能
@@ -124,49 +125,74 @@ class PluginManager:
             bot: 当前账号
             use_su_field: 关闭时写入超管锁定
             channel_id: 频道
+            current_group: 目标仅为当前群
 
         返回:
-            str: 回复消息，包含开启后仍不可用的原因
+            str: 回复消息，包含未找到的功能与开启后仍不可用的原因
         """
         from zhenxun.services.bot_group_policy import bot_group_policy_service
 
         if bot is None:
             return "缺少 Bot 作用域，请指定目标账号后重试。"
         strategy = get_strategy(is_task)
-        entity = await strategy.get_entity(name)
-        if not entity:
-            return f"未找到{strategy.entity_type_name}: {name}"
-        if (
-            not status
-            and not is_superuser
-            and not is_task
-            and entity.plugin_type in _MANAGE_TYPES
-            and entity.module_path.startswith("zhenxun.builtin_plugins.")
-        ):
-            return f"{entity.name} 是内置管理功能，仅超级用户可以关闭"
-        to_open, to_close = await cls._calculate_affected_groups(
-            target_groups, status, is_whitelist_mode, bot
-        )
-        bot_id = PlatformUtils.get_storage_bot_id(bot)
-        scope = PlatformUtils.get_platform_scope(bot)
-        opened = []
-        for gid in sorted(to_open | to_close):
-            view = await bot_group_policy_service.set_features(
-                bot_id,
-                scope,
-                gid,
-                [entity.module],
-                gid in to_open,
-                task=is_task,
-                channel_id=channel_id,
-                force=use_su_field,
-                is_superuser=is_superuser,
+        modules: dict[str, str] = {}
+        missing: list[str] = []
+        protected: list[str] = []
+        for name in names:
+            entity = await strategy.get_entity(name)
+            if not entity:
+                missing.append(name)
+            elif (
+                not status
+                and not is_superuser
+                and not is_task
+                and entity.plugin_type in _MANAGE_TYPES
+                and entity.module_path.startswith("zhenxun.builtin_plugins.")
+            ):
+                protected.append(entity.name)
+            else:
+                modules[entity.module] = entity.name
+        lines = []
+        if modules:
+            to_open, to_close = await cls._calculate_affected_groups(
+                target_groups, status, is_whitelist_mode, bot
             )
-            if gid in to_open:
-                opened.append(view)
-        return (
-            f"已更新当前账号策略：开启 {len(to_open)} 群，关闭 {len(to_close)} 群。"
-        ) + cls.blocked_notice(opened, {entity.module}, is_task)
+            bot_id = PlatformUtils.get_storage_bot_id(bot)
+            scope = PlatformUtils.get_platform_scope(bot)
+            opened = []
+            for gid in sorted(to_open | to_close):
+                view = await bot_group_policy_service.set_features(
+                    bot_id,
+                    scope,
+                    gid,
+                    list(modules),
+                    gid in to_open,
+                    task=is_task,
+                    channel_id=channel_id,
+                    force=use_su_field,
+                    is_superuser=is_superuser,
+                )
+                if gid in to_open:
+                    opened.append(view)
+            count = f"{len(modules)} 个{'被动' if is_task else '插件'}"
+            if not to_open and not to_close:
+                lines.append("没有目标群组需要操作。")
+            elif current_group:
+                lines.append(f"已在本群{'开启' if status else '关闭'} {count}")
+            elif to_open and to_close:
+                lines.append(
+                    f"已在 {len(to_open)} 个群开启、"
+                    f"其余 {len(to_close)} 个群关闭 {count}"
+                )
+            else:
+                action = "开启" if to_open else "关闭"
+                lines.append(f"已在 {len(to_open or to_close)} 个群{action} {count}")
+            lines[-1] += cls.blocked_notice(opened, set(modules), is_task)
+        if protected:
+            lines.append(f"{'、'.join(protected)} 是内置管理功能，仅超级用户可以关闭")
+        if missing:
+            lines.append(f"未找到{strategy.entity_type_name}: {'、'.join(missing)}")
+        return "\n".join(lines)
 
     @classmethod
     async def set_default_status(
