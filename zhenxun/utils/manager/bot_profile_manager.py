@@ -12,13 +12,21 @@ from zhenxun.configs.path_config import DATA_PATH
 from zhenxun.configs.utils.models import PluginExtraData
 from zhenxun.models.statistics import Statistics
 from zhenxun.models.user_console import UserConsole
+from zhenxun.services.avatar_service import avatar_service
+from zhenxun.services.help_service import is_night_mode
 from zhenxun.services.log import logger
 from zhenxun.utils.platform import PlatformUtils
 from zhenxun.utils.pydantic_compat import model_dump
 
 DIR_PATH = DATA_PATH / "bot_profile"
+"""自我介绍目录：profile.md / avatar.png 为全部 Bot 共用，<bot_id>/ 下的同名文件优先"""
 
-PROFILE_PATH = DIR_PATH / "profile"
+LEGACY_PATH = DIR_PATH / "profile"
+"""旧版 profile/<bot_id>/profile.txt 存放目录"""
+
+PROFILE_FILE = "profile.md"
+
+AVATAR_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp", ".gif")
 
 
 Config.add_plugin_config(
@@ -58,6 +66,8 @@ class BotProfileManager:
 
     _plugin_data: ClassVar[dict[str, PluginProfile]] = {}
 
+    _migrated: ClassVar[bool] = False
+
     @classmethod
     def clear_profile_image(cls, bot_id: str | None = None):
         """清除BOT自我介绍的内存缓存"""
@@ -68,27 +78,82 @@ class BotProfileManager:
             cls._bot_data.clear()
 
     @classmethod
+    def migrate_legacy(cls):
+        """将旧版 profile/<bot_id>/profile.txt 与 <bot_id>.png 移到 <bot_id>/ 下"""
+        cls._migrated = True
+        if not LEGACY_PATH.is_dir():
+            return
+        for old_dir in LEGACY_PATH.iterdir():
+            if not old_dir.is_dir():
+                continue
+            new_dir = DIR_PATH / old_dir.name
+            moves = [
+                (old_dir / "profile.txt", new_dir / PROFILE_FILE),
+                (old_dir / f"{old_dir.name}.png", new_dir / "avatar.png"),
+            ]
+            for old, new in moves:
+                if not old.is_file():
+                    continue
+                if old.stat().st_size and not new.exists():
+                    new_dir.mkdir(parents=True, exist_ok=True)
+                    old.replace(new)
+                    logger.info(f"自我介绍文件已迁移: {old} -> {new}")
+                elif not old.stat().st_size:
+                    old.unlink()
+            if not any(old_dir.iterdir()):
+                old_dir.rmdir()
+        if not any(LEGACY_PATH.iterdir()):
+            LEGACY_PATH.rmdir()
+
+    @classmethod
+    def find_file(cls, bot_id: str, names: list[str]) -> Path | None:
+        """按 <bot_id>/ 优先、再到共用目录的顺序查找文件
+
+        参数:
+            bot_id: BOT ID
+            names: 候选文件名
+
+        返回:
+            Path | None: 找到的文件
+        """
+        for folder in (DIR_PATH / bot_id, DIR_PATH):
+            for name in names:
+                if (path := folder / name).is_file():
+                    return path
+        return None
+
+    @classmethod
     async def _read_profile(cls, bot_id: str):
         """读取已有的BOT自我介绍；未配置时跳过，不创建目录或文件。
 
         参数:
             bot_id: BOT ID
-
         """
-        bot_file_path = PROFILE_PATH / f"{bot_id}"
-        bot_profile_file = bot_file_path / "profile.txt"
-        if not bot_profile_file.exists():
-            logger.debug(f"BOT自我介绍文件不存在: {bot_profile_file}, 跳过读取")
+        if not cls._migrated:
+            cls.migrate_legacy()
+        profile_file = cls.find_file(bot_id, [PROFILE_FILE])
+        if not profile_file:
+            logger.debug(f"BOT自我介绍文件不存在: {DIR_PATH / PROFILE_FILE}, 跳过读取")
             return
-        async with aiofiles.open(bot_profile_file, encoding="utf-8") as f:
+        async with aiofiles.open(profile_file, encoding="utf-8") as f:
             introduction = await f.read()
-        avatar = bot_file_path / f"{bot_id}.png"
-        if not avatar.exists():
-            avatar = None
-        bot = await PlatformUtils.get_user(nonebot.get_bot(bot_id), bot_id)
-        name = bot.name if bot else "未知"
+        avatar = cls.find_file(bot_id, [f"avatar{s}" for s in AVATAR_SUFFIXES])
+        name = ""
+        try:
+            bot = nonebot.get_bot(bot_id)
+            if user := await PlatformUtils.get_user(bot, bot_id):
+                name = user.name
+            if not avatar:
+                avatar = await avatar_service.get_avatar_path(
+                    PlatformUtils.get_platform(bot), bot_id
+                )
+        except Exception as e:
+            logger.debug("获取BOT信息失败，使用默认名称与头像", e=e)
         cls._bot_data[bot_id] = Profile(
-            bot_id=bot_id, introduction=introduction, avatar=avatar, name=name
+            bot_id=bot_id,
+            introduction=introduction,
+            avatar=avatar,
+            name=name or BotConfig.self_nickname or "绪山真寻",
         )
 
     @classmethod
@@ -155,10 +220,14 @@ class BotProfileManager:
             "plugin_list": cls.get_plugin_profile(),
             "tags": tags,
             "title": f"{BotConfig.self_nickname}简介",
+            "night": is_night_mode(),
         }
         return await ui.render_template(
             "pages/builtin/bot_profile",
             data=profile_data,
+            clip_selector=".page",
+            clip_padding=0,
+            disable_animations=True,
             use_cache=True,
         )
 

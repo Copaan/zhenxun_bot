@@ -37,8 +37,10 @@ from .core import (
     TextSpan,
 )
 from .presets import (
+    HelpBlock,
     HelpCategory,
     HelpItem,
+    HelpSection,
     PluginHelpPageData,
     PluginMenuCategory,
     PluginMenuData,
@@ -54,8 +56,10 @@ __all__ = [
     "Divider",
     "EChartsData",
     "HeadingElement",
+    "HelpBlock",
     "HelpCategory",
     "HelpItem",
+    "HelpSection",
     "ImageCell",
     "ImageElement",
     "LayoutData",

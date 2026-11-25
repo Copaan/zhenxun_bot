@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from typing import Any
 
+from pydantic_core import to_jsonable_python
+
 from zhenxun.services.cache.bounded_ttl import BoundedTTLCache
-from zhenxun.utils.pydantic_compat import dump_json_safely
 
 
 class RenderResultMemoryCache:
@@ -30,8 +32,8 @@ class RenderResultMemoryCache:
 
     @staticmethod
     def build_key(payload: Any) -> str:
-        payload_text = dump_json_safely(
-            payload,
+        payload_text = json.dumps(
+            to_jsonable_python(payload),
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),

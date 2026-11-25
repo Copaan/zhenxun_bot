@@ -1,10 +1,12 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from ..core.base import RenderableComponent
 
 __all__ = [
+    "HelpBlock",
     "HelpCategory",
     "HelpItem",
+    "HelpSection",
     "PluginHelpPageData",
 ]
 
@@ -31,6 +33,30 @@ class HelpCategory(BaseModel):
     """该分类下的功能项列表"""
 
 
+class HelpBlock(BaseModel):
+    """排版后放进某一列的内容块"""
+
+    title: str | None = None
+    """并入上一分类的小分类标题，为空时只是一张卡片"""
+    icon_svg_path: str = ""
+    """小分类图标的SVG路径数据"""
+    items: list[HelpItem]
+    """块内的功能项"""
+
+
+class HelpSection(BaseModel):
+    """排版后的一个分类区域"""
+
+    title: str
+    """分类标题"""
+    icon_svg_path: str
+    """分类图标的SVG路径数据"""
+    count: int
+    """分类下的功能数量"""
+    columns: list[list[HelpBlock]]
+    """每一列依次排列的内容块"""
+
+
 class PluginHelpPageData(RenderableComponent):
     """通用插件帮助页面的数据模型"""
 
@@ -42,6 +68,8 @@ class PluginHelpPageData(RenderableComponent):
     """页面主标题"""
     categories: list[HelpCategory]
     """帮助分类列表"""
+    sections: list[HelpSection] = Field(default_factory=list)
+    """按卡片高度分好列的分类区域"""
     night: bool = False
     """是否使用夜间配色"""
 

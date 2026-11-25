@@ -21,9 +21,9 @@ __plugin_meta__ = PluginMetadata(
     description="功能调用统计可视化",
     usage="""
     usage：
-    功能调用统计可视化
+    功能调用统计可视化，可在指令后加功能名只看该功能
     指令：
-        功能调用统计
+        功能调用统计 ?[功能名]
         日功能调用统计
         周功能调用统计
         月功能调用统计
@@ -35,7 +35,7 @@ __plugin_meta__ = PluginMetadata(
     """.strip(),
     extra=PluginExtraData(
         author="HibiKier",
-        version="0.1",
+        version="0.2",
         plugin_type=PluginType.NORMAL,
         menu_type="数据统计",
         aliases={"功能调用统计"},

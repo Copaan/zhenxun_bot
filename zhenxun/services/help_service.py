@@ -1,17 +1,28 @@
 from collections import defaultdict
 import contextlib
 from datetime import datetime
+from functools import cache
+import math
+import re
 
 import nonebot
 from nonebot.plugin import PluginMetadata
+from PIL import ImageFont
 from pydantic import BaseModel, ConfigDict
 
 from zhenxun import ui
 from zhenxun.configs.config import BotConfig, Config
+from zhenxun.configs.path_config import FONT_PATH
 from zhenxun.models.plugin_info import PluginInfo
 from zhenxun.models.task_info import TaskInfo
 from zhenxun.services.renderer.result_cache import RenderResultMemoryCache
-from zhenxun.ui.models import HelpCategory, HelpItem, PluginHelpPageData
+from zhenxun.ui.models import (
+    HelpBlock,
+    HelpCategory,
+    HelpItem,
+    HelpSection,
+    PluginHelpPageData,
+)
 from zhenxun.utils.common_utils import format_usage_for_markdown
 from zhenxun.utils.enum import PluginType
 
@@ -88,6 +99,156 @@ async def _get_task_category() -> dict:
     }
 
 
+_COLUMNS = 3
+"""帮助页每个分类的列数"""
+_COLUMN_WIDTH = (1200 - 24 * 2 - 16 * (_COLUMNS - 1)) / _COLUMNS
+"""每列宽度，与模板中页面宽度、内边距和列间距一致"""
+_FONT = "AlibabaHealthFont2.0CN-85B.ttf"
+"""帮助页正文字体"""
+
+
+@cache
+def _font(size: int) -> ImageFont.FreeTypeFont | None:
+    with contextlib.suppress(OSError):
+        return ImageFont.truetype(str(FONT_PATH / _FONT), size)
+    return None
+
+
+def _text_width(text: str, size: float) -> float:
+    """按帮助页字体测量文字宽度，字体缺失时按全角一字、半角半字估算"""
+    if font := _font(round(size)):
+        return font.getlength(text)
+    return sum(size if ord(ch) > 0x2E7F else size / 2 for ch in text)
+
+
+def _markdown_height(
+    text: str, width: float, size: float, line_height: float, gap: float
+) -> float:
+    """估算 Markdown 文本渲染后的高度，按块级元素的上下边距折叠计算
+
+    参数:
+        text: Markdown 文本
+        width: 可用宽度
+        size: 字号
+        line_height: 行高倍数
+        gap: 段落下边距
+
+    返回:
+        float: 估算高度 (像素)
+    """
+    blocks: list[tuple[float, float, list[list]]] = []
+    kind, blank, joinable = "", False, False
+    for raw in text.strip().split("\n"):
+        line = raw.strip()
+        if not line:
+            blank = True
+            continue
+        indented = raw[:1] == " "
+        if re.fullmatch(r"[-*_]{3,}", line):
+            blocks.append((8, 8, [["", 0, 2 / line_height]]))
+            kind = ""
+        elif heading := re.match(r"#+\s*", line):
+            blocks.append((8, 4, [[line[heading.end() :], width, 14]]))
+            kind = ""
+        elif item := re.match(r"[-*+]\s+", line):
+            if kind != "list":
+                blocks.append((4, 4, []))
+                kind = "list"
+            depth = 1 + (len(raw) - len(raw.lstrip())) // 4
+            blocks[-1][2].append([line[item.end() :], width - 18 * depth, size])
+        elif kind and (not blank or (kind == "list" and indented)):
+            rows = blocks[-1][2]
+            if joinable:
+                rows[-1][0] += f" {line}"
+            else:
+                rows.append([line, rows[-1][1], size])
+        else:
+            blocks.append((0, gap, [[line, width, size]]))
+            kind = "p"
+        blank = False
+        joinable = kind != "" and not raw.endswith("  ")
+    if not blocks:
+        return 0.0
+    if blocks[-1][1] == gap:
+        blocks[-1] = (blocks[-1][0], 0, blocks[-1][2])
+    height = blocks[0][0] + blocks[-1][1]
+    for index, (top, _, rows) in enumerate(blocks):
+        if index:
+            height += max(blocks[index - 1][1], top)
+        for line, line_width, line_size in rows:
+            if not line_width:
+                height += line_size * line_height
+                continue
+            extra = 8 * line.count("`") / 2
+            used = _text_width(re.sub(r"\*\*|`|^>\s*", "", line), line_size) + extra
+            height += max(1, math.ceil(used / line_width)) * line_size * line_height
+    return height
+
+
+def _item_height(item: HelpItem) -> float:
+    """估算单张帮助卡片的高度，含卡片间距"""
+    inner = _COLUMN_WIDTH - 38
+    height = 37 + 16 + 28
+    height += _markdown_height(item.description, inner, 13, 1.55, 0)
+    if item.usage:
+        height += 32 + _markdown_height(item.usage, inner - 26, 13, 1.7, 6)
+    return height
+
+
+def _balance(units: list[tuple[float, HelpBlock]]) -> list[list[HelpBlock]]:
+    """从高到低依次把内容块放进当前最矮的一列，列内保持原顺序
+
+    参数:
+        units: (估算高度, 内容块) 列表
+
+    返回:
+        list[list[HelpBlock]]: 每一列的内容块
+    """
+    heights = [0.0] * _COLUMNS
+    columns: list[list[int]] = [[] for _ in range(_COLUMNS)]
+    for index in sorted(range(len(units)), key=lambda i: -units[i][0]):
+        column = heights.index(min(heights))
+        columns[column].append(index)
+        heights[column] += units[index][0]
+    return [[units[i][1] for i in sorted(column)] for column in columns]
+
+
+def _layout(categories: list[HelpCategory]) -> list[HelpSection]:
+    """把分类排成三列；卡片少于列数的分类并入上一分类，减少空白
+
+    参数:
+        categories: 帮助分类列表
+
+    返回:
+        list[HelpSection]: 分好列的分类区域
+    """
+    groups: list[tuple[HelpCategory, list[tuple[float, HelpBlock]]]] = []
+    for category in categories:
+        heights = [_item_height(item) for item in category.items]
+        if groups and len(category.items) < _COLUMNS:
+            block = HelpBlock(
+                title=category.title,
+                icon_svg_path=category.icon_svg_path,
+                items=category.items,
+            )
+            groups[-1][1].append((sum(heights) + 46, block))
+            continue
+        units = [
+            (height, HelpBlock(items=[item]))
+            for height, item in zip(heights, category.items)
+        ]
+        groups.append((category, units))
+    return [
+        HelpSection(
+            title=category.title,
+            icon_svg_path=category.icon_svg_path,
+            count=len(category.items),
+            columns=_balance(units),
+        )
+        for category, units in groups
+    ]
+
+
 async def create_plugin_help_image(
     plugin_types: list[PluginType], page_title: str
 ) -> bytes:
@@ -142,6 +303,7 @@ async def create_plugin_help_image(
         bot_nickname=BotConfig.self_nickname,
         page_title=page_title,
         categories=categories,
+        sections=_layout(categories),
         night=is_night_mode(),
     )
 

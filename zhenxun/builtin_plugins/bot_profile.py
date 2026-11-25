@@ -19,11 +19,12 @@ __plugin_meta__ = PluginMetadata(
     """.strip(),
     extra=PluginExtraData(
         author="HibiKier",
-        version="0.1",
+        version="0.2",
         menu_type="其他",
         superuser_help="""
-        在data/bot_profile/bot_id/profile.txt 中编辑BOT自我介绍
-        在data/bot_profile/bot_id/bot_id.png  中编辑BOT头像
+        在 data/bot_profile/profile.md 中编辑BOT自我介绍（支持 Markdown）
+        在 data/bot_profile/avatar.png 中放置BOT头像，未放置时使用平台头像
+        多个BOT需要不同介绍时，放在 data/bot_profile/<bot_id>/ 下优先使用
         指令：
             重载自我介绍
         """.strip(),

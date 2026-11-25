@@ -10,6 +10,7 @@ from functools import wraps
 from typing import Any, Literal, TypeVar
 
 from tortoise.exceptions import DBConnectionError, OperationalError
+from tortoise.expressions import Q
 from tortoise.functions import Count
 
 from zhenxun.services.cache.bounded_ttl import BoundedTTLCache
@@ -163,6 +164,11 @@ _STATISTICS_COUNT_CACHE = HotCache[str, tuple[tuple[str, int], ...]](
     "hot_statistics_plugin_counts",
     ttl_seconds=20,
     max_items=512,
+)
+_STATISTICS_TREND_CACHE = HotCache[str, tuple[int, ...]](
+    "hot_statistics_trend",
+    ttl_seconds=20,
+    max_items=256,
 )
 
 _GROUP_MEMBER_LOCKS: dict[str, asyncio.Lock] = {}
@@ -652,6 +658,37 @@ async def get_chat_history_first_msg_datetime_cached(
         return result
 
 
+def _statistics_query(
+    scope: Literal["global", "user", "group"],
+    plugin_name: str | None,
+    user_id: str | None,
+    group_id: str | None,
+) -> Any:
+    """按统计范围构建调用记录查询
+
+    参数:
+        scope: 统计范围
+        plugin_name: 插件模块名
+        user_id: 用户id
+        group_id: 群组id
+
+    返回:
+        Any: Statistics 查询
+    """
+    from zhenxun.models.statistics import Statistics
+
+    query: Any = Statistics.all()
+    if scope == "user":
+        query = query.filter(user_id=user_id)
+        if group_id:
+            query = query.filter(group_id=group_id)
+    elif scope == "group":
+        query = query.filter(group_id=group_id)
+    if plugin_name:
+        query = query.filter(plugin_name=plugin_name)
+    return query
+
+
 @guarded_read
 async def get_statistics_plugin_counts_cached(
     scope: Literal["global", "user", "group"],
@@ -677,17 +714,7 @@ async def get_statistics_plugin_counts_cached(
 
         if is_db_unhealthy():
             raise CacheUnavailable("hot_query_database_unavailable")
-        from zhenxun.models.statistics import Statistics
-
-        query: Any = Statistics
-        if scope == "user":
-            query = Statistics.filter(user_id=user_id)
-            if group_id:
-                query = query.filter(group_id=group_id)
-        elif scope == "group":
-            query = Statistics.filter(group_id=group_id)
-        if plugin_name:
-            query = query.filter(plugin_name=plugin_name)
+        query = _statistics_query(scope, plugin_name, user_id, group_id)
         if start_time:
             query = query.filter(create_time__gte=start_time)
         rows = await _read_authoritative(
@@ -699,4 +726,63 @@ async def get_statistics_plugin_counts_cached(
         )
         result = tuple((str(plugin), int(count)) for plugin, count in rows)
         await _STATISTICS_COUNT_CACHE.set(key, result)
+        return list(result)
+
+
+@guarded_read
+async def get_statistics_trend_cached(
+    scope: Literal["global", "user", "group"],
+    *,
+    plugin_name: str | None,
+    edges: list[datetime],
+    user_id: str | None = None,
+    group_id: str | None = None,
+) -> list[int]:
+    """按时间分段统计调用次数
+
+    参数:
+        scope: 统计范围
+        plugin_name: 插件模块名
+        edges: 分段边界，n 个边界得到 n-1 段
+        user_id: 用户id
+        group_id: 群组id
+
+    返回:
+        list[int]: 每段的调用次数
+    """
+    key = (
+        f"{scope}:{plugin_name or ''}:{_datetime_key(edges[0])}:"
+        f"{_datetime_key(edges[-1])}:{len(edges)}:{user_id or ''}:{group_id or ''}"
+    )
+    cached = await _STATISTICS_TREND_CACHE.get(key)
+    if cached is not None:
+        return list(cached)
+
+    lock = _get_lock(_STATISTICS_LOCKS, f"trend:{key}")
+    async with lock:
+        cached = await _STATISTICS_TREND_CACHE.get(key)
+        if cached is not None:
+            return list(cached)
+
+        if is_db_unhealthy():
+            raise CacheUnavailable("hot_query_database_unavailable")
+        names = [f"b{index}" for index in range(len(edges) - 1)]
+        buckets = {
+            name: Count(
+                "id",
+                _filter=Q(create_time__gte=start, create_time__lt=end),
+            )
+            for name, start, end in zip(names, edges, edges[1:])
+        }
+        rows = await _read_authoritative(
+            _statistics_query(scope, plugin_name, user_id, group_id)
+            .filter(create_time__gte=edges[0], create_time__lt=edges[-1])
+            .annotate(**buckets)
+            .values(*names),
+            timeout=_AGGREGATE_DB_TIMEOUT,
+            operation="hot_query_cache.get_statistics_trend",
+        )
+        row = rows[0] if rows else {}
+        result = tuple(int(row.get(name) or 0) for name in names)
+        await _STATISTICS_TREND_CACHE.set(key, result)
         return list(result)
