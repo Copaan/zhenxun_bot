@@ -170,7 +170,7 @@ class RateLimit:
         limit = int(Config.get_config(MODULE, "USER_RATE_LIMIT") or 0)
         if limit <= 0:
             return None
-        now = time.time()
+        now = time.monotonic()
         if now - cls._swept >= 60:
             cls._swept = now
             prune(cls._times, now, 60)
@@ -183,7 +183,8 @@ class RateLimit:
             times.append(now)
             cls._notified.pop(user_id, None)
             return None
-        if now - cls._notified.get(user_id, 0) < 60:
+        notified = cls._notified.get(user_id)
+        if notified is not None and now - notified < 60:
             return ""
         cls._notified[user_id] = now
         return RATE_NOTICE
@@ -201,12 +202,20 @@ class SessionLimit:
     """每个会话最多排队的消息数（含等待会话锁的运行）"""
 
     @classmethod
-    async def acquire(cls, session_id: str, *, check_queue: bool = True) -> bool:
+    async def acquire(
+        cls,
+        session_id: str,
+        *,
+        conversation_id: str | None = None,
+        check_queue: bool = True,
+    ) -> bool:
         """占用一次 SESSION_RATE_LIMIT 名额，名额用完时按到达顺序等到有空位；
         每分钟最多清理一次超过一分钟没有对话且无人排队的会话
 
         参数:
-            session_id: 会话id
+            session_id: 入口会话id，频率与排队按它计算
+            conversation_id: 当前对话id，进行中的运行按它计算，为空时同入口会话
+            check_queue: 是否检查排队上限
 
         返回:
             bool: 是否可以继续，排队已满时为 False
@@ -214,7 +223,7 @@ class SessionLimit:
         from zhenxun.services.ai.run.session import session_manager
 
         waiting = cls._waiting.get(session_id, 0)
-        running = len(session_manager.live_tasks.get(session_id, ()))
+        running = len(session_manager.live_tasks.get(conversation_id or session_id, ()))
         if check_queue and waiting + running > cls.QUEUE:
             return False
         limit = int(Config.get_config(MODULE, "SESSION_RATE_LIMIT") or 0)

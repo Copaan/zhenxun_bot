@@ -34,7 +34,10 @@ class AIAgentRun(Model):
     tokens = fields.IntField(default=0, description="token 用量")
     """token 用量"""
     status = fields.CharField(16, description="结果")
-    """结果：ok 完成，error 失败，stopped 中止"""
+    """结果：ok 完成，silent 未发言，error 失败，stopped / cancelled / interrupted
+    已停止，timeout 超时，exhausted 用尽循环次数，failed / partial / unknown 为
+    投递失败、部分送达或未确认；queued / running / delivering / settling / stopping
+    为进行中"""
     error = fields.TextField(default="", description="错误信息")
     """错误信息"""
     duration = fields.IntField(default=0, description="耗时（毫秒）")

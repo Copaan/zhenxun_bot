@@ -110,9 +110,6 @@ class RestApiToolkit(BaseToolkit):
             return result
 
         except Exception as e:
-            from zhenxun.services.ai.run.context import interrupt_transport
-
-            interrupt_transport(e, "http_tool")
             logger.error(f"RestApiToolkit 结果未确认: {type(e).__name__}")
             return ToolResult(
                 output="HTTP 操作结果未确认，请核查目标服务；本轮不自动重试。"

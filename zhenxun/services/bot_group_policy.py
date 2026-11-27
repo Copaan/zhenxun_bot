@@ -51,7 +51,7 @@ class BotGroupPolicyService:
         self._policies = {}
         self._revisions = {}
         self._stale = set()
-        self._stale_marks = 0
+        self._stale_marks = {}
         self._refresh_tasks = {}
         self._memberships = set()
         self._pending = set()
@@ -171,7 +171,8 @@ class BotGroupPolicyService:
             keys: 策略键
         """
         self._stale.update(keys)
-        self._stale_marks += 1
+        for key in keys:
+            self._stale_marks[key] = self._stale_marks.get(key, 0) + 1
 
     def forget_bot(self, bot_id):
         """移除账号已加载的群聊与私聊策略和已知群
@@ -204,14 +205,14 @@ class BotGroupPolicyService:
         参数:
             key: 策略键
         """
-        epoch, marks = self._epoch, self._stale_marks
+        epoch, marks = self._epoch, self._stale_marks.get(key, 0)
         row = await BotGroupPluginPolicy.get_or_none(**key_fields(key))
         snapshot = await self._inactive_snapshot(key)
         if epoch != self._epoch:
             return
-        if marks == self._stale_marks:
+        if marks == self._stale_marks.get(key, 0):
             self._accept_inactive_snapshot(key, snapshot is not None)
-        self._accept_row(key, row, clear_stale=marks == self._stale_marks)
+        self._accept_row(key, row, clear_stale=marks == self._stale_marks.get(key, 0))
 
     async def ensure_fresh(self, bot_id, scope, group_id, channel_id=None):
         if group_id and not _valid_group_id(scope, group_id):

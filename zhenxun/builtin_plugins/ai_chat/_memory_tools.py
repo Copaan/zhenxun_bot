@@ -1,5 +1,7 @@
 """长期记忆的对话工具：自动召回或按需召回、记下与忘掉"""
 
+import re
+
 from zhenxun.models.ai_memory import AIMemory
 from zhenxun.services.ai.core.templates import wrap_untrusted
 from zhenxun.services.ai.run.context import RunContext
@@ -60,7 +62,12 @@ class MemoryToolkit(BaseToolkit):
             text = context.state.get("_retrieval_query", "") if context else ""
             if text:
                 try:
-                    hits = await Memory.recall(scope, text, reinforce=False)
+                    hits = await Memory.recall(
+                        scope,
+                        text,
+                        reinforce=False,
+                        people=context.state.get("_retrieval_people", ()),
+                    )
                 except Exception as error:
                     logger.warning(f"本轮记忆召回不可用: {type(error).__name__}")
                     hits = []
@@ -102,7 +109,9 @@ class MemoryToolkit(BaseToolkit):
         scope = context_scope(context)
         if scope is None:
             return ToolResult(output="当前不在会话中。").as_error(False)
-        hits = await Memory.recall(scope, query, reinforce=False)
+        hits = await Memory.recall(
+            scope, query, reinforce=False, people=re.findall(r"\d{5,}", query)
+        )
         context.state.setdefault("_recalled_memories", []).extend(m.id for m, _ in hits)
         if not hits:
             return ToolResult(output="没有相关的记忆。")

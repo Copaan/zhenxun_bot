@@ -32,6 +32,8 @@ from .repository import ScheduleRepository
 from .types import JobConfig, ScheduleContext
 
 _CORE_OBSERVER_REGISTERED = False
+_MISSED_TASKS: set[asyncio.Task] = set()
+"""处理错过执行的后台任务"""
 _CORE_SERVICE_MODULES = {
     "zhenxun.services.avatar_service",
     "zhenxun.services.ai.llm.manager",
@@ -114,7 +116,52 @@ def core_job_snapshot() -> list[dict]:
     ]
 
 
+async def _mark_missed(schedule_id: int) -> None:
+    """记录持久化任务错过的一次执行，一次性任务按启动时的规则标记为错过或删除
+
+    参数:
+        schedule_id: 定时任务id
+    """
+    schedule = await ScheduleRepository.get_by_id(schedule_id)
+    if schedule is None:
+        return
+    logger.warning(
+        f"定时任务 {schedule.id} ({schedule.name or schedule.plugin_name}) "
+        "到点时未能及时执行，已跳过本次"
+    )
+    if not schedule.is_one_off or schedule.last_run_status:
+        return
+    if scheduler_registry.tasks.get(schedule.plugin_name, {}).get("retain_finished"):
+        await ScheduleRepository.update_run_status(
+            schedule, status="MISSED", disable=True
+        )
+    else:
+        await ScheduledJob.filter(id=schedule.id).delete()
+
+
+def _persistent_id(job_id: str) -> int | None:
+    """从 APScheduler 任务id解析持久化任务id，补跑任务与其他任务为空
+
+    参数:
+        job_id: APScheduler 任务id
+
+    返回:
+        int | None: 定时任务id
+    """
+    prefix = APSchedulerAdapter._get_job_id(0)[:-1]
+    value = job_id.removeprefix(prefix)
+    return int(value) if value != job_id and value.isdigit() else None
+
+
 def _observe_core_job(event) -> None:
+    if (
+        event.code == EVENT_JOB_MISSED
+        and (schedule_id := _persistent_id(event.job_id)) is not None
+    ):
+        task = asyncio.get_running_loop().create_task(_mark_missed(schedule_id))
+        _MISSED_TASKS.add(task)
+        task.add_done_callback(_MISSED_TASKS.discard)
+        return
     job = scheduler.get_job(event.job_id)
     if job is None or not _is_core_job(job):
         return

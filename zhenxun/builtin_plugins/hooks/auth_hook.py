@@ -1,5 +1,5 @@
 import asyncio
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from functools import wraps
 import math
@@ -7,7 +7,7 @@ import time
 import uuid
 import weakref
 
-from nonebot import get_driver
+from nonebot import get_bots, get_driver
 from nonebot.adapters import Bot, Event
 from nonebot.exception import IgnoredException
 from nonebot.matcher import Matcher
@@ -46,6 +46,7 @@ class ConnectionEpoch:
     connection_id: str
     connected_monotonic: float = field(default_factory=lambda: time.monotonic())
     groups: dict[tuple[str, str], "GroupActivity"] = field(default_factory=dict)
+    provisional: bool = False
 
 
 @dataclass
@@ -62,7 +63,7 @@ class ConnectionEpochs:
     def __init__(self) -> None:
         self._entries: dict[tuple[str, str], ConnectionEpoch] = {}
 
-    def connect(self, bot, scope: str) -> ConnectionEpoch:
+    def connect(self, bot, scope: str, provisional: bool = False) -> ConnectionEpoch:
         key = (scope, str(bot.self_id))
 
         def expired(reference):
@@ -71,10 +72,45 @@ class ConnectionEpochs:
                 self._entries.pop(key, None)
 
         epoch = ConnectionEpoch(
-            weakref.ref(bot, expired), math.floor(time.time()), uuid.uuid4().hex
+            weakref.ref(bot, expired),
+            math.floor(time.time()),
+            uuid.uuid4().hex,
+            provisional=provisional,
         )
         self._entries[key] = epoch
         return epoch
+
+    def ensure(self, bot, scope: str) -> ConnectionEpoch | None:
+        """取得当前连接代际，在线 Bot 的连接钩子尚未执行时先建立临时代际，由连接钩子沿用
+
+        参数:
+            bot: Bot
+            scope: 平台范围
+
+        返回:
+            ConnectionEpoch | None: 连接代际，Bot 不在线时为空
+        """
+        epoch = self.get(bot, scope)
+        if epoch is None and get_bots().get(str(bot.self_id)) is bot:
+            epoch = self.connect(bot, scope, provisional=True)
+            vars(bot)["_zhenxun_connection_id"] = epoch.connection_id
+        return epoch
+
+    def confirm(self, bot, scope: str) -> bool:
+        """连接钩子沿用首条事件建立的临时代际
+
+        参数:
+            bot: Bot
+            scope: 平台范围
+
+        返回:
+            bool: 是否沿用了临时代际
+        """
+        epoch = self.get(bot, scope)
+        if epoch is None or not epoch.provisional:
+            return False
+        self._entries[(scope, str(bot.self_id))] = replace(epoch, provisional=False)
+        return True
 
     def get(self, bot, scope: str) -> ConnectionEpoch | None:
         epoch = self._entries.get((scope, str(bot.self_id)))
@@ -240,6 +276,8 @@ register_runtime_bootstrap(driver)
 async def _mark_bot_connected(bot: Bot):
     from zhenxun.utils.platform import PlatformUtils
 
+    if connection_epochs.confirm(bot, PlatformUtils.get_platform_scope(bot)):
+        return
     old = connection_epochs.get(bot, PlatformUtils.get_platform_scope(bot))
     epoch = connection_epochs.connect(bot, PlatformUtils.get_platform_scope(bot))
     bot._zhenxun_connection_id = epoch.connection_id
@@ -259,8 +297,8 @@ async def _mark_bot_disconnected(bot: Bot):
     connection_epochs.disconnect(bot, PlatformUtils.get_platform_scope(bot))
     if epoch is not None:
         bot._zhenxun_connection_id = None
-    await session_manager.stop_source(bot, epoch.connection_id if epoch else None)
     await clear_uninfo_sessions(bot)
+    await session_manager.stop_source(bot, epoch.connection_id if epoch else None)
 
 
 @PriorityLifecycle.on_startup(
@@ -342,15 +380,21 @@ async def _drop_message_before_cache_ready(event: Event, bot: Bot, state=None):
     if event.get_type() == "message" and not await wait_cache_ready(10):
         raise IgnoredException("cache not ready ignore")
     if is_cache_ready():
+        from zhenxun.models.bot_console import BotConsole
         from zhenxun.services.bot_group_policy import bot_group_policy_service
+        from zhenxun.services.cache.runtime_cache import BotMemoryCache
         from zhenxun.utils.platform import PlatformUtils
 
+        bot_id = PlatformUtils.get_storage_bot_id(bot)
+        if await BotMemoryCache.get(bot_id) is None:
+            # 连接钩子与首条事件并发，群策略写入依赖账号记录
+            await BotConsole.ensure_account(bot_id, PlatformUtils.get_platform(bot))
         group_id = resolve_event_group_id(
             event,
             getattr(event, "group_openid", None) or getattr(event, "guild_id", None),
         )
         await bot_group_policy_service.ensure_fresh(
-            PlatformUtils.get_storage_bot_id(bot),
+            bot_id,
             PlatformUtils.get_platform_scope(bot),
             group_id,
             resolve_event_channel_id(event, None),

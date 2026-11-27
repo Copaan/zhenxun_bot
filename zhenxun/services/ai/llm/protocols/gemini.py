@@ -17,7 +17,6 @@ from zhenxun.services.ai.core.exceptions import (
     ContentFilteredException,
     NoImageException,
     ResponseParseException,
-    UpstreamServerException,
 )
 from zhenxun.services.ai.core.messages import (
     AssistantMessage,
@@ -57,7 +56,6 @@ from zhenxun.services.ai.llm.profile import map_reasoning_effort
 from zhenxun.services.ai.utils.logger import log_llm as logger
 
 from . import (
-    ChatStream,
     HttpCall,
     ensure_content,
     filter_modalities,
@@ -68,7 +66,6 @@ from . import (
     replay_metadata,
     resolve_tool_choice,
     split_tools,
-    stream_error,
 )
 from .schema import schema_instruction, tool_schema
 from .tasks import to_image_part
@@ -582,64 +579,6 @@ def parse_image(route, request: ImageRequest, payload: dict[str, Any]):
     return ImageResponse(content_parts=response.content_parts, raw_response=payload)
 
 
-class GeminiStream(ChatStream):
-    """generateContent 流式累加器：每个事件是一段完整格式的响应，按片段拼接"""
-
-    def __init__(self):
-        self.payload: dict[str, Any] = {}
-        self.candidate: dict[str, Any] = {}
-        self.parts: list[dict[str, Any]] = []
-
-    @classmethod
-    def prepare(cls, call: HttpCall) -> None:
-        path = call.path.replace(":generateContent", ":streamGenerateContent")
-        call.path = f"{path}{'&' if '?' in path else '?'}alt=sse"
-        call.stream = cls
-
-    def _merge(self, part: dict[str, Any]) -> None:
-        last = self.parts[-1] if self.parts else None
-        signature = part.get("thoughtSignature")
-        if (
-            last is not None
-            and "text" in part
-            and "text" in last
-            and bool(last.get("thought")) == bool(part.get("thought"))
-            and not last.get("thoughtSignature")
-        ):
-            last["text"] += part["text"]
-            if signature:
-                last["thoughtSignature"] = signature
-        else:
-            self.parts.append(dict(part))
-
-    def feed(self, event: str, data: dict[str, Any]) -> list[tuple[str, str]]:
-        if message := stream_error(data):
-            raise UpstreamServerException(
-                f"服务端返回错误: {message}", details={"response": str(data)[:500]}
-            )
-        for key in ("usageMetadata", "promptFeedback", "modelVersion", "responseId"):
-            if data.get(key):
-                self.payload[key] = data[key]
-        deltas: list[tuple[str, str]] = []
-        candidate = (data.get("candidates") or [{}])[0]
-        for key, value in candidate.items():
-            if key != "content" and value:
-                self.candidate[key] = value
-        for part in (candidate.get("content") or {}).get("parts") or []:
-            self._merge(part)
-            if part.get("text"):
-                deltas.append(
-                    ("thought" if part.get("thought") else "text", part["text"])
-                )
-        return deltas
-
-    def result(self) -> dict[str, Any]:
-        if not self.parts and not self.candidate:
-            return self.payload
-        content = {"role": "model", "parts": self.parts}
-        return {**self.payload, "candidates": [{**self.candidate, "content": content}]}
-
-
 _TRANSCRIBE_PROMPT = (
     "Transcribe the speech in this audio verbatim, in its original language. "
     "Output only the transcript without any commentary. "
@@ -680,7 +619,6 @@ def parse_transcription(
     )
 
 
-STREAM = GeminiStream
 TASKS = {
     "chat": (build_chat, parse_chat),
     "embedding": (build_embedding, parse_embedding),

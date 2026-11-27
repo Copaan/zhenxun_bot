@@ -3,6 +3,7 @@ from dataclasses import dataclass
 import re
 import time
 
+import anyio
 from nonebot.adapters import Bot, Event
 from nonebot.exception import IgnoredException
 from nonebot.matcher import Matcher
@@ -251,6 +252,8 @@ async def _reserve_gold(
 ) -> None:
     """预扣金币，余额不足时拒绝，matcher 未实际完成时由 SideEffectCommit 回滚
 
+    扣款与登记到 SideEffectCommit 不会被取消打断，事件结束时可据登记回滚
+
     参数:
         prep: 权限检查准备数据
         bot: Bot
@@ -283,22 +286,23 @@ async def _reserve_gold(
         raise SkipPluginException(
             f"{module} 无法解析业务身份，已取消执行...", tip_message=str(error)
         ) from None
-    try:
-        reservation = await UserConsole.reserve_gold(
-            identity.storage_key,
-            cost_gold,
-            GoldHandle.PLUGIN,
-            module,
-            PlatformUtils.get_platform(session),
+    with anyio.CancelScope(shield=True):
+        try:
+            reservation = await UserConsole.reserve_gold(
+                identity.storage_key,
+                cost_gold,
+                GoldHandle.PLUGIN,
+                module,
+                PlatformUtils.get_platform(session),
+            )
+        except InsufficientGold:
+            raise SkipPluginException(
+                f"{module} 金币不足，已取消执行...",
+                tip_message=f"金币不足..该功能需要{cost_gold}金币..",
+            ) from None
+        await commit.reserve_gold(
+            reservation, amount=cost_gold, metadata={"module": module}
         )
-    except InsufficientGold:
-        raise SkipPluginException(
-            f"{module} 金币不足，已取消执行...",
-            tip_message=f"金币不足..该功能需要{cost_gold}金币..",
-        ) from None
-    await commit.reserve_gold(
-        reservation, amount=cost_gold, metadata={"module": module}
-    )
     logger.debug(f"预扣功能花费金币: {cost_gold}", LOGGER_COMMAND, session=session)
 
 

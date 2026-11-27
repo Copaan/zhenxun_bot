@@ -16,8 +16,6 @@ from zhenxun.services.ai.context.memory.models import MemoryConfig
 from zhenxun.services.ai.core.engine.token_counter import token_counter
 from zhenxun.services.ai.core.exceptions import (
     ControlFlowExit,
-    InterventionHandledException,
-    RunBudgetExceeded,
 )
 from zhenxun.services.ai.core.messages import (
     LLMMessage,
@@ -32,7 +30,13 @@ from zhenxun.services.ai.core.stream_events import EventBus
 from zhenxun.services.ai.llm.manager import get_default_model, resolve_model_profile
 from zhenxun.services.ai.llm.protocols import drop_tool_media, has_media
 from zhenxun.services.ai.message_builder import MessageBuilder
-from zhenxun.services.ai.run.context import RunContext, set_run_context
+from zhenxun.services.ai.run.context import (
+    RunContext,
+    as_timeout,
+    run_outcome,
+    run_until_deadline,
+    set_run_context,
+)
 from zhenxun.services.ai.run.di import DependencyInjector
 from zhenxun.services.ai.run.models import (
     AgentRunEnd,
@@ -253,26 +257,7 @@ class Agent:
             if finalized:
                 return
             finalized = True
-            run = ctx.run
-            if run.outcome == "unknown":
-                pass
-            elif run.operations.get("interruption"):
-                run.outcome = "interrupted"
-            elif isinstance(error, asyncio.TimeoutError):
-                run.outcome = "timeout"
-            elif isinstance(error, asyncio.CancelledError):
-                reason = run.cancellation_token.reason if run.cancellation_token else ""
-                run.outcome = "cancelled" if reason == "cancelled" else "interrupted"
-            elif isinstance(error, RunBudgetExceeded):
-                run.outcome = "exhausted"
-            elif error is not None:
-                run.outcome = (
-                    "skipped"
-                    if isinstance(error, InterventionHandledException)
-                    else "failed"
-                )
-            else:
-                run.outcome = getattr(result, "outcome", "completed")
+            ctx.run.outcome = run_outcome(ctx.run, result, error)
             await session_manager.phase(ctx, "settling" if error else "delivering")
             if finalize:
                 await finalize(result, error)
@@ -322,7 +307,6 @@ class Agent:
                         budget.setdefault(
                             "deadline", time.monotonic() + float(ctx.run.timeout)
                         )
-                    deadline = budget.get("deadline")
 
                     async def turn():
                         try:
@@ -346,23 +330,12 @@ class Agent:
                             ):
                                 raise asyncio.CancelledError("会话已重置")
                         except BaseException as error:
-                            if (
-                                isinstance(error, asyncio.CancelledError)
-                                and deadline
-                                and time.monotonic() >= deadline
-                                and not cancel_token.is_cancelled()
-                            ):
-                                error = asyncio.TimeoutError("本轮执行超时")
-                            await finish_turn(None, error)
+                            await finish_turn(None, as_timeout(ctx, error))
                             raise
                         await finish_turn(result, None)
                         return result
 
-                    if deadline:
-                        remaining = max(0.001, deadline - time.monotonic())
-                        completed = await asyncio.wait_for(turn(), remaining)
-                    else:
-                        completed = await turn()
+                    completed = await run_until_deadline(ctx, turn())
             except asyncio.CancelledError as error:
                 await finish_turn(None, error)
                 logger.debug(f"[{self.name}] 执行被取消。")

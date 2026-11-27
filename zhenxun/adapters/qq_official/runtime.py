@@ -17,6 +17,7 @@ _cleanup_task: asyncio.Task[None] | None = None
 _adapters: set[Any] = set()
 _database_ready = False
 _connection_lock: asyncio.Lock | None = None
+_admission_tasks: dict[int, asyncio.Task[None]] = {}
 
 
 def database_ready() -> bool:
@@ -32,8 +33,18 @@ def unregister_adapter_runtime(adapter: object) -> None:
 
 
 async def connect_prepared_adapter(adapter: object) -> None:
+    """接入适配器中已准备好的 Bot，运行时未就绪时在后台等待就绪后再接入
+
+    参数:
+        adapter: QQ 官方适配器
+    """
     global _connection_lock
+    from zhenxun.services.startup import startup_coordinator
+
     if not _database_ready:
+        return
+    if not await startup_coordinator.wait_bot_admission(0):
+        _wait_admission(adapter)
         return
     if _connection_lock is None:
         _connection_lock = asyncio.Lock()
@@ -43,6 +54,32 @@ async def connect_prepared_adapter(adapter: object) -> None:
         connect = getattr(adapter, "connect_prepared_bots", None)
         if callable(connect):
             await connect()
+
+
+def _wait_admission(adapter: object) -> None:
+    """后台等待运行时就绪后接入适配器的 Bot，同一适配器只保留一个等待任务
+
+    参数:
+        adapter: QQ 官方适配器
+    """
+    from zhenxun.services.startup import startup_coordinator
+
+    key = id(adapter)
+    task = _admission_tasks.get(key)
+    if task is not None and not task.done():
+        return
+
+    async def wait() -> None:
+        await startup_coordinator.wait_bot_admission(None)
+        await connect_prepared_adapter(adapter)
+
+    task = asyncio.create_task(wait(), name="qq-official-admission")
+    _admission_tasks[key] = task
+    task.add_done_callback(
+        lambda done: _admission_tasks.pop(key, None)
+        if _admission_tasks.get(key) is done
+        else None
+    )
 
 
 async def cleanup_expired_receipts() -> int:
@@ -97,6 +134,12 @@ async def start_qq_official_runtime(context=None) -> None:
 async def stop_qq_official_runtime() -> None:
     global _cleanup_task, _connection_lock, _database_ready
     _database_ready = False
+    waiting = list(_admission_tasks.values())
+    _admission_tasks.clear()
+    for task in waiting:
+        task.cancel()
+    if waiting:
+        await asyncio.gather(*waiting, return_exceptions=True)
     for adapter in tuple(_adapters):
         await adapter._dispatcher.stop()
     task = _cleanup_task

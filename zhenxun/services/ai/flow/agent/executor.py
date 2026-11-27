@@ -19,13 +19,10 @@ from zhenxun.services.ai.core.messages import (
 from zhenxun.services.ai.core.models import LLMContext
 from zhenxun.services.ai.core.options import GenerationConfig
 from zhenxun.services.ai.core.stream_events import (
-    STREAM_TEXT_KEY,
     LLMEndEvent,
     LLMStartEvent,
-    TextDeltaEvent,
 )
 from zhenxun.services.ai.llm.api import invoke
-from zhenxun.services.ai.llm.client import stream_sink
 from zhenxun.services.ai.message_builder import MessageBuilder
 from zhenxun.services.ai.run.context import RunContext
 from zhenxun.services.ai.run.models import AgentRunResult
@@ -231,23 +228,14 @@ class AgentExecutor:
                 )
             return response
 
-        async def emit_delta(kind: str, text: str) -> None:
-            await run_context.run.emit(TextDeltaEvent(kind=kind, text=text))
-
-        sink = stream_sink.set(
-            emit_delta if run_context.state.get(STREAM_TEXT_KEY) else None
+        response = await resources.capability.wrap_model_request(
+            run_context,
+            LLMContext(
+                request=request,
+                cancellation_token=run_context.run.cancellation_token,
+            ),
+            handler,
         )
-        try:
-            response = await resources.capability.wrap_model_request(
-                run_context,
-                LLMContext(
-                    request=request,
-                    cancellation_token=run_context.run.cancellation_token,
-                ),
-                handler,
-            )
-        finally:
-            stream_sink.reset(sink)
         await run_context.run.emit(LLMEndEvent(response=response))
 
         assistant_message = AssistantMessage(content=response.content_parts)

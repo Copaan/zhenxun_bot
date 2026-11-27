@@ -76,10 +76,11 @@ CONFIGS = [
     _config(
         "请求",
         "TURN_TIMEOUT",
-        300,
+        900,
         int,
         "整轮时限",
-        "取得执行权后，模型、工具与投递的总时限",
+        "取得执行权后，模型、工具与投递的总时限，本地 Agent 与 DSH 共用；"
+        "DSH 等待人工确认的时间不计入",
         unit="秒",
         min=1,
     ),
@@ -710,7 +711,7 @@ CONFIGS = [
         "DeepSeek Harness 设置",
         "transport：desktop 或 sdk，不自动互相回退。"
         "desktop_url：桌面回环 HTTP 地址，留空自动识别；home：DSH home，"
-        "留空使用当前用户 .dsh；timeout：每轮超时，等待人工确认的时间不计入；"
+        "留空使用当前用户 .dsh，每轮时限使用整轮时限；"
         "permission：Agent 权限，sandbox 在沙箱内执行，越权操作需超管批准，"
         "可回复“全部允许”批准本轮后续请求；full 不使用沙箱且不再询问；"
         "allow_tools：允许符合"

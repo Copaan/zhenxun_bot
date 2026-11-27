@@ -269,11 +269,12 @@ class LimitManager:
                     limiter.time.pop(key, None)
 
             return release_block
-        old_count = limiter.count.get(key, 0)
+        today = limiter.today
         limiter.increase(key)
 
         def release_count() -> None:
-            limiter.count[key] = old_count
+            if limiter.today == today and limiter.count.get(key, 0) > 0:
+                limiter.count[key] -= 1
 
         return release_count
 

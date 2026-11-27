@@ -2,7 +2,7 @@
 
 import asyncio
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, timedelta
 import json
 import random
 import re
@@ -12,7 +12,7 @@ import uuid
 
 from nonebot.adapters import Bot
 from pydantic import BaseModel, Field
-from tortoise.functions import Count, Sum
+from tortoise.functions import Count, Max, Sum
 from tortoise.timezone import localtime
 
 from zhenxun.configs.config import BotConfig, Config
@@ -65,10 +65,10 @@ class Settings:
 
 @dataclass
 class GroupState:
-    """群的主动对话运行状态，只在内存中"""
+    """Bot 在群里的主动对话运行状态，只在内存中；last_human_at 为系统时间，
+    last_judge_at 为单调时钟"""
 
     last_human_at: float = 0
-    last_proactive_at: float = 0
     last_judge_at: float = 0
     pending: int = 0
     unanswered: int = 0
@@ -126,6 +126,14 @@ class Proactive:
     _spent_day: ClassVar[date | None] = None
     _spent: ClassVar[dict[str, int]] = {}
     _counts: ClassVar[dict[str, int]] = {}
+    _last_sent: ClassVar[dict[str, float]] = {}
+    """各群上次插话或插话投递失败的单调时钟时间，用于冷却"""
+    _inflight: ClassVar[dict[str, float]] = {}
+    """各群正在进行的插话的单调时钟截止时间"""
+    CLAIM_SECONDS = 30
+    """决定插话到处理开始之间的占位时长，处理未开始时到期自动放开"""
+    JUDGE_SECONDS = 60
+    """监听模型判断期间额外占位的时长"""
 
     @classmethod
     def state(cls, bot_id: str, group_id: str) -> GroupState:
@@ -156,7 +164,8 @@ class Proactive:
 
     @classmethod
     async def settings(cls, group_id: str, bot: Bot | None = None) -> Settings | None:
-        """合并群设置与全局配置，主动插话关闭或群停用 AI 聊天时为空
+        """合并群设置与全局配置，主动插话关闭或群停用 AI 聊天时为空；先按模式
+        判断，关闭时不查询场景设置
 
         参数:
             group_id: 群号
@@ -165,6 +174,9 @@ class Proactive:
             Settings | None: 生效的设置
         """
         setting, group = await group_config(group_id)
+        mode = group.mode or _cfg("PROACTIVE_MODE", "probability")
+        if mode not in ("probability", "listen"):
+            return None
         from zhenxun.services.platform_identity import scoped_group_id
         from zhenxun.utils.platform import PlatformUtils
 
@@ -182,9 +194,6 @@ class Proactive:
             else bool(setting and setting.disabled)
         )
         if disabled:
-            return None
-        mode = group.mode or _cfg("PROACTIVE_MODE", "probability")
-        if mode not in ("probability", "listen"):
             return None
         probability = (
             setting.active_probability
@@ -205,7 +214,8 @@ class Proactive:
 
     @classmethod
     async def _load_today(cls) -> None:
-        """跨天或首次读取时从运行记录汇总今日的主动对话用量与插话次数"""
+        """跨天或首次读取时从运行记录汇总今日的主动对话用量与插话次数，并恢复
+        最近一天内各群上次插话的时间"""
         today = TimeUtils.now().date()
         if cls._spent_day == today:
             return
@@ -226,8 +236,28 @@ class Proactive:
             .group_by("group_id")
             .values("group_id", "n")
         )
+        latest = (
+            await AIAgentRun.filter(
+                source="interject",
+                status="ok",
+                created_at__gte=TimeUtils.now() - timedelta(days=1),
+            )
+            .annotate(last=Max("created_at"))
+            .group_by("group_id")
+            .values("group_id", "last")
+        )
         cls._spent = {str(r["group_id"]): int(r["total"] or 0) for r in rows}
         cls._counts = {str(r["group_id"]): int(r["n"] or 0) for r in counts}
+        for row in latest:
+            if not row["last"]:
+                continue
+            at = row["last"]
+            if at.tzinfo is None:
+                at = at.replace(tzinfo=TimeUtils.zone())
+            sent = time.monotonic() - (time.time() - at.timestamp())
+            group_id = str(row["group_id"])
+            if group_id not in cls._last_sent or cls._last_sent[group_id] < sent:
+                cls._last_sent[group_id] = sent
         cls._spent_day = today
 
     @classmethod
@@ -269,7 +299,7 @@ class Proactive:
 
     @classmethod
     def observe(cls, bot_id: str, group_id: str, line: ChatLine) -> None:
-        """记录一条群成员消息，唤醒等待新消息的工具
+        """记录一条未唤醒 Bot 的群成员消息，计入主动对话的新消息数
 
         参数:
             bot_id: Bot id
@@ -279,7 +309,6 @@ class Proactive:
         st = cls.state(bot_id, group_id)
         st.last_human_at = line.at
         st.pending += 1
-        cls.wake(bot_id, group_id)
 
     @classmethod
     def wake(cls, bot_id: str, group_id: str) -> None:
@@ -307,7 +336,28 @@ class Proactive:
     @classmethod
     def failed(cls, bot_id: str, group_id: str) -> None:
         """投递失败进入冷却，不计为已发送或无人回应。"""
-        cls.state(bot_id, group_id).last_proactive_at = time.time()
+        del bot_id
+        cls._last_sent[group_id] = time.monotonic()
+
+    @classmethod
+    def begin(cls, group_id: str) -> None:
+        """插话处理开始，按单轮超时延长本群插话进行中的截止时间
+
+        参数:
+            group_id: 群号
+        """
+        from ._agent import turn_timeout
+
+        cls._inflight[group_id] = time.monotonic() + turn_timeout() + 120
+
+    @classmethod
+    def release(cls, group_id: str) -> None:
+        """一次插话结束，允许本群再次插话
+
+        参数:
+            group_id: 群号
+        """
+        cls._inflight.pop(group_id, None)
 
     @classmethod
     def sent(cls, bot_id: str, group_id: str) -> None:
@@ -317,15 +367,15 @@ class Proactive:
             bot_id: Bot id
             group_id: 群号
         """
-        st = cls.state(bot_id, group_id)
-        st.last_proactive_at = time.time()
-        st.unanswered += 1
+        cls._last_sent[group_id] = time.monotonic()
+        cls.state(bot_id, group_id).unanswered += 1
         if cls._spent_day == TimeUtils.now().date():
             cls._counts[group_id] = cls._counts.get(group_id, 0) + 1
 
     @classmethod
     async def blocked(cls, bot_id: str, group_id: str, cfg: Settings) -> str | None:
-        """检查免打扰时段、冷却、连续没人理的次数、每日次数与预算
+        """检查免打扰时段、本群是否有插话正在进行、冷却、连续没人理的次数、
+        每日次数与预算；冷却与进行中的插话按群计算
 
         参数:
             bot_id: Bot id
@@ -337,8 +387,14 @@ class Proactive:
         """
         if quiet_now(str(_cfg("PROACTIVE_QUIET_HOURS", ""))):
             return "免打扰时段"
+        await cls._load_today()
         st = cls.state(bot_id, group_id)
-        if cfg.cooldown and time.time() - st.last_proactive_at < cfg.cooldown:
+        now = time.monotonic()
+        deadline = cls._inflight.get(group_id)
+        if deadline is not None and now < deadline:
+            return "上一次插话尚未结束"
+        last = cls._last_sent.get(group_id)
+        if cfg.cooldown and last is not None and now - last < cfg.cooldown:
             return "冷却中"
         limit = int(_cfg("PROACTIVE_MAX_UNANSWERED", 0))
         if limit and st.unanswered >= limit:
@@ -357,7 +413,9 @@ class Proactive:
     async def decide(cls, bot: Bot, group_id: str) -> str | None:
         """决定是否对未唤醒的群消息插话：概率模式按插话概率抽取；监听模式攒够
         新消息且距上次判断足够久时让监听模型判断。两种模式都要不在免打扰时段、
-        冷却中，且未超出每日次数与预算
+        本群没有插话正在进行、不在冷却中，且未超出每日次数与预算；通过检查后
+        立即占住本群（同群的其他 Bot 不再插话），不插话时放开，决定插话时保持
+        占位，插话结束后由 release 清除
 
         参数:
             bot: Bot
@@ -376,7 +434,11 @@ class Proactive:
         elif (
             st.judging
             or st.pending < max(1, int(_cfg("LISTEN_MESSAGES", 5)))
-            or time.time() - st.last_judge_at < int(_cfg("LISTEN_INTERVAL", 0))
+            or (
+                st.last_judge_at
+                and time.monotonic() - st.last_judge_at
+                < int(_cfg("LISTEN_INTERVAL", 0))
+            )
         ):
             return None
         listen = cfg.mode != "probability"
@@ -386,10 +448,26 @@ class Proactive:
             if reason := await cls.blocked(bot.self_id, group_id, cfg):
                 logger.debug(f"跳过主动插话: {reason}", MODULE, group_id=group_id)
                 return None
-            if not listen:
-                return ""
-            st.pending, st.last_judge_at = 0, time.time()
-            return await cls.judge(bot, group_id)
+            now = time.monotonic()
+            if (deadline := cls._inflight.get(group_id)) is not None and now < deadline:
+                return None
+            claim = cls._inflight[group_id] = (
+                now + cls.CLAIM_SECONDS + (cls.JUDGE_SECONDS if listen else 0)
+            )
+            hint = None
+            try:
+                if listen:
+                    st.pending, st.last_judge_at = 0, now
+                    hint = await cls.judge(bot, group_id)
+                else:
+                    hint = ""
+            finally:
+                if cls._inflight.get(group_id) == claim:
+                    if hint is None:
+                        cls._inflight.pop(group_id, None)
+                    else:
+                        cls._inflight[group_id] = time.monotonic() + cls.CLAIM_SECONDS
+            return hint
         finally:
             if listen:
                 st.judging = False
@@ -409,6 +487,8 @@ class Proactive:
         from zhenxun.services.ai.core.engine.token_counter import parse_usage_info
         from zhenxun.services.ai.llm.api import chat
         from zhenxun.services.ai.llm.manager import get_default_model
+        from zhenxun.services.platform_identity import scoped_group_id
+        from zhenxun.utils.platform import PlatformUtils
 
         chat_text = ChatBuffer.background(bot.self_id, group_id, None, LISTEN_CONTEXT)
         if not chat_text:
@@ -440,7 +520,8 @@ class Proactive:
             await AIAgentRun.create(
                 run_id=uuid.uuid4().hex,
                 source="listen",
-                session_id=f"{MODULE}:{bot.self_id}:{group_id}",
+                session_id=f"{MODULE}:{bot.self_id}:"
+                f"{scoped_group_id(group_id, PlatformUtils.get_platform_scope(bot))}",
                 user_id=bot.self_id,
                 group_id=group_id,
                 model=model or get_default_model("chat"),

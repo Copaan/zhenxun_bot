@@ -475,9 +475,13 @@ async def _shutdown_application_lifecycle():
     from zhenxun.services.lifecycle.deadline import remaining_timeout, shutdown_budget
     from zhenxun.services.migration.restore import stop_preparation
     from zhenxun.services.runtime_mutation import runtime_mutation_coordinator
+    from zhenxun.services.startup import startup_coordinator
 
+    startup_coordinator.begin_shutdown()
     await stop_preparation()
     with shutdown_budget(lifecycle_kernel.shutdown_remaining()):
+        if cancelled := await startup_coordinator.drain_events(remaining_timeout(10)):
+            logger.warning(f"关闭时仍有 {cancelled} 个事件未处理完，已取消。")
         if not await runtime_mutation_coordinator.quiesce(
             timeout=remaining_timeout(10)
         ):

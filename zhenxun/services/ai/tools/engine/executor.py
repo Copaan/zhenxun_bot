@@ -389,15 +389,13 @@ class ToolExecutor:
                     update={"usage": None, "reused": True}
                 )
             started = True
+            operations["tool_calls"] = operations.get("tool_calls", 0) + 1
             call = executable.execute(context=safe_context, **args_inner)
             if not (timeout := _tool_timeout(executable)):
                 return await call
             try:
                 return await asyncio.wait_for(call, timeout)
-            except asyncio.TimeoutError as error:
-                from zhenxun.services.ai.run.context import interrupt_network
-
-                interrupt_network("tool_timeout", error)
+            except asyncio.TimeoutError:
                 metadata = getattr(executable, "metadata", None) or {}
                 return ToolResult(
                     output=f"工具执行超时（{timeout} 秒），执行结果未确认。"
@@ -420,11 +418,8 @@ class ToolExecutor:
                                 identity
                             )
                         raise e
-                    from zhenxun.services.ai.run.context import interrupt_transport
-
                     if started and mutating:
                         operations.setdefault("uncertain_tools", set()).add(identity)
-                    interrupt_transport(e, "tool")
                     safe_context.state.setdefault("_disabled_tools", set()).add(
                         tool_name
                     )

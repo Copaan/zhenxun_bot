@@ -23,7 +23,8 @@ class AIAgentCall(Model):
     arguments = fields.TextField(description="调用参数")
     """调用参数"""
     decision = fields.CharField(16, description="审批结果")
-    """审批结果：auto 自动放行，approved 批准，rejected 拒绝，timeout 超时"""
+    """审批结果：auto 自动放行，approved 批准，rejected 拒绝，timeout 超时，
+    dsh 由 DSH 执行端自行审批"""
     approver = fields.CharField(255, null=True, description="处理人")
     """处理人"""
     result = fields.TextField(default="", description="执行结果")

@@ -3,6 +3,7 @@
 import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from difflib import SequenceMatcher
 from functools import lru_cache
 import random
 import re
@@ -24,8 +25,6 @@ from ._buffer import AI_SEND, ChatBuffer, ChatLine
 from ._data_source import MODULE
 from ._safety import Safety
 
-LONG_REPLY_MODES = ("text", "forward", "image")
-"""长回复发送方式：text 直接输出，forward 合并转发，image 转图片"""
 FORWARD_MAX_NODES = 20
 VOICE_MAX_CHARS = 200
 """超过该长度的回复不转语音"""
@@ -457,35 +456,50 @@ def _receipt_ids(receipt) -> list[str]:
     return ids
 
 
+def _line_key(line: str) -> str:
+    """去掉格式、空白和标点后的行内容，用于比较是否同一句话"""
+    return "".join(ch for ch in clean_markdown(line) if ch.isalnum()).lower()
+
+
+def _said(key: str, sent: list[str]) -> bool:
+    """判断一行是否已在发送过的内容里说过，允许少量改写"""
+    if len(key) < 4:
+        return False
+    for item in sent:
+        if key in item or (len(item) >= 8 and item in key):
+            return True
+        if SequenceMatcher(None, key, item).ratio() >= 0.8:
+            return True
+    return False
+
+
 def deduplicate_reply(text: str, sent: list[str]) -> tuple[str, int]:
-    """仅去掉完整送达片段组成的全文或换行前缀，保留新的正文。"""
-    text = text.strip()
-    normalized = clean_markdown(text).strip()
-    candidates: dict[str, int] = {}
-    sent = [clean_markdown(part).strip() for part in sent if part.strip()]
-    for start in range(len(sent)):
-        for end in range(start + 1, len(sent) + 1):
-            joined = "\n".join(sent[start:end])
-            if len(joined) > len(normalized):
-                break
-            candidates[joined] = end - start
-            candidates["\n\n".join(sent[start:end])] = end - start
-    if normalized in candidates:
-        return "", candidates[normalized]
-    if text.startswith(("```", "~~~", ">")):
-        return text, 0
-    cut, count = 0, 0
-    fenced = False
-    offset = 0
-    for line in text.splitlines(keepends=True):
+    """去掉最终正文中已由发送工具说过的行，代码块原样保留
+
+    参数:
+        text: 最终正文
+        sent: 本轮已送达的文本
+
+    返回:
+        tuple[str, int]: 剩余正文，去掉的行数
+    """
+    keys = [
+        key for part in sent for line in part.splitlines() if (key := _line_key(line))
+    ]
+    if not keys:
+        return text.strip(), 0
+    whole = _line_key(text)
+    if whole in keys or (len(whole) >= 4 and whole in "".join(keys)):
+        return "", 1
+    kept, count, fenced = [], 0, False
+    for line in text.strip().splitlines():
         if line.lstrip().startswith(("```", "~~~")):
             fenced = not fenced
-        offset += len(line)
-        if not fenced and not line.lstrip().startswith(">"):
-            prefix = clean_markdown(text[:offset]).strip()
-            if prefix in candidates:
-                cut, count = offset, candidates[prefix]
-    return text[cut:].lstrip() if cut else text, count
+        elif not fenced and _said(_line_key(line), keys):
+            count += 1
+            continue
+        kept.append(line)
+    return "\n".join(kept).strip(), count
 
 
 async def _deliver(
@@ -666,9 +680,9 @@ async def _deliver_unlocked(
                 result.status = "partial" if result.parts else "unknown"
                 result.uncertain = True
                 result.error = "平台未确认发送结果，不自动重发"
-                from zhenxun.services.ai.run.context import interrupt_network
+                from zhenxun.services.ai.run.context import interrupt_run
 
-                interrupt_network("delivery_unknown")
+                interrupt_run("delivery_unknown")
                 return result
             sending = False
             result.parts.append(visible)
@@ -695,10 +709,11 @@ async def _deliver_unlocked(
         )
         result.uncertain = sending
         result.error = f"投递未完成（{type(exc).__name__}）"
-        from zhenxun.services.ai.run.context import interrupt_transport
-
-        interrupt_transport(exc, "delivery")
         logger.warning(result.error, MODULE)
+        if result.uncertain:
+            from zhenxun.services.ai.run.context import interrupt_run
+
+            interrupt_run("delivery", exc)
     return result
 
 

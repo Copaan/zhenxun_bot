@@ -1,3 +1,4 @@
+import re
 import time
 from typing import Literal
 
@@ -10,6 +11,8 @@ from zhenxun.utils.image_utils import BuildImage, ImageTemplate
 
 ADMIN_BAN_LEVEL = 8
 """群管理的封禁等级，超级用户为 9999，系统自动封禁为 9"""
+_ID_PATTERN = re.compile(r"[\w\-:.@]+", re.ASCII)
+"""用户/群组 id 只能由字母、数字和 _-:.@ 组成"""
 
 
 async def call_ban(user_id: str, reason: str | None = None, duration: int = 1):
@@ -23,6 +26,18 @@ async def call_ban(user_id: str, reason: str | None = None, duration: int = 1):
 
 
 class BanManage:
+    @classmethod
+    def valid_id(cls, value: str) -> bool:
+        """判断输入的用户/群组 id 格式是否有效
+
+        参数:
+            value: 用户/群组 id
+
+        返回:
+            bool: 是否有效
+        """
+        return bool(_ID_PATTERN.fullmatch(value))
+
     @classmethod
     async def build_ban_image(
         cls,
@@ -110,6 +125,8 @@ class BanManage:
         """unban目标用户
 
         群管理只能解除群管理设下的封禁，按 id 解除时只能解除该群的记录。
+        群内解除用户时先找该群的记录，没有时超级用户可解除该用户的全局封禁；
+        只有确实删除了未过期的记录才算成功。
 
         参数:
             user_id: 用户id
@@ -119,7 +136,7 @@ class BanManage:
             is_superuser: 是否为超级用户操作
 
         返回:
-            tuple[bool, str | Non]: 是否unban成功, 群组/用户id或提示
+            tuple[bool, str]: 是否unban成功, 用户/群组id或提示
         """
         user_level = 9999 if is_superuser else ADMIN_BAN_LEVEL
         if idx:
@@ -131,11 +148,20 @@ class BanManage:
             if ban_data.ban_level > user_level:
                 return False, "unBan权限等级不足捏..."
             await ban_data.delete()
-            return True, ban_data.user_id or ban_data.group_id
-        elif await BanConsole.check_ban_level(user_id, group_id, user_level):
-            await BanConsole.unban(user_id, group_id)
-            return True, group_id or ""
-        return False, "该用户/群组不在黑名单中不足捏..."
+            return True, ban_data.user_id or ban_data.group_id or ""
+        if not user_id and not group_id:
+            return False, "请指定要解除封禁的用户或群组捏..."
+        ban_data = await BanConsole.get_active(user_id, group_id)
+        if ban_data is None and user_id and group_id:
+            ban_data = await BanConsole.get_active(user_id, None)
+            if ban_data and not is_superuser:
+                return False, "该用户被全局封禁，只有超级用户能解除捏..."
+        if ban_data is None:
+            return False, "该用户/群组不在黑名单中捏..."
+        if ban_data.ban_level > user_level:
+            return False, "unBan权限等级不足捏..."
+        await ban_data.delete()
+        return True, user_id or group_id or ""
 
     @classmethod
     async def ban(

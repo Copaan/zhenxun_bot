@@ -107,11 +107,6 @@ async def _request(
     """
     keys = list(dict.fromkeys(k for k in keys if k))
     start = next(_ROTATION) % len(keys) if keys else 0
-    from zhenxun.services.ai.run.context import fail_fast_enabled, interrupt_network
-
-    if fail_fast_enabled() and keys:
-        keys = [keys[start]]
-        start = 0
     error: Exception | None = None
     async with ManagedAsyncClient(timeout=30) as client:
         for key in [*keys[start:], *keys[:start]] or [None]:
@@ -121,8 +116,6 @@ async def _request(
             response = await client.request(method, url, json=json, headers=headers)
             if response.status_code < 400:
                 return response.json()
-            if response.status_code >= 500:
-                interrupt_network("search")
             error = LLMException(
                 f"HTTP {response.status_code}: {_clip(response.text, 300)}"
             )
@@ -290,9 +283,6 @@ class WebSearchToolkit(BaseToolkit):
             output = wrap_untrusted(await search_web(query), "search_results")
             return ToolResult(output=output)
         except Exception as e:
-            from zhenxun.services.ai.run.context import interrupt_transport
-
-            interrupt_transport(e, "search")
             logger.warning(f"联网搜索失败: {e}")
             return ToolResult(output=f"搜索失败: {e}").as_error()
 
@@ -307,9 +297,6 @@ class WebSearchToolkit(BaseToolkit):
         try:
             return ToolResult(output=wrap_untrusted(await fetch_web(url), "web_page"))
         except Exception as e:
-            from zhenxun.services.ai.run.context import interrupt_transport
-
-            interrupt_transport(e, "web_fetch")
             logger.warning(f"读取网页失败: {e}")
             return ToolResult(output=f"读取失败: {e}").as_error()
 

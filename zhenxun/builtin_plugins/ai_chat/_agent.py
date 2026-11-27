@@ -67,6 +67,15 @@ def source_policy(context: RunContext) -> dict[str, bool]:
     return SOURCES.get(caller.source if caller else "", SOURCES["interject"])
 
 
+def turn_timeout() -> int:
+    """整轮时限，本地 Agent 与 DSH 共用
+
+    返回:
+        int: 秒数
+    """
+    return max(1, int(Config.get_config(MODULE, "TURN_TIMEOUT") or 900))
+
+
 def bind_source(context: RunContext, source: str, *, management_check=None) -> None:
     """为运行绑定聊天来源，设置是否接受追加输入与整轮时限，
     无特权的来源不启用 Agent
@@ -79,13 +88,12 @@ def bind_source(context: RunContext, source: str, *, management_check=None) -> N
         raise ValueError(f"未知聊天来源: {source}")
     PermissionUtils.bind_caller(context, source, management_check)
     context.run.source = source
-    context.run.fail_fast = True
     if bot := context.get_bot():
         context.run.connection_id = vars(bot).get("_zhenxun_connection_id")
     context.run.follow_up = SOURCES[source]["follow_up"] and not context.state.get(
         "_personal_scene"
     )
-    context.run.timeout = max(1, int(Config.get_config(MODULE, "TURN_TIMEOUT") or 300))
+    context.run.timeout = turn_timeout()
     if not SOURCES[source]["privileged"]:
         context.state[AGENT_ACTIVE_KEY] = False
 
@@ -221,8 +229,8 @@ async def record_run(
             "output": _shorten(
                 Safety.filter_output(str(result.output) if result else "")[0], 4000
             ),
-            "tools": await AIAgentCall.filter(run_id=run_id).count()
-            + len(context.run.operations.get("dsh_tools", {})),
+            "tools": context.run.operations.get("tool_calls", 0)
+            + await AIAgentCall.filter(run_id=run_id, decision="dsh").count(),
             "tokens": context.run.budget.get(
                 "tokens", result.usage.total_tokens if result else 0
             ),
@@ -232,6 +240,11 @@ async def record_run(
                 **session_manager.details(context),
                 "delivery": delivery,
                 "execution_status": status,
+                **(
+                    {"schedule_id": schedule_id}
+                    if (schedule_id := getattr(context.deps, "schedule_id", None))
+                    else {}
+                ),
             },
             "duration": int((time.monotonic() - started) * 1000),
         }

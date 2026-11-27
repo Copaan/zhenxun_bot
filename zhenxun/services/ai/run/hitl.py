@@ -11,7 +11,7 @@ from nonebot_plugin_waiter import waiter
 from zhenxun.services.ai.core.exceptions import AbortException, ToolFatalError
 from zhenxun.services.ai.utils.logger import log_agent as logger
 
-from .context import RunContext
+from .context import RunContext, pause_deadline
 
 CANCEL_WORDS = {"取消", "cancel", "0", "退出", "quit"}
 
@@ -89,6 +89,23 @@ class HITLController:
         高阶交互：发起文本提问，内置超时与取消词检测。
         如用户取消或超时，自动抛出异常切断 Agent 思考循环。
         """
+        with pause_deadline(self.context):
+            user_input = await self._ask_text(prompt_msg, timeout)
+        if user_input.lower() in CANCEL_WORDS:
+            raise AbortException(reason="用户主动取消了操作")
+
+        return user_input
+
+    async def _ask_text(self, prompt_msg: str, timeout: float) -> str:
+        """发出提问并等待回答，超时时抛出 ToolFatalError
+
+        参数:
+            prompt_msg: 提问内容
+            timeout: 等待秒数
+
+        返回:
+            str: 去掉首尾空白的回答
+        """
         question_id = uuid.uuid4().hex[:12]
         answer = asyncio.get_running_loop().create_future()
         self.pending[question_id] = (self.context, answer, prompt_msg)
@@ -118,9 +135,6 @@ class HITLController:
             answer.cancel()
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
-        if user_input.lower() in CANCEL_WORDS:
-            raise AbortException(reason="用户主动取消了操作")
-
         return user_input
 
     @classmethod

@@ -124,6 +124,8 @@ class StartupCoordinator:
         self._management_complete = False
         self._server_bound = False
         self._setup_required = False
+        self._stopping = False
+        self._events: set[asyncio.Task] = set()
         self._lock = RLock()
         self._server_bound_event: asyncio.Event | None = None
         self._runtime_event: asyncio.Event | None = None
@@ -139,11 +141,51 @@ class StartupCoordinator:
     def runtime_ready(self) -> bool:
         from zhenxun.services.migration.restore import business_blocked
 
-        return not business_blocked(max_age=0.5) and self.state in {
-            "runtime_ready",
-            "warmup_ready",
-            "degraded",
+        return (
+            not self._stopping
+            and not business_blocked(max_age=0.5)
+            and self.state in {"runtime_ready", "warmup_ready", "degraded"}
+        )
+
+    def begin_shutdown(self) -> None:
+        """进入关闭阶段，之后 runtime_ready 为 False，新的 Bot 事件被拒绝"""
+        with self._lock:
+            self._stopping = True
+
+    @contextlib.contextmanager
+    def event_scope(self):
+        """登记当前任务正在处理的 Bot 事件，关闭时由 drain_events 等待其结束"""
+        task = asyncio.current_task()
+        added = task is not None and task not in self._events
+        if added:
+            self._events.add(task)  # type: ignore[arg-type]
+        try:
+            yield
+        finally:
+            if added:
+                self._events.discard(task)  # type: ignore[arg-type]
+
+    async def drain_events(self, timeout: float) -> int:
+        """等待在途的 Bot 事件处理结束，超时后取消剩余事件并等待其收尾
+
+        参数:
+            timeout: 最长等待秒数
+
+        返回:
+            int: 超时后被取消的事件数
+        """
+        current = asyncio.current_task()
+        pending = {
+            task for task in self._events if task is not current and not task.done()
         }
+        if not pending:
+            return 0
+        _, pending = await asyncio.wait(pending, timeout=max(0.0, timeout))
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.wait(pending, timeout=5)
+        return len(pending)
 
     def begin_stage(self, stage: StartupStage) -> None:
         with self._lock:

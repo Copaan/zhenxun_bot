@@ -191,15 +191,9 @@ class StickerToolkit(BaseToolkit):
             unit="张",
         ):
             return "", False, f"剩下的图片没有收藏：{reason}" if many else reason
-        if raw is None:
-            try:
-                raw = await fetch_image(scene.bot, segment, STICKER_MAX_BYTES)
-            except MediaFetchError as e:
-                SendQuota.refund(key, 1)
-                logger.debug(f"下载表情失败: {e}", MODULE)
-                reason = "图片超过 2MB。" if e.too_large else "图片下载失败。"
-                return reason, False, ""
         try:
+            if raw is None:
+                raw = await fetch_image(scene.bot, segment, STICKER_MAX_BYTES)
             sticker, created = await Stickers.add(
                 raw,
                 note.remark or summary,
@@ -208,9 +202,17 @@ class StickerToolkit(BaseToolkit):
                 group_id=scene.group_id,
                 user_id=owner,
             )
+        except MediaFetchError as e:
+            SendQuota.refund(key, 1)
+            logger.debug(f"下载表情失败: {e}", MODULE)
+            reason = "图片超过 2MB。" if e.too_large else "图片下载失败。"
+            return reason, False, ""
         except ValueError as e:
             SendQuota.refund(key, 1)
             return str(e), False, ""
+        except BaseException:
+            SendQuota.refund(key, 1)
+            raise
         if not created:
             SendQuota.refund(key, 1)
             return f"已经收藏过了：{Stickers.describe(sticker)}", False, ""
@@ -274,7 +276,10 @@ class StickerToolkit(BaseToolkit):
             return ToolResult(output="只能引用当前群里的消息。").as_error()
         expected = context.state.get("_sticker_candidates", {}).get(sticker_id)
         if expected is None:
-            return ToolResult(output="请先检索本轮可用的表情。").as_error(False)
+            return ToolResult(
+                output="这个表情不在本轮候选里，请先用 find_stickers 检索，"
+                "再用结果里的编号发送。"
+            ).as_error()
         if reason := await Stickers.send(
             scene, sticker_id, reply_to, context=context, expected_md5=expected
         ):

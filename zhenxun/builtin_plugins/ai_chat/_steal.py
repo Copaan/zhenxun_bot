@@ -171,7 +171,8 @@ class Steal:
         if mode not in ("probability", "listen"):
             return None
         cooldown = int(_cfg("STEAL_COOLDOWN", 0))
-        if cooldown and time.time() - cls._last.get(group_id, 0) < cooldown:
+        last = cls._last.get(group_id)
+        if cooldown and last is not None and time.monotonic() - last < cooldown:
             return None
         count, judges = await cls.today(group_id)
         daily = int(_cfg("STEAL_DAILY_COUNT", 0))
@@ -185,7 +186,7 @@ class Steal:
         if (limit and judges >= limit) or len(cls._tasks) >= 32:
             return None
         cls._judges += 1
-        cls._last[group_id] = time.time()
+        cls._last[group_id] = time.monotonic()
         day, started = cls._day, False
 
         async def collect_reserved() -> bool:

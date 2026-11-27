@@ -9,6 +9,11 @@ from zhenxun.services.ai.run.dsh_desktop import (
     DshUnavailable,
 )
 
+STOP_CONFIRMED = frozenset(
+    {"confirmed", "foreground_confirmed", "foreground_idle", "target_removed"}
+)
+"""已确认远端停止执行的停止结果"""
+
 
 class Foreground(Enum):
     IDLE = "idle"
@@ -440,12 +445,7 @@ class DshControl:
                 )
                 if item.get("native") and result["state"] == "confirmed":
                     result["state"] = "foreground_confirmed"
-            if result.get("state") in {
-                "confirmed",
-                "foreground_confirmed",
-                "foreground_idle",
-                "target_removed",
-            }:
+            if result.get("state") in STOP_CONFIRMED:
                 records.refresh(item)
                 if receipt(item) == expected:
                     records.update(

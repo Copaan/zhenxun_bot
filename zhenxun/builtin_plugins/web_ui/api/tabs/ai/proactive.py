@@ -27,15 +27,29 @@ class TaskPayload(BaseModel):
     user_id: str | None = Field(default=None, max_length=255)
 
 
+def _wall_time(value: float | None) -> float | None:
+    """把单调时钟时间换算为系统时间戳
+
+    参数:
+        value: 单调时钟时间
+
+    返回:
+        float | None: 系统时间戳，没有记录时为空
+    """
+    return None if value is None else time.time() - (time.monotonic() - value)
+
+
 def _state_item(bot_id: str, group_id: str, st: Any, cooldown: int) -> dict[str, Any]:
-    now = time.time()
-    left = st.last_proactive_at + cooldown - now if st.last_proactive_at else 0
+    from zhenxun.builtin_plugins.ai_chat._proactive import Proactive
+
+    last = Proactive._last_sent.get(group_id)
+    left = cooldown - (time.monotonic() - last) if last is not None else 0
     return {
         "bot_id": bot_id,
         "group_id": group_id,
         "last_message_at": st.last_human_at or None,
-        "last_proactive_at": st.last_proactive_at or None,
-        "last_judge_at": st.last_judge_at or None,
+        "last_proactive_at": _wall_time(last),
+        "last_judge_at": _wall_time(st.last_judge_at or None),
         "pending": st.pending,
         "unanswered": st.unanswered,
         "cooldown_left": max(0, int(left)),
@@ -104,17 +118,12 @@ async def _last_runs() -> dict[str, Any]:
     from zhenxun.builtin_plugins.ai_chat._tasks import AITasks
     from zhenxun.models.ai_agent_run import AIAgentRun
 
+    ids = {str(job.id) for job in await AITasks.all()}
     runs: dict[str, Any] = {}
-    for job in await AITasks.all():
-        run = (
-            await AIAgentRun.filter(
-                source="task", session_id__endswith=f":task:{job.id}"
-            )
-            .order_by("-id")
-            .first()
-        )
-        if run:
-            runs[str(job.id)] = {
+    for run in await AIAgentRun.filter(source="task").order_by("-id").limit(500):
+        key = str((run.details or {}).get("schedule_id", ""))
+        if key in ids and key not in runs:
+            runs[key] = {
                 "status": run.status,
                 "output": run.output or run.error,
                 "at": run.created_at.isoformat(),

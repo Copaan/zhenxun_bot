@@ -5,7 +5,6 @@ LLM 请求执行
 """
 
 import asyncio
-from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
 from dataclasses import dataclass
 import email.utils
@@ -36,11 +35,7 @@ from zhenxun.services.ai.core.exceptions import (
 )
 from zhenxun.services.ai.core.models import CancellationToken, ModelProfile
 from zhenxun.services.ai.core.options import CommonLLMConfig, GenerationConfig
-from zhenxun.services.ai.run.context import (
-    RunContext,
-    fail_fast_enabled,
-    interrupt_network,
-)
+from zhenxun.services.ai.run.context import RunContext
 from zhenxun.services.ai.utils.logger import log_llm as logger
 from zhenxun.services.lifecycle.deadline import remaining_timeout
 from zhenxun.services.network_proxy import ManagedAsyncClient, ProxyRequestError
@@ -51,7 +46,6 @@ from zhenxun.utils.user_agent import get_user_agent
 from .health import health_manager, key_id
 from .protocols import (
     HttpCall,
-    get_stream,
     get_task,
     native_tool_allowed,
     resolve_tool_choice,
@@ -59,9 +53,6 @@ from .protocols import (
 from .stats import ModelStats
 
 _COMMON_FIELDS = set(CommonLLMConfig.model_fields)
-StreamSink = Callable[[str, str], Awaitable[None]]
-stream_sink: ContextVar[StreamSink | None] = ContextVar("llm_stream_sink", default=None)
-"""设置后对话请求改用流式，增量以 (text / thought / reset, 文本) 回调"""
 request_timeout: ContextVar[float | None] = ContextVar(
     "llm_request_timeout", default=None
 )
@@ -172,37 +163,6 @@ class LLMHttpClient:
         except asyncio.TimeoutError as error:
             raise httpx.ReadTimeout(f"超过 {limit:.0f} 秒未完成") from error
 
-    async def stream(
-        self,
-        method: str,
-        url: str,
-        handler: Callable[[httpx.Response], Awaitable[Any]],
-        **kwargs: Any,
-    ) -> Any:
-        """发送流式请求并交给 handler 读取响应，受当前生命周期剩余时间约束
-
-        参数:
-            method: 请求方法
-            url: 地址
-            handler: 读取响应的协程函数
-            **kwargs: 传给 httpx 的参数
-
-        返回:
-            Any: handler 的返回值
-        """
-        client = self._ensure_client()
-
-        async def run() -> Any:
-            async with client.proxy_runtime.request_scope():
-                async with client.stream(method, url, **kwargs) as response:
-                    return await handler(response)
-
-        limit = remaining_timeout(float(kwargs.get("timeout") or self.timeout))
-        try:
-            return await asyncio.wait_for(run(), limit)
-        except asyncio.TimeoutError as error:
-            raise httpx.ReadTimeout(f"超过 {limit:.0f} 秒未完成") from error
-
     async def _request_with_recovery(
         self, client, method: str, url: str, kwargs: dict
     ) -> httpx.Response:
@@ -212,8 +172,6 @@ class LLMHttpClient:
             try:
                 return await client.request(method, url, **kwargs)
             except (ProxyRequestError, httpx.ConnectError, httpx.ConnectTimeout) as e:
-                if fail_fast_enabled():
-                    interrupt_network("model_connect", e)
                 cause = e.__cause__ if isinstance(e, ProxyRequestError) else e
                 if not isinstance(
                     cause, httpx.ConnectError | httpx.ConnectTimeout
@@ -379,20 +337,9 @@ async def send(
         kwargs["data"] = call.data
     if call.files is not None:
         kwargs["files"] = call.files
-    sink = stream_sink.get()
-    if call.stream and sink:
-        request = asyncio.ensure_future(
-            get_http_client(route.provider).stream(
-                call.method,
-                url,
-                lambda response: _read_stream(route, call, response, sink),
-                **kwargs,
-            )
-        )
-    else:
-        request = asyncio.ensure_future(
-            get_http_client(route.provider).request(call.method, url, **kwargs)
-        )
+    request = asyncio.ensure_future(
+        get_http_client(route.provider).request(call.method, url, **kwargs)
+    )
     if token:
         token.link_future(request)
     try:
@@ -401,8 +348,6 @@ async def send(
         raise NetworkTimeoutException(f"[{route.name}] 请求超时: {e}") from e
     except (httpx.HTTPError, ProxyRequestError) as e:
         raise NetworkTimeoutException(f"[{route.name}] 网络请求失败: {e!r}") from e
-    if isinstance(response, dict):
-        return response
     if response.status_code >= 400:
         raise map_http_error(response, route.name)
     if call.raw:
@@ -420,94 +365,6 @@ async def send(
     return payload
 
 
-async def _read_stream(
-    route: Route, call: HttpCall, response: httpx.Response, sink: StreamSink
-) -> dict[str, Any]:
-    """读取 SSE 响应，回调增量并还原为非流式响应体；服务端不支持流式而直接
-    返回 JSON 时按普通响应处理
-
-    参数:
-        route: 线路
-        call: 编码后的请求
-        response: 流式响应
-        sink: 增量回调
-
-    返回:
-        dict[str, Any]: 响应体
-    """
-    if response.status_code >= 400:
-        await response.aread()
-        raise map_http_error(response, route.name)
-    if "text/event-stream" not in response.headers.get("content-type", ""):
-        await response.aread()
-        try:
-            return response.json()
-        except ValueError as e:
-            raise ResponseParseException(
-                f"[{route.name}] 响应不是有效的 JSON",
-                details={"response": response.text[:500]},
-            ) from e
-    assert call.stream is not None
-    stream = call.stream()
-    await sink("reset", "")
-    event, lines = "", []
-    finished = False
-
-    async def dispatch() -> None:
-        nonlocal finished
-        text = "\n".join(lines)
-        if text == "[DONE]":
-            finished = True
-            return
-        if not text:
-            return
-        try:
-            data = json.loads(text)
-        except ValueError as e:
-            raise ResponseParseException(
-                f"[{route.name}] 流式响应不是有效的 JSON",
-                details={"response": text[:500]},
-            ) from e
-        if isinstance(data, dict):
-            finished |= (
-                event == "message_stop"
-                or data.get("type")
-                in {
-                    "message_stop",
-                    "response.completed",
-                    "response.incomplete",
-                    "response.failed",
-                }
-                or any(
-                    choice.get("finish_reason") is not None
-                    for choice in data.get("choices", [])
-                )
-                or any(
-                    candidate.get("finishReason")
-                    for candidate in data.get("candidates", [])
-                )
-            )
-            for kind, delta in stream.feed(event, data):
-                if delta:
-                    await sink(kind, delta)
-
-    async for line in response.aiter_lines():
-        if not line:
-            await dispatch()
-            event, lines = "", []
-        elif not line.startswith(":"):
-            field, _, value = line.partition(":")
-            value = value.removeprefix(" ")
-            if field == "event":
-                event = value
-            elif field == "data":
-                lines.append(value)
-    await dispatch()
-    if not finished and fail_fast_enabled():
-        interrupt_network("model_stream_incomplete")
-    return stream.result()
-
-
 def _no_key_error(route: Route) -> LLMException:
     provider = route.provider
     recovery = health_manager.key_recovery_time(provider)
@@ -518,14 +375,6 @@ def _no_key_error(route: Route) -> LLMException:
         f"[{route.name}] 所有密钥都在冷却中，约 {wait} 秒后恢复",
         details={"retry_after": wait},
     )
-
-
-async def _build(build: Any, route: Route, task: str, request: Any) -> HttpCall:
-    """编码请求，设置了流式回调的对话请求改为流式"""
-    call = await build(route, request)
-    if task == "chat" and stream_sink.get() and (stream := get_stream(route.protocol)):
-        stream.prepare(call)
-    return call
 
 
 async def call_route(
@@ -548,7 +397,7 @@ async def call_route(
     from .capability import adapt_route, observe_response
 
     build, parse = get_task(route.protocol, task)
-    call = await _build(build, route, task, request)
+    call = await build(route, request)
     settings = get_llm_config().client_settings
     cooldowns = {"rate": settings.rate_limit_cooldown, "quota": settings.quota_cooldown}
     provider = route.provider
@@ -569,8 +418,6 @@ async def call_route(
             payload = await send(route, call, api_key, token)
             response = parse(route, request, payload)
         except LLMException as e:
-            if fail_fast_enabled():
-                interrupt_network("model", e)
             adapted = (
                 adapt_route(route, request, call.json or {}, e)
                 if adaptations < 3
@@ -579,7 +426,7 @@ async def call_route(
             if adapted is not None:
                 adaptations += 1
                 route = adapted
-                call = await _build(build, route, task, request)
+                call = await build(route, request)
                 continue
             others = health_manager.available_keys(provider, tried | {key_id(api_key)})
             if (
@@ -754,8 +601,6 @@ async def execute(
         try:
             return await attempt(index)
         except LLMException as e:
-            if fail_fast_enabled():
-                interrupt_network("model", e)
             if not grouped and isinstance(e, NetworkTimeoutException):
                 logger.warning(f"线路 {route.name} 超时，重试一次: {e}")
                 return await attempt(index)

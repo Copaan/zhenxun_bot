@@ -362,12 +362,16 @@ class QQSendToolkit(BaseToolkit):
             purpose = "progress"
         if purpose == "final" and (reason := control.check(context)):
             return ToolResult(output=reason).as_error(False)
-        texts = [
-            text
-            for m in messages
-            if m and (text := clean_markdown(clean_output(m)).strip())
-        ]
-        if not texts or len(texts) > SEND_MAX_MESSAGES:
+        from ._stickers import send_marked, split_sticker
+
+        texts, sticker_id = [], None
+        for m in messages:
+            text, marked = split_sticker(clean_markdown(clean_output(m or "")).strip())
+            if sticker_id is None:
+                sticker_id = marked
+            if text:
+                texts.append(text)
+        if (not texts and sticker_id is None) or len(texts) > SEND_MAX_MESSAGES:
             return ToolResult(output="一次发送 1 到 5 条消息。").as_error()
         if any(len(m) > SEND_MAX_CHARS for m in texts):
             return ToolResult(output="每条消息最多 500 字。").as_error()
@@ -400,26 +404,37 @@ class QQSendToolkit(BaseToolkit):
             )
 
         result = DeliveryResult()
-        try:
-            result = await _deliver(
-                "\n".join(texts),
-                scene.bot,
-                send,
-                result=result,
-                context=context,
-                origin="tool",
-                chunks=[(UniMessage(Text(text)), text) for text in texts],
-                target=delivery_target(scene.bot, scene.group_id, scene.user_id),
-                request_key=(control.epoch, tuple(texts), reply_to, at),
-            )
-        finally:
-            SendQuota.refund(scene.key, max(0, len(texts) - result.attempted))
-        if result.status != "sent":
-            notice = (
-                f"共 {len(texts)} 条，已确认 {len(result.parts)} 条。"
-                "其余未确认，勿重发。"
-            )
-            return ToolResult(output=notice).as_error(False, uncertain=result.uncertain)
+        if texts:
+            try:
+                result = await _deliver(
+                    "\n".join(texts),
+                    scene.bot,
+                    send,
+                    result=result,
+                    context=context,
+                    origin="tool",
+                    chunks=[(UniMessage(Text(text)), text) for text in texts],
+                    target=delivery_target(scene.bot, scene.group_id, scene.user_id),
+                    request_key=(control.epoch, tuple(texts), reply_to, at),
+                )
+            finally:
+                SendQuota.refund(scene.key, max(0, len(texts) - result.attempted))
+            if result.status != "sent":
+                notice = (
+                    f"共 {len(texts)} 条，已确认 {len(result.parts)} 条。"
+                    "其余未确认，勿重发。"
+                )
+                return ToolResult(output=notice).as_error(
+                    False, uncertain=result.uncertain
+                )
+        note = ""
+        if sticker_id is not None and not result.reused:
+            if reason := await send_marked(context, sticker_id):
+                if not texts:
+                    return ToolResult(output=f"标记的表情未发送：{reason}").as_error()
+                note = f"标记的表情未发送：{reason}"
+            else:
+                context.state["_chat_sticker_sent"] = True
         if purpose == "final":
             return control.finish(context)
         return ToolResult(
@@ -427,6 +442,8 @@ class QQSendToolkit(BaseToolkit):
                 "delivery_status": "accepted",
                 "reply_state": "open",
                 "accepted_count": len(result.parts),
+                "note": note + "用户已看到这些内容，之后不要复述；"
+                "还有新内容就继续发送或写在最终答复里，已经说完就调用 finish_reply。",
             },
             reused=result.reused,
         )

@@ -491,6 +491,19 @@ async def _admit_event(event: Event) -> Callable[[], None]:
 
 @with_official_event_context
 async def handle_event(bot: Bot, event: Event) -> None:
+    """处理事件并登记为在途事件，关闭时等待其结束
+
+    参数:
+        bot: Bot
+        event: Event
+    """
+    from zhenxun.services.startup import startup_coordinator
+
+    with startup_coordinator.event_scope():
+        await _handle_event(bot, event)
+
+
+async def _handle_event(bot: Bot, event: Event) -> None:
     """处理事件：普通消息限时占用处理名额，按命令文本预筛 matcher，再按优先级并发执行
 
     参数:
@@ -503,9 +516,9 @@ async def handle_event(bot: Bot, event: Event) -> None:
     from .auth_hook import connection_epochs
 
     received_at = TimeUtils.now()
-    connection_epochs.observe_message(bot, event, received_at)
     scope = PlatformUtils.get_platform_scope(bot)
-    epoch = connection_epochs.get(bot, scope)
+    epoch = connection_epochs.ensure(bot, scope)
+    connection_epochs.observe_message(bot, event, received_at)
     _normalize_qq_self_at_message(bot, event)
     show_log = True
     log_msg = f"<m>{escape_tag(bot.type)} {escape_tag(bot.self_id)}</m> | "

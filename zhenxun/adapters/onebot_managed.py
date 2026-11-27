@@ -58,6 +58,10 @@ class SendRejected(DependencyUnavailable):
     """发送请求未交给协议端，调用方不能视为发送成功"""
 
 
+class SendTimeout(NetworkError):
+    """调用已发给协议端但超时未收到结果，协议端可能已经执行"""
+
+
 class _BotQueue:
     def __init__(self) -> None:
         self.lock = asyncio.Lock()
@@ -220,7 +224,7 @@ class ManagedOneBotAdapter(Adapter):
         try:
             return await asyncio.wait_for(exchange(), timeout)
         except asyncio.TimeoutError:
-            raise NetworkError(f"WebSocket call api {api} timeout") from None
+            raise SendTimeout(f"WebSocket call api {api} timeout") from None
         finally:
             if store._futures.get(sequence) is future:
                 store._futures.pop(sequence)

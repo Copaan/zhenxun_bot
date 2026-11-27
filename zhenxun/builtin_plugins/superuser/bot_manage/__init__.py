@@ -1,8 +1,6 @@
 import nonebot
 from nonebot.adapters import Bot
 from nonebot.plugin import PluginMetadata
-from tortoise.exceptions import IntegrityError, TransactionManagementError
-from tortoise.transactions import in_transaction
 
 from zhenxun.configs.utils import PluginExtraData
 from zhenxun.models.bot_console import BotConsole
@@ -53,20 +51,6 @@ async def init_bot_console(bot: Bot):
         )
         return
 
-    platform = PlatformUtils.get_platform(bot)
     storage_bot_id = PlatformUtils.get_storage_bot_id(bot)
-    try:
-        bot_data, _ = await BotConsole.get_or_create(
-            bot_id=storage_bot_id, platform=platform
-        )
-    except (IntegrityError, TransactionManagementError):
-        async with in_transaction() as connection:
-            bot_data = (
-                await BotConsole.filter(bot_id=storage_bot_id)
-                .using_db(connection)
-                .get()
-            )
-    from zhenxun.services.cache.runtime_cache import BotMemoryCache
-
-    await BotMemoryCache.upsert_from_model(bot_data)
+    await BotConsole.ensure_account(storage_bot_id, PlatformUtils.get_platform(bot))
     logger.info(f"Bot {storage_bot_id} 管理记录与缓存已就绪")

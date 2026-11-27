@@ -1,7 +1,10 @@
+import asyncio
+from collections.abc import Awaitable, Callable
 from contextlib import contextmanager
 from contextvars import ContextVar
 import dataclasses
 import inspect
+import time
 from typing import Any, Generic, cast, get_origin
 from typing_extensions import TypeVar
 import uuid
@@ -128,7 +131,8 @@ class AgentRunContext(Generic[AgentDepsT]):
     timeout: float | None = None
     """整轮时限（秒），从进入会话锁开始计算。"""
     budget: dict[str, float] = dataclasses.field(default_factory=dict)
-    """整轮预算：tokens 为已知模型用量，deadline 为截止时间；子代理共享同一对象。"""
+    """整轮预算：tokens 为已知模型用量，deadline 为截止时间，waiting 为正在等待
+    用户回答的数量；子代理共享同一对象。"""
     history_metadata: dict[str, Any] = dataclasses.field(default_factory=dict)
     """写入短期记忆时附加到本轮消息上的元数据。"""
     user_notice: str | None = None
@@ -147,7 +151,6 @@ class AgentRunContext(Generic[AgentDepsT]):
     parent_run_id: str | None = None
     phase: str = "queued"
     outcome: str | None = None
-    fail_fast: bool = False
     connection_id: str | None = None
     on_accept: Any = None
     prepare_follow_up: Any = None
@@ -316,19 +319,18 @@ def get_current_run_context() -> RunContext | None:
     return _CURRENT_RUN_CONTEXT.get()
 
 
-def fail_fast_enabled() -> bool:
-    """仅当前 AI 运行及继承其上下文的调用采用首次失败即停。"""
-    context = get_current_run_context()
-    return bool(context and context.run.fail_fast)
+def interrupt_run(stage: str, error: BaseException | None = None) -> None:
+    """中断当前根运行并取消兄弟执行，用于结果无法确认、不能继续执行的情况
 
-
-def interrupt_network(stage: str, error: BaseException | None = None) -> None:
-    """中断根运行并取消兄弟执行，不把通信失败降级成可重试工具结果。"""
+    参数:
+        stage: 中断阶段
+        error: 引起中断的异常
+    """
     from zhenxun.services.ai.core.exceptions import RunInterrupted
     from zhenxun.services.ai.run.session import session_manager
 
     context = get_current_run_context()
-    if context is None or not context.run.fail_fast:
+    if context is None:
         return
     context.run.operations["interruption"] = stage
     if error is not None:
@@ -343,48 +345,160 @@ def interrupt_network(stage: str, error: BaseException | None = None) -> None:
     raise RunInterrupted(stage) from error
 
 
-def interrupt_transport(error: BaseException, stage: str) -> None:
-    """按异常类型识别传输失败；完整业务拒绝仍交给工具正常返回。"""
-    import asyncio
-    import ssl
+UNTIMED_PHASES = frozenset({"delivering", "settling"})
+"""不再受整轮时限约束的执行阶段"""
+_T = TypeVar("_T")
 
-    import anyio
-    import httpx
 
-    pending = [error]
-    seen: set[int] = set()
-    while pending:
-        item = pending.pop()
-        if id(item) in seen:
-            continue
-        seen.add(id(item))
-        if isinstance(
-            item,
-            httpx.TransportError
-            | asyncio.TimeoutError
-            | ConnectionError
-            | ssl.SSLError
-            | anyio.EndOfStream
-            | anyio.BrokenResourceError
-            | anyio.ClosedResourceError,
-        ):
-            interrupt_network(stage, error)
-        if item.__cause__:
-            pending.append(item.__cause__)
-        pending.extend(getattr(item, "exceptions", ()))
+@contextmanager
+def pause_deadline(
+    context: RunContext | None, on_resume: Callable[[float], None] | None = None
+):
+    """等待用户回答期间暂停整轮计时，最后一个等待结束时按暂停时长顺延截止时间
+
+    参数:
+        context: 运行上下文，为 None 时不计时
+        on_resume: 恢复计时时以暂停秒数调用
+    """
+    if context is None:
+        yield
+        return
+    budget = context.run.budget
+    if not budget.get("waiting"):
+        budget["paused_at"] = time.monotonic()
+    budget["waiting"] = budget.get("waiting", 0) + 1
+    try:
+        yield
+    finally:
+        budget["waiting"] -= 1
+        if not budget["waiting"]:
+            paused = time.monotonic() - budget.pop("paused_at", time.monotonic())
+            if "deadline" in budget:
+                budget["deadline"] += paused
+            if on_resume:
+                on_resume(paused)
+
+
+def deadline_passed(context: RunContext) -> bool:
+    """整轮截止时间已过，且没有在等待用户回答，也没有进入投递或结算
+
+    参数:
+        context: 运行上下文
+
+    返回:
+        bool: 是否应按超时结束
+    """
+    budget = context.run.budget
+    deadline = budget.get("deadline")
+    return (
+        deadline is not None
+        and time.monotonic() >= deadline
+        and not budget.get("waiting")
+        and context.run.phase not in UNTIMED_PHASES
+    )
+
+
+def as_timeout(context: RunContext, error: BaseException) -> BaseException:
+    """把截止时间到达引起的取消换成超时，用户停止等其他取消原样返回
+
+    参数:
+        context: 运行上下文
+        error: 本轮异常
+
+    返回:
+        BaseException: 换算后的异常
+    """
+    deadline = context.run.budget.get("deadline")
+    token = context.run.cancellation_token
+    if (
+        isinstance(error, asyncio.CancelledError)
+        and deadline is not None
+        and time.monotonic() >= deadline
+        and not (token and token.is_cancelled())
+    ):
+        return asyncio.TimeoutError("本轮执行超时")
+    return error
+
+
+async def run_until_deadline(context: RunContext, coro: Awaitable[_T]) -> _T:
+    """运行本轮主体，截止时间到达时取消并抛出超时；等待用户回答与投递结算期间不计时
+
+    参数:
+        context: 运行上下文
+        coro: 本轮主体
+
+    返回:
+        _T: 本轮主体的返回值
+    """
+    task = asyncio.ensure_future(coro)
+    expired = False
+    try:
+        while not task.done():
+            deadline = context.run.budget.get("deadline")
+            if deadline is None:
+                await asyncio.wait({task})
+                break
+            if deadline_passed(context):
+                expired = True
+                task.cancel()
+                break
+            remaining = deadline - time.monotonic()
+            await asyncio.wait({task}, timeout=remaining if remaining > 0 else 1.0)
+        try:
+            return await task
+        except asyncio.CancelledError:
+            token = context.run.cancellation_token
+            if expired and not (token and token.is_cancelled()):
+                raise asyncio.TimeoutError("本轮执行超时") from None
+            raise
+    finally:
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+def run_outcome(run: Any, result: Any, error: BaseException | None) -> str:
+    """按本轮异常与结果确定运行结局
+
+    参数:
+        run: 运行状态
+        result: 运行结果
+        error: 本轮异常
+
+    返回:
+        str: 运行结局
+    """
+    from zhenxun.services.ai.core.exceptions import (
+        InterventionHandledException,
+        RunBudgetExceeded,
+        RunInterrupted,
+    )
+
+    if run.outcome == "unknown":
+        return "unknown"
+    if run.operations.get("interruption") or isinstance(error, RunInterrupted):
+        return "interrupted"
+    if isinstance(error, asyncio.TimeoutError):
+        return "timeout"
+    if isinstance(error, asyncio.CancelledError):
+        token = run.cancellation_token
+        return "cancelled" if token and token.reason == "cancelled" else "interrupted"
+    if isinstance(error, RunBudgetExceeded):
+        return "exhausted"
+    if isinstance(error, InterventionHandledException):
+        return "skipped"
+    if error is not None:
+        return "failed"
+    return getattr(result, "outcome", None) or "completed"
 
 
 @contextmanager
 def set_run_context(ctx: RunContext):
     """[内部 API] 挂载当前上下文至全局"""
-    from zhenxun.utils.decorator.retry import network_fail_fast
-
     token = _CURRENT_RUN_CONTEXT.set(ctx)
-    network_token = network_fail_fast.set(bool(ctx and ctx.run.fail_fast))
     try:
         yield
     finally:
-        network_fail_fast.reset(network_token)
         _CURRENT_RUN_CONTEXT.reset(token)
 
 

@@ -293,8 +293,9 @@ class AgentSessionManager:
         if unknown:
             from zhenxun.models.ai_agent_run import AIAgentRun
 
+            contexts = dict(entries)
             for run_id in unknown:
-                context = self.runs[run_id][0]
+                context = contexts[run_id][0]
                 context.run.outcome = "unknown"
                 await AIAgentRun.filter(run_id=run_id).update(
                     status="unknown",

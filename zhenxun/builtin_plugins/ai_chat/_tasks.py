@@ -65,7 +65,7 @@ class TaskParams(BaseModel):
 
 
 def build_trigger(kind: str, value: str) -> BaseTrigger:
-    """解析主动任务的触发方式，限制两次执行至少间隔 10 分钟
+    """按 Bot 时区解析主动任务的触发方式，限制两次执行至少间隔 10 分钟
 
     参数:
         kind: cron（“分 时 日 月 周”）、interval（间隔分钟）、date（YYYY-MM-DD HH:MM）
@@ -82,14 +82,15 @@ def build_trigger(kind: str, value: str) -> BaseTrigger:
         if not value.isdigit() or int(value) * 60 < MIN_INTERVAL:
             raise ValueError(f"间隔至少 {MIN_INTERVAL // 60} 分钟。")
         return Trigger.interval(minutes=int(value))
+    zone = TimeUtils.zone()
     if kind == "date":
         try:
-            run_at = datetime.strptime(value, "%Y-%m-%d %H:%M")
+            run_at = datetime.strptime(value, "%Y-%m-%d %H:%M").replace(tzinfo=zone)
         except ValueError as e:
             raise ValueError("时间格式应为 YYYY-MM-DD HH:MM。") from e
-        if run_at <= datetime.now():
+        if run_at <= TimeUtils.now():
             raise ValueError("执行时间必须晚于现在。")
-        return Trigger.date(run_date=run_at)
+        return Trigger.date(run_date=run_at, timezone=str(zone))
     if kind != "cron":
         raise ValueError("触发方式应为 cron、interval 或 date。")
     fields = value.split()
@@ -104,21 +105,25 @@ def build_trigger(kind: str, value: str) -> BaseTrigger:
             day=day,
             month=month,
             day_of_week=day_of_week,
-            timezone=TimeUtils.zone(),
+            timezone=zone,
         )
     except ValueError as e:
         raise ValueError(f"cron 表达式无效：{e}") from e
-    now = datetime.now().astimezone()
-    previous = trigger.get_next_fire_time(None, now)
+    previous = trigger.get_next_fire_time(None, TimeUtils.now())
     for _ in range(200):
-        if previous is None or previous - now > timedelta(days=8):
+        if previous is None:
             break
         current = trigger.get_next_fire_time(previous, previous + timedelta(seconds=1))
         if current and (current - previous).total_seconds() < MIN_INTERVAL:
             raise ValueError(f"两次执行至少间隔 {MIN_INTERVAL // 60} 分钟。")
         previous = current
     return Trigger.cron(
-        minute=minute, hour=hour, day=day, month=month, day_of_week=day_of_week
+        minute=minute,
+        hour=hour,
+        day=day,
+        month=month,
+        day_of_week=day_of_week,
+        timezone=str(zone),
     )
 
 
@@ -183,11 +188,14 @@ def describe_trigger(job: ScheduledJob) -> str:
 
 
 def _options() -> dict[str, Any]:
-    """主动任务不重叠执行，不补跑停机期间错过的触发。"""
-    return {"concurrency_policy": "SKIP", "misfire_grace_time": 1, "retries": 0}
+    """主动任务不重叠执行，到点后 60 秒内仍会执行，不补跑停机期间错过的触发。"""
+    return {"concurrency_policy": "SKIP", "misfire_grace_time": 60, "retries": 0}
 
 
 class AITasks:
+    _create_lock = asyncio.Lock()
+    """串行执行数量检查与创建，避免并发创建超出上限"""
+
     @classmethod
     def item(cls, job: ScheduledJob) -> dict[str, Any]:
         """任务的展示数据
@@ -232,6 +240,39 @@ class AITasks:
             ),
             "created_at": job.create_time.isoformat(),
         }
+
+    @classmethod
+    async def upgrade_options(cls) -> None:
+        """按当前规则补齐旧任务的执行选项与触发时区，已启用的任务重新调度"""
+        from zhenxun.services.scheduler.engine import APSchedulerAdapter
+
+        zone = TimeUtils.zone()
+        for job in await cls.all():
+            options = job.execution_options
+            options = options if isinstance(options, dict) else {}
+            config = job.trigger_config
+            config = dict(config) if isinstance(config, dict) else {}
+            grace = _options()["misfire_grace_time"]
+            changed = options.get("misfire_grace_time") != grace
+            if changed:
+                job.execution_options = {**options, **_options()}
+            if job.trigger_type in {"cron", "date"} and not config.get("timezone"):
+                config["timezone"] = str(zone)
+                run_date = config.get("run_date")
+                if isinstance(run_date, str):
+                    try:
+                        parsed = datetime.fromisoformat(run_date)
+                    except ValueError:
+                        parsed = None
+                    if parsed and parsed.tzinfo is None:
+                        config["run_date"] = parsed.replace(tzinfo=zone).isoformat()
+                job.trigger_config = config
+                changed = True
+            if not changed:
+                continue
+            await job.save()
+            if job.is_enabled:
+                APSchedulerAdapter.add_or_reschedule_job(job)
 
     @classmethod
     async def all(cls) -> list[ScheduledJob]:
@@ -303,6 +344,39 @@ class AITasks:
 
     @classmethod
     async def create(
+        cls,
+        bot_id: str,
+        params: TaskParams,
+        name: str,
+        kind: str,
+        value: str,
+        user_limit: int = 0,
+    ) -> ScheduledJob:
+        """在锁内检查每人上限与总数上限后创建主动任务
+
+        参数:
+            bot_id: 执行任务的 Bot
+            params: 任务参数（prompt、创建者、目标群或私聊对象）
+            name: 任务名称
+            kind: 触发方式
+            value: 触发值
+            user_limit: 创建者最多拥有的任务数，0 为不限
+
+        返回:
+            ScheduledJob: 主动任务
+
+        异常:
+            ValueError: 参数无效或已达数量上限
+        """
+        async with cls._create_lock:
+            if user_limit and await cls.count_by(params.creator) >= user_limit:
+                raise ValueError(
+                    f"每人最多创建 {user_limit} 个主动任务，请先取消不需要的。"
+                )
+            return await cls._create(bot_id, params, name, kind, value)
+
+    @classmethod
+    async def _create(
         cls,
         bot_id: str,
         params: TaskParams,
@@ -579,7 +653,7 @@ class AITasks:
                     "sent",
                     "skipped",
                 }:
-                    if await send_marked(context, sticker_id):
+                    if await send_marked(context, sticker_id) is None:
                         context.state["_chat_sticker_sent"] = True
                         delivery.status = "sent"
             except BaseException as exc:
@@ -687,14 +761,8 @@ class TaskToolkit(BaseToolkit):
         if bot is None or not creator:
             return ToolResult(output="只能在 QQ 对话中创建主动任务。").as_error(False)
         limit = int(Config.get_config(MODULE, "TASK_USER_LIMIT") or 0)
-        if (
-            limit
-            and not PlatformUtils.is_superuser(bot, creator)
-            and await AITasks.count_by(creator) >= limit
-        ):
-            return ToolResult(
-                output=f"每人最多创建 {limit} 个主动任务，请先取消不需要的。"
-            ).as_error(False)
+        if PlatformUtils.is_superuser(bot, creator):
+            limit = 0
         params = TaskParams(
             prompt=prompt,
             creator=creator,
@@ -702,7 +770,9 @@ class TaskToolkit(BaseToolkit):
             user_id=None if group_id else creator,
         )
         try:
-            job = await AITasks.create(bot.self_id, params, name, kind, value)
+            job = await AITasks.create(
+                bot.self_id, params, name, kind, value, user_limit=limit
+            )
         except ValueError as e:
             return ToolResult(output=str(e)).as_error(False)
         return ToolResult(output=f"已创建主动任务 #{job.id}：{describe_trigger(job)}。")

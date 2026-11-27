@@ -101,7 +101,9 @@ async def summarize(
                     ):
                         break
                     text = (
-                        _message_text(row.role, row.content)
+                        _message_text(
+                            row.role, row.content, bool(meta.get("background_claim"))
+                        )
                         if row.role in {"user", "assistant"}
                         else ""
                     )
@@ -163,7 +165,7 @@ async def summarize(
                 begun = time.monotonic()
                 status, output, error, tokens, memory = "silent", "", "", 0, None
                 try:
-                    parsed = {"summary": "", "importance": 0}
+                    parsed: list[dict] = []
                     if lines:
                         name = (
                             next(
@@ -188,14 +190,16 @@ async def summarize(
                         output = response.text
                         tokens = parse_usage_info(response.usage_info).total_tokens
                         parsed = _parse_json(output)
-                    summary = parsed["summary"].strip()
-                    should_save = bool(
-                        summary and parsed["importance"] >= MIN_IMPORTANCE
-                    )
-                    summary, blocked = Safety.filter_output(summary)
-                    if blocked:
-                        raise ValueError("摘要包含不能保存的内容")
-                    vector = (await cls._embed([summary]))[0] if should_save else None
+                    items = []
+                    for item in parsed[:5]:
+                        summary = item["summary"].strip()
+                        if not summary or item["importance"] < MIN_IMPORTANCE:
+                            continue
+                        summary, blocked = Safety.filter_output(summary)
+                        if blocked:
+                            raise ValueError("摘要包含不能保存的内容")
+                        items.append({**item, "summary": summary})
+                    vectors = await cls._embed([x["summary"] for x in items])
                     async with in_transaction() as connection:
                         current = (
                             await AIMemoryCursor.filter(id=cursor.id)
@@ -226,21 +230,21 @@ async def summarize(
                             or digest != signature
                         ):
                             raise asyncio.CancelledError("整理期间会话已改变")
-                        if should_save:
-                            participants = list(
-                                dict.fromkeys(
-                                    x.metadata.get("sender")
-                                    for x in selected
-                                    if x.metadata and x.metadata.get("sender")
-                                )
+                        senders = list(
+                            dict.fromkeys(
+                                x.metadata.get("sender")
+                                for x in selected
+                                if x.metadata and x.metadata.get("sender")
                             )
+                        )
+                        for item, vector in zip(items, vectors):
                             memory, _ = await cls.add(
                                 scope,
-                                summary,
-                                _strings(parsed.get("topics"), 5),
-                                _strings(parsed.get("key_facts"), 8),
-                                participants,
-                                parsed["importance"],
+                                item["summary"],
+                                _strings(item.get("topics"), 5),
+                                _strings(item.get("key_facts"), 5),
+                                _strings(item.get("participants"), 10) or senders,
+                                item["importance"],
                                 created_at=selected[-1].created_at,
                                 vector=vector,
                                 embedded=True,
@@ -249,6 +253,11 @@ async def summarize(
                             status = "ok"
                         current.message_id = end_id
                         current.state = {
+                            **(
+                                {"scope": current.state["scope"]}
+                                if (current.state or {}).get("scope")
+                                else {}
+                            ),
                             "status": "ready",
                             "attempts": 0,
                             "partial_id": partial_id,

@@ -88,10 +88,6 @@ async def request(
                 **kwargs,
             ) as response:
                 if not 200 <= response.status_code < 300:
-                    if response.status_code >= 500:
-                        from zhenxun.services.ai.run.context import interrupt_network
-
-                        interrupt_network(f"deepseek_{operation}")
                     reason = _STATUS.get(response.status_code, "请求未成功，未自动重发")
                     raise LLMException(
                         f"DeepSeek {operation}: HTTP {response.status_code}，{reason}"
@@ -138,9 +134,6 @@ async def request(
     try:
         return await asyncio.wait_for(future, timeout)
     except (httpx.TransportError, asyncio.TimeoutError) as exc:
-        from zhenxun.services.ai.run.context import interrupt_transport
-
-        interrupt_transport(exc, f"deepseek_{operation}")
         raise LLMException(
             f"DeepSeek {operation} 通信失败，执行结果未确认，未自动重发"
         ) from exc

@@ -178,6 +178,20 @@ async def _(
         await MessageUtils.build_message("数据为空捏...").finish(reply_to=True)
 
 
+async def _check_ids(user_id: str, group_id: Match[str]):
+    """输入的用户/群组 id 格式无效时结束会话
+
+    参数:
+        user_id: 用户id
+        group_id: 群组id
+    """
+    for value in (user_id, group_id.result if group_id.available else ""):
+        if value and not BanManage.valid_id(value):
+            await MessageUtils.build_message(
+                f"id {value} 格式不正确捏，查看黑名单请发送 ban列表"
+            ).finish(reply_to=True)
+
+
 @_ban_matcher.handle()
 async def _(
     bot: Bot,
@@ -200,6 +214,7 @@ async def _(
             if not is_superuser:
                 await MessageUtils.build_message("权限不足捏...").finish(reply_to=True)
             user_id = user.result
+    await _check_ids(user_id, group_id)
     _duration = duration.result * 60 if duration.available else -1
     _duration_text = f"{duration.result} 分钟" if duration.available else " 到世界湮灭"
     ban_reason = reason.result if reason.available else None
@@ -257,6 +272,10 @@ async def _(
         ).finish(reply_to=True)
     elif is_superuser:
         _group_id = group_id.result if group_id.available else None
+        if not user_id and not _group_id:
+            await MessageUtils.build_message("请指定要封禁的用户或群组捏...").finish(
+                reply_to=True
+            )
         await BanManage.ban(user_id, _group_id, ban_reason, _duration, session, True)
         logger.info(
             "超级用户Ban",
@@ -289,7 +308,12 @@ async def _(
             if not is_superuser:
                 await MessageUtils.build_message("权限不足捏...").finish(reply_to=True)
             user_id = user.result
+    await _check_ids(user_id, group_id)
     if gid := session.id3 or session.id2:
+        if not user_id and not group_id.available and _idx is None:
+            await MessageUtils.build_message("请指定要解除封禁的用户捏...").finish(
+                reply_to=True
+            )
         if group_id.available:
             if not is_superuser:
                 await MessageUtils.build_message("权限不足捏...").finish(reply_to=True)

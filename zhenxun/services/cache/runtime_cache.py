@@ -849,13 +849,6 @@ class BanMemoryCache(RuntimeMemoryCache):
         return entry.remaining() if entry else 0
 
     @classmethod
-    def check_ban_level(
-        cls, user_id: str | None, group_id: str | None, level: int
-    ) -> bool:
-        entry = cls._active_entry(user_id, group_id)
-        return entry is not None and entry.ban_level <= level
-
-    @classmethod
     async def cleanup_expired(cls, delete_db: bool = True) -> None:
         now_ts = time.time()
         expired: list[BanEntry] = []
@@ -884,7 +877,9 @@ class BanMemoryCache(RuntimeMemoryCache):
 
         async with write_scope():
             for entry in expired:
-                query = BanConsole.filter()
+                query = BanConsole.filter(
+                    ban_time=entry.ban_time, duration=entry.duration
+                )
                 if entry.user_id:
                     query = query.filter(user_id=entry.user_id)
                 else:

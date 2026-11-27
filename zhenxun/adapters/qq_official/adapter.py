@@ -101,6 +101,8 @@ class ZhenxunQQAdapter(QQAdapter):
                 raise RuntimeError(f"qq_ingress_version_unsupported:{name}")
         self._webhook_bots: dict[str, ZhenxunQQBot] = {}
         self._websocket_bot_infos: dict[str, Any] = {}
+        self._shard_tasks: dict[str, set[asyncio.Task]] = {}
+        """各 WebSocket Bot 已鉴权的分片任务"""
         self._websocket_started = False
         self._startup_prepared = False
         self._startup_lock = asyncio.Lock()
@@ -136,6 +138,22 @@ class ZhenxunQQAdapter(QQAdapter):
 
     @override
     def bot_disconnect(self, bot: ZhenxunQQBot) -> None:
+        """注销 Bot；多分片时只在最后一个已鉴权分片断开时注销
+
+        参数:
+            bot: Bot
+        """
+        if (live := self._shard_tasks.get(bot.self_id)) is not None:
+            live.discard(asyncio.current_task())  # type: ignore[arg-type]
+            live.difference_update([task for task in live if task.done()])
+            if live:
+                logger.info(
+                    f"QQ 官方 Bot 一个分片已断开，其余 {len(live)} 个分片仍在线",
+                    "QQOfficial",
+                    target=bot.self_id,
+                )
+                return
+            self._shard_tasks.pop(bot.self_id, None)
         was_connected = bot.self_id in self.bots
         super().bot_disconnect(bot)
         if was_connected:
@@ -245,6 +263,7 @@ class ZhenxunQQAdapter(QQAdapter):
         _runtime.unregister_adapter_runtime(self)
         self._webhook_bots.clear()
         self._websocket_bot_infos.clear()
+        self._shard_tasks.clear()
         self._websocket_started = False
         self._startup_prepared = False
         self._webhook_route_registered = False
@@ -511,6 +530,8 @@ class ZhenxunQQAdapter(QQAdapter):
                 target=bot.self_id,
             )
             raise
+        if result and (task := asyncio.current_task()) is not None:
+            self._shard_tasks.setdefault(bot.self_id, set()).add(task)
         if not result:
             public_error = QQPublicError(
                 code="qq_websocket_auth_failed",

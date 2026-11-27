@@ -25,12 +25,12 @@ from zhenxun.utils.manager.priority_manager import PriorityLifecycle
 from zhenxun.utils.message import MessageUtils
 
 from ._buffer import AtWaiter, ChatBuffer, ChatLine, sender_name, summarize
-from ._data_source import MODULE, AIChatManager
+from ._data_source import MODULE, AIChatManager, is_blank, strip_slash
 from ._memory import Memory
 from ._proactive import PROACTIVE_KEY, Proactive
 from ._reply import quote_reply
 from ._steal import Steal
-from ._tasks import register_task_job
+from ._tasks import AITasks, register_task_job
 from .config import CONFIGS
 
 MESSAGE_KEY = "ai_chat_message"
@@ -135,8 +135,10 @@ async def _rule(bot: Bot, event: Event, message: UniMsg, state: T_State) -> bool
         if AtWaiter.feed(bot.self_id, group_id, user_id, message, line.message_id):
             return False
     if await AIChatManager.should_reply(event, message, group_id, bot):
-        if group_id:
+        if group_id and line:
             Proactive.answered(bot.self_id, group_id)
+            if event.is_tome() and is_blank(strip_slash(message)):
+                AtWaiter.expect(bot.self_id, group_id, line.user_id, line.message_id)
         return True
     if not group_id or not line or not line.text:
         return False
@@ -248,6 +250,7 @@ if Memory.cursors not in HISTORY_RETAIN:
 )
 async def _():
     Proactive.upgrade_config()
+    await AITasks.upgrade_options()
     from zhenxun.services.ai.run.session import session_manager
 
     await session_manager.start()

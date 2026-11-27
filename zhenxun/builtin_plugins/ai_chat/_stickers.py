@@ -480,7 +480,11 @@ class Stickers:
             return "没有这个表情。"
         if reason := SendQuota.take(scene.key):
             return reason
-        data = await asyncio.to_thread(path.read_bytes)
+        try:
+            data = await asyncio.to_thread(path.read_bytes)
+        except BaseException:
+            SendQuota.refund(scene.key, 1)
+            raise
         if (expected_md5 and sticker.md5 != expected_md5) or hashlib.md5(
             data
         ).hexdigest() != sticker.md5:
@@ -636,32 +640,38 @@ def split_sticker(text: str) -> tuple[str, int | None]:
     return "".join(result).strip(), sticker_id
 
 
-async def send_marked(context: RunContext, sticker_id: int) -> bool:
-    """回复文字发完后发送回复中标记的表情，关闭发送工具、表情不存在或配额用完时放弃
+async def send_marked(context: RunContext, sticker_id: int) -> str | None:
+    """回复文字发完后发送回复中标记的表情，关闭发送工具、表情不在候选或配额用完时放弃
 
     参数:
         context: 运行上下文
         sticker_id: 表情 id
+
+    返回:
+        str | None: 未发送的原因，发送成功时为空
     """
     expected = context.state.get("_sticker_candidates", {}).get(sticker_id)
-    if expected is None or not Config.get_config(MODULE, "SEND_TOOLS", True):
-        return False
+    if expected is None:
+        return f"表情 #{sticker_id} 不在本轮候选里。"
     from zhenxun.services.ai.utils.runtime import PermissionUtils
 
     identity = context.state.get("_sticker_send_identity")
-    if not identity or identity not in context.run.bound_tools:
-        return False
+    if (
+        not Config.get_config(MODULE, "SEND_TOOLS", True)
+        or not identity
+        or identity not in context.run.bound_tools
+    ):
+        return "本轮不能发送表情。"
     PermissionUtils.ensure_current(context)
     restricted = await PermissionUtils.tool_restrictions(context)
     if restricted is None or identity in restricted:
-        return False
+        return "本轮不能发送表情。"
     scene = Scene.of(context)
     if scene is None:
-        return False
+        return "当前不在会话中。"
     reason = await Stickers.send(
         scene, sticker_id, context=context, expected_md5=expected
     )
     if reason:
         logger.debug(f"未发送标记的表情 #{sticker_id}: {reason}", MODULE)
-        return False
-    return True
+    return reason

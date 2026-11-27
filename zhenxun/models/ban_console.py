@@ -134,32 +134,20 @@ class BanConsole(Model):
         return BanMemoryCache.is_loaded()
 
     @classmethod
-    async def check_ban_level(
-        cls, user_id: str | None, group_id: str | None, level: int
-    ) -> bool:
-        """检测ban掉目标的用户与unban用户的权限等级大小
+    async def get_active(cls, user_id: str | None, group_id: str | None) -> Self | None:
+        """获取与用户、群组完全对应且未过期的封禁记录，群内查询不回落到全局记录
 
         参数:
             user_id: 用户id
-            group_id: 群组id
-            level: 权限等级
+            group_id: 群组id，为空时查询全局记录
 
         返回:
-            bool: 权限判断，能否unban
+            Self | None: 封禁记录
         """
-        user_id, group_id = scoped_user_id(user_id), scoped_group_id(group_id)
-        logger.debug("检测用户被ban等级", target=cls._target_label(user_id, group_id))
-        if await cls._ensure_ban_cache():
-            return BanMemoryCache.check_ban_level(user_id, group_id, level)
-        # 缓存不可用不代表没有 ban 记录，回落到权威数据。
-        try:
-            record = await cls._db_ban_entry(user_id, group_id)
-        except Exception as e:
-            logger.warning("ban 缓存未就绪且读库失败", e=e)
-            return False
+        record = await cls.get_ban(user_id=user_id, group_id=group_id)
         if record is None or cls._entry_remaining(record) == 0:
-            return False
-        return int(record.ban_level) <= level
+            return None
+        return record
 
     @classmethod
     async def check_ban_time(

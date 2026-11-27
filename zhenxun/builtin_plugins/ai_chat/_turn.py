@@ -177,6 +177,74 @@ class ChatTurn:
             )
         return None
 
+    def failure_notice(
+        self, error: BaseException | None, persona: AIPersona | None = None
+    ) -> str | None:
+        """本轮失败时给发起对话的用户看的说明，具体原因优先，其次是人设的出错提示
+
+        参数:
+            error: 运行异常
+            persona: 人设
+
+        返回:
+            str | None: 说明文本，主动发言、定时任务、用户停止、模型选择沉默或投递结果
+                未确认时为空
+        """
+        from zhenxun.services.ai.core.exceptions import ControlFlowExit, LLMException
+
+        from ._reply import clean_output
+
+        run = self.context.run
+        if self.source != "qq" or run.operations.get("interruption"):
+            return None
+        if isinstance(error, asyncio.CancelledError | ControlFlowExit) or (
+            self.result and self.result.stopped
+        ):
+            return None
+        record = run.operations.get("deliveries", {}).get(self.target, {})
+        if record.get("uncertain"):
+            return None
+        text = str(self.result.output or "") if self.result else ""
+        if (
+            error is None
+            and self.context.state.get("_chat_reply_issue") != "output_blocked"
+            and clean_output(text)
+            and parse_silent(text) is None
+        ):
+            return None
+        if run.user_notice:
+            return run.user_notice
+        if persona and persona.error_message:
+            return persona.error_message
+        if isinstance(error, asyncio.TimeoutError):
+            return (
+                f"这次处理超过 {int(run.timeout or 0)} 秒，已停止。"
+                "可以稍后再问，或在 AI 聊天设置中调大整轮时限。"
+            )
+        if isinstance(error, LLMException):
+            return error.user_friendly_message
+        if error is not None:
+            return "这次处理出错了，请稍后再试。"
+        return "这次没能生成回复，请稍后再试。"
+
+    async def notify_failure(
+        self, error: BaseException | None, persona: AIPersona | None = None
+    ) -> None:
+        """向发起对话的用户发送失败说明，不改变本轮的投递状态
+
+        参数:
+            error: 运行异常
+            persona: 人设
+        """
+        from ._reply import send_reply
+
+        if not (notice := self.failure_notice(error, persona)):
+            return
+        try:
+            await send_reply(notice, self.context.get_group_id(), context=self.context)
+        except Exception as exc:
+            logger.warning(f"失败说明未送达: {type(exc).__name__}", MODULE)
+
     def report(self, error: BaseException | None = None) -> dict:
         """汇总投递结果：本轮回复（含失败提示）确认送达时为已送达，出错前只由发送工具
         发出部分内容时为部分送达
@@ -279,7 +347,7 @@ class ChatTurn:
         setting: AIChatGroup | None,
         persona: AIPersona | None,
     ) -> None:
-        """投递正常回复与业务拒绝；系统故障只进入运行记录。
+        """投递正常回复与业务拒绝；本轮失败时向发起对话的用户说明原因
 
         参数:
             value: 运行结果，失败时为空
@@ -318,6 +386,8 @@ class ChatTurn:
                 )
             else:
                 delivery.status = "failed"
+                if directed:
+                    await self.notify_failure(error, persona)
             return
         if (
             record.get("tool_delivery_failure")
@@ -326,6 +396,8 @@ class ChatTurn:
         ):
             self.reply_kind = "failure"
             delivery.status = "failed"
+            if directed:
+                await self.notify_failure(None, persona)
             return
         if value.stopped:
             delivery.status = "skipped"
@@ -344,6 +416,8 @@ class ChatTurn:
         reply = self.resolve_reply(value)
         if self.reply_kind == "failure":
             delivery.status = "failed"
+            if directed:
+                await self.notify_failure(None, persona)
             return
         sticker_id = None
         if reply:
@@ -359,7 +433,7 @@ class ChatTurn:
         if sticker_id is not None and delivery.status in {"sent", "skipped"}:
             if check := context.state.get("_chat_delivery_check"):
                 await check()
-            if await send_marked(context, sticker_id):
+            if await send_marked(context, sticker_id) is None:
                 context.state["_chat_sticker_sent"] = True
                 delivery.status = "sent"
 

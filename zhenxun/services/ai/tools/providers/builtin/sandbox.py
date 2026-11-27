@@ -90,8 +90,11 @@ class SandboxToolkit(BaseToolkit):
             result = await sandbox.run_code(lang, code, timeout)
         except Exception as e:
             logger.warning(f"沙箱调用未完成: {type(e).__name__}")
+            if not started:
+                reason = str(e) or type(e).__name__
+                return ToolResult(output=f"沙箱不可用：{reason}").as_error(False)
             return ToolResult(output="沙箱执行未完成，请核查结果。").as_error(
-                False, uncertain=started
+                False, uncertain=True
             )
         logger.info(f"沙箱执行 {lang} 代码 {len(code)} 字符，退出码 {result.exit_code}")
         text = result.text()
@@ -121,8 +124,11 @@ class SandboxToolkit(BaseToolkit):
             terminal = await sandbox.open_terminal(command)
         except Exception as e:
             logger.warning(f"沙箱命令未完成: {type(e).__name__}")
+            if not started:
+                reason = str(e) or type(e).__name__
+                return ToolResult(output=f"沙箱不可用：{reason}").as_error(False)
             return ToolResult(output="沙箱命令未完成，请核查结果。").as_error(
-                False, uncertain=started
+                False, uncertain=True
             )
         await asyncio.sleep(1.5)
         return ToolResult(output=f"终端已启动，当前画面:\n{terminal.screen()}")

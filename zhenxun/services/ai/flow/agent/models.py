@@ -61,8 +61,6 @@ class AgentState(BaseModel):
     """大模型最新返回的响应实体"""
     current_tool_calls: list[ToolCallPart] = Field(default_factory=list)
     """当前轮次准备在本地执行的工具调用"""
-    current_tool_results: list[Any] = Field(default_factory=list)
-    """当前轮次工具执行的结果或异常收集"""
 
     should_reset_cycle: bool = False
     """是否需要重置循环计数（追加了用户消息）"""
@@ -72,8 +70,6 @@ class AgentState(BaseModel):
     """等待返回的最终运行结果"""
     usage: UsageInfo = Field(default_factory=UsageInfo)
     """累计的 Token 消耗"""
-    token_drift: int = 0
-    """动态 Token 校准偏移量 (真实 - 预估)"""
 
 
 class AgentRunResources(BaseModel):

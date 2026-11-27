@@ -363,9 +363,6 @@ async def invoke(
                 else await pending
             )
         except asyncio.TimeoutError as exc:
-            from zhenxun.services.ai.run.context import interrupt_transport
-
-            interrupt_transport(exc, "deepseek_asr")
             raise NetworkTimeoutException("DeepSeek ASR 请求超时，未自动重发") from exc
     routes = resolve_routes(model, task)
     if task == "chat":

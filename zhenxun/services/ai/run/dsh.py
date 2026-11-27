@@ -59,7 +59,6 @@ class DshSettings(BaseModel):
     sdk_provider: str = ""
     sdk_model: str = ""
     sdk_thinking: str = ""
-    timeout: int = Field(default=900, ge=10, le=3600)
     permission: Literal["sandbox", "full"] = "sandbox"
     allow_tools: bool = False
     migration_required: bool = Field(default=False, exclude=True)
@@ -501,6 +500,9 @@ class _Turn:
     pending: set = field(default_factory=set)
     bridge_tasks: set = field(default_factory=set)
     event_ids: set[str] = field(default_factory=set)
+    calls: dict[str, dict] = field(default_factory=dict)
+    calls_saved: bool = False
+    checked_at: float = 0.0
 
     def mark_submission(self, phase: Literal["unknown", "accepted"]):
         """在发送边界持久化本轮提交状态，通信中断时不覆盖旧收据。"""
@@ -511,6 +513,119 @@ class _Turn:
             self.binding, inflight={**flight, "submission": phase}
         )
         self.context.run.operations.setdefault("dsh", {})["submission"] = phase
+
+    @property
+    def lease_path(self) -> Path:
+        """本轮守卫授权文件的路径"""
+        return DSH_PATH / "leases" / (self.binding["remote_id"] + ".json")
+
+    def write_lease(self, **extra: Any) -> None:
+        """写入供桌面守卫校验的本轮授权，有效期为整轮时限
+
+        参数:
+            **extra: 附加字段
+        """
+        from nonebot import get_driver
+
+        from .dsh_tools import bridge_lease
+
+        port = int(get_driver().config.port)
+        self.lease_path.parent.mkdir(parents=True, exist_ok=True)
+        write_json_locked(
+            self.lease_path,
+            {
+                "sessionId": self.binding["remote_id"],
+                "runId": self.context.run.run_id,
+                "requestId": self.request_id,
+                "token": self.token,
+                "bridge": bridge_lease(self),
+                "expires": time.time() + (self.context.run.timeout or 900),
+                "authorize": f"http://127.0.0.1:{port}/zhenxun/api/ai/dsh/authorize",
+                **extra,
+            },
+        )
+
+    def inflight(self) -> dict:
+        """提交前写入会话映射的本轮在途记录
+
+        返回:
+            dict: 在途记录
+        """
+        return {
+            "boot": BOOT_ID,
+            "run_id": self.context.run.run_id,
+            "request_id": self.request_id,
+            "submission": "not_submitted",
+            "input_id": self.context.state.get("_dsh_input_id"),
+        }
+
+    def finish(self, outcome: str) -> tuple[str, UsageInfo, str]:
+        """按远端报告的结束原因给出本轮结果，远端明确报告未完成时按失败处理
+
+        参数:
+            outcome: 远端报告的结束原因
+
+        返回:
+            tuple[str, UsageInfo, str]: 最终文本、用量与结束原因
+        """
+        if outcome != "completed":
+            reason = "模型请求失败" if outcome == "error" else f"未完成（{outcome}）"
+            raise DshUnavailable(f"DSH 本轮{reason}，没有生成回复。")
+        return self.final_text(), self.usage, outcome
+
+    async def verify_authorization(self) -> None:
+        """运行期间每隔 5 秒复核本轮授权，超管、人设或模式变化时停止本轮"""
+        if time.monotonic() - self.checked_at < 5:
+            return
+        self.checked_at = time.monotonic()
+        PermissionUtils.ensure_current(self.context)
+        check = self.context.state.get("_dsh_authorization_check")
+        if check and await check() != self.binding["mode"]:
+            raise DshUnavailable("DSH 模式或当前授权已变化，本轮已停止。")
+
+    def final_text(self) -> str:
+        """本轮最终答复：最后一条模型消息的文本，为空时取最近一条有文本的消息
+
+        伴随工具调用的中间文本不并入答复
+
+        返回:
+            str: 答复文本
+        """
+        texts = list(self.responses.values())
+        if texts and texts[-1].strip():
+            return texts[-1]
+        return next((t for t in reversed(texts) if t.strip()), "")
+
+    async def answer_questions(self, questions: list[dict]) -> list[dict]:
+        """逐个向用户转述 DSH 的提问并收集答复，回复选项编号时视为选中该项
+
+        参数:
+            questions: DSH 提问列表
+
+        返回:
+            list[dict]: 按 DSH 格式组织的答复
+        """
+        answers = []
+        for q in questions:
+            options = [str(o.get("label", "")) for o in q.get("options") or []]
+            question = str(q.get("question", ""))
+            if q.get("detail"):
+                question += "\n\n" + str(q["detail"])
+            if options:
+                question += "\n" + "\n".join(
+                    f"{i}. {label}" for i, label in enumerate(options, 1)
+                )
+            reply = (await self.ask(question)).strip()
+            if reply.isdigit() and 0 < int(reply) <= len(options):
+                reply = options[int(reply) - 1]
+            answers.append(
+                {
+                    "id": q.get("id"),
+                    "selected": [reply] if reply in options else [],
+                    **({"custom": reply} if reply not in options else {}),
+                }
+            )
+        return answers
 
 
 class DshRuntime:
@@ -570,10 +685,6 @@ class DshRuntime:
             return hashlib.sha256(document["content"].encode()).hexdigest()
         except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
             raise DshUnavailable("DSH 专用预设或守卫组成不符，未提交问题。") from exc
-
-    @classmethod
-    def running(cls):
-        return bool(cls._turns)
 
     @classmethod
     async def status(cls, settings: DshSettings) -> dict:
@@ -733,7 +844,6 @@ class DshRuntime:
     @classmethod
     async def start(cls, context, binding, settings, approve, ask) -> _Turn:
         from .dsh_control import DshControl, Foreground
-        from .dsh_tools import bridge_lease
 
         if settings.transport != binding.get("transport", "desktop"):
             raise DshUnavailable("执行器传输已变化，请重新选择会话。")
@@ -801,9 +911,6 @@ class DshRuntime:
                 and binding.get("preset_revision") != preset_revision
             ):
                 await recover("preset_changed")
-            from nonebot import get_driver
-
-            port = int(get_driver().config.port)
             workspace = (
                 Path(binding["cwd"])
                 if binding.get("inherited")
@@ -816,24 +923,12 @@ class DshRuntime:
                 if binding["created"] and binding.get("cwd") != str(workspace):
                     raise DshUnavailable("普通聊天工作区已变化，未自动更换。")
             workspace.mkdir(parents=True, exist_ok=True)
-            leases = DSH_PATH / "leases"
-            leases.mkdir(parents=True, exist_ok=True)
-            write_json_locked(
-                leases / (binding["remote_id"] + ".json"),
-                {
-                    "sessionId": binding["remote_id"],
-                    "runId": context.run.run_id,
-                    "token": turn.token,
-                    "mode": execution_mode,
-                    "requestId": turn.request_id,
-                    "modelSelection": binding.get("model")
-                    if binding.get("inherited")
-                    else None,
-                    "cwd": str(workspace.resolve()),
-                    "expires": time.time() + settings.timeout,
-                    "authorize": f"http://127.0.0.1:{port}/zhenxun/api/ai/dsh/authorize",
-                    "bridge": bridge_lease(turn),
-                },
+            turn.write_lease(
+                mode=execution_mode,
+                modelSelection=binding.get("model")
+                if binding.get("inherited")
+                else None,
+                cwd=str(workspace.resolve()),
             )
             if not binding["created"]:
                 await client.rpc(
@@ -867,16 +962,7 @@ class DshRuntime:
                 state.get("active") is not True and not binding.get("inherited")
             ) or Foreground.read("desktop", state) is not Foreground.IDLE:
                 raise DshUnavailable("该 DSH 会话仍有未结束的执行，未提交新输入。")
-            DshSessions.update(
-                binding,
-                inflight={
-                    "boot": BOOT_ID,
-                    "run_id": context.run.run_id,
-                    "request_id": turn.request_id,
-                    "submission": "not_submitted",
-                    "input_id": context.state.get("_dsh_input_id"),
-                },
-            )
+            DshSessions.update(binding, inflight=turn.inflight())
             return turn
         except BaseException:
             await cls.release(turn)
@@ -885,10 +971,7 @@ class DshRuntime:
     @classmethod
     async def _start_native(cls, turn, settings, revision):
         """接入原生 Agent，保留其模型、思考等级、计划模式及执行权限。"""
-        from nonebot import get_driver
-
         from .dsh_control import DshControl, Foreground
-        from .dsh_tools import bridge_lease
 
         binding, client, context = turn.binding, turn.client, turn.context
         marker = read_json_locked(DSH_PATH / "forwarding-ready.json", None, strict=True)
@@ -938,20 +1021,7 @@ class DshRuntime:
         await client.rpc(
             "workspace/unarchiveSession", {"sessionId": binding["remote_id"]}
         )
-        (DSH_PATH / "leases").mkdir(parents=True, exist_ok=True)
-        write_json_locked(
-            DSH_PATH / "leases" / (binding["remote_id"] + ".json"),
-            {
-                "sessionId": binding["remote_id"],
-                "runId": context.run.run_id,
-                "requestId": turn.request_id,
-                "native": True,
-                "token": turn.token,
-                "bridge": bridge_lease(turn),
-                "expires": time.time() + settings.timeout,
-                "authorize": f"http://127.0.0.1:{int(get_driver().config.port)}/zhenxun/api/ai/dsh/authorize",
-            },
-        )
+        turn.write_lease(native=True)
         DshSessions.update(
             binding,
             model=info["model"],
@@ -959,13 +1029,7 @@ class DshRuntime:
             preset=info["preset"],
             title=info["title"],
             quarantined=None,
-            inflight={
-                "boot": BOOT_ID,
-                "run_id": context.run.run_id,
-                "request_id": turn.request_id,
-                "submission": "not_submitted",
-                "input_id": context.state.get("_dsh_input_id"),
-            },
+            inflight=turn.inflight(),
         )
         turn.proof = {
             "mode": "native",
@@ -1059,19 +1123,7 @@ class DshRuntime:
                             if outcome is not None:
                                 if not turn.proof:
                                     raise DshUnavailable("桌面未提供有效执行守卫证据。")
-                                if outcome == "error":
-                                    raise RunInterrupted("DSH 模型请求")
-                                if outcome != "completed":
-                                    raise DshUnavailable(
-                                        f"DSH 本轮未完成（{outcome}）。"
-                                    )
-                                return (
-                                    "\n\n".join(
-                                        t for t in turn.responses.values() if t
-                                    ),
-                                    turn.usage,
-                                    outcome,
-                                )
+                                return turn.finish(outcome)
                     for task in list(turn.pending):
                         if task.done():
                             turn.pending.remove(task)
@@ -1179,7 +1231,13 @@ class DshRuntime:
                 )
         if kind == "tool/call":
             call_id = str(data.get("callId") or "")
+            arguments = json.dumps(data.get("arguments"), ensure_ascii=False)[:2000]
             tools[call_id] = {"name": data.get("name"), "status": "running"}
+            turn.calls[call_id] = {
+                "name": str(data.get("name") or ""),
+                "arguments": arguments,
+                "started": time.monotonic(),
+            }
             if callback:
                 callback(
                     {
@@ -1187,18 +1245,26 @@ class DshRuntime:
                         "run_id": turn.context.run.run_id,
                         "tool_call_id": call_id,
                         "name": data.get("name"),
-                        "arguments": json.dumps(
-                            data.get("arguments"), ensure_ascii=False
-                        )[:2000],
+                        "arguments": arguments,
                     }
                 )
         elif kind == "tool/result":
             message = data.get("message") or {}
             call_id = str(message.get("toolCallId") or "")
             if call_id in tools:
-                tools[call_id]["status"] = (
-                    "failed" if message.get("isError") else "completed"
-                )
+                failed = bool(message.get("isError"))
+                output = "\n".join(
+                    p.get("text", "")
+                    for p in message.get("content", [])
+                    if p.get("type") == "text"
+                )[:2000]
+                tools[call_id]["status"] = "failed" if failed else "completed"
+                if call := turn.calls.get(call_id):
+                    call.update(
+                        result=output,
+                        is_error=failed,
+                        duration=int((time.monotonic() - call["started"]) * 1000),
+                    )
                 if callback:
                     callback(
                         {
@@ -1206,12 +1272,8 @@ class DshRuntime:
                             "run_id": turn.context.run.run_id,
                             "tool_call_id": call_id,
                             "name": tools[call_id]["name"],
-                            "is_error": bool(message.get("isError")),
-                            "result": "\n".join(
-                                p.get("text", "")
-                                for p in message.get("content", [])
-                                if p.get("type") == "text"
-                            )[:2000],
+                            "is_error": failed,
+                            "result": output,
                         }
                     )
         if kind == "assistant/message":
@@ -1254,6 +1316,44 @@ class DshRuntime:
             return reason.get("kind", "unknown")
         return None
 
+    @staticmethod
+    async def save_calls(turn: _Turn) -> None:
+        """把执行端自行执行的工具调用写入 Agent 调用记录，桥接工具在本地执行时已记录
+
+        参数:
+            turn: 当前轮次
+        """
+        if turn.calls_saved:
+            return
+        turn.calls_saved = True
+        from zhenxun.models.ai_agent_call import AIAgentCall
+
+        context = turn.context
+        bridge = context.state.get("_dsh_chat_tools")
+        bridged = bridge.identities if bridge else {}
+        records = [
+            AIAgentCall(
+                run_id=context.run.run_id,
+                session_id=context.session_id or "",
+                user_id=context.get_user_id() or context.state.get("_agent_user") or "",
+                group_id=context.get_group_id(),
+                tool=call["name"][:255],
+                arguments=call["arguments"],
+                decision="dsh",
+                result=call.get("result", "执行结果未确认"),
+                is_error=call.get("is_error", True),
+                duration=call.get("duration", 0),
+            )
+            for call in turn.calls.values()
+            if call["name"] not in bridged
+        ]
+        if not records:
+            return
+        try:
+            await AIAgentCall.bulk_create(records)
+        except Exception as e:
+            logger.warning(f"保存 DSH 工具调用记录失败: {e}", LOG_NAME)
+
     @classmethod
     async def _answer_event(cls, turn, client_id, value):
         event_id = value.get("eventId")
@@ -1268,27 +1368,9 @@ class DshRuntime:
             )
             answer = "allowed-once" if allowed else "rejected"
         elif value.get("event") == "user-questions/request":
-            answers = []
-            for q in request.get("questions") or []:
-                options = [str(o.get("label", "")) for o in q.get("options") or []]
-                question = str(q.get("question", ""))
-                if q.get("detail"):
-                    question += "\n\n" + str(q["detail"])
-                if options:
-                    question += "\n" + "\n".join(
-                        f"{i}. {label}" for i, label in enumerate(options, 1)
-                    )
-                reply = (await turn.ask(question)).strip()
-                if reply.isdigit() and 0 < int(reply) <= len(options):
-                    reply = options[int(reply) - 1]
-                answers.append(
-                    {
-                        "id": q.get("id"),
-                        "selected": [reply] if reply in options else [],
-                        **({"custom": reply} if reply not in options else {}),
-                    }
-                )
-            answer = {"answers": answers}
+            answer = {
+                "answers": await turn.answer_questions(request.get("questions") or [])
+            }
         else:
             return
         await turn.client.rpc(
@@ -1302,7 +1384,7 @@ class DshRuntime:
 
     @classmethod
     async def interrupt(cls, turn):
-        from .dsh_control import Foreground
+        from .dsh_control import STOP_CONFIRMED, Foreground
 
         turn.revoked = True
         for task in tuple(turn.bridge_tasks):
@@ -1362,13 +1444,7 @@ class DshRuntime:
                 quarantined="interrupted",
                 inflight=None
                 if not info["result_uncertain"]
-                and turn.stop_confirmation
-                in {
-                    "confirmed",
-                    "foreground_confirmed",
-                    "foreground_idle",
-                    "target_removed",
-                }
+                and turn.stop_confirmation in STOP_CONFIRMED
                 else turn.binding.get("inflight"),
             )
         except Exception as exc:
@@ -1393,12 +1469,7 @@ class DshRuntime:
             return True
 
         try:
-            mutate_json_locked(
-                DSH_PATH / "leases" / (turn.binding["remote_id"] + ".json"),
-                {},
-                mutate,
-                write_if=bool,
-            )
+            mutate_json_locked(turn.lease_path, {}, mutate, write_if=bool)
         except (OSError, AtomicJsonRecordError):
             logger.warning("DSH 运行授权延期失败，后续工具调用可能被拒绝。", LOG_NAME)
 
@@ -1419,7 +1490,7 @@ class DshRuntime:
             await turn.client.close()
             return
         try:
-            path = DSH_PATH / "leases" / (turn.binding["remote_id"] + ".json")
+            path = turn.lease_path
             if path.exists():
 
                 def clear_owned(lease):

@@ -35,19 +35,6 @@ class LLMEndEvent(AgentStreamEvent):
     """大模型返回的完整响应 (ChatResponse)"""
 
 
-STREAM_TEXT_KEY = "__stream_text__"
-"""运行上下文 state 中设置为 True 时，模型请求改用流式并发出 TextDeltaEvent"""
-
-
-class TextDeltaEvent(AgentStreamEvent):
-    """流式请求中模型输出的增量"""
-
-    kind: str
-    """text 正文，thought 思考，reset 本次请求重试，丢弃已收到的增量"""
-    text: str = ""
-    """增量文本"""
-
-
 class ToolCallStartEvent(AgentStreamEvent):
     """工具调用开始事件"""
 

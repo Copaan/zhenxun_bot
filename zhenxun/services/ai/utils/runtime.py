@@ -1,6 +1,5 @@
 import asyncio
 import inspect
-import time
 from typing import Any
 
 
@@ -124,9 +123,10 @@ class PermissionUtils:
         if context.run.connection_id and (bot := context.get_bot()):
             if vars(bot).get("_zhenxun_connection_id") != context.run.connection_id:
                 raise asyncio.CancelledError("来源连接已变更")
-        if deadline := context.run.budget.get("deadline"):
-            if time.monotonic() >= deadline:
-                raise asyncio.TimeoutError("本轮执行超时")
+        from zhenxun.services.ai.run.context import deadline_passed
+
+        if deadline_passed(context):
+            raise asyncio.TimeoutError("本轮执行超时")
         if context.run.root_revision is not None:
             from zhenxun.services.ai.run.session import session_manager
 

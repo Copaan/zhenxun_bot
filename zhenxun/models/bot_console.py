@@ -1,6 +1,9 @@
 from typing import Literal, overload
+from typing_extensions import Self
 
 from tortoise import fields
+from tortoise.exceptions import IntegrityError, TransactionManagementError
+from tortoise.transactions import in_transaction
 
 from zhenxun.services.cache.runtime_cache import BotMemoryCache
 from zhenxun.services.db_context import Model
@@ -348,6 +351,25 @@ class BotConsole(Model):
         if not bot_data:
             return False
         return cls.format(task_name) in bot_data.block_tasks
+
+    @classmethod
+    async def ensure_account(cls, bot_id: str, platform: str | None) -> Self:
+        """确保Bot账号的管理记录存在并写入缓存，并发创建时读取已有记录
+
+        参数:
+            bot_id: 存储用的bot_id
+            platform: 平台
+
+        返回:
+            Self: 管理记录
+        """
+        try:
+            bot_data, _ = await cls.get_or_create(bot_id=bot_id, platform=platform)
+        except (IntegrityError, TransactionManagementError):
+            async with in_transaction() as connection:
+                bot_data = await cls.filter(bot_id=bot_id).using_db(connection).get()
+        await BotMemoryCache.upsert_from_model(bot_data)
+        return bot_data
 
     @classmethod
     async def create(cls, *args, **kwargs):

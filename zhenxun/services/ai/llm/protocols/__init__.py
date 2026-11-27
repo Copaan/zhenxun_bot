@@ -53,57 +53,6 @@ class HttpCall:
     """覆盖线路的 base_url"""
     raw: bool = False
     """响应为二进制数据"""
-    stream: "type[ChatStream] | None" = None
-    """流式请求的累加器类型，为空时为普通请求"""
-
-
-class ChatStream:
-    """流式对话响应的累加器：逐个接收 SSE 事件，给出文本增量，
-    结束后还原为与非流式相同的响应体，交给协议原有的解码函数"""
-
-    @classmethod
-    def prepare(cls, call: HttpCall) -> None:
-        """把请求改为流式请求
-
-        参数:
-            call: 编码后的请求
-        """
-        raise NotImplementedError
-
-    def feed(self, event: str, data: dict[str, Any]) -> list[tuple[str, str]]:
-        """接收一个 SSE 事件
-
-        参数:
-            event: 事件名，没有 event 字段时为空
-            data: 事件数据
-
-        返回:
-            list[tuple[str, str]]: 增量 (text 正文 / thought 思考, 文本)
-        """
-        raise NotImplementedError
-
-    def result(self) -> dict[str, Any]:
-        """还原出的非流式响应体
-
-        返回:
-            dict[str, Any]: 响应体
-        """
-        raise NotImplementedError
-
-
-def stream_error(data: dict[str, Any]) -> str | None:
-    """提取流式事件中携带的错误信息
-
-    参数:
-        data: 事件数据
-
-    返回:
-        str | None: 错误描述，没有错误时为空
-    """
-    error = data.get("error")
-    if isinstance(error, dict):
-        return str(error.get("message") or error)
-    return str(error) if error else None
 
 
 Build = Callable[["Route", Any], Awaitable[HttpCall]]
@@ -131,19 +80,6 @@ def get_task(protocol: str, task: str) -> tuple[Build, Parse]:
     if task not in module.TASKS:
         raise ConfigurationException(f"{protocol} 协议不支持 {task} 任务")
     return module.TASKS[task]
-
-
-def get_stream(protocol: str) -> type[ChatStream] | None:
-    """获取协议的流式对话累加器
-
-    参数:
-        protocol: 接口协议
-
-    返回:
-        type[ChatStream] | None: 累加器类型，协议不支持流式时为空
-    """
-    module = import_module(f"{__name__}.{_MODULES[protocol]}")
-    return getattr(module, "STREAM", None)
 
 
 _PLACEHOLDERS = {

@@ -15,7 +15,14 @@ import psutil
 
 from zhenxun.services.ai.core.exceptions import RunInterrupted
 from zhenxun.services.ai.run.dsh_desktop import DshUnavailable
+from zhenxun.services.log import logger
 
+SANDBOX_HINT = (
+    "请在运行 Bot 的机器上安装 bubblewrap（Debian/Ubuntu：apt install bubblewrap；"
+    "CentOS/RHEL/Fedora：dnf install bubblewrap；Arch：pacman -S bubblewrap），"
+    "在容器中运行时还需允许创建用户命名空间；"
+    "也可以在 DSH 连接设置中把 Agent 权限改为完全权限"
+)
 BWRAP_PROBE = [
     "--ro-bind",
     "/",
@@ -52,7 +59,6 @@ def eligible_providers():
 
 
 class SdkClient:
-    transport = "sdk"
     _starting = asyncio.Lock()
     _sandbox: tuple[float, dict] | None = None
 
@@ -314,47 +320,51 @@ class SdkClient:
 
     @classmethod
     async def sandbox(cls) -> dict:
-        """探测 Linux 上 SDK 沙箱可用的执行器，结果缓存五分钟
+        """探测 Linux 上 SDK 沙箱能否运行，只认 bubblewrap，可用结果缓存五分钟
 
         返回:
             dict: available 是否可用，runner 选中的执行器，detail 不可用原因
         """
         if sys.platform != "linux":
             return {"available": True, "runner": None, "detail": ""}
-        if cls._sandbox and time.monotonic() - cls._sandbox[0] < 300:
+        if (
+            cls._sandbox
+            and cls._sandbox[1]["available"]
+            and time.monotonic() - cls._sandbox[0] < 300
+        ):
             return cls._sandbox[1]
 
         def probe() -> dict:
-            reasons = []
-            if bwrap := shutil.which("bwrap"):
-                try:
-                    done = subprocess.run(
-                        [bwrap, *BWRAP_PROBE],
-                        capture_output=True,
-                        text=True,
-                        timeout=5,
-                    )
-                    if done.returncode == 0:
-                        return {"available": True, "runner": "bwrap", "detail": ""}
-                    reasons.append(
-                        "bubblewrap 无法创建命名空间："
-                        + (done.stderr.strip().splitlines() or ["未知错误"])[-1][:160]
-                    )
-                except (OSError, subprocess.TimeoutExpired):
-                    reasons.append("bubblewrap 探测失败")
-            else:
-                reasons.append("未安装 bubblewrap")
+            if not (bwrap := shutil.which("bwrap")):
+                return {
+                    "available": False,
+                    "runner": None,
+                    "detail": "未安装 bubblewrap",
+                }
             try:
-                lsm = Path("/sys/kernel/security/lsm").read_text().split(",")
-            except OSError:
-                lsm = []
-            if "landlock" in (item.strip() for item in lsm):
-                return {"available": True, "runner": "landlock", "detail": ""}
-            reasons.append("内核未启用 Landlock")
-            return {"available": False, "runner": None, "detail": "；".join(reasons)}
+                done = subprocess.run(
+                    [bwrap, *BWRAP_PROBE], capture_output=True, text=True, timeout=5
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                return {
+                    "available": False,
+                    "runner": None,
+                    "detail": "bubblewrap 探测失败",
+                }
+            if done.returncode == 0:
+                return {"available": True, "runner": "bwrap", "detail": ""}
+            error = (done.stderr.strip().splitlines() or ["未知错误"])[-1][:160]
+            return {
+                "available": False,
+                "runner": None,
+                "detail": f"bubblewrap 无法创建命名空间：{error}",
+            }
 
         result = await asyncio.to_thread(probe)
+        previous = cls._sandbox[1] if cls._sandbox else None
         cls._sandbox = (time.monotonic(), result)
+        if not result["available"] and (previous or {}).get("available", True):
+            logger.warning(f"DSH 沙箱不可用：{result['detail']}。{SANDBOX_HINT}")
         return result
 
     async def rpc(self, method, args=None):
@@ -367,7 +377,7 @@ class SdkClient:
 
     @classmethod
     async def start_turn(cls, context, binding, settings, approve, ask):
-        from .dsh import BOOT_ID, DshRuntime, DshSessions, _Turn
+        from .dsh import DshRuntime, DshSessions, _Turn
         from .dsh_control import DshControl, Foreground
 
         records = DshSessions.for_binding(binding)
@@ -413,13 +423,7 @@ class SdkClient:
             binding,
             sdk_home=home,
             home_identity=DshControl.home_identity(client),
-            inflight={
-                "boot": BOOT_ID,
-                "run_id": context.run.run_id,
-                "request_id": turn.request_id,
-                "submission": "not_submitted",
-                "input_id": context.state.get("_dsh_input_id"),
-            },
+            inflight=turn.inflight(),
         )
         client.context = context
         client.run_id = context.run.run_id
@@ -464,6 +468,7 @@ class SdkClient:
                 "poll", {"run_id": self.run_id, "cursor": cursor}, timeout=20
             )
             cursor = batch["cursor"]
+            await turn.verify_authorization()
             for question in batch["questions"]:
                 if question["id"] in answered:
                     continue
@@ -484,13 +489,7 @@ class SdkClient:
                 event = params.get("event") or {}
                 outcome = DshRuntime.consume(turn, event, message_id=self.message_id)
                 if outcome is not None:
-                    if outcome != "completed":
-                        raise RunInterrupted("SDK 本轮未完成")
-                    return (
-                        "\n\n".join(t for t in turn.responses.values() if t),
-                        turn.usage,
-                        outcome,
-                    )
+                    return turn.finish(outcome)
 
     async def answer(self, turn, question):
         from zhenxun.services.ai.utils.runtime import PermissionUtils
@@ -503,11 +502,9 @@ class SdkClient:
             )
             result = {"outcome": "allowed-once" if allowed else "rejected"}
         else:
-            answers = []
-            for item in params.get("questions", []):
-                text = await turn.ask(str(item.get("question", "")))
-                answers.append({"id": item["id"], "selected": [], "custom": text})
-            result = {"answers": answers}
+            result = {
+                "answers": await turn.answer_questions(params.get("questions") or [])
+            }
         PermissionUtils.ensure_current(turn.context)
         await self.call(
             "answer", {"run_id": self.run_id, "id": question["id"], "answer": result}

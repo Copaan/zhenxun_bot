@@ -104,6 +104,20 @@ class ChatToolBridge:
         binding = self.context.state["_dsh_binding"]
         if not (binding.get("native") and binding.get("inherited")):
             self.reminders = list(dict.fromkeys(payload.reminders))
+        self.context.state["_injections"] = {
+            "system": {
+                "count": int(bool(self.instructions)),
+                "characters": len(self.instructions),
+                "temporary": True,
+            },
+            "reminders": {
+                "count": len(self.reminders),
+                "characters": sum(map(len, self.reminders)),
+                "temporary": True,
+            },
+            "tools": sorted(self.identities),
+            "sources": list(payload.injection_sources),
+        }
 
     async def call(self, turn, call_id: str, name: str, arguments: dict) -> dict:
         """复核本轮授权后执行一次桥接工具调用，同一调用编号只执行一次

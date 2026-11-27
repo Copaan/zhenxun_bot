@@ -143,9 +143,6 @@ class ToolRetryAndReflectionCapability(AbstractCapability):
         try:
             result = await handler(arguments)
         except Exception as error:
-            from zhenxun.services.ai.run.context import interrupt_transport
-
-            interrupt_transport(error, "tool")
             readonly = bool(
                 _get_tool_meta(context.call.current_tool, "read_only", False)
             ) and not isinstance(error, PermissionError)
@@ -198,9 +195,6 @@ class ReflexionCapability(AbstractCapability):
         try:
             return await handler(arguments)
         except Exception as error:
-            from zhenxun.services.ai.run.context import interrupt_transport
-
-            interrupt_transport(error, "tool")
             from zhenxun.services.ai.tools.models import ToolResult
 
             if isinstance(error, ToolRetryError | ModelRetry):

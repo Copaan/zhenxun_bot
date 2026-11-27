@@ -1,5 +1,4 @@
 from collections.abc import Callable
-from contextvars import ContextVar
 from functools import partial, wraps
 from typing import Any, Literal
 
@@ -26,7 +25,6 @@ from zhenxun.services.log import logger
 
 LOG_COMMAND = "RetryDecorator"
 _SENTINEL = object()
-network_fail_fast: ContextVar[bool] = ContextVar("network_fail_fast", default=False)
 
 
 def _log_before_sleep(log_name: str | None, retry_state: RetryCallState):
@@ -180,27 +178,10 @@ class Retry:
 
             log_callback = partial(_log_before_sleep, log_name)
 
-            def should_retry(state):
-                if network_fail_fast.get():
-                    from zhenxun.services.ai.run.context import (
-                        interrupt_network,
-                        interrupt_transport,
-                    )
-
-                    if state.outcome and (error := state.outcome.exception()):
-                        interrupt_transport(error, "http")
-                        if (
-                            isinstance(error, HTTPStatusError)
-                            and error.response.status_code >= 500
-                        ):
-                            interrupt_network("http_status", error)
-                    return False
-                return retry_conditions(state)
-
             tenacity_retry_decorator = retry(
                 stop=stop_after_attempt(stop_max_attempt),
                 wait=wait_strategy,
-                retry=should_retry,
+                retry=retry_conditions,
                 before_sleep=log_callback,
                 reraise=True,
             )

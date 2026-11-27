@@ -76,6 +76,33 @@ def sender_name(event: Event, user_id: str) -> str:
     return name or user_id
 
 
+def mentioned_users(event: Event | None) -> list[str]:
+    """消息里 @ 到的人和被回复消息的发送者，用于按人召回记忆
+
+    参数:
+        event: 事件
+
+    返回:
+        list[str]: 用户id，去重保序
+    """
+    if event is None:
+        return []
+    users = []
+    try:
+        message = event.get_message()
+    except Exception:
+        message = []
+    for seg in message:
+        if getattr(seg, "type", "") == "at":
+            target = str(seg.data.get("qq") or seg.data.get("user_id") or "")
+            if target.isdigit():
+                users.append(target)
+    reply = getattr(event, "reply", None)
+    if sender := getattr(getattr(reply, "sender", None), "user_id", None):
+        users.append(str(sender))
+    return list(dict.fromkeys(users))
+
+
 _NAME_TABLE = str.maketrans({"(": "（", ")": "）", "#": "＃", ":": "："})
 
 
@@ -361,17 +388,78 @@ class ChatBuffer:
         return True
 
 
+@dataclass
+class _AtWait:
+    future: asyncio.Future
+    deadline: float
+    """截止时间（事件循环时间）"""
+    message_id: str | None
+    """空 @ 的消息id"""
+    claimed: bool = False
+    """处理流程是否已开始等待"""
+
+
 class AtWaiter:
     """只 @ 了 Bot 没说内容时，等该用户的下一条消息一起处理"""
 
-    _futures: ClassVar[dict[tuple[str, str, str], asyncio.Future]] = {}
+    _futures: ClassVar[dict[tuple[str, str, str], _AtWait]] = {}
     WAIT_SECONDS = 15
 
     @classmethod
     def pending(cls, bot_id: str, group_id: str, user_id: str) -> bool:
         """判断当前用户是否有尚未收到补问内容的空 @。"""
-        future = cls._futures.get((bot_id, group_id, user_id))
-        return future is not None and not future.done()
+        entry = cls._futures.get((bot_id, group_id, user_id))
+        return entry is not None and not entry.future.done()
+
+    @classmethod
+    def expect(
+        cls, bot_id: str, group_id: str, user_id: str, message_id: str | None
+    ) -> None:
+        """收到空 @ 时立即登记等待，处理开始前到达的补问也会被接收；
+        到截止时间仍未开始处理时自动清除
+
+        参数:
+            bot_id: Bot id
+            group_id: 群号
+            user_id: 用户id
+            message_id: 空 @ 的消息id
+        """
+        key = (bot_id, group_id, user_id)
+        if key in cls._futures:
+            return
+        loop = asyncio.get_running_loop()
+        entry = _AtWait(
+            loop.create_future(), loop.time() + cls.WAIT_SECONDS, message_id
+        )
+        cls._futures[key] = entry
+        loop.call_at(entry.deadline, cls._expire, key, entry)
+
+    @classmethod
+    def _expire(cls, key: tuple[str, str, str], entry: _AtWait) -> None:
+        if not entry.claimed and cls._futures.get(key) is entry:
+            cls._futures.pop(key, None)
+
+    @classmethod
+    def discard(
+        cls, bot_id: str, group_id: str, user_id: str, message_id: str | None
+    ) -> None:
+        """处理结束时清除该空 @ 登记后未被取走的等待
+
+        参数:
+            bot_id: Bot id
+            group_id: 群号
+            user_id: 用户id
+            message_id: 空 @ 的消息id
+        """
+        key = (bot_id, group_id, user_id)
+        entry = cls._futures.get(key)
+        if (
+            entry is not None
+            and not entry.claimed
+            and message_id is not None
+            and entry.message_id == message_id
+        ):
+            cls._futures.pop(key, None)
 
     @classmethod
     def feed(
@@ -394,34 +482,45 @@ class AtWaiter:
         返回:
             bool: 是否被等待中的空 @ 接收
         """
-        future = cls._futures.get((bot_id, group_id, user_id))
-        if future is None or future.done():
+        entry = cls._futures.get((bot_id, group_id, user_id))
+        if entry is None or entry.future.done():
             return False
-        future.set_result((message, message_id))
+        entry.future.set_result((message, message_id))
         return True
 
     @classmethod
     async def wait(
-        cls, bot_id: str, group_id: str, user_id: str
+        cls, bot_id: str, group_id: str, user_id: str, message_id: str | None = None
     ) -> tuple[UniMessage, str | None] | None:
-        """等待该用户在群里的下一条消息，最多 WAIT_SECONDS 秒
+        """取走该空 @ 已登记的补问，未登记时新登记；最多等到登记后 WAIT_SECONDS 秒
 
         参数:
             bot_id: Bot id
             group_id: 群号
             user_id: 用户id
+            message_id: 空 @ 的消息id
 
         返回:
-            tuple[UniMessage, str | None] | None: 消息与消息id，超时或已在等待时为空
+            tuple[UniMessage, str | None] | None: 消息与消息id，超时或已由其他
+                空 @ 等待时为空
         """
         key = (bot_id, group_id, user_id)
-        if key in cls._futures:
+        loop = asyncio.get_running_loop()
+        entry = cls._futures.get(key)
+        if entry is None:
+            entry = _AtWait(
+                loop.create_future(), loop.time() + cls.WAIT_SECONDS, message_id
+            )
+            cls._futures[key] = entry
+        elif entry.claimed or message_id is None or entry.message_id != message_id:
             return None
-        future = asyncio.get_running_loop().create_future()
-        cls._futures[key] = future
+        entry.claimed = True
         try:
-            return await asyncio.wait_for(future, cls.WAIT_SECONDS)
+            return await asyncio.wait_for(
+                entry.future, max(0.0, entry.deadline - loop.time())
+            )
         except asyncio.TimeoutError:
             return None
         finally:
-            cls._futures.pop(key, None)
+            if cls._futures.get(key) is entry:
+                cls._futures.pop(key, None)

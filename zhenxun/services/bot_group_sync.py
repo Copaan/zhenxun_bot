@@ -10,10 +10,11 @@ from nonebot_plugin_uninfo import Member, Scene, SceneType, get_interface
 from nonebot_plugin_uninfo.adapters import alter_get_fetcher
 from tortoise.transactions import in_transaction
 
+from zhenxun.models.bot_console import BotConsole
 from zhenxun.models.group_console import GroupConsole
 from zhenxun.models.group_member_info import GroupInfoUser
 from zhenxun.services.bot_group_policy import bot_group_policy_service
-from zhenxun.services.cache.runtime_cache import GroupMemoryCache
+from zhenxun.services.cache.runtime_cache import BotMemoryCache, GroupMemoryCache
 from zhenxun.services.db_context.write import defer, write_scope
 from zhenxun.services.hot_query_cache import (
     invalidate_group_members,
@@ -135,6 +136,10 @@ class BotGroupSync:
                 return
             self.status[key] = {"source": "uninfo", "attempt": attempt, "code": code}
             if groups:
+                if await BotMemoryCache.get(key) is None:
+                    await BotConsole.ensure_account(
+                        key, PlatformUtils.get_platform(bot)
+                    )
                 async with runtime_mutation_coordinator.operation("bot_group_sync"):
                     if not self._current(bot, key):
                         return

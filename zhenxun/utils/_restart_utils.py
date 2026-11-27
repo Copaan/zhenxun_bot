@@ -294,7 +294,8 @@ async def request_dependency_restart(source: str, paths: set[Path]) -> tuple[boo
 async def handle_restart_connect(bot: Bot) -> None:
     """目标 Bot 连接后发送一次重启回执
 
-    Bot 已断开时保留回执，由下一次连接发送；在线时发送失败不再重试
+    发送失败且 Bot 已断开时保留回执，由下一次连接发送；Bot 仍在线或发送超时
+    （可能已送达）时不再重试
 
     参数:
         bot: 已连接的 Bot
@@ -343,7 +344,9 @@ async def handle_restart_connect(bot: Bot) -> None:
             target, bot=bot
         )
     except Exception as e:
-        if _bot_online(bot):
+        from zhenxun.adapters.onebot_managed import SendTimeout
+
+        if _bot_online(bot) or isinstance(e, SendTimeout | asyncio.TimeoutError):
             logger.warning(f"发送重启回执失败: {type(e).__name__}", "重启")
             return
 
