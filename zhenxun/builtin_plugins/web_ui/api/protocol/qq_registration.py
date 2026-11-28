@@ -6,6 +6,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 import hashlib
 from io import StringIO
+import json
 import secrets
 import time
 from typing import Any
@@ -44,11 +45,11 @@ from ..configure.persistence import _write_transaction
 from .configuration import _ENV_FILE as _ENV_FILE
 from .configuration import (
     _PROTOCOL_ENV_KEYS,
-    _parse_bots,
     _probe_credential,
     _revision,
     _source_path,
     _update_env,
+    _validate_env,
 )
 
 router = APIRouter()
@@ -250,17 +251,73 @@ async def _poll_bind_task(task_id: str) -> dict[str, Any]:
     return _payload(_response_data(response))
 
 
+def _save_error(exc: Exception) -> HTTPException:
+    """生成不含配置值的扫码保存错误。"""
+    if isinstance(exc, HTTPException) and isinstance(exc.detail, dict):
+        if exc.detail.get("code") in {
+            "registration_env_missing",
+            "registration_bots_invalid",
+        }:
+            return exc
+        for issue in exc.detail.get("issues", []):
+            reason = {
+                "dotenv_duplicate_key": "配置键重复",
+                "dotenv_invalid_statement": "dotenv 语法错误",
+            }.get(issue.get("code"))
+            line = issue.get("line")
+            if reason and isinstance(line, int):
+                return _registration_error(
+                    422,
+                    "registration_env_invalid",
+                    f"QQ 凭据已验证。环境配置第 {line} 行{reason}，请修正后重新扫码。",
+                )
+    if isinstance(exc, UnicodeError | OSError):
+        return _registration_error(
+            500,
+            "registration_file_error",
+            "QQ 凭据已验证。请检查本地配置文件的 UTF-8 编码、读写权限及可用磁盘空间。",
+        )
+    if isinstance(exc, ValueError):
+        return _registration_error(
+            422,
+            "registration_bots_invalid",
+            "QQ 凭据已验证。请检查 QQ_BOTS 中的账号字段、重复 AppID 和事件订阅。",
+        )
+    return _registration_error(
+        500,
+        "registration_save_failed",
+        "QQ 凭据已验证。请在机器人接入页核对配置保存状态。",
+    )
+
+
 async def _save_websocket_bot(app_id: str, secret: str) -> dict[str, Any]:
     async with _configuration_write_lock:
-        source = _source_path()
+        try:
+            source = _source_path()
+        except HTTPException as exc:
+            raise _registration_error(
+                500, "registration_env_missing", "未找到 Bot 的环境配置文件。"
+            ) from exc
         current = source.read_text(encoding="utf-8")
-        values = dotenv_values(stream=StringIO(current))
-        raw_bots = _parse_bots(values.get("QQ_BOTS"))
+        _validate_env(current)
+        values = {
+            k.upper(): v for k, v in dotenv_values(stream=StringIO(current)).items()
+        }
+        try:
+            raw_bots = json.loads(values.get("QQ_BOTS") or "[]")
+            if not isinstance(raw_bots, list) or not all(
+                isinstance(item, dict) for item in raw_bots
+            ):
+                raise ValueError
+        except ValueError as exc:
+            raise _registration_error(
+                422,
+                "registration_bots_invalid",
+                "请将环境配置中的 QQ_BOTS 修正为机器人对象数组后重新扫码。",
+            ) from exc
         merged: list[dict[str, Any]] = []
         replaced = False
         for item in raw_bots:
-            if not isinstance(item, dict):
-                continue
             if str(item.get("id") or "").strip() == app_id:
                 item = model_dump(
                     merge_qq_bot_config(
@@ -392,15 +449,16 @@ async def poll_qq_registration(registration_id: str, request: Request) -> Result
             )
         try:
             secret = _decrypt_secret(encrypted_secret, session.key)
+        except ValueError as exc:
+            raise _registration_error(
+                502,
+                "registration_secret_invalid",
+                "无法解密 QQ 返回的凭据，请重新扫码。",
+            ) from exc
+        try:
             identity = await _probe_credential(app_id, secret)
-            _require_pending(session)
-            session.saving = True
-            saved = await _save_websocket_bot(app_id, secret)
         except HTTPException as exc:
-            session.saving = False
             public_detail = exc.detail if isinstance(exc.detail, dict) else {}
-            if str(public_detail.get("code", "")).startswith("registration_"):
-                raise
             logger.warning(
                 "QQ Bot扫码凭据验证失败 "
                 f"code={public_detail.get('code', 'credential_invalid')} "
@@ -418,15 +476,21 @@ async def poll_qq_registration(registration_id: str, request: Request) -> Result
                 trace_id=public_detail.get("trace_id"),
                 retryable=bool(public_detail.get("retryable", False)),
             ) from exc
+
+        _require_pending(session)
+        session.saving = True
+        try:
+            saved = await _save_websocket_bot(app_id, secret)
         except Exception as exc:
-            session.saving = False
+            error = _save_error(exc)
             logger.warning(
-                f"QQ Bot扫码配置保存失败 result={exc.__class__.__name__}",
+                f"QQ Bot扫码配置保存失败 code={error.detail['code']} "
+                f"result={type(exc).__name__} {error.detail['message']}",
                 "QQOfficialRegistration",
             )
-            raise _registration_error(
-                500, "registration_save_failed", "机器人配置保存失败，请重试。"
-            ) from exc
+            raise error from None
+        finally:
+            session.saving = False
 
         restart = restart_status_data()
         restart_required = bool(saved.get("restart_required", True))
@@ -453,7 +517,6 @@ async def poll_qq_registration(registration_id: str, request: Request) -> Result
             updated_existing=saved["updated_existing"],
         )
         session.completed = result
-        session.saving = False
         session.key = b""
         session.task_id = ""
         logger.info("QQ Bot扫码绑定完成并已保存", "QQOfficialRegistration")

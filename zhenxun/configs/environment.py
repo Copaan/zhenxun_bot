@@ -57,8 +57,8 @@ def sync_env_missing_items(project_root: Path) -> None:
     from dotenv.parser import parse_stream
 
     content = env_path.read_text(encoding="utf-8")
-    existing_values = {
-        item.key: item.value for item in parse_stream(StringIO(content)) if item.key
+    existing_keys = {
+        item.key.upper() for item in parse_stream(StringIO(content)) if item.key
     }
     additions: list[str] = []
     added_keys: list[str] = []
@@ -69,9 +69,9 @@ def sync_env_missing_items(project_root: Path) -> None:
         if item.key is None:
             comments.append(item.original.string)
             continue
-        if item.key not in existing_values:
+        if item.key.upper() not in existing_keys:
             additions.append("".join(comments) + item.original.string)
-            existing_values[item.key] = item.value
+            existing_keys.add(item.key.upper())
             added_keys.append(item.key)
         comments.clear()
     if not additions:
